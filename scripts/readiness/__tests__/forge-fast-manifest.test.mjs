@@ -1,0 +1,177 @@
+// @vitest-environment node
+import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
+import * as fs from 'node:fs/promises';
+import {spawnSync} from 'node:child_process';
+import {join} from 'node:path';
+import {buildManifest,buildDeltaManifest} from '../remote-exec.mjs';
+import {manifestWire,digestManifest,parseGitStatus} from '../forge-exec-manifest.mjs';
+let cwd,base;
+const exec=async ({file,args,cwd,input})=>{
+  const result=spawnSync(file,args,{cwd,input,maxBuffer:4*1024*1024});
+  if(result.error)throw result.error;
+  return {code:result.status,stdout:result.stdout};
+};
+async function git(args) {
+  const result=await exec({file:'git',args,cwd});
+  if(result.code!==0)throw new Error('Fixture git failed');
+  return result.stdout;
+}
+const commit=()=>git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
+const write=(name,data)=>fs.writeFile(join(cwd,name),data);
+const readSpy=()=>{const readFile=vi.fn(path=>fs.readFile(path));return {fs:{...fs,readFile},readFile};};
+const readNames=spy=>spy.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(cwd)+1).toString()).sort();
+beforeEach(async()=>{
+  cwd=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-fast-manifest-')));
+  await git(['init','-q']);
+  await write('keep.txt','keep');await write('edit.txt','edit');await write('remove.txt','remove');
+  await git(['add','.']);await commit();
+  const manifest=await buildManifest({cwd,exec});
+  base={sha:(await git(['rev-parse','HEAD'])).toString().trim(),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest};
+});
+afterEach(async()=>fs.rm(cwd,{recursive:true,force:true}));
+async function compare(options={}) {
+  const fast=await buildDeltaManifest({cwd,exec,base,...options});
+  const full=await buildManifest({cwd,exec});
+  expect(fast.entries).toEqual(full.entries);
+  expect(fast.excluded).toEqual(full.excluded);
+  expect(manifestWire(fast)).toEqual(manifestWire(full));
+  expect(fast.manifestDigest).toBe(full.manifestDigest);
+  expect(digestManifest(manifestWire(fast))).toBe(full.manifestDigest);
+  return fast;
+}
+describe('fast Git manifest',()=>{
+  it('reads only committed, staged, unstaged and untracked changes, matching full entries, wire and digest',async()=>{
+    await write('edit.txt','committed');await git(['add','.']);await commit();
+    await write('staged.txt','staged');await git(['add','staged.txt']);
+    await write('new.txt','new');await fs.rm(join(cwd,'remove.txt'));
+    const spy=readSpy(),fast=await compare({fs:spy.fs});
+    expect(fast.manifestMode).toBe('git-delta');
+    expect(readNames(spy.readFile)).toEqual(['edit.txt','new.txt','staged.txt']);
+    expect(fast.deletions).toEqual([Buffer.from('remove.txt')]);
+  });
+  it.each(['injected','batch'])('hashes a dirty warm snapshot followed by a same-size clean reversion (%s Git reader)',async reader=>{
+    await write('keep.txt','dirt');
+    const dirty=await buildManifest({cwd,exec});
+    const dirtyBase={...base,manifest:manifestWire(dirty),manifestDigest:dirty.manifestDigest};
+    await git(['checkout','--','keep.txt']);
+    expect(await git(['status','--porcelain=v1','-z'])).toHaveLength(0);
+    const spy=readSpy();
+    const fast=await compare({base:dirtyBase,fs:spy.fs,...(reader==='batch'?{exec:undefined}:{})});
+    expect(fast.manifestMode).toBe('git-delta');
+    expect(readNames(spy.readFile)).toEqual(['keep.txt']);
+    expect(fast.deltaPaths).toEqual([Buffer.from('keep.txt')]);
+  });
+  it.each(['failed','oversized','truncated','wrong bytes'])('falls back to full scan when blob-content evidence is %s',async fault=>{
+    const broken=async call=>{
+      if(call.args[0]==='cat-file'&&call.args[1]==='blob')return {
+        code:fault==='failed'?1:0,
+        stdout:Buffer.alloc(fault==='oversized'?4*1024*1024+1:fault==='truncated'?0:4),
+      };
+      return exec(call);
+    };
+    const spy=readSpy(),fast=await compare({exec:broken,fs:spy.fs});
+    expect(fast.manifestMode).toBe('full-scan');
+    expect(fast.manifestReason).toBeTruthy();
+    expect(readNames(spy.readFile)).toEqual(['edit.txt','keep.txt','remove.txt']);
+  });
+  it('hashes leaves above the blob-reader size limit normally',async()=>{
+    await write('large.txt',Buffer.alloc(4*1024*1024+1,97));await git(['add','.']);await commit();
+    const manifest=await buildManifest({cwd,exec});
+    const largeBase={sha:(await git(['rev-parse','HEAD'])).toString().trim(),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest};
+    const spy=readSpy(),fast=await compare({base:largeBase,fs:spy.fs,exec:undefined});
+    expect(fast.manifestMode).toBe('git-delta');
+    expect(readNames(spy.readFile)).toEqual(['large.txt']);
+  });
+  it('includes both rename/copy paths, including opaque byte paths',()=>{
+    const opaque=Buffer.from([0xff,46,116,120,116]);
+    const bytes=Buffer.concat([Buffer.from('R  dest.txt\0source.txt\0 C copy.txt\0'),opaque,Buffer.from('\0?? new.txt\0')]);
+    expect(parseGitStatus(bytes)).toEqual([Buffer.from('dest.txt'),Buffer.from('source.txt'),Buffer.from('copy.txt'),opaque,Buffer.from('new.txt')]);
+    expect(()=>parseGitStatus(Buffer.from('R  dest.txt\0'))).toThrow();
+  });
+  it('handles staged renames and byte paths in the live Git inventory',async()=>{
+    await git(['mv','edit.txt','renamed.txt']);
+    const path=Buffer.concat([Buffer.from(cwd+'/'),Buffer.from('space café.txt')]);
+    await fs.writeFile(path,'opaque');
+    const fast=await compare();expect(fast.manifestMode).toBe('git-delta');
+    expect(fast.deltaPaths).toContainEqual(Buffer.from('renamed.txt'));
+    expect(fast.entries.map(entry=>entry.path)).toContainEqual(Buffer.from('space café.txt'));
+  });
+  it.each(['bad','a'.repeat(40)])('reports full-scan for unknown/unparseable base %s',async sha=>{
+    const spy=readSpy(),fast=await compare({base:{...base,sha},fs:spy.fs});
+    expect(fast.manifestMode).toBe('full-scan');expect(fast.manifestReason).toBeTruthy();
+    expect(readNames(spy.readFile)).toEqual(['edit.txt','keep.txt','remove.txt']);
+  });
+  it.each(['diff','status','check-attr','ls-files flags','oversized','truncated','throw'])('falls back without partial reuse on %s evidence',async fault=>{
+    const broken=async call=>{
+      const command=fault==='ls-files flags'?'ls-files':fault;
+      if(call.args[0]===command && (command!=='ls-files'||call.args.includes('-v')))return {code:1,stdout:Buffer.alloc(0)};
+      if(call.args[0]==='status') {
+        if(fault==='throw')throw new Error('process failed');
+        if(fault==='oversized')return {code:0,stdout:Buffer.alloc(4*1024*1024+1)};
+        if(fault==='truncated')return {code:0,stdout:Buffer.from(' M edit.txt')};
+      }
+      return exec(call);
+    };
+    const spy=readSpy(),fast=await compare({exec:broken,fs:spy.fs});
+    expect(fast.manifestMode).toBe('full-scan');expect(fast.manifestReason).toBeTruthy();
+    expect(readNames(spy.readFile)).toHaveLength(3);
+  });
+  it.each(['size','mode','symlink'])('retains fresh %s checks even when status hides the path',async fault=>{
+    if(fault==='size')await write('keep.txt','longer content');
+    if(fault==='mode')await fs.chmod(join(cwd,'keep.txt'),0o755);
+    if(fault==='symlink'){await fs.rm(join(cwd,'keep.txt'));await fs.symlink('edit.txt',join(cwd,'keep.txt'));}
+    const hidden=call=>call.args[0]==='status'?Promise.resolve({code:0,stdout:Buffer.alloc(0)}):exec(call);
+    if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toThrow('Unsafe inventory component');
+    else {const spy=readSpy();await compare({exec:hidden,fs:spy.fs});expect(readNames(spy.readFile)).toEqual(['keep.txt']);}
+  });
+  it.each(['filter','index flag'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
+    if(kind==='filter') {
+      await write('.gitattributes','keep.txt filter=fixture\n');
+      await git(['config','filter.fixture.clean','printf keep']);
+      await git(['add','.']);await commit();
+    } else await git(['update-index','--assume-unchanged','keep.txt']);
+    await write('keep.txt','diff');
+    expect(await git(['diff','--name-only'])).toHaveLength(0);
+    const spy=readSpy();await compare({fs:spy.fs});
+    expect(readNames(spy.readFile)).toContain('keep.txt');
+  });
+  it('hashes a same-size write racing after status evidence',async()=>{
+    let raced=false;
+    const racing=async call=>{
+      const result=await exec(call);
+      if(call.args[0]==='status'&&!raced){raced=true;await write('keep.txt','race');}
+      return result;
+    };
+    const spy=readSpy();await compare({exec:racing,fs:spy.fs});
+    expect(readNames(spy.readFile)).toEqual(['keep.txt']);
+  });
+  it('hashes tracked-only and public credential leaves despite reuse',async()=>{
+    await write('oauth-source.mjs','public');await git(['add','.']);await commit();await git(['update-ref','refs/remotes/origin/main','HEAD']);
+    const full=await buildManifest({cwd,exec});
+    const reuse=new Map(await Promise.all(full.entries.map(async entry=>{
+      const stat=await fs.lstat(join(cwd,entry.path.toString()));
+      return [entry.path.toString('hex'),{...entry,size:stat.size,stat}];
+    })));
+    const spy=readSpy();await buildManifest({cwd,exec,fs:spy.fs,reuse,trackedOnly:true});
+    expect(readNames(spy.readFile)).toEqual(full.entries.map(entry=>entry.path.toString()).sort());
+    const fast=await buildDeltaManifest({cwd,exec,fs:spy.fs,base:{sha:(await git(['rev-parse','HEAD'])).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest}});
+    expect(fast.manifestMode).toBe('git-delta');expect(readNames(spy.readFile).filter(name=>name==='oauth-source.mjs')).toHaveLength(2);
+  });
+});
+describe('ignored build output test policy',()=>{
+  it.each(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static','nested/dist'])('skips ignored whole build directory %s',async dir=>{
+    await write('.gitignore',dir+'/\n');await fs.mkdir(join(cwd,dir),{recursive:true});
+    await write(dir+'/output.test.mjs','stale output');
+    const result=await buildManifest({cwd,exec});
+    expect(result.entries.some(entry=>entry.path.toString().includes('output.test'))).toBe(false);
+  });
+  it.each(['tests/foo.test.mjs','dist/foo.test.mjs','nested/build/foo.test.mjs'])('refuses ignored tests when only the file is ignored: %s',async path=>{
+    await fs.mkdir(join(cwd,path,'..'),{recursive:true});await write('.gitignore',path+'\n');await write(path,'hidden');
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'ignored-test-file'});
+  });
+  it('refuses when whole-directory ignore evidence fails',async()=>{
+    await write('.gitignore','dist/\n');await fs.mkdir(join(cwd,'dist'));await write('dist/a.test.mjs','hidden');
+    const broken=call=>call.args[0]==='check-ignore'?Promise.resolve({code:2,stdout:Buffer.alloc(0)}):exec(call);
+    await expect(buildManifest({cwd,exec:broken})).rejects.toThrow('Ignored directory evidence unavailable');
+  });
+});

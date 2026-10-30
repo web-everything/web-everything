@@ -111,16 +111,33 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, nulPaths} from './forge-exec-manifest.mjs';
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head} = {}) {
+import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse} = {}) {
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Only dependency and Git internals are exempt. In particular, secret/hidden
-  // directories and ambiguous dist/build directories may still contain tests.
+  // Build names are exempt only with evidence that Git ignores the whole directory.
   const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
-  for (const path of splitPaths(ignored.stdout)) {
-    if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
-    if (isTestFile(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
+  const ignoredTests=splitPaths(ignored.stdout).filter(path=>isTestFile(path)
+    && !pathParts(path).slice(0,-1).some(part=>['node_modules','.git'].includes(part.toString('latin1'))));
+  const buildNames=new Set(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static']);
+  const candidates=new Map();
+  for(const path of ignoredTests) {
+    const parts=pathParts(path);
+    for(let i=0;i<parts.length-1;i++)if(buildNames.has(parts[i].toString('latin1'))) {
+      const dir=path.subarray(0,parts.slice(0,i+1).reduce((length,part)=>length+part.length+1,0)-1);
+      candidates.set(dir.toString('hex'),dir);
+    }
+  }
+  let ignoredDirs=[];
+  if(candidates.size) {
+    const result=await exec({file:'git',args:['check-ignore','--no-index','-z','--stdin'],cwd,input:nulPaths([...candidates.values()])});
+    if(![0,1].includes(result.code))throw new Error('Ignored directory evidence unavailable');
+    ignoredDirs=splitPaths(result.stdout);
+    if(ignoredDirs.some(dir=>!candidates.has(dir.toString('hex'))))throw new Error('Invalid ignored directory evidence');
+  }
+  for(const path of ignoredTests) {
+    if(ignoredDirs.some(dir=>path[dir.length]===47 && path.subarray(0,dir.length).equals(dir)))continue;
+    throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
   }
   let files;
   if (listFiles) {
@@ -225,6 +242,13 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       st = await fs.lstat(absolute);
       if (st.isSymbolicLink() || (i === parts.length-1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe inventory component');
     }
+    const previous=!trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
+    const executable=!!(st.mode & 0o111), tracked=indexBlobs.has(path.toString('base64'));
+    const stable=previous?.stat && ['dev','ino','size','mode','mtimeMs','ctimeMs'].every(key=>st[key]===previous.stat[key]);
+    if(previous && stable && st.size===previous.size && executable===previous.executable) {
+      entries.push({path,sha256:previous.sha256,executable,tracked});
+      continue;
+    }
     const content = await readManifestFile(absolute,st,fs);
     if (publicOid || trackedOnly) {
       publicOid ??= indexBlobs.get(path.toString('base64'));
@@ -280,28 +304,63 @@ export async function selectBase({cwd,exec=defaultExec,bases}={}) {
   }
   return newestLocal;
 }
-function changedPaths(bytes) {
-  const fields=splitPaths(bytes),paths=[];
-  for(let i=0;i<fields.length;i+=2) {
-    if(!/^[ACDMTUXB]$/.test(fields[i].toString('ascii'))||!fields[i+1])throw new Error('Invalid delta diff; use full ship');
-    paths.push(fields[i+1]);
-  }
-  return paths;
-}
 export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head}={}) {
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
-  const git=async args=>{const result=await exec({file:'git',args,cwd});if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Delta git evidence unavailable; use full ship');return result.stdout;};
-  const tree=parseGitTree(await git(['ls-tree','-r','-z',base.sha]));
-  const blobs=new Map(tree.map(entry=>[entry.path.toString('hex'),entry]));
-  // Validate working changes against Mac HEAD, never the warm base. Every final
-  // leaf is still read and hashed even when Git filters or CRLF report it clean.
-  changedPaths(await git(['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--']));
-  splitPaths(await git(['ls-files','-o','--exclude-standard','-z']));
-  const manifest=await buildManifest({cwd,exec,fs,head});
-  // This is a byte-transfer delta, not Git scope. Reuse a warm leaf only when
-  // its hash and mode match the complete Mac snapshot at the pinned HEAD.
+  const git=async (args,input)=>{const result=await exec({file:'git',args,cwd,...(input===undefined?{}:{input})});if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Delta git evidence unavailable; use full ship');return result.stdout;};
   const baseEntries=new Map(snapshot.entries.map(entry=>[entry.path.toString('hex'),entry]));
+  let blobs=new Map(),reuse,changed,manifestMode='full-scan',manifestReason;
+  try {
+    if(typeof base.sha!=='string'||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha))throw new Error('invalid base sha');
+    const tree=parseGitTree(await git(['ls-tree','-r','-l','-z',base.sha]),{sizes:true});
+    blobs=new Map(tree.map(entry=>[entry.path.toString('hex'),entry]));
+    // Capture metadata before Git evidence; a subsequent write invalidates reuse.
+    const stats=new Map();
+    for(const entry of snapshot.entries) {
+      try {stats.set(entry.path.toString('hex'),await fs.lstat(bytePath(cwd,entry.path)));}
+      catch(error){if(error.code!=='ENOENT')throw error;}
+    }
+    changed=new Set([
+      ...splitPaths(await git(['diff','--no-ext-diff','--no-textconv','--name-only','-z','--no-renames',base.sha,head??'HEAD','--'])),
+      ...parseGitStatus(await git(['status','--porcelain=v1','-z','--untracked-files=all'])),
+    ].map(path=>path.toString('hex')));
+    // Filters/encodings and index flags can hide byte changes from status.
+    // Such leaves need ordinary hashing, even if their normalized Git blob is clean.
+    const attributes=splitPaths(await git(['check-attr','-z','--stdin','filter','working-tree-encoding','ident','text','eol'],nulPaths(snapshot.entries.map(entry=>entry.path))));
+    if(attributes.length!==snapshot.entries.length*15)throw new Error('Incomplete Git attributes');
+    for(let i=0;i<attributes.length;i+=3) {
+      if(!['unspecified','unset'].includes(attributes[i+2].toString('latin1')))changed.add(attributes[i].toString('hex'));
+    }
+    for(const record of splitPaths(await git(['ls-files','-v','-z']))) {
+      if(record.length<3||record[1]!==32)throw new Error('Invalid Git index flags');
+      if(record[0]===83 || (record[0]>=97 && record[0]<=122))changed.add(record.subarray(2).toString('hex'));
+    }
+    reuse=new Map();
+    const blobHashes=new Map();
+    let reader;
+    try {
+      for(const entry of snapshot.entries) {
+        const key=entry.path.toString('hex'),blob=blobs.get(key),stat=stats.get(key);
+        if(changed.has(key) || !blob || !stat || blob.size!==stat.size || blob.size>LIMIT
+          || classifyManifestPath(entry.path).credentialSource)continue;
+        // Git cleanliness binds the worktree to the Git blob, not to arbitrary
+        // warm snapshot bytes. Prove that the snapshot hash names those bytes.
+        if(!blobHashes.has(blob.oid)) {
+          if(exec===defaultExec)reader ??= createGitBlobReader({cwd});
+          const content=reader ? await reader.read(blob.oid) : await git(['cat-file','blob',blob.oid]);
+          const oid=createHash(blob.oid.length===64?'sha256':'sha1')
+            .update(`blob ${content.length}\0`).update(content).digest('hex');
+          if(content.length!==blob.size || oid!==blob.oid)throw new Error('Invalid base blob evidence');
+          blobHashes.set(blob.oid,createHash('sha256').update(content).digest('hex'));
+        }
+        if(blobHashes.get(blob.oid)!==entry.sha256)continue;
+        reuse.set(key,{...entry,size:blob.size,stat});
+      }
+    } finally {await reader?.close();}
+    manifestMode='git-delta';
+  } catch {manifestReason='base or git evidence unavailable';reuse=undefined;}
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse});
+  // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
     const previous=baseEntries.get(entry.path.toString('hex'));
@@ -309,7 +368,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
   }).map(e=>e.path).sort(Buffer.compare);
   const deletions=snapshot.entries.filter(e=>!final.has(e.path.toString('hex'))).map(e=>e.path);
   let deltaBytes=0;for(const path of deltaPaths)deltaBytes+=(await fs.lstat(bytePath(cwd,path))).size;
-  return {...manifest,deltaPaths,deletions,deltaBytes,baseSha:base.sha,baseManifestDigest:base.manifestDigest,baseBlobs:blobs};
+  return {...manifest,manifestMode,...(manifestReason?{manifestReason}:{}),changedCount:changed?.size??0,baseCount:snapshot.entries.length,deltaPaths,deletions,deltaBytes,baseSha:base.sha,baseManifestDigest:base.manifestDigest,baseBlobs:blobs};
 }
 // Reproduce the legacy length-prefixed input binding without staging base
 // files: unchanged content is read from local Git objects, delta from staging.
@@ -387,7 +446,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   const needsGit=argv[2]==='check:standards';
@@ -412,7 +471,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     let expected, expectedManifest, delta, transferBytes=0, transferCount=0;
     try {
       const manifestDone=begin('manifest-build');
-      let manifest;
+      let manifest, manifestReason='no usable warm base';
       let logicalHead;
       if(needsGit){
         const evidence=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
@@ -434,8 +493,11 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const wire=JSON.parse(protocolText(response.stdout,LIMIT));
         delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire},head:logicalHead});
         manifest=delta;
+        if(delta.manifestMode==='full-scan'){manifestReason=delta.manifestReason;delta=undefined;}
       } catch {delta=undefined;}
+
       manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead});
+      log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone();
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
       const selectedKeys=new Set(selected.map(path=>path.toString('hex')));

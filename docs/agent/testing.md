@@ -1,5 +1,17 @@
 # Testing — Three-Tier Strategy
 
+## Forge manifest reuse
+
+`forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
+file reads. Git status is not sufficient byte evidence for filters, encodings, index flags,
+or concurrent writes: hash those leaves normally, and use fresh stat/mode and base blob-size
+checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
+warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
+read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
+Ignored test-shaped build output is exempt only when `check-ignore`
+confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
+Run this fixture and the affected Forge tests through heavy admission.
+
 ## Human-only enqueue approval license (R212)
 
 `human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
