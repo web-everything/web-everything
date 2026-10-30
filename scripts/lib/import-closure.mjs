@@ -36,6 +36,17 @@ const opaqueLoaderReference = node => (ts.isIdentifier(node) && OPAQUE_LOADER_NA
   || (ts.isNewExpression(node) && callName(node.expression) === 'Function');
 const opaqueLoaderSpecifier = spec => /^(?:(?:data|file|https?):|(?:node:)?(?:module|vm|test)$)/i.test(spec);
 
+// Comments in loader arguments are deliberately outside the exclusion proof grammar.
+// Use syntax tokens, not per-loader regular expressions (comment-like string data is safe).
+function loaderHasComments(source, node) {
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard,
+    source, undefined, node.expression.end, node.end - node.expression.end);
+  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+    if (token === ts.SyntaxKind.SingleLineCommentTrivia || token === ts.SyntaxKind.MultiLineCommentTrivia) return true;
+  }
+  return false;
+}
+
 // Provenance is rooted in module bindings, never in an enumeration of their exports.
 // An escaped binding is already unknown at its source: aliases, destructuring, callbacks,
 // spreads and computed members need no optimistic downstream alias inference.
@@ -167,6 +178,7 @@ function importSpecs(file, source, strict, resolveLaunch, legacyRequires = false
     } else if (ts.isCallExpression(node)) {
       const name = callName(node.expression);
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword || ((strict || legacyRequires) && name === 'require')) {
+        if (strict && loaderHasComments(source, node)) opaqueReads = true;
         const target = node.arguments[0];
         if (literal(target)) (name === 'require' ? requires : specs).push(target.text);
         else complete = false;

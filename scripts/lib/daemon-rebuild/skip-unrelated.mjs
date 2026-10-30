@@ -8,22 +8,18 @@
  * The clone is then fast-moved to the target (see `prepareRebuild`) without the ~100-140s smoke.
  * Applies to EVERY daemon that uses daemon-self-sync (drain, review, fix, ...), not only the drain.
  */
-import { cascadePolicy, logCascadeSources } from '../policy-cascade.mjs';
+import { daemonRebuildSettingsPath } from './closure-scope-settings.mjs';
+export { daemonRebuildSettingsPath, resolveClosureScopeMode } from './closure-scope-settings.mjs';
 import { isCodePath } from '../main-staleness.mjs';
 import { closureHits, collectImportClosure, MAX_SPAWN_HOPS, PARSEABLE_CODE_RE } from '../import-closure.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { DAEMON_ENTRY_MODULES, resolveDaemonEntries } from '../daemon-boot-smoke.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 
 /** Env override: `0`/`false` turns the skip off, `1`/`true` on. Unset = the settings file (default on). */
 export const SKIP_UNRELATED_ENV = 'WE_DAEMON_REBUILD_SKIP_UNRELATED';
-
-export function daemonRebuildSettingsPath() {
-  return join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
-}
 
 /** `daemonRebuild.skipUnrelated` — default ON; env beats file; anything malformed keeps the default. */
 export function resolveSkipUnrelated(env = process.env, { path = daemonRebuildSettingsPath() } = {}) {
@@ -35,20 +31,6 @@ export function resolveSkipUnrelated(env = process.env, { path = daemonRebuildSe
     if (typeof v === 'boolean') return v;
   } catch { /* missing/corrupt file = default */ }
   return true;
-}
-
-/** Standard shadow never auto-graduates: enabling scoped adoption requires an explicit layer. */
-export function resolveClosureScopeMode(env = process.env, { settingsPath = daemonRebuildSettingsPath() } = {}) {
-  let tool;
-  try { tool = JSON.parse(readFileSync(settingsPath, 'utf8')).closureScope; } catch { /* unset */ }
-  const r = cascadePolicy('closureScope', tool, {
-    env, standard: { mode: 'shadow' },
-    envValues: { mode: env?.WE_DAEMON_CLOSURE_SCOPE?.trim() || undefined },
-    valid: { mode: v => ['off', 'shadow', 'on'].includes(v) },
-  });
-  const mode = r.value.mode, source = r.sources.mode;
-  logCascadeSources('closureScope.effective', { value: { mode }, sources: { mode: source } }, { env });
-  return { mode, source };
 }
 
 export const MANIFEST_RE = /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
@@ -69,7 +51,9 @@ export const RUNTIME_READ_RE = /^(skills-src|\.claude)\//;
  */
 export function smokeSurfaceEntries(env = process.env) {
   const out = new Set(['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-boot-smoke.mjs', ...DAEMON_ENTRY_MODULES]);
-  for (const e of resolveDaemonEntries(env).entries) out.add(e);
+  // Runtime entries are supplied by the closure caller. The legacy skip surface
+  // must stay fixed even when the live smoke environment names a clone.
+  for (const e of resolveDaemonEntries(env, { fixedEntriesOnly: true }).entries) out.add(e);
   for (const check of SMOKE_CHECKS) for (const e of check.codeEntries || []) out.add(e);
   return [...out];
 }

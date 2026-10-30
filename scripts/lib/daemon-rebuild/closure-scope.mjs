@@ -21,14 +21,12 @@ const always = p => MANIFEST_RE.test(p) || CONFIG_RE.test(p) || EXECUTABLE_RE.te
   || RUNTIME_READ_RE.test(p) || /\.(md|json)$/i.test(p) || !PARSEABLE_CODE_RE.test(p);
 const under = (p, prefix) => prefix.endsWith('/') ? p.startsWith(prefix) : p === prefix;
 
-/** Unknown paths are retained. Membership and mandatory rules take precedence over
- * excludable categories, including tests/docs that are themselves in the closure. */
+/** Exclusion requires proof issued for this exact snapshot scope. Unknown paths, copied
+ * or caller-created sets and persisted membership alone never authorize dropping a file.
+ * Membership still wins so the planner can extend protection during its fixpoint. */
 export function isExcludable(path, scope) {
   if (!validPath(path) || !(scope instanceof Set) || scope.has(path) || always(path)) return false;
-  const { mechanismPaths = REBUILD_MECHANISM_PATHS, jsonNames = new Set() } = metadata.get(scope) || {};
-  if (mechanismPaths.some(p => under(path, p)) || (path.endsWith('.json') && jsonNames.has(basename(path)))) return false;
-  return isCodePath(path) || /(^|\/)(__tests__|tests)\//.test(path)
-    || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) || path.startsWith('backlog/');
+  return metadata.get(scope)?.exclusions.has(path) === true;
 }
 
 function layeredReader(base, layers) {
@@ -91,16 +89,35 @@ export function computeClosureScope({ reader, git, mainSha, overlays = [], overl
     if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
     closure = { ...closure, files: new Set([...closure.files, ...legacy.files, ...legacyRequire.files]),
       bareDeps: closure.bareDeps || legacy.bareDeps || legacyRequire.bareDeps,
+      opaqueReads: closure.opaqueReads !== false || Boolean(legacy.opaqueReads || legacyRequire.opaqueReads),
+      referenceTexts: new Map([...legacy.referenceTexts || [], ...legacyRequire.referenceTexts || [],
+        ...closure.referenceTexts || []]),
       jsonNames: new Set([...closure.jsonNames, ...legacy.jsonNames, ...legacyRequire.jsonNames]),
       spawnedNames: new Set([...closure.spawnedNames, ...legacy.spawnedNames, ...legacyRequire.spawnedNames]) };
     if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
+    // A complete import walk is necessary but insufficient. Every closure file and entry
+    // must also provide textual evidence; a missing source or opaque read protects ALL files.
+    const opaque = Boolean(closure.opaqueReads) || [...closure.files, ...starts]
+      .some(p => typeof closure.referenceTexts.get(p) !== 'string');
+    const texts = [...closure.referenceTexts.values()].map(text => text.normalize('NFC').toLowerCase());
+    const exclusions = new Set();
     const scope = new Set([...closure.files, ...mechanismPaths]);
     for (const p of combined.listFiles()) {
-      if (closure.opaqueReads || always(p) || mechanismPaths.some(prefix => under(p, prefix))
-        || (p.endsWith('.json') && closure.jsonNames.has(basename(p)))) scope.add(p);
+      // Raw source plus decoded literals protect path, extensionless path and basename
+      // substrings without needing another inventory of loader spellings.
+      const stem = p.replace(PARSEABLE_CODE_RE, '').normalize('NFC').toLowerCase();
+      const mentioned = !opaque && texts.some(text => text.includes(p.normalize('NFC').toLowerCase())
+        || text.includes(stem) || text.includes(basename(stem)));
+      const eligible = isCodePath(p) || /(^|\/)(__tests__|tests)\//.test(p)
+        || /\.(test|spec)\.[cm]?[jt]sx?$/.test(p) || p.startsWith('backlog/');
+      if (opaque || !validPath(p) || scope.has(p) || always(p) || mentioned || !eligible
+        || mechanismPaths.some(prefix => under(p, prefix))) scope.add(p);
+      else exclusions.add(p);
     }
-    metadata.set(scope, { mechanismPaths: [...mechanismPaths], jsonNames: new Set(closure.jsonNames) });
-    return { ok: true, scope, closure };
+    metadata.set(scope, { exclusions });
+    // ok:true remains compatible with read-capability callers: scope contains every
+    // snapshot file and the allowlist is empty, so the caller retains the full conflict.
+    return { ok: true, scope, closure, ...(opaque ? { reason: 'closure-opaque' } : {}) };
   } catch (error) {
     return { ok: false, reason: error.code === 'CLOSURE_TOO_LARGE' ? 'closure-too-large' : 'scope-unreadable' };
   }

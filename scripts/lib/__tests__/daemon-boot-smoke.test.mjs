@@ -17,8 +17,42 @@ import {
   isSafeRelativeEntry, pickSmokeDiagnostics, resolveDaemonEntries, resolveBootSettings, smokeErrorClass, writeStderrTail,
 } from '../daemon-boot-smoke.mjs';
 import { redactDetail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
 
 describe('resolveDaemonEntries', () => {
+  it.each([undefined, 'off', 'shadow'])('keeps boot discovery inert with unreadable LaunchAgents in mode %s', async mode => {
+    const home = mkdtempSync(join(tmpdir(), 'boot-shadow-home-'));
+    try {
+      const env = { HOME: home, WE_SMOKE_LIVE_CLONE: process.cwd(),
+        ...(mode === undefined ? {} : { WE_DAEMON_CLOSURE_SCOPE: mode }) };
+      const fixed = await checkDaemonEntriesBoot({ root: process.cwd(), env: { HOME: home },
+        runChild: async () => '{"ok":true}', now: () => 0 });
+      const result = await checkDaemonEntriesBoot({ root: process.cwd(), env,
+        runChild: async () => '{"ok":true}', now: () => 0 });
+      expect(result).toEqual(fixed);
+      expect(result.ok).toBe(true);
+      expect(result.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it.each(['off', 'shadow', 'on'])('keeps the skip surface fixed despite unreadable LaunchAgents in mode %s', mode => {
+    const home = mkdtempSync(join(tmpdir(), 'surface-home-'));
+    try {
+      const env = { HOME: home, WE_SMOKE_LIVE_CLONE: process.cwd(), WE_DAEMON_CLOSURE_SCOPE: mode };
+      expect(smokeSurfaceEntries(env)).toEqual(smokeSurfaceEntries({}));
+      expect(smokeSurfaceEntries({ ...env, [DAEMON_ENTRIES_ENV]: 'custom.mjs' })).toContain('custom.mjs');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it.each(['off', 'shadow'])('does not call an injected runtime discovery in mode %s', mode => {
+    let discovered = false;
+    const result = resolveDaemonEntries({ WE_DAEMON_CLOSURE_SCOPE: mode, WE_SMOKE_LIVE_CLONE: 'live-clone' }, {
+      runtimeEntries() { discovered = true; return [...DAEMON_ENTRY_MODULES, 'extra.mjs']; },
+    });
+    expect(discovered).toBe(false);
+    expect(result).toEqual({ entries: DAEMON_ENTRY_MODULES, overridden: false });
+  });
+
   it('uses the real list when no override is set', () => {
     expect(resolveDaemonEntries({})).toEqual({ entries: DAEMON_ENTRY_MODULES, overridden: false });
   });
@@ -54,7 +88,8 @@ describe('resolveDaemonEntries', () => {
     const root = mkdtempSync(join(tmpdir(), 'boot-smoke-live-'));
     let spawned = false;
     try {
-      const r = await checkDaemonEntriesBoot({ root: process.cwd(), env: { WE_SMOKE_LIVE_CLONE: join(root, 'missing') },
+      const r = await checkDaemonEntriesBoot({ root: process.cwd(), env: {
+        WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: join(root, 'missing') },
         runChild: async () => { spawned = true; return '{"ok":true}'; } });
       expect(r.ok).toBe(false);
       expect(r.detail).toContain('runtime entries unreadable');
@@ -65,14 +100,15 @@ describe('resolveDaemonEntries', () => {
   it('uses cloneRuntimeEntries when a clone root is known', () => {
     let observed;
     const runtimeEntries = options => { observed = options; return [...DAEMON_ENTRY_MODULES, 'clone.mjs']; };
-    expect(resolveDaemonEntries({}, { root: 'clone-root', runtimeEntries }).entries).toContain('clone.mjs');
-    expect(observed).toEqual({ root: 'clone-root', entries: [], env: {} });
+    const env = { WE_DAEMON_CLOSURE_SCOPE: 'on' };
+    expect(resolveDaemonEntries(env, { root: 'clone-root', runtimeEntries }).entries).toContain('clone.mjs');
+    expect(observed).toEqual({ root: 'clone-root', entries: [], env });
   });
 
   it('discovers LaunchAgents against the live clone while booting a disposable candidate', () => {
     let observed;
     const runtimeEntries = options => { observed = options; return DAEMON_ENTRY_MODULES; };
-    const env = { WE_SMOKE_LIVE_CLONE: 'live-clone', HOME: 'isolated-home' };
+    const env = { WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: 'live-clone', HOME: 'isolated-home' };
     resolveDaemonEntries(env, { root: 'candidate-tree', runtimeEntries });
     expect(observed.root).toBe('live-clone');
     expect(observed.env).toBe(env);
@@ -80,7 +116,7 @@ describe('resolveDaemonEntries', () => {
 
   it('fails closed when clone entry discovery is unreadable', async () => {
     let spawned = false;
-    const r = await checkDaemonEntriesBoot({ root: 'clone-root', env: {},
+    const r = await checkDaemonEntriesBoot({ root: 'clone-root', env: { WE_DAEMON_CLOSURE_SCOPE: 'on' },
       runtimeEntries() { throw new Error('plist unreadable'); },
       runChild: async () => { spawned = true; return '{"ok":true}'; },
     });
