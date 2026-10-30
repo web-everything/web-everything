@@ -348,6 +348,7 @@ describe('item 100 — `other` is split into real kinds; only a truly unknown co
 
 describe('waitersAheadOf — P0 > P1 > builds without preempting holders', () => {
   const baseline = () => ({
+    priorityMode: 'enforce',
     ...queueBacklog({
       held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
       waiting: [
@@ -391,17 +392,37 @@ describe('waitersAheadOf — P0 > P1 > builds without preempting holders', () =>
   });
 
   it.each([null, undefined, {}, { waiting: null }, { waiting: 'unreadable' }, { bypassed: 'off', waiting: [{ priority: 'P3' }] }])('closed path: bypassed or missing/malformed waiting input %j stays unchanged', (b) => {
-    const enabled = b && typeof b === 'object' ? { ...b, p1OrderingEnabled: true } : b;
+    const enabled = b && typeof b === 'object' ? { ...b, priorityMode: 'enforce', p1OrderingEnabled: true } : b;
     expect(waitersAheadOf(enabled, 'fix')).toBe(enabled);
   });
 
   it('closed path: non-object rows remain counted while valid lower-priority rows are removed', () => {
-    const b = { p1OrderingEnabled: true, waiting: [null, 'unreadable', 42, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }], waitingMinutes: 12, backlogMinutes: 12, shortBacklogMinutes: 12, heavyBacklogMinutes: 0, waitingHeavyCount: 0 };
+    const b = { priorityMode: 'enforce', p1OrderingEnabled: true, waiting: [null, 'unreadable', 42, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }], waitingMinutes: 12, backlogMinutes: 12, shortBacklogMinutes: 12, heavyBacklogMinutes: 0, waitingHeavyCount: 0 };
     expect(waitersAheadOf(b, 'fix')).toMatchObject({ waiting: [null, 'unreadable', 42], waitingMinutes: 9, backlogMinutes: 9, shortBacklogMinutes: 9, excludedBehindCount: 1, excludedBehindMinutes: 3 });
   });
 });
 
 describe('P1 queue budget — cap 3 plus one fast slot', () => {
+  it.each(['fix', 'ci-heal'])('%s does not discount P2/P3 waiters with the flag but without enforce mode', (kind) => {
+    for (const priorityMode of [undefined, null, 'off', 'shadow', 'ENFORCE', true]) {
+      const b = {
+        ...queueBacklog({
+          held: Array.from({ length: 3 }, () => ({ kind: 'FULL' })),
+          waiting: Array.from({ length: 12 }, (_, i) => ({ kind: 'selected', priority: i % 2 ? 'P2' : 'P3' })),
+        }),
+        ...(priorityMode === undefined ? {} : { priorityMode }),
+        slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30, p1OrderingEnabled: true,
+      };
+      expect(waitersAheadOf(b, kind)).toBe(b);
+      const budget = createQueueBudget(b);
+      expect(budget.projectFor(3.25, kind)).toBe(39.25);
+      const result = budget.tryAdmit(kind);
+      expect(result).toMatchObject({ admit: false, projectedMinutes: 39.25 });
+      expect(result).not.toHaveProperty('excludedBehindCount');
+      expect(result).not.toHaveProperty('aheadOnly');
+    }
+  });
+
   it.each(['fix', 'ci-heal'])('%s counts all FIFO waiters until live P1 ordering is enabled', (kind) => {
     for (const enabled of [undefined, null, false, 'true', 1, {}]) {
       const b = {
@@ -409,7 +430,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
           held: Array.from({ length: 3 }, () => ({ kind: 'FULL' })),
           waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3' })),
         }),
-        slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30, p1OrderingEnabled: enabled,
+        priorityMode: 'enforce', slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30, p1OrderingEnabled: enabled,
       };
       expect(waitersAheadOf(b, kind)).toBe(b);
       const budget = createQueueBudget(b);
@@ -423,21 +444,21 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
     for (const priorityClass of [undefined, null, '', 'unknown', 'p3', 'P4', 3, {}, []]) {
       const b = {
         ...queueBacklog({ waiting: [{ kind: 'selected', priorityClass }], standardMinutes: { selected: 40 } }),
-        p1OrderingEnabled: true, slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
+        priorityMode: 'enforce', p1OrderingEnabled: true, slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
       };
       expect(waitersAheadOf(b, kind).waiting).toEqual(b.waiting);
       expect(createQueueBudget(b).tryAdmit(kind)).toMatchObject({ admit: false, projectedMinutes: 43.25, excludedBehindCount: 0 });
     }
     const b = {
       ...queueBacklog({ waiting: [{ kind: 'selected', priorityClass: 'invalid', priority: 'P3' }], standardMinutes: { selected: 40 } }),
-      p1OrderingEnabled: true, slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
+      priorityMode: 'enforce', p1OrderingEnabled: true, slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
     };
     expect(createQueueBudget(b).tryAdmit(kind)).toMatchObject({ admit: false, projectedMinutes: 43.25, excludedBehindCount: 0 });
   });
 
   it.each(['fix', 'ci-heal'])('%s legacy non-split projection discounts only explicit lower classes and retains held/pending demand', (kind) => {
     const b = {
-      p1OrderingEnabled: true, slots: 2, maxWaitMinutes: 15,
+      priorityMode: 'enforce', p1OrderingEnabled: true, slots: 2, maxWaitMinutes: 15,
       backlogMinutes: 60, waitingMinutes: 55, heldRemainingMinutes: 3, pendingMinutes: 2,
       waiting: [
         { priority: 'P3', expectedMinutes: 40 },
@@ -454,7 +475,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
     expect(createQueueBudget({ ...b, p1OrderingEnabled: false }).tryAdmit(kind)).toMatchObject({ admit: false, projectedMinutes: 31.63 });
   });
 
-  it('retains unclassified P0 and earlier fix demand from the real baseline producer; projection agrees with live FIFO', async () => {
+  it('retains unclassified historical P0 and earlier fix demand; priority-off projection agrees with live FIFO', async () => {
     const { markWaiting, clearWaiting, resolveQueueBaseline, isOldestLiveWaiter, listWaiting } = await import('../heavy-admission.mjs');
     const root = mkdtempSync(join(tmpdir(), 'p1-projection-'));
     const nowMs = Date.parse('2026-10-29T12:00:00Z');
@@ -464,23 +485,28 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
       }
       expect(listWaiting(root)).toHaveLength(3);
       expect(listWaiting(root).find((row) => row.owner === 'waiter-0').priority).toBe('P0');
-      const b = resolveQueueBaseline({
+      const live = resolveQueueBaseline({
         lockRoot: root, cap: 1, nowMs, checkoutRoot: root, readLeases: () => [],
-        env: { VITEST: 'true', LANE_POOL_ROOT: root, WE_PLATFORM_PREFERENCES: join(root, 'no-platform.json'), WE_HEAVY_ADMISSION_FAST_SLOTS: '0', WE_HEAVY_UNBLOCK: '1' },
+        env: { VITEST: 'true', LANE_POOL_ROOT: root, WE_PLATFORM_PREFERENCES: join(root, 'no-platform.json'), WE_HEAVY_ADMISSION_FAST_SLOTS: '0', WE_HEAVY_UNBLOCK: '1', WE_HEAVY_ADMISSION_PRIORITY: 'off' },
       });
+      expect(live.p1OrderingEnabled).toBe(false);
+      expect(waitersAheadOf(live, 'fix')).toBe(live);
+      expect(live.waiting.map(row => row.priority)).toEqual(['P0', 'P1', undefined]);
+      // Pin the pre-P1 producer shape: persisted snapshots carry neither classes nor capability.
+      const { p1OrderingEnabled, ...b } = { ...live, waiting: live.waiting.map(({ priority, ...row }) => row) };
       expect(b.waiting).toHaveLength(3);
       expect(b.waiting.every((row) => !('priorityClass' in row) && !('priority' in row))).toBe(true);
-      expect(isOldestLiveWaiter({ lockRoot: root, owner: 'waiter-1', kind: 'selected', nowMs })).toBe(false);
+      expect(isOldestLiveWaiter({ lockRoot: root, owner: 'waiter-1', kind: 'selected', nowMs, priorityMode: 'off' })).toBe(false);
       expect(waitersAheadOf(b, 'fix')).toBe(b);
       for (const kind of ['fix', 'ci-heal']) {
         expect(createQueueBudget({ ...b, maxWaitMinutes: 10 }).tryAdmit(kind)).toMatchObject({ admit: false, projectedMinutes: 12.25 });
-        // Unknown producer rows stay counted even after the capability is enabled in Part B.
-        expect(createQueueBudget({ ...b, maxWaitMinutes: 10, p1OrderingEnabled: true }).tryAdmit(kind)).toMatchObject({ admit: false, projectedMinutes: 12.25, excludedBehindCount: 0 });
+        // Unknown historical rows stay counted even with an enabled capability.
+        expect(createQueueBudget({ ...b, maxWaitMinutes: 10, priorityMode: 'enforce', p1OrderingEnabled: true }).tryAdmit(kind)).toMatchObject({ admit: false, projectedMinutes: 12.25, excludedBehindCount: 0 });
       }
-      // After P0 is removed, an older ordinary waiter still wins over a P1 marker today.
+      // With priority off, an older ordinary waiter still wins over a P1 marker.
       clearWaiting({ lockRoot: root, owner: 'waiter-0' });
       markWaiting({ lockRoot: root, owner: 'older-build', kind: 'selected', nowIso: new Date(nowMs - 5000).toISOString() });
-      expect(isOldestLiveWaiter({ lockRoot: root, owner: 'waiter-1', kind: 'selected', nowMs })).toBe(false);
+      expect(isOldestLiveWaiter({ lockRoot: root, owner: 'waiter-1', kind: 'selected', nowMs, priorityMode: 'off' })).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -489,6 +515,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
   it.each(['fix', 'ci-heal'])('%s retains held and pending backlog after excluding valid lower-priority waiters', (kind) => {
     const pending = [{ demandMinutes: 7 }];
     const b = {
+      priorityMode: 'enforce',
       ...queueBacklog({
         held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
         waiting: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
@@ -526,7 +553,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
     // The aggregate snapshot includes 40 minutes attributed to the unreadable row.
     // Its unknown cost must not erase that recorded demand or disable the cap.
     const b = {
-      p1OrderingEnabled: true, waiting: [row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }],
+      priorityMode: 'enforce', p1OrderingEnabled: true, waiting: [row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }],
       waitingMinutes: 43, backlogMinutes: 43, shortBacklogMinutes: 43,
       heavyBacklogMinutes: 0, heldHeavyCount: 0, waitingHeavyCount: 0,
       slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
@@ -546,6 +573,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
   });
 
   const baseline = () => ({
+    priorityMode: 'enforce',
     ...queueBacklog({
       held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3' })),
       waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3' })),
@@ -570,6 +598,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
 
   it('never discounts a running lower-priority holder: its remaining work can still hold a fix', () => {
     const b = {
+      priorityMode: 'enforce',
       ...queueBacklog({ held: [{ kind: 'selected' }], waiting: [{ kind: 'selected', priority: 'P3' }], standardMinutes: { selected: 40 } }),
       slots: 1, maxWaitMinutes: 30, dispatchMinutes: { fix: 3.25 }, p1OrderingEnabled: true,
     };
