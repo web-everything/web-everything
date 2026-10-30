@@ -1148,9 +1148,16 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     ]);
   });
   it('allows a transitive-only JSON config change', async () => {
-    await expectDependencyQuickSmoke(candidateFixture('config/other-settings.json', '1', { seed: ({ write }) => {
+    const f = candidateFixture('config/other-settings.json', '1', { seed: ({ write }) => {
       write(DISPATCH_DRY_RUN_CODE_ENTRIES[0], "export const config = 'other-settings.json';\n");
-    } }));
+    } });
+    const options = smokeOptions(f);
+    const runSmoke = vi.fn(async () => passed());
+    await smokeAndAdopt({ ...options, runSmoke });
+    expect(runSmoke).toHaveBeenCalledOnce();
+    expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
+    expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=on'));
+    expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, adopt: { finalSha: f.plan.finalSha } });
   });
   it('quick runs one pre-adopt smoke, carries its mark through ready adoption and launches soak', async () => {
     const f = candidateFixture();
