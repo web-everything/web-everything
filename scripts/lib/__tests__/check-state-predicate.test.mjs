@@ -45,6 +45,19 @@ describe('CHECK_STATE_TABLE', () => {
 });
 
 describe('classifyCheck exhaustive independent outcome grid', () => {
+  it('fails closed on prototype-key statuses and conclusions just like unknown values', () => {
+    for (const value of ['unrecognised', 'constructor', 'toString', '__proto__']) {
+      for (const evidence of [
+        { status: value, conclusion: 'success' },
+        { status: 'completed', conclusion: value },
+        { conclusion: value },
+      ]) {
+        expect(classifyCheck({ name: 'ci', ...evidence, required: true })).toBe('red');
+        expect(classifyCheck({ name: 'ci', ...evidence, required: false })).toBe('ignore');
+      }
+    }
+  });
+
   for (const required of [true, false]) {
     for (const status of statuses) {
       for (const conclusion of conclusions) {
@@ -97,6 +110,23 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 });
 
 describe('latestAttempts', () => {
+  it('does not mutate deeply frozen input and returns original rows in first-seen name order', () => {
+    const older = Object.freeze(settled('test', 'failure', { run_attempt: 1, id: 1 }));
+    const build = Object.freeze(settled('build', 'success', { run_attempt: 1, id: 2 }));
+    const newer = Object.freeze(settled('test', 'success', { run_attempt: 2, id: 3 }));
+    const smoke = Object.freeze(settled('smoke', 'success', { run_attempt: 1, id: 4 }));
+    const input = Object.freeze([older, build, newer, smoke]);
+    const snapshot = input.map((row) => ({ ...row }));
+
+    const result = latestAttempts(input);
+
+    expect(input).toEqual(snapshot);
+    expect(result).toHaveLength(3);
+    expect(result[0]).toBe(newer);
+    expect(result[1]).toBe(build);
+    expect(result[2]).toBe(smoke);
+  });
+
   it('compares large run_attempt integers exactly before considering id in either order', () => {
     const older = settled('ci', 'success', { run_attempt: '9007199254740992', id: 999 });
     const newer = settled('ci', 'failure', { run_attempt: '9007199254740993', id: 1 });
@@ -169,6 +199,25 @@ describe('latestAttempts', () => {
 });
 
 describe('named check-state regressions', () => {
+  it('groups check names case-insensitively and matches required and hold-gate names with lowercase sets', () => {
+    const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
+    const newer = settled('test', 'failure', { run_attempt: 2, id: 2, required: false });
+    for (const runs of [[older, newer], [newer, older]]) {
+      expect(latestAttempts(runs)).toEqual([newer]);
+      expect(summarize([
+        ...runs,
+        { name: 'Build', status: 'queued' },
+        settled('Smoke', 'failure'),
+      ], {
+        requiredNames: ['TEST', 'bUiLd', 'ABSENT'],
+        holdGateNames: ['tEsT'],
+      })).toEqual({
+        redSet: new Set(['test']), pendingSet: new Set(['build', 'absent']),
+        gateOnlyRed: true, allRequiredGreen: false,
+      });
+    }
+  });
+
   it('large adjacent ids cannot hide a newer failure in either row order', () => {
     const older = settled('ci', 'success', { run_attempt: 1, id: '9007199254740992' });
     const newer = settled('ci', 'failure', { run_attempt: 1, id: '9007199254740993' });
