@@ -5,7 +5,7 @@ import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -924,6 +924,12 @@ it('keeps distinct per-seat policy models in separate calls and reserves both un
 
 
 describe('seat answer extraction — realistic provider replies, fail closed', () => {
+  it('refuses 200 KB of unmatched braces in under one second', () => {
+    const text = '{'.repeat(200 * 1024);
+    const started = performance.now();
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
   const raw = name => readFileSync(join(process.cwd(), 'scripts/operations/__tests__/fixtures/seat-raw', `${name}.txt`), 'utf8');
   const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];
   it.each(['codex-fenced', 'inner-backticks', 'echo-then-answer'])('extracts the exact last answer from %s', name => {
@@ -1382,6 +1388,27 @@ describe('durable raw seat evidence', () => {
     effect = createExtraSeatsIo({ storePath: join(root, 'scores.json') }).writeRawAnswer;
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
+  it('tightens an existing seat-raw directory to owner-only access before writing evidence', () => {
+    const directory = join(root, 'seat-raw');
+    mkdirSync(directory);
+    chmodSync(directory, 0o755);
+    expect(statSync(directory).mode & 0o777).toBe(0o755);
+    const relative = effect({ callId: 'existing-directory', text: 'raw evidence' });
+    expect(statSync(directory).mode & 0o777).toBe(0o700);
+    expect(statSync(join(root, relative)).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(root, relative), 'utf8')).toBe('raw evidence');
+  });
+  it('keeps scan-budget exhaustion unparseable with durable evidence and a manual-review fallback', () => {
+    const text = '{'.repeat(200 * 1024);
+    const call = classifySeatCall('codex', { report: { lastMessage: text } });
+    const parsed = parseSeatAnswer(text, seats);
+    preserveSeatRawAnswer({ callId: 'scan-budget', call, seats, parsed }, { writeRawAnswer: effect });
+    expect(parsed['red-team'].ok).toBe(false);
+    expect(buildSeatRows({ callId: 'scan-budget', pr: 5, repo: REPO, seats, call, parsed })[0].status).toBe('unparseable');
+    const evidence = readFileSync(join(root, call.rawAnswerPath), 'utf8');
+    expect(evidence).toContain('[truncated at 64 KB;');
+    expect(evidence).toContain('new seat call or manual review');
+  });
   const raw = name => readFileSync(join(process.cwd(), 'scripts/operations/__tests__/fixtures/seat-raw', `${name}.txt`), 'utf8');
   const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];
   it.each(['reasoning-only', 'trailing-prose'])('sanitizes call IDs and writes private %s evidence beside the selected store', name => {
@@ -1437,17 +1464,20 @@ describe('durable raw seat evidence', () => {
   it.each(['truncated', 'reasoning-only', 'trailing-prose', 'missing-seat'])('runExtraSeats saves %s once per call and references it on every row', async name => {
     const text = name === 'missing-seat' ? answer({ 'claim-accuracy': { verdict: 'accept', findings: [] } }) : raw(name);
     const writes = [];
+    const rawWrites = [];
     const { io, calls, rows } = fakeSeatIo({
       cliAvailable: provider => provider === 'codex',
       writeFile: (path, contents) => writes.push([path, contents]),
-      writeRawAnswer: effect,
+      writeRawAnswer: input => { rawWrites.push(input); return effect(input); },
       runSeat: async opts => { calls.push(['seat', opts]); return { report: { lastMessage: text } }; },
     });
     const result = await runExtraSeats({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: LOOP_PAYLOAD, env: {} }, io);
     expect(result.status).toBe('ran');
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.some(row => row.status === 'unparseable')).toBe(true);
+    expect(rawWrites).toHaveLength(calls.filter(call => call[0] === 'seat').length);
     for (const row of rows) {
+      expect(rawWrites.filter(write => write.callId === row.callId)).toHaveLength(1);
       expect(row.rawAnswerPath).toBe(`seat-raw/${row.callId}.txt`);
       expect(readFileSync(join(root, row.rawAnswerPath), 'utf8')).toBe(text);
       expect(JSON.stringify(row)).not.toContain(root);

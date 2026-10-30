@@ -138,7 +138,8 @@ export function buildAgyDirectTaskArgv({ addDirs = [], model, effort, jsonSchema
   if (!review) argv.push('--dangerously-skip-permissions');
   if (jsonSchema !== undefined) {
     requireText(jsonSchema, 'jsonSchema');
-    argv.push('--json-schema', jsonSchema);
+    // The schema belongs to the initial turn; text-mode resume continues that conversation.
+    if (resumeConversationId === null) argv.push('--json-schema', jsonSchema);
   }
   if (!Array.isArray(addDirs)) throw new TypeError('gemini-direct-task: addDirs must be an array');
   // An extra dir would re-grant reads outside --dir that a review run exists to deny.

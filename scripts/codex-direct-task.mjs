@@ -1131,7 +1131,7 @@ export async function codexDirectTask({
     fix: async prompt => {
       if (!summary.threadId) throw new Error('self-review requires the original builder session');
       const fixed = await withCodexUsage({ model, effort, taskKind: 'fix', caller, repo, pr, card, cwd: targetDir },
-        () => runCodexDirectExec({ dir: targetDir, task: prompt, outputSchemaFile, route, model, effort,
+        () => runCodexDirectExec({ dir: targetDir, task: prompt, route, model, effort,
           timeoutMs, logFile: resolvedLogFile, stream, spawnFn, gitDir, writableRoots, tempRoot, env,
           policy: briefPolicy, resumeThreadId: summary.threadId }), { env });
       if (fixed.code !== 0 || fixed.timedOut) throw new Error('self-review builder failed');

@@ -552,7 +552,7 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     expect(result.stderr).toBe(`agy quota exhausted: skip-quota-hold until ${quotaResetsAt} (held by google model gemini-3.1-pro)`);
   });
 
-  it('recovers the init UUID after SIGKILL and resumes once with a fresh budget and no task replay', async () => {
+  it('recovers the init UUID after SIGKILL and resumes once with a fresh budget, no task replay and no schema flag', async () => {
     vi.useFakeTimers();
     const dir = tempDir();
     const id = 'afa6b941-eb5d-4652-9471-4bae369c1cbd';
@@ -563,12 +563,15 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     const spawnFn = vi.fn().mockImplementationOnce(first.fn).mockImplementationOnce(second.fn);
     const execFn = fakeExec();
     const pending = geminiDirectTask({ dir, task: 'original task', stream: false, timeoutMs: 20,
-      model: 'chosen', effort: 'high', addDirs: ['/extra'], sandbox: true, gate: 'standards', execFn, spawnFn });
+      model: 'chosen', effort: 'high', jsonSchema: 'seat.schema.json', addDirs: ['/extra'], sandbox: true, gate: 'standards', execFn, spawnFn });
     await vi.advanceTimersByTimeAsync(20);
     expect(first.seen.child.kill).toHaveBeenCalledWith('SIGKILL');
     expect(spawnFn).toHaveBeenCalledTimes(1); // wait for close/output drain before starting the resume
     await vi.advanceTimersByTimeAsync(1);
     expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(first.seen.argv.slice(first.seen.argv.indexOf('--json-schema'), first.seen.argv.indexOf('--json-schema') + 2))
+      .toEqual(['--json-schema', 'seat.schema.json']);
+    expect(second.seen.argv).not.toContain('--json-schema');
     expect(second.seen.argv).toEqual(['--input-format', 'text', '--output-format', 'stream-json',
       '--disable-slash-commands', '--dangerously-skip-permissions', '--add-dir', '/extra',
       '--model', 'chosen', '--effort', 'high', '--sandbox', '--print-timeout', '0.02s',

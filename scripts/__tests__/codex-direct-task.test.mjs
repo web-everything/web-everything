@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync }
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
@@ -933,9 +933,11 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     return { fn, seen };
   }
 
-  it('awaits the async gate again after a self-review repair', async () => {
+  it('awaits the async gate again after a self-review repair and omits the output schema on resume', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-regate-'));
-    const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const { fn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const spawnFn = vi.fn(fn);
+    const outputSchemaFile = join(dir, 'seat.schema.json');
     const gateExecFn = vi.fn(async () => 'gate output');
     const selfReviewFn = vi.fn().mockResolvedValueOnce(['repair fixture']).mockResolvedValueOnce([]);
     const execFn = (bin, args) => {
@@ -944,11 +946,17 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     };
     try {
       const report = await codexDirectTask({ task: 'fixture', dir, gate: 'standards', selfReview: true,
-        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn,
+        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn, outputSchemaFile,
         readQuotaFn: () => ({ quota: null, rolloutFile: null }) });
       expect(gateExecFn).toHaveBeenCalledTimes(2);
       expect(report.selfReview.rounds).toBe(1);
       expect(report.gate).toMatchObject({ pass: true, steps: [{ output: 'gate output' }] });
+      expect(spawnFn).toHaveBeenCalledTimes(2);
+      const [initial, resumed] = spawnFn.mock.calls.map(([, argv]) => argv);
+      expect(initial.slice(initial.indexOf('--output-schema'), initial.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
+      expect(resumed).toContain('resume');
+      expect(resumed).toContain('builder');
+      expect(resumed).not.toContain('--output-schema');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1499,6 +1507,37 @@ describe('direct task routes', () => {
 
 
 describe('direct CLI flags reach the actual spawn and JSON result', () => {
+  it('threads the schema from CLI through the task and exec spawn as a resolved path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-schema-'));
+    const argvFile = join(dir, 'spawn-argv.json');
+    const schemaFile = 'seat schema.json';
+    const preload = `import cp from 'node:child_process';
+      import { writeFileSync } from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
+      cp.spawn = (_bin, argv) => {
+        writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
+          child.emit('close', 0);
+        }, 0); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();`;
+    try {
+      const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', '--task=review', `--dir=${dir}`, `--output-schema-file=${schemaFile}`,
+        '--json', '--no-stream', '--review'], { encoding: 'utf8' });
+      const argv = JSON.parse(readFileSync(argvFile, 'utf8'));
+      expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', resolve(schemaFile)]);
+      expect(JSON.parse(stdout).argv).toEqual(argv);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([
     [['--task-kind=fix'], 'fix', 'gpt-6.1-sol', 'high', 'tool', 'tool'],
     [['--task-kind=prepare', '--size=8'], 'prepare-complex', 'gpt-6-astra', 'high', 'tool', 'tool'],

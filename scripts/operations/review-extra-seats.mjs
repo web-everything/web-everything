@@ -355,6 +355,10 @@ export function extractAnswerJson(text) {
     } catch { /* An invalid quoted key is not an answer-key token. */ }
   }
   let last = null;
+  // Malformed candidates can overlap. Bound their combined scan work so unmatched
+  // braces cannot cause quadratic rescanning. Exhaustion stays unparseable; the
+  // caller preserves raw evidence for a new seat call or manual review.
+  let scanBudget = s.length * 4;
   for (let start = 0; start < s.length; start += 1) {
     if (s[start] !== '{') continue;
     let depth = 0;
@@ -362,6 +366,7 @@ export function extractAnswerJson(text) {
     let escaped = false;
     let end = start;
     for (; end < s.length; end += 1) {
+      if (scanBudget-- === 0) return null;
       const c = s[end];
       if (inString) {
         if (escaped) escaped = false;
@@ -969,6 +974,7 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       const relative = `seat-raw/${String(callId).replace(/[^A-Za-z0-9._-]/g, '_')}.txt`;
       const path = join(stateDir, relative);
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      chmodSync(dirname(path), 0o700);
       writeFileSync(path, text, { mode: 0o600 });
       chmodSync(path, 0o600);
       return relative;
