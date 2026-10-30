@@ -26,7 +26,11 @@
  *   episodes/<id>.md    the durable per-episode report (+ .json)
  *
  * Every child call has a hard timeout; a whole-tick watchdog kills a hung tick and records it, so the next tick
- * raises the `health-tick-overrun` smell.
+ * raises the `health-tick-overrun` smell. The deadline is budget × 3 × clamp(load1 / cores, 1, maxScale),
+ * capped by an absolute ceiling (defaults: maxScale 3, ceiling 540000ms; idle deadline 180000ms).
+ * Policy `healthWatchTickWatchdog`: standard → platform → health dir config.json (flat tickBudgetMs,
+ * tickKillLoadScaleMax, tickKillCeilingMs) → WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX / WE_HEALTH_TICK_KILL_CEILING_MS.
+ * Invalid settings fall back to their standard values and are logged with effective provenance.
  *
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
@@ -41,6 +45,8 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
+export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
@@ -59,6 +65,7 @@ import {
 import { homedir, hostname, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+export { resolveTickWatchdogLimit } from './health-watch-tick-limit.mjs';
 
 import {
   DEFAULT_HEALTH_CONFIG, emptyHealthState, runHealthTick, renderEpisodeReport, renderHealthSection, summarizeDiagnosisOutput, scrubText, scrubDeep, parsePsOutput, MINUTE, HOUR,
@@ -1136,6 +1143,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
 
+  // R217: each kind owns a 24h stamp; fixture ticks never touch host archives.
+  await attempt('archiveRetention', async () => {
+    const { results, error } = await runArchiveRetentionTick({ flags, now, archive: deps.archiveRetention ?? undefined });
+    if (error) probeErrors.archiveRetention = error;
+    return results;
+  });
+
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
@@ -1659,7 +1673,6 @@ async function main(argv) {
   // `--in-process` is the watchdog's worker child: its parent already holds the tick lock.
   const release = flags['dry-run'] || flags['in-process'] ? () => {} : acquireTickLock(dir);
   if (!release) { console.error('health-watch: another tick holds the tick lock — skipping.'); return 0; }
-  const budget = (readJson(join(dir, 'config.json'), {}).tickBudgetMs) ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs;
   if (flags['in-process']) {
     // The worker: runs the tick itself. Its probes block on synchronous child calls, so no timer in THIS
     // process could interrupt it — the watchdog lives in the parent (below).
@@ -1676,7 +1689,10 @@ async function main(argv) {
     } finally { release(); }
   }
   try {
-    return await runTickWithWatchdog(argv, { dir, killAfterMs: budget * 3 });
+    // Only the parent tick needs to resolve the watchdog deadline.
+    const { resolveTickWatchdogLimit } = await import('./health-watch-tick-limit.mjs');
+    const { killAfterMs } = resolveTickWatchdogLimit({ config: readJson(join(dir, 'config.json'), {}) });
+    return await runTickWithWatchdog(argv, { dir, killAfterMs });
   } finally { release(); }
 }
 
@@ -1687,7 +1703,9 @@ async function main(argv) {
  * execFileSync probes block the very event loop the timer needs.)
  * @returns {Promise<number>} the exit code: the child's own, or 3 when the watchdog killed it
  */
-export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLToPath(import.meta.url) }) {
+export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLToPath(import.meta.url), spawnChild = spawn }) {
+  // Keep the reviewed spawn call explicit while allowing hermetic watchdog fixtures.
+  const spawn = spawnChild;
   return new Promise((resolveExit) => {
     const child = spawn(process.execPath, [script, ...argv, '--in-process'], { stdio: 'inherit' });
     let killed = false;
