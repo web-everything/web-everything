@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute, resolvePolicyModel } from '../dispatch-routing-policy.mjs';
+import { DEFAULT_ROUTING_POLICY, applyRoutingOverrides, resolveOperationRoute, resolvePolicyModel, validateRoutingPolicy } from '../dispatch-routing-policy.mjs';
 import { createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
-import { operatorPreferencesPath, readPlatformPreferences, PLATFORM_PREFERENCES_PATH } from '../policy-cascade.mjs';
+import { operatorPreferencesPath, readPlatformPreferences, PLATFORM_PREFERENCES_PATH, LEGACY_PLATFORM_PREFERENCES_PATHS } from '../policy-cascade.mjs';
 import { resolveRoutingProviderCap } from '../../operations/review-seat-policy.mjs';
 import { runExtraSeats, reserveSeatCalls } from '../../operations/review-extra-seats.mjs';
 import { ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from '../../operations/review-dispatch.mjs';
@@ -98,7 +98,7 @@ describe('operator routing overrides', () => {
       fallback: [{ provider: 'agy-claude', model: 'sonnet' }, { provider: 'codex', model: 'sol' }], disabledProviders: ['codex'] } });
     expect(policy.operations[key].effort).toEqual({ codex: 'high', 'agy-gemini': 'high' });
     expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', policy })).toMatchObject({
-      provider: 'agy-gemini', model: 'gemini-3.1-pro', effort: 'high', fallback: [{ provider: 'agy-claude', model: 'claude-sonnet-5-5' }],
+      provider: 'agy-gemini', model: 'gemini-3.1-pro', effort: 'high', fallback: [{ provider: 'agy-claude', model: 'claude-sonnet-5-5-high' }],
     });
     expect(base.operations[key].provider).toBe('codex');
   });
@@ -144,6 +144,8 @@ describe('operator routing overrides', () => {
     expect(resolveRoutingProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '7' }, entry)).toBe(7);
     expect(resolveRoutingProviderCap('agy-gemini', {}, DEFAULT_ROUTING_POLICY.operations[key])).toBe(0);
     expect(resolveRoutingProviderCap('codex', {}, { disabledProviders: ['codex'] })).toBe(0);
+    expect(resolveRoutingProviderCap('codex', {}, { enabledProviders: ['codex'] })).toBe(80);
+    expect(resolveRoutingProviderCap('agy-claude', {}, { enabledProviders: ['agy-claude'] })).toBe(300);
   });
 
   it.each([
@@ -161,16 +163,98 @@ describe('operator routing overrides', () => {
     const operator = operatorPreferencesPath({});
     const readFile = vi.fn(path => JSON.stringify(path === PLATFORM_PREFERENCES_PATH ? { routingOverrides: { repo: true }, other: 1 }
       : path === operator ? { routingOverrides: {} } : {}));
-    expect(readPlatformPreferences({ env: {}, readFile }).prefs).toEqual({ routingOverrides: {}, other: 1 });
+    const warn = vi.fn();
+    expect(readPlatformPreferences({ env: {}, readFile, warn }).prefs).toEqual({ routingOverrides: {}, other: 1 });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ignoring routingOverrides'));
     expect(readPlatformPreferences({ env: { WE_PLATFORM_PREFERENCES_FILE: 'operator.json' }, readFile: path => {
       expect(path).toBe('operator.json'); return '{"routingOverrides":{}}';
     } }).prefs).toEqual({ routingOverrides: {} });
   });
 
-  it('uses current Sonnet aliases while accepting historical persisted ids', () => {
+  it('uses effort-suffixed Sonnet aliases accepted by the agy catalog while accepting historical persisted ids', () => {
     for (const provider of ['agy-claude', 'antigravity']) {
-      expect(resolvePolicyModel(provider, 'sonnet')).toBe('claude-sonnet-5-5');
+      expect(resolvePolicyModel(provider, 'sonnet')).toBe('claude-sonnet-5-5-high');
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations[key] = { provider, model: policy.aliases[provider].sonnet, fallback: [] };
+      expect(() => validateRoutingPolicy(policy)).not.toThrow();
+      policy.aliases[provider].sonnet = 'claude-sonnet-5-5-unknown';
+      expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);
       expect(resolvePolicyModel(provider, 'claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+      expect(resolvePolicyModel(provider, 'claude-sonnet-5-5')).toBe('claude-sonnet-5-5');
     }
+  });
+
+  it.each(['inherited', 'fallback'])('keeps a Gemini enable local to its seat when another seat uses an %s route', async routeKind => {
+    const base = structuredClone(DEFAULT_ROUTING_POLICY);
+    for (const task of [`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]) {
+      base.operations[`review-seat:${task}`] = routeKind === 'inherited' ? { inherit: true }
+        : { provider: 'codex', model: 'sol', fallback: [{ provider: 'agy-gemini', model: 'flash' }] };
+    }
+    const policy = applyRoutingOverrides(base, {
+      'review-seat:standards-conformance': { provider: 'agy-gemini', model: 'pro', fallback: [] },
+    });
+    const io = {
+      now: () => Date.parse('2026-10-30T12:00:00Z'), readRecords: () => [], log: vi.fn(),
+      cliAvailable: p => p === 'agy-gemini',
+      reserveCalls: vi.fn(options => reserveSeatCalls({ ...options, ledger: null, records: [], newId: () => 'local-enable' })),
+      makeScratch: () => temp(), removeScratch: vi.fn(), writeFile: vi.fn(), append: vi.fn(),
+      runSeat: vi.fn(async () => ({ exitCode: 0, report: { events: { finalResponse: JSON.stringify({
+        lenses: { 'standards-conformance': { verdict: 'accept', findings: [] } },
+      }) } } })),
+    };
+    const result = await runExtraSeats({ pr: 5, repo: 'test/repo', lanePath: temp(), env: {}, routingPolicy: policy,
+      loopPayload: { findings: { read: { diffText: 'diff --git a/x b/x\n+1\n', netBasis: { rev: 'a'.repeat(40) } } } } }, io);
+    expect(result.status).toBe('ran');
+    expect(io.reserveCalls).toHaveBeenCalledTimes(1);
+    expect(io.reserveCalls).toHaveBeenCalledWith(expect.objectContaining({ provider: 'agy-gemini', want: 1, dailyCap: 300 }));
+    expect(io.runSeat).toHaveBeenCalledTimes(1);
+    expect(result.seats.map(seat => seat.lens)).toEqual(['standards-conformance']);
+    expect(result.skipped).toHaveLength(ROUTED_ADVISORY_LENSES.length);
+  });
+
+  it.each([PLATFORM_PREFERENCES_PATH, ...LEGACY_PLATFORM_PREFERENCES_PATHS])(
+    'ignores and warns about repo routingOverrides in %s without preventing operator overrides', repoPath => {
+      const operator = operatorPreferencesPath({}), warn = vi.fn();
+      let operatorPresent = false;
+      const preferences = () => readPlatformPreferences({ env: {}, warn, readFile: path => {
+        if (path === repoPath) return JSON.stringify({ routingOverrides: { [key]: { provider: 'agy-gemini' } }, other: 1 });
+        if (path === operator && operatorPresent) return JSON.stringify({ routingOverrides: { [key]: { provider: 'codex' } } });
+        return '{}';
+      } });
+      expect(preferences().prefs).toEqual({ other: 1 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(`${repoPath}: ignoring routingOverrides`));
+      const reader = createRoutingPolicyReader({ preferences, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY), log: vi.fn(), emit: vi.fn() });
+      expect(reader().operations[key]).toEqual(DEFAULT_ROUTING_POLICY.operations[key]);
+      operatorPresent = true;
+      expect(reader().operations[key].provider).toBe('codex');
+      const replaced = readPlatformPreferences({ env: { WE_PLATFORM_PREFERENCES_FILE: repoPath }, warn,
+        readFile: () => JSON.stringify({ routingOverrides: { [key]: { provider: 'agy-gemini' } }, other: 1 }) });
+      expect(replaced.prefs).toEqual({ other: 1 });
+    });
+
+  it.each(['throws synchronously', 'rejects'])('applies a validated policy when event emission %s', async failure => {
+    const f = fixture();
+    let onLog;
+    const eventLogged = new Promise(resolve => { onLog = resolve; });
+    const log = vi.fn(message => onLog(message));
+    f.set({ [key]: { provider: 'agy-gemini' } });
+    const emit = vi.fn(() => {
+      if (failure === 'throws synchronously') throw new Error('event sink unavailable');
+      return Promise.reject(new Error('event sink unavailable'));
+    });
+    const reader = createRoutingPolicyReader({ env: f.env, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY), log, emit });
+    const applied = reader();
+    expect(applied.operations[key].provider).toBe('agy-gemini');
+    await eventLogged;
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith('routing-override-event: event sink unavailable');
+    expect(reader()).toBe(applied);
+    expect(emit).toHaveBeenCalledTimes(1);
+    f.set({});
+    const clearLogged = new Promise(resolve => { onLog = resolve; });
+    expect(reader().operations[key]).toEqual(DEFAULT_ROUTING_POLICY.operations[key]);
+    await clearLogged;
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(emit).toHaveBeenCalledTimes(2);
   });
 });

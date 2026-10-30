@@ -229,11 +229,11 @@ export function reviewSeatKey(seat) {
  * `callsRemaining` is the day's remaining non-Claude call budget. One provider is one call (its seats share a
  * prompt), so with 0 left every seat is skipped (`daily-cap`) and with 1 left every seat goes to the provider
  * the first seat picked.
- * @param {{available?: string[], scorecards?: Array<object>, callsRemaining?: number}} [o]
+ * @param {{available?: string[], providerAvailable?: (provider:string, seatKey:string)=>boolean, scorecards?: Array<object>, callsRemaining?: number}} [o]
  * @returns {{routes: Array<{seat:string, lens:string, key:string, provider:string, model:string, effort:string, reasoning:string}>,
  *   skipped: Array<{seat:string, lens:string, key:string, reason:string}>}}
  */
-export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
+export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
   const seats = [
     { seat: 'extra-juror', lens: EXTRA_JUROR_MANDATE },
     ...ROUTED_ADVISORY_LENSES.map((lens) => ({ seat: 'advisory-lens', lens })),
@@ -246,10 +246,11 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards
   let usable = [...available];
   const plannedLoad = {};
   for (const s of seats) {
+    const seatAvailable = usable.filter(provider => providerAvailable(provider, s.key));
     let configured;
-    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: usable, policy: routingPolicy }); }
+    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: seatAvailable, policy: routingPolicy }); }
     catch (error) { skipped.push({ ...s, reason: error.message }); continue; }
-    const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: usable, scorecards, plannedLoad });
+    const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: seatAvailable, scorecards, plannedLoad });
     if (!pick.provider) { skipped.push({ ...s, reason: pick.reasoning }); continue; }
     plannedLoad[pick.provider] = (plannedLoad[pick.provider] ?? 0) + 1;
     // One call left: every later seat rides the call this first pick already costs.

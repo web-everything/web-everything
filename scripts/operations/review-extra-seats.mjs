@@ -527,12 +527,13 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     // `callsUsedTodayForProvider`): a provider at its own cap is treated exactly like a quota hold or a missing
     // CLI — excluded from `available` — so `reviewSeatRoutes` naturally falls the seat back to whichever OTHER
     // provider still has budget, never to "no seat" while at least one provider does.
-    const routingEntries = [`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]
-      .map(task => routingPolicy.operations[`review-seat:${task}`] ?? routingPolicy.operations['review-seat']);
-    // A live enable on any added seat opens its provider's shared budget; route resolution still enforces
-    // each seat's disables. Explicit env caps remain binding for every entry.
+    const seatCaps = Object.fromEntries([`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]
+      .map(task => [task, Object.fromEntries(REVIEW_SEAT_PROVIDERS.map(p => [p, resolveRoutingProviderCap(p, env,
+        routingPolicy.operations[`review-seat:${task}`] ?? routingPolicy.operations['review-seat'])]))]));
+    // Reservations share a provider ledger, but eligibility is checked against EACH seat's own cap.
+    // An enable on one seat must never make that provider available to another seat.
     const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p,
-      Math.max(...routingEntries.map(entry => resolveRoutingProviderCap(p, env, entry))),
+      Math.max(...Object.values(seatCaps).map(byProvider => byProvider[p])),
     ]));
     const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     let available = [];
@@ -555,7 +556,8 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     }
     for (const u of unavailable) io.log(`added seats: skipping ${u.provider} — ${u.reason}`);
     const remainingCalls = (list) => list.reduce((sum, p) => sum + Math.max(0, caps[p] - usedByProvider[p]), 0);
-    let plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+    const providerAvailable = (provider, seatKey) => usedByProvider[provider] < seatCaps[seatKey][provider];
+    let plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
 
     // RESERVE each distinct provider's ONE call under ITS OWN cap, before launching anything, so concurrent
     // reviews can never together overspend any one provider's budget. A provider that cannot be granted (another
@@ -583,7 +585,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         if (reservation.callIds.length === reservation.models.length) { callIdOf.set(p, new Map(reservation.models.map((model, index) => [model, reservation.callIds[index]]))); } else { anyDenied = true; available = available.filter((x) => x !== p); }
       }
       if (!anyDenied) break;
-      plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+      plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
     }
     const providerUsage = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, { usedToday: usedByProvider[p] + (callIdOf.get(p)?.size ?? 0), cap: caps[p] }]));
     const totalUsedToday = Object.values(providerUsage).reduce((sum, u) => sum + u.usedToday, 0);

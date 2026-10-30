@@ -13,6 +13,12 @@ Clearing restores the repo/env defaults on the next pass. The preference writer 
 file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
 Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
 operations those names remain reserved juror controls; undeclared juror flags still fail closed.
+Repo platform files must ignore `routingOverrides` and warn, even when the operator file has no
+override; only the operator file (or its explicit replacement) can supply them. In added-seat
+fixtures, enable Gemini for one seat and leave other seats inherited or with Gemini fallbacks:
+only the enabled seat may use the default-zero provider. Check both synchronous and rejected
+event writes: neither may prevent applying or clearing a validated policy. Agy Sonnet aliases
+must resolve to an effort-suffixed catalog ID; historical persisted IDs remain readable.
 
 ## Human-only enqueue approval license (R212)
 

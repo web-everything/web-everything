@@ -26,7 +26,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isUnderTest } from './under-test.mjs';
 
@@ -46,10 +46,11 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
- * IO: every platform preference, keyed by policy. Never throws.
+ * IO: every platform preference, keyed by policy. routingOverrides is operator-only;
+ * repo platform copies are ignored with a warning. Never throws.
  * @returns {{prefs:object, errors:string[]}}
  */
-export function readPlatformPreferences({ env = process.env, readFile = readFileSync } = {}) {
+export function readPlatformPreferences({ env = process.env, readFile = readFileSync, warn = message => console.error(message) } = {}) {
   const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
   const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(env)];
   const prefs = {};
@@ -58,7 +59,14 @@ export function readPlatformPreferences({ env = process.env, readFile = readFile
     try {
       const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
-      for (const [k, v] of Object.entries(data)) if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = v;
+      for (const [k, v] of Object.entries(data)) {
+        if (k === 'routingOverrides' && (path !== operatorPreferencesPath(env)
+          || [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH].some(repoPath => resolve(repoPath) === resolve(path)))) {
+          warn(`policy-cascade: ${path}: ignoring routingOverrides; only the operator-owned preferences file may set it`);
+          continue;
+        }
+        if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = v;
+      }
     } catch (e) {
       if (e?.code !== 'ENOENT') errors.push(`${path}: ${String(e?.message ?? e).split('\n')[0]}`);
     }

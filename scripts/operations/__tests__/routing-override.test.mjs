@@ -11,7 +11,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { createRoutingOverrideSinks } from '../routing-override-file.mjs';
 import { routingOverrideOperation, planRoutingOverride } from '../routing-override.mjs';
 import { op } from '../registry.mjs';
-import { compute } from '../step-kinds.mjs';
+import { compute, judge } from '../step-kinds.mjs';
 
 const dirs = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -154,4 +154,11 @@ it('derives provider/model as inputs only where declared, keeping absent juror f
   const simple = op('simple', { input: {}, verdictFrom: 'read', read: compute({ reads: [], fn: () => ({}) }) });
   expect(parseOperationArgv(simple, ['--provider=agy-gemini']).ok).toBe(false);
   expect(parseOperationArgv(declaration, ['--operation=review-seat', '--cwd=somewhere']).ok).toBe(false);
+});
+
+it.each(['model', 'provider'])('keeps %s reserved for juror controls on judged operations', field => {
+  const declaration = op('judged-collision', { input: { [field]: 'string' }, verdictFrom: 'panel',
+    panel: judge({ reads: [], request: () => ({ mandate: 'review', input: '', shape: {} }) }),
+  });
+  expect(() => buildCliSpec(declaration)).toThrow(`declares an input field \`${field}\` that collides`);
 });

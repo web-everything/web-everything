@@ -42,7 +42,7 @@ export function resolveRoutingProviderCap(provider, env = process.env, entry) {
   const cap = resolveProviderCap(provider, env);
   return entry?.enabledProviders?.includes(provider) && cap === 0 && PROVIDER_CAP_DEFAULT[provider] === 0
     && env?.[PROVIDER_CAP_ENV[provider]] === undefined
-    ? (PROVIDER_CAP_DEFAULT[provider] || 300) : cap;
+    ? 300 : cap;
 }
 /** @returns {number} the configured daily call cap (a non-negative integer), else the default. PURE. */
 export function resolveDailyCap(env = process.env) {
