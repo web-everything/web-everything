@@ -6,13 +6,14 @@ import {createHash} from 'node:crypto';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {classifyManifestPath,manifestEntry,manifestWire,digestManifest,parseGitTree,validateTestNames,isTestFile,bytePath,pathParts,decodeManifest} from './forge-exec-manifest.mjs';
-import {baseGuard,baseDirectory,baseFile,readBase,readyBases,pruneBases} from './forge-exec-bases.mjs';
+import {baseGuard,baseDirectory,baseFile,readBase,readyBases,pruneBases,PUBLIC_REPOSITORY,anonymousGitEnv} from './forge-exec-bases.mjs';
 import {createRunner,verifyManifest,digestLock} from './forge-exec-run.mjs';
-const URL='https://github.com/chalbert/web-everything.git';
+const URL=PUBLIC_REPOSITORY;
 const LIMIT=4*1024*1024;
-function run({file,args,cwd,env}) {
+function run({file,args,cwd,env,input}) {
   return new Promise((resolve,reject)=>{
-    const child=spawn(file,args,{cwd,env,stdio:['ignore','pipe','pipe']}),out=[];let bytes=0,overflow=false;
+    const child=spawn(file,args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']}),out=[];let bytes=0,overflow=false;
+    if(input!==undefined){child.stdin.on('error',()=>{});child.stdin.end(input);}
     const timer=setTimeout(()=>{overflow=true;child.kill('SIGKILL');},120000);
     for(const stream of [child.stdout,child.stderr])stream.on('data',chunk=>{bytes+=chunk.length;if(bytes>LIMIT){overflow=true;child.kill('SIGKILL');}else if(stream===child.stdout)out.push(chunk);});
     child.on('error',error=>{clearTimeout(timer);reject(error);});child.on('close',code=>{clearTimeout(timer);if(overflow)reject(new Error('Warm command bound exceeded: full shipping remains available'));else resolve({code,stdout:Buffer.concat(out)});});
@@ -63,7 +64,15 @@ async function revalidateBase(root,ready,fs) {
       ||marker.manifestDigest!==observed.manifestDigest||marker.fileCount!==observed.fileCount||marker.treeDigest!==observed.treeDigest)throw new Error('Warm tree marker mismatch');
   }
 }
-export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,fs=filesystem,install=async (tree,manifest)=>createRunner().warmInstall(tree,manifest)}={}) {
+async function installWarm(tree,manifest) {
+  const pool=(await filesystem.readdir('/srv/forge-exec')).some(name=>/^slot-[1-9]\d*$/.test(name));
+  if(!pool)return createRunner().warmInstall(tree,manifest);
+  const result=await run({file:'/usr/bin/sudo',args:['-n','/usr/local/libexec/forge-exec-run.mjs','warm-install'],
+    env:{PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent'},input:JSON.stringify({source:tree,manifest})});
+  if(result.code!==0)throw new Error('Warm worker unavailable; full shipping remains available');
+  return {code:0};
+}
+export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,fs=filesystem,install=installWarm}={}) {
   await baseDirectory(root,fs);
   // The timer's flock serializes ticks. The short base guard is also shared
   // with runner pin creation, closing the prune-vs-prepare race.
@@ -83,7 +92,7 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
     await pruneBases(root,fs);
   },fs);
   const repo=join(root,'repo.git');
-  const env={PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'};
+  const env=anonymousGitEnv();
   const git=async args=>{
     const result=await exec({file:'git',args:['-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','protocol.file.allow=never','-c','protocol.ext.allow=never','-c','http.followRedirects=false','--git-dir',repo,...args],cwd:root,env});
     if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Anonymous Git unavailable: full shipping remains available');return result.stdout;
@@ -114,7 +123,7 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
         if(oid!==entry.oid)throw new Error('Public blob changed');
         let dest=Buffer.from(tree);const parts=pathParts(entry.path);
         for(const [i,part] of parts.entries()){dest=bytePath(dest,part);if(i<parts.length-1)await fs.mkdir(dest,{recursive:true,mode:0o755});else await fs.writeFile(dest,content,{flag:'wx',mode:entry.executable?0o755:0o644});}
-        entries.push(manifestEntry(entry.path,content,entry.executable));
+        entries.push(manifestEntry(entry.path,content,entry.executable,true));
       }
       const manifest=manifestWire({entries,excluded}),manifestDigest=digestManifest(manifest);
       if(Buffer.byteLength(JSON.stringify(manifest))>LIMIT-16384)throw new Error('Warm manifest bound exceeded: use full shipping');

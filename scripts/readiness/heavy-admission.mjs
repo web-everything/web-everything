@@ -428,7 +428,6 @@ export function decideRemote({ policy, loadPerCore, argv }) {
 
 const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'command-not-allowed',
-  'requires-git-worktree',
   'invalid-parameters',
   'forge-unreachable',
   'copy-failed',
@@ -2086,9 +2085,18 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       process.exit(1);
     }
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
-    if (!bypass && !useContainer && !process.env[ADMISSION_HELD_ENV]) {
+    // The Mac verify driver holds local phase capacity, but its gate may run on
+    // Forge. Consume this internal handoff once; local fallback stays reentrant.
+    const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
+    delete process.env.WE_FORGE_GATE_DISPATCH;
+    if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
+      const requested=argv.slice(dashDashIdx+1);
+      // package.json wraps the underlying executable, so reconstruct only the
+      // fixed standards script contract at this client boundary.
+      const remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
+        ? ['npm','run','check:standards',...(requested.length>2?['--',...requested.slice(2)]:[])] : requested;
       const result = await runWithRemoteDecision({
-        argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd(),
+        argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });

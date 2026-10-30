@@ -1,9 +1,43 @@
 #!/bin/bash
+# Creates (idempotently; run only on Forge):
+# - system user/group forge-exec (legacy) and forge-exec-1..FORGE_EXEC_SLOTS
+#   (default 8), each slot user with its own group and no shared membership;
+# - /srv/forge-exec ops:ops 0755, legacy .cache root:forge-exec 0700;
+# - /srv/forge-exec/slot-K ops:forge-exec-K 0710 (worker traverse only);
+#   run containers stay operator-owned, only work/sibling trees are handed over;
+# - /srv/forge-receipts ops:ops 0700, /srv/forge-cache root:ops 0770,
+#   /srv/forge-base ops:ops 0700 and its anonymous public bare repo.git;
+# - /usr/local/libexec root:root 0755 and bundled root:root 0755 wrappers
+#   forge-exec-run.mjs and forge-warm-base.mjs;
+# - /etc/sudoers.d/forge-exec root:root 0440 with these exact forms:
+#   ops ALL=(forge-exec-1,...,forge-exec-N) NOPASSWD: /usr/bin/rsync
+#   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs
+#   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *
+# - root-owned forge-warm-base systemd service/timer (service runs as ops,
+#   timer every 30s) and /etc/cron.daily/forge-exec-prune root:root 0755;
+# - installs python3 and rsync if missing. Never prunes active slot locks.
 set -euo pipefail
 
+FORGE_EXEC_SLOTS=${FORGE_EXEC_SLOTS:-8}
+if [[ ! "$FORGE_EXEC_SLOTS" =~ ^[1-9][0-9]*$ ]] || (( FORGE_EXEC_SLOTS > 128 )); then
+  echo 'forge-setup: FORGE_EXEC_SLOTS must be 1..128' >&2
+  exit 1
+fi
+export FORGE_EXEC_SLOTS
+for existing in /srv/forge-exec/slot-*; do
+  if [[ "$existing" =~ /slot-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > FORGE_EXEC_SLOTS )); then
+    echo 'forge-setup: cannot shrink an installed pool; retain its slot count and inspect reservations' >&2
+    exit 1
+  fi
+done
 if ! id forge-exec >/dev/null 2>&1; then
   useradd --system --user-group --home-dir /srv/forge-exec --shell /bin/bash forge-exec
 fi
+for ((k=1; k<=FORGE_EXEC_SLOTS; k++)); do
+  if ! id "forge-exec-$k" >/dev/null 2>&1; then
+    useradd --system --user-group --home-dir "/srv/forge-exec/slot-$k" --shell /bin/bash "forge-exec-$k"
+  fi
+done
 if ! command -v python3 >/dev/null 2>&1; then
   apt-get install -y python3
 fi
@@ -45,6 +79,32 @@ try:
             os.close(cache)
         os.fchown(root, ops.pw_uid, ops.pw_gid)
         os.fchmod(root, 0o755)
+        identities = set()
+        groups = set()
+        for k in range(1, int(os.environ["FORGE_EXEC_SLOTS"]) + 1):
+            worker = pwd.getpwnam("forge-exec-" + str(k))
+            group = grp.getgrnam("forge-exec-" + str(k))
+            if worker.pw_uid in {0, ops.pw_uid, pwd.getpwnam("forge-exec").pw_uid} or worker.pw_gid != group.gr_gid or worker.pw_uid in identities or group.gr_gid in groups:
+                raise RuntimeError("invalid or shared worker identity")
+            if group.gr_mem or worker.pw_gid in os.getgrouplist("ops", ops.pw_gid):
+                raise RuntimeError("slot groups must be private")
+            if set(os.getgrouplist("forge-exec-" + str(k), worker.pw_gid)) != {worker.pw_gid}:
+                raise RuntimeError("slot users must not have supplementary groups")
+            identities.add(worker.pw_uid)
+            groups.add(group.gr_gid)
+            name = "slot-" + str(k)
+            try:
+                os.mkdir(name, 0o700, dir_fd=root)
+            except FileExistsError:
+                pass
+            slot = os.open(name, flags, dir_fd=root)
+            try:
+                # Revoke the worker's ability to replace metadata entries.
+                # Pinning this inode also upgrades an old worker-owned slot.
+                os.fchown(slot, ops.pw_uid, worker.pw_gid)
+                os.fchmod(slot, 0o710)
+            finally:
+                os.close(slot)
     finally:
         os.close(root)
     for name, uid, group, mode in [("forge-receipts", ops.pw_uid, ops.pw_gid, 0o700),
@@ -63,7 +123,24 @@ try:
 finally:
     os.close(with_parent)
 DIRECTORIES
-# ops uses passwordless sudo -u forge-exec; no additional group privileges are needed.
+# Explicit Runas list: never grant a wildcard worker identity or arbitrary commands.
+sudoers_pending=$(mktemp /etc/sudoers.d/.forge-exec.XXXXXXXX)
+trap 'rm -f -- "$sudoers_pending"' EXIT
+{
+  printf 'ops ALL=('
+  for ((k=1; k<=FORGE_EXEC_SLOTS; k++)); do
+    ((k == 1)) || printf ','
+    printf 'forge-exec-%s' "$k"
+  done
+  printf ') NOPASSWD: /usr/bin/rsync\n'
+  printf 'ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs\n'
+  printf 'ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *\n'
+} > "$sudoers_pending"
+visudo -cf "$sudoers_pending"
+chown root:root "$sudoers_pending"
+chmod 440 "$sudoers_pending"
+mv -f -- "$sudoers_pending" /etc/sudoers.d/forge-exec
+trap - EXIT
 if ! command -v rsync >/dev/null 2>&1; then
   apt-get install -y rsync
 fi
@@ -177,12 +254,31 @@ cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
 # Trusted roots cannot be replaced by the task. find does not follow symlinks.
-# worker-active is a protected directory, deliberately excluded from receipt
-# pruning. After interrupted execution, stop ALL forge-exec processes before
-# manually removing /srv/forge-receipts/worker-active; never expire it by age.
-find /srv/forge-exec -mindepth 1 -maxdepth 1 -type d -name 'r-*' -mmin +1440 -exec rm -rf -- {} +
-find /srv/forge-receipts -mindepth 1 -maxdepth 1 -type f -mmin +1440 -delete
-find /srv/forge-cache -mindepth 1 -maxdepth 1 -type d -mmin +20160 -exec rm -rf -- {} +
+# Never prune active/uncertain slots, their receipts or cache. Locks never age
+# out. An operator must first stop every process of the specific reserved UID.
+python3 - <<'PRUNE_PY'
+import os, re, stat, shutil, time
+root, receipts = '/srv/forge-exec', '/srv/forge-receipts'
+active = {name for name in os.listdir(receipts) if name.startswith('worker-active')}
+def prune(parent, age, pattern, files=False):
+    if stat.S_ISLNK(os.lstat(parent).st_mode):
+        raise RuntimeError('unsafe prune root')
+    for name in os.listdir(parent):
+        if not re.fullmatch(pattern, name): continue
+        path = os.path.join(parent, name)
+        st = os.lstat(path)
+        if time.time() - st.st_mtime <= age: continue
+        if files and stat.S_ISREG(st.st_mode): os.unlink(path)
+        elif not files and stat.S_ISDIR(st.st_mode): shutil.rmtree(path)
+if 'worker-active' not in active:
+    prune(root, 86400, r'r-.*')
+for slot in os.listdir(root):
+    if re.fullmatch(r'slot-[1-9][0-9]*', slot) and 'worker-active-' + slot[5:] not in active:
+        prune(os.path.join(root, slot), 86400, r'(r-|warm-)[a-f0-9]{32}')
+if not active:
+    prune(receipts, 86400, r'.*', files=True)
+    prune('/srv/forge-cache', 1209600, r'.*')
+PRUNE_PY
 PRUNE
 chown root:root /etc/cron.daily/forge-exec-prune
 chmod 755 /etc/cron.daily/forge-exec-prune

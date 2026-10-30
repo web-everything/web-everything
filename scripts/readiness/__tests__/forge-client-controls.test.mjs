@@ -9,6 +9,7 @@ import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
 import {main as telemetryCli, readForgeTelemetry} from '../forge-telemetry.mjs';
 import {checkRemoteHealth} from '../forge-remote-health.mjs';
+import {parseCLI} from 'vitest/node';
 import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const roots = [];
@@ -31,7 +32,7 @@ describe('Forge telemetry contracts', () => {
   });
   it('refreshes stale idle Forge telemetry over SSH, caches for ten seconds and retries failed SSH after backoff', async () => {
     let time=now;
-    const root=scratch(),healthRoot=scratch(),receipts=join(root,'receipts');mkdirSync(receipts);
+    const root=scratch(),healthRoot=scratch(),receipts=join(root,'receipts');mkdirSync(receipts,{mode:0o700});
     writeFileSync(join(receipts,'telemetry.json'),JSON.stringify(sample(now-60000)));
     const server=runner.createRunner({testRoot:root,clock:()=>time});
     const exec=vi.fn((_file,args,_options,done)=>{
@@ -56,7 +57,7 @@ describe('Forge telemetry contracts', () => {
     expect(exec).toHaveBeenCalledTimes(5);
   });
   it('fails closed when live sampling finds unreadable run evidence', async () => {
-    const root=scratch(),receipts=join(root,'receipts');mkdirSync(receipts);
+    const root=scratch(),receipts=join(root,'receipts');mkdirSync(receipts,{mode:0o700});
     writeFileSync(join(receipts,'r-'+'a'.repeat(32)+'.telemetry'),'{}');
     await expect(runner.createRunner({testRoot:root}).telemetry()).rejects.toThrow();
   });
@@ -122,6 +123,14 @@ describe('Forge telemetry contracts', () => {
 });
 
 describe('shared command classes', () => {
+  it('proves the installed Vitest parser disables related run mode for --run false, and refuses it on both boundaries',()=>{
+    expect(parseCLI(['vitest','related','src/a.ts','--run','false']).options.run).toBe(false);
+    for(const value of ['false','False','FALSE','false.test.mjs']){
+      const argv=['npx','vitest','related','src/a.ts','--run',value];
+      expect(isAllowedCommand(argv)).toBe(false);
+      expect(runner.allowedCommand(argv)).toBe(false);
+    }
+  });
   it.each(['--run','--silent','--no-color'].flatMap(flag=>
     ['false','true','false.test.mjs','true-source.ts'].map(value=>[flag,value])))
   ('rejects boolean-looking positional values immediately after %s: %s', (flag,value) => {
@@ -183,7 +192,7 @@ ${gate?`if(!fs.existsSync(${JSON.stringify(join(root,'release'))})){const watch=
     writeFileSync(join(work,'package-lock.json'),'lock');
     const {createHash}=await import('node:crypto');
     const sha=data=>createHash('sha256').update(data).digest('hex');
-    const manifest={paths:Buffer.from('package-lock.json\0').toString('base64'),hashes:[sha('lock')],executable:[false],excluded:''};
+    const manifest=runner.manifestWire({entries:[{path:Buffer.from('package-lock.json'),sha256:sha('lock'),executable:false,tracked:false}],excluded:[]});
     const request={run:prepared.run,nonce:'b'.repeat(32),argv,argvDigest:runner.digestArgv(argv),env:{},lock:sha('lock'),
       inputDigest:await runner.digestInput(work),manifest,manifestDigest:sha(JSON.stringify(manifest))};
     return {root,work,server,request,setTime:ms=>{time=ms;}};
@@ -243,6 +252,18 @@ describe('remote controls', () => {
     return {argv:command,policy:policy(remote),cwd:root,env:{},lockRoot,clock:()=>now,
       readTelemetry:vi.fn(async()=>sample()),remoteExec:vi.fn(async()=>({mode:'remote',code:0})),log:vi.fn()};
   }
+  it('refreshes an idle server through SSH on the heavy-admission remote path after its cache expires',async()=>{
+    const f=fixture({maxLoadPerCore:Number.MAX_VALUE,minFreeRamPct:0}),serverRoot=scratch();let time=now;
+    const server=runner.createRunner({testRoot:serverRoot,clock:()=>time});
+    const ssh=vi.fn((_file,_args,_options,done)=>server.telemetry().then(value=>done(null,JSON.stringify(value)),done));
+    f.clock=()=>time;f.readTelemetry=options=>readForgeTelemetry({...options,exec:ssh});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0});
+    time+=60000;
+    expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0});
+    expect(ssh).toHaveBeenCalledTimes(2);
+    expect(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(readFileSync(join(serverRoot,'receipts','telemetry.json'),'utf8')).sampledAtET).toBe(runner.easternTimestamp(time));
+  });
   it('holds a separate remote slot during execution and releases on success without Mac heavy capacity', async () => {
     const f=fixture();
     f.remoteExec.mockImplementation(async()=>{
@@ -311,8 +332,8 @@ describe('remote controls', () => {
         policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:1}}}),
         readTelemetry:async()=>({sampledAtET:easternTimestamp(${now}),cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
         remoteExec:()=>new Promise((resolve,reject)=>{
-          // Model the remote process boundary: the job outlives this client.
-          const job=spawn(process.execPath,['-e',${JSON.stringify(keepAliveScript())}],{detached:true,stdio:'ignore'});
+          // Anchor to the test runner, so the bounded job outlives only this client.
+          const job=spawn(process.execPath,['-e',${JSON.stringify(keepAliveScript({maxLifetimeMs:60_000}))}],{detached:true,stdio:'ignore'});
           job.on('error',reject);
           job.once('spawn',()=>{job.unref();process.send({stage:'dispatched',jobPid:job.pid});});
         }),

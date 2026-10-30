@@ -149,6 +149,12 @@ describe('sibling root snapshot acceptance', () => {
 });
 
 describe('fixed wrapper security boundary', () => {
+  it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
+    const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
+    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Invalid execution parameters');
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
+  });
   it('does not certify a rejected reply after the protected run phase started', async () => {
     await writeFile(join(root,'receipts',request.run+'.running'), JSON.stringify({v:1,nonce:request.nonce,run:request.run}));
     await rm(join(root,'receipts',request.run+'.prepared'));
@@ -334,9 +340,9 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     const next = await runner.prepare({nonce:request.nonce});
     await expect(runner.run({...request,...next})).rejects.toThrow('Worker execution busy');
   });
-  it('rejects Git-dependent standards requests at the server boundary', async () => {
+  it('rejects standards requests without hash-bound Git evidence at the server boundary', async () => {
     const command = ['npm','run','check:standards'];
-    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Invalid execution parameters');
+    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Missing Git evidence');
     await expect(stat(join(root,'install.log'))).rejects.toThrow();
   });
   it.each([
@@ -613,8 +619,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     expect(setup).toContain('("forge-receipts", ops.pw_uid, ops.pw_gid, 0o700)');
     expect(setup).toContain('("forge-cache", 0, ops.pw_gid, 0o770)');
     const prune=setup.match(/<<'PRUNE'\n([\s\S]*?)\nPRUNE/)[1];
-    expect(prune).toContain('-mmin +1440');
-    expect(prune).toContain('-mmin +20160');
+    expect(prune).toContain('86400');
+    expect(prune).toContain('1209600');
     const expired=new Date(Date.now()-16*24*60*60*1000);
     const oldRun=join(root,'runs','r-expired'), oldReceipt=join(root,'receipts','expired.receipt');
     const oldCache=join(root,'cache','expired'), newCache=join(root,'cache','fresh');
@@ -622,16 +628,19 @@ with patch.object(os, 'open', side_effect=local_open), \
     await mkdir(active,{mode:0o700});
     await mkdir(oldRun); await writeFile(oldReceipt,'old'); await mkdir(oldCache); await mkdir(newCache);
     for(const path of [oldRun,oldReceipt,oldCache,active]) await utimes(path,expired,expired);
-    const quote=value=>"'"+value.replaceAll("'", "'\\''")+"'";
-    const local=prune.replaceAll('/srv/forge-exec',quote(join(root,'runs')))
-      .replaceAll('/srv/forge-receipts',quote(join(root,'receipts')))
-      .replaceAll('/srv/forge-cache',quote(join(root,'cache')));
+    const local=prune.replaceAll('/srv/forge-exec',join(root,'runs'))
+      .replaceAll('/srv/forge-receipts',join(root,'receipts'))
+      .replaceAll('/srv/forge-cache',join(root,'cache'));
     const result=spawnSync('bash',['-c',local],{encoding:'utf8'});
     expect(result.status,result.stderr).toBe(0);
+    for(const path of [oldRun,oldReceipt,oldCache])expect((await stat(path)).isDirectory()||(await stat(path)).isFile()).toBe(true);
+    await rm(active,{recursive:true});
+    const inactive=spawnSync('bash',['-c',local],{encoding:'utf8'});
+    expect(inactive.status,inactive.stderr).toBe(0);
     for(const path of [oldRun,oldReceipt,oldCache]) await expect(stat(path)).rejects.toThrow();
     expect((await stat(newCache)).isDirectory()).toBe(true);
     expect((await stat(work)).isDirectory()).toBe(true);
-    expect((await stat(active)).isDirectory()).toBe(true);
+    await expect(stat(active)).rejects.toThrow();
   });
   it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
@@ -780,10 +789,10 @@ exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
 
 // Manifest acceptance contract (Round 1): isTestFile(path:Buffer) -> boolean;
 // verifyManifest(root, manifest, manifestDigest, {fs?} = {}) -> {entries, testPaths}.
-// entries = [{path:Buffer, sha256:string, executable:boolean}], testPaths = Buffer[].
+// entries = [{path:Buffer, sha256:string, executable:boolean, tracked:boolean}], testPaths = Buffer[].
 // fs defaults to node:fs/promises (lstat/readFile/readdir, Buffer paths/names).
-// Wire manifest = {paths:base64(NUL-terminated byte paths), hashes:hexSHA256[],
-//   executable:boolean[], excluded:base64(NUL-terminated excluded byte paths)};
+// Wire manifest v2 = {v:2, paths:base64(NUL-terminated byte paths), hashes:hexSHA256[],
+//   executable:boolean[], tracked:boolean[], excluded:base64(NUL-terminated excluded byte paths)};
 // manifestDigest = sha256(JSON.stringify(manifest)), in that property order.
 // Both path lists are strictly byte-sorted; excluded files must be absent.
 // Invalid UTF-8 is allowed only for non-test byte paths; base64 is canonical.
@@ -792,9 +801,11 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
   function makeManifest(entries, excluded = []) {
     const ordered = [...entries].sort((a,b) => Buffer.compare(a.path,b.path));
     const manifest = {
+      v:2,
       paths:nul(ordered.map(entry => entry.path)).toString('base64'),
       hashes:ordered.map(entry => entry.sha256),
       executable:ordered.map(entry => entry.executable),
+      tracked:ordered.map(entry => entry.tracked ?? false),
       excluded:nul([...excluded].sort(Buffer.compare)).toString('base64'),
     };
     return {manifest, manifestDigest:hash(JSON.stringify(manifest))};
@@ -811,6 +822,21 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     expect(manifestAPI.verifyManifest, 'export the pre-execution exact snapshot verifier').toBeTypeOf('function');
     return manifestAPI.verifyManifest(work, manifest, digest, options);
   }
+
+  it.each(['legacy','unknown version','missing tracked','tracked count','tracked type','tampered tracked'])
+  ('refuses %s tracking evidence rather than accepting an old digest as proof',async fault=>{
+    Object.assign(request,await snapshot());
+    const manifest=request.manifest;
+    if(fault==='legacy'){delete manifest.v;delete manifest.tracked;}
+    if(fault==='unknown version')manifest.v=3;
+    if(fault==='missing tracked')delete manifest.tracked;
+    if(fault==='tracked count')manifest.tracked=[];
+    if(fault==='tracked type')manifest.tracked=['true'];
+    if(fault==='tampered tracked')manifest.tracked[0]=!manifest.tracked[0];
+    else request.manifestDigest=hash(JSON.stringify(manifest));
+    await expect(runner.run(request)).rejects.toThrow(/manifest|digest|tracking/i);
+    await expectNoExecutionOrReceipt();
+  });
   async function expectNoExecutionOrReceipt() {
     expect(await readFile(join(root,'install.log'),'utf8').catch(error => {
       if (error.code !== 'ENOENT') throw error;
@@ -930,7 +956,7 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
       }),
     };
     const verified = await verify(manifest,manifestDigest,{fs});
-    expect(verified.entries).toEqual([{path,sha256:hash('assertion'),executable:false}]);
+    expect(verified.entries).toEqual([{path,sha256:hash('assertion'),executable:false,tracked:false}]);
     expect(verified.testPaths).toEqual([]);
     expect(fs.readFile).toHaveBeenCalled();
   });

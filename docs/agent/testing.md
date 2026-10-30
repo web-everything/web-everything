@@ -1933,6 +1933,8 @@ before manually clearing a retained marker. If marker creation fails, refuse rem
 fall back through local admission. The SIGKILL subprocess regression leaves its simulated remote
 job alive and asserts that a second caller cannot reclaim that capacity. Keep this crash test
 alongside the returned-result and confirmed-cleanup cases when changing remote-slot lifecycle.
+Model the surviving job with `keepAliveScript()` anchored to the test runner, with a bounded
+lifetime; anchoring to the simulated client would invalidate the crash-survival assertion.
 The local host's heavy semaphore is acquired only on a safe local fallback.
 
 ### Forge warm bases and delta snapshots
@@ -1943,6 +1945,8 @@ Run `forge-offload.test.mjs` alongside the existing remote client, runner, outpu
 and admission-contract test files through heavy-admission when changing this protocol.
 Exercise the actual rsync file list and full reconstructed manifest, including executable
 bits, worktree deletions, public credential-named sources, and ignored/excluded tests.
+Give transport and retry cases an explicit 30-second deadline: they perform real Git and
+runner subprocess work, and a safe retry repeats the complete transport/run/finish cycle.
 
 Read-only `bases` discovery precedes local admission so older runners keep their original
 full-ship order: no prepared run or transported bytes before snapshot admission/staging.
@@ -1953,7 +1957,8 @@ and input-digest checks still run before cache extraction or npm. Pre-run delta 
 transport failures rebuild through full shipping; execution ambiguity never retries.
 Delta membership compares a fresh no-follow read and SHA-256 of every final Mac worktree
 leaf (plus its executable bit) against the base, including Git-clean CRLF/filter output;
-Git diff supplies ordering hints only. Unchanged leaves skip staging and rsync, not the
+Git diff validates working changes against the pinned HEAD; transfer paths use byte order.
+Unchanged leaves skip staging and rsync, not the
 initial read/hash. Pin this with real Git autocrlf and post-diff race fixtures.
 Each warm tick revalidates retained READY records and their tree count/metadata digest;
 a missing tree marker requires one full manifest verification before publication, while
@@ -2906,3 +2911,74 @@ the current occupant as ours. Git optional locks are disabled, so status does no
 refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
+
+## Forge worker reservations and Git gates
+
+The fixed Forge wrapper discovers `slot-K` directories and matching system users;
+client concurrency settings never define server identities. Pool prepare reserves
+`forge-exec-K` through finish using an ops-protected `worker-active-K` directory
+bound to run ID and nonce. An interrupted command leaves the reservation closed
+until an operator confirms that UID has no remaining processes. Never expire
+these directories by age. Hosts without pool directories retain the legacy UID.
+The privileged fixed wrapper owns metadata operations; tasks and rsync run only
+as the reserved UID. Slot roots are ops-owned with the worker's private group
+and mode 0710 (traverse only); run containers remain operator-owned. Only work
+and sibling trees belong to the worker. Receipts remain ops-only. Worker-owned
+0700 slot roots from the earlier pool layout are refused until setup is redeployed.
+
+Every worker ownership handoff opens each component relative to pinned directory
+descriptors with `O_NOFOLLOW`, validates ownership, and uses `fchown`. Recursive
+handoffs reject hardlinks and hand directories over after their children. Never
+use path-following `chown` beneath a worker-writable parent, even for root-owned
+children: owning the parent permits replacement of any child entry. Keep the
+`forge-ownership.test.mjs` adversarial fixtures in the scoped gate. Its required
+Linux test uses actual distinct UIDs through passwordless python sudo to attempt
+work/container replacement during prepare and checks the other slot's ownership;
+macOS cannot establish that cross-identity proof and skips it explicitly.
+
+Git gates receive hash-bound logical Mac HEAD and per-entry `tracked` evidence
+from Mac `git ls-files` in manifest v2. Older manifests (including warm bases)
+are refused; rebuild bases or use local/full shipping rather than infer tracking.
+Forge fetches current `origin/main` and the exact manifest-bound Mac HEAD from
+the fixed public HTTPS origin with a credential-free environment, even when
+that object is already cached. Its detached HEAD must equal the Mac SHA. It
+stages exact tracked snapshot bytes and deletions, leaves Mac untracked leaves
+untracked, and creates no snapshot commit. Unfetchable/unpublished HEAD or failed
+Git setup returns protected `started:false`, `reason:git-head-unavailable` evidence;
+the client falls back through Mac admission without retrying remote execution.
+The separately installed wrapper advertises `gitWorktree:2`; clients refuse v1
+(the historical base-HEAD behavior) before rsync and use local admission.
+Snapshot inventory pins deletion evidence to that HEAD and refuses HEAD drift
+before prepare. A warm base only saves hash-verified file transfers and dependency
+work; its SHA/ancestry never defines Git scope. Pin both real guards
+(`scanDiffBranchCoverage` and `validateUntrackedDerivedArtifacts`) against
+materialized local-bare-origin fixtures, including Mac HEAD behind public main
+with working tier bytes equal to main, both full and delta shipping, unavailable
+HEAD, and Git setup failures with cached objects. Replace only public transport
+in hermetic tests; never contact a developer remote or the network.
+No Mac Git configuration, credentials, or verification marker path crosses SSH.
+Verification marker authorship stays in the Mac gate driver and requires a
+confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
+never execute setup in a development lane.
+
+Git metadata setup runs entirely under an operator-owned 0700 temporary parent;
+publish `.git` only after the final privileged Git command. A root-owned `.git`
+under worker-owned `work` can still be renamed and replaced by that worker.
+Never run privileged Git in `work`, or trust it through `safe.directory`; trust
+only the protected clone and warm mirror, and disable `core.fsmonitor` as well
+as hooks. The ownership tests substitute a real executable fsmonitor repository
+at `update-index` and include a positive payload control. A required Linux test
+uses root and an actual worker UID, proving that UID cannot reach the protected
+metadata and its substituted config never executes as root; macOS skips this
+cross-UID proof explicitly. Cross-UID fixtures that use absolute worker paths
+must have traversable ancestors: changing only the fixture root's mode does not
+grant traversal through Vitest's private 0700 run root. Allocate those Linux
+fixtures under the system shared temporary directory with a privileged
+`TemporaryDirectory` supervisor that cleans up on success, failure and child
+timeout; keep shared ancestor permissions unchanged. The executable fsmonitor
+positive control must still run as the actual worker UID before the attack.
+Exercise Git's ownership checks with
+`GIT_TEST_ASSUME_DIFFERENT_OWNER` and a mirror with only `origin/main`
+(an unborn bare `HEAD` is normal for the warmer). Active base pins must remain
+ops-owned and readable by the ops warmer even when the pool wrapper creates them
+as root; pin creation and ownership changes stay inside the shared base guard.
