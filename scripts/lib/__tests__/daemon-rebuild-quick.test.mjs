@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
@@ -1026,9 +1027,12 @@ describe('post-adopt soak', () => {
     const release = join(control, 'release');
     const proof = join(control, 'proof.json');
     const driver = join(control, 'launcher.mjs');
-    const soakUrl = new URL('../daemon-rebuild/quick-soak-job.mjs', import.meta.url).href;
-    const runtimeUrl = new URL('../daemon-jobs-runtime.mjs', import.meta.url).href;
-    const stateUrl = new URL('../daemon-rebuild/state.mjs', import.meta.url).href;
+    // Native Node children need file URLs; Vite rewrites new URL(..., import.meta.url)
+    // into HTTP asset URLs that Node's default ESM loader cannot import.
+    const libDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const soakUrl = pathToFileURL(join(libDir, 'daemon-rebuild/quick-soak-job.mjs')).href;
+    const runtimeUrl = pathToFileURL(join(libDir, 'daemon-jobs-runtime.mjs')).href;
+    const stateUrl = pathToFileURL(join(libDir, 'daemon-rebuild/state.mjs')).href;
     const worker = `
       import { readFileSync, writeFileSync } from 'node:fs';
       import { runJob } from ${JSON.stringify(runtimeUrl)};
