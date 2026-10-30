@@ -2014,11 +2014,11 @@ state. Base pin creation and pruning share a guard; unknown or unreadable eviden
 pruning closed. A worker receives independent copies, and the existing full-tree manifest
 and input-digest checks still run before cache extraction or npm. Pre-run delta build or
 transport failures rebuild through full shipping; execution ambiguity never retries.
-Delta membership compares a fresh no-follow read and SHA-256 of every final Mac worktree
-leaf (plus its executable bit) against the base, including Git-clean CRLF/filter output;
-Git diff validates working changes against the pinned HEAD; transfer paths use byte order.
-Unchanged leaves skip staging and rsync, not the
-initial read/hash. Pin this with real Git autocrlf and post-diff race fixtures.
+Delta membership compares each final Mac worktree leaf (plus its executable bit) against the base.
+Git-clean leaves with verified base blob bytes and stable metadata reuse the base SHA-256; changed,
+untracked, filtered/CRLF, index-flagged or unverifiable leaves are read and hashed, and any Git
+evidence failure falls back to a full scan (see "Forge manifest reuse"). Transfer paths use byte order.
+Unchanged leaves skip staging and rsync. Pin this with real Git autocrlf and post-diff race fixtures.
 Each warm tick revalidates retained READY records and their tree count/metadata digest;
 a missing tree marker requires one full manifest verification before publication, while
 mismatched evidence removes and rebuilds the base. Test both legacy-marker migration and
