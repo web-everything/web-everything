@@ -120,5 +120,9 @@ export function enrichPrsWithCompleteComments(prs, {
       out.push(annotatePr({ ...pr, comments, commentsComplete: true }));
     } catch (e) { onError(pr, e); }
   }
+  // R242: consumers deciding whether discovery is empty must distinguish an empty
+  // raw list from rows omitted by ANY enrichment failure, including coverage checks.
+  // Keep this in-memory evidence non-enumerable to preserve the historical array shape.
+  if (prs.discoveryIncomplete === true || out.length !== prs.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
   return out;
 }
