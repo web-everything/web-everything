@@ -85,6 +85,27 @@ export function isValidRunId(id) {
  * @param {object} [spec.input]
  * @returns {object} a new run record.
  */
+/** PR #5520 operator send-back — every `review-pr` run's id starts with this; `run-store.mjs#writeRun` enforces it. */
+export const REVIEW_RUN_ID_PREFIX = 'review-pr-';
+
+/**
+ * PR #5520 operator send-back — A RUN STARTED UNDER A CHOSEN `--run-id`. The id's shape cannot prove it was minted
+ * (`--run-id=review-pr-<any uuid>` looks minted), so the record itself says so: `idChosen: true`, which the merge
+ * guard's readers treat as never a clean review. A chosen id that names an existing review run is refused: the new
+ * record would silently replace that run, and a parked or failed review would vanish from every reader.
+ * @param {object} run - the fresh record `startRun` returned.
+ * @param {{read(id: string): (object|null)}} store
+ * @returns {{run: object} | {error: string}}
+ */
+export function chosenRunIdRecord(run, store) {
+  // Only review runs gate a merge on their provenance; every other operation's record is left exactly as it was.
+  if (!run.id.startsWith(REVIEW_RUN_ID_PREFIX)) return { run };
+  let existing;
+  try { existing = store.read(run.id); } catch { existing = true; } // unreadable is not proof it is free
+  if (existing) return { error: `--run-id=${run.id} names an existing review run record; a chosen id never replaces one` };
+  return { run: { ...run, idChosen: true } };
+}
+
 export function newRunRecord({ id, op, input = {} } = {}) {
   if (!isValidRunId(id)) throw new TypeError(`operations: invalid run id ${JSON.stringify(id)}`);
   if (typeof op !== 'string' || !op.trim()) throw new TypeError('operations: a run record needs an operation name');

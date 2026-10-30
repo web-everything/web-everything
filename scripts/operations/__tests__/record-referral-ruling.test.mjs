@@ -44,6 +44,22 @@ function ruling(rec, { result = 'card', key = rec.referrals[0].key, runId = rec.
 }
 const ctx = (over = {}) => ({ repo, pr: 7, head, body: '<!-- authored-by-actor: author -->', cardReadable: (c) => c === CARD, ...over });
 
+describe('operator protection repo aliases', () => {
+  it.each([
+    ['chalbert/web-everything', 'web-everything/web-everything', true],
+    ['web-everything/web-everything', 'chalbert/web-everything', true],
+    ['web-everything/web-everything', 'other/repo', false],
+  ])('protects block for %s / %s', (recordRepo, rulingRepo, matches) => {
+    const rec = { ...referral(), repo: recordRepo };
+    const comments = [gh(renderReferralRecord(rec)), gh(buildOperatorRulingComment(
+      ruling(rec, { repo: rulingRepo, result: 'block' })))];
+    const result = openReferralFindings({ ...ctx({ repo: recordRepo }), comments });
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0].protectingRulings).toHaveLength(matches ? 1 : 0);
+    expect(result.blocked).toEqual(matches ? [rec.referrals[0].key] : []);
+  });
+});
+
 describe('#4979 gate: operator rulings alongside reviewer rulings', () => {
   const blocked = referral({ rulings: ['block'] });
   const thread = (...extra) => [gh(renderReferralRecord(blocked)), ...extra];

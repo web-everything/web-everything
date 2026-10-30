@@ -8,7 +8,12 @@
  *      pure decision functions (`decideHoldReadyStrip`, `pollVerdict`, …) — not re-asserted here.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// These adapter assertions exercise uncached argv; label-cache.test.mjs covers shared caching.
+beforeEach(() => vi.stubEnv('WE_LABELS_CACHE_TTL_MS', '0'));
+afterEach(() => vi.unstubAllEnvs());
+
 import { GH_ARGV, createGhLandProvider, mergeMethodFlag, buildCreateArgs, buildMergeArgs, buildAddLabelArgs } from '../forge-land-provider.mjs';
 
 describe('GH_ARGV is byte-identical to the pre-port inline calls', () => {

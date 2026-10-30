@@ -1,3 +1,4 @@
+import { ensureLabelCached } from './label-cache.mjs';
 import { assertMachineTitle } from '../operations/machine-pr-title.mjs';
 /**
  * @file scripts/lib/forge-land-provider.mjs
@@ -124,10 +125,7 @@ export const GH_ARGV = Object.freeze({
    *  reconcile) — matching what `ghC` executed inline before. */
   editBody: (pr, body) => ['pr', 'edit', String(pr), '--body', body],
   removeLabel: (pr, label) => ['pr', 'edit', String(pr), '--remove-label', label],
-  /** No `--force`, unlike `review-label-provider.mjs`'s `ensureLabel` — `pr-land.mjs`'s labels are its OWN
-   *  small, long-lived set (`ready-to-merge`, the review-escalation labels, a caller's `--park` label), created
-   *  once and re-created best-effort (wrapped in a try/catch at every call site) rather than force-updated on
-   *  every land. Byte-identical to the inline calls this replaces — adding `--force` would NOT be. */
+  /** Provision missing labels without overwriting existing metadata. */
   labelCreate: (name, { color, description }) => ['label', 'create', name, '--color', color, '--description', clampLabelDescription(description)],
   requiredChecks: (pr) => ['pr', 'checks', String(pr), '--required', '--json', 'state,bucket'],
 });
@@ -205,7 +203,7 @@ export function createGhLandProvider({
     },
 
     ensureLabel(name, opts) {
-      return exec(GH_ARGV.labelCreate(name, opts));
+      return ensureLabelCached(GH_ARGV.labelCreate(name, opts), { exec, cwd });
     },
 
     requiredChecks(pr) {

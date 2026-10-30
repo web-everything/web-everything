@@ -1,7 +1,7 @@
 /** Relay a clearing operator referral ruling into the existing stand-down answer ceremony. */
 import { latestUnresolvedStandDown, latestOperatorAnswer, parseOperatorAnswer, buildOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownTrailerReason, standDownFindingRefs, standDownHead } from './stand-down.mjs';
-import { readOperatorRulings, operatorRulingId, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
+import { sameRepo, readOperatorRulings, operatorRulingId, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { openReferralFindings } from '../operations/record-referral-ruling.mjs';
 import { decideSetLabel, presentRemoveLabels } from '../review-set-label.mjs';
@@ -46,7 +46,7 @@ export function planRulingResolvedStandDown(pr, { repo }) {
   const rulings = comments.slice(comments.indexOf(sd) + 1)
     .filter(c => !(c.createdAt && sd.createdAt) || Date.parse(c.createdAt) >= Date.parse(sd.createdAt))
     .flatMap(c => readOperatorRulings([c], { head }).rulings)
-    .filter(r => r.head === head && r.repo === repo && r.pr === Number(number)
+    .filter(r => r.head === head && sameRepo(r.repo, repo) && r.pr === Number(number)
       && r.actor?.toLowerCase() !== AUTO_POLICY_ACTOR && OPERATOR_LOGINS.includes(r.actor?.toLowerCase())
       && subjects.has(subjectKey(r)));
   const covered = new Set(rulings.map(subjectKey));
