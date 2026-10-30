@@ -26,7 +26,11 @@
  *   episodes/<id>.md    the durable per-episode report (+ .json)
  *
  * Every child call has a hard timeout; a whole-tick watchdog kills a hung tick and records it, so the next tick
- * raises the `health-tick-overrun` smell.
+ * raises the `health-tick-overrun` smell. The deadline is budget × 3 × clamp(load1 / cores, 1, maxScale),
+ * capped by an absolute ceiling (defaults: maxScale 3, ceiling 540000ms; idle deadline 180000ms).
+ * Policy `healthWatchTickWatchdog`: standard → platform → health dir config.json (flat tickBudgetMs,
+ * tickKillLoadScaleMax, tickKillCeilingMs) → WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX / WE_HEALTH_TICK_KILL_CEILING_MS.
+ * Invalid settings fall back to their standard values and are logged with effective provenance.
  *
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
@@ -59,6 +63,7 @@ import {
 import { homedir, hostname, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from '../lib/policy-cascade.mjs';
 
 import {
   DEFAULT_HEALTH_CONFIG, emptyHealthState, runHealthTick, renderEpisodeReport, renderHealthSection, summarizeDiagnosisOutput, scrubText, scrubDeep, parsePsOutput, MINUTE, HOUR,
@@ -1659,7 +1664,6 @@ async function main(argv) {
   // `--in-process` is the watchdog's worker child: its parent already holds the tick lock.
   const release = flags['dry-run'] || flags['in-process'] ? () => {} : acquireTickLock(dir);
   if (!release) { console.error('health-watch: another tick holds the tick lock — skipping.'); return 0; }
-  const budget = (readJson(join(dir, 'config.json'), {}).tickBudgetMs) ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs;
   if (flags['in-process']) {
     // The worker: runs the tick itself. Its probes block on synchronous child calls, so no timer in THIS
     // process could interrupt it — the watchdog lives in the parent (below).
@@ -1676,8 +1680,47 @@ async function main(argv) {
     } finally { release(); }
   }
   try {
-    return await runTickWithWatchdog(argv, { dir, killAfterMs: budget * 3 });
+    const { killAfterMs } = resolveTickWatchdogLimit({ config: readJson(join(dir, 'config.json'), {}) });
+    return await runTickWithWatchdog(argv, { dir, killAfterMs });
   } finally { release(); }
+}
+
+/** Resolve a bounded parent-process deadline; OS readings are injectable without touching host load. */
+export function resolveTickWatchdogLimit({ config = {}, env = process.env,
+  platform = platformPreference('healthWatchTickWatchdog', { env }),
+  readLoad = () => ({ load1: loadavg()[0], cores: cpus().length }), log = console.error,
+} = {}) {
+  const standard = { tickBudgetMs: DEFAULT_HEALTH_CONFIG.tickBudgetMs, tickKillLoadScaleMax: 3, tickKillCeilingMs: 540_000 };
+  const pick = block => Object.fromEntries(Object.keys(standard).filter(k => block?.[k] !== undefined)
+    .map(k => [k, typeof block[k] === 'object' ? JSON.stringify(block[k]) : block[k]]));
+  const number = raw => raw === undefined ? undefined : /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : raw;
+  // Node timers above this bound overflow to 1ms. Reject rather than silently changing the deadline.
+  const validMs = v => Number.isSafeInteger(v) && v > 0 && v <= 2_147_483_647;
+  const result = cascadePolicy('healthWatchTickWatchdog', pick(config), {
+    standard, platform: pick(platform), env,
+    envValues: { tickKillLoadScaleMax: number(env.WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX),
+      tickKillCeilingMs: number(env.WE_HEALTH_TICK_KILL_CEILING_MS) },
+    valid: { tickBudgetMs: validMs, tickKillCeilingMs: validMs,
+      tickKillLoadScaleMax: v => Number.isFinite(v) && v >= 1 },
+    log: () => {}, // Log once below, after applying the explicit standard fallback.
+  });
+  for (const key of Object.keys(standard)) {
+    if (result.invalid.some(entry => entry.startsWith(`platform.${key}=`) || entry.startsWith(`tool.${key}=`) || entry.startsWith(`env.${key}=`))) {
+      result.value[key] = standard[key]; result.sources[key] = 'standard'; result.leafValues[key] = standard[key];
+    }
+  }
+  log(formatCascadeSourcesLine('healthWatchTickWatchdog', result));
+  let loadScale = 1;
+  try {
+    const { load1, cores } = readLoad();
+    if (!Number.isFinite(load1) || load1 < 0 || !Number.isSafeInteger(cores) || cores <= 0) throw new Error('invalid reading');
+    loadScale = Math.min(result.value.tickKillLoadScaleMax, Math.max(1, load1 / cores));
+  } catch {
+    log('health-watch: load reading invalid or unavailable; using bounded idle deadline (scale=1).');
+  }
+  const killAfterMs = Math.min(result.value.tickKillCeilingMs, Math.ceil(result.value.tickBudgetMs * 3 * loadScale));
+  log(`health-watch: tick watchdog killAfterMs=${killAfterMs}, loadScale=${loadScale}`);
+  return { ...result, killAfterMs, loadScale };
 }
 
 /**
@@ -1687,9 +1730,9 @@ async function main(argv) {
  * execFileSync probes block the very event loop the timer needs.)
  * @returns {Promise<number>} the exit code: the child's own, or 3 when the watchdog killed it
  */
-export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLToPath(import.meta.url) }) {
+export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLToPath(import.meta.url), spawnChild = spawn }) {
   return new Promise((resolveExit) => {
-    const child = spawn(process.execPath, [script, ...argv, '--in-process'], { stdio: 'inherit' });
+    const child = spawnChild(process.execPath, [script, ...argv, '--in-process'], { stdio: 'inherit' });
     let killed = false;
     const timer = setTimeout(() => {
       killed = true;
