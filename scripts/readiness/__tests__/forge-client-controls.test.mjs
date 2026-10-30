@@ -4,6 +4,7 @@ import {mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, symlinkSync
 import {join} from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
+import {fileURLToPath} from 'node:url';
 import * as runner from '../forge-exec-run.mjs';
 import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
@@ -21,6 +22,20 @@ const policy = remote => resolveAdmissionPolicy({platform:{remote:{enabled:true,
 const command = ['npx','vitest','run','a.test.mjs'];
 const classes = [command,['npx','vitest','related','src/a.ts','--run'],['npm','run','test:integration:vitest'],['npm','run','test:coverage']];
 const withArg = (argv,arg) => argv[0]==='npm' ? [...argv,'--',arg] : [...argv,arg];
+
+describe('Forge synchronous module loading', () => {
+  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs'])
+  ('loads %s synchronously without executing its CLI', module => {
+    // Native require rejects any top-level await in the entire static import graph.
+    const result=spawnSync(process.execPath,['--experimental-require-module','-e',
+      'require(process.env.FORGE_MODULE);'],{
+      env:{...process.env,FORGE_MODULE:fileURLToPath(new URL('../'+module,import.meta.url))},
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.status,result.stderr).toBe(0);
+    expect(result.stdout).toBe('');
+  });
+});
 
 describe('Forge telemetry contracts', () => {
   it('samples on demand on a fresh install without a telemetry file', async () => {

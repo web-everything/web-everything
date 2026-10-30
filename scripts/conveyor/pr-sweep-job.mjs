@@ -71,8 +71,11 @@ export function runSweepWorker(input, { timeoutMs = 15 * 60000, WorkerClass = Wo
     let settled = false;
     const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
     const timer = setTimeout(() => {
-      finish(fail, new Error(`PR sweep worker timed out after ${timeoutMs}ms`));
-      worker.terminate().catch(() => {});
+      // Ignore termination's late events, and keep the caller alive until the worker has shut down.
+      if (settled) return;
+      settled = true;
+      const error = new Error(`PR sweep worker timed out after ${timeoutMs}ms`);
+      worker.terminate().then(() => fail(error), () => fail(error));
     }, timeoutMs);
     worker.once('message', (r) => finish(done, r));
     worker.once('error', (e) => finish(fail, e));

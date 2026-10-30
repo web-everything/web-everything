@@ -111,8 +111,49 @@ describe('per-user worker reservations',()=>{
     const body=setup.slice(setup.indexOf("{\n  printf 'ops ALL=('"),setup.indexOf('} > "$sudoers_pending"')+1);
     const result=spawnSync('bash',['-c','FORGE_EXEC_SLOTS=2\n'+body],{encoding:'utf8',timeout:10000});
     expect(result.status,result.stderr).toBe(0);
-    expect(result.stdout.split('\n')[0]).toBe('ops ALL=(forge-exec-1,forge-exec-2) NOPASSWD: /usr/bin/rsync');
+    expect(result.stdout).toBe([
+      'ops ALL=(forge-exec-1,forge-exec-2) NOPASSWD: /usr/bin/rsync',
+      'ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs',
+      'ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *',
+      '',
+    ].join('\n'));
     expect(result.stdout).not.toContain('(ALL)');expect(result.stdout).not.toContain('(forge-exec-*)');
+    expect(result.stdout).not.toContain('SETENV');
+  });
+  it.each([true,false])('validates sudoers before installing root:root 0440 (visudo accepts: %s)',async valid=>{
+    const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    const install=setup.slice(setup.indexOf('visudo -cf "$sudoers_pending"'),setup.indexOf('trap - EXIT'));
+    const pending=join(root,'sudoers.pending');await fs.writeFile(pending,'fixture',{mode:0o600});
+    const result=spawnSync('bash',['-c',`
+set -euo pipefail
+sudoers_pending=$1
+visudo() { printf 'visudo:%s\\n' "$*"; return ${valid?0:1}; }
+chown() { printf 'chown:%s\\n' "$*"; }
+chmod() { printf 'chmod:%s\\n' "$*"; command chmod "$@"; }
+mv() { printf 'mv:%s\\n' "$*"; }
+${install}
+`,'fixture',pending],{encoding:'utf8',timeout:10000});
+    expect(result.status,result.stderr).toBe(valid?0:1);
+    expect(result.stdout).toBe([
+      `visudo:-cf ${pending}`,
+      ...(valid?[`chown:root:root ${pending}`,`chmod:440 ${pending}`,`mv:-f -- ${pending} /etc/sudoers.d/forge-exec`]:[]),
+      '',
+    ].join('\n'));
+    expect((await fs.stat(pending)).mode&0o777).toBe(valid?0o440:0o600);
+  });
+  it.each([2,3])('refuses shrinking an installed three-slot pool to %s slots',async slots=>{
+    const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    // Exercise the shipped guard against a private pool, before user creation
+    // or privileged setup can run. Only the installation path is redirected.
+    const guard=setup.slice(setup.indexOf('set -euo pipefail'),setup.indexOf('if ! id forge-exec'))
+      .replaceAll('/srv/forge-exec',root);
+    await fs.mkdir(join(root,'slot-3'));
+    const result=spawnSync('bash',['-c',guard+'\nprintf "setup-continues\\n"'],{
+      encoding:'utf8',timeout:10000,env:{...process.env,FORGE_EXEC_SLOTS:String(slots)},
+    });
+    expect(result.status,result.stderr).toBe(slots===2?1:0);
+    expect(result.stderr).toBe(slots===2?'forge-setup: cannot shrink an installed pool; retain its slot count and inspect reservations\n':'');
+    expect(result.stdout).toBe(slots===2?'':'setup-continues\n');
   });
   it('rejects client-selected identities outside the discovered pool',async()=>{
     for(const slot of ['root','forge-exec-3','forge-exec-01','../slot-1'])
