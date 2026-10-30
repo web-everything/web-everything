@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createRemoteExec, formatAdmissionPolicy, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision } from '../heavy-admission.mjs';
+import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision } from '../heavy-admission.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
@@ -112,6 +112,7 @@ describe('remote client override', () => {
     expect(importClient).not.toHaveBeenCalled();
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('remote client override ignored ('));
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+    expect(f.seams.log).not.toHaveBeenCalledWith(expect.stringContaining('bundled client'));
   });
 
   it.each(['export const other = true;', 'export const runRemote = true;'])('preserves exit 124 for a missing or non-callable runRemote export: %s', async (source) => {
@@ -277,6 +278,28 @@ describe('remote client override', () => {
       expect(importClient).not.toHaveBeenCalled();
       expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('override ignored (clientPath unreadable: read?? failed:'));
     }
+  });
+
+  it.each(['tool', 'env'])('ignores %s clientPath in a private pool without importing it', async (layer) => {
+    const f = fixture();
+    const env = { LANE_POOL_ROOT: join(f.root, 'private-pool'),
+      ...(layer === 'env' ? { WE_HEAVY_ADMISSION_REMOTE_CLIENT_PATH: f.clientPath } : {}) };
+    expect(privateAdmissionPool(env, f.root)).toBe(true);
+    const policy = resolveAdmissionPolicy({
+      platform: { remote: { enabled: true, mode: 'always' } },
+      tool: layer === 'tool' ? { remote: { clientPath: f.clientPath } } : {},
+      env, checkoutRoot: f.root,
+    });
+    expect(policy.settings.remote.clientPath).toBeNull();
+    expect(policy.sources['remote.clientPath']).toBe('standard');
+    if (layer === 'tool') expect(policy.ignored).toContainEqual(expect.stringContaining('tool.remote.clientPath='));
+    const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
+    expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env, policy,
+      log: f.seams.log, remoteExec: createRemoteExec({ ...f.seams, policy, env, importClient }) }))
+      .toEqual({ handled: true, exitCode: 0 });
+    expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
+    expect(f.seams.readSha).not.toHaveBeenCalled();
+    expect(f.seams.appendEvent).not.toHaveBeenCalled();
   });
 
   it('resolves the leaf with provenance, ignores shared tool settings and has no env mapping', () => {

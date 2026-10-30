@@ -324,7 +324,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
  * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
  * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
  * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
- * keeps both local override layers.
+ * keeps both local override layers, except remote.clientPath is always platform-only.
  */
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
@@ -338,6 +338,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
       const v = admissionLeaf(block, leaf);
       if (v === undefined) continue;
+      if (layer === 'tool' && leaf === 'remote.clientPath') {
+        ignored.push(`tool.${leaf}=${clientPathForLog(v)} (only platform preferences may select executable client code)`);
+        continue;
+      }
       if (layer === 'tool' && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
         continue;
@@ -498,7 +502,7 @@ export function createRemoteExec({
     if (client.clientPath === null) return adaptLegacyRemoteResult(await (await importClient('./remote-exec.mjs')).runRemote(options));
     const ignored = (reason) => {
       reason = oneLine(reason);
-      log(`heavy-admission: remote client override ignored (${oneLine(reason)}) - using bundled client\n`);
+      log(`heavy-admission: remote client override ignored (${reason}) - falling back to local admission\n`);
       return { mode: 'not-started', terminated: true, reason: `remote client override: ${reason}` };
     };
     if (client.reason) return ignored(client.reason);
