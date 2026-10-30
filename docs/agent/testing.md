@@ -2950,6 +2950,12 @@ an initialization side effect before the throw and requires exit 124 without loc
 Also keep **refuses local rerun when import starts work before a missing runRemote export**: it
 observes initialization before export validation fails and requires the same refusal.
 
+Remote override provenance runs after client invocation as a detached, best-effort task. SHA lookup
+uses asynchronous Git so it cannot block the execution timer; neither its one-second bound nor the
+100 ms persistence bound belongs on the client path. The never-resolving SHA/event regressions require
+client invocation and success before advancing fake time. Provenance assertions must await background
+writes explicitly while preserving once-per-process logs and change-only events.
+
 ## Admission imports and daemon closures
 
 Heavy admission is imported by review, promotion, self-sync and smoke machinery. A computed import

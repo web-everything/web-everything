@@ -145,7 +145,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { mkdir, writeFile, open } from 'node:fs/promises';
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -521,8 +521,11 @@ export function createRemoteExec({
   fs = realClientFs(), importClient = importRemoteClient,
   provenanceFs = { readFile: readClientProvenance, mkdir, writeFile },
   log = (line) => process.stderr.write(line), appendEvent = appendDaemonEvent,
-  readSha = (path) => execFileSync('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
-    { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim(),
+  readSha = (path) => new Promise((resolve, reject) => {
+    execFile('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
+      { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096 },
+      (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
+  }),
   notice = remoteClientNotice,
 } = {}) {
   return async (options) => {
@@ -541,36 +544,44 @@ export function createRemoteExec({
       throw new Error(`remote client override import failed: ${oneLine(error?.message ?? error)}`, { cause: error });
     }
     if (typeof remote.runRemote !== 'function') throw new Error('remote client override runRemote export is not a function');
-    const sha = oneLine(await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown');
-    if (!notice.logged) {
-      notice.logged = true;
-      const displayPath = clientPathForLog(client.clientPath);
-      log(`heavy-admission: remote client override ${displayPath} @ ${oneLine(sha)}\n`);
-    }
-    await boundedClientProvenance(async (signal) => {
-      const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
-      let previous = null;
-      try {
-        const raw = await provenanceFs.readFile(file, { encoding: 'utf8', signal });
-        if (typeof raw === 'string' && Buffer.byteLength(raw, 'utf8') <= CLIENT_PROVENANCE_MAX_BYTES) {
-          const parsed = JSON.parse(raw);
-          if (typeof parsed?.clientPath === 'string' && typeof parsed?.sha === 'string'
-            && !/[^\x20-\x7e]/.test(parsed.clientPath) && !/[^\x20-\x7e]/.test(parsed.sha)) {
-            previous = { clientPath: clientPathForLog(parsed.clientPath), sha: oneLine(parsed.sha) };
-          }
+    let result;
+    try {
+      // Invoke the validated client before starting any optional provenance work.
+      result = remote.runRemote(options);
+    } finally {
+      void (async () => {
+        const sha = oneLine(await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown');
+        if (!notice.logged) {
+          notice.logged = true;
+          const displayPath = clientPathForLog(client.clientPath);
+          await log(`heavy-admission: remote client override ${displayPath} @ ${oneLine(sha)}\n`);
         }
-      } catch { /* first use, invalid or unreadable state is missing provenance */ }
-      if (signal.aborted) return;
-      const pair = { clientPath: clientPathForLog(client.clientPath), sha };
-      if (previous?.clientPath !== pair.clientPath || previous?.sha !== pair.sha) {
-        await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } });
-        if (signal.aborted) return;
-        await provenanceFs.mkdir(dirname(file), { recursive: true });
-        if (signal.aborted) return;
-        await provenanceFs.writeFile(file, JSON.stringify(pair) + '\n', { encoding: 'utf8', signal });
-      }
-    }, 100);
-    return adaptLegacyRemoteResult(await remote.runRemote(options));
+        await boundedClientProvenance(async (signal) => {
+          const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
+          let previous = null;
+          try {
+            const raw = await provenanceFs.readFile(file, { encoding: 'utf8', signal });
+            if (typeof raw === 'string' && Buffer.byteLength(raw, 'utf8') <= CLIENT_PROVENANCE_MAX_BYTES) {
+              const parsed = JSON.parse(raw);
+              if (typeof parsed?.clientPath === 'string' && typeof parsed?.sha === 'string'
+                && !/[^\x20-\x7e]/.test(parsed.clientPath) && !/[^\x20-\x7e]/.test(parsed.sha)) {
+                previous = { clientPath: clientPathForLog(parsed.clientPath), sha: oneLine(parsed.sha) };
+              }
+            }
+          } catch { /* first use, invalid or unreadable state is missing provenance */ }
+          if (signal.aborted) return;
+          const pair = { clientPath: clientPathForLog(client.clientPath), sha };
+          if (previous?.clientPath !== pair.clientPath || previous?.sha !== pair.sha) {
+            await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } });
+            if (signal.aborted) return;
+            await provenanceFs.mkdir(dirname(file), { recursive: true });
+            if (signal.aborted) return;
+            await provenanceFs.writeFile(file, JSON.stringify(pair) + '\n', { encoding: 'utf8', signal });
+          }
+        }, 100);
+      })().catch(() => {});
+    }
+    return adaptLegacyRemoteResult(await result);
   };
 }
 

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as provenanceIo from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
@@ -10,7 +10,7 @@ import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveA
 import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
-  ...await importOriginal(), execFileSync: vi.fn(),
+  ...await importOriginal(), execFile: vi.fn(),
 }));
 // Preserve real IO while making the built-in namespace configurable for read-range observation.
 vi.mock('node:fs/promises', async (importOriginal) => ({ ...await importOriginal() }));
@@ -19,7 +19,7 @@ vi.mock('../../lib/daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async (
 const roots = [];
 afterEach(() => {
   vi.useRealTimers();
-  vi.mocked(execFileSync).mockReset();
+  vi.mocked(execFile).mockReset();
   vi.mocked(appendDaemonEvent).mockClear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -62,18 +62,32 @@ describe('remote client override', () => {
     // realpath may expand a platform tmpdir symlink.
     first.clientPath = resolveRemoteClient({ clientPath: f.clientPath }).clientPath;
     expect(f.seams.log).toHaveBeenCalledWith(`heavy-admission: remote client override ${first.clientPath} @ abc123\n`);
-    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(first);
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(first));
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(1);
     expect(f.seams.appendEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...first, previous: null } });
+    const realOpen = provenanceIo.open;
+    let close;
+    const reads = vi.spyOn(provenanceIo, 'open').mockImplementationOnce(async (...args) => {
+      const handle = await realOpen(...args);
+      close = vi.spyOn(handle, 'close');
+      return handle;
+    });
     await f.run();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    await close.mock.results[0].value;
+    reads.mockRestore();
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(1);
     f.seams.readSha.mockReturnValue('def456');
     await f.run();
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, sha: 'def456' }));
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(2);
     expect(f.seams.appendEvent.mock.calls[1][0].detail).toEqual({ ...first, sha: 'def456', previous: first });
     const other = fixture();
     f.policy.settings.remote.clientPath = other.clientPath;
     await f.run();
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({
+      clientPath: resolveRemoteClient({ clientPath: other.clientPath }).clientPath, sha: 'def456',
+    }));
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(3);
     expect(f.seams.appendEvent.mock.calls[2][0].detail.previous).toEqual({ ...first, sha: 'def456' });
     expect(f.seams.log.mock.calls.filter(([line]) => line.includes(' @ '))).toHaveLength(1);
@@ -91,12 +105,12 @@ describe('remote client override', () => {
     const f = fixture();
     const lockRoot = join(f.root, 'explicit-pool', '.admission', 'heavy');
     const env = { LANE_POOL_ROOT: join(f.root, 'derived-pool') };
-    vi.mocked(execFileSync).mockReturnValue('production-sha\n');
+    vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(null, 'production-sha\n'));
     // main() supplies lockRoot to this entry point; leave remoteExec unset to exercise its wiring.
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env,
       policy: f.policy, lockRoot, log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'production-sha' };
-    expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8'))).toEqual(pair);
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8'))).toEqual(pair));
     expect(appendDaemonEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...pair, previous: null } });
     expect(existsSync(join(env.LANE_POOL_ROOT, '.admission', 'remote', 'client-override.json'))).toBe(false);
     expect(existsSync(f.state)).toBe(false);
@@ -272,7 +286,7 @@ describe('remote client override', () => {
     const f = fixture();
     expect(await f.run({ readSha: () => { throw new Error('no git'); }, appendEvent: async () => { throw new Error('no storage'); } }))
       .toEqual({ handled: true, exitCode: 0 });
-    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
+    await vi.waitFor(() => expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown')));
   });
 
   it('sanitizes and bounds a control-bearing readSha through oneLine', async () => {
@@ -283,7 +297,7 @@ describe('remote client override', () => {
     const line = f.seams.log.mock.calls.find(([value]) => value.includes(' @ '))[0];
     expect(line).toMatch(/^[\x20-\x7e]+\n$/);
     expect(line.split(' @ ')[1]).toBe(`${'ab??c'.repeat(16)}\n`);
-    expect(f.seams.appendEvent.mock.calls[0][0].detail.sha).toBe('ab??c'.repeat(16));
+    await vi.waitFor(() => expect(f.seams.appendEvent.mock.calls[0][0].detail.sha).toBe('ab??c'.repeat(16)));
     expect(line).not.toContain(sha);
   });
 
@@ -306,6 +320,7 @@ describe('remote client override', () => {
     writeFileSync(f.state, raw);
     expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(pair));
     expect(f.seams.appendEvent.mock.calls).toEqual([[{
       kind: 'remote-client-override', detail: { ...pair, previous: null },
     }]]);
@@ -317,7 +332,7 @@ describe('remote client override', () => {
     mkdirSync(dirname(f.state), { recursive: true });
     writeFileSync(f.state, JSON.stringify({ clientPath: 'p'.repeat(1300), sha: 's'.repeat(200), extra: '\n\x1braw' }));
     expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
-    expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual({ clientPath: 'p'.repeat(1024), sha: 's'.repeat(80) });
+    await vi.waitFor(() => expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual({ clientPath: 'p'.repeat(1024), sha: 's'.repeat(80) }));
   });
 
   it('accepts provenance at the 4096-byte read limit', async () => {
@@ -326,7 +341,7 @@ describe('remote client override', () => {
     mkdirSync(dirname(f.state), { recursive: true });
     writeFileSync(f.state, JSON.stringify(previous).padEnd(4096, ' '));
     expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
-    expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual(previous);
+    await vi.waitFor(() => expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual(previous));
   });
 
   it.each([4096, 8192])('production provenance reader requests at most 4097 bytes at offset 0 for a %i-byte file', async (size) => {
@@ -346,6 +361,7 @@ describe('remote client override', () => {
     try {
       // Keep provenanceFs unset: observe the production reader and real filesystem IO.
       expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
       expect(open).toHaveBeenCalledTimes(1);
       expect(open).toHaveBeenCalledWith(f.state, 'r');
       expect(read).toHaveBeenCalledTimes(1);
@@ -365,34 +381,93 @@ describe('remote client override', () => {
 
   it('bounds the default git SHA lookup to at most one second and continues on timeout', async () => {
     const f = fixture();
-    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('ETIMEDOUT'); });
+    vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(new Error('ETIMEDOUT')));
     expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0 });
-    expect(execFileSync).toHaveBeenCalledWith('git', ['-C', expect.any(String), 'rev-parse', 'HEAD'],
-      expect.objectContaining({ timeout: expect.any(Number), maxBuffer: 4096 }));
-    const { timeout } = vi.mocked(execFileSync).mock.calls[0][2];
+    expect(execFile).toHaveBeenCalledWith('git', ['-C', expect.any(String), 'rev-parse', 'HEAD'],
+      expect.objectContaining({ timeout: expect.any(Number), maxBuffer: 4096 }), expect.any(Function));
+    const { timeout } = vi.mocked(execFile).mock.calls[0][2];
     expect(timeout).toBeGreaterThan(0);
     expect(timeout).toBeLessThanOrEqual(1000);
-    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
+    await vi.waitFor(() => expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown')));
   });
 
   it('hard-kills a timed-out default git SHA lookup and records unknown without blocking remote execution', async () => {
     const f = fixture();
-    vi.mocked(execFileSync).mockImplementation(() => {
-      throw Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT', signal: 'SIGKILL' });
+    vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => {
+      callback(Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT', signal: 'SIGKILL' }));
     });
     expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0 });
-    expect(execFileSync).toHaveBeenCalledTimes(1);
+    expect(execFile).toHaveBeenCalledTimes(1);
     const { clientPath } = resolveRemoteClient({ clientPath: f.clientPath });
-    expect(execFileSync).toHaveBeenCalledWith('git', ['-C', dirname(clientPath), 'rev-parse', 'HEAD'],
-      expect.objectContaining({ killSignal: 'SIGKILL', timeout: expect.any(Number), maxBuffer: 4096 }));
-    const { timeout } = vi.mocked(execFileSync).mock.calls[0][2];
+    expect(execFile).toHaveBeenCalledWith('git', ['-C', dirname(clientPath), 'rev-parse', 'HEAD'],
+      expect.objectContaining({ killSignal: 'SIGKILL', timeout: expect.any(Number), maxBuffer: 4096 }), expect.any(Function));
+    const { timeout } = vi.mocked(execFile).mock.calls[0][2];
     expect(timeout).toBeGreaterThan(0);
     expect(timeout).toBeLessThanOrEqual(1000);
-    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
-    expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('unknown');
+    await vi.waitFor(() => expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown')));
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('unknown'));
     expect(f.seams.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
       kind: 'remote-client-override', detail: expect.objectContaining({ sha: 'unknown' }),
     }));
+  });
+
+  it.each(['readSha', 'appendEvent', 'git'])('a never-resolving %s cannot consume the remote execution deadline', async (operation) => {
+    const f = fixture();
+    vi.useFakeTimers();
+    const stalled = vi.fn(() => new Promise(() => {}));
+    if (operation === 'git') vi.mocked(execFile).mockImplementation(stalled);
+    const extra = operation === 'git' ? { readSha: undefined } : { [operation]: stalled };
+    const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
+    const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+    let result;
+    const pending = runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
+      policy: f.policy, timeoutMs: 1000, loadPerCore: () => 0, log: f.seams.log,
+      remoteExec: createRemoteExec({ ...f.seams, provenanceFs, ...extra,
+        importClient: async () => ({ runRemote }) }),
+    }).then((value) => { result = value; return value; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stalled).toHaveBeenCalledTimes(1);
+    expect(runRemote).toHaveBeenCalledTimes(1);
+    expect(runRemote.mock.invocationCallOrder[0]).toBeLessThan(stalled.mock.invocationCallOrder[0]);
+    expect(result).toEqual({ handled: true, exitCode: 0 });
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(await pending).toEqual({ handled: true, exitCode: 0 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('waits for a delayed SHA only in provenance and logs the resolved pair once', async () => {
+    const f = fixture();
+    vi.useFakeTimers();
+    let resolveSha;
+    const readSha = vi.fn(() => new Promise((resolve) => { resolveSha = resolve; }));
+    const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+    const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
+    expect(await f.run({ readSha, provenanceFs, importClient: async () => ({ runRemote }) }))
+      .toEqual({ handled: true, exitCode: 0 });
+    expect(runRemote).toHaveBeenCalledTimes(1);
+    expect(f.seams.log.mock.calls.filter(([line]) => line.includes(' @ '))).toHaveLength(0);
+    resolveSha('delayed-sha');
+    await vi.advanceTimersByTimeAsync(0);
+    const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'delayed-sha' };
+    expect(f.seams.log.mock.calls.filter(([line]) => line.includes(' @ ')))
+      .toEqual([[`heavy-admission: remote client override ${pair.clientPath} @ delayed-sha\n`]]);
+    expect(f.seams.appendEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...pair, previous: null } });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['log', 'async log', 'notice'])('a throwing provenance %s cannot fail client execution', async (operation) => {
+    const f = fixture();
+    const extra = operation === 'notice'
+      ? { notice: { get logged() { throw new Error('notice unavailable'); } } }
+      : { log: () => {
+        if (operation === 'async log') return Promise.reject(new Error('log unavailable'));
+        throw new Error('log unavailable');
+      } };
+    const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
+    expect(await f.run({ ...extra, importClient: async () => ({ runRemote }) }))
+      .toEqual({ handled: true, exitCode: 0 });
+    expect(runRemote).toHaveBeenCalledTimes(1);
+    expect(f.seams.appendEvent).not.toHaveBeenCalled();
   });
 
   it.each(['readSha', 'readFile', 'appendEvent', 'mkdir', 'writeFile'])(
@@ -409,9 +484,10 @@ describe('remote client override', () => {
       const pending = f.run({ ...extra, importClient: async () => ({ runRemote }) });
       await vi.advanceTimersByTimeAsync(0);
       expect(stalled).toHaveBeenCalledTimes(1);
-      expect(runRemote).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(operation === 'readSha' ? 1000 : 100);
+      expect(runRemote).toHaveBeenCalledTimes(1);
       expect(await pending).toEqual({ handled: true, exitCode: 0 });
+      expect(runRemote.mock.invocationCallOrder[0]).toBeLessThan(stalled.mock.invocationCallOrder[0]);
+      await vi.advanceTimersByTimeAsync(operation === 'readSha' ? 1000 : 100);
       expect(runRemote).toHaveBeenCalledTimes(1);
       if (operation === 'readSha') expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
       // A late storage completion must not resume the timed-out persistence chain.
@@ -428,7 +504,7 @@ describe('remote client override', () => {
     const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
     provenanceFs[operation].mockRejectedValue(new Error('storage unavailable'));
     expect(await f.run({ provenanceFs })).toEqual({ handled: true, exitCode: 0 });
-    expect(provenanceFs[operation]).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(provenanceFs[operation]).toHaveBeenCalledTimes(1));
   });
 
   it.each(['selected', 'unreadable', 'import failure'])('sanitizes and bounds policy and %s path logs', async (kind) => {
