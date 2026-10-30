@@ -5,8 +5,15 @@
  * the red team. No real process, model, git or GitHub call: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { recordRedTeamStatus, readDrainRedTeamEvidence } from '../../lib/drain-red-team-evidence.mjs';
 
 import { runReviewJob } from '../review-job.mjs';
+import { planRedTeamOnSkip, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { redTeamEnqueueHold } from '../../lib/drain-queue-safety.mjs';
+import { redTeamForHead } from '../../lib/red-team-gate.mjs';
 import { redTeamOwedFor, runRedTeam } from '../review-extra-seats.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -152,5 +159,65 @@ describe('runRedTeam — the pass itself honours the advisory accept and stays o
     const r = await runRedTeam({ pr: 4722, repo: REPO, lanePath: '/lane', loopPayload: advisoryAccept(HEAD_2), env: {} }, io);
     expect(calls.some((c) => c[0] === 'reserve')).toBe(false);
     expect(r.status).not.toBe('not-owed');
+  });
+});
+
+describe('failed red-team recovery (#6096)', () => {
+  const failed = { status: 'failed', reason: 'provider quota exhausted', findings: [],
+    foldedVerdict: 'needs-human', comment: { status: 'not-posted' } };
+  const evidence = { loopPayload: payload(), inFlight: false, queued: false, recorded: true,
+    seatRecorded: true, completedRecorded: false, failedSeatCount: 1 };
+  const recovery = (over = {}) => ({ repo: REPO,
+    refusals: [{ kind: 'already-reviewed-head', prNumber: 4722, headSha: HEAD_1 }],
+    rawPrs: [{ number: 4722, headRefOid: HEAD_1, comments: [], reviews: [], labels: ['review:accepted'] }],
+    readEvidence: () => evidence, readStatus: () => ({ status: 'finished', result: failed }),
+    now: NOW, lastDispatch: new Map(), setting: { enabled: true, retryCooldownMin: 30 }, ...over });
+
+  it('persists failed and settles the failure reason without an unpublished claim or clear', () => {
+    const { io } = jobIo(payload());
+    const settlements = [], statuses = [];
+    io.runRedTeam = () => failed;
+    io.settleRedTeamSkip = input => { settlements.push(input.redTeam); return { outcome: 'non-policy' }; };
+    io.redTeamStatus = input => statuses.push(input);
+    const result = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
+    expect(result.redTeam).toMatchObject({ status: 'failed', reason: failed.reason, outcome: 'non-policy' });
+    expect(settlements).toEqual([failed]);
+    expect(statuses.at(-1)).toMatchObject({ status: 'finished', result: 'failed' });
+    expect(redTeamForHead([], 4722, HEAD_1)).toBeFalsy();
+  });
+
+  it('drain evidence never credits a failed seat as a completed pass or creates a clear', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-failed-drain-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    try {
+      recordRedTeamStatus({ repo: REPO, pr: 4722, loopPayload: payload(), status: 'finished', result: 'failed' }, { env });
+      const read = readDrainRedTeamEvidence({ repo: REPO, pr: 4722, head: HEAD_1, env,
+        list: () => [], readScorecards: () => [{ dispatchKind: 'review-seat', seat: 'red-team',
+          repo: REPO, pr: 4722, rev: HEAD_1, status: 'timeout' }] });
+      expect(read).toMatchObject({ completedRecorded: false, failedSeatCount: 1, inFlight: false,
+        status: { result: 'failed' } });
+      expect(redTeamEnqueueHold({ ...read, comments: [], repo: REPO, pr: 4722, head: HEAD_1,
+        env: { WE_RED_TEAM_SKIP_CARD_ONLY: '0' } })).toBe('post-accept red team has no recorded result on the live head');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['failed', { status: 'failed' }, 'ran', { status: 'ran' }])('schedules one fresh retry, then observes cooldown: %s', result => {
+    const inputs = recovery({ readStatus: () => ({ status: 'finished', result }) });
+    const dispatches = [];
+    const run = () => runRedTeamOnSkip({ ...inputs, plan: { refusals: inputs.refusals },
+      now: () => NOW, capacity: { lanes: 2, liveReviews: 0, maxLive: 2 },
+      readCarry: () => null, dispatch: input => { dispatches.push(input); return { jobPid: 123 }; } });
+    expect(run().rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(run().rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+    expect(dispatches).toHaveLength(1);
+  });
+
+  it.each([
+    { readStatus: () => ({ status: 'finished', result: 'failed', retryCount: 1 }) },
+    { readEvidence: () => ({ ...evidence, failedSeatCount: 2 }) },
+    { readEvidence: () => ({ ...evidence, completedRecorded: true }) },
+    { setting: { enabled: false, retryCooldownMin: 30 } },
+  ])('refuses retries with spent, contradictory, or disabled evidence: %s', overrides => {
+    expect(planRedTeamOnSkip(recovery(overrides))[0].action).toBe('skip');
   });
 });
