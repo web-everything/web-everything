@@ -45,6 +45,22 @@ describe('CHECK_STATE_TABLE', () => {
 });
 
 describe('classifyCheck exhaustive independent outcome grid', () => {
+  it.each(['constructor', 'toString', '__proto__'])(
+    'fails closed on prototype-key status %s with required omitted',
+    (status) => {
+      expect(classifyCheck({ status, conclusion: 'success' })).toBe('red');
+    },
+  );
+
+  it.each(['constructor', 'toString', '__proto__'])(
+    'fails closed on prototype-key conclusion %s with explicit or inferred completion',
+    (conclusion) => {
+      for (const statusFlag of [{ status: 'completed' }, {}, { status: null }, { status: undefined }]) {
+        expect(classifyCheck({ ...statusFlag, conclusion })).toBe('red');
+      }
+    },
+  );
+
   it('fails closed on prototype-key statuses and conclusions just like unknown values', () => {
     for (const value of ['unrecognised', 'constructor', 'toString', '__proto__']) {
       for (const evidence of [
@@ -111,12 +127,15 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 
 describe('latestAttempts', () => {
   it('does not mutate deeply frozen input and returns original rows in first-seen name order', () => {
-    const older = Object.freeze(settled('test', 'failure', { run_attempt: 1, id: 1 }));
+    const older = Object.freeze(settled('test', 'failure', {
+      run_attempt: 1, id: 1,
+      output: Object.freeze({ annotations: Object.freeze([Object.freeze({ message: 'failed' })]) }),
+    }));
     const build = Object.freeze(settled('build', 'success', { run_attempt: 1, id: 2 }));
     const newer = Object.freeze(settled('test', 'success', { run_attempt: 2, id: 3 }));
     const smoke = Object.freeze(settled('smoke', 'success', { run_attempt: 1, id: 4 }));
     const input = Object.freeze([older, build, newer, smoke]);
-    const snapshot = input.map((row) => ({ ...row }));
+    const snapshot = structuredClone(input);
 
     const result = latestAttempts(input);
 
@@ -125,6 +144,48 @@ describe('latestAttempts', () => {
     expect(result[0]).toBe(newer);
     expect(result[1]).toBe(build);
     expect(result[2]).toBe(smoke);
+  });
+
+  it('returns the original winning row objects without cloning or normalizing them', () => {
+    const older = settled('Test', 'failure', { run_attempt: 1, id: 1 });
+    const winner = settled('TEST', 'success', { run_attempt: 2, id: 2 });
+    const build = settled('Build', 'success', { id: 3 });
+
+    const result = latestAttempts([older, winner, build]);
+
+    expect(result).toHaveLength(2);
+    expect(result[0]).toBe(winner);
+    expect(result[1]).toBe(build);
+    expect(winner.name).toBe('TEST');
+    expect(build.name).toBe('Build');
+  });
+
+  it('preserves first-seen name order when later attempts replace multiple winners', () => {
+    const zed = settled('zed', 'success', { run_attempt: 2 });
+    const alpha = settled('alpha', 'success', { run_attempt: 2 });
+    const middle = settled('middle', 'success', { run_attempt: 1 });
+
+    expect(latestAttempts([
+      settled('zed', 'failure', { run_attempt: 1 }),
+      settled('alpha', 'failure', { run_attempt: 1 }),
+      middle, alpha, zed,
+    ])).toEqual([zed, alpha, middle]);
+  });
+
+  it('groups Test and test as one check in either order, including exact ranking ties', () => {
+    const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
+    const newer = settled('test', 'failure', { run_attempt: 2, id: 2 });
+    for (const rows of [[older, newer], [newer, older]]) {
+      const result = latestAttempts(rows);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBe(newer);
+    }
+    const tied = { ...newer, name: 'Test' };
+    for (const rows of [[newer, tied], [tied, newer]]) {
+      const result = latestAttempts(rows);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBe(rows[0]);
+    }
   });
 
   it('compares large run_attempt integers exactly before considering id in either order', () => {
@@ -274,6 +335,31 @@ describe('named check-state regressions', () => {
 });
 
 describe('summarize required checks', () => {
+  it('matches requiredNames case-insensitively without inventing missing required checks', () => {
+    expect(summarize([
+      settled('TeSt', 'success', { required: false }),
+      settled('SMOKE', 'failure'),
+    ], { requiredNames: ['TEST', 'test'] })).toEqual({
+      redSet: new Set(), pendingSet: new Set(),
+      gateOnlyRed: false, allRequiredGreen: true,
+    });
+  });
+
+  it('matches holdGateNames case-insensitively and returns lowercase blocker sets', () => {
+    expect(summarize([
+      settled('ReViEw-GaTe', 'failure'),
+      settled('MERGE-GATE', 'failure'),
+      { name: 'BuIlD', status: 'queued' },
+    ], {
+      requiredNames: ['REVIEW-GATE', 'merge-gate', 'BUILD', 'Absent', 'ABSENT'],
+      holdGateNames: ['REVIEW-GATE', 'mErGe-GaTe'],
+    })).toEqual({
+      redSet: new Set(['review-gate', 'merge-gate']),
+      pendingSet: new Set(['build', 'absent']),
+      gateOnlyRed: true, allRequiredGreen: false,
+    });
+  });
+
   it('marks an explicitly required name with no row as pending', () => {
     expect(summarize([settled('ci', 'success')], { requiredNames: ['ci', 'missing'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(['missing']),
