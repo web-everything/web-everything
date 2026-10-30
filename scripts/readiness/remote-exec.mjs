@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
 import * as filesystem from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';

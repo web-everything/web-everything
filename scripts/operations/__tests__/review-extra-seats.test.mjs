@@ -3,11 +3,12 @@ import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
  * direct-task scripts, BESIDE Claude's mandatory seats. No real codex/agy/git/GitHub process: every effect is a fake.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE, REVIEW_SEAT_MODELS,
@@ -15,10 +16,11 @@ import {
 import {
   runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
   PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MS, resolveProbeIntervalMs, probeDue, quotaHoldOrProbe,
-  claudeFindingsFromLoop, buildSeatTask, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
+  claudeFindingsFromLoop, buildSeatTask, SEAT_ANSWER_CONTRACT, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
   resolveProviderCap, reviewSeatCapUsage, toIsoInstant, extractAnswerJson, reserveSeatCalls, createExtraSeatsIo,
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
+  seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow,
 } from '../review-extra-seats.mjs';
 import { runReviewJob, summarizeExtraSeats } from '../review-job.mjs';
 import { ADVISORY_JUDGE_LENS, JUDGE_SEATS } from '../review-pr.mjs';
@@ -50,6 +52,7 @@ const LOOP_PAYLOAD = {
 };
 
 const answer = (lenses) => `I reviewed it.\n\n\`\`\`json\n${JSON.stringify({ lenses })}\n\`\`\``;
+const VALID_SEAT_FINDING = { summary: 'Real finding', category: 'failing-input', impactIfUnfixed: 'broken', file: null, line: null, failure_scenario: 'A concrete failure.' };
 
 /** A fake seat io recording every effect. Reservations are kept in ONE ledger PER PROVIDER inside `ledgerBox`
  *  (an object keyed by provider), matching the real io's per-provider ledger files — pass one `ledgerBox` to
@@ -73,15 +76,16 @@ function fakeSeatIo(over = {}, ledgerBox = {}) {
     makeScratch: (o) => { calls.push(['scratch', o]); return '/tmp/seat-scratch'; },
     removeScratch: (d) => calls.push(['rm', d]),
     writeFile: (p) => calls.push(['write', p]),
+    writeRawAnswer: ({ callId, text }) => { calls.push(['raw', callId, text]); return `seat-raw/${callId}.txt`; },
     runSeat: async (o) => {
       calls.push(['seat', o]);
       if (o.provider === 'codex') {
         return { exitCode: 0, report: { lastMessage: answer({
-          'extra-juror:correctness': { verdict: 'changes', findings: [{ summary: 'a forged merge headline bypasses isMechanicalMergeCommit', file: 'scripts/lib/ai-pr-authorship.mjs', line: 44, impactIfUnfixed: 'broken' }] },
+          'extra-juror:correctness': { verdict: 'changes', findings: [{ summary: 'a forged merge headline bypasses isMechanicalMergeCommit', category: null, file: 'scripts/lib/ai-pr-authorship.mjs', line: 44, impactIfUnfixed: 'broken', failure_scenario: null }] },
         }), quotaUsedPercent: 12, quotaResetsAt: null } };
       }
       if (o.provider === 'agy-claude') {
-        return { exitCode: 0, report: { events: { finalResponse: answer({ 'claim-accuracy': { verdict: 'changes', findings: [{ summary: 'PR body says tests were added; none were', file: null, impactIfUnfixed: 'cosmetic' }] } }) } } };
+        return { exitCode: 0, report: { events: { finalResponse: answer({ 'claim-accuracy': { verdict: 'changes', findings: [{ summary: 'PR body says tests were added; none were', category: null, file: null, line: null, impactIfUnfixed: 'cosmetic', failure_scenario: null }] } }) } } };
       }
       return { exitCode: 0, report: { events: { finalResponse: answer({ 'standards-conformance': { verdict: 'accept', findings: [] } }) } } };
     },
@@ -383,6 +387,18 @@ describe('#4194 the direct-task scripts in --review mode', () => {
 describe('#4194 prompt, answer parsing, confirmation, rows', () => {
   const seats = reviewSeatRoutes({}).routes.map((r) => ({ ...r }));
 
+  it('both briefs use the same unchanged three-line answer contract', () => {
+    expect(SEAT_ANSWER_CONTRACT).toBe([
+      'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
+      'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
+      'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
+    ].join('\n'));
+    const options = { pr: 5, repo: REPO, title: 'T', inline: { diffText: '', body: '' }, seats };
+    for (const build of [buildSeatTask, buildRedTeamTask]) {
+      expect(build(options)).toContain('\n' + SEAT_ANSWER_CONTRACT + '\n');
+    }
+  });
+
   it('the brief names each seat, the files, and the JSON contract', () => {
     const t = buildSeatTask({ pr: 5, repo: REPO, title: 'T', dir: '/s', diffFile: '/s/.git/d', bodyFile: '/s/.git/b', seats });
     for (const s of seats) expect(t).toContain(`"${s.key}"`);
@@ -403,7 +419,7 @@ describe('#4194 prompt, answer parsing, confirmation, rows', () => {
   });
 
   it('parses the last fenced JSON; a seat missing from it is not ok', () => {
-    const text = answer({ 'claim-accuracy': { verdict: 'changes', findings: [{ summary: 'wrong count', file: 'a.md', line: 3 }] } });
+    const text = answer({ 'claim-accuracy': { verdict: 'changes', findings: [{ summary: 'wrong count', category: null, file: 'a.md', line: 3, impactIfUnfixed: 'broken', failure_scenario: null }] } });
     const parsed = parseSeatAnswer(text, seats);
     expect(parsed['claim-accuracy']).toMatchObject({ ok: true, verdict: 'changes' });
     expect(parsed['claim-accuracy'].findings[0]).toMatchObject({ summary: 'wrong count', file: 'a.md', line: 3 });
@@ -917,4 +933,670 @@ it('keeps distinct per-seat policy models in separate calls and reserves both un
   expect(calls.filter(c => c[0] === 'seat').map(c => c[1].model).sort()).toEqual(['gpt-6-astra', 'gpt-6-sol']);
   expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 2, 2]]);
   expect(result.seats.find(s => s.lens === 'claim-accuracy').model).toBe('gpt-6-sol');
+});
+
+
+describe('seat answer extraction — realistic provider replies, fail closed', () => {
+  it('refuses 300 KB of quotes and backslashes followed by a valid answer in under one second', () => {
+    const text = '"\\'.repeat(150 * 1024) + '\n' + answer({ 'red-team': { verdict: 'accept', findings: [] } });
+    const started = performance.now();
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+  it('accepts a valid answer after 100 KB of balanced prose', () => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const prose = 'Reviewed {} and [].\n'.padEnd(100 * 1024, ' ');
+    expect(extractAnswerJson(prose + JSON.stringify(obj))).toEqual(obj);
+  });
+  it('scans 200 KB of backslash/quote-heavy text below the cap in under one second', () => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const prose = '"' + '\\"'.repeat(100 * 1024) + '"\nActual answer:\n';
+    const text = prose + JSON.stringify(obj);
+    expect(text.length).toBeGreaterThan(200_000);
+    expect(text.length).toBeLessThan(256 * 1024);
+    const started = performance.now();
+    const result = extractAnswerJson(text);
+    const elapsed = performance.now() - started;
+    expect(result).toEqual(obj);
+    expect(elapsed).toBeLessThan(1000);
+  });
+  it.each([0, 1])('enforces the 256 KB scan limit with %i extra characters', extra => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = JSON.stringify(obj).padStart(256 * 1024 + extra, ' ');
+    expect(extractAnswerJson(text)).toEqual(extra === 0 ? obj : null);
+  });
+  it('refuses 200 KB of unmatched braces in under one second', () => {
+    const text = '{'.repeat(200 * 1024);
+    const started = performance.now();
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+  const raw = name => readFileSync(fileURLToPath(new URL('./fixtures/seat-raw/' + name + '.txt', import.meta.url)), 'utf8');
+  const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];
+  it.each(['codex-fenced', 'inner-backticks', 'echo-then-answer'])('extracts the exact last answer from %s', name => {
+    const text = raw(name);
+    const obj = extractAnswerJson(text);
+    expect(obj.lenses['red-team'].verdict).toBe('changes');
+    expect(obj.lenses['red-team'].findings).toHaveLength(1);
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(true);
+    for (const provider of ['codex', 'agy-gemini']) {
+      const report = provider === 'codex' ? { lastMessage: text } : { events: { finalResponse: text } };
+      expect(classifySeatCall(provider, { report })).toMatchObject({ status: 'ok', text });
+    }
+    if (name === 'inner-backticks') expect(obj.lenses['red-team'].findings[0].failure_scenario).toContain('```json and ```');
+    else expect(obj.lenses['red-team'].findings[0].failure_scenario).toContain('Number.MAX_VALUE');
+  });
+  it.each(['truncated', 'reasoning-only', 'trailing-prose'])('refuses %s and retains its final text for evidence', name => {
+    const text = raw(name);
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    for (const provider of ['codex', 'agy-gemini']) {
+      const report = provider === 'codex' ? { lastMessage: text } : { events: { finalResponse: text } };
+      expect(classifySeatCall(provider, { report })).toMatchObject({ status: 'unparseable', text });
+    }
+  });
+  it.each(['JSON', 'jsonc', ''])('refuses trailing prose after %s fences with CRLF and BOM', language => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = '\uFEFFReasoning.\r\n```' + language + '\r\n' + JSON.stringify(obj) + '\r\n```\r\nDone.';
+    expect(extractAnswerJson(text)).toBeNull();
+  });
+  it('selects the last complete valid answer regardless of fence order', () => {
+    const first = answer({ 'red-team': { verdict: 'accept', findings: [] } });
+    const last = JSON.stringify({ lenses: { 'red-team': { verdict: 'changes', findings: [] } } });
+    expect(extractAnswerJson(first + '\nCorrected answer:\n' + last).lenses['red-team'].verdict).toBe('changes');
+    expect(extractAnswerJson(last + '\nCorrected answer:\n' + first).lenses['red-team'].verdict).toBe('accept');
+  });
+  it.each([',', ':', ']', '}'])('refuses an answer followed by JSON continuation %s', continuation => {
+    const text = JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } })
+      + ' \n\t' + continuation + '"unfinished":';
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each(['"\\u006censes"', '"lens\\u0065s"'])('selects the later changes answer with escaped key %s over an echoed example', key => {
+    const example = answer({ 'red-team': { verdict: 'accept', findings: [] } });
+    const later = '{' + key + ':{"red-team":{"verdict":"changes","findings":[]}}}';
+    const text = example + '\nActual answer:\n' + later;
+    expect(extractAnswerJson(text)).toEqual(JSON.parse(later));
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: true, verdict: 'changes', findings: [] });
+  });
+  it('refuses a metadata-first answer after an unfenced echoed accept example', () => {
+    const example = JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } });
+    const real = { metadata: {}, lenses: { 'red-team': { verdict: 'changes', findings: [] } } };
+    const text = example + '\nActual answer:\n' + JSON.stringify(real);
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each([
+    '{"wrapper": ',
+    '{"wrapper" \n : \t',
+    '[',
+    '[{}, \n',
+    '{"wrapper": \n```json\n',
+    '{"wrapper" \n : \t\n```JSON\r\n',
+    '[\n```\n',
+    '[{}, \n```jsonc\n',
+  ])('refuses an inner answer in an unfinished outer structure after %j', prefix => {
+    const text = prefix + JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } })
+      + (prefix.includes('```') ? '\n```\nDone.' : '');
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each([
+    { metadata: {}, lenses: {} },
+    { lenses: {}, metadata: {} },
+  ])('refuses a root with keys besides lenses: %j', obj => {
+    const text = JSON.stringify(obj);
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each(['Actual answer:\n', 'Actual answer:\n```json\n'])('accepts a valid root after a prose colon: %j', prefix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = prefix + JSON.stringify(obj) + (prefix.includes('```') ? '\n```\n' : '\n');
+    expect(extractAnswerJson(text)).toEqual(obj);
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: true, verdict: 'accept', findings: [] });
+  });
+  it.each(['"lenses"', '"\\u006censes"', '"lens\\u0065s"'])('refuses an unfenced echoed accept when the last answer key %s has no valid candidate', key => {
+    const example = JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } });
+    for (const later of ['{' + key + ':null}', '{"metadata":{},' + key + ':', '{"metadata":{},' + key + ':invalid}']) {
+      const text = example + '\nActual answer:\n' + later;
+      expect(extractAnswerJson(text)).toBeNull();
+      expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+    }
+  });
+  it.each(['Actual answer:', 'Example: {unparseable}', '{"note":"balanced braces {} in a string", "nested":{}}'])('ignores balanced prose or a non-answer span %s before a valid answer', prose => {
+    const obj = { lenses: { 'red-team': { verdict: 'changes', findings: [] } } };
+    const text = prose + '\nActual answer:\n' + JSON.stringify(obj);
+    expect(extractAnswerJson(text)).toEqual(obj);
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(true);
+  });
+  it.each(['function(){', '{"note":"a brace { in a string", "nested":{}}', '}'])('refuses unbalanced preceding braces in %s for bare and fenced answers', prose => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    for (const candidate of [JSON.stringify(obj), answer(obj.lenses)]) {
+      const text = prose + '\nActual answer:\n' + candidate;
+      expect(extractAnswerJson(text)).toBeNull();
+      expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+      expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+    }
+  });
+  it.each(['[0,', ']', '{"note":"a bracket [ in a string"}', '{"note":"a bracket ] in a string"}'])('refuses unbalanced preceding brackets in %s for bare and fenced answers', prose => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    for (const candidate of [JSON.stringify(obj), answer(obj.lenses)]) {
+      const text = prose + '\nActual answer:\n' + candidate;
+      expect(extractAnswerJson(text)).toBeNull();
+      expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+      expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+    }
+  });
+  it.each(['Example: [0]', '{"note":"balanced brackets [] in a string"}'])('accepts balanced preceding brackets in %s for bare and fenced answers', prose => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    for (const candidate of [JSON.stringify(obj), answer(obj.lenses)]) {
+      expect(extractAnswerJson(prose + '\nActual answer:\n' + candidate)).toEqual(obj);
+    }
+  });
+  it.each(['[0,\nActual answer:\n', '[0]\nActual answer:\n', 'Actual answer:\n'])('refuses non-whitespace before the answer inside its fence: %j', prefix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = '```json\n' + prefix + JSON.stringify(obj) + '\n```';
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each(['', ' \t\n\r\n '])('accepts only whitespace before the answer inside its fence: %j', prefix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    expect(extractAnswerJson('```json\r\n' + prefix + JSON.stringify(obj) + '\n```')).toEqual(obj);
+  });
+  it('refuses an inner accept answer in an unfinished commented wrapper', () => {
+    const text = '{ /* c */ "wrapper": ' + JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } });
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it('does not extract an answer from inside a consumed complete span', () => {
+    const example = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const embedded = { lenses: { 'red-team': { verdict: 'changes', findings: [] } } };
+    const text = JSON.stringify(example) + '\n' + JSON.stringify({ quoted: JSON.stringify(embedded), nested: embedded });
+    expect(extractAnswerJson(text)).toBeNull();
+  });
+  it('refuses an echoed accept followed by a truncated metadata-first actual answer', () => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [] } }) + '\nActual answer:\n{"metadata":';
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each(['{', '}', '[', ']'])('refuses an echoed accept followed by prose and a trailing JSON bracket %s', bracket => {
+    const example = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    for (const prefix of [JSON.stringify(example), answer(example.lenses)]) {
+      const text = prefix + '\nActual answer:\n' + bracket;
+      expect(extractAnswerJson(text)).toBeNull();
+      expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+      expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+    }
+  });
+  it.each(['{', '{}', '{"metadata":{}}', '{garbled}', 'Hope that helps. {'])('refuses any trailing opening brace: %s', trailing => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [] } }) + '\n' + trailing;
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+  });
+  it('refuses a later answer-key token even in prose without braces', () => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [] } }) + '\nCorrection: "lens\\u0065s": unavailable';
+    expect(extractAnswerJson(text)).toBeNull();
+  });
+  it('refuses trailing prose without braces after a bare answer', () => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = JSON.stringify(obj) + '\nHope that helps.';
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it('refuses an echoed accept followed by a bare null actual answer', () => {
+    const example = JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } });
+    const text = example + '\nActual answer:\nnull';
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it('refuses an unfenced echoed accept followed by a fenced null answer', () => {
+    const example = JSON.stringify({ lenses: { 'red-team': { verdict: 'accept', findings: [] } } });
+    const text = example + '\nActual answer:\n```json\nnull\n```';
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each(['```', 'Hope that helps.\n```', '```\nPlain prose.'])('refuses any fence after a bare answer: %j', suffix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    expect(extractAnswerJson(JSON.stringify(obj) + '\n' + suffix)).toBeNull();
+  });
+  it.each(['```\n```', '```\nPlain prose.\n```json\nnull\n```', 'Plain prose.\n```'])('refuses extra or nonleading fences after a fenced answer: %j', suffix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    expect(extractAnswerJson('```json\n' + JSON.stringify(obj) + '\n' + suffix)).toBeNull();
+  });
+  it.each(['', '\nPlain prose.'])('refuses a fenced answer missing its closing fence: %j', suffix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    expect(extractAnswerJson('```json\n' + JSON.stringify(obj) + suffix)).toBeNull();
+  });
+  it.each(['', '\n \t\r\n'])('accepts a fenced answer and its closing fence followed only by whitespace: %j', suffix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    expect(extractAnswerJson('```json\n' + JSON.stringify(obj) + '\n```' + suffix)).toEqual(obj);
+  });
+  it.each(['\nHope that helps.', 'Done.', '...nu'])('refuses trailing text after a closing fence: %j', suffix => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    expect(extractAnswerJson('```json\n' + JSON.stringify(obj) + '\n```' + suffix)).toBeNull();
+  });
+  it.each(['null', 'nu'])('refuses a JSON-fenced echoed accept followed by an actual answer of %s', actual => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = '```JSON\n' + JSON.stringify(obj) + '\n```\nActual answer:\n' + actual;
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each(['"unfinished', '"finished"'])('refuses an echoed accept followed by trailing quoted text %s', trailing => {
+    const example = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    for (const prefix of [JSON.stringify(example), answer(example.lenses)]) {
+      const text = prefix + '\nActual answer: ' + trailing;
+      expect(extractAnswerJson(text)).toBeNull();
+      expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+      expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+    }
+  });
+  it.each([
+    '{"lenses":',
+    '{"\\u006censes":',
+    '{"lenses":invalid}',
+    '{"\\u006censes":invalid}',
+    '{"\\u00xx":',
+    '{"\\u00xx":invalid}',
+  ])('refuses malformed later answer-like candidate %s after an echoed example', candidate => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [] } }) + '\nCorrection:\n' + candidate;
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(parseSeatAnswer(text, seats)['red-team'].ok).toBe(false);
+  });
+  it.each([[], null, 'accept', 1])('rejects invalid lenses shape %j', lenses => {
+    const text = JSON.stringify({ lenses });
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it.each([{}, [], { verdict: 'maybe' }, { verdict: 'maybe', findings: [] }, { findings: {} }, { verdict: 'accept', findings: {} }])('refuses invalid seat entry %j', entry => {
+    expect(parseSeatAnswer(JSON.stringify({ lenses: { 'red-team': entry } }), seats)['red-team'].ok).toBe(false);
+  });
+  it.each(['unexpected-seat', 'metadata', '__proto__', 'toString'])('refuses every requested seat when lenses contains the unknown key %s', key => {
+    const requested = [...seats, { key: 'extra-juror:correctness', lens: 'correctness' }];
+    const text = answer({
+      'red-team': { verdict: 'accept', findings: [] },
+      correctness: { verdict: 'changes', findings: [{ ...VALID_SEAT_FINDING }] },
+      [key]: null,
+    });
+    expect(parseSeatAnswer(text, requested)).toEqual({
+      'red-team': { ok: false, verdict: null, findings: [] },
+      'extra-juror:correctness': { ok: false, verdict: null, findings: [] },
+    });
+  });
+  it.each(['key', 'lens', 'both'])('accepts requested seat keys and lens aliases using %s', mode => {
+    const requested = [...seats, { key: 'extra-juror:correctness', lens: 'correctness' }];
+    const lenses = { 'red-team': { verdict: 'accept', findings: [] } };
+    if (mode !== 'lens') lenses['extra-juror:correctness'] = { verdict: 'changes', findings: [] };
+    if (mode !== 'key') lenses.correctness = { verdict: mode === 'both' ? 'accept' : 'changes', findings: [] };
+    expect(parseSeatAnswer(answer(lenses), requested)).toEqual({
+      'red-team': { ok: true, verdict: 'accept', findings: [] },
+      'extra-juror:correctness': { ok: true, verdict: 'changes', findings: [] },
+    });
+  });
+  it.each(['summary', 'category', 'impactIfUnfixed', 'file', 'line', 'failure_scenario'])('refuses a finding missing required key %s for every seat, including beyond the findings cap', key => {
+    const incomplete = { ...VALID_SEAT_FINDING };
+    delete incomplete[key];
+    const requested = [...seats, { key: 'claim-accuracy', lens: 'claim-accuracy' }];
+    for (const verdict of ['accept', 'changes']) {
+      for (const findings of [[incomplete], [...Array.from({ length: 12 }, () => ({ ...VALID_SEAT_FINDING })), incomplete]]) {
+        for (const invalidSeat of ['red-team', 'claim-accuracy']) {
+          const lenses = { 'red-team': { verdict: 'accept', findings: [] }, 'claim-accuracy': { verdict: 'accept', findings: [] } };
+          lenses[invalidSeat] = { verdict, findings };
+          const parsed = parseSeatAnswer(answer(lenses), requested);
+          expect(parsed[invalidSeat]).toEqual({ ok: false, verdict: null, findings: [] });
+          expect(parsed[invalidSeat === 'red-team' ? 'claim-accuracy' : 'red-team']).toEqual({ ok: true, verdict: 'accept', findings: [] });
+        }
+      }
+    }
+  });
+  it('refuses a red-team finding missing category', () => {
+    const finding = { ...VALID_SEAT_FINDING };
+    delete finding.category;
+    const text = answer({ 'red-team': { verdict: 'changes', findings: [finding] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it('refuses a red-team finding with null failure_scenario', () => {
+    const text = answer({ 'red-team': { verdict: 'changes', findings: [{ ...VALID_SEAT_FINDING, failure_scenario: null }] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each([{ verdict: 'accept' }, { verdict: 'changes' }, { findings: [] }, { findings: [{ summary: 'A real finding' }] }])('refuses a seat missing verdict or findings: %j', entry => {
+    expect(parseSeatAnswer(JSON.stringify({ lenses: { 'red-team': entry } }), seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each(['accept', 'changes'])('accepts a complete %s entry with empty findings', verdict => {
+    const text = answer({ 'red-team': { verdict, findings: [] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: true, verdict, findings: [] });
+  });
+  it.each(['accept', 'changes'])('refuses an extra property on a %s seat entry', verdict => {
+    const text = answer({ 'red-team': { verdict, findings: [], extra: true } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each(['extra', 'constructor', '__proto__'])('refuses an unknown finding property %s, including beyond the output cap', key => {
+    const invalid = { ...VALID_SEAT_FINDING, [key]: true };
+    for (const findings of [[invalid], [...Array.from({ length: 12 }, () => ({ ...VALID_SEAT_FINDING })), invalid]]) {
+      const text = answer({ 'red-team': { verdict: 'changes', findings } });
+      expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+    }
+  });
+  it.each([
+    ...[undefined, null, 42, true, {}, [], '', ' '].map(value => ['summary', value]),
+    ...[undefined, null, 42, true, {}, [], ' '].map(value => ['impactIfUnfixed', value]),
+    ...['category', 'file', 'failure_scenario'].flatMap(key => [42, true, {}, []].map(value => [key, value])),
+    ...['category', 'failure_scenario'].map(key => [key, null]),
+    ...['3', 3.5, true, {}, []].map(value => ['line', value]),
+  ])('refuses finding field %s with invalid value %j, including beyond the output cap', (key, value) => {
+    const valid = { ...VALID_SEAT_FINDING };
+    const invalid = { ...valid, [key]: value };
+    for (const findings of [[invalid], [...Array.from({ length: 12 }, () => valid), invalid]]) {
+      for (const invalidSeat of ['red-team', 'claim-accuracy']) {
+        if (invalidSeat !== 'red-team' && value === null && ['category', 'failure_scenario'].includes(key)) continue;
+        const lenses = { 'red-team': { verdict: 'accept', findings: [] }, 'claim-accuracy': { verdict: 'accept', findings: [] } };
+        lenses[invalidSeat] = { verdict: 'changes', findings };
+        const parsed = parseSeatAnswer(answer(lenses), [...seats, { key: 'claim-accuracy', lens: 'claim-accuracy' }]);
+        expect(parsed[invalidSeat]).toEqual({ ok: false, verdict: null, findings: [] });
+        expect(parsed[invalidSeat === 'red-team' ? 'claim-accuracy' : 'red-team']).toEqual({ ok: true, verdict: 'accept', findings: [] });
+      }
+    }
+  });
+  it('refuses an empty impact string even when all required fields are present', () => {
+    const text = answer({ 'red-team': { verdict: 'changes', findings: [{ ...VALID_SEAT_FINDING, impactIfUnfixed: '' }] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each([
+    ...['category', 'file', 'failure_scenario'].flatMap(key => [null, '', 'text'].map(value => [key, value])),
+    ...[null, 0, -3, 3].map(value => ['line', value]),
+  ])('accepts schema-compatible nullable finding field %s with value %j per seat', (key, value) => {
+    for (const seat of ['red-team', 'claim-accuracy']) {
+      if (seat === 'red-team' && value === null && ['category', 'failure_scenario'].includes(key)) continue;
+      const finding = { ...VALID_SEAT_FINDING, [key]: value };
+      const expected = { summary: 'Real finding', category: VALID_SEAT_FINDING.category, impactIfUnfixed: 'broken', failure_scenario: VALID_SEAT_FINDING.failure_scenario };
+      if (key === 'line' ? value > 0 : value) expected[key] = value;
+      else delete expected[key];
+      const text = answer({ [seat]: { verdict: 'changes', findings: [finding] } });
+      expect(parseSeatAnswer(text, [{ key: seat, lens: seat }])[seat]).toEqual({ ok: true, verdict: 'changes', findings: [expected] });
+    }
+  });
+  it.each([[null], ['x'], [[]], [true], [3]])('refuses a seat containing a non-object finding %j', finding => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [finding] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it('refuses a seat with a non-object finding even alongside a valid finding', () => {
+    const text = answer({ 'red-team': { verdict: 'changes', findings: [{ ...VALID_SEAT_FINDING }, null] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it('refuses plain-object findings rejected by normalization even alongside a valid finding', () => {
+    const text = answer({ 'red-team': { verdict: 'changes', findings: [{}, { ...VALID_SEAT_FINDING, summary: ' ' }, { ...VALID_SEAT_FINDING }] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it.each([{}, { summary: ' ' }, null])('refuses an accept with an unusable finding %j followed by prose', finding => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [finding] } }) + '\nHope that helps.';
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+  });
+  it('checks every finding before applying the per-seat output cap', () => {
+    const findings = Array.from({ length: 12 }, () => ({ ...VALID_SEAT_FINDING }));
+    const text = answer({ 'red-team': { verdict: 'changes', findings: [...findings, {}] } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: false, verdict: null, findings: [] });
+    expect(parseSeatAnswer(answer({ 'red-team': { verdict: 'changes', findings: [...findings, { ...VALID_SEAT_FINDING, summary: 'Another finding' }] } }), seats)['red-team'].findings).toHaveLength(12);
+  });
+  it('preserves findings matching both prompt contracts', () => {
+    const findings = [
+      { summary: 'Real finding', category: 'failing-input', file: 'scripts/x.mjs', line: 3, impactIfUnfixed: 'broken', failure_scenario: 'A concrete failure.' },
+      { summary: 'Another finding', category: 'failing-input', file: null, line: null, impactIfUnfixed: 'cosmetic', failure_scenario: 'Another concrete failure.' },
+    ];
+    const text = answer({ 'red-team': { verdict: 'changes', findings } });
+    expect(parseSeatAnswer(text, seats)['red-team']).toEqual({ ok: true, verdict: 'changes', findings: [
+      findings[0], { summary: 'Another finding', category: 'failing-input', impactIfUnfixed: 'cosmetic', failure_scenario: 'Another concrete failure.' },
+    ] });
+  });
+  it('does not recover an embedded fake answer inside an incomplete string', () => {
+    const text = '{"lenses":{"red-team":{"findings":[{"summary":"' + raw('codex-fenced');
+    expect(extractAnswerJson(text)).toBeNull();
+  });
+  it('refuses a truncated final correction rather than accepting an earlier echoed example', () => {
+    const text = answer({ 'red-team': { verdict: 'accept', findings: [] } }) + '\nCorrection:\n' + raw('truncated');
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(classifySeatCall('codex', { report: { lastMessage: text } }).status).toBe('unparseable');
+  });
+  it('both prompts require final-message JSON, forbid file/tool answers and backticks, and retain the example', () => {
+    for (const build of [buildSeatTask, buildRedTeamTask]) {
+      const task = build({ pr: 5, repo: REPO, title: 'T', seats, inline: { diffText: 'diff', body: '' } });
+      expect(task).toContain('ONLY this single JSON object');
+      expect(task).toContain('Every finding must include all six fields above; summary and impactIfUnfixed must be non-empty strings.');
+      expect(task).toContain('Include only the requested seat keys under lenses.');
+      expect(task).toContain('"line": integer|null');
+      expect(task).not.toContain('Only category is optional');
+      if (build === buildSeatTask) {
+        expect(task).toContain('"category": string|null');
+        expect(task).toContain('"failure_scenario": string|null');
+        expect(task).toContain('For the red-team seat, category and failure_scenario must be strings, never null.');
+      } else {
+        expect(task).toContain('"category": string,');
+        expect(task).toContain('"failure_scenario": string}');
+        expect(task).toContain('category and failure_scenario must be strings, never null.');
+      }
+      expect(task).toContain('put NO commentary after it.');
+      expect(task).not.toContain('no commentary before or after');
+      expect(task).toContain('Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters');
+      expect(task).toContain('must not end with a comma (,), an opening bracket ([), or a JSON key colon.');
+      expect(task).toContain('final message itself, NOT written to a file or reported via tool output');
+      expect(task).toContain('must not contain triple backticks');
+      expect(task).toContain('empty findings list with verdict "accept" is a valid answer');
+      expect(task).toContain('{"lenses":{"red-team":{"verdict":"accept","findings":[]}}}');
+    }
+  });
+});
+
+describe('seat answer schemas and provider argv', () => {
+  it('uses the strict schema dialect at every object and exactly the requested seat keys', () => {
+    const schema = seatAnswerJsonSchema(['red-team', 'claim-accuracy']);
+    const visitSchema = node => {
+      if (node.type === 'object') {
+        expect(node.additionalProperties).toBe(false);
+        expect(node.required).toEqual(Object.keys(node.properties));
+        Object.values(node.properties).forEach(visitSchema);
+      }
+      if (node.items) visitSchema(node.items);
+    };
+    visitSchema(schema);
+    expect(schema.properties.lenses.required).toEqual(['red-team', 'claim-accuracy']);
+    const seat = schema.properties.lenses.properties['red-team'];
+    expect(seat.properties.verdict.enum).toEqual(['accept', 'changes']);
+    expect(seat.properties.findings.items.properties).toEqual({
+      summary: { type: 'string', minLength: 1, pattern: '\\S' }, category: { type: 'string' }, file: { type: ['string', 'null'] },
+      line: { type: ['integer', 'null'] }, impactIfUnfixed: { type: 'string', minLength: 1, pattern: '\\S' }, failure_scenario: { type: 'string' },
+    });
+    expect(schema.properties.lenses.properties['claim-accuracy'].properties.findings.items.properties).toEqual({
+      summary: { type: 'string', minLength: 1, pattern: '\\S' }, category: { type: ['string', 'null'] }, file: { type: ['string', 'null'] },
+      line: { type: ['integer', 'null'] }, impactIfUnfixed: { type: 'string', minLength: 1, pattern: '\\S' }, failure_scenario: { type: ['string', 'null'] },
+    });
+  });
+  it.each(['codex', 'agy-gemini', 'agy-claude'])('passes the schema file safely through %s seat argv', provider => {
+    const opts = { provider, taskFile: 'task.md', schemaFile: 'task.md.schema.json', dir: 'checkout', model: 'model', effort: 'high', timeoutMs: 1000 };
+    const flag = provider === 'codex' ? '--output-schema-file=' : '--json-schema=';
+    expect(seatCallArgv(opts)).toContain(flag + opts.schemaFile);
+    expect(seatCallArgv({ ...opts, schemaFile: undefined }).some(a => a.startsWith(flag))).toBe(false);
+  });
+});
+
+describe('durable raw seat evidence', () => {
+  let root;
+  let effect;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'we-seat-raw-'));
+    effect = createExtraSeatsIo({ storePath: join(root, 'scores.json') }).writeRawAnswer;
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  it('deletes raw files older than 14 days after writing, preserving recent files and directories', () => {
+    const directory = join(root, 'seat-raw');
+    mkdirSync(directory);
+    const old = join(directory, 'old.txt');
+    const recent = join(directory, 'recent.txt');
+    const nested = join(directory, 'nested');
+    writeFileSync(old, 'old evidence');
+    writeFileSync(recent, 'recent evidence');
+    mkdirSync(nested);
+    const oldTime = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+    utimesSync(old, oldTime, oldTime);
+    utimesSync(nested, oldTime, oldTime);
+    const relative = effect({ callId: 'new', text: 'new evidence' });
+    expect(existsSync(old)).toBe(false);
+    expect(readFileSync(recent, 'utf8')).toBe('recent evidence');
+    expect(statSync(nested).isDirectory()).toBe(true);
+    expect(readFileSync(join(root, relative), 'utf8')).toBe('new evidence');
+  });
+  it('returns saved evidence even when retention cleanup throws', () => {
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => { throw new Error('cleanup clock failed'); });
+    try {
+      const relative = effect({ callId: 'cleanup-failure', text: 'saved evidence' });
+      expect(readFileSync(join(root, relative), 'utf8')).toBe('saved evidence');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it('tightens an existing seat-raw directory to owner-only access before writing evidence', () => {
+    const directory = join(root, 'seat-raw');
+    mkdirSync(directory);
+    chmodSync(directory, 0o755);
+    expect(statSync(directory).mode & 0o777).toBe(0o755);
+    const relative = effect({ callId: 'existing-directory', text: 'raw evidence' });
+    expect(statSync(directory).mode & 0o777).toBe(0o700);
+    expect(statSync(join(root, relative)).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(root, relative), 'utf8')).toBe('raw evidence');
+  });
+  it('keeps scan-budget exhaustion unparseable with durable evidence and a manual-review fallback', () => {
+    const text = '{'.repeat(200 * 1024);
+    const call = classifySeatCall('codex', { report: { lastMessage: text } });
+    const parsed = parseSeatAnswer(text, seats);
+    preserveSeatRawAnswer({ callId: 'scan-budget', call, seats, parsed }, { writeRawAnswer: effect });
+    expect(parsed['red-team'].ok).toBe(false);
+    expect(buildSeatRows({ callId: 'scan-budget', pr: 5, repo: REPO, seats, call, parsed })[0].status).toBe('unparseable');
+    const evidence = readFileSync(join(root, call.rawAnswerPath), 'utf8');
+    expect(evidence).toContain('[truncated at 64 KB;');
+    expect(evidence).toContain('new seat call or manual review');
+  });
+  it('keeps oversized answers unparseable with capped evidence and a manual-review fallback', () => {
+    const text = '"\\'.repeat(150 * 1024) + '\n' + answer({ 'red-team': { verdict: 'accept', findings: [] } });
+    const call = classifySeatCall('codex', { report: { lastMessage: text } });
+    const parsed = parseSeatAnswer(text, seats);
+    preserveSeatRawAnswer({ callId: 'scan-size', call, seats, parsed }, { writeRawAnswer: effect });
+    expect(call.status).toBe('unparseable');
+    expect(parsed['red-team'].ok).toBe(false);
+    expect(buildSeatRows({ callId: 'scan-size', pr: 5, repo: REPO, seats, call, parsed })[0].status).toBe('unparseable');
+    const evidence = readFileSync(join(root, call.rawAnswerPath));
+    expect(evidence.length).toBeLessThanOrEqual(64 * 1024);
+    expect(evidence.toString()).toContain('[truncated at 64 KB;');
+    expect(evidence.toString()).toContain('new seat call or manual review');
+  });
+  const raw = name => readFileSync(fileURLToPath(new URL('./fixtures/seat-raw/' + name + '.txt', import.meta.url)), 'utf8');
+  const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];
+  it.each(['reasoning-only', 'trailing-prose'])('sanitizes call IDs and writes private %s evidence beside the selected store', name => {
+    const call = { status: 'unparseable', text: raw(name), error: 'no JSON answer in the final message' };
+    preserveSeatRawAnswer({ callId: '../unsafe/call?1', call, seats, parsed: {} }, { writeRawAnswer: effect });
+    expect(call.rawAnswerPath).toBe('seat-raw/.._unsafe_call_1.txt');
+    expect(readFileSync(join(root, call.rawAnswerPath), 'utf8')).toBe(call.text);
+    expect(statSync(join(root, call.rawAnswerPath)).mode & 0o777).toBe(0o600);
+  });
+  it.each(['x', '🚀'])('caps oversized %s evidence at 64 KB with an operator-visible fallback', character => {
+    const call = { status: 'unparseable', text: character.repeat(70_000) };
+    preserveSeatRawAnswer({ callId: 'large', call, seats, parsed: {} }, { writeRawAnswer: effect });
+    const bytes = readFileSync(join(root, call.rawAnswerPath));
+    expect(bytes.length).toBeLessThanOrEqual(64 * 1024);
+    expect(bytes.toString()).toContain('[truncated at 64 KB;');
+    expect(bytes.toString()).toContain('new seat call or manual review');
+    expect(bytes.toString()).not.toContain('�');
+  });
+  it.each(['unparseable', 'error', 'timeout', 'quota-exhausted'])('saves any non-ok %s text without publishing a scrubbed replacement', status => {
+    const text = 'Unparsed evidence, including an opaque token: ghp_' + 'a'.repeat(40);
+    const call = { status, text };
+    preserveSeatRawAnswer({ callId: status, call, seats, parsed: {} }, { writeRawAnswer: effect });
+    expect(readFileSync(join(root, call.rawAnswerPath), 'utf8')).toBe(text);
+  });
+  it('does not write a file for empty text or a fully parsed answer', () => {
+    for (const call of [{ status: 'error', text: '' }, { status: 'error', text: '  ' }, { status: 'ok', text: answer({}) }]) {
+      preserveSeatRawAnswer({ callId: 'empty', call, seats, parsed: { 'red-team': { ok: true } } }, { writeRawAnswer: () => { throw new Error('must not write'); } });
+      expect(call.rawAnswerPath).toBeUndefined();
+      expect(call.rawAnswerError).toBeUndefined();
+    }
+    expect(existsSync(join(root, 'seat-raw'))).toBe(false);
+  });
+  it('does not copy a nonzero-exit final message into scorecard errors, including quota failures', () => {
+    for (const text of ['Opaque final reasoning without JSON', 'Quota exhausted: opaque final reasoning']) {
+      const call = classifySeatCall('codex', { report: { lastMessage: text, exitCode: 1 } });
+      preserveSeatRawAnswer({ callId: 'nonzero', call, seats, parsed: {} }, { writeRawAnswer: effect });
+      const [row] = buildSeatRows({ callId: 'nonzero', pr: 5, repo: REPO, seats, call, parsed: {} });
+      expect(row.status).toBe(text.startsWith('Quota') ? 'quota-exhausted' : 'unparseable');
+      expect(JSON.stringify(row)).not.toContain(text);
+      expect(readFileSync(join(root, row.rawAnswerPath), 'utf8')).toBe(text);
+    }
+  });
+  it('makes a failed evidence write visible and keeps the seat fail-closed', () => {
+    const call = { status: 'unparseable', text: raw('reasoning-only') };
+    const logs = [];
+    preserveSeatRawAnswer({ callId: 'failed', call, seats, parsed: {} }, { writeRawAnswer: () => { throw new Error('disk full'); }, log: line => logs.push(line) });
+    expect(call.status).toBe('unparseable');
+    expect(call.rawAnswerPath).toBeUndefined();
+    expect(logs).toEqual([call.rawAnswerError]);
+    expect(logs[0]).toContain('retry the seat call or review manually');
+    expect(buildSeatRows({ callId: 'failed', pr: 5, repo: REPO, seats, call, parsed: {} })[0]).toMatchObject({ status: 'unparseable', rawAnswerError: call.rawAnswerError });
+  });
+  it.each(['truncated', 'reasoning-only', 'trailing-prose', 'missing-seat'])('runExtraSeats saves %s once per call and references it on every row', async name => {
+    const text = name === 'missing-seat' ? answer({ 'claim-accuracy': { verdict: 'accept', findings: [] } }) : raw(name);
+    const writes = [];
+    const rawWrites = [];
+    const { io, calls, rows } = fakeSeatIo({
+      cliAvailable: provider => provider === 'codex',
+      writeFile: (path, contents) => writes.push([path, contents]),
+      writeRawAnswer: input => { rawWrites.push(input); return effect(input); },
+      runSeat: async opts => { calls.push(['seat', opts]); return { report: { lastMessage: text } }; },
+    });
+    const result = await runExtraSeats({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: LOOP_PAYLOAD, env: {} }, io);
+    expect(result.status).toBe('ran');
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.some(row => row.status === 'unparseable')).toBe(true);
+    expect(rawWrites).toHaveLength(calls.filter(call => call[0] === 'seat').length);
+    for (const row of rows) {
+      expect(rawWrites.filter(write => write.callId === row.callId)).toHaveLength(1);
+      expect(row.rawAnswerPath).toBe(`seat-raw/${row.callId}.txt`);
+      expect(readFileSync(join(root, row.rawAnswerPath), 'utf8')).toBe(text);
+      expect(JSON.stringify(row)).not.toContain(root);
+      expect(row).not.toHaveProperty('text');
+      expect(JSON.stringify(row)).not.toContain(text);
+    }
+    for (const [, opts] of calls.filter(call => call[0] === 'seat')) {
+      expect(opts.schemaFile).toBe(`${opts.taskFile}.schema.json`);
+      const schema = JSON.parse(writes.find(([path]) => path === opts.schemaFile)[1]);
+      expect(schema.properties.lenses.required).toEqual(rows.filter(row => row.model === opts.model && row.effort === opts.effort).map(row => row.seat === 'extra-juror' ? `extra-juror:${row.lens}` : row.lens));
+    }
+  });
+  it.each(['truncated', 'reasoning-only', 'trailing-prose', 'missing-seat'])('speculative red team preserves %s through completion and discard rows, without posting', async name => {
+    const text = name === 'missing-seat' ? answer({}) : raw(name);
+    const { io, calls, rows } = fakeSeatIo({
+      cliAvailable: provider => provider === 'codex', writeRawAnswer: effect,
+      readHeadMessage: () => '', runSeat: async opts => { calls.push(['seat', opts]); return { report: { lastMessage: text } }; },
+      postComment: () => { throw new Error('failed calls must never post'); },
+    });
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: LOOP_PAYLOAD.findings.read, env: {}, post: false }, io);
+    expect(pass.status).toBe('speculated');
+    expect(pass.call.rawAnswerPath).toBe(`seat-raw/${pass.callId}.txt`);
+    expect(pass.rawAnswerPath).toBe(pass.call.rawAnswerPath);
+    expect(readFileSync(join(root, pass.rawAnswerPath), 'utf8')).toBe(text);
+    const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: LOOP_PAYLOAD, pass, post: true }, io);
+    expect(result.status).toBe('failed');
+    expect(result.reason).toBe(name === 'missing-seat' ? 'red-team seat unparseable' : 'no JSON answer in the final message');
+    expect(result.rawAnswerPath).toBe(pass.rawAnswerPath);
+    expect(result.seat).toMatchObject({ status: 'unparseable', rawAnswerPath: pass.rawAnswerPath });
+    expect(result.comment.status).toBe('not-posted');
+    expect(rows).toHaveLength(1);
+    expect(JSON.stringify(rows)).not.toContain(root);
+    expect(JSON.stringify(rows)).not.toContain(text);
+    const discard = buildRedTeamDiscardRow({ pr: 5, repo: REPO, pass, reason: 'cancelled', now: NOW });
+    expect(discard.rawAnswerPath).toBe(pass.rawAnswerPath);
+    expect(calls.find(call => call[0] === 'seat')[1].schemaFile).toMatch(/task-red-team-codex\.md\.schema\.json$/);
+  });
 });

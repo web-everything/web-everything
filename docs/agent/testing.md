@@ -1251,6 +1251,19 @@ temporary git repo to verify gate arguments and green/red handling without recur
 suite. Exercise real subprocesses and git transport. Emit gate chatter in the fixture too: a CLI's
 machine-readable JSON stdout must remain parseable when its child gate prints output.
 
+Keep real-Git fixtures compatible with Forge's Git 2.43. An unsupported repository extension can
+prevent even read-only repository commands: inspect configuration with `git config --file`, and
+prove refusal by comparing filesystem bytes. Git's fetch negotiation may avoid a stale commit-graph,
+so verify an existing graph explicitly when testing corruption admission and repair. An `ls-files`
+exit 1 alone does not prove an untracked path: sparse-tree read failures can share that exit status.
+For a narrowed catch, keep one negative test per independent condition: the expected status with
+an unrelated diagnostic, and the expected diagnostic with another status. Fail-closed hook checks
+also need nonempty stdout and extra or partial stderr cases, in both reporting and repair modes.
+A test promising "only" or "never" must exercise the excluded case as well as the permitted one;
+assert the absence of retries or writes, not just the returned error.
+Send repository-sized path lists through NUL-delimited stdin, not argv; real-Git regressions should
+exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` while stdin succeeds.
+
 ### Passive-wait hook regression probes
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
@@ -1406,6 +1419,11 @@ A large seed commit can launch detached maintenance/repack that outlives `execFi
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
 do not hide the race with sleeps, cleanup retries, or exclusions from the snapshot.
 
+Git path safety tests must preserve raw command-output bytes until UTF-8 round-trip validation;
+include invalid filename bytes as well as a valid U+FFFD name. For generated safety attributes,
+probe the effective value with `git check-attr`, and test encoded line lengths near Git 2.43's
+2048-byte limit. An ignored override must refuse the merge before Git can allocate conflict markers.
+
 1. Test behavior, not implementation.
 2. One concept per test; descriptive names (`should notify listeners on setItem`).
 3. Arrange-Act-Assert. Reset state in `beforeEach`/`afterEach`.
@@ -1462,6 +1480,24 @@ npx vitest run --coverage           # coverage report
 ```
 
 ## Developing & manually testing in a lane
+
+An entry guard placed in the first side-effect import must finish synchronously before
+transferring execution. Awaiting IO in that guard lets sibling entry dependencies evaluate.
+The tools-root subprocess fixture pins this: a later dependency throws if local evaluation
+starts, while the selected tools entry records its actual cwd, argv and exit status.
+Tools-root redirection accepts only the three entries declared in `TOOLS_ROOT_ENTRIES`;
+an ordinary `scripts/` runner importing one of them as a library must stay local, even
+when a counterpart exists in the tools checkout. Pin both the no-spawn seam and the real
+import path. Pin every explicit resolver rejection reason, including a successful Git
+probe that names a different checkout root. The default event-writer fixtures must cover
+both timeout and excessive-output recovery before selected tooling starts.
+
+The synchronous tools-root wrapper cannot forward a signal addressed only to its PID;
+the selected child (or the event writer) can outlive it. Supervisors must terminate the
+whole process group. Moving to async signal forwarding also requires deferring sibling
+entry imports; awaiting the first side-effect import alone does not defer them.
+Oversized-input fixtures must measure requested ranges and cumulative bytes through the
+filesystem seam, including short reads; rejection alone does not prove bounded IO.
 
 Every edit — including an ad-hoc "just fix this one thing" — happens in an **isolated lane clone**, never the main checkout (#2123; the writer model in [platform-decisions.md#pr-flow-rollout-mechanism](platform-decisions.md#pr-flow-rollout-mechanism)). The lane trigger is *making an edit*, not *running a command*. The main checkout stays the human's — its dev server on `:3000`/`:8080` is theirs; don't build or serve into it.
 
