@@ -39,7 +39,7 @@ export default {
         run: (_bin, args) => ({ status: 0,
           stdout: JSON.stringify({ ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) }),
       });
-      const boot = resolveDaemonEntries({ WE_SMOKE_LIVE_CLONE: alias }, { root, runtimeEntries });
+      const boot = resolveDaemonEntries({ WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: alias }, { root, runtimeEntries });
       for (const p of ['scripts/extra-daemon.mjs', 'scripts/conveyor/branch-drift.mjs']) {
         if (!boot.entries.includes(p)) violations.push(`boot omitted aliased entry: ${p}`);
       }

@@ -1307,6 +1307,51 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
 });
 
 // LIVE INCIDENT 2026-10-04, PR #3826: card-only PR, an UNTOUCHED test hit the 5000 ms default, 3/3 heals burned.
+describe('timeout evidence required-check origin recovery', () => {
+  const repo = 'web-everything/web-everything';
+  const head = 'a'.repeat(40);
+  const origin = `https://github.com/${repo}/actions/runs/10/job/20`;
+  const fixture = () => ({ number: 5273, headRefOid: head, requiredCheckName: 'test',
+    statusCheckRollup: [
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ],
+  });
+
+  it('recovers the required check own run URL and reads timeout evidence exactly once with that origin', () => {
+    const pr = fixture();
+    const timeoutRetry = { eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory' };
+    const read = vi.fn(() => timeoutRetry);
+    const readCheckOrigin = vi.fn(({ repo: slug, pr: number, head: sha, name }) => {
+      expect({ repo: slug, pr: number, head: sha, name }).toEqual({ repo, pr: pr.number, head, name: pr.requiredCheckName });
+      return origin;
+    });
+    const [result] = enrichPrsWithTimeoutEvidence([pr], {
+      repo, enabled: true, read, readCheckOrigin, readBudget: () => ({ confirmed: 0, rejected: 0 }),
+    });
+    expect.soft(readCheckOrigin).toHaveBeenCalledTimes(1);
+    expect.soft(read).toHaveBeenCalledTimes(1);
+    expect.soft(read).toHaveBeenCalledWith(expect.objectContaining({
+      requiredCheckName: 'test',
+      statusCheckRollup: [pr.statusCheckRollup[0], { ...pr.statusCheckRollup[1], detailsUrl: origin }],
+    }), { repo });
+    expect.soft(result.timeoutRetry?.reason).not.toBe('missing-check-origin');
+    expect.soft(result.timeoutRetry).toEqual(timeoutRetry);
+  });
+
+  it('fails closed with missing-check-origin and never reads timeout evidence when origin recovery returns null', () => {
+    const read = vi.fn(() => ({ eligible: true }));
+    const readCheckOrigin = vi.fn(() => null);
+    const [result] = enrichPrsWithTimeoutEvidence([fixture()], {
+      repo, enabled: true, read, readCheckOrigin, readBudget: () => ({ confirmed: 0, rejected: 0 }),
+    });
+    expect.soft(readCheckOrigin).toHaveBeenCalledTimes(1);
+    expect.soft(readCheckOrigin).toHaveBeenCalledWith({ repo, pr: 5273, head, name: 'test' });
+    expect.soft(read).not.toHaveBeenCalled();
+    expect.soft(result.timeoutRetry).toEqual({ eligible: false, reason: 'missing-check-origin' });
+  });
+});
+
 describe('timeout re-run eligibility — card-only diff + derived red checks (PR #3826)', () => {
   const sources = { 'a.test.mjs': 'import "./b.mjs"; process.env.X;', 'b.mjs': 'export const b = 1;', 'vite.config.mts': 'export default {};' };
   const base = { head: 'h', sourceHead: 'h', sources, roots: ['vite.config.mts', 'a.test.mjs'] };

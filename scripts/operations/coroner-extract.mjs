@@ -267,7 +267,7 @@ export function gateCause(marker) {
 
 const SOAK = /soak/i;
 export function ciCheckName(jobName, runName = '') {
-  const name = String(jobName || '');
+  const name = String(jobName || '').replace(/^hetzner \/ /, '');
   if (/codeql/i.test(name) || /codeql/i.test(runName)) return 'CodeQL';
   if (/daemon-soak/i.test(name)) return 'daemon-soak';
   if (SOAK.test(name) || SOAK.test(runName)) return 'soak-shard';

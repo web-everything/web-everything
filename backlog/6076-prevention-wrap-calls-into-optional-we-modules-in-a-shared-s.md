@@ -3,9 +3,10 @@ bornAs: xwb5txn
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:tools/drain-daemon/daemon.mjs", "we:tools/drain-daemon/__tests__/daemon.test.mjs"]
 dateOpened: "2026-10-13"
+dateResolved: "2026-10-29"
 tags: []
 ---
 
