@@ -1,5 +1,15 @@
 # Testing — Three-Tier Strategy
 
+## Probe worker timeout teardown
+
+Worker timeout promises must wait for `worker.terminate()` before rejecting. Reserve
+the timeout outcome first so late message, error and exit events cannot replace it.
+Rejecting before shutdown lets a caller tear down its own worker while the nested
+worker is still exiting; the health-job test reproduced V8's
+`SourceTextModule::AsyncModuleExecutionFulfilled` fatal error in this window.
+`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` holds termination open
+to test this ordering for both GH probes and PR sweeps, including termination failure.
+
 ## Forge manifest reuse
 
 `forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on

@@ -504,9 +504,12 @@ export function runProbeWorker({ input, timeoutMs = GH_PROBE_TIMEOUT_MS, workerU
     let settled = false;
     const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
     const timer = setTimeout(() => {
-      // Settle first: terminating fires the worker's own 'exit', which must not be reported as a crash.
-      done(reject, new Error(`gh probe worker timed out after ${timeoutMs}ms`));
-      worker.terminate().catch(() => {});
+      // Reserve the timeout before termination emits 'exit', but wait for shutdown before rejecting.
+      // Otherwise the caller (including Vitest) can tear down its own worker with this one still exiting.
+      if (settled) return;
+      settled = true;
+      const error = new Error(`gh probe worker timed out after ${timeoutMs}ms`);
+      worker.terminate().then(() => reject(error), () => reject(error));
     }, timeoutMs);
     worker.once('message', (msg) => done(resolveRun, msg));
     worker.once('error', (e) => done(reject, e));
