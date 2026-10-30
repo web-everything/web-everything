@@ -191,7 +191,7 @@ const symrefTargets = (dir) => {
     // Packed refs cannot be symbolic; for-each-ref below still covers both loose and packed refs/ entries.
     nextHop('HEAD');
     for (const entry of readdirSync(gitDir, { withFileTypes: true })) {
-      if (entry.isFile() && /^[A-Z_]+$/.test(entry.name) && readFileSync(join(gitDir, entry.name), 'utf8').startsWith('ref: ')) nextHop(entry.name);
+      if (entry.isFile() && /^[A-Z_]+$/.test(entry.name) && /^ref:\s*(\S+)/.test(readFileSync(join(gitDir, entry.name), 'utf8'))) nextHop(entry.name);
     }
     for (const line of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--format=%(if)%(symref)%(then)%(refname) %(symref)%(end)']).split('\n')) {
       if (!line) continue;

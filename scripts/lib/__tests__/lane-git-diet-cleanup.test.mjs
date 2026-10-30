@@ -751,6 +751,20 @@ describe('real git: cleanup CLI', () => {
     }],
     ['another symbolic ref', (dir) => { git(dir, 'symbolic-ref', 'refs/heads/alias', OPS); return [dir, 'refs/heads/alias', [OPS]]; }],
     ['a root ref', (dir) => { git(dir, 'symbolic-ref', 'FOO_HEAD', OPS); return [dir, 'FOO_HEAD', [OPS]]; }],
+    ...[
+      ['a tab-separated root ref', '\t'],
+      ['a root ref with mixed separator whitespace', ' \t '],
+      ['a root ref without separator whitespace', ''],
+    ].map(([name, separator]) => [name, (dir) => {
+      writeFileSync(join(dir, '.git', 'FOO_HEAD'), `ref:${separator}${OPS}\n`);
+      return [dir, 'FOO_HEAD', [OPS]];
+    }]),
+    ['a tab-separated linked worktree root ref', (dir) => {
+      const wt = join(root, 'symref-worktree');
+      git(dir, 'worktree', 'add', '-q', '--detach', wt);
+      writeFileSync(join(git(wt, 'rev-parse', '--absolute-git-dir'), 'FOO_HEAD'), `ref:\t${OPS}\n`);
+      return [wt, 'FOO_HEAD', [OPS]];
+    }],
     ['HEAD through a chain of ops refs', (dir) => {
       git(dir, 'symbolic-ref', HOP, OPS);
       git(dir, 'symbolic-ref', 'HEAD', HOP);
@@ -764,6 +778,7 @@ describe('real git: cleanup CLI', () => {
     const tip = git(dir, 'rev-parse', OPS);
     try {
       const [cwd, symref, kept] = plant(dir);
+      expect(git(cwd, 'rev-parse', '--verify', symref)).toBe(tip);
       const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=25', '--json'], { env, encoding: 'utf8' }));
       expect(out.rows[0]).toMatchObject({ mode: 'apply', opsRefsDeleted: 0, opsRefsKept: kept });
       expect(git(cwd, 'rev-parse', '--verify', symref)).toBe(tip);
