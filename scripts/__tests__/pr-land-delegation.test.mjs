@@ -17,11 +17,13 @@ afterEach(() => {
 });
 const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
 let loadN = 0;
+const prLandPath = resolve(import.meta.dirname, '../pr-land.mjs');
 async function load(args = []) {
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
   // Re-evaluate argv-derived defaults without reloading the entire CLI dependency graph.
-  return import(`../pr-land.mjs?fresh=${++loadN}`);
+  // Vite cannot statically resolve a relative template with a query, so build an absolute specifier.
+  return import(/* @vite-ignore */ `${prLandPath}?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
