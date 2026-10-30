@@ -203,6 +203,7 @@ describe('adaptLegacyRemoteResult', () => {
     'invalid-parameters',
     'forge-unreachable',
     'copy-failed',
+    'ignored-test-file',
     'unsupported-sibling-dependency',
   ])('maps %s to a confirmed non-start only at the adapter boundary', async (reason) => {
     const legacy = { mode: 'fallback', reason };
@@ -275,6 +276,18 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 1, 'remote');
   });
 
+  it.each([0, 254])('accepts remote completion at valid exit boundary %s', async code => {
+    expect(await runWithRemoteDecision(fixture({result:{mode:'remote', code}})))
+      .toEqual({handled:true, exitCode:code});
+  });
+
+  it.each([-1, 255, 999, 1.5, NaN, Infinity, '0', undefined])
+  ('refuses local rerun for invalid remote exit code %s', async code => {
+    const f = fixture({result:{mode:'remote', code}});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:true, exitCode:124});
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('refusing local rerun'));
+  });
+
   it.each([undefined, true])('legacy fallback refuses local rerun even with terminated=%s', async (terminated) => {
     const reason = 'remote receipt unavailable';
     const f = fixture({ result: { mode: 'fallback', reason, terminated } });
@@ -311,6 +324,7 @@ describe('runWithRemoteDecision', () => {
       const actions = [];
       const exec = vi.fn(async (call) => {
         if (call.file === 'git' && call.args.includes('-i')) return { code: 0, stdout: Buffer.alloc(0) };
+        if (call.file === 'git' && call.args.includes('--stage')) return { code: 0, stdout: Buffer.alloc(0) };
         if (call.file === 'rsync') return { code: 0, stdout: '' };
         if (call.file === 'ssh') {
           const action = call.args.at(-1).split(' ').at(-1);
