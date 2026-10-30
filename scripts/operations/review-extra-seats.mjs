@@ -67,7 +67,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS } from './review-dispatch.mjs';
+import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from './review-dispatch.mjs';
 import {
   REVIEW_SEAT_DISPATCH_KIND, REVIEW_SEAT_PROVIDERS, reviewSeatTaskType, selectReviewSeatProvider,
 } from '../lib/provider-routing.mjs';
@@ -523,11 +523,17 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`added seats: could not read the scorecard store (${e.message}) — treating it as empty`); }
-    // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveProviderCap`/
+    // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveRoutingProviderCap`/
     // `callsUsedTodayForProvider`): a provider at its own cap is treated exactly like a quota hold or a missing
     // CLI — excluded from `available` — so `reviewSeatRoutes` naturally falls the seat back to whichever OTHER
     // provider still has budget, never to "no seat" while at least one provider does.
-    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
+    const routingEntries = [`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]
+      .map(task => routingPolicy.operations[`review-seat:${task}`] ?? routingPolicy.operations['review-seat']);
+    // A live enable on any added seat opens its provider's shared budget; route resolution still enforces
+    // each seat's disables. Explicit env caps remain binding for every entry.
+    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p,
+      Math.max(...routingEntries.map(entry => resolveRoutingProviderCap(p, env, entry))),
+    ]));
     const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     let available = [];
     const unavailable = [];

@@ -7,6 +7,8 @@ import { createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { operatorPreferencesPath, readPlatformPreferences, PLATFORM_PREFERENCES_PATH } from '../policy-cascade.mjs';
 import { resolveRoutingProviderCap } from '../../operations/review-seat-policy.mjs';
+import { runExtraSeats, reserveSeatCalls } from '../../operations/review-extra-seats.mjs';
+import { ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from '../../operations/review-dispatch.mjs';
 
 const key = 'review-seat:red-team';
 const dirs = [];
@@ -26,6 +28,69 @@ function fixture(realEvents = false) {
 }
 
 describe('operator routing overrides', () => {
+  it('applies operation provider disables after resolving an inherited task-type route', () => {
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { disabledProviders: ['codex'] } });
+    expect(resolveOperationRoute({ operation: 'fix', taskType: 'doc-fix', policy })).toMatchObject({
+      provider: 'claude', fallback: [],
+    });
+    expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'doc-fix', policy, available: ['codex'] }))
+      .toThrow(/no available route/);
+  });
+
+  it('filters disabled inherited fallbacks while retaining task-type provider disables', () => {
+    const base = structuredClone(DEFAULT_ROUTING_POLICY);
+    base.taskTypes['doc-fix'] = { provider: 'agy-claude', model: 'sonnet', disabledProviders: ['agy-claude'],
+      fallback: [{ provider: 'codex', model: 'sol' }, { provider: 'claude', model: 'sonnet' }] };
+    const policy = applyRoutingOverrides(base, { fix: { disabledProviders: ['codex'] } });
+    expect(resolveOperationRoute({ operation: 'fix', taskType: 'doc-fix', policy })).toMatchObject({
+      provider: 'claude', fallback: [],
+    });
+  });
+
+  it.each([[undefined, 300], ['0', 0], ['1', 1]])(
+    'runs an overridden Gemini advisory seat with env cap %s, preserving the reservation bound', async (envCap, cap) => {
+      const base = structuredClone(DEFAULT_ROUTING_POLICY);
+      const seatKey = 'review-seat:standards-conformance';
+      for (const task of [`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]) {
+        base.operations[`review-seat:${task}`] = { provider: 'codex', model: 'sol', fallback: [] };
+      }
+      base.operations[seatKey] = { inherit: true };
+      const policy = applyRoutingOverrides(base, { [seatKey]: { provider: 'agy-gemini', model: 'pro', fallback: [] } });
+      const env = envCap === undefined ? {} : { WE_REVIEW_SEAT_CAP_AGY_GEMINI: envCap };
+      const now = Date.parse('2026-10-30T12:00:00Z');
+      let ledger = null;
+      const io = {
+        now: () => now, readRecords: () => [], log: vi.fn(), cliAvailable: p => p === 'agy-gemini',
+        reserveCalls: vi.fn(options => {
+          const reservation = reserveSeatCalls({ ...options, ledger, records: [], newId: () => 'advisory-call' });
+          ledger = reservation.ledger;
+          return reservation;
+        }),
+        makeScratch: () => temp(), removeScratch: vi.fn(), writeFile: vi.fn(), append: vi.fn(),
+        runSeat: vi.fn(async () => ({ exitCode: 0, report: { events: { finalResponse: JSON.stringify({
+          lenses: { 'standards-conformance': { verdict: 'accept', findings: [] } },
+        }) } } })),
+      };
+      const input = { pr: 5, repo: 'test/repo', lanePath: temp(), env, routingPolicy: policy,
+        loopPayload: { findings: { read: { diffText: 'diff --git a/x b/x\n+1\n', netBasis: { rev: 'a'.repeat(40) } } } } };
+      const result = await runExtraSeats(input, io);
+      expect(result.status).toBe(cap ? 'ran' : 'skipped');
+      expect(result.providerUsage['agy-gemini'].cap).toBe(cap);
+      if (cap) {
+        expect(io.reserveCalls).toHaveBeenCalledWith(expect.objectContaining({ provider: 'agy-gemini', dailyCap: cap, want: 1 }));
+        expect(io.runSeat).toHaveBeenCalledTimes(1);
+        expect(io.runSeat).toHaveBeenCalledWith(expect.objectContaining({ provider: 'agy-gemini', model: 'gemini-3.1-pro' }));
+        expect(result.seats).toContainEqual(expect.objectContaining({ lens: 'standards-conformance', provider: 'agy-gemini' }));
+        if (cap === 1) {
+          expect((await runExtraSeats(input, io)).status).toBe('skipped');
+          expect(io.runSeat).toHaveBeenCalledTimes(1);
+        }
+      } else {
+        expect(io.reserveCalls).not.toHaveBeenCalled();
+        expect(io.runSeat).not.toHaveBeenCalled();
+      }
+    });
+
   it('merges effort leaves, replaces fallback order, and gives platform selection precedence over repo policy', () => {
     const base = structuredClone(DEFAULT_ROUTING_POLICY);
     base.operations[key] = { provider: 'codex', model: 'sol', effort: { codex: 'high', 'agy-gemini': 'low' }, fallback: [] };

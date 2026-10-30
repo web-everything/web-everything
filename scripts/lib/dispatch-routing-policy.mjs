@@ -130,6 +130,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
   let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
   if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size) && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) entry = policy.smallPrepare.route;
   else if (['prepare', 'prepare-item'].includes(operation) && (size >= 5 || designQuestion === true)) entry = policy.operations['prepare-decision'];
+  const disabledProviders = entry?.disabledProviders ?? [];
   if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
   if (entry.inherit) {
     if (!gateClosed) return null;
@@ -139,7 +140,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     if (!entry || entry.inherit) return null;
   }
   const chain = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }))
-    .filter(route => !entry.disabledProviders?.includes(route.provider))
+    .filter(route => !disabledProviders.includes(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]
       && !(route.provider.startsWith('agy-') && availability?.antigravity)
