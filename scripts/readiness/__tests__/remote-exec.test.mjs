@@ -1,10 +1,11 @@
 // @vitest-environment node
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import * as filesystem from 'node:fs/promises';
 import {
   isAllowedCommand, filterEnv, validateRunId,
   runRemote, main as runRemoteCli, parseArgs,
@@ -103,7 +104,7 @@ function realRemoteFixture(files) {
     if (call.file === 'rsync') {
       const args = call.args.filter((arg,i,all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
       args[args.length-1] = join(root,'runs',serverRun,'work') + '/';
-      const result = spawnSync('rsync',args,{cwd,input:call.input,encoding:'utf8',timeout:10000});
+      const result = spawnSync('rsync',args,{cwd:call.cwd,input:call.input,encoding:'utf8',timeout:10000});
       return {code:result.status,stdout:result.stdout};
     }
     if (isRun(call)) {
@@ -557,6 +558,62 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it('sends only verified staged bytes when a live file becomes private after manifest build', async () => {
+    const f = fixture();
+    const transport = f.exec;
+    let staging;
+    f.exec = vi.fn(async call => {
+      if (isPrepare(call)) writeFileSync(join(cwd, 'a.test.mjs'), 'private bytes');
+      if (call.file === 'rsync') {
+        staging = call.cwd;
+        expect(readFileSync(join(staging, 'a.test.mjs'), 'utf8')).toBe('fixture');
+        expect(staging).not.toBe(cwd);
+        expect(statSync(staging).mode & 0o777).toBe(0o700);
+      }
+      return transport(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'remote', code:0});
+    expect(staging).toBeDefined();
+    expect(existsSync(staging)).toBe(false);
+  });
+
+  it.each(['private bytes', 'symlink', 'directory', 'missing', 'unreadable'])
+  ('aborts not-started without transmission when injected fs swaps a source to %s after the manifest read', async kind => {
+    const f = fixture();
+    let staging;
+    const source = join(cwd, 'a.test.mjs');
+    const fs = {...filesystem, mkdtemp:vi.fn(async prefix => {
+      staging = await filesystem.mkdtemp(prefix);
+      return staging;
+    }), open:vi.fn(async (path, flags) => {
+      expect(flags & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
+      if (kind === 'unreadable') throw Object.assign(new Error('unreadable'), {code:'EACCES'});
+      return filesystem.open(path, flags);
+    }), readFile:vi.fn(async path => {
+      const data = await filesystem.readFile(path);
+      if (Buffer.from(path).equals(Buffer.from(join(cwd, 'package-lock.json')))) {
+        rmSync(source);
+        if (kind === 'symlink') symlinkSync(join(cwd, 'package-lock.json'), source);
+        else if (kind === 'directory') mkdirSync(source);
+        else if (kind !== 'missing') writeFileSync(source, 'private bytes');
+      }
+      return data;
+    })};
+    expect(await runRemote({...f, fs})).toEqual({mode:'not-started', terminated:true, reason:'snapshot-staging-failed'});
+    expect(callsOf(f.exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+    expect(staging).toBeDefined();
+    expect(existsSync(staging)).toBe(false);
+  });
+
+  it.each([{prepareCode:1}, {copyCode:1}, {runCode:1}, {receiptCode:1}])
+  ('removes the staging directory after transport failure %j', async options => {
+    const f = fixture(options);
+    const fs = {...filesystem, mkdtemp:vi.fn(filesystem.mkdtemp)};
+    await runRemote({...f, fs});
+    expect(fs.mkdtemp).toHaveBeenCalledOnce();
+    expect(existsSync(await fs.mkdtemp.mock.results[0].value)).toBe(false);
+  });
+
   it('admits local execution for a Git-ignored test through the real legacy adapter', async () => {
     const f = fixture();
     const exec = f.exec;
@@ -592,7 +649,7 @@ describe('runRemote', () => {
       if (call.file === 'rsync') {
         const args = call.args.filter((arg, i, all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
         args[args.length-1] = destination + '/';
-        copied = spawnSync('rsync', args, {cwd, input:call.input, encoding:'utf8', timeout:10000});
+        copied = spawnSync('rsync', args, {cwd:call.cwd, input:call.input, encoding:'utf8', timeout:10000});
         return {code:copied.status, stdout:copied.stdout};
       }
       return exec(call);
@@ -602,7 +659,8 @@ describe('runRemote', () => {
     expect(copied.error).toBeUndefined();
     expect(readFileSync(join(destination, 'package-lock.json'), 'utf8')).toContain('lockfileVersion');
     expect(readFileSync(join(destination, 'src', 'kept.mjs'), 'utf8')).toBe('selected nested file');
-    expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['package-lock.json', 'src', 'src/kept.mjs']);
+    expect(readFileSync(join(destination, 'a.test.mjs'), 'utf8')).toBe('fixture');
+    expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['a.test.mjs', 'package-lock.json', 'src', 'src/kept.mjs']);
   });
 
   it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
@@ -1012,10 +1070,15 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
     return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
   }
-  function gitInventory(paths, stage = Buffer.alloc(0)) {
+  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
     return vi.fn(async call => {
       expect(call.file).toBe('git');
       expect(call.args).toContain('-z');
+      if (call.args[0] === 'ls-tree') {
+        expect(call.args).toEqual(['ls-tree', '-r', '-z', 'origin/main']);
+        if (tree instanceof Error) throw tree;
+        return tree;
+      }
       return {code:0, stdout:call.args.includes('-i') ? Buffer.alloc(0) : call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
     });
   }
@@ -1182,12 +1245,105 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
   });
 
+  const blob = data => createHash('sha1').update(`blob ${Buffer.byteLength(data)}\0`).update(data).digest('hex');
+  const indexRecord = (name, data) => Buffer.from(`100644 ${blob(data)} 0\t${name}\0`);
+  const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
+
+  it.each([
+    '.claude/skills/x/SKILL.md', '.githooks/pre-commit.js', '.eleventy.js',
+    '.claude/secrets.md', '.secret.js', 'secret-directory/.hidden.md',
+    'private.key/safe.md', 'secret.key/safe.js', '.env.local.js',
+    '.netrc/safe.md', '.npmrc/safe.js',
+  ])('silently excludes tracked forbidden source %s and proceeds remotely without public evidence', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    writeFileSync(join(cwd, name), 'DO_NOT_TRANSMIT');
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const stage = indexRecord(name, 'DO_NOT_TRANSMIT');
+    const inventory = gitInventory(paths, stage, new Error('must not read public evidence'));
+    const manifest = await build({cwd, exec:inventory});
+    expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
+    expect(manifest.excluded).toEqual([Buffer.from(name)]);
+    expect(callsOf(inventory).some(call => call.args[0] === 'ls-tree')).toBe(false);
+    const exec = acceptingTransport(paths, stage);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
+    expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it.each(['.claude/skills/x/SKILL.test.md', '.eleventy.test.js', '.claude/secrets.test.js', 'private.key/safe.test.js'])
+  ('still refuses excluded test %s before transmitting a snapshot', async name => {
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
+    await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it.each(['id_custom.md', 'id_backup/safe.js'])
+  ('requires public evidence for credential-name-only source %s', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    writeFileSync(join(cwd, name), 'public');
+    const paths = [Buffer.from(name)];
+    const stage = indexRecord(name, 'public');
+    await expect(build({cwd, exec:gitInventory(paths, stage)}))
+      .rejects.toMatchObject({code:'excluded-source-file'});
+    const manifest = await build({cwd, exec:gitInventory(paths, stage,
+      {code:0, stdout:treeRecord(name, 'public')})});
+    expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
+    expect(manifest.excluded).toEqual([]);
+  });
+
   it('keeps tracked credential JSON excluded from entries', async () => {
     const paths = [Buffer.from('secret-example.json')];
     const stage = Buffer.from(`100644 ${'a'.repeat(40)} 0\tsecret-example.json\0`);
     const manifest = await build({cwd, exec:gitInventory(paths, stage)});
     expect(manifest.entries).toEqual([]);
     expect(manifest.excluded).toEqual(paths);
+  });
+
+  it.each(['mjs','js','ts','tsx','jsx','css','md','html'])
+  ('allows public credential-named .%s source with matching index and working bytes', async ext => {
+    const names = [`credentials.${ext}`, `secret-directory/safe.${ext}`];
+    mkdirSync(join(cwd, 'secret-directory'));
+    for (const name of names) writeFileSync(join(cwd, name), 'public');
+    const exec = gitInventory(names.map(name => Buffer.from(name)), Buffer.concat(names.map(name => indexRecord(name, 'public'))),
+      {code:0, stdout:Buffer.concat(names.map(name => treeRecord(name, 'public')))});
+    const manifest = await build({cwd, exec});
+    expect(manifest.entries.map(entry => entry.path.toString())).toEqual(names);
+    expect(manifest.excluded).toEqual([]);
+    expect(callsOf(exec).filter(call => call.args[0] === 'ls-tree')).toHaveLength(1);
+  });
+
+  it.each(['modified', 'untracked', 'new', 'staged-different'])
+  ('refuses %s credential source despite public evidence where available', async kind => {
+    const name = 'credentials.md';
+    writeFileSync(join(cwd, name), kind === 'modified' ? 'private' : 'public');
+    const stage = kind === 'untracked' ? Buffer.alloc(0) : indexRecord(name, kind === 'staged-different' ? 'private' : 'public');
+    const tree = {code:0, stdout:kind === 'new' ? Buffer.alloc(0) : treeRecord(name, 'public')};
+    await expect(build({cwd, exec:gitInventory([Buffer.from(name)], stage, tree)}))
+      .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
+  });
+
+  it.each([
+    {code:128, stdout:Buffer.alloc(0)}, new Error('unreadable origin/main'),
+    {code:0, stdout:Buffer.from('malformed\0')},
+    {code:0, stdout:Buffer.alloc(4 * 1024 * 1024 + 1)},
+    {code:0, stdout:treeRecord('credentials.md', 'public').subarray(0, -1)},
+  ])('refuses credential source when origin/main evidence is unavailable or incomplete: %s', async tree => {
+    writeFileSync(join(cwd, 'credentials.md'), 'public');
+    await expect(build({cwd, exec:gitInventory([Buffer.from('credentials.md')], indexRecord('credentials.md', 'public'), tree)}))
+      .rejects.toMatchObject({code:'excluded-source-file'});
+  });
+
+  it.each(['secrets.json', 'credentials.yaml', 'secret.pem', 'credentials', '.secrets/safe.md', 'secret.key/safe.md'])
+  ('keeps public tracked non-source or forbidden-component path %s excluded', async name => {
+    const paths = [Buffer.from(name)];
+    const exec = gitInventory(paths, indexRecord(name, 'public'), {code:0, stdout:treeRecord(name, 'public')});
+    const manifest = await build({cwd, exec});
+    expect(manifest.entries).toEqual([]);
+    expect(manifest.excluded).toEqual(paths);
+    expect(callsOf(exec).some(call => call.args[0] === 'ls-tree')).toBe(false);
   });
 
   it.each(['.github/workflows/ci.yml','.husky/pre-commit','.vscode/settings.json','.storybook/main.ts','.changeset/change.md',
