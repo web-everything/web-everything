@@ -2956,6 +2956,14 @@ uses asynchronous Git so it cannot block the execution timer; neither its one-se
 client invocation and success before advancing fake time. Provenance assertions must await background
 writes explicitly while preserving once-per-process logs and change-only events.
 
+The persistence deadline cannot cancel a filesystem open blocked on a FIFO. Before reading override
+state, use `lstat` to reject symlinks and special files, and skip reads above the 4096-byte cap.
+Open descriptors with `O_NONBLOCK | O_NOFOLLOW` where supported and verify the descriptor is regular.
+Publish through an exclusive sibling temp file plus rename, checking the destination is still absent
+or regular before replacement. Unreadable or special state skips persistence while the client runs.
+The native FIFO regression in `heavy-admission-import-boundary.test.mjs` must let its subprocess exit
+naturally under a timeout: observing the client result alone misses a live, abandoned filesystem request.
+
 ## Admission imports and daemon closures
 
 Heavy admission is imported by review, promotion, self-sync and smoke machinery. A computed import

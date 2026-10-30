@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { constants, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as provenanceIo from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -37,6 +37,18 @@ function fixture(source = success) {
   const run = (extra = {}) => runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: root, env: {},
     policy, loadPerCore: () => 0, log: seams.log, remoteExec: createRemoteExec({ ...seams, ...extra }) });
   return { root, clientPath, policy, seams, run, state: join(dirname(lockRoot), 'remote', 'client-override.json') };
+}
+
+function mockProvenanceFs() {
+  return { lstat: vi.fn(async () => ({ isFile: () => true, size: 2 })),
+    readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+}
+function makeFifo(file, context) {
+  try { execFileSync('mkfifo', [file], { timeout: 1000, maxBuffer: 4096 }); }
+  catch (error) {
+    if (['ENOENT', 'ENOSYS', 'ENOTSUP'].includes(error.code)) context.skip();
+    throw error;
+  }
 }
 
 describe('remote client override', () => {
@@ -344,26 +356,32 @@ describe('remote client override', () => {
     await vi.waitFor(() => expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual(previous));
   });
 
-  it.each([4096, 8192])('production provenance reader requests at most 4097 bytes at offset 0 for a %i-byte file', async (size) => {
+  it.each([4096, 8192])('production provenance reader bounds a file growing to %i bytes to one 4097-byte read', async (size) => {
     const f = fixture();
     mkdirSync(dirname(f.state), { recursive: true });
-    writeFileSync(f.state, JSON.stringify({ clientPath: 'old-client', sha: 'old-sha' }).padEnd(size, ' '));
+    const raw = JSON.stringify({ clientPath: 'old-client', sha: 'old-sha' });
+    writeFileSync(f.state, raw.padEnd(4096, ' '));
     const realOpen = provenanceIo.open;
     let handle;
     let read;
     let close;
     const open = vi.spyOn(provenanceIo, 'open').mockImplementationOnce(async (...args) => {
       handle = await realOpen(...args);
-      read = vi.spyOn(handle, 'read');
+      const realRead = handle.read.bind(handle);
+      read = vi.spyOn(handle, 'read').mockImplementationOnce(async (...readArgs) => {
+        // Grow after both path and descriptor stat: the read itself must still be bounded.
+        writeFileSync(f.state, raw.padEnd(size, ' '));
+        return realRead(...readArgs);
+      });
       close = vi.spyOn(handle, 'close');
       return handle;
     });
     try {
-      // Keep provenanceFs unset: observe the production reader and real filesystem IO.
       expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
-      await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
-      expect(open).toHaveBeenCalledTimes(1);
-      expect(open).toHaveBeenCalledWith(f.state, 'r');
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
+      expect(open.mock.calls.filter(([file]) => file === f.state)).toEqual([
+        [f.state, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0)],
+      ]);
       expect(read).toHaveBeenCalledTimes(1);
       const [buffer, offset, length, position] = read.mock.calls[0];
       expect(Buffer.isBuffer(buffer)).toBe(true);
@@ -373,11 +391,125 @@ describe('remote client override', () => {
       expect(position).toBe(0);
       expect((await read.mock.results[0].value).bytesRead).toBe(Math.min(size, 4097));
       expect(close).toHaveBeenCalledTimes(1);
+      expect(f.seams.appendEvent.mock.calls[0][0].detail.previous)
+        .toEqual(size === 4096 ? { clientPath: 'old-client', sha: 'old-sha' } : null);
     } finally {
       open.mockRestore();
       if (handle) await handle.close();
     }
   });
+
+  it('replaces oversized regular provenance without opening it for reading', async () => {
+    const f = fixture();
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, 'x'.repeat(8192));
+    const open = vi.spyOn(provenanceIo, 'open');
+    try {
+      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
+      expect(open).toHaveBeenCalledTimes(1);
+      const [temporary, flags, mode] = open.mock.calls[0];
+      expect(dirname(temporary)).toBe(dirname(f.state));
+      expect(temporary).not.toBe(f.state);
+      expect(flags).toBe(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+        | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+      expect(mode).toBe(0o600);
+      expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toBeNull();
+    } finally { open.mockRestore(); }
+  });
+
+  it.each([false, true])('publishes complete sibling provenance atomically and cleans up when rename fails=%s', async (fail) => {
+    const f = fixture();
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, '{}');
+    const realRename = provenanceIo.rename;
+    let publication;
+    const rename = vi.spyOn(provenanceIo, 'rename').mockImplementationOnce(async (temporary, destination) => {
+      publication = { temporary, destination, previous: readFileSync(f.state, 'utf8'),
+        next: JSON.parse(readFileSync(temporary, 'utf8')) };
+      if (fail) throw new Error('rename unavailable');
+      return realRename(temporary, destination);
+    });
+    const realUnlink = provenanceIo.unlink;
+    let cleanup;
+    const unlink = vi.spyOn(provenanceIo, 'unlink').mockImplementationOnce((...args) => {
+      cleanup = realUnlink(...args);
+      return cleanup;
+    });
+    try {
+      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      await vi.waitFor(() => expect(unlink).toHaveBeenCalledTimes(1));
+      await cleanup.catch(() => {});
+      expect(rename).toHaveBeenCalledTimes(1);
+      expect(dirname(publication.temporary)).toBe(dirname(f.state));
+      expect(publication.destination).toBe(f.state);
+      expect(publication.previous).toBe('{}');
+      expect(publication.next).toEqual({
+        clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123',
+      });
+      expect(readdirSync(dirname(f.state))).toEqual(['client-override.json']);
+      expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(fail ? {} : {
+        clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123',
+      });
+    } finally { rename.mockRestore(); unlink.mockRestore(); }
+  });
+
+  it.each(['directory', 'symlink', 'dangling symlink', 'FIFO'])(
+    'skips all provenance IO for a %s while the client succeeds', async (kind, context) => {
+      const f = fixture();
+      mkdirSync(dirname(f.state), { recursive: true });
+      const target = join(f.root, 'untouched.json');
+      writeFileSync(target, 'untouched');
+      if (kind === 'directory') mkdirSync(f.state);
+      else if (kind === 'FIFO') makeFifo(f.state, context);
+      else symlinkSync(kind === 'symlink' ? target : join(f.root, 'absent'), f.state);
+      const before = lstatSync(f.state);
+      const stat = vi.spyOn(provenanceIo, 'lstat');
+      const open = vi.spyOn(provenanceIo, 'open');
+      const mkdir = vi.spyOn(provenanceIo, 'mkdir');
+      const rename = vi.spyOn(provenanceIo, 'rename');
+      try {
+        expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+        await vi.waitFor(() => expect(stat).toHaveBeenCalledWith(f.state));
+        await stat.mock.results[0].value;
+        expect(open).not.toHaveBeenCalled();
+        expect(mkdir).not.toHaveBeenCalled();
+        expect(rename).not.toHaveBeenCalled();
+        expect(f.seams.appendEvent).not.toHaveBeenCalled();
+        expect(lstatSync(f.state).ino).toBe(before.ino);
+        expect(readFileSync(target, 'utf8')).toBe('untouched');
+      } finally { stat.mockRestore(); open.mockRestore(); mkdir.mockRestore(); rename.mockRestore(); }
+    },
+  );
+
+  it.each(['directory', 'symlink', 'FIFO'])(
+    'refuses to replace a target changed to a %s before publication and removes the temp file', async (kind, context) => {
+      const f = fixture();
+      mkdirSync(dirname(f.state), { recursive: true });
+      writeFileSync(f.state, '{}');
+      const target = join(f.root, 'untouched.json');
+      writeFileSync(target, 'untouched');
+      // Verify mkfifo availability before background provenance attempts the race.
+      if (kind === 'FIFO') { makeFifo(f.state + '.probe', context); rmSync(f.state + '.probe'); }
+      f.seams.appendEvent.mockImplementationOnce(async () => {
+        rmSync(f.state);
+        if (kind === 'directory') mkdirSync(f.state);
+        else if (kind === 'FIFO') makeFifo(f.state, context);
+        else symlinkSync(target, f.state);
+      });
+      const unlink = vi.spyOn(provenanceIo, 'unlink');
+      const rename = vi.spyOn(provenanceIo, 'rename');
+      try {
+        expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+        await vi.waitFor(() => expect(unlink).toHaveBeenCalledTimes(1));
+        await unlink.mock.results[0].value;
+        expect(rename).not.toHaveBeenCalled();
+        expect(lstatSync(f.state).isFile()).toBe(false);
+        expect(readFileSync(target, 'utf8')).toBe('untouched');
+        expect(readdirSync(dirname(f.state))).toEqual(['client-override.json']);
+      } finally { unlink.mockRestore(); rename.mockRestore(); }
+    },
+  );
 
   it('bounds the default git SHA lookup to at most one second and continues on timeout', async () => {
     const f = fixture();
@@ -418,7 +550,7 @@ describe('remote client override', () => {
     if (operation === 'git') vi.mocked(execFile).mockImplementation(stalled);
     const extra = operation === 'git' ? { readSha: undefined } : { [operation]: stalled };
     const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
-    const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+    const provenanceFs = mockProvenanceFs();
     let result;
     const pending = runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
       policy: f.policy, timeoutMs: 1000, loadPerCore: () => 0, log: f.seams.log,
@@ -440,7 +572,7 @@ describe('remote client override', () => {
     vi.useFakeTimers();
     let resolveSha;
     const readSha = vi.fn(() => new Promise((resolve) => { resolveSha = resolve; }));
-    const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+    const provenanceFs = mockProvenanceFs();
     const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
     expect(await f.run({ readSha, provenanceFs, importClient: async () => ({ runRemote }) }))
       .toEqual({ handled: true, exitCode: 0 });
@@ -470,13 +602,13 @@ describe('remote client override', () => {
     expect(f.seams.appendEvent).not.toHaveBeenCalled();
   });
 
-  it.each(['readSha', 'readFile', 'appendEvent', 'mkdir', 'writeFile'])(
+  it.each(['readSha', 'lstat', 'readFile', 'appendEvent', 'mkdir', 'writeFile'])(
     'a stalled provenance %s has a deadline and never prevents invocation', async (operation) => {
       const f = fixture();
       vi.useFakeTimers();
       let release;
       const stalled = vi.fn(() => new Promise((resolve) => { release = resolve; }));
-      const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+      const provenanceFs = mockProvenanceFs();
       const extra = { provenanceFs };
       if (operation in provenanceFs) provenanceFs[operation] = stalled;
       else extra[operation] = stalled;
@@ -499,12 +631,18 @@ describe('remote client override', () => {
     },
   );
 
-  it.each(['readFile', 'mkdir', 'writeFile'])('provenance %s rejection never fails the gate', async (operation) => {
+  it.each(['lstat', 'readFile', 'mkdir', 'writeFile'])('provenance %s rejection never fails the gate', async (operation) => {
     const f = fixture();
-    const provenanceFs = { readFile: vi.fn(async () => '{}'), mkdir: vi.fn(async () => {}), writeFile: vi.fn(async () => {}) };
+    const provenanceFs = mockProvenanceFs();
     provenanceFs[operation].mockRejectedValue(new Error('storage unavailable'));
     expect(await f.run({ provenanceFs })).toEqual({ handled: true, exitCode: 0 });
     await vi.waitFor(() => expect(provenanceFs[operation]).toHaveBeenCalledTimes(1));
+    if (operation === 'lstat') {
+      expect(provenanceFs.readFile).not.toHaveBeenCalled();
+      expect(provenanceFs.mkdir).not.toHaveBeenCalled();
+      expect(provenanceFs.writeFile).not.toHaveBeenCalled();
+      expect(f.seams.appendEvent).not.toHaveBeenCalled();
+    }
   });
 
   it.each(['selected', 'unreadable', 'import failure'])('sanitizes and bounds policy and %s path logs', async (kind) => {

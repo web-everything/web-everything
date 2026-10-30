@@ -143,11 +143,11 @@
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
-import { mkdir, writeFile, open } from 'node:fs/promises';
+import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -485,16 +485,54 @@ export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClien
 
 const remoteClientNotice = { logged: false };
 const CLIENT_PROVENANCE_MAX_BYTES = 4096;
+const CLIENT_PROVENANCE_OPEN_FLAGS = (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0);
+
+/** Only an absent path or a regular, non-symlink file is safe for optional persistence. */
+async function clientProvenanceStat(file, stat = lstat) {
+  let info;
+  try { info = await stat(file); }
+  catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!info.isFile()) throw new Error('remote client provenance is not a regular file');
+  return info;
+}
 
 /** Oversized state is missing provenance: record the current pair and replace it on this run. */
 async function readClientProvenance(file, { signal }) {
-  const handle = await open(file, 'r');
+  const handle = await open(file, constants.O_RDONLY | CLIENT_PROVENANCE_OPEN_FLAGS);
   try {
+    signal.throwIfAborted();
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > CLIENT_PROVENANCE_MAX_BYTES) return '';
     signal.throwIfAborted();
     const buffer = Buffer.alloc(CLIENT_PROVENANCE_MAX_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     return bytesRead > CLIENT_PROVENANCE_MAX_BYTES ? '' : buffer.toString('utf8', 0, bytesRead);
   } finally { await handle.close(); }
+}
+
+/** Never open the destination for writing: publish a complete sibling file by rename. */
+async function writeClientProvenance(file, data, { signal, encoding }) {
+  const temporary = join(dirname(file), `.client-override-${randomUUID()}.tmp`);
+  let handle;
+  let created = false;
+  try {
+    signal.throwIfAborted();
+    handle = await open(temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | CLIENT_PROVENANCE_OPEN_FLAGS, 0o600);
+    created = true;
+    await handle.writeFile(data, { encoding, signal });
+    await handle.close();
+    handle = null;
+    await clientProvenanceStat(file);
+    signal.throwIfAborted();
+    await rename(temporary, file);
+  } finally {
+    try { if (handle) await handle.close(); }
+    finally { if (created) await unlink(temporary).catch(() => {}); }
+  }
 }
 
 /** Provenance is optional: storage deadlines skip it without changing remote execution semantics. */
@@ -519,7 +557,7 @@ export function createRemoteExec({
   policy, cwd = process.cwd(), env = process.env, lockRoot,
   laneRoots = [defaultPoolRoot(cwd, env), defaultPoolRoot(MODULE_CHECKOUT, {})],
   fs = realClientFs(), importClient = importRemoteClient,
-  provenanceFs = { readFile: readClientProvenance, mkdir, writeFile },
+  provenanceFs = { lstat, readFile: readClientProvenance, mkdir, writeFile: writeClientProvenance },
   log = (line) => process.stderr.write(line), appendEvent = appendDaemonEvent,
   readSha = (path) => new Promise((resolve, reject) => {
     execFile('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
@@ -558,9 +596,12 @@ export function createRemoteExec({
         }
         await boundedClientProvenance(async (signal) => {
           const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
+          const info = await clientProvenanceStat(file, provenanceFs.lstat);
+          if (signal.aborted) return;
           let previous = null;
           try {
-            const raw = await provenanceFs.readFile(file, { encoding: 'utf8', signal });
+            const raw = info && info.size <= CLIENT_PROVENANCE_MAX_BYTES
+              ? await provenanceFs.readFile(file, { encoding: 'utf8', signal }) : '';
             if (typeof raw === 'string' && Buffer.byteLength(raw, 'utf8') <= CLIENT_PROVENANCE_MAX_BYTES) {
               const parsed = JSON.parse(raw);
               if (typeof parsed?.clientPath === 'string' && typeof parsed?.sha === 'string'
