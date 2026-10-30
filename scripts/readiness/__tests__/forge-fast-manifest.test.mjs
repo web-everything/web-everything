@@ -163,17 +163,42 @@ describe('fast Git manifest',()=>{
     if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toThrow('Unsafe inventory component');
     else {const spy=readSpy();await compare({exec:hidden,fs:spy.fs});expect(readNames(spy.readFile)).toEqual(['keep.txt']);}
   });
-  it.each(['filter','filter named unset','index flag'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
+  it.each(['filter','filter named unset','assume-unchanged','skip-worktree','skip-worktree + assume-unchanged'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
     if(kind==='filter'||kind==='filter named unset') {
       const driver=kind==='filter'?'fixture':'unset';
       await write('.gitattributes',`keep.txt filter=${driver}\n`);
       await git(['config',`filter.${driver}.clean`,'printf keep']);
       await git(['add','.']);await commit();
-    } else await git(['update-index','--assume-unchanged','keep.txt']);
+    } else {
+      if(kind.includes('skip-worktree'))await git(['update-index','--skip-worktree','keep.txt']);
+      if(kind.includes('assume-unchanged'))await git(['update-index','--assume-unchanged','keep.txt']);
+      const flag=kind==='skip-worktree'?'S':kind==='assume-unchanged'?'h':'s';
+      expect((await git(['ls-files','-f','-v','--','keep.txt'])).toString()).toBe(`${flag} keep.txt\n`);
+    }
     await write('keep.txt','diff');
     expect(await git(['diff','--name-only'])).toHaveLength(0);
     const spy=readSpy();await compare({fs:spy.fs});
     expect(readNames(spy.readFile)).toContain('keep.txt');
+  });
+  it.each([
+    ['filter','filter=fixture'],
+    ['working-tree-encoding','working-tree-encoding=UTF-8'],
+    ['working-tree-encoding','working-tree-encoding=UTF-16LE'],
+    ['ident','ident'],
+    ['text','text'],
+    ['eol','eol=crlf'],
+  ])('hashes Git-clean %s leaves (%s) and matches full hashing',async(attribute,rule)=>{
+    await write('.gitattributes',`keep.txt ${rule}\n`);
+    if(attribute==='filter')await git(['config','filter.fixture.clean','cat']);
+    if(rule==='working-tree-encoding=UTF-16LE')await write('keep.txt',Buffer.from('keep','utf16le'));
+    await git(['add','.']);await commit();
+    const manifest=await buildManifest({cwd,exec});
+    const cleanBase={sha:(await git(['rev-parse','HEAD'])).toString().trim(),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest};
+    expect(await git(['status','--porcelain=v1','-z'])).toHaveLength(0);
+    expect((await git(['check-attr','--all','--','keep.txt'])).toString()).toContain(`: ${attribute}:`);
+    const spy=readSpy(),fast=await compare({base:cleanBase,fs:spy.fs});
+    expect(fast.manifestMode).toBe('git-delta');
+    expect(readNames(spy.readFile)).toEqual(['keep.txt']);
   });
   it('full-scans a same-size edit hidden by unsafe stat config and restored mtime',async()=>{
     await git(['config','core.trustctime','false']);

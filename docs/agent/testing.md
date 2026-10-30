@@ -3140,13 +3140,19 @@ integration case that runs prune as root then reserves every slot as the operato
 
 ## Probe worker timeout teardown
 
-Worker timeout promises must wait for `worker.terminate()` before rejecting. Reserve
-the timeout outcome first so late message, error and exit events cannot replace it.
-Rejecting before shutdown lets a caller tear down its own worker while the nested
-worker is still exiting; the health-job test reproduced V8's
-`SourceTextModule::AsyncModuleExecutionFulfilled` fatal error in this window.
-`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` holds termination open
-to test this ordering for both GH probes and PR sweeps, including termination failure.
+Worker timeout promises allow at most one second for `worker.terminate()` before
+rejecting. A synchronous native call such as `execFileSync` can prevent termination
+from settling: every timeout-path termination wait needs a separate hard deadline.
+Reserve the timeout outcome first so late message, error and exit events cannot
+replace it. Await normal shutdown within the grace period so callers can tear down
+safely; after the deadline, unreference the blocked worker and reject with the original
+timeout error. Shutdown remains best effort after this bound; the worker may survive
+until its native call returns or its owning process exits.
+`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` covers pending, rejected
+and synchronously throwing termination for both runners, plus a real probe blocked in
+`execFileSync`. The `probe-worker-termination-blocks-timeout` daemon soak break runs
+the equivalent real sweep worker case. Keep these bounded-wait cases when changing
+timeout teardown; awaiting termination without a secondary deadline must fail them.
 
 ## Forge manifest reuse
 
@@ -3184,3 +3190,9 @@ starting but does not forcibly interrupt the loader. Do not use this readiness p
 that dynamically imports additional modules after announcing readiness.
 `bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
 imports to exercise cancellation without taking down the test runner on a native loader regression.
+The named `hashes Git-clean … leaves` table covers every sensitive attribute:
+`filter`, `working-tree-encoding`, `ident`, `text`, and `eol`, asserting actual leaf
+reads and equality with full hashing. Include an identity encoding as well as a
+byte-transforming encoding so base-blob size/hash checks cannot mask a missing
+attribute guard. Same-size hidden-edit cases pin uppercase `S` (skip-worktree),
+lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
