@@ -115,6 +115,9 @@ we:skills-src/conveyor/verify-daemon.mjs, and no active card scopes it. The buil
    - **Seams:** `main()` becomes a thin wrapper over an exported `runLoop(deps)`; `deps` injects the tick, clock,
      resolver, lease acquire/release, dispatch, state-record writer, heartbeat and logger. Each tick the loop calls
      the resolver with `last` set to the previous resolved `enabled` (none on the first call), then `pluginStep`.
+     An injectable startup boundary lets tests invoke production `main()` with these dependencies and observe
+     its delegation. Cap each sleep at the next resolver deadline, including when the normal tick interval is
+     longer than `recheckMs`, so both idle and running loops honor the one-interval reaction guarantee.
    - **Boot while off:** log `plugin verify disabled (<source>)`, hold NO lease, dispatch nothing, re-resolve every
      `recheckMs`. The process stays up, so launchd `KeepAlive` does not crash-loop it.
    - **Off → on:** acquire the lease on the next recheck and enter the normal loop, no process restart.
@@ -148,10 +151,25 @@ we:skills-src/conveyor/verify-daemon.mjs, and no active card scopes it. The buil
    first) → health-watch (3; after PR 6062 lands, since it edits `we:skills-src/conveyor/pass-daemon.mjs`) → fix (6) → review clone (9,
    and first split its 12 jobs onto their own clones).
 
-**Rollback.** Runtime: `node we:scripts/lib/daemon-plugins.mjs set verify on` (or delete the override file); takes
-effect at the next recheck, no restart. Durable: set `daemonPlugins.verify.enabled` back to `true` by PR. Code
-before merge: `node we:scripts/daemon-overlay.mjs remove --clone=$HOME/workspace/wev-control --ref=<ref>` restores
-main. Code after merge: revert the PR; the default is ON, so a revert changes nothing at runtime.
+**Rollback.** To intentionally re-enable verify while retaining plugin support, use
+`node we:scripts/lib/daemon-plugins.mjs set verify on`; absent a higher-priority process-env OFF, it takes
+effect at the next recheck, no restart.
+Deleting the override only falls back to the remaining cascade layers; it does not guarantee ON. A durable
+tool-layer change sets `daemonPlugins.verify.enabled` back to `true` by PR (higher layers still take precedence).
+Code rollback removes switch support, so the restored implementation would acquire its lease even if the
+effective setting is OFF. Before removing the prototype overlay or reverting the PR, record the effective
+setting and provenance. If disabled (including mid-drain), keep the plugin implementation running until its
+real in-flight registry reaches zero, the persisted job store confirms no running gates, and its lease is
+released; an empty idle-loop counter after a restart is insufficient. Never terminate detached gates to hurry this.
+Then persistently disable `com.we.verify-daemon` in its installed launchd domain (`launchctl disable <domain>/com.we.verify-daemon`),
+boot out only that job, and confirm the disabled flag, stopped process and absent lease before restoring code.
+Suppress any enable/bootstrap/restart hook in the overlay-removal or revert procedure; code restoration must
+leave this job disabled and unloaded, including across login or reboot. If draining, disabling or stopping
+cannot be confirmed, abort the code rollback. Preserve the override after rollback. Explicit operator
+re-enable must restore the launchd enabled flag before bootstrapping the old daemon. If the plugin was
+enabled, an ordinary daemon restart may resume dispatch. Code before merge:
+`node we:scripts/daemon-overlay.mjs remove --clone=$HOME/workspace/wev-control --ref=<ref>` restores main;
+after merge: revert the PR. Both paths require the disabled-state procedure above.
 
 ## MVP
 
@@ -178,6 +196,24 @@ we:scripts/lib/__tests__/daemon-plugins.test.mjs (RED for all: module does not e
 - **`plugin resolve: tool off`** — fixture tool `verify.enabled=false` → `false, source: 'tool'`. Capability — Red today.
 - **`plugin resolve: env beats tool`** — `WE_DAEMON_PLUGIN_VERIFY=1` over tool `false` → `true, 'env'`; tool
   `recheckMs` still resolves from the tool layer. Capability — Red today.
+- **`plugin resolve: sibling settings survive an env override`** — register a fixture sibling alongside verify,
+  with explicit tool values `verify.enabled=false` and `sibling.enabled=true`. Set only
+  `WE_DAEMON_PLUGIN_VERIFY=1` and assert verify becomes `true, 'env'` while sibling stays `true, 'tool'`.
+  Reverse the explicit sibling values and use `WE_DAEMON_PLUGIN_VERIFY=0`: verify becomes `false, 'env'`
+  while sibling stays `false, 'tool'`. Both rows must retain the sibling's explicit value and provenance;
+  replacing the whole `daemonPlugins` block with the env layer must fail. Capability — Red today.
+- **`plugin resolve: platform preference overrides standard and loses to tool`** — injected platform
+  `verify.enabled=false` beats standard `true`, with source `platform`; adding tool `verify.enabled=true`
+  beats the platform, with source `tool`. Capability — Red today.
+- **`plugin resolve: test mode reads only injected paths`** — under `isUnderTest()`, spy on filesystem reads:
+  no injected paths means zero reads of real tool, platform-preference or override files. With fixture paths
+  injected, only those paths may be read and their values must resolve; assert zero uninjected reads in both
+  cases, including when an injected read fails. Capability — Red today.
+- **`plugin settings: recheckMs enforces the minimum`** — table rows for zero, negative, below-minimum positive,
+  nonnumeric, non-finite and missing values, plus the exact minimum and a larger valid value. Assert invalid
+  inputs fall back to the 60,000 ms standard and report invalid values, never scheduling a recheck below the
+  documented 10,000 ms minimum. Missing values use that default without an invalid diagnostic;
+  valid boundary values are retained. Capability — Red today.
 - **`plugin resolve: override beats tool, process env beats override`.** Capability — Red today.
 - **`plugin resolve: invalid never wins`** — tool `"enabled": "nope"` → stays `true`, `invalid` names the leaf. Capability — Red today.
 - **`plugin resolve: invalid keeps a previously disabled state`** (the `"false"` string row below is the tool layer;
@@ -219,10 +255,14 @@ off path at all):
   owned until normal gate completion. Assert no duplicate dispatch across the restart or lease handoff, and
   exactly one completion before release to idle. The test must fail if registry adoption is skipped or moved
   after dispatch/drain decisions. Capability — Red today: no plugin-aware restart/adoption integration exists.
-- **`plugin lifecycle: main() wiring`** — the pure `pluginStep` tests above do not prove `main()` calls it, so this
-  drives the real loop through the injected seams (`main()` delegates to an exported `runLoop(deps)`; `deps` carries
+- **`plugin lifecycle: main() wiring`** — invoke production `main()` through an injectable startup boundary,
+  with process/plist IO replaced by fixtures; do not call `runLoop` directly as the test entry point. Spy on
+  delegation to the exported `runLoop(deps)` using a wrapper around the actual loop at the startup boundary,
+  and assert it occurs exactly once with the injected dependencies; the spy must execute the actual loop.
+  Removing that delegation or restoring main's unconditional lease path must fail the test. Drive the real
+  loop through the injected seams (`deps` carries
   the tick, clock, `resolvePluginEnabled`, lease acquire/release, dispatch, state-record writer, heartbeat and logger,
-  all fakes in the test) through one scripted sequence and asserts the calls in order:
+  all fakes in the test) through one scripted sequence and assert the calls in order:
   1. resolver returns off at boot → the first resolver call carries **no `last`**; logs `plugin verify disabled (override)`,
      lease acquire fake **never called**, dispatch fake never called, state record `{ enabled: false, phase: 'idle' }`,
      loop still running (does not exit, so launchd `KeepAlive` has nothing to restart);
@@ -240,6 +280,22 @@ off path at all):
   8. across steps 2–7 every resolver call carries `last` equal to the previous resolved `enabled`, so the fail-closed
      rule (invalid or unreadable keeps the last known value) holds end to end in the loop, not only in the resolver.
   Capability — Red today: no off path, no `runLoop`, and nothing consults `pluginStep`.
+- **`plugin lifecycle: toggles apply within one recheck interval`** — invoke production `main()` with a fake
+  clock, initially off, and record resolver-call timestamps. For both off→on and on→off, toggle immediately
+  after a resolve, advance to just before the next deadline and then to the deadline: the next resolver call
+  and state transition must occur no later than `lastResolvedAt + recheckMs`. Assert no earlier busy polling,
+  no dispatch while off, acquisition when enabled, and immediate dispatch suppression on disable even when
+  real in-flight work delays lease release. Exercise default and minimum intervals with ticks longer than
+  `recheckMs`, so an ordinary loop sleep cannot defer the recheck. Capability — Red today.
+- **`plugin rollback: disabled daemon does not resume unexpectedly`** — required rollback integration test,
+  parameterized over prototype-overlay removal and post-merge code revert, starting from an explicitly OFF
+  effective setting (idle, mid-drain, and restarted idle with a persisted running gate). Exercise the documented procedure through injectable service
+  and code-restoration boundaries. A controlled detached gate must finish normally before service bootout;
+  assert persistent launchd disable, bootout, disabled-flag/stopped-process/absent-lease checks precede code
+  restoration, the override is preserved, and the old implementation is never started automatically
+  (including by code-restoration hooks). Simulate KeepAlive, restart and a fresh login/bootstrap with the
+  persisted launchd disabled flag; assert no lease acquisition or dispatch until explicit operator re-enable.
+  Failed drain/disable/stop confirmation must prevent code restoration. Capability — Red today.
 
 we:scripts/__tests__/verify-lane.test.mjs:
 - **`request refusal names a disabled plugin`** — a fixture state record with `enabled: false` → exit 3 and the
@@ -302,10 +358,11 @@ shows `in flight 0`, and the orchestrator is told the window (≤ 2 × `recheckM
 
 - [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-plugins.test.mjs` fails before (module
   missing) and passes after.
-- [A2] **Executable** — `npx vitest run we:skills-src/conveyor/__tests__/verify-daemon.test.mjs -t "plugin (step|drain|lifecycle)"`
-  runs the three named `plugin step:` tests (fails before: `pluginStep` not exported), the `plugin drain:` test and
-  the `plugin lifecycle: main() wiring` test, and all pass after (the lifecycle test fails before because the loop
-  never consults `pluginStep`).
+- [A2] **Executable** — `npx vitest run we:skills-src/conveyor/__tests__/verify-daemon.test.mjs -t "plugin (step|drain|restart|lifecycle|rollback)"`
+  runs every named `plugin step:`, `plugin drain:`, `plugin restart:`, `plugin lifecycle:` and `plugin rollback:`
+  test above and all pass after. The lifecycle test must fail when production `main()` delegation is removed;
+  the restart test must fail when persisted-gate adoption is skipped or deferred until after drain/dispatch
+  decisions. The rollback test covers explicitly disabled idle and mid-drain states on both code rollback paths.
 - [A1b] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-plugins.test.mjs -t "invalid keeps a previously disabled state"`
   fails before (module missing) and passes after.
 - [A3] **Executable** — `npx vitest run we:scripts/__tests__/verify-lane.test.mjs -t "plugin"` runs the three
