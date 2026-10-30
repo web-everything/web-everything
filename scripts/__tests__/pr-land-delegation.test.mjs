@@ -20,7 +20,9 @@ async function load(args = []) {
   process.argv = ['node', 'test-import', ...args];
   // Re-evaluate the module-scope flags without rebuilding the entire transitive graph.
   // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
-  return import(`../pr-land.mjs?fresh=${++loadN}`);
+  // @vite-ignore: under --coverage the variable query is otherwise rewritten into a glob map that
+  // has no `?fresh=N` key ("Unknown variable dynamic import"); the plain specifier resolves normally.
+  return import(/* @vite-ignore */ `../pr-land.mjs?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
