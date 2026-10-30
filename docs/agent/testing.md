@@ -236,6 +236,19 @@ settings file to warn/3000000 with tool provenance, checks unreadable settings/p
 guards executable-looking custom input with an execution sentinel and a static evaluation check.
 An unreadable policy source must retain a readable higher-priority mode; unknown mode fails closed.
 
+## Health tick watchdog deadlines
+
+`scripts/conveyor/__tests__/health-watch.test.mjs` keeps the real child-process kill probe and uses an
+injected child with virtual time to cover production-sized deadlines without waiting minutes. Inject load
+readings through `resolveTickWatchdogLimit.readLoad`; do not depend on the host's current load.
+The deadline is `min(tickKillCeilingMs, tickBudgetMs * 3 * clamp(load1 / cores, 1, tickKillLoadScaleMax))`.
+Defaults are a 60000ms budget, maximum scale 3 and absolute ceiling 540000ms. Policy
+`healthWatchTickWatchdog` resolves standard → platform → flat health-dir `config.json` keys → environment
+(`WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX`, `WE_HEALTH_TICK_KILL_CEILING_MS`). Invalid settings fall back to
+their standard values with provenance logged; invalid/unreadable load uses scale 1. Keep named cases for
+healthy 174s completion under load, the idle 180s deadline, exact scaled-limit SIGKILL, actual-limit
+`overrun.json` persistence, invalid knobs and oversized values capped by the absolute ceiling.
+
 ## Daemon entry boot smoke
 
 Rebuild candidates must also work with the old live daemon's smoke environment: it exports
@@ -255,7 +268,16 @@ Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.b
 Exit failures and `ok:false` never receive this retry. Both settings use the policy cascade via
 `scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
 `WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Env integers are strict
-digits; empty is unset.
+digits; empty is unset. `rebuildSmoke.bootMinChildMs` (default 10000; env
+`WE_SMOKE_BOOT_MIN_CHILD_MS`) uses the same cascade and source log. Each boot asks for a
+per-call floor of `min(daemonBootMs, bootMinChildMs)`; less shared rebuild budget means the
+existing budget refusal, never a doomed short child. Live smoke tracks that same floor when
+marking budget interruptions. Only an all-timeout boot failure set at the full requested caps
+counts as env-timeout (caps at least `MIN_OWN_CAP_MS`, each attempt's measured `elapsedMs`
+at least `min(minElapsedMs, cap * 0.9)`; aggregate row time cannot substitute for entry timing).
+An import failure already reported on child stdout remains `import failed` even when a pending
+timer keeps the child alive until a timeout kills it.
+Mixed import failures, crashes, budget slices and missing entry evidence remain code failures.
 
 Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or
 dispatch smoke failure detail, held state, self-sync alert and PR comment carry only an
