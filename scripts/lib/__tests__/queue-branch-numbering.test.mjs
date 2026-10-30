@@ -2,6 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import * as realFs from 'node:fs';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, trustedDrainAuthors, assertWorktreeCard, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
+
+vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
 
 describe('queue branch numbering', () => {
   it('probes main for the branch-numbering CI contract and fails closed', () => {
@@ -164,9 +167,22 @@ describe('queue branch numbering', () => {
     expect(isMergeGroupCiRun({ GITHUB_EVENT_NAME: 'merge_group' })).toBe(false);
     expect(isMergeGroupCiRun({ GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request' })).toBe(false);
   });
+  it('does not classify raised-by ledger files as hash cards, even with hash-like basenames', () => {
+    expect(hashBacklogFiles([
+      'backlog/raised-by/5360/5839-c45b28a53b6cbe632235b6a7.md',
+      'backlog/raised-by/5360/xabc123-ledger.md',
+      'backlog/xabc123-card.md',
+    ])).toEqual(['backlog/xabc123-card.md']);
+  });
   it('uses main and live reservations, pruning landed and closed PRs', () => {
     const rows = [ { repo: 'r', num: 1, headRef: 'a', nnns: [11], at: 'now' }, { repo: 'r', num: 2, headRef: 'b', nnns: [25], at: 'now' }, { repo: 'r', num: 3, headRef: 'c', nnns: [99], at: 'now' } ];
     expect(reservationPlan(['backlog/011-a.md', 'backlog/020-b.md'], rows, (_, n) => n !== 3)).toEqual({ reservations: [rows[1]], minNext: 26 });
+  });
+  it('ignores raised-by ledger ids when setting the number floor or pruning reservations', () => {
+    const reservation = { repo: 'r', num: 1, headRef: 'a', nnns: [5839], at: 'now' };
+    const files = ['backlog/010-main.md', 'backlog/raised-by/5360/5839-c45b28a53b6cbe632235b6a7.md'];
+    expect(reservationPlan(files, [], () => true)).toEqual({ reservations: [], minNext: 11 });
+    expect(reservationPlan(files, [reservation], () => true)).toEqual({ reservations: [reservation], minNext: 5840 });
   });
   function setup({ pending = true, state = '{"reservations":[]}', head = 'old' } = {}) {
     let numbered = false;
@@ -312,6 +328,43 @@ describe('queue branch numbering', () => {
     expect(finishBranchPreparation({ action: 'numbered', newHead: '123456789abcd' }, { c: { num: 4 }, revalidationAborted: aborted, needsAcceptanceRestamp: () => true, restampAcceptance: () => ({ ok: false, reason: 'net diff changed' }), log: { write() {} } })).toBe(false);
     expect(aborted[0].reason).toContain('acceptance re-stamp failed: net diff changed');
   });
+  it('emits needs-you through the default daemon writer when branch numbering is refused', () => {
+    appendDaemonEvent.mockClear();
+    const reason = 'merge-queue: branch numbering refused: unsafe backlog card path';
+    const aborted = [];
+    expect(finishBranchPreparation({ action: 'skip', reason }, {
+      c: { num: 6055 }, revalidationAborted: aborted, log: { write() {} },
+    })).toBe(false);
+    expect(aborted).toEqual([{ num: 6055, repo: undefined, reason }]);
+    expect(appendDaemonEvent).toHaveBeenCalledTimes(1);
+    expect(appendDaemonEvent).toHaveBeenCalledWith({
+      kind: 'needs-you', pr: 6055, daemon: 'drain',
+      detail: `PR #6055: branch numbering refused (${reason}) - the PR was not enqueued; fix the cause or number it by hand`,
+    });
+  });
+  it.each(['numbered', 'final'])('does not emit needs-you for %s branch preparation', action => {
+    const emit = vi.fn();
+    expect(finishBranchPreparation({ action, newHead: '123456789abcd' }, {
+      c: { num: 6055 }, revalidationAborted: [], needsAcceptanceRestamp: () => false,
+      log: { write() {} }, emit,
+    })).toBe(action === 'final');
+    expect(emit).not.toHaveBeenCalled();
+  });
+  it.each(['throw', 'reject'])('swallows a daemon emitter %s without changing the skip outcome', async failure => {
+    const emit = vi.fn(() => {
+      if (failure === 'throw') throw new Error('event storage unavailable');
+      return Promise.reject(new Error('event storage unavailable'));
+    });
+    expect(finishBranchPreparation({ action: 'skip', reason: 'numbering mutex refused' }, {
+      c: { num: 6055 }, revalidationAborted: [], log: { write() {} }, emit,
+    })).toBe(false);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith({
+      kind: 'needs-you', pr: 6055, daemon: 'drain',
+      detail: 'PR #6055: branch numbering refused (numbering mutex refused) - the PR was not enqueued; fix the cause or number it by hand',
+    });
+    await Promise.resolve();
+  });
 });
 
 import { execFileSync } from 'node:child_process';
@@ -320,7 +373,53 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { buildFollowupInput } from '../drain-followup-job.mjs';
+import { workflowEditHold } from '../merge-queue-enqueue.mjs';
 import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
+
+it.each([
+  'backlog/xprg7e1-reap-lane-leases-whose-owner-is-dead-using-a-durable-owner-p.md',
+  'backlog/xsewwno-fix-daemon-must-not-count-lane-acquire-contention-as-a-fix-a.md',
+  'backlog/raised-by/5360/5839-c45b28a53b6cbe632235b6a7.md',
+  'backlog/raised-by/5360/Ab_9.ledger-note.md',
+])('accepts regular PR #6055 cards and raised-by ledger paths: %s', path => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-card-path-'));
+  try {
+    mkdirSync(join(root, path, '..'), { recursive: true });
+    writeFileSync(join(root, path), 'ledger or card\n');
+    expect(() => assertWorktreeCard(root, path)).not.toThrow();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it.each([
+  'backlog/a/b.md', 'backlog/raised-by/x/../y.md',
+  'backlog/raised-by/x/y.md', 'backlog/raised-by/5360/a/b.md',
+  'backlog/raised-by/5360/a..b.md', 'backlog/a..b.md',
+  'backlog/raised-by/5360/a b.md', 'backlog/raised-by/5360/a.txt',
+  'backlog/raised-by/5360/a\0.md', 'backlog/a\0.md',
+])('fails closed on unsafe backlog paths before filesystem IO: %s', path => {
+  const fs = { lstatSync: vi.fn() };
+  expect(() => assertWorktreeCard('unused', path, fs)).toThrow('unsafe backlog card path');
+  expect(fs.lstatSync).not.toHaveBeenCalled();
+});
+
+it.each(['backlog', 'backlog/raised-by', 'backlog/raised-by/5360', 'backlog/raised-by/5360/5839-c45b28a53b6cbe632235b6a7.md'])(
+  'rejects a real symlink at %s in a raised-by path without changing its target', link => {
+    const root = mkdtempSync(join(tmpdir(), 'queue-ledger-symlink-'));
+    try {
+      const tree = join(root, 'tree');
+      const path = 'backlog/raised-by/5360/5839-c45b28a53b6cbe632235b6a7.md';
+      const suffix = path.slice(link.length);
+      const target = join(root, 'outside');
+      if (suffix) mkdirSync(join(target + suffix, '..'), { recursive: true });
+      const text = 'ledger stays unchanged\n';
+      writeFileSync(target + suffix, text);
+      mkdirSync(join(tree, link, '..'), { recursive: true });
+      symlinkSync(target, join(tree, link));
+      expect(() => assertWorktreeCard(tree, path)).toThrow(/symlink/);
+      expect(readFileSync(target + suffix, 'utf8')).toBe(text);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  },
+);
 
 it('rejects a real external card symlink and leaves the target unchanged', () => {
   const root = mkdtempSync(join(tmpdir(), 'queue-symlink-'));
@@ -333,19 +432,69 @@ it('rejects a real external card symlink and leaves the target unchanged', () =>
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-it.each([false, true])('permits confined convenience links and refuses escaping links (external=%s)', external => {
+it.each([false, true])('permits confined convenience links and refuses escaping links before numbering (external=%s)', external => {
   const root = mkdtempSync(join(tmpdir(), 'queue-directory-link-'));
+  try {
+    const temporary = join(root, 'temporary');
+    const tree = join(temporary, 'tree');
+    mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(tree, '.claude'));
+    mkdirSync(join(tree, 'skills-src')); mkdirSync(join(root, 'outside'));
+    const text = '---\nstatus: open\n---\n';
+    writeFileSync(join(tree, 'backlog/xabc123-card.md'), text);
+    writeFileSync(join(root, 'outside/sentinel.md'), text);
+    symlinkSync(external ? join(root, 'outside') : '../skills-src', join(tree, '.claude/skills'));
+    const number = vi.fn(() => {
+      realFs.renameSync(join(tree, 'backlog/xabc123-card.md'), join(tree, 'backlog/041-card.md'));
+      return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true };
+    });
+    const lock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'ls-files') {
+        const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
+        return args.length === 1 ? `${card}\n.claude/skills` : card;
+      }
+      if (args[0] === 'ls-tree') return 'backlog/040-main.md';
+      if (args[0] === 'rev-parse') return 'numbered-head';
+      return '';
+    });
+    const statePath = join(root, 'reservations.json');
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => temporary }, statePath, lock, number });
+    expect(out).toMatchObject(external
+      ? { action: 'skip', reason: expect.stringContaining('escapes worktree') }
+      : { action: 'numbered', newHead: 'numbered-head' });
+    expect(readFileSync(join(root, 'outside/sentinel.md'), 'utf8')).toBe(text);
+    if (external) {
+      expect(number).not.toHaveBeenCalled();
+      expect(lock).not.toHaveBeenCalled();
+      expect(existsSync(statePath)).toBe(false);
+      expect(exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    } else {
+      expect(number).toHaveBeenCalledWith(tree, { minNext: 41 });
+      expect(exec).toHaveBeenCalledWith('git', ['push', '--no-verify', 'origin', 'HEAD:refs/heads/lane/example'], expect.any(Object));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('returns final for a hash-free tree with external and dangling tracked links without numbering IO', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-hash-free-links-'));
   try {
     const tree = join(root, 'tree');
     mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(tree, '.claude'));
-    mkdirSync(join(tree, 'skills-src')); mkdirSync(join(root, 'outside'));
+    mkdirSync(join(root, 'outside'));
     writeFileSync(join(tree, 'backlog/041-card.md'), '---\nstatus: resolved\n---\n');
-    symlinkSync(external ? join(root, 'outside') : '../skills-src', join(tree, '.claude/skills'));
+    symlinkSync(join(root, 'outside'), join(tree, '.claude/skills'));
+    symlinkSync('missing.md', join(tree, 'dangling.md'));
     const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files'
-      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills' : 'backlog/041-card.md') : '');
+      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
+    const unexpected = vi.fn(() => { throw new Error('unexpected numbering IO'); });
     const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
-      fs: { ...realFs, mkdtempSync: () => root }, number: () => { throw new Error('unexpected numbering'); } });
-    expect(out).toMatchObject(external ? { action: 'skip', reason: expect.stringContaining('escapes worktree') } : { action: 'final' });
+      fs: { ...realFs, mkdtempSync: () => root, lstatSync: unexpected, writeFileSync: unexpected },
+      lock: unexpected, number: unexpected });
+    expect(out).toEqual({ action: 'final' });
+    expect(unexpected).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && args.length === 1))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -369,10 +518,10 @@ it('reports stranded queue hashes with a read-only probe', () => {
   expect(write).toHaveBeenCalledWith(expect.stringContaining('WARNING'));
 });
 
-it('publishes a real fast-forward numbering commit to the PR branch, never main', () => {
+it.each([false, true])('numbers a hash card beside unchanged raised-by ledgers in a real PR branch, never main (human-only workflow edits=%s)', humanOnly => {
   const root = mkdtempSync(join(tmpdir(), 'queue-numbering-git-'));
   const cwd = join(root, 'clone'); const origin = join(root, 'origin.git');
-  const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
+  const git = (...args) => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
   try {
     execFileSync('git', ['init', '--bare', '-q', '-b', 'main', origin]);
     execFileSync('git', ['clone', '-q', origin, cwd], { stdio: 'pipe' });
@@ -381,9 +530,17 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     mkdirSync(join(cwd, 'backlog'));
     writeFileSync(join(cwd, '.gitignore'), '.claude/skills/batch-backlog-items/id-ledger.json\n');
     writeFileSync(join(cwd, 'backlog/010-old.md'), '---\nstatus: resolved\n---\n');
+    const ledgerPaths = ['backlog/raised-by/5360/5839-c45b28a53b6cbe632235b6a7.md', 'backlog/raised-by/5360/xdef456-ledger.md'];
+    const ledgerText = '---\nstatus: open\n---\nLedger records #xabc123 without being a card.\n';
+    mkdirSync(join(cwd, 'backlog/raised-by/5360'), { recursive: true });
+    for (const path of ledgerPaths) writeFileSync(join(cwd, path), ledgerText);
     git('add', '.'); git('commit', '-qm', 'seed'); git('push', '-q', 'origin', 'main');
     const main = git('rev-parse', 'HEAD');
     git('checkout', '-qb', 'topic');
+    if (humanOnly) {
+      mkdirSync(join(cwd, '.github/workflows'), { recursive: true });
+      writeFileSync(join(cwd, '.github/workflows/ci.yml'), 'name: CI\non: push\n');
+    }
     writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n');
     git('add', '.'); git('commit', '-qm', 'branch card'); git('push', '-q', 'origin', 'topic');
     let old = git('rev-parse', 'HEAD');
@@ -394,8 +551,12 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     writeFileSync(join(cwd, 'scripts/backlog.mjs'), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(sentinel)}, 'executed');`);
     git('add', '.'); git('commit', '-qm', 'untrusted branch code'); git('push', '-q', 'origin', 'topic');
     git('config', 'core.hooksPath', '.githooks');
-    const c = { repo: 'test/repo', num: 1, headRef: 'topic', hasManifest: true, item: 'xabc123' };
+    const c = { repo: 'test/repo', num: humanOnly ? 6003 : 1, headRef: 'topic', hasManifest: true, item: 'xabc123', mergeQueueEntry: null };
     old = git('rev-parse', 'HEAD');
+    if (humanOnly) {
+      const files = git('diff', '--name-only', `${main}...${old}`).split('\n');
+      expect(workflowEditHold({ files, expectedCount: files.length })).toMatchObject({ hold: true, humanOnly: true });
+    }
     const statePath = join(root, 'state.json');
     const lock = (fn, options) => withNumberingLock(fn, { ...options, lockRoot: join(root, 'locks') });
     const envBefore = { ...process.env };
@@ -411,6 +572,12 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     git('merge-base', '--is-ancestor', old, result.newHead);
     expect(git('ls-tree', '-r', '--name-only', result.newHead)).toContain('backlog/011-foo.md');
     expect(git('ls-tree', '-r', '--name-only', result.newHead)).not.toContain('backlog/xabc123-foo.md');
+    for (const path of ledgerPaths) {
+      expect(git('rev-parse', `${result.newHead}:${path}`)).toBe(git('rev-parse', `${old}:${path}`));
+      expect(git('show', `${result.newHead}:${path}`)).toBe(ledgerText.trim());
+    }
+    expect(git('diff', '--no-renames', '--name-only', old, result.newHead).split('\n')).toEqual(['backlog/011-foo.md', 'backlog/xabc123-foo.md']);
+    if (humanOnly) expect(git('show', `${result.newHead}:.github/workflows/ci.yml`)).toBe(git('show', `${old}:.github/workflows/ci.yml`));
     expect(JSON.parse(readFileSync(statePath, 'utf8')).reservations[0].nnns).toEqual([11]);
     expect(prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: result.newHead, statePath, lock })).toEqual({ action: 'final' });
     expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
@@ -420,25 +587,112 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
 
 describe('sweepQueuedHashCards', () => {
   function setup() {
-    const nodes = [1, 2, 3, 4].map((number) => ({ id: `entry-${number}`, state: 'QUEUED', pullRequest: {
+    const nodes = [1, 2, 3, 4].map((number) => ({ id: `entry-${number}`, state: 'QUEUED', enqueuer: { login: 'plateau-merger' }, pullRequest: {
       id: `pr-${number}`, number, headRefName: `topic-${number}`, headRefOid: `sha-${number}`, isCrossRepository: number === 3,
     } }));
     const exec = vi.fn((cmd, args) => {
       if (cmd === 'gh' && args[3].startsWith('query=query(')) return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes } } } } });
       if (args[0] === 'ls-tree') return args[3] === 'sha-2' ? 'backlog/012-clean.md' : 'backlog/xabc123-card.md';
+      if (args[0] === 'diff') return 'src/example.mjs\0backlog/xabc123-card.md\0';
       return '{}';
     });
-    return { repo: 'owner/repo', cwd: '/clone', exec, log: { write: vi.fn() }, prepare: vi.fn(() => ({ action: 'numbered', newHead: 'new' })), isOpen: () => true };
+    return { repo: 'owner/repo', cwd: '/clone', nodes, exec, emit: vi.fn(), log: { write: vi.fn() }, prepare: vi.fn(() => ({ action: 'numbered', newHead: 'new' })), isOpen: () => true };
   }
   it('dequeues hash-bearing PRs, prepares their branches, and leaves clean and cross-repo PRs alone', () => {
     const x = setup();
-    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [1, 4], errors: [] });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [1, 4], skipped: [], errors: [] });
     expect(x.exec).toHaveBeenCalledWith('gh', ['api', 'graphql', '-f', expect.stringContaining('mergeQueue(branch:"main")'), '-f', 'owner=owner', '-f', 'name=repo'], expect.any(Object));
+    expect(x.exec.mock.calls[0][1][3]).toContain('enqueuer{login}');
     expect(x.exec).toHaveBeenCalledWith('gh', ['api', 'graphql', '-f', 'query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', '-f', 'id=pr-1'], expect.any(Object));
     expect(x.prepare).toHaveBeenCalledWith({ c: { num: 1, repo: null, headRef: 'topic-1', item: null, hasManifest: false }, traceHeadSha: 'sha-1', cwd: '/clone', isLocal: true, isOpen: x.isOpen });
     expect(x.prepare).toHaveBeenCalledTimes(2);
     expect(x.exec.mock.calls.some(([, args]) => args.includes('refs/heads/topic-3'))).toBe(false);
     expect(x.log.write).toHaveBeenCalledWith(expect.stringContaining('PR 1 DEQUEUED: carries hash card(s) backlog/xabc123-card.md'));
+    expect(x.emit.mock.calls.map(([event]) => event)).toEqual([1, 4].map((pr) => ({
+      kind: 'queue-dequeued', pr, daemon: 'drain', detail: { reason: 'hash-cards-numbering', files: ['backlog/xabc123-card.md'] },
+    })));
+  });
+  it.each(['plateau-merger', 'human-reviewer'])('leaves #6003 workflow edits and its hash card queued when enqueued by %s', (login) => {
+    const x = setup();
+    x.nodes.splice(0, x.nodes.length, { id: 'entry-6003', state: 'QUEUED', enqueuer: { login }, pullRequest: {
+      id: 'pr-6003', number: 6003, headRefName: 'topic-6003', headRefOid: 'bb609fd418', isCrossRepository: false,
+    } });
+    const exec = x.exec;
+    x.exec = vi.fn((cmd, args, opts) => args[0] === 'diff'
+      ? '.github/workflows/ci.yml\0.github/workflows/hetzner-jobs.yml\0backlog/xabc123-card.md\0'
+      : exec(cmd, args, opts));
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 6003, reason: 'human-only' }], errors: [] });
+    expect(x.exec).toHaveBeenCalledWith('git', ['diff', '--name-only', '--no-renames', '-z', 'origin/main...bb609fd418'], expect.any(Object));
+    expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).toHaveBeenCalledTimes(2);
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 6003, daemon: 'drain', detail: { reason: 'human-only' } });
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'needs-you', pr: 6003, daemon: 'drain',
+      detail: 'PR #6003 was queued by a human while its backlog card(s) backlog/xabc123-card.md are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.' });
+  });
+  it('leaves a human-enqueued non-workflow hash PR queued', () => {
+    const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer.login = 'human-reviewer';
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'human-enqueued' }], errors: [] });
+    expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).toHaveBeenCalledTimes(2);
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 1, daemon: 'drain', detail: { reason: 'human-enqueued' } });
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'needs-you', pr: 1, daemon: 'drain',
+      detail: 'PR #1 was queued by a human while its backlog card(s) backlog/xabc123-card.md are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.' });
+  });
+  it('does not alert for a human-enqueued branch without hash cards', () => {
+    const x = setup(); x.nodes.splice(0, x.nodes.length, x.nodes[1]); x.nodes[0].enqueuer.login = 'human-reviewer';
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [], errors: [] });
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['missing enqueuer', undefined],
+    ['null enqueuer', null],
+    ['missing login', {}],
+    ['empty login', { login: '' }],
+    ['null login', { login: null }],
+    ['non-string login', { login: 42 }],
+  ])('fails closed when the enqueuer is unknown (%s), leaving the hash PR queued', (_case, enqueuer) => {
+    const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer = enqueuer;
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'enqueuer-unknown' }], errors: [] });
+    expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 1, daemon: 'drain', detail: { reason: 'enqueuer-unknown' } });
+    expect(x.log.write).toHaveBeenCalledWith(expect.stringContaining('enqueuer-unknown — left queued'));
+  });
+  it('still dequeues a normal hash PR enqueued by a bot and emits an event', () => {
+    const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer = { login: 'numbering[bot]' };
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1], numbered: [1], skipped: [], errors: [] });
+    expect(x.exec).toHaveBeenCalledWith('gh', ['api', 'graphql', '-f', 'query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', '-f', 'id=pr-1'], expect.any(Object));
+    expect(x.prepare).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeued', pr: 1, daemon: 'drain', detail: { reason: 'hash-cards-numbering', files: ['backlog/xabc123-card.md'] } });
+  });
+  it.each(['diff unreadable', 'spawnSync git ENOBUFS'])('fails closed when changed files are unreadable (%s), leaving the hash PR queued for a later pass', (message) => {
+    const x = setup(); x.nodes.splice(1); const exec = x.exec;
+    x.exec = vi.fn((cmd, args, opts) => {
+      if (args[0] === 'diff') throw new Error(message);
+      return exec(cmd, args, opts);
+    });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'changed-files-unreadable' }], errors: [] });
+    expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 1, daemon: 'drain', detail: { reason: 'changed-files-unreadable' } });
+    expect(x.log.write).toHaveBeenCalledWith(expect.stringContaining('left queued; retry on next pass'));
+  });
+  it.each(['throw', 'reject'])('swallows event-writer failures (%s) without interrupting dequeue or preparation', async (mode) => {
+    const x = setup();
+    x.emit.mockImplementation(() => {
+      if (mode === 'throw') throw new Error('event storage unavailable');
+      return Promise.reject(new Error('event storage unavailable'));
+    });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [1, 4], skipped: [], errors: [] });
+    expect(x.emit).toHaveBeenCalledTimes(2);
+    expect(x.prepare).toHaveBeenCalledTimes(2);
+    await Promise.resolve();
   });
   it('continues after an entry fetch fails', () => {
     const x = setup(); const exec = x.exec;
@@ -446,13 +700,13 @@ describe('sweepQueuedHashCards', () => {
       if (args.includes('refs/heads/topic-1')) throw new Error('fetch failed');
       return exec(cmd, args, opts);
     });
-    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [4], numbered: [4], errors: [{ num: 1, reason: 'fetch failed' }] });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [4], numbered: [4], skipped: [], errors: [{ num: 1, reason: 'fetch failed' }] });
   });
   it('records preparation refusal and queue-read failure without throwing', () => {
     const x = setup(); x.prepare.mockReturnValue({ action: 'skip', reason: 'mutex refused' });
-    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [], errors: [{ num: 1, reason: 'mutex refused' }, { num: 4, reason: 'mutex refused' }] });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [], skipped: [], errors: [{ num: 1, reason: 'mutex refused' }, { num: 4, reason: 'mutex refused' }] });
     x.exec.mockImplementation(() => { throw new Error('queue unavailable'); });
-    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], errors: [{ num: null, reason: 'queue unavailable' }] });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [], errors: [{ num: null, reason: 'queue unavailable' }] });
   });
 });
 
