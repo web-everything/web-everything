@@ -2,7 +2,8 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/review-timing.mjs", "we:scripts/lib/review-timing-settings.mjs", "we:scripts/conveyor/fix-procedure.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+scopeRationale: we:scripts/conveyor/fix-procedure.mjs is not edited; the fixer push gate lives in we:scripts/operations/fix-run.mjs.
+scope: ["we:scripts/lib/review-timing.mjs", "we:scripts/lib/review-timing-settings.mjs", "we:scripts/lib/review-ci-gate-io.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/lib/__tests__/review-timing.test.mjs", "we:scripts/lib/__tests__/review-timing-settings.test.mjs", "we:scripts/lib/__tests__/review-ci-gate-io.test.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/review-timing-dispatch.test.mjs", "we:scripts/conveyor/__tests__/review-verify-green.test.mjs", "we:scripts/operations/__tests__/fix-run.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-10-29"
 tags: []
 ---
@@ -13,7 +14,7 @@ R231 prototype: two default-off cascade settings. review.startBeforeCi lets the 
 
 ## Acceptance
 
-- [A1] **Executable** — run `we:scripts/readiness/heavy-admission.mjs` with vitest over `we:scripts/lib/__tests__/review-timing.test.mjs` and `we:scripts/lib/__tests__/review-timing-settings.test.mjs`: fails before and passes after (new startBeforeCi / pushAfterCi cases).
+- [A1] **Executable** — vitest over `we:scripts/lib/__tests__/review-timing.test.mjs` and `we:scripts/lib/__tests__/review-timing-settings.test.mjs` fails before and passes after (new startBeforeCi / pushAfterCi cases).
 - [A2] **Must** — both settings default off and behave exactly as today; one setting change (platform, tool file or env WE_REVIEW_START_BEFORE_CI / WE_FIX_PUSH_AFTER_CI) toggles each.
 - [A3] **Must** — error or missing evidence refuses (waits for CI): no green verify-ledger record for the exact head sha means review waits as today.
 
