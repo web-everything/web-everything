@@ -460,6 +460,9 @@ export function adaptLegacyRemoteResult(result) {
 
 const realClientFs = () => ({ realpathSync, statSync });
 
+// Static closure reference only; execution stays behind the native CJS adapter below.
+void (() => import('./remote-exec.mjs'));
+
 // Command-only adapter: daemon import closures must stay statically complete even though a host
 // can select arbitrary client code. Load it only when executing remotely, through native CJS so
 // Vitest does not transform the adapter's computed import. Relative clients still resolve beside it.
@@ -638,25 +641,32 @@ export function createRemoteExec({
           const info = await clientProvenanceStat(file, provenanceFs.lstat);
           if (signal.aborted) return;
           let previous = null;
+          let previousPathKey = null;
           try {
             const raw = info && info.size <= CLIENT_PROVENANCE_MAX_BYTES
               ? await provenanceFs.readFile(file, { encoding: 'utf8', signal }) : '';
             if (typeof raw === 'string' && Buffer.byteLength(raw, 'utf8') <= CLIENT_PROVENANCE_MAX_BYTES) {
               const parsed = JSON.parse(raw);
               if (typeof parsed?.clientPath === 'string' && typeof parsed?.sha === 'string'
-                && !/[^\x20-\x7e]/.test(parsed.clientPath) && !/[^\x20-\x7e]/.test(parsed.sha)) {
+                && !/[^\x20-\x7e]/.test(parsed.clientPath) && !/[^\x20-\x7e]/.test(parsed.sha)
+                && (parsed.pathKey === undefined || (typeof parsed.pathKey === 'string'
+                  && parsed.pathKey.length === 64 && !/[^a-f0-9]/.test(parsed.pathKey)))) {
                 previous = { clientPath: clientPathForLog(parsed.clientPath), sha: oneLine(parsed.sha) };
+                previousPathKey = parsed.pathKey ?? null;
               }
             }
           } catch { /* first use, invalid or unreadable state is missing provenance */ }
           if (signal.aborted) return;
           const pair = { clientPath: clientPathForLog(client.clientPath), sha };
-          if (previous?.clientPath !== pair.clientPath || previous?.sha !== pair.sha) {
+          // Display sanitization is lossy; identify the raw resolved path independently.
+          // Legacy state without a key deliberately emits fresh provenance once.
+          const pathKey = createHash('sha256').update(client.clientPath).digest('hex');
+          if (previousPathKey !== pathKey || previous?.sha !== pair.sha) {
             if (await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } }) === false) return;
             if (signal.aborted) return;
             await provenanceFs.mkdir(dirname(file), { recursive: true });
             if (signal.aborted) return;
-            await provenanceFs.writeFile(file, JSON.stringify(pair) + '\n', { encoding: 'utf8', signal });
+            await provenanceFs.writeFile(file, JSON.stringify({ ...pair, pathKey }) + '\n', { encoding: 'utf8', signal });
           }
         }, 100);
       })().catch(() => {}).finally(() => pendingClientProvenance.delete(provenance));

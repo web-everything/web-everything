@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as provenanceIo from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
@@ -22,6 +23,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const success = "export async function runRemote() { return { mode: 'remote', code: 0 }; }";
+const pathKeyFor = (clientPath) => createHash('sha256').update(clientPath).digest('hex');
 function fixture(source = success) {
   const root = mkdtempSync(join(tmpdir(), 'remote-client-'));
   roots.push(root);
@@ -130,7 +132,8 @@ describe('remote client override', () => {
     // realpath may expand a platform tmpdir symlink.
     first.clientPath = resolveRemoteClient({ clientPath: f.clientPath }).clientPath;
     expect(f.seams.log).toHaveBeenCalledWith(`heavy-admission: remote client override ${first.clientPath} @ abc123\n`);
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(first));
+    const pathKey = pathKeyFor(first.clientPath);
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, pathKey }));
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(1);
     expect(f.seams.appendEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...first, previous: null } });
     const realOpen = provenanceIo.open;
@@ -147,18 +150,102 @@ describe('remote client override', () => {
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(1);
     f.seams.readSha.mockReturnValue('def456');
     await f.run();
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, sha: 'def456' }));
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, sha: 'def456', pathKey }));
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(2);
     expect(f.seams.appendEvent.mock.calls[1][0].detail).toEqual({ ...first, sha: 'def456', previous: first });
     const other = fixture();
     f.policy.settings.remote.clientPath = other.clientPath;
     await f.run();
+    const otherPath = resolveRemoteClient({ clientPath: other.clientPath }).clientPath;
     await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({
-      clientPath: resolveRemoteClient({ clientPath: other.clientPath }).clientPath, sha: 'def456',
+      clientPath: otherPath, sha: 'def456', pathKey: pathKeyFor(otherPath),
     }));
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(3);
     expect(f.seams.appendEvent.mock.calls[2][0].detail.previous).toEqual({ ...first, sha: 'def456' });
     expect(f.seams.log.mock.calls.filter(([line]) => line.includes(' @ '))).toHaveLength(1);
+  });
+
+  it('removing the clientPath setting leaves unrelated admission state untouched', async () => {
+    const f = fixture();
+    const platform = { cap: 3, fastSlots: 2, priority: { mode: 'off' },
+      remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 2.5 } };
+    const withClient = resolveAdmissionPolicy({ platform: {
+      ...platform, remote: { ...platform.remote, clientPath: f.clientPath },
+    } });
+    const withoutClient = resolveAdmissionPolicy({ platform });
+    expect(withClient.invalid).toEqual([]);
+    expect(withoutClient.invalid).toEqual([]);
+    expect(withoutClient.settings.cap).toBe(withClient.settings.cap);
+    expect(withoutClient.settings.fastSlots).toBe(withClient.settings.fastSlots);
+    expect(withoutClient.settings.priority).toEqual(withClient.settings.priority);
+    expect(withoutClient.settings).toEqual({ ...withClient.settings,
+      remote: { ...withClient.settings.remote, clientPath: null } });
+    expect(withoutClient.sources).toEqual({ ...withClient.sources, 'remote.clientPath': 'standard' });
+    expect(withoutClient.ignored).toEqual(withClient.ignored);
+
+    mkdirSync(f.seams.lockRoot, { recursive: true });
+    mkdirSync(dirname(f.state), { recursive: true });
+    const slot = join(f.seams.lockRoot, 'slot-0.json');
+    const slotState = JSON.stringify({ owner: 'existing-holder', cap: 3 });
+    const overrideState = JSON.stringify({ clientPath: f.clientPath, sha: 'old-sha', pathKey: pathKeyFor(f.clientPath) });
+    writeFileSync(slot, slotState);
+    writeFileSync(f.state, overrideState);
+    const provenanceFs = mockProvenanceFs();
+    const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
+    expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
+      policy: withoutClient, log: f.seams.log, remoteExec: createRemoteExec({
+        ...f.seams, policy: withoutClient, importClient, provenanceFs,
+      }) })).toEqual({ handled: true, exitCode: 0 });
+    expect(await settleClientProvenance()).toBe(true);
+    expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
+    expect(f.seams.readSha).not.toHaveBeenCalled();
+    expect(f.seams.appendEvent).not.toHaveBeenCalled();
+    expect(f.seams.notice.logged).toBe(false);
+    for (const operation of Object.values(provenanceFs)) expect(operation).not.toHaveBeenCalled();
+    expect(readFileSync(slot, 'utf8')).toBe(slotState);
+    expect(readFileSync(f.state, 'utf8')).toBe(overrideState);
+    expect(readdirSync(f.seams.lockRoot)).toEqual(['slot-0.json']);
+    expect(readdirSync(dirname(f.state))).toEqual(['client-override.json']);
+  });
+
+  it('emits a remote-client-override event for distinct raw paths that sanitize identically with the same sha', async () => {
+    const f = fixture();
+    const firstPath = join(f.root, 'caf\u00e9', 'remote-exec.mjs');
+    const secondPath = join(f.root, 'caf\u00e8', 'remote-exec.mjs');
+    const displayPath = firstPath.replace(/[^\x20-\x7e]/g, '?');
+    expect(secondPath.replace(/[^\x20-\x7e]/g, '?')).toBe(displayPath);
+    // Keep raw Unicode spelling independent of filesystem normalization on the host.
+    const fs = { realpathSync: (path) => path, statSync: () => ({ isFile: () => true }) };
+    const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
+    const pair = { clientPath: displayPath, sha: 'abc123' };
+    f.policy.settings.remote.clientPath = firstPath;
+    expect(await f.run({ fs, importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await settleClientProvenance()).toBe(true);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...pair, pathKey: pathKeyFor(firstPath) });
+    f.policy.settings.remote.clientPath = secondPath;
+    expect(await f.run({ fs, importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await settleClientProvenance()).toBe(true);
+    expect(f.seams.appendEvent.mock.calls).toEqual([
+      [{ kind: 'remote-client-override', detail: { ...pair, previous: null } }],
+      [{ kind: 'remote-client-override', detail: { ...pair, previous: pair } }],
+    ]);
+    const raw = readFileSync(f.state, 'utf8');
+    expect(JSON.parse(raw)).toEqual({ ...pair, pathKey: pathKeyFor(secondPath) });
+    expect(raw).toMatch(/^[\x20-\x7e]+\n$/);
+    expect(Buffer.byteLength(raw)).toBeLessThanOrEqual(4096);
+  });
+
+  it('emits fresh provenance for legacy state without pathKey even when path and sha match', async () => {
+    const f = fixture();
+    const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, JSON.stringify(pair));
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await settleClientProvenance()).toBe(true);
+    expect(f.seams.appendEvent.mock.calls).toEqual([
+      [{ kind: 'remote-client-override', detail: { ...pair, previous: pair } }],
+    ]);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...pair, pathKey: pathKeyFor(pair.clientPath) });
   });
 
   it('uses createRemoteExec by default and keeps an invalid override local', async () => {
@@ -179,7 +266,8 @@ describe('remote client override', () => {
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env,
       policy: f.policy, lockRoot, log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'production-sha' };
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8'))).toEqual(pair));
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8')))
+      .toEqual({ ...pair, pathKey: pathKeyFor(pair.clientPath) }));
     expect(JSON.parse(readFileSync(join(f.root, 'events.jsonl'), 'utf8'))).toEqual({
       at: expect.any(String), kind: 'remote-client-override', repo: 'web-everything',
       detail: { ...pair, previous: null },
@@ -419,6 +507,8 @@ describe('remote client override', () => {
     ['non-string sha', JSON.stringify({ clientPath: 'old-client', sha: ['untrusted'] })],
     ['numeric clientPath', JSON.stringify({ clientPath: 42, sha: 'old-sha' })],
     ['null sha', JSON.stringify({ clientPath: 'old-client', sha: null })],
+    ...[null, 42, 'a'.repeat(63), 'a'.repeat(65), 'g'.repeat(64), 'a'.repeat(64) + '\n', '\u00e9'.repeat(64)]
+      .map((pathKey) => [`invalid pathKey ${JSON.stringify(pathKey)}`, JSON.stringify({ clientPath: 'old-client', sha: 'old-sha', pathKey })]),
     ['missing fields', '{}'],
     ['null state', 'null'],
     ['malformed JSON', 'untrusted: not JSON'],
@@ -429,11 +519,12 @@ describe('remote client override', () => {
     writeFileSync(f.state, raw);
     expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(pair));
+    const state = { ...pair, pathKey: pathKeyFor(pair.clientPath) };
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(state));
     expect(f.seams.appendEvent.mock.calls).toEqual([[{
       kind: 'remote-client-override', detail: { ...pair, previous: null },
     }]]);
-    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(pair);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(state);
   });
 
   it('bounds previous string fields and discards all other parsed fields', async () => {
@@ -543,10 +634,12 @@ describe('remote client override', () => {
       expect(publication.previous).toBe('{}');
       expect(publication.next).toEqual({
         clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123',
+        pathKey: pathKeyFor(resolveRemoteClient({ clientPath: f.clientPath }).clientPath),
       });
       expect(readdirSync(dirname(f.state))).toEqual(['client-override.json']);
       expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(fail ? {} : {
         clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123',
+        pathKey: pathKeyFor(resolveRemoteClient({ clientPath: f.clientPath }).clientPath),
       });
     } finally { rename.mockRestore(); unlink.mockRestore(); }
   });

@@ -58,10 +58,11 @@ node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/readine
 Preserve these concrete cases:
 
 - `ignores tool clientPath in a private pool without importing it` and `ignores env clientPath in a private pool without importing it`.
-- `rejects lane and falls back locally with a reason`, `rejects custom pool and falls back locally with a reason`, `rejects symlink into lane and falls back locally with a reason`, and `rejects case variants of lane pools on the named/real path`.
+- `rejects lane and falls back locally with a reason`, `rejects custom pool and falls back locally with a reason`, `rejects symlink into lane and falls back locally with a reason`, and `rejects case variants of lane pools on the %s path (%s)`.
 - `rejects a custom LANE_POOL_ROOT with default laneRoots before import` and `forwards lockRoot through the production runWithRemoteDecision default executor`.
+- `removing the clientPath setting leaves unrelated admission state untouched`.
 - `treats oversized state file as missing provenance and replaces it without raw event data`, plus its oversized UTF-8, control-character, non-string, malformed JSON and truncated JSON cases; `bounds previous string fields and discards all other parsed fields`; and `accepts provenance at the 4096-byte read limit`.
 - `sanitizes and bounds a control-bearing readSha through oneLine`, `refuses local rerun when import starts work before throwing`, and `refuses local rerun when import starts work before a missing runRemote export`.
-- `production provenance reader requests at most 4097 bytes at offset 0 for a 4096-byte file` and its oversized 8192-byte file case assert the production reader's buffer size, read range, actual byte count and handle closure.
+- `production provenance reader bounds a file growing to %i bytes to one 4097-byte read` (4096 and 8192 cases) asserts the production reader's buffer size, read range, actual byte count and handle closure.
 
 After removal, run the bundled suite at `we:scripts/readiness/__tests__/heavy-admission-remote.test.mjs` using A1's queued command to verify bundled routing and the exit-124 contract. A1's absence check is a one-line grep run by the removal PR after removing the override plumbing.

@@ -2955,6 +2955,9 @@ uses asynchronous Git so it cannot block the execution timer; neither its one-se
 100 ms persistence bound belongs on the client path. The never-resolving SHA/event regressions require
 client invocation and success before advancing fake time. Provenance assertions must await background
 writes explicitly while preserving once-per-process logs and change-only events.
+Identify path changes with the persisted SHA-256 `pathKey` of the raw resolved client path plus the SHA;
+sanitized display paths can collide. Legacy state without `pathKey` emits fresh provenance once, while
+event details keep only sanitized paths and SHAs.
 The real CLI drains tracked provenance only after the remote decision, for at most 1500 ms, with
 an unref'd timer cleared on completion. Set the remote exit code before awaiting so natural exit
 also preserves nonzero results. Keep native CLI regressions for fast event/state persistence and

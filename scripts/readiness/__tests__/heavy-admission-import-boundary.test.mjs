@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -42,7 +43,9 @@ describe('admission import boundary', () => {
     expect(result.status).toBe(code);
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'unknown' };
     expect(result.stderr).toContain(`heavy-admission: remote client override ${pair.clientPath} @ unknown\n`);
-    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(pair);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({
+      ...pair, pathKey: createHash('sha256').update(pair.clientPath).digest('hex'),
+    });
     expect(readFileSync(f.eventPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([{
       at: expect.any(String), repo: 'web-everything', kind: 'remote-client-override',
       detail: { ...pair, previous: null },
@@ -84,6 +87,7 @@ describe('admission import boundary', () => {
     const closure = collectImportClosure({ root: repoRoot, entries: ['scripts/readiness/heavy-admission.mjs'] });
     expect(closure.complete).toBe(true);
     expect(closure.files.has('scripts/lib/daemon-events.mjs')).toBe(true);
+    expect(closure.files.has('scripts/readiness/remote-exec.mjs')).toBe(true);
     expect(closure.files.has('scripts/operations/handoff-home.mjs')).toBe(false);
     expect(closure.files.has('scripts/readiness/remote-client-import.cjs')).toBe(false);
   });
@@ -214,7 +218,7 @@ describe('admission import boundary', () => {
     expect(pair.sha).toBe('native-sha');
     const raw = readFileSync(eventPath, 'utf8');
     const events = raw.trim().split('\n').map(line => JSON.parse(line));
-    const event = { kind: 'remote-client-override', detail: { ...pair, previous: null } };
+    const event = { kind: 'remote-client-override', detail: { clientPath: pair.clientPath, sha: pair.sha, previous: null } };
     expect(events).toEqual([{
       at: expect.any(String), repo: 'web-everything', ...event,
     }]);
