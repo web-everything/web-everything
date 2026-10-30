@@ -1,20 +1,26 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import * as provenanceIo from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision } from '../heavy-admission.mjs';
+import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
+// Preserve real IO while making the built-in namespace configurable for read-range observation.
+vi.mock('node:fs/promises', async (importOriginal) => ({ ...await importOriginal() }));
+vi.mock('../../lib/daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
 
 const roots = [];
 afterEach(() => {
   vi.useRealTimers();
   vi.mocked(execFileSync).mockReset();
+  vi.mocked(appendDaemonEvent).mockClear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const success = "export async function runRemote() { return { mode: 'remote', code: 0 }; }";
@@ -81,6 +87,21 @@ describe('remote client override', () => {
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('clientPath must be absolute'));
   });
 
+  it('forwards lockRoot through the production runWithRemoteDecision default executor', async () => {
+    const f = fixture();
+    const lockRoot = join(f.root, 'explicit-pool', '.admission', 'heavy');
+    const env = { LANE_POOL_ROOT: join(f.root, 'derived-pool') };
+    vi.mocked(execFileSync).mockReturnValue('production-sha\n');
+    // main() supplies lockRoot to this entry point; leave remoteExec unset to exercise its wiring.
+    expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env,
+      policy: f.policy, lockRoot, log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
+    const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'production-sha' };
+    expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8'))).toEqual(pair);
+    expect(appendDaemonEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...pair, previous: null } });
+    expect(existsSync(join(env.LANE_POOL_ROOT, '.admission', 'remote', 'client-override.json'))).toBe(false);
+    expect(existsSync(f.state)).toBe(false);
+  });
+
   it('passes the exact options object to runRemote and imports a file URL', async () => {
     const f = fixture();
     const options = { argv: ['echo', '$(literal)'], cwd: f.root, env: { A: 'b' }, signal: new AbortController().signal };
@@ -113,6 +134,23 @@ describe('remote client override', () => {
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('remote client override ignored ('));
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
     expect(f.seams.log).not.toHaveBeenCalledWith(expect.stringContaining('bundled client'));
+  });
+
+  it('rejects a custom LANE_POOL_ROOT with default laneRoots before import', async () => {
+    const f = fixture();
+    const pool = join(f.root, 'custom-pool');
+    const clientPath = join(pool, 'lane-1', 'remote-exec.mjs');
+    mkdirSync(dirname(clientPath), { recursive: true });
+    writeFileSync(clientPath, success);
+    f.policy.settings.remote.clientPath = clientPath;
+    const importClient = vi.fn();
+    const remoteExec = createRemoteExec({ policy: f.policy, cwd: f.root,
+      env: { LANE_POOL_ROOT: pool }, importClient, log: f.seams.log });
+    expect(await remoteExec({ argv: ['npm', 'run', 'build'] })).toEqual({
+      mode: 'not-started', terminated: true, reason: 'remote client override: clientPath is inside a lane pool',
+    });
+    expect(importClient).not.toHaveBeenCalled();
+    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
   });
 
   it.each(['export const other = true;', 'export const runRemote = true;'])('preserves exit 124 for a missing or non-callable runRemote export: %s', async (source) => {
@@ -200,6 +238,94 @@ describe('remote client override', () => {
     expect(await f.run({ readSha: () => { throw new Error('no git'); }, appendEvent: async () => { throw new Error('no storage'); } }))
       .toEqual({ handled: true, exitCode: 0 });
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
+  });
+
+  it('sanitizes and bounds a control-bearing readSha through oneLine', async () => {
+    const f = fixture();
+    const sha = 'ab\n\x1bc'.repeat(100);
+    f.seams.readSha.mockReturnValue(sha);
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    const line = f.seams.log.mock.calls.find(([value]) => value.includes(' @ '))[0];
+    expect(line).toMatch(/^[\x20-\x7e]+\n$/);
+    expect(line.split(' @ ')[1]).toBe(`${'ab??c'.repeat(16)}\n`);
+    expect(f.seams.appendEvent.mock.calls[0][0].detail.sha).toBe('ab??c'.repeat(16));
+    expect(line).not.toContain(sha);
+  });
+
+  it.each([
+    ['oversized state file', JSON.stringify({ clientPath: 'old-client', sha: 'old-sha' }) + ' '.repeat(4096)],
+    ['oversized UTF-8 state file', JSON.stringify({ clientPath: 'old-client', sha: 'old-sha', extra: 'é'.repeat(2048) })],
+    ['control-character clientPath', JSON.stringify({ clientPath: 'old\n\x1bclient', sha: 'old-sha' })],
+    ['control-character sha', JSON.stringify({ clientPath: 'old-client', sha: 'old\r\x7fsha' })],
+    ['non-string clientPath', JSON.stringify({ clientPath: { raw: 'untrusted' }, sha: 'old-sha' })],
+    ['non-string sha', JSON.stringify({ clientPath: 'old-client', sha: ['untrusted'] })],
+    ['numeric clientPath', JSON.stringify({ clientPath: 42, sha: 'old-sha' })],
+    ['null sha', JSON.stringify({ clientPath: 'old-client', sha: null })],
+    ['missing fields', '{}'],
+    ['null state', 'null'],
+    ['malformed JSON', 'untrusted: not JSON'],
+    ['truncated JSON', '{"clientPath":"old-client","sha":'],
+  ])('treats %s as missing provenance and replaces it without raw event data', async (_kind, raw) => {
+    const f = fixture();
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, raw);
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
+    expect(f.seams.appendEvent.mock.calls).toEqual([[{
+      kind: 'remote-client-override', detail: { ...pair, previous: null },
+    }]]);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(pair);
+  });
+
+  it('bounds previous string fields and discards all other parsed fields', async () => {
+    const f = fixture();
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, JSON.stringify({ clientPath: 'p'.repeat(1300), sha: 's'.repeat(200), extra: '\n\x1braw' }));
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual({ clientPath: 'p'.repeat(1024), sha: 's'.repeat(80) });
+  });
+
+  it('accepts provenance at the 4096-byte read limit', async () => {
+    const f = fixture();
+    const previous = { clientPath: 'old-client', sha: 'old-sha' };
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, JSON.stringify(previous).padEnd(4096, ' '));
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual(previous);
+  });
+
+  it.each([4096, 8192])('production provenance reader requests at most 4097 bytes at offset 0 for a %i-byte file', async (size) => {
+    const f = fixture();
+    mkdirSync(dirname(f.state), { recursive: true });
+    writeFileSync(f.state, JSON.stringify({ clientPath: 'old-client', sha: 'old-sha' }).padEnd(size, ' '));
+    const realOpen = provenanceIo.open;
+    let handle;
+    let read;
+    let close;
+    const open = vi.spyOn(provenanceIo, 'open').mockImplementationOnce(async (...args) => {
+      handle = await realOpen(...args);
+      read = vi.spyOn(handle, 'read');
+      close = vi.spyOn(handle, 'close');
+      return handle;
+    });
+    try {
+      // Keep provenanceFs unset: observe the production reader and real filesystem IO.
+      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(open).toHaveBeenCalledWith(f.state, 'r');
+      expect(read).toHaveBeenCalledTimes(1);
+      const [buffer, offset, length, position] = read.mock.calls[0];
+      expect(Buffer.isBuffer(buffer)).toBe(true);
+      expect(buffer.byteLength).toBeLessThanOrEqual(4097);
+      expect(offset).toBe(0);
+      expect(length).toBe(4097);
+      expect(position).toBe(0);
+      expect((await read.mock.results[0].value).bytesRead).toBe(Math.min(size, 4097));
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      open.mockRestore();
+      if (handle) await handle.close();
+    }
   });
 
   it('bounds the default git SHA lookup to at most one second and continues on timeout', async () => {

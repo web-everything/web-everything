@@ -144,7 +144,7 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, open } from 'node:fs/promises';
 import { execSync, execFileSync } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -468,6 +468,18 @@ export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClien
 }
 
 const remoteClientNotice = { logged: false };
+const CLIENT_PROVENANCE_MAX_BYTES = 4096;
+
+/** Oversized state is missing provenance: record the current pair and replace it on this run. */
+async function readClientProvenance(file, { signal }) {
+  const handle = await open(file, 'r');
+  try {
+    signal.throwIfAborted();
+    const buffer = Buffer.alloc(CLIENT_PROVENANCE_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return bytesRead > CLIENT_PROVENANCE_MAX_BYTES ? '' : buffer.toString('utf8', 0, bytesRead);
+  } finally { await handle.close(); }
+}
 
 /** Provenance is optional: storage deadlines skip it without changing remote execution semantics. */
 async function boundedClientProvenance(work, timeoutMs, fallback) {
@@ -491,7 +503,7 @@ export function createRemoteExec({
   policy, cwd = process.cwd(), env = process.env, lockRoot,
   laneRoots = [defaultPoolRoot(cwd, env), defaultPoolRoot(MODULE_CHECKOUT, {})],
   fs = realClientFs(), importClient = importRemoteClient,
-  provenanceFs = { readFile, mkdir, writeFile },
+  provenanceFs = { readFile: readClientProvenance, mkdir, writeFile },
   log = (line) => process.stderr.write(line), appendEvent = appendDaemonEvent,
   readSha = (path) => execFileSync('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
     { encoding: 'utf8', timeout: 1000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim(),
@@ -513,7 +525,7 @@ export function createRemoteExec({
       throw new Error(`remote client override import failed: ${oneLine(error?.message ?? error)}`, { cause: error });
     }
     if (typeof remote.runRemote !== 'function') throw new Error('remote client override runRemote export is not a function');
-    const sha = await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown';
+    const sha = oneLine(await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown');
     if (!notice.logged) {
       notice.logged = true;
       const displayPath = clientPathForLog(client.clientPath);
@@ -522,9 +534,18 @@ export function createRemoteExec({
     await boundedClientProvenance(async (signal) => {
       const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
       let previous = null;
-      try { previous = JSON.parse(await provenanceFs.readFile(file, { encoding: 'utf8', signal })); } catch { /* first use or unreadable state */ }
+      try {
+        const raw = await provenanceFs.readFile(file, { encoding: 'utf8', signal });
+        if (typeof raw === 'string' && Buffer.byteLength(raw, 'utf8') <= CLIENT_PROVENANCE_MAX_BYTES) {
+          const parsed = JSON.parse(raw);
+          if (typeof parsed?.clientPath === 'string' && typeof parsed?.sha === 'string'
+            && !/[^\x20-\x7e]/.test(parsed.clientPath) && !/[^\x20-\x7e]/.test(parsed.sha)) {
+            previous = { clientPath: clientPathForLog(parsed.clientPath), sha: oneLine(parsed.sha) };
+          }
+        }
+      } catch { /* first use, invalid or unreadable state is missing provenance */ }
       if (signal.aborted) return;
-      const pair = { clientPath: client.clientPath, sha };
+      const pair = { clientPath: clientPathForLog(client.clientPath), sha };
       if (previous?.clientPath !== pair.clientPath || previous?.sha !== pair.sha) {
         await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } });
         if (signal.aborted) return;
