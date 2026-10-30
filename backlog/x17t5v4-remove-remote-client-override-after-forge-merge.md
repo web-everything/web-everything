@@ -30,8 +30,8 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — Until removal, log client paths and SHAs only through the bounded one-line sanitizers; never treat provenance text as code or authority.
-2. **Truncated reads** — Unreadable or partial the provenance state file is missing provenance, never proof of safe execution; removal must not depend on reading it successfully.
-3. **Shared state files** — Retire the the provenance state file provenance file beneath the pool's `lockRoot` admission state tree without resetting unrelated admission state.
+2. **Truncated reads** — An unreadable or partial provenance state file is missing provenance, never proof of safe execution; removal must not depend on reading it successfully.
+3. **Shared state files** — Retire the provenance state file beneath the pool's `lockRoot` admission state tree without resetting unrelated admission state.
 4. **Fail closed** — Invalid clients rejected before import allow local admission; imported clients with unconfirmed termination keep exit 124 and refuse a local rerun.
 5. **Identity scoping** — Only platform preferences may select the override, including with private pools; tool settings and environment cannot select it, and lane-pool paths are rejected.
 6. **State over time** — After removal, old platform settings and persisted provenance must not reactivate the override; the bundled client covers remote execution.
