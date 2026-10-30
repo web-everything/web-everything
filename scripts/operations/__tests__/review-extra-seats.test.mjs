@@ -1587,7 +1587,8 @@ describe('durable raw seat evidence', () => {
     expect(pass.rawAnswerPath).toBe(pass.call.rawAnswerPath);
     expect(readFileSync(join(root, pass.rawAnswerPath), 'utf8')).toBe(text);
     const result = await completeRedTeam({ pr: 5, repo: REPO, loopPayload: LOOP_PAYLOAD, pass, post: true }, io);
-    expect(result.status).toBe('ran');
+    expect(result.status).toBe('failed');
+    expect(result.reason).toBe(name === 'missing-seat' ? 'red-team seat unparseable' : 'no JSON answer in the final message');
     expect(result.rawAnswerPath).toBe(pass.rawAnswerPath);
     expect(result.seat).toMatchObject({ status: 'unparseable', rawAnswerPath: pass.rawAnswerPath });
     expect(result.comment.status).toBe('not-posted');
