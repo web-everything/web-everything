@@ -16,7 +16,7 @@ export default {
     const { runAwaitVerifyPass } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/await-verify-pass.mjs')).href);
     const now = Date.parse('2026-10-29T12:00:00Z');
     const sha = 'a'.repeat(40);
-    let record = { v: 1, kind: 'fix', pr: 6085, repo: 'web-everything/web-everything', sha,
+    let record = { v: 1, kind: 'fix', pr: 6085, repo: 'ci-wait-fixture/example', sha,
       sessionId: 'claude-fix', who: 'fix-6085', lane: '/lanes/lane-49', ref: 'lane/ci-parallel-settings',
       requestedAt: new Date(now).toISOString(), attempt: 1 };
     const violations = [];
