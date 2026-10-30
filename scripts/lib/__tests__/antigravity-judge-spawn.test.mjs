@@ -85,8 +85,24 @@ describe('buildAntigravityJudgeArgv — the argv translation, per #3633\'s probe
 
   it('adds --model <model> only when a model is given', () => {
     expect(buildAntigravityJudgeArgv(base)).not.toContain('--model');
-    expect(buildAntigravityJudgeArgv({ ...base, model: 'gemini-3.1-pro-high' }))
-      .toEqual(expect.arrayContaining(['--model', 'gemini-3.1-pro-high']));
+    expect(buildAntigravityJudgeArgv({ ...base, model: 'gemini-4-argon-high' }))
+      .toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+  });
+
+  it.each(['low', 'medium', 'high'])('omits --effort for a trimmed Argon %s id, even with a conflicting request', (suffix) => {
+    const model = `gemini-4-argon-${suffix}`;
+    const argv = buildAntigravityJudgeArgv({ ...base, model: ` ${model} `, effort: 'medium' });
+    expect(argv).toEqual(expect.arrayContaining(['--model', model]));
+    expect(argv).not.toContain('--effort');
+  });
+
+  it('pins Argon high and omits --effort for every supported shared effort', () => {
+    expect(ANTIGRAVITY_MODEL).toBe('gemini-4-argon-high');
+    for (const effort of Object.keys(ANTIGRAVITY_EFFORT_MAP)) {
+      expect(buildAntigravityJudgeArgv({ ...base, model: ANTIGRAVITY_MODEL, effort })).not.toContain('--effort');
+    }
+    expect(() => buildAntigravityJudgeArgv({ ...base, model: ANTIGRAVITY_MODEL, effort: 'bogus' })).toThrow(/must be one of/);
+    expect(resolveAntigravityModelEffort(ANTIGRAVITY_MODEL, 'medium')).toBe('medium');
   });
 
   it('refuses a model shaped like a flag', () => {
@@ -116,21 +132,21 @@ describe('buildAntigravityJudgeArgv — the argv translation, per #3633\'s probe
   // #x5s8b47 — live crash reproduced 2026-09-28: `--model gemini-3.1-pro --effort medium` was refused by
   // `agy` itself (`status: "ERROR"`, "gemini-3.1-pro has no \"medium\" effort (available: low, high)"), on
   // EVERY run of the `judgeAdvisory`/`judgeCorrectnessAdvisory` seats' quota-hold fallback onto this provider.
-  it('clamps `medium` to `high` for the pinned seat model (ANTIGRAVITY_MODEL), per ANTIGRAVITY_MODEL_EFFORT_OVERRIDES', () => {
-    const argv = buildAntigravityJudgeArgv({ ...base, model: ANTIGRAVITY_MODEL, effort: 'medium' });
+  it('clamps `medium` to `high` for the legacy bare Pro model, per ANTIGRAVITY_MODEL_EFFORT_OVERRIDES', () => {
+    const argv = buildAntigravityJudgeArgv({ ...base, model: 'gemini-3.1-pro', effort: 'medium' });
     expect(argv).toEqual(expect.arrayContaining(['--effort', 'high']));
     expect(argv).not.toEqual(expect.arrayContaining(['--effort', 'medium']));
   });
 
-  it('leaves `low`/`high` alone for the pinned seat model — only `medium` is unsupported', () => {
-    expect(buildAntigravityJudgeArgv({ ...base, model: ANTIGRAVITY_MODEL, effort: 'low' }))
+  it('leaves `low`/`high` alone for the legacy bare Pro model — only `medium` is unsupported', () => {
+    expect(buildAntigravityJudgeArgv({ ...base, model: 'gemini-3.1-pro', effort: 'low' }))
       .toEqual(expect.arrayContaining(['--effort', 'low']));
-    expect(buildAntigravityJudgeArgv({ ...base, model: ANTIGRAVITY_MODEL, effort: 'high' }))
+    expect(buildAntigravityJudgeArgv({ ...base, model: 'gemini-3.1-pro', effort: 'high' }))
       .toEqual(expect.arrayContaining(['--effort', 'high']));
   });
 
   it('leaves `medium` alone for a model with no override entry, and with no model at all', () => {
-    expect(buildAntigravityJudgeArgv({ ...base, model: 'gemini-3.8-flash-low', effort: 'medium' }))
+    expect(buildAntigravityJudgeArgv({ ...base, model: 'future-model', effort: 'medium' }))
       .toEqual(expect.arrayContaining(['--effort', 'medium']));
     expect(buildAntigravityJudgeArgv({ ...base, effort: 'medium' }))
       .toEqual(expect.arrayContaining(['--effort', 'medium']));
@@ -138,13 +154,13 @@ describe('buildAntigravityJudgeArgv — the argv translation, per #3633\'s probe
 });
 
 describe('resolveAntigravityModelEffort — #x5s8b47 per-model effort clamp, layered under ANTIGRAVITY_EFFORT_MAP', () => {
-  it('applies the override table entry for the pinned seat model', () => {
-    expect(resolveAntigravityModelEffort(ANTIGRAVITY_MODEL, 'medium')).toBe('high');
+  it('applies the override table entry for the legacy bare Pro model', () => {
+    expect(resolveAntigravityModelEffort('gemini-3.1-pro', 'medium')).toBe('high');
   });
 
   it('passes through unchanged for a value the model has no override for', () => {
-    expect(resolveAntigravityModelEffort(ANTIGRAVITY_MODEL, 'low')).toBe('low');
-    expect(resolveAntigravityModelEffort(ANTIGRAVITY_MODEL, 'high')).toBe('high');
+    expect(resolveAntigravityModelEffort('gemini-3.1-pro', 'low')).toBe('low');
+    expect(resolveAntigravityModelEffort('gemini-3.1-pro', 'high')).toBe('high');
   });
 
   it('passes through unchanged for an unlisted model, or no model at all', () => {
@@ -153,8 +169,8 @@ describe('resolveAntigravityModelEffort — #x5s8b47 per-model effort clamp, lay
     expect(resolveAntigravityModelEffort('', 'medium')).toBe('medium');
   });
 
-  it('ANTIGRAVITY_MODEL_EFFORT_OVERRIDES is keyed only for the pinned seat model today', () => {
-    expect(Object.keys(ANTIGRAVITY_MODEL_EFFORT_OVERRIDES)).toEqual([ANTIGRAVITY_MODEL]);
+  it('ANTIGRAVITY_MODEL_EFFORT_OVERRIDES is keyed only for the legacy bare Pro model', () => {
+    expect(Object.keys(ANTIGRAVITY_MODEL_EFFORT_OVERRIDES)).toEqual(['gemini-3.1-pro']);
   });
 });
 
@@ -470,12 +486,12 @@ describe('antigravityJudgeSpawn — exercised over an injected spawn (real temp 
     let seen = null;
     const spy = (o) => { seen = o; return null; };
     const r = await antigravityJudgeSpawn({
-      mandate: 'm', input: 'i', shape: SHAPE, model: 'gemini-3.1-pro', effort: 'low', spawnFn: fn, recordScorecard: spy,
+      mandate: 'm', input: 'i', shape: SHAPE, model: 'gemini-4-argon-high', effort: 'low', spawnFn: fn, recordScorecard: spy,
       transcriptDir: mkdtempSync(join(tmpdir(), 'agy-scorecard-test-')),
     });
     expect(seen).toMatchObject({
       dispatchKind: 'advisory-review', kind: 'review', role: 'advisory-review', provider: 'antigravity',
-      model: 'unknown', requestedModel: 'gemini-3.1-pro', servedModel: 'unknown', modelEvidence: 'unavailable', effort: 'low',
+      model: 'unknown', requestedModel: 'gemini-4-argon-high', servedModel: 'unknown', modelEvidence: 'unavailable', effort: 'low',
     });
     // the SAME transcriptFile this run's own return value reports — never raw stdout.
     expect(seen.transcriptFile).toBe(r.transcriptFile);

@@ -103,8 +103,9 @@ describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
     }
     // spread across all three providers when all are usable (3 seats, 3 providers, no prior history)
     expect(new Set(routes.map((r) => r.provider)).size).toBe(3);
-    // live-caught: agy refuses gemini-3.1-pro at `medium` ("available: low, high")
-    expect(['low', 'high']).toContain(REVIEW_SEAT_MODELS['agy-gemini'].effort);
+    // The Gemini seat pins high effort in the model id; launchers omit the separate flag.
+    expect(REVIEW_SEAT_MODELS['agy-gemini'].effort).toBe('high');
+    expect(REVIEW_SEAT_MODELS['agy-gemini'].model).toBe('gemini-4-argon-high');
   });
 
   it('routes every advisory lens review-pr does not already seat off-Claude, and leaves Claude\'s mandatory seats alone', () => {

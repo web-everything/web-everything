@@ -29,7 +29,7 @@
       "sonnet": "claude-sonnet-4-6",
       "opus": "claude-opus-4-6-thinking",
       "flash": "gemini-3.8-flash",
-      "pro": "gemini-3.1-pro"
+      "pro": "gemini-4-argon-high"
     },
     "agy-claude": {
       "sonnet": "claude-sonnet-4-6",
@@ -38,7 +38,7 @@
     },
     "agy-gemini": {
       "flash": "gemini-3.8-flash",
-      "pro": "gemini-3.1-pro"
+      "pro": "gemini-4-argon-high"
     }
   },
   "criticalWorkGate": {

@@ -90,7 +90,7 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
       writeFileSync(${JSON.stringify(termCheckout)}, String(existsSync(${JSON.stringify(dir)})));
     });
     const work = ${execName}({ dir: ${JSON.stringify(dir)}, task: 'inert test',
-      model: ${JSON.stringify(provider === 'codex' ? 'gpt-5.4' : 'gemini-3.1-pro')}, effort: 'high',
+      model: ${JSON.stringify(provider === 'codex' ? 'gpt-5.4' : 'gemini-4-argon-high')}, effort: 'high',
       review: true, timeoutMs: 60000, stream: false, logFile: ${JSON.stringify(join(tmp, 'model.log'))},
       spawnFn: (_cli, _argv, opts) => spawn(process.execPath,
         ['--input-type=module', '-e', ${JSON.stringify(modelCode)}], opts) });

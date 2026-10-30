@@ -123,7 +123,7 @@ describe('resolveJudgeProvider', () => {
     const provider = resolveJudgeProvider('antigravity');
     antigravityJudgeSpawnCalls.length = 0;
     await provider({ mandate: 'm', input: 'i', shape: { type: 'object' } });
-    expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-3.1-pro');
+    expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-4-argon-high');
     antigravityJudgeSpawnCalls.length = 0;
     await provider({ mandate: 'm', input: 'i', shape: { type: 'object' }, model: 'gemini-3.8-flash-low' });
     expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-3.8-flash-low');
@@ -326,7 +326,7 @@ describe('createDefaultJudge — a REQUEST-level `providerName` overrides the fa
     await judgeFn({ mandate: 'm', input: 'i', shape: { type: 'object' }, providerName: 'codex' });
     await judgeFn({ mandate: 'm', input: 'i', shape: { type: 'object' }, providerName: 'antigravity' });
     expect(codexJudgeSpawnCalls[0].model).toBe('gpt-6-astra');
-    expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-3.1-pro');
+    expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-4-argon-high');
   });
 
   it('an injectable `resolveProvider` lets a test substitute BOTH providers without the module-mock seam', async () => {
@@ -376,7 +376,7 @@ describe('createDefaultJudge — a REQUEST-level `providerName` overrides the fa
     const judgeFn = createDefaultJudge({ model: 'opus' });
     await judgeFn({ mandate: 'm', input: 'i', shape: { type: 'object' }, providerName: 'antigravity' });
     expect(antigravityJudgeSpawnCalls).toHaveLength(1);
-    expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-3.1-pro');
+    expect(antigravityJudgeSpawnCalls[0].model).toBe('gemini-4-argon-high');
     expect(antigravityJudgeSpawnCalls[0].model).not.toBe('opus');
   });
 });

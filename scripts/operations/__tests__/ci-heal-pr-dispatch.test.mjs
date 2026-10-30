@@ -1216,3 +1216,10 @@ it('bounds dispatch log reads to 64 KiB and treats missing or unreadable logs as
     expect(readSessionLog('directory', root)).toBe('');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+it('checks the current Argon Pro identity for CI-heal quota holds', () => {
+  const readHolds = vi.fn(() => null);
+  routeAvailableCiHeal({ scope: [] }, { readHolds, readScores: () => [], now: 123 });
+  expect(readHolds).toHaveBeenCalledWith('gemini-4-argon-high', { now: 123 });
+  expect(readHolds).not.toHaveBeenCalledWith('gemini-3.1-pro', expect.anything());
+});

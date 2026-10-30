@@ -14,7 +14,7 @@
     },
     {
       "provider": "antigravity",
-      "model": "gemini-3.1-pro",
+      "model": "gemini-4-argon-high",
       "roles": {
         "advisory-review": "probation"
       },

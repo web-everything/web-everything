@@ -22,6 +22,12 @@ const repairLaunchRoute = (kind, vetoes = []) => {
   return resolveOperationRoute({ operation: kind, policy, vetoes });
 };
 describe('operation routing policy', () => {
+  it.each(['antigravity', 'agy-gemini'])('resolves the %s Pro alias to the registered Argon high model', (provider) => {
+    const policy = copy();
+    policy.operations.judge = { provider, model: 'pro', effort: 'high', fallback: [] };
+    expect(resolveOperationRoute({ operation: 'judge', policy })).toMatchObject({ provider, model: 'gemini-4-argon-high', effort: 'high' });
+    expect(() => validateRoutingPolicy({ ...policy, aliases: { ...policy.aliases, [provider]: { ...policy.aliases[provider], pro: 'gemini-4-argon' } } })).toThrow(/unknown model/);
+  });
   it('resolves aliases, ordered availability fallback, and inherited routes', () => {
     expect(resolveOperationRoute({ operation: 'prepare-item' })).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', fallback: [{ provider: 'claude', model: 'claude-sonnet-5-5' }] });
     expect(resolveOperationRoute({ operation: 'prepare-item', available: ['claude'] })).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5', fallback: [] });
