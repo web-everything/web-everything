@@ -2960,7 +2960,10 @@ must resolve to an effort-suffixed catalog ID; historical persisted IDs remain r
 Provider-disable regressions must reach `decideDispatchRoute` with an inherited task such as
 `bugfix`, as well as concrete task routes and both prepare branches. Constrained inheritance
 refuses with a request for an explicit provider/fallback; it must never delegate an unchecked
-provider choice to the evidence router. Review settings seats accept only Claude and agy
+provider choice to the evidence router. Added review seats may retain inherited evidence selection
+when their supplied candidate list excludes every disabled provider and the critical-work gate is
+open. Test missing and unfiltered lists, a closed gate, and mandatory/work routes to keep that
+exception confined to added seats. Review settings seats accept only Claude and agy
 adapters: test rejection through the CLI before a preference write and retention of last-good
 settings during live reload. Disabling the optional agy advisory seat must still allow review
 initialization; exhausting a mandatory seat's routes must fail validation.

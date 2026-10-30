@@ -144,16 +144,18 @@ export function applyRoutingOverrides(base, overrides = {}) {
 }
 
 /** Null retains the evidence/tier decision, or omits the optional agy advisory seat.
- * Constrained inheritance refuses dispatch unless an explicit route can enforce the disables.
+ * Constrained inheritance requires an explicit route, except added seats with filtered candidates.
  * Availability is supplied by the launch boundary. */
 export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY } = {}) {
   let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
   const disabledProviders = new Set(entry?.disabledProviders ?? []);
   const optionalAdvisory = (taskType ? `${operation}:${taskType}` : operation) === OPTIONAL_ADVISORY_SEAT;
   const inheritRoute = () => {
-    // Null delegates to a caller-owned evidence router whose choice is unknown here.
-    // Require an explicit route before allowing a constrained inherited dispatch.
-    if (disabledProviders.size && !optionalAdvisory) fail(`${operation}: inherited route cannot enforce disabled providers; configure an explicit provider and fallback`);
+    // Added-seat callers pass this same candidate list to selectReviewSeatProvider after null.
+    // Other callers may select outside `available`, so retain their explicit-route requirement.
+    const filteredAddedSeat = operation === 'review-seat' && taskType && !SETTINGS_SEAT_TASKS.includes(taskType)
+      && !gateClosed && Array.isArray(available) && available.every(provider => !disabledProviders.has(provider));
+    if (disabledProviders.size && !optionalAdvisory && !filteredAddedSeat) fail(`${operation}: inherited route cannot enforce disabled providers; configure an explicit provider and fallback`);
     return null;
   };
   if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size) && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) entry = policy.smallPrepare.route;

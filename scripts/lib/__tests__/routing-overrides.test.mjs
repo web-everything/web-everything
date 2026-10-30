@@ -8,7 +8,7 @@ import { appendDaemonEvent } from '../daemon-events.mjs';
 import { operatorPreferencesPath, readPlatformPreferences, PLATFORM_PREFERENCES_PATH, LEGACY_PLATFORM_PREFERENCES_PATHS } from '../policy-cascade.mjs';
 import { resolveRoutingProviderCap } from '../../operations/review-seat-policy.mjs';
 import { runExtraSeats, reserveSeatCalls } from '../../operations/review-extra-seats.mjs';
-import { ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from '../../operations/review-dispatch.mjs';
+import { reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from '../../operations/review-dispatch.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
 import { settingsFromRoutingPolicy } from '../review-seat-provider.mjs';
 
@@ -83,6 +83,36 @@ describe('operator routing overrides', () => {
     'never delegates constrained inherited %s routes to an unfiltered caller', operation => {
       const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { [operation]: { disabledProviders: ['codex'] } });
       expect(() => resolveOperationRoute({ operation, policy })).toThrow(/disabled providers/);
+    });
+
+  it.each(['red-team', 'standards-conformance', `extra-juror:${EXTRA_JUROR_MANDATE}`])(
+    'delegates inherited %s selection only with candidates excluding every disabled provider', taskType => {
+      const base = structuredClone(DEFAULT_ROUTING_POLICY);
+      base.operations[`review-seat:${taskType}`] = { inherit: true };
+      const policy = applyRoutingOverrides(base, { [`review-seat:${taskType}`]: {
+        enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'],
+      } });
+      const options = { operation: 'review-seat', taskType, policy };
+      expect(resolveOperationRoute({ ...options, available: ['agy-gemini'] })).toBeNull();
+      expect(resolveOperationRoute({ ...options, available: [] })).toBeNull();
+      for (const available of [undefined, ['codex', 'agy-gemini'], ['agy-claude', 'agy-gemini']]) {
+        expect(() => resolveOperationRoute({ ...options, available })).toThrow(/disabled providers/);
+      }
+      expect(() => resolveOperationRoute({ ...options, available: ['agy-gemini'], gateClosed: true }))
+        .toThrow(/disabled providers/);
+      if (taskType !== 'red-team') {
+        const plan = reviewSeatRoutes({ routingPolicy: policy, available: ['agy-gemini'] });
+        expect(plan.routes.find(route => route.key === taskType)).toMatchObject({ provider: 'agy-gemini' });
+      }
+    });
+
+  it.each(['fix', 'ci-heal', 'review-seat'])(
+    'still refuses constrained inherited %s outside added seats even with filtered candidates', operation => {
+      const base = structuredClone(DEFAULT_ROUTING_POLICY);
+      const taskType = operation === 'review-seat' ? 'mandatory:correctness' : 'bugfix';
+      base.operations[`${operation}:${taskType}`] = { inherit: true, disabledProviders: ['codex'] };
+      expect(() => resolveOperationRoute({ operation, taskType, available: ['agy-gemini'], policy: base }))
+        .toThrow(/disabled providers/);
     });
 
   it.each([
