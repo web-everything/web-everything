@@ -1969,3 +1969,140 @@ it.each(['', 'null', undefined, new Error('unreadable')])('defers without a reso
     expect(execFileSyncImpl).toHaveBeenCalledTimes(2);
   } finally { handle.kill(); }
 });
+
+
+describe('catch-up miss backoff', () => {
+  const head = { ...READY_PR, headRefOid: 'miss-head' };
+  const fixture = (extra = {}) => catchUpSetup({
+    readPr: async () => head,
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0)] }),
+    drainResult: num => ({ revalidationAborted: [{ num, reason: 'red-team-pending' }] }),
+    ...extra,
+  });
+  const attempts = f => f.calls.map(c => c.args[1]);
+
+  it('resolves nested defaults, independent cascade leaves, sources and invalid bounds', () => {
+    expect(resolveSetting().catchUp.missBackoff).toEqual({ enabled: true, ttlMinutes: 30 });
+    const s = resolveSetting({ catchUp: { missBackoff: { enabled: false, ttlMinutes: 90 } } },
+      { platform: { catchUp: { missBackoff: { enabled: true, ttlMinutes: 45 } } } });
+    expect(s.catchUp.missBackoff).toEqual({ enabled: false, ttlMinutes: 90 });
+    expect(s.line).toContain('catchUp.missBackoff.enabled=false (tool)');
+    expect(s.line).toContain('catchUp.missBackoff.ttlMinutes=90 (tool)');
+    expect(resolveSetting({ catchUp: { missBackoff: { enabled: false } } },
+      { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } }).catchUp.missBackoff).toEqual({ enabled: false, ttlMinutes: 45 });
+    for (const ttlMinutes of [0, 1441, 1.5, '30', true]) {
+      const invalid = resolveSetting({ catchUp: { missBackoff: { ttlMinutes } } },
+        { platform: { catchUp: { missBackoff: { ttlMinutes: 45 } } } });
+      expect(invalid.catchUp.missBackoff.ttlMinutes).toBe(45);
+      expect(invalid.line).toContain('catchUp.missBackoff.ttlMinutes=45 (platform)');
+      expect(invalid.invalid.join(' ')).toContain('catchUp.missBackoff.ttlMinutes=');
+    }
+    for (const ttlMinutes of [1, 1440]) expect(resolveSetting({ catchUp: { missBackoff: { ttlMinutes } } }).catchUp.missBackoff.ttlMinutes).toBe(ttlMinutes);
+    expect(resolveSetting({ catchUp: { missBackoff: { enabled: 'yes' } } }).catchUp.missBackoff.enabled).toBe(true);
+  });
+
+  it('runs the first miss, records its identity, then skips and logs only once for unchanged head/labels/reason', async () => {
+    const f = fixture();
+    await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head', labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending', at: expect.any(Number) });
+    f.advance(600_000); await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(f.lines.filter(l => l.includes('miss-backoff: skipped'))).toEqual([
+      'enqueue-on-event: catch-up #42 — miss-backoff: skipped (reason red-team-pending) until head/labels change or TTL',
+    ]);
+    expect(f.lines.at(-1)).toContain('nothing runnable');
+  });
+
+  it.each(['head', 'labels', 'TTL'])('re-picks after %s changes', async change => {
+    let pr = head;
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp();
+    if (change === 'head') pr = { ...head, headRefOid: 'new-head' };
+    if (change === 'labels') pr = { ...head, labels: [...head.labels, { name: 'review:accepted' }] };
+    f.advance(change === 'TTL' ? 1_800_000 : 600_000);
+    await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+  });
+
+  it('ignores label order and check-only changes', async () => {
+    let pr = { ...head, labels: [...head.labels, { name: 'review:accepted' }] };
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp();
+    pr = { ...pr, labels: [...pr.labels].reverse(), statusCheckRollup: [] };
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(1);
+  });
+
+  it('refills the freed slot with the next eligible candidate', async () => {
+    let prs = [candidate(42, 0)];
+    const f = fixture({ readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs }) });
+    await f.handle.catchUp();
+    prs = [candidate(42, 0), candidate(43, 1)];
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=43']);
+  });
+
+  it('enabled:false never skips or records misses', async () => {
+    const f = fixture({ resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, missBackoff: { enabled: false } } }) });
+    await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toEqual(['--only=42', '--only=42']);
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it('events bypass the hold and a new reason replaces the record on re-pick', async () => {
+    let reason = 'red-team-pending';
+    const f = fixture({ drainResult: num => ({ revalidationAborted: [{ num, reason }] }) });
+    await f.handle.catchUp();
+    reason = 'other-gate';
+    f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000); await f.handle.tick();
+    expect(attempts(f)).toHaveLength(2);
+    f.advance(1_800_000); await f.handle.catchUp();
+    expect(f.handle.missBackoff().get(42).reason).toBe('other-gate');
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(3);
+    expect(f.lines.some(l => l.includes('miss-backoff: skipped (reason other-gate)'))).toBe(true);
+  });
+
+  it.each(['absent', 'queued', 'closed', 'enqueued', 'not-listed'])('drops records when %s', async change => {
+    let prs = [candidate(42)]; let pr = head; let result;
+    const f = fixture({ readPr: async () => pr, readCandidates: async () => ({ ok: true, queued: 0, prs }),
+      drainResult: num => result ?? { revalidationAborted: [{ num, reason: 'red-team-pending' }] } });
+    await f.handle.catchUp();
+    if (change === 'absent') prs = [];
+    if (change === 'queued') prs = [candidate(42, 0, { inQueue: true })];
+    if (change === 'closed') pr = { ...head, state: 'CLOSED' };
+    if (change === 'enqueued') result = { toMerge: [{ num: 42 }] };
+    if (change === 'not-listed') result = { considered: 0 };
+    if (['closed', 'enqueued', 'not-listed'].includes(change)) f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(600_000); await f.handle.tick();
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it('unreadable labels cannot authorize a fast drain or a miss hold', async () => {
+    let pr = head;
+    const f = fixture({ readPr: async () => pr });
+    await f.handle.catchUp(); pr = { ...head, labels: null };
+    f.advance(600_000); const ran = await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(1);
+    expect(ran[0].what).toContain('labels unreadable');
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+});
+
+
+it('catch-up miss backoff uses a nondefault TTL from the resolved setting', async () => {
+  const f = catchUpSetup({
+    resolveSetting: () => resolveSetting({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, missBackoff: { ttlMinutes: 1 } } }),
+    readPr: async () => ({ ...READY_PR, headRefOid: 'short-ttl' }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+    drainResult: num => ({ revalidationAborted: [{ num, reason: 'red-team-pending' }] }),
+  });
+  await f.handle.catchUp();
+  f.advance(600_000); await f.handle.catchUp();
+  expect(f.calls).toHaveLength(2);
+});
