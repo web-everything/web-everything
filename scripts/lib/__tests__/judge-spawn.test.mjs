@@ -566,6 +566,157 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       .rejects.toThrow('Not logged in · Please run /login');
   });
 
+  it.each([
+    ...['weekly', 'daily', '5-hour', 'session']
+      .flatMap(period => ['', 'tomorrow', 'Oct 30 at 4pm (America/Toronto)']
+        .map(reset => `You've hit your ${period} limit · resets ${reset}`)),
+    "You've hit your weekly limit · resets tomorrow\nmore diagnostics",
+  ])
+    ('tags quota failure %s without changing its message', async result => {
+      const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+      const before = Date.now();
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
+        .catch(e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+      expect(error.telemetry).toMatchObject({ failureKind: 'provider-quota' });
+      expect(error.telemetry.failureText).toContain(result);
+      expect(error.quota).toBe(true);
+      expect(error.holdRow).toEqual({ provider: 'claude', status: 'quota-exhausted',
+        scoredAt: expect.any(String), quotaResetsAt: null });
+      const scoredAt = Date.parse(error.holdRow.scoredAt);
+      expect(new Date(scoredAt).toISOString()).toBe(error.holdRow.scoredAt);
+      expect(scoredAt).toBeGreaterThanOrEqual(before);
+      expect(scoredAt).toBeLessThanOrEqual(Date.now());
+    });
+
+  it.each([
+    'schema invalid', '',
+    // Former quota positives now remain countable failures.
+    ...['weekly', 'daily', 'monthly', 'usage', 'session', 'hourly', '5-hour']
+      .map(period => `You've hit your ${period} limit`),
+    ...['monthly', 'usage', 'hourly', 'yearly']
+      .map(period => `You've hit your ${period} limit · resets tomorrow`),
+    'You exceeded your current quota',
+    ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
+      { type }, { error: { type } }, { type: 'error', error: { type } },
+    ].flatMap(payload => ['', 'API Error: 429 ', 'API Error: 400 ']
+      .map(prefix => `${prefix}${JSON.stringify(payload)}`))),
+    ...['weekly', 'daily', '5-hour', 'session'].flatMap(period => [
+      `You've hit your ${period} limit of 2 repair rounds`,
+      `You've hit your ${period} limit · resets`,
+      `You've hit your ${period} limit · reset tomorrow`,
+      `You've hit your ${period} limit - resets tomorrow`,
+      `You've hit your ${period} limit • resets tomorrow`,
+      `You've hit your ${period} limit· resets tomorrow`,
+      `You've hit your ${period} limit ·resets tomorrow`,
+      `You've hit your ${period} limit  · resets tomorrow`,
+      `You've hit your ${period} limit ·  resets tomorrow`,
+    ]),
+    ...[' ', '\t', '\n', '\r\n', '\uFEFF', '\u001b[31m', 'diagnostic\n',
+      'API Error: ', 'Error: ', '429 ', 'API Error: 429 ', 'Error: 429 ']
+      .map(prefix => `${prefix}You've hit your weekly limit · resets tomorrow`),
+    "You’ve hit your weekly limit · resets tomorrow",
+    "you've hit your weekly limit · resets tomorrow",
+    "YOU'VE HIT YOUR WEEKLY LIMIT · RESETS tomorrow",
+    "You've hit your Weekly limit · resets tomorrow",
+    "You've hit your weekly limit · Resets tomorrow",
+    JSON.stringify("You've hit your weekly limit · resets tomorrow"),
+    JSON.stringify({ is_error: true, result: "You've hit your weekly limit · resets tomorrow" }),
+    'HTTP 429 Too Many Requests', '429 Too Many Requests',
+    '429 rate_limit_error Rate limit exceeded', 'API Error: 429 rate_limit_error',
+    '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
+    '429 rate_limit_error', 'status 429 Too Many Requests',
+    'rate_limit_error', 'insufficient_quota', 'RESOURCE_EXHAUSTED: Quota exceeded',
+    'rate limit exceeded', 'Too Many Requests', 'usage limit reached',
+    ...['API Error: ', 'Error: ', '429 ', 'API Error: 429 ', 'Error: 429 ']
+      .flatMap(prefix => ["You've hit your weekly limit", 'You exceeded your current quota']
+        .map(message => `${prefix}${message}`)),
+    ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
+      `error type: ${type}`,
+      JSON.stringify({ type: `${type}_config` }),
+      JSON.stringify({ error: { type: type.toUpperCase() } }),
+      JSON.stringify([{ type }]),
+      `{"type":"${type}"`,
+      `{"type":"${type}"} trailing diagnostic`,
+      `diagnostic {"type":"${type}"}`,
+      ...['Error: ', 'API Error: ', '429 ', 'HTTP 429 ', 'API Error: nope ']
+        .map(prefix => `${prefix}${JSON.stringify({ type: 'error', error: { type } })}`),
+    ]),
+    'HTTP 429 fixture failed: expected 429, received 500',
+    'HTTP 429', 'HTTP 429 request failed', 'status 429 fixture',
+    'rate_limit', 'rate limit', 'too many requests', 'Usage limit reached',
+    'rate limit must be a positive integer',
+    'too many requests configured: expected at most 10',
+    'Rate limit is configured wrong',
+    'usage limit reached for your plan setting (config error)',
+    'RESOURCE_EXHAUSTED: Out of memory', 'TypeError: rate limit is not a function',
+    'build log mentions HTTP 429 in a fixture', 'disk quota exceeded',
+  ])('leaves non-quota failure %j untagged and countable', async result => {
+    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
+      .catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    if (result) expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+    else expect(error.message).toContain('judge-spawn: the juror failed with no result text.');
+    expect(error.telemetry ?? {}).not.toHaveProperty('failureKind');
+    expect(error).not.toHaveProperty('quota');
+    expect(error).not.toHaveProperty('holdRow');
+  });
+
+  it.each([
+    ...['weekly', 'daily', '5-hour', 'session']
+      .map(period => `You've hit your ${period} limit · resets tomorrow`),
+    "You've hit your weekly limit",
+    'HTTP 429: too many requests',
+    '429 rate_limit_error Rate limit exceeded',
+  ].flatMap(text => [
+    { source: 'stdout', stdout: text, stderr: '' },
+    { source: 'stderr', stdout: 'not JSON', stderr: text },
+  ]))('never tags UNPARSEABLE raw $source as provider-quota: $stdout $stderr', async ({ stdout, stderr }) => {
+    const { fn } = fakeSpawn(stdout, { code: 1, stderr });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
+      sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
+    const original = new JudgeUnparseableError({ attempt: 1, attempts: 1, exitCode: 1,
+      signal: null, stdout, stderr, wallMs: 0, sessionId: SID, failedAttempts: [] });
+    expect(error).toBeInstanceOf(JudgeUnparseableError);
+    expect(error.message).toBe(original.message);
+    expect(error.telemetry).toMatchObject({
+      sessionId: SID, exitCode: 1, attempts: 1, stderrTail: stderr,
+      failure: 'unparseable-stdout',
+    });
+    expect(error.telemetry).not.toHaveProperty('failureKind');
+    expect(error.telemetry).not.toHaveProperty('failureText');
+    expect(error).not.toHaveProperty('quota');
+    expect(error).not.toHaveProperty('holdRow');
+  });
+
+  it.each(['stdout', 'stderr'])('ignores matching raw %s when parsed is_error result is ordinary', async source => {
+    const text = "You've hit your weekly limit · resets tomorrow";
+    const result = 'schema invalid';
+    const parsed = JSON.stringify({ is_error: true, result });
+    const { fn } = fakeSpawn(source === 'stdout' ? `${text}\n${parsed}` : parsed,
+      { code: 1, stderr: source === 'stderr' ? text : '' });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
+      sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+    expect(error.telemetry ?? {}).not.toHaveProperty('failureKind');
+    expect(error).not.toHaveProperty('quota');
+    expect(error).not.toHaveProperty('holdRow');
+  });
+
+  it.each([false, undefined])('requires is_error, even with matching result (is_error: %s)', async is_error => {
+    const { fn } = fakeSpawn(JSON.stringify({ is_error,
+      result: "You've hit your weekly limit · resets tomorrow" }), { code: 1 });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
+      sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.telemetry ?? {}).not.toHaveProperty('failureKind');
+    expect(error).not.toHaveProperty('quota');
+    expect(error).not.toHaveProperty('holdRow');
+  });
+
   it('refuses an empty input rather than spawning a juror with nothing to judge', async () => {
     let started = false;
     const spawnFn = () => { started = true; };
