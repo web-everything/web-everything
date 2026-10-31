@@ -926,7 +926,7 @@ it('reloads red-team routing each pass, enables unset Gemini, preserves explicit
     const first = fakeIo({ readRoutingPolicy: reader });
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: payload('accept').findings.read, env }, first.io);
     expect(pass.status).toBe('speculated');
-    expect(first.calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.1-pro' });
+    expect(first.calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-argon-high' });
     const capped = fakeIo({ readRoutingPolicy: reader });
     expect((await speculateRedTeam({ pr: 8, repo: REPO, read: payload('accept').findings.read,
       env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } }, capped.io)).status).toBe('skipped');

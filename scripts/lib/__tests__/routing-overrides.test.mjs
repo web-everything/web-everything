@@ -199,7 +199,7 @@ describe('operator routing overrides', () => {
       if (cap) {
         expect(io.reserveCalls).toHaveBeenCalledWith(expect.objectContaining({ provider: 'agy-gemini', dailyCap: cap, want: 1 }));
         expect(io.runSeat).toHaveBeenCalledTimes(1);
-        expect(io.runSeat).toHaveBeenCalledWith(expect.objectContaining({ provider: 'agy-gemini', model: 'gemini-3.1-pro' }));
+        expect(io.runSeat).toHaveBeenCalledWith(expect.objectContaining({ provider: 'agy-gemini', model: 'gemini-4-argon-high' }));
         expect(result.seats).toContainEqual(expect.objectContaining({ lens: 'standards-conformance', provider: 'agy-gemini' }));
         if (cap === 1) {
           expect((await runExtraSeats(input, io)).status).toBe('skipped');
@@ -218,7 +218,7 @@ describe('operator routing overrides', () => {
       fallback: [{ provider: 'agy-claude', model: 'sonnet' }, { provider: 'codex', model: 'sol' }], disabledProviders: ['codex'] } });
     expect(policy.operations[key].effort).toEqual({ codex: 'high', 'agy-gemini': 'high' });
     expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', policy })).toMatchObject({
-      provider: 'agy-gemini', model: 'gemini-3.1-pro', effort: 'high', fallback: [{ provider: 'agy-claude', model: 'claude-sonnet-5-5-high' }],
+      provider: 'agy-gemini', model: 'gemini-4-argon-high', effort: 'high', fallback: [{ provider: 'agy-claude', model: 'claude-sonnet-5-5-high' }],
     });
     expect(base.operations[key].provider).toBe('codex');
   });
