@@ -43,13 +43,6 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
-    test: 'scripts/__tests__/check-standards-memory-index.test.mjs',
-    scope: 'full',
-    why: 'executes the memory-index producer section read from check-standards; a source read has no static import edge for related-test selection',
-    matches: (f) => ['scripts/check-standards.mjs', 'scripts/check-memory.mjs'].includes(f),
-    inputs: ['scripts/__tests__/check-standards-memory-index.test.mjs'],
-  },
-  {
     test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
     scope: 'files',
     why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',

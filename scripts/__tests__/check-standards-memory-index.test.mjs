@@ -1,12 +1,13 @@
 // @vitest-environment node
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createRequire} from 'node:module';
 import {runInNewContext} from 'node:vm';
+// Keep the source dependency visible to related-test selection without executing the CLI.
+import source from '../check-standards.mjs?raw';
 
-const source=readFileSync(new URL('../check-standards.mjs',import.meta.url),'utf8');
 // Execute the actual producer section, including its subprocess call, without
 // running every unrelated standards gate. Fail loudly if its boundaries move.
 const start=source.indexOf('// ── 9a″. Agent-memory index-tree shape');
