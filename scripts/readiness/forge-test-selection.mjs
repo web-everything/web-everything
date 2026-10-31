@@ -1,60 +1,64 @@
-import * as filesystem from 'node:fs/promises';
-import {isAbsolute, join, resolve, win32} from 'node:path';
-import micromatch from 'micromatch';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {isAbsolute, relative} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
-const refuse = () => true;
+const refuse = async () => true;
+const execute = promisify(execFile);
+const child = fileURLToPath(new URL('./forge-vitest-select.mjs', import.meta.url));
+const MAX_OUTPUT = 4 * 1024 * 1024;
 
-// Only reproduce relative globs with ordinary wildcards and flat literal brace
-// lists. Everything else retains the ignored/unshipped-test local fallback;
-// micromatch accepting syntax does not prove parity with fast-glob discovery.
-function supportedPattern(pattern) {
-  if (isAbsolute(pattern) || win32.isAbsolute(pattern) || pattern.startsWith('!')
-    || pattern.split('/').some(part => !part || part === '.' || part === '..')) return false;
-  const plain = pattern.replace(/\{[A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)+\}/g, 'literal');
-  return /^[A-Za-z0-9_./*?-]+$/.test(plain);
+// Deliberately smaller than Vitest's CLI. Unknown syntax keeps local fallback;
+// only Vitest itself interprets configs, workspaces, globs and filename filters.
+function selectionArgs(argv) {
+  if (!Array.isArray(argv) || argv.some(arg => typeof arg !== 'string' || arg.includes('\0'))) return;
+  const args = argv[0] === 'npx' && argv[1] === 'vitest' && argv[2] === 'run' ? argv.slice(3)
+    : argv[0] === 'vitest' && argv[1] === 'run' ? argv.slice(2) : undefined;
+  if (!args) return;
+  const options = {watch:false, run:true}, filters = [];
+  const valued = new Map([['--config','config'], ['-c','config'], ['--root','root'], ['-r','root'], ['--dir','dir'], ['--project','project'], ['--reporter','reporter']]);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith('-')) { filters.push(arg); continue; }
+    const equal = arg.startsWith('--') ? arg.indexOf('=') : -1;
+    const flag = equal < 0 ? arg : arg.slice(0, equal);
+    const key = valued.get(flag);
+    if (key) {
+      const value = equal < 0 ? args[++i] : arg.slice(equal + 1);
+      if (!value || value.startsWith('-')) return;
+      if (key === 'reporter') continue;
+      if (key === 'project') (options.project ??= []).push(value);
+      else {
+        // Repeated scalar flags have CLI-dependent array/coercion semantics.
+        if (Object.hasOwn(options, key)) return;
+        options[key] = value;
+      }
+    } else if (flag === '--silent' || flag === '--coverage') {
+      if (equal >= 0 ? !['true','false'].includes(arg.slice(equal + 1)) : /^(?:true|false)/i.test(args[i+1] ?? '')) return;
+    } else return;
+  }
+  return {options, filters};
 }
 
-// Pure discovery predicate: every config contributes include minus exclude.
-// Unknown evidence retains the existing ignored/unshipped-test local fallback.
-export function createTestSelector(configs) {
+// exec has the promisified execFile signature, independent of Git/SSH exec.
+// A killed/oversized/unreadable listing always retains ignored-test refusal.
+export async function loadTestSelector({cwd, argv, env = process.env, exec = execute, timeoutMs = 60000} = {}) {
   try {
-    if (!Array.isArray(configs) || !configs.length) return refuse;
-    const compile = patterns => {
-      if (!Array.isArray(patterns) || patterns.some(p => typeof p !== 'string' || !p.length || !supportedPattern(p))) throw new Error('Unknown test globs');
-      return patterns.map(pattern => micromatch.matcher(pattern, {dot:true, strictBrackets:true}));
+    const selection = selectionArgs(argv);
+    if (!selection || !isAbsolute(cwd) || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return refuse;
+    const {stdout} = await exec(process.execPath, [child, JSON.stringify(selection)], {
+      cwd, env, encoding:'utf8', timeout:timeoutMs, killSignal:'SIGKILL', maxBuffer:MAX_OUTPUT,
+    });
+    if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > MAX_OUTPUT) return refuse;
+    const files = JSON.parse(stdout);
+    if (!Array.isArray(files) || files.some(file => typeof file !== 'string' || !isAbsolute(file) || file.includes('\0') || /[\uD800-\uDFFF]/u.test(file))) return refuse;
+    const selected = new Set(files.map(file => Buffer.from(relative(cwd, file)).toString('hex')));
+    return async path => {
+      if (typeof path !== 'string' && !Buffer.isBuffer(path)) return true;
+      const bytes = Buffer.from(path);
+      // Node/Vitest filenames cannot prove non-selection of opaque Git bytes.
+      if (!Buffer.from(bytes.toString('utf8')).equals(bytes)) return true;
+      return selected.has(bytes.toString('hex'));
     };
-    const selectors = configs.map(({include, exclude}) => ({include:compile(include), exclude:compile(exclude)}));
-    return path => {
-      try {
-        const name = Buffer.isBuffer(path) ? new TextDecoder('utf-8', {fatal:true, ignoreBOM:true}).decode(path) : path;
-        if (typeof name !== 'string') return true;
-        return selectors.some(({include, exclude}) => include.some(match => match(name)) && !exclude.some(match => match(name)));
-      } catch { return true; }
-    };
-  } catch { return refuse; }
-}
-
-// Evaluate the actual configs (including imported/computed arrays) with Vite's
-// own loader. Keep this client-only: the trusted Forge runtime has no npm deps.
-export async function loadTestSelector({cwd, fs = filesystem} = {}) {
-  try {
-    const names = (await fs.readdir(cwd)).filter(name => /^vitest.*\.config\..+$/.test(name)).sort();
-    if (!names.length) return refuse;
-    const {loadConfigFromFile} = await import('vite');
-    const {configDefaults} = await import('vitest/config');
-    const configs = [];
-    for (const name of names) {
-      const file = join(cwd, name);
-      // Explicit IO also keeps unreadable-config behavior injectable in fixtures.
-      await fs.readFile(file);
-      const loaded = await loadConfigFromFile({command:'serve', mode:'test'}, file, cwd, 'silent');
-      if (!loaded?.config) return refuse;
-      const config = loaded.config, test = config.test ?? {};
-      // Discovery outside cwd or through projects/plugins needs more evidence.
-      if ([config.root, test.root, test.dir].some(root => root !== undefined && resolve(cwd, root) !== resolve(cwd))
-        || test.workspace !== undefined || test.projects !== undefined || config.plugins?.length) return refuse;
-      configs.push({include:test.include ?? configDefaults.include, exclude:test.exclude ?? configDefaults.exclude});
-    }
-    return createTestSelector(configs);
   } catch { return refuse; }
 }

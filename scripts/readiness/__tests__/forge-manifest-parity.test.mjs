@@ -31,46 +31,43 @@ beforeEach(async()=>{
   const full=await buildManifest({cwd,env});base={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
 });
 
-it.each(['missing configs','unreadable config','evaluation failure','invalid include glob','invalid exclude glob',
-  'absolute include glob','absolute exclude glob','negated include glob','negated exclude glob'])
-('fails closed for an ignored build test with %s in full, delta and remote admission',async fault=>{
+it.each(['selected','timeout','invalid JSON','non-vitest argv','unknown flag','missing argv'])('refuses ignored tests in full/delta and before transport: %s',async fault=>{
   const path='_site/assets/js/__tests__/x.test.ts';
   await write(path,'export {};');await write('.gitignore','_site/\n');
-  if(fault==='missing configs')await fs.unlink(join(cwd,'vitest.config.mjs'));
-  if(fault==='evaluation failure')await write('vitest.integration.config.mjs',"throw new Error('cannot evaluate discovery');\n");
-  if(fault==='invalid include glob'||fault==='invalid exclude glob')await write('vitest.integration.config.mjs',
-    `export default {test:{include:${fault==='invalid include glob'?"['[bad']":"[]"},exclude:${fault==='invalid exclude glob'?"['[bad']":"[]"}}};\n`);
-  if(fault.startsWith('absolute')||fault.startsWith('negated')) {
-    const field=fault.includes('include')?'include':'exclude';
-    const pattern=fault.startsWith('absolute')?join(cwd,'_site/**/*.test.ts'):'!other/**';
-    const test={include:['_site/**/*.test.ts'],exclude:[],[field]:[pattern]};
-    await write('vitest.integration.config.mjs',`export default ${JSON.stringify({test})};\n`);
-  }
-  const io={...fs,readFile:async(file,...args)=>{
-    if(fault==='unreadable config'&&String(file)===join(cwd,'vitest.config.mjs'))throw Object.assign(new Error('denied'),{code:'EACCES'});
-    return fs.readFile(file,...args);
-  }};
-  await expect(buildManifest({cwd,env,fs:io})).rejects.toMatchObject({code:'ignored-test-file'});
-  await expect(buildDeltaManifest({cwd,env,fs:io,base})).rejects.toMatchObject({code:'ignored-test-file'});
+  const argv=fault==='missing argv'?undefined:fault==='non-vitest argv'?['npm','run','test:unit']
+    :['npx','vitest','run','a.test.mjs',...(fault==='unknown flag'?['--no-color']:[])];
+  const selectorExec=vi.fn(async()=>{
+    if(fault==='timeout')throw Object.assign(new Error('deadline exceeded'),{killed:true,signal:'SIGKILL'});
+    return {stdout:fault==='invalid JSON'?'broken':JSON.stringify([join(cwd,path)])};
+  });
+  const options={cwd,env,argv,selectorExec};
+  await expect(buildManifest(options)).rejects.toMatchObject({code:'ignored-test-file'});
+  await expect(buildDeltaManifest({...options,base})).rejects.toMatchObject({code:'ignored-test-file'});
   const calls=[],exec=async call=>{
     calls.push(call);
     if(call.file==='ssh'&&call.args.length===2&&call.args[1]==='true')return {code:0,stdout:Buffer.alloc(0)};
     if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
     return defaultExec(call);
   };
-  expect(await runRemote({cwd,env,fs:io,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}}))
+  expect(await runRemote({...options,exec,disableDelta:true,argv:argv??['npm','run','test:unit'],log:()=>{}}))
     .toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file'});
   expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+  if(['non-vitest argv','unknown flag','missing argv'].includes(fault))expect(selectorExec).not.toHaveBeenCalled();
 });
 
-it('omits a config-excluded ignored test from full and delta entries',async()=>{
+it('omits a Vitest-excluded ignored test from full and delta entries with the same argv and env',async()=>{
   const path='scripts/build/lost.test.mjs';
   await write(path,'export {};');await write('.gitignore','scripts/build/\n');
-  await write('vitest.config.mjs',"export default {test:{include:['**/*.test.mjs'],exclude:['scripts/build/**']}};\n");
-  for(const actual of [await buildManifest({cwd,env}),await buildDeltaManifest({cwd,env,base})]){
+  const argv=['npx','vitest','run','a.test.mjs'],selectorExec=vi.fn(async(file,args,options)=>{
+    expect(JSON.parse(args[1]).filters).toEqual(['a.test.mjs']);
+    expect(options.env).toBe(env);expect(options.cwd).toBe(cwd);
+    return {stdout:JSON.stringify([join(cwd,'a.test.mjs')])};
+  });
+  for(const actual of [await buildManifest({cwd,env,argv,selectorExec}),await buildDeltaManifest({cwd,env,base,argv,selectorExec})]){
     expect(actual.entries.map(entry=>entry.path.toString())).not.toContain(path);
     expect(actual.excluded.map(entry=>entry.toString())).not.toContain(path);
   }
+  expect(selectorExec).toHaveBeenCalledTimes(2);
 });
 
 it('refuses a subdirectory or unreadable binding as unbound-worktree before remote dispatch',async()=>{
@@ -164,7 +161,9 @@ it.each(deletionFaults)('refuses missing tracked leaves without explicit deletio
 
 it.each(['node_modules','credentials','.private','ＮＯＤＥ＿ＭＯＤＵＬＥＳ','node_\u200bmodules'])
 ('refuses policy-excluded tracked alias %s in full and delta manifests',async name=>{
-  await write('vendor-src/leaf.js','export {};');await fs.mkdir(join(cwd,'tools'));
+  // Credential-named source aliases are allowed; retain non-source refusal coverage.
+  const leaf=name==='credentials'?'leaf.txt':'leaf.js';
+  await write('vendor-src/'+leaf,'export {};');await fs.mkdir(join(cwd,'tools'));
   await fs.symlink('../vendor-src',join(cwd,'tools',name));commit();
   for(const nested of [false,true]) {
     if(nested){await fs.symlink('tools',join(cwd,'outer'));commit();}
@@ -203,6 +202,32 @@ it('ships every regular source through a committed memory bridge',async()=>{
   const projection=manifest.entries.find(entry=>entry.path.toString()==='.claude/agent-memory/MEMORY.md');
   expect(projection.sha256).toBe(sha('x'.repeat(201)));
   expect(projection.sourcePath).toEqual(Buffer.from('agent-memory-src/MEMORY.md'));
+});
+
+it.each(['x-tokens.md','id_rsa','secret.pem'])
+('memory bridge credential-policy parity in full and delta manifests: %s',async name=>{
+  await write('agent-memory-src/x-tokens.md','# Tokens\n');
+  if(name!=='x-tokens.md')await write('agent-memory-src/'+name,'private fixture');
+  await fs.mkdir(join(cwd,'.claude'));
+  await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));commit();
+  git(['update-ref','refs/remotes/origin/main','HEAD']);
+  for(const delta of [false,true]) {
+    const build=()=>delta?buildDeltaManifest({cwd,env,base}):buildManifest({cwd,env});
+    if(name!=='x-tokens.md') {
+      await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
+      continue;
+    }
+    const actual=await build();
+    const alias='.claude/agent-memory/x-tokens.md';
+    expect(actual.entries.map(({path,sha256,executable})=>({path:path.toString(),sha256,executable}))).toEqual(await oracle());
+    expect(actual.entries.find(entry=>entry.path.toString()===alias)).toMatchObject({
+      sha256:sha('# Tokens\n'),sourcePath:Buffer.from('agent-memory-src/x-tokens.md'),
+    });
+    if(delta) {
+      expect(actual.manifestMode).toBe('git-delta');
+      expect(actual.deltaPaths).toContainEqual(Buffer.from(alias));
+    }
+  }
 });
 
 it.each(['untracked link','changed link bytes','escaping target','absolute escaping target','untracked target','unmerged link','linked parent','linked target','file target','missing traversal component','ignored target leaf'])
@@ -356,12 +381,13 @@ const rows=[
   [30,'nested tracked directory links omit an ignored non-test leaf at every alias'],
   [31,'allowed tracked directory alias omits ignored runtime files beside a node_modules/.bin symlink'],
   [32,'ignored _site test outside all Vitest includes is omitted'],
-  [33,'ignored _site test selected only by integration config still refuses'],
+  [33,'ignored _site test selected by the explicit integration config still refuses'],
 ];
 it.each(rows)('row %i: %s',async row=>{
   let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29,33].includes(row);
   const omitted=[];
   if(row===32||row===33){
+    await fs.symlink(new URL('../../../node_modules',import.meta.url).pathname,join(cwd,'node_modules'),'dir');
     const path='_site/assets/js/__tests__/x.test.ts';
     await write(path,'export {};');await write('.gitignore','_site/\n');omitted.push(path);
     if(row===33)await write('vitest.integration.config.mjs',"export default {test:{include:['_site/**/*.test.ts'],exclude:[]}};\n");
@@ -433,7 +459,8 @@ it.each(rows)('row %i: %s',async row=>{
     return result;
   };
   for(const delta of [false,true]) {
-    const build=()=>delta?buildDeltaManifest({cwd,env:hostile,exec,base}):buildManifest({cwd,env:hostile,exec});
+    const argv=row===32?['npx','vitest','run']:row===33?['npx','vitest','run','--config','vitest.integration.config.mjs']:undefined;
+    const build=()=>delta?buildDeltaManifest({cwd,env:hostile,exec,base,argv}):buildManifest({cwd,env:hostile,exec,argv});
     if(refuse){
       if(row>=20)await expect(build()).rejects.toMatchObject({code:[25,33].includes(row)?'ignored-test-file':'unshipped-symlink'});
       else await expect(build()).rejects.toThrow();
