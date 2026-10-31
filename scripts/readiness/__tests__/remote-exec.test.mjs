@@ -296,7 +296,7 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
       symlinkSync(join(external,'payload.txt'),join(cwd,file));
     } else symlinkSync(kind === 'dangling parent' ? join(cwd,'absent') : external,join(cwd,'fixtures'));
     f.listFiles.mockResolvedValue(['package-lock.json',file]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'unshipped-symlink'});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
   });
@@ -601,8 +601,8 @@ describe('isAllowedCommand', () => {
 });
 
 describe('standards input parity', () => {
-  it('discovers the same base, ignored coverage report and tracked memory index locally and through the real manifest + filterEnv', async () => {
-    for (const scenario of ['coverage base', 'coverage report', 'memory index']) {
+  it('discovers the same base, ignored coverage report, tracked memory index and tracked skills locally and through the real manifest + filterEnv', async () => {
+    for (const scenario of ['coverage base', 'coverage report', 'memory index', 'tracked skills']) {
       let observed;
       const f = fixture({receipt:(_nonce,value)=>JSON.stringify({...value,code:observed.exitCode})});
       const original = f.exec, work = join(cwd, scenario), snapshot = join(cwd, `${scenario}-remote`);
@@ -621,6 +621,11 @@ describe('standards input parity', () => {
       mkdirSync(join(work,'.claude')); mkdirSync(join(work,'agent-memory-src'));
       symlinkSync('../agent-memory-src',join(work,'.claude/agent-memory'));
       writeFileSync(join(work,'agent-memory-src/MEMORY.md'),scenario === 'memory index' ? 'x'.repeat(201) : '# Memory\n');
+      if(scenario==='tracked skills') {
+        mkdirSync(join(work,'skills-src/example'),{recursive:true});
+        writeFileSync(join(work,'skills-src/example/SKILL.md'),'# Skill\n');
+        symlinkSync('../skills-src',join(work,'.claude/skills'));
+      }
       writeFileSync(join(work,tier),'export const changed = false;\n');
       git('add','.'); git('commit','-m','base');
       const base = git('rev-parse','HEAD');
@@ -650,6 +655,10 @@ describe('standards input parity', () => {
       f.exec = vi.fn(async call => {
         if (call.file === 'git') return remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}});
         if (call.file === 'rsync') {
+          if(scenario==='tracked skills') {
+            expect(readFileSync(join(call.cwd,'.claude/skills/example/SKILL.md'),'utf8')).toBe('# Skill\n');
+            expect((await filesystem.lstat(join(call.cwd,'.claude/skills'))).isDirectory()).toBe(true);
+          }
           cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
         }
         if (isRun(call)) {
@@ -1723,7 +1732,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       symlinkSync(join(outside,'coverage-final.json'),join(cwd,'coverage/coverage-final.json'));
     }
     const exec=vi.fn(async call=>bindingEvidence(call)??({code:0,stdout:call.args.includes('-i')?Buffer.from('coverage/coverage-final.json\0'):Buffer.alloc(0)}));
-    await expect(build({cwd,exec})).rejects.toThrow('Unsafe inventory component');
+    await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
   function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
     return vi.fn(async call => {

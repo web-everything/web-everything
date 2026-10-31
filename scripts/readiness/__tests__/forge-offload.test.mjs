@@ -250,7 +250,13 @@ describe('warm base selection and delta proof',()=>{
   it.each([['120000','blob','skills'],['160000','commit','module'],['120000','blob','oauth-source.mjs']])('rejects non-excluded %s tree entry %s %s', (mode,type,path)=>{
     expect(()=>parseGitTree(Buffer.from(`${mode} ${type} ${'a'.repeat(40)}\t${path}\0`))).toThrow('Unsupported git tree mode');
   });
-  it('refuses excluded symlinks in full and delta manifests even when the base predates them',async()=>{
+  it('retains symlinks only as delta tree evidence while refusing gitlinks and default exports',()=>{
+    const oid='a'.repeat(40),link=Buffer.from(`120000 blob ${oid} 9\ttools/alias\0`);
+    expect(parseGitTree(link,{sizes:true,links:true})).toEqual([{path:Buffer.from('tools/alias'),oid,executable:false,symlink:true,size:9}]);
+    expect(()=>parseGitTree(link,{sizes:true})).toThrow('Unsupported git tree mode');
+    expect(()=>parseGitTree(Buffer.from(`160000 commit ${oid} -\ttools/module\0`),{sizes:true,links:true})).toThrow('Unsupported git tree mode');
+  });
+  it('refuses tracked symlinks to files in full and delta manifests even when the base predates them',async()=>{
     const base=await baseFixture();
     await fs.mkdir(join(repo,'.claude'));
     await fs.symlink('../mode.txt',join(repo,'.claude/skills'));
@@ -378,7 +384,7 @@ describe('warm base selection and delta proof',()=>{
 });
 
 describe('runner base materialization refuses before install',()=>{
-  async function setup(pool=false,shape) {
+  async function setup(pool=false,shape,linked=false) {
     if(shape==='file to directory')await fs.writeFile(join(repo,'node'),'old leaf');
     if(['directory to file','nested deletion'].includes(shape)) {
       await fs.mkdir(join(repo,'node','nested'),{recursive:true});await fs.writeFile(join(repo,'node','nested','leaf'),'old leaf');
@@ -394,6 +400,11 @@ describe('runner base materialization refuses before install',()=>{
     const nonce='e'.repeat(32),prepared=await runner.prepare({nonce});
     expect(prepared.capabilities).toMatchObject({delta:1,bases:[{sha:base.sha,manifestDigest:base.manifestDigest}]});
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    if(linked) {
+      await fs.mkdir(join(repo,'skills-src'));await fs.writeFile(join(repo,'skills-src/leaf.md'),'skill');
+      await fs.mkdir(join(repo,'.claude'));await fs.symlink('../skills-src',join(repo,'.claude/skills'));
+      git(['add','skills-src','.claude/skills']);
+    }
     if(shape)await fs.rm(join(repo,'node'),{recursive:true});
     if(shape==='file to directory'){await fs.mkdir(join(repo,'node'));await fs.writeFile(join(repo,'node','leaf'),'new leaf');}
     if(shape==='directory to file')await fs.writeFile(join(repo,'node'),'new leaf');
@@ -494,8 +505,8 @@ describe('runner base materialization refuses before install',()=>{
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
   // These cases run real Git, file copies and the install supervisor; allow for CI contention.
-  it.each(['delta','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
-    const f=await setup(),requests=[],copies=[],log=vi.fn();
+  it.each(['delta','tracked symlink','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+    const f=await setup(false,undefined,mode==='tracked symlink'),requests=[],copies=[],log=vi.fn();
     const sshOptions=['-o','BatchMode=yes','-o','ControlMaster=auto','-o','ControlPersist=60s','-o','ControlPath=private-cm/%C'];
     let baseRetrieved=false,ignoredCalls=0,manifestCalls=0;
     const attempts=[];
@@ -532,7 +543,7 @@ describe('runner base materialization refuses before install',()=>{
       return {code:0,stdout:JSON.stringify(value)};
     };
     const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions});
-    expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','tracked symlink','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
     if(mode==='retry succeeds')expect(manifestCalls).toBe(2);
     if(mode==='next base'){expect(manifestCalls).toBe(3);expect(attempts[0]).toBe(attempts[1]);expect(attempts[2]).toBe(f.base.sha);}
@@ -545,14 +556,14 @@ describe('runner base materialization refuses before install',()=>{
       expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
-    const deltaMode=['delta','retry succeeds','next base'].includes(mode);
+    const deltaMode=['delta','tracked symlink','retry succeeds','next base'].includes(mode);
     expect(stage.shipMode).toBe(deltaMode?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
     // only in delta mode; the deleted file and private credentials never ship.
-    const payloads=deltaMode?['changed']:['changed','lock','mode','public'];
+    const payloads=mode==='tracked symlink'?['changed','skill','skill']:deltaMode?['changed']:['changed','lock','mode','public'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
-      deltaFileCount:deltaMode?1:0,deltaBytes:deltaMode?Buffer.byteLength('changed'):0});
+      deltaFileCount:deltaMode?payloads.length:0,deltaBytes:deltaMode?bytes:0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
     if(mode==='late delta failure'){
       expect(copies).toHaveLength(2);
@@ -561,6 +572,10 @@ describe('runner base materialization refuses before install',()=>{
     if(mode==='delta'){
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
       expect(requests[0]).toMatchObject({baseSha:f.base.sha,deletions:Buffer.from('deleted.txt\0').toString('base64')});
+    }else if(mode==='tracked symlink') {
+      expect(result.code).toBe(0);
+      expect(copies[0]).toEqual(Buffer.from('./.claude/skills/leaf.md\0./a.test.mjs\0./skills-src/leaf.md\0'));
+      expect(requests[0].baseSha).toBe(f.base.sha);
     }else if(!['retry succeeds','next base'].includes(mode))expect(requests[0].baseSha).toBeUndefined();
   },30_000);
   it('refuses an ignored test created while the SSH base-manifest response is in flight',async()=>{

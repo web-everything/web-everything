@@ -3529,3 +3529,22 @@ Re-reading the staged timestamp and converting it again can truncate another mic
 making coverage older than a source with the same original mtime. The absolute-path coverage
 table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
 compares staged nanoseconds before its `cpSync` transport loses sub-millisecond precision.
+
+## Forge tracked-symlink parity
+
+Forge projects stage-0 index symlinks to regular files; it never ships or follows a
+symlink during transfer. The link's working bytes must hash to its index blob OID,
+all parent and target directories must be real directories, and the target
+must stay inside the repository and contain tracked content. This rule applies to
+every path, including the memory and skills bridges. Untracked, changed, unmerged,
+escaping or incomplete links refuse with `unshipped-symlink`. Cyclic projections
+also refuse; expanding links share the walk's count/byte limits and report
+`manifest-walk-limit` when those limits are exceeded.
+
+Projected entries retain their regular `sourcePath` and link evidence for staging
+reverification. Delta manifests always transfer projected leaves, including unchanged
+ones: their alias paths have no corresponding regular Git blob for digest assembly.
+Keep the full/delta filesystem oracle, negative admission cases and staging-swap
+case in `forge-manifest-parity.test.mjs`, plus the real manifest/stager/worker fixture
+in `remote-exec.test.mjs`. Run these and the affected fast-manifest/offload suites
+through the host heavy-admission queue.

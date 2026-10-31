@@ -17,7 +17,7 @@ async function oracle(dir=cwd,prefix='') {
   for(const name of await fs.readdir(dir)) {
     if(name==='.git'||name==='node_modules')continue;
     const path=prefix+name,absolute=join(dir,name),st=await fs.lstat(absolute);
-    if(st.isDirectory())entries.push(...await oracle(absolute,path+'/'));
+    if(st.isDirectory()||(st.isSymbolicLink()&&(await fs.stat(absolute)).isDirectory()))entries.push(...await oracle(absolute,path+'/'));
     else if(st.isFile())entries.push({path,sha256:sha(await fs.readFile(absolute)),executable:!!(st.mode&0o111)});
   }
   return entries.sort((a,b)=>Buffer.compare(Buffer.from(a.path),Buffer.from(b.path)));
@@ -60,6 +60,96 @@ it('ships every regular source through a committed memory bridge',async()=>{
   expect(projection.sha256).toBe(sha('x'.repeat(201)));
   expect(projection.sourcePath).toEqual(Buffer.from('agent-memory-src/MEMORY.md'));
 });
+
+it.each(['untracked link','changed link bytes','escaping target','absolute escaping target','untracked target','unmerged link','linked parent','linked target','file target','missing traversal component','ignored target leaf'])
+('refuses %s before remote prepare or transfer',async fault=>{
+  await write('skills-src/example/SKILL.md','# Skill\n');await write('other-src/leaf.md','other');
+  await fs.mkdir(join(cwd,'tools'));
+  const link='tools/alias';
+  const target=fault==='escaping target'?'../../outside':fault==='absolute escaping target'?join(root,'outside'):fault==='file target'?'../keep.txt':fault==='missing traversal component'?'../missing/../skills-src':'../skills-src';
+  if(fault.includes('escaping target')){await fs.mkdir(join(root,'outside'));await fs.writeFile(join(root,'outside/leaf.md'),'outside');}
+  if(fault==='untracked link')commit();
+  await fs.symlink(target,join(cwd,link));
+  if(fault!=='untracked link')commit();
+  if(fault==='changed link bytes'){await fs.unlink(join(cwd,link));await fs.symlink('../other-src',join(cwd,link));}
+  if(fault==='untracked target')git(['rm','--cached','-r','skills-src']);
+  if(fault==='linked parent'){await fs.rename(join(cwd,'tools'),join(cwd,'real-tools'));await fs.symlink('real-tools',join(cwd,'tools'));}
+  if(fault==='linked target'){await fs.rename(join(cwd,'skills-src'),join(cwd,'real-source'));await fs.symlink('real-source',join(cwd,'skills-src'));}
+  if(fault==='ignored target leaf'){await write('skills-src/hidden.txt','hidden');await fs.writeFile(join(cwd,'.git/info/exclude'),'skills-src/hidden.txt\n');}
+  const calls=[],exec=async call=>{
+    calls.push(call);
+    if(call.file==='ssh'&&call.args.at(-1)==='true')return {code:0,stdout:Buffer.alloc(0)};
+    if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
+    const result=await defaultExec(call);
+    if(fault==='unmerged link'&&call.args.includes('--stage'))return {...result,stdout:Buffer.from(result.stdout.toString().replace(' 0\ttools/alias',' 2\ttools/alias'))};
+    return result;
+  };
+  await expect(buildManifest({cwd,env,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+  await expect(buildDeltaManifest({cwd,env,exec,base})).rejects.toMatchObject({code:'unshipped-symlink'});
+  const result=await runRemote({cwd,env,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
+  expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'unshipped-symlink'});
+  expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+});
+
+it('projects nested tracked links in inventory order and rejects projection cycles',async()=>{
+  await write('outer-src/local.md','local');await write('inner-src/leaf.md','inner');
+  await fs.symlink('../inner-src',join(cwd,'outer-src/inner'));
+  await fs.symlink('outer-src',join(cwd,'alias'));commit();
+  const manifest=await buildManifest({cwd,env});
+  expect(manifest.entries.map(({path,sha256,executable})=>({path:path.toString(),sha256,executable}))).toEqual(await oracle());
+  expect(manifest.entries.find(entry=>entry.path.toString()==='alias/inner/leaf.md').sourcePath).toEqual(Buffer.from('inner-src/leaf.md'));
+  await fs.symlink('../outer-src',join(cwd,'inner-src/cycle'));commit();
+  await expect(buildManifest({cwd,env})).rejects.toMatchObject({code:'unshipped-symlink'});
+});
+
+it('refuses excessive tracked-link expansion before remote dispatch',async()=>{
+  for(let i=0;i<18;i++) {
+    await write(`src-${i}/leaf.md`,'leaf');
+    if(i)for(const name of ['a','b'])await fs.symlink(`../src-${i}`,join(cwd,`src-${i-1}/${name}`));
+  }
+  commit();
+  const calls=[],exec=async call=>{
+    calls.push(call);
+    if(call.file==='git')return defaultExec(call);
+    if(call.file==='ssh'&&call.args.at(-1)==='true')return {code:0,stdout:Buffer.alloc(0)};
+    throw new Error(`Unexpected transport: ${call.file}`);
+  };
+  const result=await runRemote({cwd,env,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
+  expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'manifest-walk-limit'});
+  expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+});
+
+it.each(['.claude/skills','tools/alias'])('transfers %s leaves even when a warm base has identical projected bytes',async link=>{
+  await write('skills-src/leaf.md','skill');await fs.mkdir(join(cwd,link,'..'));
+  await fs.symlink('../skills-src',join(cwd,link));commit();
+  const full=await buildManifest({cwd,env});
+  const warm={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
+  const delta=await buildDeltaManifest({cwd,env,base:warm});
+  expect(delta.manifestMode).toBe('git-delta');
+  expect(manifestWire(delta)).toEqual(manifestWire(full));
+  expect(delta.deltaPaths).toContainEqual(Buffer.from(link+'/leaf.md'));
+});
+
+it('rechecks a projected link during staging before prepare or rsync',async()=>{
+  await write('skills-src/leaf.md','skill');await write('other-src/leaf.md','skill');
+  await fs.mkdir(join(cwd,'.claude'));await fs.symlink('../skills-src',join(cwd,'.claude/skills'));commit();
+  let swapped=false;
+  const io={...fs,mkdtemp:async(...args)=>{
+    const dir=await fs.mkdtemp(...args);
+    await fs.unlink(join(cwd,'.claude/skills'));await fs.symlink('../other-src',join(cwd,'.claude/skills'));swapped=true;
+    return dir;
+  }};
+  const calls=[],exec=async call=>{
+    calls.push(call);
+    if(call.file==='git')return defaultExec(call);
+    if(call.file==='ssh'&&call.args.at(-1)==='true')return {code:0,stdout:Buffer.alloc(0)};
+    throw new Error(`Unexpected transport: ${call.file}`);
+  };
+  const result=await runRemote({cwd,env,exec,fs:io,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
+  expect(swapped).toBe(true);
+  expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'snapshot-staging-failed'});
+  expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+});
 afterEach(async()=>fs.rm(root,{recursive:true,force:true}));
 const rows=[
   [1,'clean tree'],[2,'same-size edit with restored mtime'],[3,'GIT_DIR/GIT_WORK_TREE twin'],
@@ -68,6 +158,9 @@ const rows=[
   [9,'GIT_CONFIG_GLOBAL excludesFile'],[10,'201-char memory index with omitted bridge'],
   [11,'extra untracked symlink'],[12,'bridge replaced by directory'],[13,'fsmonitor hook'],
   [14,'filter attribute'],[15,'deleted tracked file'],[16,'sub-millisecond staging mtime'],
+  [17,'tracked directory symlink projects skills'],
+  [18,'tracked directory symlink has no special path name'],
+  [19,'tracked directory symlink with an absolute in-repo target'],
 ];
 it.each(rows)('row %i: %s',async row=>{
   let hostile={...env},omit=false,refuse=[6,7,8,10,11,12].includes(row);
@@ -79,11 +172,21 @@ it.each(rows)('row %i: %s',async row=>{
   if(row===7){await write('.gitignore','dist/\n');await write('dist/lost.test.mjs','lost');}
   if(row===8){await write('nested/.gitignore','*.test.mjs\n');await write('nested/lost.test.mjs','lost');omit=true;}
   if(row===9){const ignore=join(root,'ignore'),config=join(root,'global');await fs.writeFile(ignore,'hidden.txt\n');await fs.writeFile(config,`[core]\n excludesFile = ${ignore}\n`);hostile.GIT_CONFIG_GLOBAL=config;await write('hidden.txt','visible');}
-  if([10,12].includes(row)){await write('agent-memory-src/MEMORY.md','x'.repeat(201));await fs.mkdir(join(cwd,'.claude'));if(row===10)await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));else await fs.mkdir(join(cwd,'.claude/agent-memory'));}
+  if([10,12].includes(row)){
+    await write('agent-memory-src/MEMORY.md','x'.repeat(201));await fs.mkdir(join(cwd,'.claude'));
+    await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));
+    if(row===12){commit();await fs.unlink(join(cwd,'.claude/agent-memory'));await fs.mkdir(join(cwd,'.claude/agent-memory'));}
+  }
   if(row===11){await fs.symlink('keep.txt',join(cwd,'extra-link'));await fs.writeFile(join(cwd,'.git/info/exclude'),'extra-link\n');}
   if(row===13){await fs.writeFile(join(cwd,'.git/hooks/fsmonitor-fixture'),'#!/bin/sh\nexit 1\n',{mode:0o755});git(['config','core.fsmonitor','.git/hooks/fsmonitor-fixture']);}
   if(row===14){await write('.gitattributes','keep.txt filter=fixture\n');git(['config','filter.fixture.clean','printf keep']);await write('keep.txt','diff');}
   if(row===15)await fs.rm(join(cwd,'keep.txt'));
+  if([17,18,19].includes(row)){
+    await write('skills-src/example/SKILL.md','# Skill\n');await write('skills-src/example/run.mjs','export {};\n');
+    await fs.chmod(join(cwd,'skills-src/example/run.mjs'),0o755);
+    const parent=row===17?'.claude':'tools';await fs.mkdir(join(cwd,parent));
+    await fs.symlink(row===19?join(cwd,'skills-src'):'../skills-src',join(cwd,parent,row===17?'skills':'alias'));commit();
+  }
   const calls=[];
   const exec=async call=>{
     calls.push(call);

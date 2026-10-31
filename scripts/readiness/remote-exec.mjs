@@ -201,23 +201,60 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
 }
 import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
-// Project the committed memory bridge into regular leaves. The wire protocol
+// Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
-const MEMORY_LINK = '.claude/agent-memory';
-const MEMORY_SOURCE = 'agent-memory-src/';
-async function verifyMemoryLink(cwd, oid, fs) {
-  const parent = await fs.lstat(join(cwd,'.claude'));
-  const link = await fs.lstat(join(cwd,MEMORY_LINK));
-  if (parent.isSymbolicLink() || !parent.isDirectory() || !link.isSymbolicLink()) throw new Error('Unsafe memory bridge');
-  const target = await fs.readlink(join(cwd,MEMORY_LINK), {encoding:'buffer'});
-  if (!oid || !target.equals(Buffer.from('../agent-memory-src'))
+const underPath=(path,prefix)=>path.subarray(0,prefix.length).equals(prefix);
+const directoryPrefix=path=>Buffer.concat([path,Buffer.from('/')]);
+async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
+  const parts=pathParts(linkPath);
+  let absolute=Buffer.from(cwd);
+  for(const part of [null,...parts.slice(0,-1)]) {
+    if(part)absolute=bytePath(absolute,part);
+    const parent=await fs.lstat(absolute);
+    if(parent.isSymbolicLink()||!parent.isDirectory())throw manifestRefusal('unshipped-symlink');
+  }
+  const link=bytePath(cwd,linkPath);
+  if(!(await fs.lstat(link)).isSymbolicLink())throw manifestRefusal('unshipped-symlink');
+  const target = await fs.readlink(link, {encoding:'buffer'});
+  if (!oid || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(oid)
     || createHash(oid.length === 64 ? 'sha256' : 'sha1').update(`blob ${target.length}\0`).update(target).digest('hex') !== oid)
-    throw new Error('Unverified memory bridge; use local fallback');
+    throw manifestRefusal('unshipped-symlink');
+  // Resolve POSIX link bytes without decoding opaque Git filenames or following
+  // another link. Any step outside the repository refuses the whole snapshot.
+  if(!target.length||target.some(b=>b===0||b===10||b===13))throw manifestRefusal('unshipped-symlink');
+  const rootPrefix=directoryPrefix(Buffer.from(cwd));
+  if(target[0]===47&&!underPath(target,rootPrefix))throw manifestRefusal('unshipped-symlink');
+  const relativeTarget=target[0]===47?target.subarray(rootPrefix.length):target;
+  const resolved=target[0]===47?[]:parts.slice(0,-1);
+  let start=0;
+  for(let i=0;i<=relativeTarget.length;i++)if(i===relativeTarget.length||relativeTarget[i]===47) {
+    const part=relativeTarget.subarray(start,i);start=i+1;
+    if(!part.length||part.equals(Buffer.from('.')))continue;
+    if(part.equals(Buffer.from('..'))) {
+      if(!resolved.length)throw manifestRefusal('unshipped-symlink');
+      resolved.pop();
+    } else {
+      resolved.push(part);
+      const path=Buffer.concat(resolved.flatMap((part,i)=>i?[Buffer.from('/'),part]:[part]));
+      const st=await fs.lstat(bytePath(cwd,path));
+      if(st.isSymbolicLink()||!st.isDirectory())throw manifestRefusal('unshipped-symlink');
+    }
+  }
+  const source=Buffer.concat(resolved.flatMap((part,i)=>i?[Buffer.from('/'),part]:[part]));
+  if(!source.length||underPath(linkPath,directoryPrefix(source))||(targetPath&&!source.equals(targetPath)))
+    throw manifestRefusal('unshipped-symlink');
+  absolute=Buffer.from(cwd);
+  for(const part of pathParts(source)) {
+    absolute=bytePath(absolute,part);
+    const st=await fs.lstat(absolute);
+    if(st.isSymbolicLink()||!st.isDirectory())throw manifestRefusal('unshipped-symlink');
+  }
+  return source;
 }
 
 const manifestRefusal=code=>Object.assign(new Error(`${code}: use local fallback`),{code});
 // Independent of Git's inventory/ignore rules. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,memoryOid,exec,head,rootInfo,scoped}) {
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -232,20 +269,21 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,memoryOi
       if(++count>100000||(bytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
       const absolute=bytePath(cwd,path),st=await inventoryStat(fs,absolute),key=path.toString('hex');
       walked.set(key,st);
-      // (b) Only the verified memory bridge may project a link into regular files.
-      if(st.isSymbolicLink()||path.equals(Buffer.from(MEMORY_LINK))) {
-        if(!path.equals(Buffer.from(MEMORY_LINK)))throw manifestRefusal('unshipped-symlink');
-        try {await verifyMemoryLink(cwd,memoryOid,fs);}catch {throw manifestRefusal('unshipped-symlink');}
+      // (b) Only verified index links may project regular source leaves.
+      const link=trackedLinks.get(key);
+      if(st.isSymbolicLink()||link) {
+        if(!link)throw manifestRefusal('unshipped-symlink');
+        try {await verifyTrackedLink(cwd,link,fs);}catch {throw manifestRefusal('unshipped-symlink');}
         continue;
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
         // (a) Ignored tests still belong to the runner's discovery universe.
         if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file');
-        if(path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE))) {
-          const projection=shipped.get(Buffer.concat([Buffer.from(MEMORY_LINK+'/'),path.subarray(MEMORY_SOURCE.length)]).toString('hex'));
+        for(const link of trackedLinks.values())if(underPath(path,link.sourcePrefix)) {
+          const projection=shipped.get(Buffer.concat([directoryPrefix(link.linkPath),path.subarray(link.sourcePrefix.length)]).toString('hex'));
           const source=shipped.get(key);
-          if(!memoryOid||!source||!projection||projection.sha256!==source.sha256
+          if(!source||!projection||projection.sha256!==source.sha256
             ||!projection.sourcePath?.equals(path))throw manifestRefusal('unshipped-symlink');
         }
       } else throw manifestRefusal('manifest-worktree-mismatch');
@@ -330,13 +368,16 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
   }
-  const memoryKey = Buffer.from(MEMORY_LINK).toString('base64');
-  const memoryOid = indexLinks.has(memoryKey) ? indexBlobs.get(memoryKey) : undefined;
-  if (indexLinks.has(memoryKey)) {
-    await verifyMemoryLink(cwd,memoryOid,fs);
-    // An injected inventory cannot omit the tracked bridge or its target corpus.
-    files.push(Buffer.from(MEMORY_LINK), ...[...indexBlobs.keys()].map(key=>Buffer.from(key,'base64'))
-      .filter(path=>path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE))));
+  const trackedLinks=new Map();
+  for(const key of indexLinks.keys()) {
+    const link={linkPath:Buffer.from(key,'base64'),linkOid:indexBlobs.get(key)};
+    try {link.targetPath=await verifyTrackedLink(cwd,link,fs);}catch {throw manifestRefusal('unshipped-symlink');}
+    link.sourcePrefix=directoryPrefix(link.targetPath);
+    const targets=[...indexBlobs.keys()].filter(key=>underPath(Buffer.from(key,'base64'),link.sourcePrefix));
+    if(!targets.some(key=>indexBlobs.get(key)))throw manifestRefusal('unshipped-symlink');
+    trackedLinks.set(link.linkPath.toString('hex'),link);
+    // An injected inventory cannot omit a tracked link or its target corpus.
+    files.push(link.linkPath,...targets.map(key=>Buffer.from(key,'base64')));
   }
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
@@ -375,7 +416,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const entries = [], excluded = [], identities = new Map();
   let deletedWorktreePaths;
   for (const path of files) {
-    if (memoryOid && path.equals(Buffer.from(MEMORY_LINK))) continue;
+    if (trackedLinks.has(path.toString('hex'))) continue;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
     let publicOid;
     if (credentialSource && !names.includes('node_modules')) {
@@ -412,7 +453,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     for (const [i,part] of parts.entries()) {
       absolute = bytePath(absolute,part);
       st = await inventoryStat(fs,absolute);
-      if (st.isSymbolicLink() || (i === parts.length-1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe inventory component');
+      if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink');
+      if (i === parts.length-1 ? !st.isFile() : !st.isDirectory()) throw new Error('Unsafe inventory component');
     }
     identities.set(path.toString('hex'),st);
     const previous=!trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
@@ -435,14 +477,29 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     entries.push(manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64'))));
     hashDone();
   }
-  if (memoryOid) {
-    if ([...excluded,...ignoredPaths].some(path=>path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE))))
-      throw new Error('Incomplete memory corpus; use local fallback');
-    const targets = entries.filter(entry=>entry.path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE)));
-    if (!targets.some(entry=>entry.path.equals(Buffer.from(MEMORY_SOURCE+'MEMORY.md')))) throw new Error('Missing memory index; use local fallback');
-    for (const entry of targets) entries.push({...entry,
-      path:Buffer.concat([Buffer.from(MEMORY_LINK+'/'),entry.path.subarray(MEMORY_SOURCE.length)]),
-      tracked:false,sourcePath:entry.path,memoryOid});
+  const sourceEntries=[...entries],projected=new Map(),projecting=new Set();
+  let projectionCount=entries.length,projectionBytes=entries.reduce((size,entry)=>size+entry.path.length+1,0);
+  function project(link) {
+    const key=link.linkPath.toString('hex');
+    if(projected.has(key))return projected.get(key);
+    if(projecting.has(key))throw manifestRefusal('unshipped-symlink');
+    projecting.add(key);
+    if ([...excluded,...ignoredPaths].some(path=>underPath(path,link.sourcePrefix)))
+      throw manifestRefusal('unshipped-symlink');
+    const targets = sourceEntries.filter(entry=>underPath(entry.path,link.sourcePrefix));
+    for(const nested of trackedLinks.values())if(underPath(nested.linkPath,link.sourcePrefix))targets.push(...project(nested));
+    if (!targets.length) throw manifestRefusal('unshipped-symlink');
+    const leaves=[];
+    for (const entry of targets) {
+      const path=Buffer.concat([directoryPrefix(link.linkPath),entry.path.subarray(link.sourcePrefix.length)]);
+      if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
+      leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
+    }
+    projecting.delete(key);projected.set(key,leaves);
+    return leaves;
+  }
+  for(const link of trackedLinks.values())entries.push(...project(link));
+  if(trackedLinks.size) {
     entries.sort((a,b)=>Buffer.compare(a.path,b.path));
     validateTestNames(entries.map(entry=>entry.path));
   }
@@ -474,7 +531,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       throw error;
     }
   }
-  try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,memoryOid,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
+  try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch');}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
@@ -549,8 +606,8 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
       ||(settings.has('core.fsmonitor')&&!/^(false|no|off|0)$/i.test(settings.get('core.fsmonitor'))))throw new Error('Unsafe Git stat config');
     manifestReason=undefined;
     if(typeof base.sha!=='string'||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha))throw new Error('invalid base sha');
-    const tree=parseGitTree(await git(['ls-tree','-r','-l','-z',base.sha]),{sizes:true});
-    blobs=new Map(tree.map(entry=>[entry.path.toString('hex'),entry]));
+    const tree=parseGitTree(await git(['ls-tree','-r','-l','-z',base.sha]),{sizes:true,links:true});
+    blobs=new Map(tree.filter(entry=>!entry.symlink).map(entry=>[entry.path.toString('hex'),entry]));
     // Capture metadata before Git evidence; a subsequent write invalidates reuse.
     const stats=new Map();
     await timed(beginSub,'lstat-pass',async()=>{
@@ -612,15 +669,15 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
   const manifest=await buildManifest({cwd,exec,fs,head,reuse,beginSub});
-  if (manifest.entries.some(entry=>entry.sourcePath)) throw new Error('Projected memory inputs require full ship');
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
     const previous=baseEntries.get(entry.path.toString('hex'));
-    return !previous || previous.sha256!==entry.sha256 || previous.executable!==entry.executable;
+    return entry.sourcePath || !previous || previous.sha256!==entry.sha256 || previous.executable!==entry.executable;
   }).map(e=>e.path).sort(Buffer.compare);
   const deletions=snapshot.entries.filter(e=>!final.has(e.path.toString('hex'))).map(e=>e.path);
-  let deltaBytes=0;for(const path of deltaPaths)deltaBytes+=(await fs.lstat(bytePath(cwd,path))).size;
+  const sources=new Map(manifest.entries.map(entry=>[entry.path.toString('hex'),entry.sourcePath??entry.path]));
+  let deltaBytes=0;for(const path of deltaPaths)deltaBytes+=(await fs.lstat(bytePath(cwd,sources.get(path.toString('hex'))))).size;
   return {...manifest,manifestMode,...(manifestReason?{manifestReason}:{}),changedCount:changed?.size??0,baseCount:snapshot.entries.length,deltaPaths,deletions,deltaBytes,baseSha:base.sha,baseManifestDigest:base.manifestDigest,baseBlobs:blobs};
 }
 // Reproduce the legacy length-prefixed input binding without staging base
@@ -820,7 +877,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           for (const entry of snapshot.entries) {
             const parts = pathParts(entry.path);
             let source = Buffer.from(snapshot.source), destination = Buffer.from(snapshot.destination);
-            if (entry.sourcePath) await verifyMemoryLink(snapshot.source,entry.memoryOid,fs);
+            if (entry.sourcePath)for(const link of entry.links)await verifyTrackedLink(snapshot.source,link,fs);
             const sourceParts = pathParts(entry.sourcePath ?? entry.path);
             for (const [i, part] of sourceParts.entries()) {
               source = bytePath(source, part);

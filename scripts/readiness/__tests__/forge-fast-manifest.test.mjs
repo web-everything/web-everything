@@ -161,7 +161,7 @@ describe('fast Git manifest',()=>{
     if(fault==='mode')await fs.chmod(join(cwd,'keep.txt'),0o755);
     if(fault==='symlink'){await fs.rm(join(cwd,'keep.txt'));await fs.symlink('edit.txt',join(cwd,'keep.txt'));}
     const hidden=call=>gitArgs(call)[0]==='status'?Promise.resolve({code:0,stdout:Buffer.alloc(0)}):exec(call);
-    if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toThrow('Unsafe inventory component');
+    if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toMatchObject({code:'unshipped-symlink'});
     else {const spy=readSpy();await compare({exec:hidden,fs:spy.fs});expect(readNames(spy.readFile)).toEqual(['keep.txt']);}
   });
   it.each(['filter','filter named unset','assume-unchanged','skip-worktree','skip-worktree + assume-unchanged'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
