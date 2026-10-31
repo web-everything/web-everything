@@ -34,7 +34,7 @@
  *
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
- *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR]
+ *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR] [--fix-ready-store=FILE]
  *                                                  [--heavy-run-samples-file=FILE]  # ungated heavy-run history fixture
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
@@ -52,6 +52,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
+import { reconcileCardBatches, resolveReconcileIntervalMin } from '../operations/card-batch-reconcile.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
@@ -76,6 +77,7 @@ import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns 
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
+import { runBundleRepairs } from './bundle-repair-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
 } from './health-file-request.mjs';
@@ -89,6 +91,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { probeFixReady } from './fix-ready-probe.mjs';
 import { kickOverlayMainSync } from '../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
@@ -1150,6 +1153,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     return results;
   });
 
+  const cardBatchReconcile = !flags['state-root'] && !flags['dry-run']
+    && cadenceDue(prev.cardBatchReconcile?.completedAt, now, resolveReconcileIntervalMin() * 60_000)
+    ? await attempt('cardBatchReconcile', async () => {
+      const results = await reconcileCardBatches({ now });
+      const failures = results.filter(result => result.action === 'error');
+      if (failures.length) throw new Error(failures.map(result => result.reason).join('; '));
+      return { completedAt: now };
+    }) : null;
+
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
@@ -1205,6 +1217,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.leases = flags['lock-root'] ? attempt('leases', leaseScan)
     : (attempt('daemonStatus', () => probeDaemonStatus()) ?? attempt('leases', leaseScan));
   probes.selfSync = attempt('selfSync', () => probeSelfSync(flags['self-sync-dir'] || defaultSelfSyncDir()));
+  probes.fixReady = attempt('fixReady', () => probeFixReady({ storePath: flags['fix-ready-store'] || undefined }));
   probes.cloneLag = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('cloneLag', () => probeCloneLag());
   probes.daemonCloneBranches = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('daemonCloneBranches', () => probeDaemonCloneBranches({ workspace: workspaceOf(REPO_ROOT) }));
   probes.lanePools = attempt('lanePools', () => probeLanePools(logsDir));
@@ -1423,6 +1436,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       }, { now }));
     }
   }
+  if (cardBatchReconcile) state.cardBatchReconcile = cardBatchReconcile;
+  else if (prev.cardBatchReconcile) state.cardBatchReconcile = prev.cardBatchReconcile;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
@@ -1490,6 +1505,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
         closedEpisodes: result.transitions.filter((t) => t.type === 'closed').map((t) => t.episode),
       });
     } catch (e) { probeErrors.investigate = scrubText(String(e?.message || e).split('\n')[0]); }
+  }
+
+  // Bundle repair (prototype, 2026-10-21) — a daemon clone held on its last-good build by an overlay conflict gets ONE
+  // supervised repair session (or, in shadow, the brief it would launch). Off unless `bundleRepair.enabled`; its own
+  // failure is a probe error, never a failed tick. A fixture tick never touches it unless a test supplies the seam.
+  let bundleRepair = null;
+  if (!flags['no-bundle-repair'] && (!flags['state-root'] || deps.runBundleRepairs) && Array.isArray(probes.selfSync)) {
+    try {
+      bundleRepair = await (deps.runBundleRepairs ?? runBundleRepairs)({ dir, selfSync: probes.selfSync, now, dryRun: !!flags['dry-run'] });
+    } catch (e) { probeErrors.bundleRepair = scrubText(String(e?.message || e).split('\n')[0]); }
   }
 
   // #4079 — filing requests (slice 5): plan which open episodes get a NEW filing request this tick and append
@@ -1619,7 +1644,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
-    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
+    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, bundleRepair, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
   });
