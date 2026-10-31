@@ -2,7 +2,7 @@
 bornAs: xtyxepf
 kind: task
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-pool-salvage-push.mjs", "we:scripts/lib/lane-salvage.mjs", "we:scripts/lib/health-watch-lane-scan.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-pool-salvage-push.mjs", "we:scripts/lib/lane-salvage.mjs", "we:scripts/lib/health-watch-lane-scan.mjs", "we:scripts/lib/__tests__/lane-pool-salvage-push.test.mjs", "we:scripts/lib/__tests__/lane-salvage.test.mjs", "we:scripts/__tests__/lane-pool-release-salvage.test.mjs"]
 dateOpened: "2026-10-28"
 preparedDate: "2026-10-31"
 preparedAgainstSha: "7a14a95543db88daa4fc0056846bf1b16c11cf64"
@@ -54,14 +54,14 @@ Out of scope (Follow-ups): D auto-reclaim in health-watch, a `lane-pool doctor` 
 ## Test plan
 
 Each case is RED today and GREEN after.
-1. `we:scripts/lib/__tests__/lane-pool-salvage-push.test.mjs`: fake `git config --show-origin --show-scope` output with `unknown` + origin `file:/Library/Developer/CommandLineTools/...` + `credential.helper` -> push proceeds (today throws `unknown transport config scope`).
-2. Same file: `unknown` scope with an origin inside the lane dir, a relative origin, or no origin -> still throws `unknown transport config scope`.
-3. Same file: `unknown` entry `url.x.insteadOf` -> still refused (URL rewrite).
-4. `we:scripts/lib/__tests__/lane-salvage.test.mjs`: lane with an untracked nested git clone -> `snapshotWorkTree` succeeds, wip commit excludes it, record lists the archive, archive hash matches the tree (today: `fatal: adding files failed`).
-5. Same: nested archive write fails (read-only salvage dir) -> snapshot throws, nothing reset.
-6. `we:scripts/__tests__/lane-pool-release-salvage.test.mjs`: salvage `failed` on a dirty lane -> release exits non-success path, lane marked `quarantined: salvage-failed`, `acquire` skips it (today: warns, releases, lane reusable dirty).
-7. Same: salvage failed on a clean, fully pushed lane -> released normally.
-8. Same: quarantined lane + successful `reclaim --salvage` -> unquarantined, content in refs/archive.
+1. Red today (capability): `we:scripts/lib/__tests__/lane-pool-salvage-push.test.mjs`: fake `git config --show-origin --show-scope` output with `unknown` + origin `file:/Library/Developer/CommandLineTools/...` + `credential.helper` -> push proceeds (today throws `unknown transport config scope`).
+2. GREEN today (preservation; mutation proof: delete the guard and the case goes red): Same file: `unknown` scope with an origin inside the lane dir, a relative origin, or no origin -> still throws `unknown transport config scope`.
+3. GREEN today (preservation; mutation proof: delete the guard and the case goes red): Same file: `unknown` entry `url.x.insteadOf` -> still refused (URL rewrite).
+4. Red today (capability): `we:scripts/lib/__tests__/lane-salvage.test.mjs`: lane with an untracked nested git clone -> `snapshotWorkTree` succeeds, wip commit excludes it, record lists the archive, archive hash matches the tree (today: `fatal: adding files failed`).
+5. GREEN today (preservation; mutation proof: delete the guard and the case goes red): Same: nested archive write fails (read-only salvage dir) -> snapshot throws, nothing reset.
+6. Red today (capability): `we:scripts/__tests__/lane-pool-release-salvage.test.mjs`: salvage `failed` on a dirty lane -> release exits non-success path, lane marked `quarantined: salvage-failed`, `acquire` skips it (today: warns, releases, lane reusable dirty).
+7. GREEN today (preservation; mutation proof: delete the guard and the case goes red): Same: salvage failed on a clean, fully pushed lane -> released normally.
+8. Red today (capability): Same: quarantined lane + successful `reclaim --salvage` -> unquarantined, content in refs/archive.
 
 ## Proof plan
 
