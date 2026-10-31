@@ -38,7 +38,7 @@ function expectDecision(result, remote) {
 
 function fixture({ remote = {}, load = 4, result = { mode: 'remote', code: 0 } } = {}) {
   const root=mkdtempSync(join(process.env.TMPDIR,'admission-remote-'));testRoots.push(root);
-  return {lockRoot:join(root,'heavy'),readTelemetry:healthyRead,
+  return {lockRoot:join(root,'heavy'),readTelemetry:healthyRead,readForgeStatus:vi.fn(async()=>({reachable:false})),
     argv: [...argv], policy: policyFor(remote), cwd: 'fixture-checkout',
     loadPerCore: vi.fn(() => load), remoteExec: vi.fn(async () => result), log: vi.fn(),
   };

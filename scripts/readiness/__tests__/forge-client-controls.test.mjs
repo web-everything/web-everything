@@ -271,6 +271,7 @@ describe('remote controls', () => {
   function fixture(remote={}) {
     const root=scratch(),lockRoot=join(root,'heavy');
     return {argv:command,policy:policy(remote),cwd:root,env:{},lockRoot,clock:()=>now,
+      readForgeStatus:vi.fn(async()=>({reachable:false})),
       readTelemetry:vi.fn(async()=>sample()),remoteExec:vi.fn(async()=>({mode:'remote',code:0})),log:vi.fn()};
   }
   it('refreshes an idle server through SSH on the heavy-admission remote path after its cache expires',async()=>{
@@ -336,7 +337,11 @@ describe('remote controls', () => {
     const f=fixture({maxConcurrent:1});
     f.remoteExec.mockResolvedValue({mode:'unconfirmed'});
     expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:124});
-    expect(readFileSync(join(f.cwd,'remote','slot-0.unconfirmed'),'utf8')).toContain('unconfirmed');
+    const marker=JSON.parse(readFileSync(join(f.cwd,'remote','slot-0.unconfirmed'),'utf8'));
+    expect(marker).toEqual({
+      v:1,runId:expect.any(String),slot:0,startedAt:new Date(now).toISOString(),pid:process.pid,
+    });
+    expect(marker.runId).toBe(f.remoteExec.mock.calls[0][0].runId);
     expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:1})).toHaveLength(1);
   });
   it('keeps a dispatched remote slot reserved after SIGKILL of its client while its job survives', async () => {
@@ -384,7 +389,9 @@ describe('remote controls', () => {
       expect(await next).toEqual({handled:false});
       expect(f.remoteExec).not.toHaveBeenCalled();
       expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
-      expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(true);
+      expect(JSON.parse(readFileSync(join(f.cwd,'remote','slot-0.unconfirmed'),'utf8'))).toEqual({
+        v:1,runId:expect.any(String),slot:0,startedAt:new Date(now).toISOString(),pid:child.pid,
+      });
       expect(()=>process.kill(jobPid,0)).not.toThrow();
     } finally {
       clearTimeout(timer);vi.useRealTimers();
@@ -437,6 +444,8 @@ describe('remote controls', () => {
     const second=runWithRemoteDecision(f);
     await vi.advanceTimersByTimeAsync(30000);
     expect(await second).toEqual({handled:false});
+    expect(f.readForgeStatus).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(true);
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
     resolve({mode:'remote',code:0});await first;
