@@ -3626,7 +3626,8 @@ refuses with `manifest-walk-limit` (local fallback) when that budget is exhauste
 Git ignores do not define Vitest discovery. Full and delta manifest admission omit ignored
 test-shaped files only when Vitest's own `createVitest('test', options)` and
 `globTestFiles(filters)` prove they are absent from the selected files. A native Node child
-resolves `vitest/node` from the lane, forwards its environment, discovers the actual config
+resolves `vitest/node` from the lane, receives only the `filterEnv` environment Forge execution
+receives (an invalid env retains fallback), discovers the actual config
 and workspace, and closes the context without running tests. Mirror the CLI's `TEST=true`,
 `VITEST=true` and default `NODE_ENV=test` prelude (preserving an explicit `NODE_ENV`):
 `createVitest` alone does not set them. Admission forwards the run's
@@ -3641,4 +3642,8 @@ timeouts, oversized output, invalid JSON or paths retain local fallback; use loc
 through heavy admission when evidence is unavailable. Keep native-child regressions for
 config/workspace discovery and no test execution, plus injected full/delta parity and refusal
 cases. Warm bases have no run argv and export tracked Git entries only; policy exclusions
-still refuse test-shaped entries, as do commandless manifest callers.
+still refuse test-shaped entries, as do commandless manifest callers. The refusal names the path.
+
+A credential-named alias is refused like any excluded path. The one exemption is the
+`.claude/agent-memory/` bridge's exact image of a tracked `agent-memory-src/` source-extension
+file that itself passed the public-blob check; any other credential-named alias still refuses.

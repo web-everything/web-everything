@@ -4,7 +4,7 @@ import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
-import {bindGit,buildManifest,buildDeltaManifest,defaultExec,runRemote} from '../remote-exec.mjs';
+import {bindGit,buildManifest,buildDeltaManifest,defaultExec,filterEnv,runRemote} from '../remote-exec.mjs';
 import {manifestWire} from '../forge-exec-manifest.mjs';
 import {manifestMutation} from './fixtures/forge-bound-git.mjs';
 let root,cwd,base,env;
@@ -60,7 +60,7 @@ it('omits a Vitest-excluded ignored test from full and delta entries with the sa
   await write(path,'export {};');await write('.gitignore','scripts/build/\n');
   const argv=['npx','vitest','run','a.test.mjs'],selectorExec=vi.fn(async(file,args,options)=>{
     expect(JSON.parse(args[1]).filters).toEqual(['a.test.mjs']);
-    expect(options.env).toBe(env);expect(options.cwd).toBe(cwd);
+    expect(options.env).toEqual(filterEnv(env));expect(options.cwd).toBe(cwd);
     return {stdout:JSON.stringify([join(cwd,'a.test.mjs')])};
   });
   for(const actual of [await buildManifest({cwd,env,argv,selectorExec}),await buildDeltaManifest({cwd,env,base,argv,selectorExec})]){
@@ -161,9 +161,9 @@ it.each(deletionFaults)('refuses missing tracked leaves without explicit deletio
 
 it.each(['node_modules','credentials','.private','ＮＯＤＥ＿ＭＯＤＵＬＥＳ','node_\u200bmodules'])
 ('refuses policy-excluded tracked alias %s in full and delta manifests',async name=>{
-  // Credential-named source aliases are allowed; retain non-source refusal coverage.
-  const leaf=name==='credentials'?'leaf.txt':'leaf.js';
-  await write('vendor-src/'+leaf,'export {};');await fs.mkdir(join(cwd,'tools'));
+  // Includes vendor-src/leaf.js -> tools/credentials/leaf.js: an ordinary source never
+  // passed the public-blob check, so a credential-named alias of it must refuse.
+  await write('vendor-src/leaf.js','export {};');await fs.mkdir(join(cwd,'tools'));
   await fs.symlink('../vendor-src',join(cwd,'tools',name));commit();
   for(const nested of [false,true]) {
     if(nested){await fs.symlink('tools',join(cwd,'outer'));commit();}
@@ -202,6 +202,16 @@ it('ships every regular source through a committed memory bridge',async()=>{
   const projection=manifest.entries.find(entry=>entry.path.toString()==='.claude/agent-memory/MEMORY.md');
   expect(projection.sha256).toBe(sha('x'.repeat(201)));
   expect(projection.sourcePath).toEqual(Buffer.from('agent-memory-src/MEMORY.md'));
+});
+
+it.each(['other-src','vendor-src'])
+('refuses a credential-named memory-bridge alias whose real target is outside agent-memory-src/: %s',async dir=>{
+  await write(dir+'/x-tokens.md','# Tokens\n');
+  await fs.mkdir(join(cwd,'.claude'));
+  await fs.symlink('../'+dir,join(cwd,'.claude/agent-memory'));commit();
+  git(['update-ref','refs/remotes/origin/main','HEAD']);
+  for(const build of [()=>buildManifest({cwd,env}),()=>buildDeltaManifest({cwd,env,base})])
+    await expect(build()).rejects.toMatchObject({code:'unshipped-symlink',detail:'.claude/agent-memory'});
 });
 
 it.each(['x-tokens.md','id_rsa','secret.pem'])
@@ -382,15 +392,20 @@ const rows=[
   [31,'allowed tracked directory alias omits ignored runtime files beside a node_modules/.bin symlink'],
   [32,'ignored _site test outside all Vitest includes is omitted'],
   [33,'ignored _site test selected by the explicit integration config still refuses'],
+  [34,'selection sees the Forge env: a local-only env var cannot deselect an ignored test'],
 ];
 it.each(rows)('row %i: %s',async row=>{
-  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29,33].includes(row);
+  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29,33,34].includes(row);
   const omitted=[];
-  if(row===32||row===33){
+  if(row===32||row===33||row===34){
     await fs.symlink(new URL('../../../node_modules',import.meta.url).pathname,join(cwd,'node_modules'),'dir');
     const path='_site/assets/js/__tests__/x.test.ts';
     await write(path,'export {};');await write('.gitignore','_site/\n');omitted.push(path);
     if(row===33)await write('vitest.integration.config.mjs',"export default {test:{include:['_site/**/*.test.ts'],exclude:[]}};\n");
+    if(row===34){
+      await write('vitest.integration.config.mjs',"export default {test:{include:process.env.LOCAL_SELECTION?['none/**']:['_site/**/*.test.ts'],exclude:[]}};\n");
+      hostile.LOCAL_SELECTION='1';
+    }
   }
   if(row===2){const st=await fs.stat(join(cwd,'keep.txt'));await write('keep.txt','diff');await fs.utimes(join(cwd,'keep.txt'),st.atimeMs/1000,st.mtimeMs/1000);}
   if(row===3){const twin=join(root,'twin');await fs.cp(cwd,twin,{recursive:true});await fs.writeFile(join(twin,'keep.txt'),'twin');hostile.GIT_DIR=join(twin,'.git');hostile.GIT_WORK_TREE=twin;}
@@ -459,10 +474,12 @@ it.each(rows)('row %i: %s',async row=>{
     return result;
   };
   for(const delta of [false,true]) {
-    const argv=row===32?['npx','vitest','run']:row===33?['npx','vitest','run','--config','vitest.integration.config.mjs']:undefined;
+    const argv=row===32?['npx','vitest','run']:row===33||row===34?['npx','vitest','run','--config','vitest.integration.config.mjs']:undefined;
     const build=()=>delta?buildDeltaManifest({cwd,env:hostile,exec,base,argv}):buildManifest({cwd,env:hostile,exec,argv});
     if(refuse){
-      if(row>=20)await expect(build()).rejects.toMatchObject({code:[25,33].includes(row)?'ignored-test-file':'unshipped-symlink'});
+      if(row>=20)await expect(build()).rejects.toMatchObject({code:[25,33,34].includes(row)?'ignored-test-file':'unshipped-symlink'});
+      if(row===33||row===34)await expect(build()).rejects.toMatchObject({detail:'_site/assets/js/__tests__/x.test.ts',
+        message:'Ignored test _site/assets/js/__tests__/x.test.ts: use local fallback'});
       else await expect(build()).rejects.toThrow();
       continue;
     }
@@ -482,7 +499,7 @@ it.each(rows)('row %i: %s',async row=>{
   if(refuse) {
     calls.length=0;
     const result=await runRemote({cwd,env:hostile,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
-    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:[7,25,33].includes(row)?'ignored-test-file':[6,8].includes(row)?'unshipped-test-file':'unshipped-symlink'});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:[7,25,33,34].includes(row)?'ignored-test-file':[6,8].includes(row)?'unshipped-test-file':'unshipped-symlink'});
     expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
   }
   if(row===3) {

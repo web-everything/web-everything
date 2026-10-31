@@ -1107,7 +1107,7 @@ describe('runRemote', () => {
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
       ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it.each([
@@ -1139,7 +1139,7 @@ describe('runRemote', () => {
       return exec(call);
     });
     await expect(remoteManifestAPI.buildManifest(f)).rejects.toMatchObject({code:'ignored-test-file'});
-    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
 

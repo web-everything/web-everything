@@ -351,13 +351,19 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // Git ignore rules alone do not establish runner exclusions. Load discovery
   // evidence lazily, once per snapshot, and retain refusal on any uncertainty.
   let testSelector;
-  const testSelected=async path=>(await (testSelector??=loadTestSelector({cwd,argv,env,exec:selectorExec})))(path);
+  // Discovery sees exactly the env Forge execution receives; an invalid env refuses.
+  const selectorEnv=()=>{try{return filterEnv(env);}catch{return undefined;}};
+  const testSelected=async path=>(await (testSelector??=(()=>{const forgeEnv=selectorEnv();
+    return forgeEnv?loadTestSelector({cwd,argv,env:forgeEnv,exec:selectorExec}):async()=>true;})()))(path);
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredPaths = splitPaths(ignored.stdout);
   for (const path of ignoredPaths) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
-    if (isTestFile(path) && await testSelected(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
+    if (isTestFile(path) && await testSelected(path)) {
+      const refusal=manifestRefusal('ignored-test-file',path);
+      throw Object.assign(refusal,{message:`Ignored test ${refusal.detail}: use local fallback`});
+    }
   }
   const walkDone=beginSub('inventory-walk');
   let files;
@@ -524,7 +530,15 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
       const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
-      if((policy.excluded&&!policy.credentialSource)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
+      // A credential-named alias is refused unless it is the memory bridge's exact
+      // image of a tracked agent-memory-src/ source that itself passed the public-blob check above.
+      const sourcePath=entry.sourcePath??entry.path,memoryRoot=Buffer.from('agent-memory-src/');
+      const verifiedMemory=bridge==='.claude/agent-memory/'&&policy.credentialSource
+        &&sourcePath.subarray(0,memoryRoot.length).equals(memoryRoot)
+        &&sourcePath.subarray(memoryRoot.length).equals(path.subarray(bridge.length))
+        &&indexBlobs.has(sourcePath.toString('base64'))&&classifyManifestPath(sourcePath).credentialSource
+        &&sourceEntries.some(source=>source.path.equals(sourcePath));
+      if((policy.excluded&&!verifiedMemory)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }
