@@ -41,3 +41,4 @@
 {"type":"quarantine-removed","at":1793317461278,"actor":"red-main-safety-net","test":"scripts/ci/__tests__/ci-hetzner-routing.test.mjs","brokenSha":"dbd6e67c3d8940fb2b8f1b5021ca435b17ad598a","why":"main-green"}
 {"type":"quarantine-removed","at":1793317461278,"actor":"red-main-safety-net","test":"scripts/__tests__/ci-integration-parallel.test.mjs","brokenSha":"dbd6e67c3d8940fb2b8f1b5021ca435b17ad598a","why":"main-green"}
 {"type":"quarantine-fix-prs","at":1793317461278,"actor":"red-main-safety-net","fixPrs":[]}
+{"type":"quarantine-added","at":1793464266376,"actor":"red-main-safety-net","test":"scripts/lib/__tests__/proc-identity.test.mjs","brokenSha":"06649b99","owner":"card-proc-identity-fd-flake","reason":"flaky fd reuse in procfs reader test (carded 2026-10-31); main CI red 16:03Z coverage-merge via shard 10","addedAt":1793464266376,"expiresAt":1793550666376}

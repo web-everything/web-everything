@@ -1,5 +1,14 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/lib/__tests__/proc-identity.test.mjs",
+      "brokenSha": "06649b99",
+      "owner": "card-proc-identity-fd-flake",
+      "reason": "flaky fd reuse in procfs reader test (carded 2026-10-31); main CI red 16:03Z coverage-merge via shard 10",
+      "addedAt": 1793464266376,
+      "expiresAt": 1793550666376
+    }
+  ],
   "mode": "quarantine"
 }
