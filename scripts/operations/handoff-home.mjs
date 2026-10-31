@@ -33,13 +33,16 @@
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { stageOnTransportBranch, trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
+import { handoffHome } from '../lib/handoff-path.mjs';
+
+// Preserve the CLI module's public API; location-only consumers use the leaf module directly.
+export { handoffHome };
 
 export const HANDOFF_BRANCH = 'ops/handoff';
 
@@ -48,11 +51,6 @@ export const HANDOFF_FILES = Object.freeze(['handoff-webeverything.md', 'handoff
 
 /** This repository's checkout: the board the transport pushes from, and where `origin` is read. */
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-
-/** THE one answer to "where is the handoff". Outside `~/.claude/` (its path gate prompts on every edit). */
-export function handoffHome({ home = homedir() } = {}) {
-  return join(home, 'workspace', '.operations', 'handoff');
-}
 
 /** A personal home directory in a path. `scrubPublish` leaves paths alone on purpose; a public branch cannot. */
 export const PERSONAL_PATH = /\/Users\/(?!Shared\b)[A-Za-z0-9._-]+|\/home\/[A-Za-z0-9._-]+|[A-Za-z]:\\Users\\[^\\\s]+/;

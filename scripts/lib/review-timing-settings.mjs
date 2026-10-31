@@ -32,12 +32,12 @@ export function resolveTimingPolicy({ env = process.env, read = readFileSync, re
     envValues: reviewEnv, valid: {
       startAfter: v => ['fast-checks', 'ci-green', 'push'].includes(v),
       fastChecks: validFastChecks,
-      cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
+      startBeforeCi: boolean, cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
     },
   });
   const fixResult = cascadePolicy('fix', pick(fix ?? readJson(join(HERE, '..', 'settings', 'fix.json'), read)?.fix, FIX_TIMING_DEFAULTS), {
     standard: FIX_TIMING_DEFAULTS, platform: pick(platformFix ?? platformPreference('fix', { env, readFile: read }), FIX_TIMING_DEFAULTS), env, log,
-    envValues: envValues('WE_FIX', FIX_TIMING_DEFAULTS), valid: { joinCiAndReview: boolean, joinWaitMaxMin: nonnegative },
+    envValues: envValues('WE_FIX', FIX_TIMING_DEFAULTS), valid: { joinCiAndReview: boolean, joinWaitMaxMin: nonnegative, pushAfterCi: boolean, pushAfterCiMaxMin: nonnegative },
   });
   return { review: reviewResult.value, fix: fixResult.value, sources: { review: reviewResult.sources, fix: fixResult.sources } };
 }

@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync }
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
@@ -76,6 +76,28 @@ describe('defaultExecFn — real child-process output buffering', () => {
 });
 
 describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mode', () => {
+  it('omits the schema on resume in the builder while retaining schema validation', () => {
+    const options = { cwd: '/lane', resumeThreadId: 'thread-123', outputSchemaFile: 'seat.schema.json' };
+    const argv = buildCodexDirectTaskArgv(options);
+    expect(argv).not.toContain('--output-schema');
+    expect(argv).not.toContain(options.outputSchemaFile);
+    expect(argv.slice(-3)).toEqual(['resume', options.resumeThreadId, '-']);
+    for (const outputSchemaFile of ['', ' ', null, 3]) {
+      expect(() => buildCodexDirectTaskArgv({ ...options, outputSchemaFile })).toThrow(/outputSchemaFile/);
+    }
+  });
+  it('rejects a null resume thread as before (never an initial turn)', () => {
+    expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId: null, outputSchemaFile: 'seat.schema.json' })).toThrow(/resumeThreadId/);
+  });
+  it('optionally forwards the schema file as a separate argv value without changing defaults', () => {
+    const outputSchemaFile = 'task with spaces.schema.json';
+    const argv = buildCodexDirectTaskArgv({ cwd: '/lane', review: true, outputSchemaFile });
+    expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
+    expect(buildCodexDirectTaskArgv({ cwd: '/lane' })).not.toContain('--output-schema');
+    for (const value of ['', ' ', null, 42]) {
+      expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', outputSchemaFile: value })).toThrow(/outputSchemaFile/);
+    }
+  });
   it('#4665 encodes exact edit roots and temp environment without shell interpolation', () => {
     const roots = ['/lane/.git', '/pool/.admission/heavy', '/tmp/a "quoted" \\ root'];
     const argv = buildCodexDirectTaskArgv({ cwd: '/lane', writableRoots: roots, tempRoot: roots[2] });
@@ -924,9 +946,11 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     return { fn, seen };
   }
 
-  it('awaits the async gate again after a self-review repair', async () => {
+  it('awaits the async gate again after a self-review repair and omits the output schema on resume', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'we-direct-regate-'));
-    const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const { fn } = fakeSpawn('{"type":"thread.started","thread_id":"builder"}\n');
+    const spawnFn = vi.fn(fn);
+    const outputSchemaFile = join(dir, 'seat.schema.json');
     const gateExecFn = vi.fn(async () => 'gate output');
     const selfReviewFn = vi.fn().mockResolvedValueOnce(['repair fixture']).mockResolvedValueOnce([]);
     const execFn = (bin, args) => {
@@ -935,11 +959,17 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     };
     try {
       const report = await codexDirectTask({ task: 'fixture', dir, gate: 'standards', selfReview: true,
-        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn,
+        stream: false, log: false, execFn, gateExecFn, spawnFn, selfReviewFn, outputSchemaFile,
         readQuotaFn: () => ({ quota: null, rolloutFile: null }) });
       expect(gateExecFn).toHaveBeenCalledTimes(2);
       expect(report.selfReview.rounds).toBe(1);
       expect(report.gate).toMatchObject({ pass: true, steps: [{ output: 'gate output' }] });
+      expect(spawnFn).toHaveBeenCalledTimes(2);
+      const [initial, resumed] = spawnFn.mock.calls.map(([, argv]) => argv);
+      expect(initial.slice(initial.indexOf('--output-schema'), initial.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
+      expect(resumed).toContain('resume');
+      expect(resumed).toContain('builder');
+      expect(resumed).not.toContain('--output-schema');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1048,9 +1078,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
     const { fn, seen } = fakeSpawn(stdout);
     try {
-      const r = await runCodexDirectExec({ dir, task: 'do the thing', logFile, stream: false, spawnFn: fn });
+      const outputSchemaFile = join(dir, 'seat.schema.json');
+      const r = await runCodexDirectExec({ dir, task: 'do the thing', outputSchemaFile, logFile, stream: false, spawnFn: fn });
       expect(seen.cli).toBe(CODEX_CLI);
-      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
+      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
       expect(seen.stdin).toContain('do the thing');
       expect(seen.stdin).toMatch(/do not run `git commit`/);
       expect(r.stdout).toBe(stdout);
@@ -1489,6 +1520,37 @@ describe('direct task routes', () => {
 
 
 describe('direct CLI flags reach the actual spawn and JSON result', () => {
+  it('threads the schema from CLI through the task and exec spawn as a resolved path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-direct-cli-schema-'));
+    const argvFile = join(dir, 'spawn-argv.json');
+    const schemaFile = 'seat schema.json';
+    const preload = `import cp from 'node:child_process';
+      import { writeFileSync } from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { EventEmitter } from 'node:events';
+      cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, 'metadata'))} : args.includes('rev-parse') ? 'sha' : '';
+      cp.spawn = (_bin, argv) => {
+        writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(argv));
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        child.stdin = { on() {}, end() { setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'turn.completed' }) + '\\n'));
+          child.emit('close', 0);
+        }, 0); } };
+        child.kill = () => {};
+        return child;
+      };
+      syncBuiltinESMExports();`;
+    try {
+      const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', '--task=review', `--dir=${dir}`, `--output-schema-file=${schemaFile}`,
+        '--json', '--no-stream', '--review'], { encoding: 'utf8' });
+      const argv = JSON.parse(readFileSync(argvFile, 'utf8'));
+      expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', resolve(schemaFile)]);
+      expect(JSON.parse(stdout).argv).toEqual(argv);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([
     [['--task-kind=fix'], 'fix', 'gpt-6.1-sol', 'high', 'tool', 'tool'],
     [['--task-kind=prepare', '--size=8'], 'prepare-complex', 'gpt-6-astra', 'high', 'tool', 'tool'],
