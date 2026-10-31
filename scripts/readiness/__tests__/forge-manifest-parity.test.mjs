@@ -153,7 +153,9 @@ it('refuses excessive ignored-leaf alias expansion with local fallback before tr
   const result=await runRemote({cwd,env,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
   expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'manifest-walk-limit'});
   expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
-});
+  // Real Git plus a successful expanded baseline and three refusal scans need
+  // the integration budget on busy CI shards; keep the production limits intact.
+},30000);
 
 it.each(['.claude/skills','tools/alias'])('transfers %s leaves even when a warm base has identical projected bytes',async link=>{
   await write('skills-src/leaf.md','skill');await fs.mkdir(join(cwd,link,'..'));
