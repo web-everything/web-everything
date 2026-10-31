@@ -54,6 +54,9 @@
  * for a while. v1 does not claim to solve that; it only bounds concurrency and makes the wait OBSERVABLE (the
  * `waiting` intent markers this module writes, which `tick-core.mjs` surfaces as `waiting-for-capacity` notes).
  *
+ * REMOTE SLOT CLEANUP — `node scripts/readiness/heavy-admission.mjs reap-remote [--dry-run]`
+ * clears abandoned execution markers with affirmative Forge-idle or process-age evidence.
+ *
  * A GENERAL-PURPOSE `run` CLI MODE — `node scripts/readiness/heavy-admission.mjs run [--container] -- <cmd…>`
  * wraps `acquire → run <cmd> → release` in one call ({@link runUnderAdmission}), so any caller can opt into
  * this SAME semaphore without hand-rolling the acquire/execute/release sequence itself.
@@ -144,7 +147,7 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
-import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, lstatSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
@@ -159,7 +162,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { reserve, releaseLockDir, releaseLockDirIf, isLeaseExpired, readLockEntry, heartbeatOwn } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -703,6 +706,116 @@ export function createRemoteExec({
   };
 }
 
+/** Both independent Forge observations must succeed; grep exit 1 means no matches, not an IO error. */
+async function readRemoteForgeStatus() {
+  try {
+    const { readForgeTelemetry } = await import('./forge-telemetry.mjs');
+    const [output, telemetry] = await Promise.all([
+      new Promise((resolve, reject) => execFile('ssh', [
+        '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'forge',
+        "set -o pipefail; ps -eo etimes=,args= | { grep -E '[f]orge-exec-run.mjs (prepare|run|finish)$'; rc=$?; [ \"$rc\" -le 1 ]; }",
+      ], { encoding: 'utf8', timeout: 8000, maxBuffer: 4096 },
+      (error, stdout) => error ? reject(error) : resolve(stdout))),
+      readForgeTelemetry(),
+    ]);
+    const procEtimesSec = [];
+    for (const line of output === '' ? [] : output.replace(/\n$/, '').split('\n')) {
+      const match = /^\s*(\d+)\s+.*forge-exec-run\.mjs (prepare|run|finish)$/.exec(line);
+      if (!match || !Number.isSafeInteger(Number(match[1]))) return { reachable: false };
+      procEtimesSec.push(Number(match[1]));
+    }
+    if (!Number.isSafeInteger(telemetry?.activeRuns)
+      || telemetry.activeRuns < 0) return { reachable: false };
+    return { reachable: true, activeRuns: telemetry.activeRuns, procCount: procEtimesSec.length, procEtimesSec };
+  } catch { return { reachable: false }; }
+}
+
+function remoteMarkerPidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    if (error?.code === 'EPERM') return true;
+    throw error;
+  }
+}
+
+/** Reclaim abandoned remote markers after proving Forge idle or no process old enough to own them. Never throws.
+ * Invalid/oversized markers require operator inspection via reap-remote; they remain admission holds.
+ * Returns candidates only; dryRun reports them without changing markers, leases or events. */
+export async function reapRemoteSlots({
+  remoteRoot, clock = Date.now, readForgeStatus = readRemoteForgeStatus,
+  log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
+  dryRun = false, maxRunMs = DEFAULT_ADMISSION_CEILING_MS, marginMs = 600000,
+  graceMs = 120000, pidAlive = remoteMarkerPidAlive,
+}) {
+  const results = [];
+  const notice = (line) => { try { log(line); } catch { /* diagnostics must not break admission */ } };
+  try {
+    if (!existsSync(remoteRoot)) return results;
+    const names = readdirSync(remoteRoot).filter(name => /^slot-\d+\.unconfirmed$/.test(name));
+    if (!names.length) return results;
+    const status = await readForgeStatus();
+    if (status?.reachable !== true || !Number.isSafeInteger(status.activeRuns) || status.activeRuns < 0
+      || !Number.isSafeInteger(status.procCount) || status.procCount < 0) return results;
+    const idle = status.activeRuns === 0 && status.procCount === 0;
+    const ages = status.procEtimesSec;
+    const validAges = Array.isArray(ages) && ages.length === status.procCount
+      && ages.every(age => Number.isSafeInteger(age) && age >= 0);
+    if ((!idle || ages !== undefined) && !validAges) return results;
+    const nowMs = clock();
+    if (![nowMs, maxRunMs, marginMs, graceMs].every(n => Number.isFinite(n) && n >= 0)) return results;
+    for (const name of names) {
+      try {
+        const slot = Number(name.slice(5, -12));
+        if (!Number.isSafeInteger(slot) || name !== `slot-${slot}.unconfirmed`) continue;
+        const file = join(remoteRoot, name);
+        const info = lstatSync(file);
+        if (!info.isFile() || info.size > 4096) {
+          notice(`heavy-admission: remote slot-${slot} marker unreadable or oversized; inspect with reap-remote before operator cleanup\n`);
+          continue;
+        }
+        const text = readFileSync(file, 'utf8');
+        let marker;
+        try { marker = JSON.parse(text); }
+        catch { if (/^[\s]*[\[{]/.test(text)) continue; }
+        let age; let runId = null;
+        if (marker !== undefined) {
+          if (marker?.v !== 1 || marker.slot !== slot || !Number.isSafeInteger(marker.pid) || marker.pid <= 0
+            || typeof marker.runId !== 'string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(marker.runId)
+            || typeof marker.startedAt !== 'string') continue;
+          age = nowMs - Date.parse(marker.startedAt);
+          if (!Number.isFinite(age) || age < graceMs || age < 0) continue;
+          if (age < maxRunMs + marginMs && pidAlive(marker.pid) !== false) continue;
+          runId = marker.runId;
+        } else {
+          age = nowMs - info.mtimeMs;
+          if (!Number.isFinite(age) || age < 0 || age < maxRunMs + marginMs) continue;
+        }
+        const markerAgeSec = age / 1000;
+        if (!idle && (age < maxRunMs + marginMs || ages.some(age => age >= markerAgeSec - 300))) continue;
+        const maxProcAgeSec = validAges ? ages.reduce((max, age) => Math.max(max, age), 0) : 0;
+        const evidence = idle ? `forge-idle activeRuns=0 procs=0 age=${Math.floor(age)}ms`
+          : `no-forge-proc-as-old-as-marker maxProcAgeSec=${maxProcAgeSec} markerAgeSec=${markerAgeSec}`;
+        if (!dryRun) {
+          // Guard lease removal against a replacement or heartbeat since the stale read.
+          unlinkSync(file);
+          try {
+            const entry = readLockEntry(remoteRoot, slotPath(slot));
+            if (entry && isLeaseExpired(entry, nowMs, ADMISSION_LEASE_MINUTES)) {
+              releaseLockDirIf(remoteRoot, slotPath(slot), entry);
+            }
+          } catch { notice(`heavy-admission: remote slot-${slot} lease cleanup failed; leaving to lease expiry\n`); }
+          results.push({ slot, runId, evidence, cleared: true });
+          notice(`heavy-admission: remote slot-${slot} reaped (${evidence})\n`);
+          try { await appendEvent({ kind: 'remote-slot-reaped', detail: { slot, runId, evidence } }); }
+          catch { notice(`heavy-admission: remote slot-${slot} reap event failed\n`); }
+        } else results.push({ slot, runId, evidence, cleared: false });
+      } catch { notice('heavy-admission: remote slot reap failed; marker retained if not already cleared\n'); }
+    }
+  } catch { notice('heavy-admission: remote slot reap unavailable; retaining unconfirmed markers\n'); }
+  return results;
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -716,7 +829,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec,
+  remoteExec, readForgeStatus,
   log = (line) => process.stderr.write(line),
 }) {
   let load;
@@ -728,6 +841,7 @@ export async function runWithRemoteDecision({
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
+  await reapRemoteSlots({ remoteRoot, clock, readForgeStatus, log });
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
@@ -757,6 +871,7 @@ export async function runWithRemoteDecision({
     catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
   };
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
+  const runId = `${new Date(clock()).toISOString().replace(/[^0-9tz]/gi, '').toLowerCase()}-${randomBytes(4).toString('hex')}`;
   let outstanding = false;
   let terminated = false;
   remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
@@ -775,7 +890,8 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      writeFileSync(executionMarker,'remote termination unconfirmed\n',{flag:'wx',mode:0o600});
+      writeFileSync(executionMarker, JSON.stringify({ v: 1, runId, slot: slot.slot,
+        startedAt: new Date(clock()).toISOString(), pid: process.pid }) + '\n', {flag:'wx',mode:0o600});
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {
@@ -784,7 +900,7 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, runId, signal: controller.signal }));
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {
       const termination = await Promise.race([
@@ -2182,7 +2298,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec, readTelemetry } = {}) {
+export async function main(argv, { remoteExec, readTelemetry, readForgeStatus } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -2271,6 +2387,11 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     process.stdout.write(`projected wait if you start now: ~${b.projectedWaitMinutes}m for a dispatch's short checks (max ${b.maxWaitMinutes}m), ~${b.heavyWaitMinutes}m for a full suite — `
       + `short ${b.shortBacklogMinutes} slot-min over ${b.shortCapacity} slot(s) (${b.fastSlots} fast + ${b.freeHeavySlots} free heavy), `
       + `heavy ${b.heavyBacklogMinutes} slot-min over ${b.heavySlots} heavy slot(s)\n`);
+    return;
+  }
+  if (mode === 'reap-remote') {
+    const results = await reapRemoteSlots({ remoteRoot: join(dirname(lockRoot), 'remote'), readForgeStatus, dryRun: !!flags['dry-run'] });
+    emit(results);
     return;
   }
   if (mode === 'reap') {
@@ -2363,7 +2484,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       }
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec, readTelemetry, lockRoot,
+        env: process.env, remoteExec, readTelemetry, readForgeStatus, lockRoot,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
@@ -2399,7 +2520,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     const { exitCode } = await runUnderAdmission(runOpts);
     process.exit(exitCode);
   }
-  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);
+  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap|reap-remote> [--dry-run] [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);
   process.exit(3);
 }
 
