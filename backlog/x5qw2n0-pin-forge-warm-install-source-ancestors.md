@@ -3,18 +3,35 @@ kind: story
 status: open
 size: 3
 dateOpened: '2026-10-31'
-scope: ['we:scripts/readiness/forge-exec-run.mjs', 'we:scripts/readiness/__tests__/forge-exec-run.test.mjs']
+scope: ['we:scripts/readiness/forge-exec-run.mjs', 'we:scripts/readiness/forge-exec-bases.mjs', 'we:scripts/readiness/__tests__/forge-exec-run.test.mjs']
 tags: [security, forge]
 ---
 
 # Pin Forge warm-install source ancestors before privileged copying
 
 The PR #6059 review on 2026-10-31 identified a privileged source-path boundary in
-`we:scripts/readiness/forge-exec-run.mjs:991`: the CLI checks the source spelling,
-but `warmInstall` at line 749 passes the source to `copyLeaves` without pinning the
-`<sha>.tmp` parent. A symlinked parent can redirect root reads before manifest
-verification. This is a source-reviewed risk; no exploit was run in this repair.
-The review explicitly permits tracking it as hardening debt for the single-operator release.
+`we:scripts/readiness/forge-exec-run.mjs:991`: at reviewed head `068dcb1db9`, the
+CLI checked the source spelling, but `warmInstall` at line 749 passed the source
+to a `copyLeaves` implementation that did not pin the `<sha>.tmp` parent. A
+symlinked parent could redirect root reads before manifest verification.
+The later automatic policy ruling blocks this finding; tracking it
+as hardening debt alone does not satisfy that ruling.
+
+## Implementation evidence
+
+Merge `93aa7025a1` replaces the pathname-based `copyLeaves` implementation in
+`we:scripts/readiness/forge-exec-bases.mjs` with `verifiedCopySource`. It opens
+every absolute source ancestor and nested directory relative to a pinned
+descriptor using `O_DIRECTORY | O_NOFOLLOW`, and reads regular, singly linked
+leaves through no-follow descriptors. It verifies the pinned bytes' digest and
+executable bit before creating a destination leaf. Warm installation and both
+delta-assembly copies use this shared helper.
+
+`we:scripts/readiness/__tests__/forge-exec-run.test.mjs` covers symlinked source
+components, replacement of pinned ancestors, digest mismatch, FIFO and hardlink
+refusals, and ordinary warm-install success. The Linux/root sentinel case is
+explicitly skipped on other hosts. A focused run on 2026-10-31 passed 287 tests
+with 3 skipped. This card remains open pending review of that implementation.
 
 ## Acceptance
 
