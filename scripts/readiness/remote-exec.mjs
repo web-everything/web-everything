@@ -130,6 +130,7 @@ export async function bindGit({cwd=process.cwd(),env=process.env,exec=defaultExe
   const prefix=[`--git-dir=${dir}`,`--work-tree=${top}`,'-c','core.fsmonitor=false'];
   const bound=async call=>{
     if(call.file!=='git')return raw(call);
+    call={...call,cwd:call.cwd??cwd};
     if(call.cwd!==cwd)return (await bindGit({cwd:call.cwd,env:cleanEnv,exec:raw}))(call);
     return raw({...call,args:[...prefix,...call.args],env:cleanEnv});
   };
@@ -460,15 +461,19 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const missing=await fs.lstat(bytePath(cwd,path)).then(()=>false,error=>{if(error.code==='ENOENT')return true;throw error;});
       if(missing) {
         if(!deletedWorktreePaths) {
-          const deleted=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});
-          if(deleted.code!==0)throw new Error('Missing deletion evidence');
-          const fields=splitPaths(deleted.stdout);deletedWorktreePaths=new Set();
+          let deleted;
+          try {deleted=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});}
+          catch {throw manifestRefusal('manifest-worktree-mismatch',path);}
+          if(deleted.code!==0)throw manifestRefusal('manifest-worktree-mismatch',path);
+          let fields;
+          try {fields=splitPaths(deleted.stdout);}catch {throw manifestRefusal('manifest-worktree-mismatch',path);}
+          deletedWorktreePaths=new Set();
           for(let i=0;i<fields.length;i+=2) {
-            if(!/^[ACDMTUXB]$/.test(fields[i].toString('ascii'))||!fields[i+1])throw new Error('Invalid deletion evidence');
+            if(!/^[ACDMTUXB]$/.test(fields[i].toString())||!fields[i+1])throw manifestRefusal('manifest-worktree-mismatch',path);
             if(fields[i].equals(Buffer.from('D')))deletedWorktreePaths.add(fields[i+1].toString('hex'));
           }
         }
-        if(!deletedWorktreePaths.has(path.toString('hex')))throw new Error('Missing inventory leaf');
+        if(!deletedWorktreePaths.has(path.toString('hex')))throw manifestRefusal('manifest-worktree-mismatch',path);
         continue;
       }
     }
@@ -515,6 +520,11 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const leaves=[];
     for (const entry of targets) {
       const path=Buffer.concat([directoryPrefix(link.linkPath),entry.path.subarray(link.sourcePrefix.length)]);
+      // Only the established Claude bridges may bypass their dot-directory prefix;
+      // their remaining components and all other aliases obey the normal policy.
+      const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
+      const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
+      if(policy.excluded||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }
@@ -593,7 +603,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);

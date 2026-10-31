@@ -3324,6 +3324,19 @@ construction), since the runner rejects extra directories.
 Stub SSH reachability in manifest-refusal fixtures and reject later transport calls;
 real host availability must not decide whether a filesystem guard is exercised.
 
+The named `refuses missing tracked leaves without explicit deletion evidence` table
+must cover both Git inventories that retain a missing leaf and inventories that omit
+it. Failed, thrown, malformed, truncated, absent, wrong-path and non-deletion evidence
+must report `manifest-worktree-mismatch` before prepare or transfer, in full and delta
+builds. The `deletion-evidence mutation gate` imports isolated in-memory copies of
+the client and removes each cross-check (d) guard independently, including the whole
+check; the same bad inventory must escape only in the mutant. Production files are
+never rewritten by these probes, and a missing mutation target fails the test.
+
+Keep direct bound-exec missing-cwd cases and the delta builder's default-cwd case.
+Row 13 configures a side-effecting fsmonitor hook: require its sentinel to stay absent
+and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
+
 Remote discovery may overlap reachability, HEAD and base discovery, but drain every
 speculative process before returning fallback. `buildManifest` always lists ignored files
 fresh after base-manifest retrieval; ignored tests created during retrieval must still
@@ -3564,6 +3577,13 @@ every path, including the memory and skills bridges. Untracked, changed, unmerge
 escaping or incomplete links refuse with `unshipped-symlink`. Cyclic projections
 also refuse; expanding links share the walk's count/byte limits and report
 `manifest-walk-limit` when those limits are exceeded.
+
+Apply the path policy to every projected leaf, including nested aliases and normalized
+`node_modules` components. Excluded aliases refuse with `unshipped-symlink` in full
+and delta builds. Only the exact `.claude/skills/` and `.claude/agent-memory/` prefixes
+are exempt from the dot-directory exclusion; their remaining path components still
+must pass policy. The named policy-excluded tracked-alias table includes credential,
+dot-directory, NFKC and invisible-character variants and checks refusal before transport.
 
 Manifest refusals keep the reason code separate from `detail`: the offending path
 relative to the checkout, decoded as lossy UTF-8 and kept on one line. Preserve
