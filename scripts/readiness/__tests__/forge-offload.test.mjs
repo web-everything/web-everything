@@ -252,9 +252,14 @@ describe('warm base selection and delta proof',()=>{
   it('matches the full-ship digest with excluded symlinks in the base tree',async()=>{
     await fs.mkdir(join(repo,'.claude'));
     await fs.symlink('../mode.txt',join(repo,'.claude/skills'));
-    await fs.symlink('../deleted.txt',join(repo,'.claude/agent-memory'));
+    await fs.mkdir(join(repo,'agent-memory-src'));
+    await fs.writeFile(join(repo,'agent-memory-src/MEMORY.md'),'# Memory\n');
+    await fs.symlink('../agent-memory-src',join(repo,'.claude/agent-memory'));
     git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
     const base=await baseFixture();
+    // Keep the link in the base tree, but untrack it for the delta: indexed
+    // memory bridges intentionally require full shipping.
+    git(['rm','--cached','.claude/agent-memory']);
     await fs.writeFile(join(repo,'mode.txt'),'changed');
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
     const full=await remote.buildManifest({cwd:repo,exec});

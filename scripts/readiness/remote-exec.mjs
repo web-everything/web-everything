@@ -306,6 +306,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (createHash('sha256').update(config).digest('hex') !== entries.find(entry => entry.path.equals(Buffer.from('vitest.shared.ts'))).sha256)
         throw new Error('Config changed during inventory');
       const dependencies = [...config.matchAll(/["'`]((?:\.\.\/)[^"'`]+)["'`]/g)].map(match => match[1]);
+      for (const [, key] of config.matchAll(/\bSIBLING_PATHS\.([A-Za-z_$][\w$]*)/g)) {
+        if (Object.hasOwn(SIBLING_PATHS,key)) dependencies.push(SIBLING_PATHS[key]);
+      }
       if (dependencies.some(path => !Object.values(SIBLING_PATHS).includes(path)))
         throw Object.assign(new Error('Unsupported sibling dependency'),{code:'unsupported-sibling-dependency'});
       const siblingRoot = resolve(cwd,'../frontierui');

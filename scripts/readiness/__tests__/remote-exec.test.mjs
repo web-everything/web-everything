@@ -2159,6 +2159,17 @@ describe('allowlisted sibling snapshots', () => {
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
 
+  it('ships sibling snapshots for the real repository Vitest shared config', async () => {
+    const f = siblingsFixture();
+    const config = readFileSync(new URL('../../../vitest.shared.ts', import.meta.url), 'utf8');
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
   it('counts exact staged primary and sibling payload bytes, excluding private leaves',async()=>{
     const f=siblingsFixture();
     const primary=['a.test.mjs','package-lock.json','vitest.shared.ts'];
