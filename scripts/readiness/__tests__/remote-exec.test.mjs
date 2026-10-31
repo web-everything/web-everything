@@ -1740,7 +1740,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
   }
   it.each(['inventory','walk'])('carries a relative, lossy UTF-8, single-line path in an unshipped symlink refusal from %s', async site => {
-    const path=Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('\n\t\ré\u2028.txt')]);
+    // LF/CR are unsafe manifest bytes; exercise detail sanitization with allowed
+    // controls so inventory reaches the symlink refusal instead of path rejection.
+    const path=Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('\t\x1b\x7fé\u2028.txt')]);
+    expect(forgeManifestAPI.pathParts(path)).toEqual([path]);
     const fs={
       lstat:async absolute=>Buffer.from(absolute).equals(Buffer.from(cwd))
         ? filesystem.lstat(cwd) : {isSymbolicLink:()=>true},
@@ -1749,6 +1752,13 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     await expect(build({cwd,fs,exec:gitInventory(site === 'inventory' ? [path] : [])})).rejects.toMatchObject({
       code:'unshipped-symlink',message:'unshipped-symlink: use local fallback',detail:'raw-�???é?.txt',
     });
+  });
+  it.each(['\n','\r'])('rejects %j in a lossy UTF-8 inventory path before filesystem inspection', async control => {
+    const path=Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from(`${control}.txt`)]);
+    const fs={lstat:vi.fn(),readdir:vi.fn()};
+    await expect(build({cwd,fs,exec:gitInventory([path])})).rejects.toThrow('Unsafe manifest path');
+    expect(fs.lstat).not.toHaveBeenCalled();
+    expect(fs.readdir).not.toHaveBeenCalled();
   });
   it.each(['parent','leaf'])('rejects an allowlisted ignored coverage input with a %s symlink', async kind => {
     const outside=join(cwd,'outside');

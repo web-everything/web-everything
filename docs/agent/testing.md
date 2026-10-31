@@ -3570,6 +3570,11 @@ relative to the checkout, decoded as lossy UTF-8 and kept on one line. Preserve
 this detail through verification wrappers and remote fallback; heavy admission
 logs it with the shared `oneLine` sanitizer and bound.
 
+Symlink-detail fixtures must use valid manifest byte paths: invalid UTF-8, tabs,
+ESC, DEL and Unicode line separators can exercise lossy decoding and sanitization,
+but LF/CR are rejected by `pathParts` before the inventory symlink check. Keep
+separate negative cases for LF/CR that assert rejection before filesystem inspection.
+
 Projected entries retain their regular `sourcePath` and link evidence for staging
 reverification. Delta manifests always transfer projected leaves, including unchanged
 ones: their alias paths have no corresponding regular Git blob for digest assembly.
