@@ -4,11 +4,12 @@
  * stacked on them edits) must be excludable together. `--exclude-pr` is repeatable and takes a comma list, for
  * `check` and `register` alike. The snapshot reader is injected; the registry is a private temp file.
  */
-import { beforeEach, afterEach, it, expect } from 'vitest';
+import { beforeEach, afterEach, describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { main } from '../free-scope-cli.mjs';
+import { readRegistry } from '../free-scope-io.mjs';
 
 let root, env;
 const now = () => Date.parse('2026-10-09T19:00:00Z');
@@ -59,4 +60,50 @@ it('a malformed entry in the list is refused', () => {
   const r = run(['check', '--files=held.mjs', '--exclude-pr=4643,nope']);
   expect(r.code).toBe(2);
   expect(r.err).toMatch(/--exclude-pr must be/);
+});
+
+// Live 2026-10-31 18:36 ET: dead subagents' scopes blocked the restarted worker until a manual release.
+describe('heartbeat (live 2026-10-31 dead-owner reap)', () => {
+  let clock;
+  const t0 = Date.parse('2026-10-31T22:00:00Z');
+  const regCollect = ({ files }) => ({ files: String(files).split(','), nowMs: clock, unreadable: [], prs: [],
+    agents: readRegistry(env.WE_AGENT_SCOPES_PATH) });
+  const go = (argv, extraEnv = {}) => {
+    let out = '', err = '';
+    const code = main(argv, { env: { ...env, ...extraEnv }, now: () => clock, collect: regCollect,
+      stdout: { write: (s) => { out += s; } }, stderr: { write: (s) => { err += s; } } });
+    return { code, out, err };
+  };
+  const entry = (agent) => readRegistry(env.WE_AGENT_SCOPES_PATH).find((e) => e.agent === agent);
+  beforeEach(() => { clock = t0; });
+  it('register --heartbeat stamps the cascade window (env layer) on the entry', () => {
+    expect(go(['register', '--agent=a', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat'], { WE_FREE_SCOPE_STALE_AFTER_MINUTES: '10' }).code).toBe(0);
+    expect(entry('a')).toMatchObject({ staleAfterMinutes: 10, lastSeenAt: new Date(t0).toISOString() });
+    expect(go(['register', '--agent=d', '--owner=D', '--purpose=p', '--files=y.mjs', '--heartbeat']).code).toBe(0);
+    expect(entry('d').staleAfterMinutes).toBe(45);
+    expect(go(['register', '--agent=b', '--owner=B', '--purpose=p', '--files=z.mjs', '--heartbeat'], { WE_FREE_SCOPE_STALE_AFTER_MINUTES: '0' }).code).toBe(2);
+  });
+  it('a dead heartbeat owner stops blocking another owner; a plain entry still blocks for its TTL', () => {
+    go(['register', '--agent=dead', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat']);
+    go(['register', '--agent=plain', '--owner=P', '--purpose=p', '--files=y.mjs']);
+    clock = t0 + 46 * 60e3;
+    const r = go(['register', '--agent=next', '--owner=B', '--purpose=p', '--files=x.mjs']);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/stale \(ignored\):[\s\S]*dead/);
+    expect(go(['register', '--agent=next2', '--owner=C', '--purpose=p', '--files=y.mjs']).code).toBe(1);
+  });
+  it('a check naming its own agent and owner heartbeats it, so a live worker keeps its files', () => {
+    go(['register', '--agent=live', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat']);
+    clock = t0 + 40 * 60e3;
+    expect(go(['check', '--files=x.mjs', '--exclude-agent=live', '--exclude-owner=A']).code).toBe(0);
+    expect(entry('live').lastSeenAt).toBe(new Date(clock).toISOString());
+    clock = t0 + 80 * 60e3;
+    expect(go(['register', '--agent=intruder', '--owner=B', '--purpose=p', '--files=x.mjs']).code).toBe(1);
+  });
+  it('a check without the owner token never heartbeats anyone', () => {
+    go(['register', '--agent=live', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat']);
+    clock = t0 + 40 * 60e3;
+    go(['check', '--files=x.mjs', '--exclude-agent=live']);
+    expect(entry('live').lastSeenAt).toBe(new Date(t0).toISOString());
+  });
 });

@@ -3,7 +3,7 @@
  * @description Pure conflict and expiry contract tests, including the declared reader/assessor boundary.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, assessFreeScope, formatFreeScope, freeScopeOperation, parseExcludePr,
+import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, heartbeatScope, assessFreeScope, formatFreeScope, freeScopeOperation, parseExcludePr,
   choosePrFileSet, prHoldsFile, GH_LIST_FILE_CAP, GH_API_FILE_CAP } from '../free-scope.mjs';
 const startedAt = '2026-10-05T10:00:00.000Z';
 const nowMs = Date.parse(startedAt);
@@ -220,5 +220,65 @@ describe('a PR holds only the files git says it changes against current main (xl
     const before = facts.map(({ number, listed }) => ({ repo: WE, number, title: `PR ${number}`, url: 'u', files: listed.files }));
     const old = assessFreeScope({ files: scope, prs: before, nowMs, excludePr: 4524, unreadable: [{ repo: WE, error: 'PR #4461 lists 100 files' }] });
     expect(old.files[0].holders.map((h) => h.number)).toEqual([4502, 4508, 4512]);
+  });
+});
+
+// Live 2026-10-31 18:36 ET: an operator interrupt stopped 4 subagents; their 4h-TTL entries kept their files
+// reserved and the restarted worker was refused for its own files. Subagents share the main session's OS process,
+// so pid liveness cannot tell them apart. An entry that opts into a heartbeat (`staleAfterMinutes` stamped at
+// register) goes stale once its owner stops calling free-scope; an entry without the stamp keeps the 4h TTL only.
+describe('heartbeat liveness (live 2026-10-31 dead-owner reap)', () => {
+  const beat = { ...agent, owner: 'A', staleAfterMinutes: 45, lastSeenAt: startedAt };
+  it('a heartbeat entry is live inside its window and stale at the window edge', () => {
+    expect(partitionRegistry([beat], nowMs + 45 * 60e3 - 1).live).toEqual([beat]);
+    expect(partitionRegistry([beat], nowMs + 45 * 60e3).stale).toEqual([beat]);
+  });
+  it('falls back to startedAt when lastSeenAt is missing or unreadable', () => {
+    const { lastSeenAt, ...noSeen } = beat;
+    expect(partitionRegistry([noSeen, { ...beat, lastSeenAt: 'bad' }], nowMs + 45 * 60e3).stale).toHaveLength(2);
+  });
+  it('a fresh lastSeenAt never outlives the hard TTL', () => {
+    const late = { ...beat, lastSeenAt: new Date(nowMs + 4 * 3600e3 - 60e3).toISOString() };
+    expect(partitionRegistry([late], nowMs + 4 * 3600e3 - 1).live).toEqual([late]);
+    expect(partitionRegistry([late], nowMs + 4 * 3600e3).stale).toEqual([late]);
+  });
+  it('an entry without the stamp, or with an unreadable stamp, keeps its reservation for the full TTL', () => {
+    const later = nowMs + 4 * 3600e3 - 1;
+    const odd = [agent, { ...agent, lastSeenAt: startedAt }, { ...beat, staleAfterMinutes: 0 }, { ...beat, staleAfterMinutes: 'x' }];
+    expect(partitionRegistry(odd, later).live).toEqual(odd);
+  });
+  it('register stamps the window and lastSeenAt only when asked, and validates it', () => {
+    const [e] = registerScope([], { agent: 'a', purpose: 'p', files: ['x.mjs'], owner: 'A', staleAfterMinutes: 45 }, startedAt);
+    expect(e).toMatchObject({ staleAfterMinutes: 45, lastSeenAt: startedAt, startedAt });
+    const [plain] = registerScope([], { agent: 'a', purpose: 'p', files: ['x.mjs'] }, startedAt);
+    expect(plain).not.toHaveProperty('lastSeenAt');
+    expect(plain).not.toHaveProperty('staleAfterMinutes');
+    expect(() => registerScope([], { agent: 'a', files: ['x.mjs'], staleAfterMinutes: 0 }, startedAt)).toThrow(TypeError);
+  });
+  it('a different owner may take over a heartbeat-stale name; a live one is still refused', () => {
+    const entries = [{ ...beat, agent: 'w', files: ['we:x.mjs'] }];
+    const inside = new Date(nowMs + 44 * 60e3).toISOString(), after = new Date(nowMs + 46 * 60e3).toISOString();
+    expect(() => registerScope(entries, { agent: 'w', files: ['x.mjs'], owner: 'B' }, inside)).toThrow(/different owner/);
+    expect(registerScope(entries, { agent: 'w', files: ['x.mjs'], owner: 'B' }, after).at(-1).owner).toBe('B');
+  });
+  it('heartbeatScope refreshes only the same agent AND owner, never a tokenless or TTL-expired entry', () => {
+    const at = new Date(nowMs + 30 * 60e3).toISOString();
+    const other = { ...beat, owner: 'B', agent: 'other' }, tokenless = { ...agent, agent: 'build-x', staleAfterMinutes: 45, lastSeenAt: startedAt };
+    const r = heartbeatScope([beat, other], 'build-x', 'A', at);
+    expect(r.refreshed).toBe(1);
+    expect(r.entries[0]).toEqual({ ...beat, lastSeenAt: at });
+    expect(r.entries[1]).toBe(other);
+    expect(heartbeatScope([beat], 'build-x', 'B', at).refreshed).toBe(0);
+    expect(heartbeatScope([tokenless], 'build-x', undefined, at).refreshed).toBe(0);
+    expect(heartbeatScope([beat], 'build-x', 'A', new Date(nowMs + 4 * 3600e3).toISOString()).refreshed).toBe(0);
+  });
+  it('a heartbeat-stale holder is ignored and reported with its last-seen time', () => {
+    const verdict = assess({ agents: [beat], nowMs: nowMs + 46 * 60e3 });
+    expect(verdict.status).toBe('free');
+    expect(verdict.staleAgents[0]).toMatchObject({ agent: 'build-x', lastSeenAt: startedAt, staleAfterMinutes: 45 });
+    expect(formatFreeScope(verdict)).toMatch(/build-x \(build, since .*, last seen .*, heartbeat 45m, ttl 4h\)/);
+    const live = assess({ agents: [beat], nowMs: nowMs + 44 * 60e3 });
+    expect(live.status).toBe('occupied');
+    expect(live.files[0].holders[0].expiresAt).toBe(new Date(nowMs + 45 * 60e3).toISOString());
   });
 });
