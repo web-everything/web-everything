@@ -191,7 +191,7 @@ export {
  *   false — see file header for why this script's default differs from the judge role's.
  * @param {string[]} [opts.addDirs] - forwarded as repeated `--add-dir`, for a task that legitimately needs to
  *   touch more than one directory (rare; most callers leave this empty).
- * @param {string[]} [opts.writableRoots] - edit-only gitdir, admission lock root and private temp root.
+ * @param {string[]} [opts.writableRoots] - edit-only gitdir, heavy + remote admission roots and private temp root.
  * @param {string} [opts.tempRoot] - edit-only fixture temp directory, pinned in the child shell environment.
  * @param {string} [opts.resumeThreadId] - resume this session using the same exec-level configuration.
  * @returns {string[]} argv AFTER the `codex` binary name.
@@ -1126,7 +1126,11 @@ export async function codexDirectTask({
   // A private temp root isolates concurrent fixture repositories. Keep it for manual resume/debugging,
   // just like the persisted Codex session and log; review mode allocates no new writable roots.
   const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
-  const writableRoots = review ? [] : [gitDir, resolve(admissionLockRoot(resolve(targetDir), env)), tempRoot];
+  // The remote admission root sits beside the heavy lock root, exactly as heavy-admission derives it
+  // (`join(dirname(lockRoot), 'remote')`). Without it the sandbox cannot read remote health or take a
+  // remote slot, so every Codex-run gate silently fell back to local admission on this host.
+  const heavyLockRoot = review ? undefined : resolve(admissionLockRoot(resolve(targetDir), env));
+  const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy,
