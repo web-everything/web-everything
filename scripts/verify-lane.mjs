@@ -689,7 +689,7 @@ async function runGate(command, args) {
   const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
   const result = await new Promise((resolveGate, reject) => {
     const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
-      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
+      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', WE_FORGE_GATE_DISPATCH:'1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
