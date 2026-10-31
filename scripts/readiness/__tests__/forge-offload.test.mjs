@@ -396,7 +396,8 @@ describe('runner base materialization refuses before install',()=>{
     const bin=join(server,'bin');await fs.mkdir(bin);await fs.symlink(process.execPath,join(bin,'node'));
     await fs.writeFile(join(bin,'npm'),`#!/bin/sh\necho ran >> '${server}/npm.log'\necho \"$*\" >> '${server}/npm-args.log'\nexit 0\n`,{mode:0o755});
     if(pool){await fs.mkdir(join(server,'runs','slot-1'),{recursive:true,mode:0o710});await fs.chmod(join(server,'runs','slot-1'),0o710);}
-    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin',...(pool?{testWorkerExec:async()=>({code:0,stdout:'',stderr:''})}:{})});
+    const workerExec=vi.fn(async()=>({code:0,stdout:'',stderr:''}));
+    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin',...(pool?{testWorkerExec:workerExec}:{})});
     const nonce='e'.repeat(32),prepared=await runner.prepare({nonce});
     expect(prepared.capabilities).toMatchObject({delta:1,bases:[{sha:base.sha,manifestDigest:base.manifestDigest}]});
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
@@ -418,7 +419,7 @@ describe('runner base materialization refuses before install',()=>{
     const argv=['npm','run','test:unit','--','a.test.mjs'];
     const request={v:1,nonce,run:prepared.run,argv,env:{},argvDigest:digestArgv(argv),lock:hash('lock'),inputDigest:await digestInput(full),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest,baseSha:base.sha,baseManifestDigest:base.manifestDigest,deletions:Buffer.from('deleted.txt\0').toString('base64')};
     if(shape)request.deletions=Buffer.concat([Buffer.from('deleted.txt\0'),Buffer.from(shape==='file to directory'?'node\0':'node/nested/leaf\0')]).toString('base64');
-    return {base,dir,server,runner,request,work};
+    return {base,dir,server,runner,request,work,workerExec};
   }
   it('uses independent copies, applies deletion and delta, and verifies before install',async()=>{
     const f=await setup();expect((await f.runner.run(f.request)).code).toBe(0);
@@ -483,7 +484,20 @@ describe('runner base materialization refuses before install',()=>{
     await copyLeaves(join(f.dir,'tree'),tree,decodeManifest(f.base.manifest).entries);
     await fs.writeFile(tree+'.json',JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}),{mode:0o600});
     const inode=(await fs.stat(join(tree,'mode.txt'))).ino;
+    f.workerExec.mockImplementation(async({cwd})=>{
+      // Observe exact reconstructed inputs before install/test consumers run.
+      if(cwd===f.work) {
+        expect(await digestInput(cwd)).toBe(f.request.inputDigest);
+        expect(await fs.readFile(join(cwd,'a.test.mjs'),'utf8')).toBe('changed');
+        expect((await fs.stat(join(cwd,'mode.txt'))).ino).toBe(inode);
+        await expect(fs.lstat(join(cwd,'deleted.txt'))).rejects.toMatchObject({code:'ENOENT'});
+        if(shape==='nested deletion')await expect(fs.lstat(join(cwd,'node'))).rejects.toMatchObject({code:'ENOENT'});
+        else expect(await fs.readFile(join(cwd,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
+      }
+      return {code:0,stdout:'',stderr:''};
+    });
     expect((await f.runner.run(f.request)).code).toBe(0);
+    expect(f.workerExec.mock.calls.filter(([call])=>call.cwd===f.work).length).toBeGreaterThanOrEqual(2);
     expect((await fs.stat(join(f.work,'mode.txt'))).ino).toBe(inode);
     if(shape==='nested deletion')await expect(fs.lstat(join(f.work,'node'))).rejects.toMatchObject({code:'ENOENT'});
     else expect(await fs.readFile(join(f.work,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
@@ -566,6 +580,7 @@ describe('runner base materialization refuses before install',()=>{
       deltaFileCount:deltaMode?payloads.length:0,deltaBytes:deltaMode?bytes:0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
     if(mode==='late delta failure'){
+      expect(log).toHaveBeenCalledWith('manifest: full-scan (Full ship selected)\n');
       expect(copies).toHaveLength(2);
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
     }

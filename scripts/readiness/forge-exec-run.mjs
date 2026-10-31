@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
+import {readLimits, slotCpus, scopeLauncherArgv} from './forge-exec-limits.mjs';
 import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
 import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
@@ -103,11 +104,12 @@ export function formatTelemetry(value,host='forge') {
   const last=v.recent.find(r=>r.code!==null);
   return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
 }
-const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE'];
+const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS'];
 export function allowedEnv(env) {
   return env && typeof env === 'object' && !Array.isArray(env) && Object.entries(env).every(([key,value]) =>
     ENV_KEYS.includes(key) && !/secret|token|password|credential|auth|key/i.test(key)
     && typeof value === 'string' && !value.includes('\0')
+    && (key !== 'WE_VITEST_MAX_WORKERS' || /^[1-9]\d*$/.test(value))
     && (key !== 'DIFF_COVERAGE_BASE' || (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)
       && !/\s/.test(value) && !value.includes('..') && !value.includes('//') && !/(?:^|\/)\.|\.lock(?:\/|$)|[/.]$/.test(value))));
 }
@@ -418,6 +420,24 @@ while True:
     try: os.waitpid(-1, 0)
     except ChildProcessError:
         if not uid_processes(): break
+# Read this scope's counters only after every descendant has been reaped.
+# Missing kernel counters are unknown, not a measured zero.
+if 'usage' in cfg:
+    usage = {'memoryPeakBytes': None, 'cpuUsec': None, 'oomKills': None}
+    try:
+        with open('/proc/self/cgroup') as stream:
+            path = next(line.strip().split(':', 2)[2] for line in stream if line.startswith('0::'))
+        base = '/sys/fs/cgroup/' + path.lstrip('/')
+        def counter(name, key=None):
+            try:
+                with open(base + '/' + name) as stream:
+                    data = stream.read()
+                return int(data) if key is None else int(dict(line.split() for line in data.splitlines())[key])
+            except (OSError, ValueError, KeyError): return None
+        usage = {'memoryPeakBytes': counter('memory.peak'), 'cpuUsec': counter('cpu.stat', 'usage_usec'), 'oomKills': counter('memory.events', 'oom_kill')}
+    except (OSError, StopIteration): pass
+    fd = os.open(cfg['usage'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, 'w') as result: json.dump(usage, result)
 fd = os.open(cfg['status'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
 with os.fdopen(fd, 'w') as result: result.write(str(code if 0 <= code <= 255 else 255))
 sys.exit(0)
@@ -583,17 +603,29 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
   async function workCommand(worker,argv,work,env,archive) {
-    if(testRoot) return testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});
+    const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
+    if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
+    if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
+    const {limits,warnings}=testRoot?{limits:{},warnings:[]}:await readLimits();
+    for(const warning of warnings) process.stderr.write('forge-exec-run: '+warning.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
+    const cpus=slotCpus(limits,slot);
+    env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
+    const usage=status+'.usage';
     const name=writerName(worker.reservation),writer={...worker.reservation,guard:join(receipts,'.'+name+'.writer'),reservation:join(receipts,name,'reservation.json')};
     try {
-      const result=await execute('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',supervisorSource,JSON.stringify({argv,cwd:work,env,status,writer,reapUid:true,...(archive?{archive}:{}),...ids})],{inherit:true});
+      const launcher=scopeLauncherArgv({slot,unit:'forge-exec-run-'+randomBytes(16).toString('hex'),sudo:false,source:supervisorSource,
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(archive?{archive}:{}),...ids})});
+      const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
-      return {...result,code};
-    } finally {await rm(status,{force:true});}
+      let measured;
+      try {measured=JSON.parse((await readPinned(usage)).toString());} catch(error) {if(error.code!=='ENOENT')throw error;}
+      return {...result,code,usage:measured,slotCpus:cpus};
+    } finally {await Promise.all([rm(status,{force:true}),rm(usage,{force:true})]);}
   }
   async function exclusiveWorker(action,record) {
     return withWorkerWriter(writerName(record),async()=>{
@@ -819,7 +851,21 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       try {
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
-      return await exclusiveWorker(async (command,selected) => {
+      return await exclusiveWorker(async (executeCommand,selected) => {
+      const resources={memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8};
+      const unmeasured=new Set();
+      const command=async(...args)=>{
+        const value=await executeCommand(...args);
+        resources.slotCpus=value.slotCpus??resources.slotCpus;
+        for(const key of ['memoryPeakBytes','cpuUsec','oomKills']) {
+          const n=value.usage?.[key];
+          if(!Number.isSafeInteger(n)||n<0) {
+            unmeasured.add(key);
+            resources[key]=null;
+          } else if(!unmeasured.has(key)) resources[key]=key==='memoryPeakBytes'?Math.max(resources[key]??0,n):(resources[key]??0)+n;
+        }
+        return value;
+      };
       const worker=selected??{user:'forge-exec',root:runs};
       const container=join(worker.root,request.run),work=join(container,'work');
       await directory(container,true,operator); await directory(work);
@@ -919,7 +965,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
       const {slot:reservedSlot,...receiptState}=prepared;
-      const receipt={...receiptState,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      const receipt={...receiptState,resources,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed});
       if(telemetryError)throw telemetryError;
