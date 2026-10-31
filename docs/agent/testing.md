@@ -3609,3 +3609,8 @@ include-minus-exclude set. Missing/unreadable configs, evaluation errors and mal
 retain the existing local fallback. Keep fixture discovery configs explicit; test the native
 Node loader against the repository configs as well as full/delta parity. Warm bases export
 tracked Git entries only; their policy exclusions still refuse test-shaped entries.
+The selector only reproduces relative globs with ordinary wildcards and flat literal
+brace lists. Absolute/negated patterns, traversal and unsupported syntax in either
+include or exclude retain selection and the existing local fallback; never infer
+discovery parity merely because micromatch compiles a pattern. The selector regressions
+cover these refusals alongside the supported repository-config path.
