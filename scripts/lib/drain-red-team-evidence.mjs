@@ -52,7 +52,8 @@ const digest = bytes => bytes === null ? null : createHash('sha256').update(byte
 const optionalBytes = path => { try { return readFileSync(path); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
 
 /** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
-export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = sharedRunsDir(env),
+// Match resolveRunsDir's override precedence without migrating runs during a raw read.
+export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);

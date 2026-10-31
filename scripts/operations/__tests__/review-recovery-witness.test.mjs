@@ -9,7 +9,7 @@ import { pidNamespace } from '../../lib/pid-alive.mjs';
 import * as evidence from '../../lib/drain-red-team-evidence.mjs';
 import * as recovery from '../../lib/review-red-team-on-skip.mjs';
 import { createReviewJobIo, dispatchReviewJob, runReviewJob, runReviewJobCli } from '../review-job.mjs';
-import { newRunRecord } from '../run-store.mjs';
+import { newRunRecord, resolveRunsDir } from '../run-store.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { runRedTeam, runExtraSeatsCli } from '../review-extra-seats.mjs';
 
@@ -36,6 +36,46 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   const admit = () => io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: seats.some(seat => seat.status === 'ok') ? 'resume' : 'fresh' });
   return { dir, env, key, path, run, seats, probe, readWitness, decide, abandon, io, admit };
 }
+
+it('default recovery witness reads the writer run store when OPERATION_RUNS_DIR overrides the shared store', () => {
+  const f = fixture({ status: 'queued' });
+  const canonical = join(f.dir, 'canonical', 'runs');
+  mkdirSync(canonical, { recursive: true });
+  f.env.OPERATION_RUNS_DIR = canonical;
+  vi.stubEnv('OPERATION_RUNS_DIR', canonical);
+  vi.stubEnv('WE_SHARED_RUNS_DIR', f.env.WE_SHARED_RUNS_DIR);
+  try {
+    const id = 'review-pr-7537-canonical';
+    writeFileSync(join(resolveRunsDir(), `${id}.json`), JSON.stringify({
+      ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }), ...payload(),
+    }));
+    rmSync(f.run);
+    const readWitness = () => evidence.readRecoveryWitness({ ...f.key, readScorecards: () => [] });
+    expect(readWitness().newest).toMatchObject({ id, verdict: { verdict: 'accept' } });
+    expect(evidence.readRecoveryWitness({ repo, pr, head, readScorecards: () => [] }).newest).toMatchObject({ id });
+    expect(recovery.planRedTeamRecovery(readWitness(), { probe: f.probe, deadlineMs: 1000 }))
+      .toMatchObject({ mode: 'fresh', abandon: true });
+    expect(recovery.abandonStaleRedTeamRun(f.key, { readWitness, probe: f.probe, deadlineMs: 1000 }).ok).toBe(true);
+    const io = createReviewJobIo({ env: f.env, root: f.dir, readWitness, recoveryProbe: f.probe });
+    expect(io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: 'fresh' }))
+      .toHaveProperty('redTeamAdmission.queued.status', 'queued');
+    expect(evidence.readRecoveryWitness({ ...f.key, runsDir: f.env.WE_SHARED_RUNS_DIR, readScorecards: () => [] }).newest).toBeNull();
+  } finally { vi.unstubAllEnvs(); }
+});
+
+it.each([undefined, '', ' \t '])('recovery falls back to the shared store for an inactive OPERATION_RUNS_DIR (%j)', override => {
+  const f = fixture();
+  const env = { ...f.env, OPERATION_RUNS_DIR: override };
+  expect(evidence.readRecoveryWitness({ ...f.key, env, readScorecards: () => [] }).newest)
+    .toMatchObject({ id: 'review-pr-7537' });
+});
+
+it('recovery trims the operation run directory override', () => {
+  const f = fixture();
+  const env = { ...f.env, OPERATION_RUNS_DIR: ` \t${f.env.WE_SHARED_RUNS_DIR} \t`, WE_SHARED_RUNS_DIR: join(f.dir, 'empty') };
+  expect(evidence.readRecoveryWitness({ ...f.key, env, readScorecards: () => [] }).newest)
+    .toMatchObject({ id: 'review-pr-7537' });
+});
 
 it.each([[1, true], [2, true], [4, false], [5, false], [8, false], [9, false]])('matrix %s: raw dead writer is abandoned then admitted (foreign=%s)', (row, foreign) => {
   const f = fixture({ foreign, ageMs: foreign ? 2000 : undefined, status: row === 9 ? 'queued' : 'running' });

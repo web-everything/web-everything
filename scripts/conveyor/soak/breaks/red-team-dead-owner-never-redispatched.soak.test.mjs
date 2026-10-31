@@ -6,3 +6,7 @@ defineBreakTest(scenario);
 it('daemon tick recovers a dead status-write claim and publishes exactly once', async () => {
   expect(scenario.judge(await scenario.run({ staleClaim: true }))).toEqual([]);
 });
+
+it('daemon tick recovers and publishes once when OPERATION_RUNS_DIR overrides the shared run store', async () => {
+  expect(scenario.judge(await scenario.run({ operationRunsOverride: true }))).toEqual([]);
+});

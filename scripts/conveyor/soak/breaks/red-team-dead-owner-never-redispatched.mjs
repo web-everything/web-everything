@@ -8,7 +8,7 @@ export default {
   id: 'red-team-dead-owner-never-redispatched', title: 'a dead queued red-team owner recovers once and settles',
   card: '#7537', fixedBy: { sha: '7537', where: 'raw-witness recovery' },
   fixPresent: root => readFileSync(join(root, 'scripts/operations/review-job.mjs'), 'utf8').includes('planRedTeamRecovery(witness'),
-  async run({ sourceRoot = ROOT, staleClaim = false } = {}) {
+  async run({ sourceRoot = ROOT, staleClaim = false, operationRunsOverride = false } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-dead-red-team-'));
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
@@ -18,9 +18,10 @@ export default {
       const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
       const repo = CONSTELLATION_REPOS.we.slug, pr = 6039, head = 'a'.repeat(40), comments = [], events = [];
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_STALE_RUN_MS: '1000', WE_RED_TEAM_STATUS_LABELS: '0' };
+      if (operationRunsOverride) env.OPERATION_RUNS_DIR = join(dir, 'canonical', 'runs');
       const key = { repo, pr, head, env }, loopPayload = { verdict: { verdict: 'accept' },
         findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } } };
-      runs.writeRun({ ...runs.newRunRecord({ id: 'review-pr-soak', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      runs.writeRun({ ...runs.newRunRecord({ id: 'review-pr-soak', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.OPERATION_RUNS_DIR || env.WE_SHARED_RUNS_DIR);
       mkdirSync(e.redTeamStatusDir(env), { recursive: true });
       const statusPath = join(e.redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
       writeFileSync(statusPath, JSON.stringify({ repo, pr, head,
