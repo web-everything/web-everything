@@ -2268,7 +2268,7 @@ describe('overlapped Forge discovery',()=>{
     pending.get('probe').resolve({code:0});
     pending.get('head').reject(new Error('HEAD unavailable'));
     pending.get('bases').reject(new Error('bases unavailable'));
-    expect((await result).mode).toBe('fallback');
+    expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'copy-failed'});
     expect(exec).toHaveBeenCalledTimes(3);
   });
   it.each(['nonzero','rejection'])('drains in-flight failures before unreachable fallback (%s)',async fault=>{
@@ -2280,7 +2280,7 @@ describe('overlapped Forge discovery',()=>{
     else pending.get('probe').resolve({code:255});
     await new Promise(resolve=>setImmediate(resolve));expect(settled).toBe(false);
     pending.get('head').reject(new Error('local failure'));pending.get('bases').reject(new Error('remote failure'));
-    expect(await result).toMatchObject({mode:'fallback',reason:'forge-unreachable'});
+    expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-unreachable'});
     expect(exec).toHaveBeenCalledTimes(3);
   });
 });

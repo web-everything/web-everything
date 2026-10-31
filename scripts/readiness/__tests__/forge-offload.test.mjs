@@ -582,7 +582,7 @@ describe('runner base materialization refuses before install',()=>{
       return {code:0,stdout:JSON.stringify(value)};
     });
     const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log:vi.fn()});
-    expect(result).toMatchObject({mode:'fallback',reason:'ignored-test-file'});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file'});
     expect(transport.mock.calls.some(([call])=>call.file==='ssh'&&call.args.at(-1).endsWith(' base-manifest'))).toBe(true);
     expect(ignoredListings.length).toBeGreaterThan(0);
     for(const listing of ignoredListings)expect(listing.toString().split('\0')).toContain('late.test.mjs');
