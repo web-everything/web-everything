@@ -257,6 +257,7 @@ describe('verify-lane remote phase spawn', () => {
       "npx vitest run 'one.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, localExit])),
     ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], true, 1, 1, 0],
+    ...[false, true].map(phaseAdmission => ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, 1, 1]),
   ];
   function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit, localBehavior = '') {
     const root = mkdtempSync(join(tmpdir(), 'verify-routing-'));
@@ -269,6 +270,9 @@ describe('verify-lane remote phase spawn', () => {
       const gate = pathToFileURL(resolve(repo, 'scripts/lib/verify-lane-gate.mjs')).href;
       const laterPhases = phaseAdmission !== undefined;
       const confirmed = mode === 'remote' && remoteExit !== 0 && remoteExit !== 124;
+      // A red that survives the isolated retry is compared with origin/main; that unheld spawn needs its own slot.
+      // Standards stays green there, since only a Vitest-only red is compared with the base.
+      const baseCompared = retryExit !== undefined && retryExit !== 0;
       const watchdogKill = mode === 'watchdog' || localBehavior === 'watchdog';
       const signalKill = mode === 'signal' || localBehavior === 'signal';
       // Exit 124 is remote-unconfirmed only for the dispatched attempt; a local confirmation's 124 is a local exit code.
@@ -302,7 +306,8 @@ const mode=process.env.ROUTING_MODE;
 const held=process.env.WE_HEAVY_ADMISSION_HELD === '1';
 const retry=process.argv.includes('--maxWorkers=1');
 const localBehavior=held ? process.env.ROUTING_LOCAL_BEHAVIOR : '';
-const exitCode=held ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
+const exitCode=process.env.ROUTING_STANDARDS_EXIT && process.argv.includes('check:standards') ? Number(process.env.ROUTING_STANDARDS_EXIT)
+  : held ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
 fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'spawn',held, env:{WE_HEAVY_ADMISSION_HELD:process.env.WE_HEAVY_ADMISSION_HELD,WE_FORGE_GATE_DISPATCH:process.env.WE_FORGE_GATE_DISPATCH}, report:!!process.env.WE_VERIFY_REMOTE_REPORT, executable:require('node:path').basename(process.argv[1]), args:process.argv.slice(2)})+'\\n');
 if(mode==='local-fallback') {
   if(held) throw Error('double local admission');
@@ -338,6 +343,7 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
           ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched',
+          ROUTING_STANDARDS_EXIT: baseCompared ? '0' : '',
           WE_VERIFY_RUN_ALL_PHASES: '1', WE_FORGE_GATE_DISPATCH: '1',
           ...(watchdogKill ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}), ROUTING_LOCAL_BEHAVIOR: localBehavior,
           ROUTING_PHASES: laterPhases ? '1' : '0',
@@ -349,8 +355,8 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(expectedStatus);
       const marker = JSON.parse(readFileSync(join(root, '.git/.lane-verify'), 'utf8'));
       const observed = readFileSync(events, 'utf8').trim().split('\n').map(JSON.parse);
-      const confirmationCount = confirmed ? (laterPhases ? 2 : 1) : 0;
-      expect(observed.filter(e => e.event === 'acquire')).toHaveLength((held ? 1 : confirmationCount) + (retryExit !== undefined ? 1 : 0));
+      const confirmationCount = confirmed ? (laterPhases && !baseCompared ? 2 : 1) : 0;
+      expect(observed.filter(e => e.event === 'acquire')).toHaveLength((held ? 1 : confirmationCount) + (retryExit !== undefined ? 1 : 0) + (baseCompared ? 1 : 0));
       expect(observed.filter(e => e.event === 'release')).toHaveLength(observed.filter(e => e.event === 'acquire').length);
       expect(observed.find(e => e.event === 'spawn')).toMatchObject({held,report:true});
       for (const spawn of observed.filter(e => e.event === 'spawn')) {
@@ -377,17 +383,20 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
             ...(confirmed ? [{ executable: 'npx', args: ['vitest', ...gateCommand.split(' ').slice(2).map(arg => arg.replaceAll("'", ''))] }] : []),
             ...(retryExit !== undefined ? [{ executable: 'npx', args: ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', './local.test.mjs'] }] : []),
             { executable: 'npm', args: ['run', 'check:standards'] },
-            ...(confirmed ? [{ executable: 'npm', args: ['run', 'check:standards'] }] : []),
+            ...(baseCompared ? [{ executable: 'npx', args: ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', './local.test.mjs'] }] : []),
+            ...(confirmed && !baseCompared ? [{ executable: 'npm', args: ['run', 'check:standards'] }] : []),
           ]);
-        expect(marker.ranOn.phases.standards).toEqual(confirmed
+        expect(marker.ranOn.phases.standards).toEqual(confirmed && !baseCompared
           ? { location: 'local', remoteRedConfirmedLocally: true }
           : { location: 'remote', receiptId: 'run-123456' });
         if (confirmed) expect(observed.filter(e => e.event === 'acquire').map(e => e.kind)).toEqual(
-          phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
+          baseCompared ? (phaseAdmission ? ['files', 'files', 'files'] : ['selected', 'selected', 'selected'])
+            : phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
       }
       expect(observed.filter(e => e.event === 'nested-acquire')).toHaveLength(mode === 'local-fallback' ? 1 : 0);
       const phase = laterPhases || command.startsWith('npm run test:unit') ? 'vitest' : command.startsWith('npm run check:standards') ? 'standards' : 'gate';
-      expect(marker.ranOn).toMatchObject({ location, phases: { [phase]: { location } } });
+      // The base-compare case keeps standards remote and green, so the gate as a whole ran mixed.
+      expect(marker.ranOn).toMatchObject({ location: baseCompared ? 'mixed' : location, phases: { [phase]: { location } } });
       if (confirmed) {
         expect(marker.ranOn.phases[phase]).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
         expect(result.stderr.split(`verify-lane: remote phase red (exit ${remoteExit}) - confirming locally`)).toHaveLength(confirmationCount + 1);
@@ -424,7 +433,12 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
         expect(marker.failureDetails.summary).toContain('local failure');
         expect(marker.failureDetails.summary).not.toContain('remote failure');
       }
-      if (retryExit !== undefined) {
+      if (baseCompared) {
+        const baseSpawn = observed.findLastIndex(e => e.event === 'spawn');
+        expect(observed[baseSpawn]).toMatchObject({ held: false, executable: 'npx' });
+        expect(observed[baseSpawn - 1]).toMatchObject({ event: 'acquire', kind: phaseAdmission ? 'files' : 'selected' });
+        expect(observed.slice(baseSpawn + 1).filter(e => e.event !== 'heartbeat')).toEqual([{ event: 'release' }]);
+      } else if (retryExit !== undefined) {
         expect(marker.isolatedRetry).toBe('flaky-outside-diff');
         expect(marker.retriedFailures).toEqual([{ file: 'local.test.mjs', kind: 'assertion' }]);
       }

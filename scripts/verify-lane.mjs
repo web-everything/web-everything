@@ -852,6 +852,28 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     if (acquired?.ok && (phaseAdmission || admission.remote)) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
   }
 }
+// runVitestOnBase runs inside the caller's slot. Only a whole-gate local slot is still held at that point; per-phase
+// and remote-planned gates released theirs (or never took one), so the base comparison takes its own local slot.
+const holdsWholeGateSlot = () => !phaseAdmission && admission.ok;
+async function withBaseRerunSlot(run) {
+  if (holdsWholeGateSlot()) return run();
+  const acquired = await acquireSlotBlocking({
+    lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
+    lane: laneMatch ? laneMatch[1] : null,
+    // The same kind the Vitest phase (per-phase) or the whole gate is admitted under.
+    kind: phaseAdmission ? phaseAdmissionKind({ phase: 'vitest', decision: resolvedGate.decision,
+      standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env }).kind : classifyCommandKind(GATE),
+  });
+  if (acquired.timedOut) process.stderr.write(`⚠ heavy-command admission: base comparison timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+  const heartbeat = acquired.ok ? setInterval(() => {
+    try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+  }, SLOT_HEARTBEAT_MS) : null;
+  heartbeat?.unref();
+  try { return await run(); } finally {
+    clearInterval(heartbeat);
+    if (acquired.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
+  }
+}
 const gateStarted = performance.now();
 let gateMs;
 // 75b — run every phase of the default gate even after a red one (`runAllPhases`), so a red test phase can no longer
@@ -953,7 +975,7 @@ try {
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
-      runBase: (files) => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs }) });
+      runBase: (files) => withBaseRerunSlot(() => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs })) });
   }
 } catch (e) {
   signal = e?.signal || null;
