@@ -59,12 +59,15 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
     if (command === 'register' && (!Number.isFinite(ttlHours) || ttlHours <= 0)) throw new TypeError('free-scope: --ttl-hours must be positive');
     if (options.heartbeat && command !== 'register') throw new TypeError('free-scope: --heartbeat applies to register only');
     const staleAfterMinutes = options.heartbeat ? resolveFreeScopeSettings({ env }).staleAfterMinutes : undefined;
-    // A check naming its own agent AND owner token is that owner's heartbeat. It is written under the registry lock
-    // BEFORE the slow PR/git collection, so a live owner is refreshed at call time; a failed write is an error.
-    if (command === 'check' && options['exclude-agent'] && options['exclude-owner']) {
+    // A check naming its own agent AND owner token, or a re-register by the same owner, is that owner's heartbeat.
+    // It is written under the registry lock BEFORE the slow PR/git collection, so a live owner is refreshed at call
+    // time; a failed write is an error.
+    const beatAgent = command === 'check' ? options['exclude-agent'] : options.agent;
+    const beatOwner = command === 'check' ? options['exclude-owner'] : options.owner;
+    if (beatAgent && beatOwner) {
       let refreshed = 0;
-      updateRegistry(registry, (entries) => { const r = heartbeatScope(entries, options['exclude-agent'], options['exclude-owner'], new Date(now()).toISOString()); refreshed = r.refreshed; return r.entries; });
-      if (!refreshed) stderr.write(`free-scope: no entry for agent ${options['exclude-agent']} with that owner to heartbeat — your reservation is gone (released, expired or taken); re-register before relying on it\n`);
+      updateRegistry(registry, (entries) => { const r = heartbeatScope(entries, beatAgent, beatOwner, new Date(now()).toISOString()); refreshed = r.refreshed; return r.entries; });
+      if (!refreshed && command === 'check') stderr.write(`free-scope: no entry for agent ${options['exclude-agent']} with that owner to heartbeat — your reservation is gone (released, expired or taken); re-register before relying on it\n`);
     }
     const snapshot = collect({ files: options.files ?? '', card: options.card ?? '', env, now });
     // Every excluded PR is dropped from the snapshot here, so the core's single-PR exclusion stays unused.

@@ -112,6 +112,18 @@ describe('heartbeat (live 2026-10-31 dead-owner reap)', () => {
       stdout: { write: () => {} }, stderr: { write: () => {} } });
     expect(entry('r').lastSeenAt).toBe(new Date(clock).toISOString());
   });
+  it('a same-owner re-register heartbeats before collection, so a takeover during it is refused (Codex audit)', () => {
+    go(['register', '--agent=w', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat']);
+    clock = t0 + 44 * 60e3;
+    let takeover;
+    const slow = (args) => { clock += 2 * 60e3; takeover = go(['register', '--agent=w', '--owner=B', '--purpose=p', '--files=x.mjs']); return regCollect(args); };
+    const code = main(['register', '--agent=w', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat'], { env, now: () => clock, collect: slow,
+      stdout: { write: () => {} }, stderr: { write: () => {} } });
+    expect(takeover.code).toBe(2);
+    expect(takeover.err).toMatch(/different owner/);
+    expect(code).toBe(0);
+    expect(entry('w')).toMatchObject({ owner: 'A', lastSeenAt: new Date(clock).toISOString() });
+  });
   it('a heartbeat that finds no entry of its own says the reservation is gone', () => {
     const r = go(['check', '--files=x.mjs', '--exclude-agent=ghost', '--exclude-owner=G']);
     expect(r.err).toMatch(/reservation is gone/);
