@@ -339,7 +339,7 @@ describe('remote controls', () => {
     expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:124});
     const marker=JSON.parse(readFileSync(join(f.cwd,'remote','slot-0.unconfirmed'),'utf8'));
     expect(marker).toEqual({
-      v:1,runId:expect.any(String),slot:0,startedAt:new Date(now).toISOString(),pid:process.pid,
+      v:1,runId:expect.any(String),slot:0,host:'forge',startedAt:new Date(now).toISOString(),pid:process.pid,
     });
     expect(marker.runId).toBe(f.remoteExec.mock.calls[0][0].runId);
     expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:1})).toHaveLength(1);
@@ -390,7 +390,7 @@ describe('remote controls', () => {
       expect(f.remoteExec).not.toHaveBeenCalled();
       expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
       expect(JSON.parse(readFileSync(join(f.cwd,'remote','slot-0.unconfirmed'),'utf8'))).toEqual({
-        v:1,runId:expect.any(String),slot:0,startedAt:new Date(now).toISOString(),pid:child.pid,
+        v:1,runId:expect.any(String),slot:0,host:'forge',startedAt:new Date(now).toISOString(),pid:child.pid,
       });
       expect(()=>process.kill(jobPid,0)).not.toThrow();
     } finally {

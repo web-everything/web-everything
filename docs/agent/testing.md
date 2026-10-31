@@ -3416,7 +3416,7 @@ before any escalation comment is posted. The read-error fallback never catches r
 ## Remote slot reaper safety
 
 Remote prepare and run are separate processes with a transfer between them: process age never
-proves termination. Reaping requires reachable Forge telemetry with zero active runs and zero
+proves termination. Reaping requires reachable telemetry for the marker's dispatch host (hostless legacy markers use only `forge`; invalid/unreachable hosts retain their markers), with zero active runs and zero
 prepare/run/finish processes, plus the marker age/pid checks. Only the exact trimmed legacy text
 `remote termination unconfirmed` or a valid v1 JSON marker is eligible. Unknown markers remain
 operator cleanup holds. Before unlinking, re-read and match the marker's bytes, inode and mtime;

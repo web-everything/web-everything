@@ -109,6 +109,58 @@ describe('remote slot reaper', () => {
     expect(f.log).toHaveBeenCalled();
   });
   it.each([
+    ['busy runs', { ...idle, activeRuns: 1 }],
+    ['busy processes', { ...idle, procCount: 1 }],
+    ['unreachable', { reachable: false }],
+    ['reader throws', null],
+  ])('keeps other-host markers when Forge is idle but their host is %s', async (_, status) => {
+    const f = fixture();
+    const forge = marker(f, { legacy: true, age: oldAge });
+    const other = marker(f, { slot: 1, age: oldAge, overrides: { host: 'other' } });
+    const another = marker(f, { slot: 2, age: oldAge, overrides: { host: 'other' } });
+    f.readForgeStatus.mockImplementation(async ({ host }) => {
+      if (host === 'forge') return idle;
+      if (status === null) throw new Error('unreachable');
+      return status;
+    });
+    expect(await reapRemoteSlots(f)).toEqual([
+      { slot: 0, runId: null, evidence: expect.any(String), cleared: true },
+    ]);
+    expect(existsSync(forge)).toBe(false);
+    expect(existsSync(other)).toBe(true);
+    expect(existsSync(another)).toBe(true);
+    expect(f.readForgeStatus.mock.calls).toEqual([[{ host: 'forge' }], [{ host: 'other' }]]);
+    expect(f.appendEvent).toHaveBeenCalledTimes(1);
+  });
+  it('reads each distinct host once and reaps hostless markers only against Forge', async () => {
+    const f = fixture();
+    const text = marker(f, { legacy: true, age: oldAge });
+    const json = marker(f, { slot: 1, age: oldAge });
+    const other = marker(f, { slot: 2, overrides: { host: 'other' } });
+    const another = marker(f, { slot: 3, overrides: { host: 'other' } });
+    f.readForgeStatus.mockImplementation(async ({ host }) => host === 'other' ? idle : { ...idle, activeRuns: 1 });
+    expect(await reapRemoteSlots(f)).toEqual([2, 3].map(slot => ({
+      slot, runId, evidence: expect.stringContaining('other-idle activeRuns=0 procs=0'), cleared: true,
+    })));
+    expect(existsSync(text)).toBe(true);
+    expect(existsSync(json)).toBe(true);
+    expect(existsSync(other)).toBe(false);
+    expect(existsSync(another)).toBe(false);
+    expect(f.readForgeStatus.mock.calls).toEqual([[{ host: 'forge' }], [{ host: 'other' }]]);
+  });
+  it.each(['', '-oProxyCommand=bad', 'forge;bad', 'forge\n', null, 123, ['forge'], {}])(
+    'retains invalid host %j without reading status or issuing SSH', async host => {
+      const f = fixture(); const file = marker(f, { age: oldAge, overrides: { host } });
+      expect(await reapRemoteSlots(f)).toEqual([]);
+      expect(await reapRemoteSlots({ ...f, readForgeStatus: undefined })).toEqual([]);
+      expect(existsSync(file)).toBe(true);
+      expect(f.readForgeStatus).not.toHaveBeenCalled();
+      expect(execFile).not.toHaveBeenCalled();
+      expect(readForgeTelemetry).not.toHaveBeenCalled();
+      expect(f.appendEvent).not.toHaveBeenCalled();
+    },
+  );
+  it.each([
     ['new too young', { age: 119999 }],
     ['legacy too young', { legacy: true, age: oldAge - 1 }],
     ['future timestamp', { age: -1 }],
@@ -270,14 +322,26 @@ describe('remote slot reaper', () => {
         return { activeRuns };
       });
       const results = await reapRemoteSlots({ ...f, readForgeStatus: undefined });
+      expect(readForgeTelemetry).toHaveBeenCalledWith({ host: 'forge' });
       expect(results).toHaveLength(cleared ? 1 : 0);
       expect(existsSync(file)).toBe(!cleared);
       expect(f.appendEvent.mock.calls).toEqual(results.map(({ cleared, ...detail }) => [{ kind: 'remote-slot-reaped', detail }]));
     },
   );
+  it.each(['other', 'worker-1.example'])('default status reader uses marker host %s for both SSH and telemetry', async host => {
+    const f = fixture(); const file = marker(f, { overrides: { host } });
+    vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(null, ''));
+    vi.mocked(readForgeTelemetry).mockResolvedValue({ activeRuns: 0 });
+    expect(await reapRemoteSlots({ ...f, readForgeStatus: undefined })).toHaveLength(1);
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(execFile).mock.calls[0][1][4]).toBe(host);
+    expect(readForgeTelemetry).toHaveBeenCalledTimes(1);
+    expect(readForgeTelemetry).toHaveBeenCalledWith({ host });
+    expect(existsSync(file)).toBe(false);
+  });
 });
 
-async function admission(f, remoteExec) {
+async function admission(f, remoteExec, host = 'forge') {
   const { easternTimestamp } = await import('../forge-exec-run.mjs');
   return runWithRemoteDecision({
     argv: ['npm', 'run', 'test:unit', '--', 'fixture.test.mjs'],
@@ -286,23 +350,24 @@ async function admission(f, remoteExec) {
     policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
     readTelemetry: async () => ({ sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.1,
       memFreePct: 90, activeRuns: 0, recent: [] }),
-    loadPerCore: () => 4, remoteExec,
+    loadPerCore: () => 4, remoteExec, host,
   });
 }
 
 describe('remote admission markers', () => {
-  it('writes one JSON line with its own valid runId and passes the same runId to remoteExec', async () => {
+  it.each(['forge', 'other'])('writes one JSON line with a valid runId and dispatch host %s before execution', async host => {
     const f = fixture();
     const remoteExec = vi.fn(async options => {
       const raw = readFileSync(join(f.remoteRoot, 'slot-0.unconfirmed'), 'utf8');
       expect(raw.split('\n')).toHaveLength(2);
       const data = JSON.parse(raw);
-      expect(data).toEqual({ v: 1, runId: options.runId, slot: 0, startedAt: new Date(now).toISOString(), pid: process.pid });
+      expect(options.host).toBe(host);
+      expect(data).toEqual({ v: 1, runId: options.runId, slot: 0, host, startedAt: new Date(now).toISOString(), pid: process.pid });
       expect(data.runId).toMatch(/^20261031[a-z0-9]*-[a-f0-9]{8}$/);
       expect(validateRunId(data.runId)).toBe(true);
       return { mode: 'remote', code: 0 };
     });
-    expect(await admission(f, remoteExec)).toEqual({ handled: true, exitCode: 0 });
+    expect(await admission(f, remoteExec, host)).toEqual({ handled: true, exitCode: 0 });
     expect(remoteExec).toHaveBeenCalledTimes(1);
     expect(f.readForgeStatus).not.toHaveBeenCalled();
     expect(existsSync(join(f.remoteRoot, 'slot-0.unconfirmed'))).toBe(false);

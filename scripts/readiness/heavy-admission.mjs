@@ -706,17 +706,24 @@ export function createRemoteExec({
   };
 }
 
-/** Both independent Forge observations must succeed; grep exit 1 means no matches, not an IO error. */
-async function readRemoteForgeStatus() {
+const REMOTE_HOST_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+function validRemoteHost(host) {
+  // Require a full match: JavaScript's $ also accepts a position before a final newline.
+  return typeof host === 'string' && REMOTE_HOST_PATTERN.exec(host)?.[0] === host;
+}
+
+/** Both independent host observations must succeed; grep exit 1 means no matches, not an IO error. */
+async function readRemoteForgeStatus({ host = 'forge' } = {}) {
+  if (!validRemoteHost(host)) return { reachable: false };
   try {
     const { readForgeTelemetry } = await import('./forge-telemetry.mjs');
     const [output, telemetry] = await Promise.all([
       new Promise((resolve, reject) => execFile('ssh', [
-        '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'forge',
+        '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', host,
         "set -o pipefail; ps -eo args= | { grep -E '[f]orge-exec-run.mjs (prepare|run|finish)$'; rc=$?; [ \"$rc\" -le 1 ]; }",
       ], { encoding: 'utf8', timeout: 8000, maxBuffer: 4096 },
       (error, stdout) => error ? reject(error) : resolve(stdout))),
-      readForgeTelemetry(),
+      readForgeTelemetry({ host }),
     ]);
     let procCount = 0;
     for (const line of output === '' ? [] : output.replace(/\n$/, '').split('\n')) {
@@ -738,7 +745,7 @@ function remoteMarkerPidAlive(pid) {
   }
 }
 
-/** Reclaim abandoned remote markers only after proving Forge idle. Never throws.
+/** Reclaim abandoned remote markers only after proving their dispatch host idle. Never throws.
  * Invalid/oversized markers require operator inspection via reap-remote; they remain admission holds.
  * Returns candidates only; dryRun reports them without changing markers, leases or events. */
 export async function reapRemoteSlots({
@@ -753,11 +760,7 @@ export async function reapRemoteSlots({
     if (!existsSync(remoteRoot)) return results;
     const names = readdirSync(remoteRoot).filter(name => /^slot-\d+\.unconfirmed$/.test(name));
     if (!names.length) return results;
-    const status = await readForgeStatus();
-    if (status?.reachable !== true || !Number.isSafeInteger(status.activeRuns) || status.activeRuns < 0
-      || !Number.isSafeInteger(status.procCount) || status.procCount < 0) return results;
-    // Prepare and run use separate processes; process age cannot prove termination.
-    if (status.activeRuns !== 0 || status.procCount !== 0) return results;
+    const statuses = new Map();
     const nowMs = clock();
     if (![nowMs, maxRunMs, marginMs, graceMs].every(n => Number.isFinite(n) && n >= 0)) return results;
     for (const name of names) {
@@ -778,6 +781,23 @@ export async function reapRemoteSlots({
           try { marker = JSON.parse(text); }
           catch { continue; }
         }
+        // Hostless JSON and text markers predate host recording and belong only to Forge.
+        const host = legacy || marker?.host === undefined ? 'forge' : marker.host;
+        if (!validRemoteHost(host)) continue;
+        if (!statuses.has(host)) {
+          let status;
+          try { status = await readForgeStatus({ host }); }
+          catch {
+            notice(`heavy-admission: remote host ${host} status unavailable; retaining unconfirmed markers\n`);
+            status = { reachable: false };
+          }
+          statuses.set(host, status);
+        }
+        const status = statuses.get(host);
+        if (status?.reachable !== true || !Number.isSafeInteger(status.activeRuns) || status.activeRuns < 0
+          || !Number.isSafeInteger(status.procCount) || status.procCount < 0) continue;
+        // Prepare and run use separate processes; process age cannot prove termination.
+        if (status.activeRuns !== 0 || status.procCount !== 0) continue;
         let age; let runId = null;
         if (!legacy) {
           if (marker?.v !== 1 || marker.slot !== slot || !Number.isSafeInteger(marker.pid) || marker.pid <= 0
@@ -791,7 +811,7 @@ export async function reapRemoteSlots({
           age = nowMs - info.mtimeMs;
           if (!Number.isFinite(age) || age < 0 || age < maxRunMs + marginMs) continue;
         }
-        const evidence = `forge-idle activeRuns=0 procs=0 age=${Math.floor(age)}ms`;
+        const evidence = `${host}-idle activeRuns=0 procs=0 age=${Math.floor(age)}ms`;
         if (!dryRun) {
           await beforeMarkerUnlink({ file, slot });
           // Re-read immediately before unlinking: a new owner may have replaced this marker.
@@ -892,7 +912,7 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      writeFileSync(executionMarker, JSON.stringify({ v: 1, runId, slot: slot.slot,
+      writeFileSync(executionMarker, JSON.stringify({ v: 1, runId, slot: slot.slot, host,
         startedAt: new Date(clock()).toISOString(), pid: process.pid }) + '\n', {flag:'wx',mode:0o600});
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
