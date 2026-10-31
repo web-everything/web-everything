@@ -1887,6 +1887,19 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
     if (retryCount !== undefined) f.readStatus().retryCount = retryCount;
     expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });
   });
+  it.each(['completedRecorded', 'cleanRecorded'])('dead running owner with %s resumes its recorded pass', field => {
+    const f = staleFixture();
+    const evidence = { ...f.readEvidence(), recorded: true, seatRecorded: true, [field]: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'resume', abandonStale: true });
+  });
+  it.each(['completedRecorded', 'cleanRecorded'])('dead running owner with %s still skips a spent retry', field => {
+    const f = staleFixture();
+    f.readStatus().retryCount = 1;
+    f.readEvidence = () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, [field]: true });
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip',
+      why: 'red-team retry already spent; inspect stored evidence' });
+  });
   it.each([true, false])('dead owner dispatches fresh with pending label %s', pending => {
     const f = staleFixture();
     if (!pending) f.rawPrs[0].labels = ['review:accepted'];

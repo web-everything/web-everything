@@ -710,6 +710,52 @@ describe('red-team-only review job', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it.each([undefined, 'host', 'pidNamespace'])(
+    'completed seat resumes through production admission after abandoning a dead running owner (foreign=%s)', foreign => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-completed-stale-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
+      const loopPayload = { ...payload(), findings: { read: { netBasis: { rev: head },
+        diffText: '+export const value = 1;', netChangedFiles: ['scripts/example.mjs'] } } };
+      const seat = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', repo, pr, rev: head,
+        callId: 'completed-before-owner-died', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };
+      const key = { repo, pr, head, env }, read = () => readRedTeamStatus(key);
+      const production = createReviewJobIo({ env, readEvidence: input => readDrainRedTeamEvidence({ ...input,
+        list: () => [], readScorecards: () => [seat], isAlive: () => false }) });
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload, status: 'running', result: null }, { env });
+        const status = { ...read(), pid: 2147483647 };
+        if (foreign) {
+          status[foreign] = `foreign-${status[foreign]}`;
+          status.pidStart = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+        }
+        writeJsonAtomic(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`), status);
+        expect(abandonStaleRedTeamRun({ ...key, status,
+          ...(foreign ? {} : { probe: { host: status.host, namespace: status.pidNamespace, isAlive: () => false } }) }).ok).toBe(true);
+        let observed;
+        const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+          redTeamStatus: production.redTeamStatus, clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+          runRedTeam: vi.fn(input => {
+            const missing = runSharedRecovery(input, { env, records: [] });
+            expect(missing.result).toMatchObject({ status: 'not-owed', deferredByGuard: true,
+              reason: expect.stringContaining('no clean prior red-team row') });
+            expect(missing.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+            expect(missing.comments).toEqual([]);
+            observed = runSharedRecovery(input, { env, records: [seat] });
+            return observed.result;
+          }),
+        });
+        const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'resume',
+          redTeamStaleRecovery: true }, io);
+        expect(result.redTeam).toMatchObject({ status: 'resumed' });
+        expect(observed.result).toMatchObject({ status: 'resumed', callId: seat.callId, comment: { status: 'posted' } });
+        expect(observed.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+        expect(redTeamForHead(observed.comments, pr, head)).toBeTruthy();
+        expect(read()).toMatchObject({ status: 'finished', result: 'resumed' });
+        expect(io.clearRedTeamQueued).not.toHaveBeenCalled();
+        expect(io.runRedTeamGate).toHaveBeenCalledOnce();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it.each([
     ['expired foreign host', { foreign: 'host', age: 3 * 60 * 60 * 1000 }, true],
     ['expired foreign namespace', { foreign: 'pidNamespace', age: 3 * 60 * 60 * 1000 }, true],

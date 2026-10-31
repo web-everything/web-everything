@@ -405,14 +405,20 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if ((!staleOwed && (evidence.inFlight || status?.status === 'running')) || evidence.queued) return skip('red-team pass in flight');
+      const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
+      const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
+      if (movedCardOnly && (status != null || evidence.completedRecorded === true)) return skip('live head already has red-team state');
+      if (comment === 'posted') return skip('result posted; comment not visible yet');
       if (staleOwed) {
         if (status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
+        // The owner may have died after recording the seat but before publishing its effects.
+        const mode = completedSeat ? 'resume' : 'fresh';
         const key = { repo, pr, head }, spent = staleSpent(key), redispatch = staleRedispatch(key);
         if (spent || redispatch.count > 0) {
           // Admission replaces the abandoned row with queued before a run starts.
           // An unchanged abandoned row means the prior job never launched a call.
           if (redTeamStatusWithoutRun(status, { allowAbandonedRunning: true })) {
-            if (redispatch.count === 1) return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: false,
+            if (redispatch.count === 1) return dispatchDecision({ action: 'dispatch', mode, abandonStale: false,
               why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
             return skip('stale red team already re-dispatched; inspect review run');
           }
@@ -422,17 +428,13 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (!Number.isFinite(now)) return skip('red-team evidence unreadable; inspect stored evidence before retrying');
           if (now - redispatch.firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS) return skip('stale red team re-dispatch backoff');
         }
-        return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: true,
+        return dispatchDecision({ action: 'dispatch', mode, abandonStale: true,
           why: 'running red team owner is dead; abandon and re-dispatch' });
       }
-      const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
-      const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
       // A null completion alone is unknown. Only the recovery reader's normalization
       // of an originally queued writer can make it a never-started placeholder.
       const placeholder = redTeamStatusWithoutRun(status, { originalStatus: evidence.status });
       let mode;
-      if (movedCardOnly && (status != null || evidence.completedRecorded === true)) return skip('live head already has red-team state');
-      if (comment === 'posted') return skip('result posted; comment not visible yet');
       // Only one explicitly failed seat permits a fresh retry. Successful execution
       // can resume effects even when its verdict contains confirmed breaks.
       if (movedCardOnly || failedRedTeamRetry(status, evidence)) mode = 'fresh';

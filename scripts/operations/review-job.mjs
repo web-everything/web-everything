@@ -383,9 +383,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       try {
         if (queued) {
           prior = readStatus(key);
-          const staleRecovery = input.redTeamMode === 'fresh' && input.redTeamStaleRecovery === true
+          const staleRecovery = ['fresh', 'resume'].includes(input.redTeamMode) && input.redTeamStaleRecovery === true
             && verifiedStaleRedTeamAbandonment(key, prior)
-            && staleRedTeamRun({ status: prior, deadlineMs: staleRunDeadlineMs(env) }).stale;
+            && staleRedTeamRun({ status: prior, deadlineMs: staleRunDeadlineMs(env) }).stale
+            && (input.redTeamMode === 'fresh' || ((prior.retryCount === undefined || prior.retryCount === 0) && (() => {
+              const evidence = readEvidence(key);
+              return evidence?.completedRecorded === true || evidence?.cleanRecorded === true;
+            })()));
           if (['queued', 'running'].includes(prior?.status)) {
             // A normal review may adopt its own speculative child; another live/unknown writer keeps the head.
             const ownSpeculation = Number.isInteger(input.speculativePid) && input.speculativePid > 0
@@ -405,6 +409,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // the guard before replacing that evidence with our own queued writer.
           admissionPrior = input.redTeamMode
             ? readRedTeamRecoveryStatus(key, { readStatus: () => prior, readEvidence }) : prior;
+          // A recorded seat proves the pass completed before this verified-dead owner
+          // wrote its result. The shared resume guard still requires the matching seat row.
+          if (staleRecovery && input.redTeamMode === 'resume') {
+            admissionPrior = { ...admissionPrior, status: 'finished', result: 'ran' };
+          }
           // A healed policy skip has no model result to resume. Let the fresh seat
           // apply today's policy; its independent comment and scorecard guards remain active.
           // readRedTeamStatus binds status.head to this job's head; the predicate
