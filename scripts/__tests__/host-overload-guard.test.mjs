@@ -288,9 +288,12 @@ it('host policy regression: preference files merge per leaf and canonical confli
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 60000 } } },
   { host: { maxWaitMs: 250 }, lanes: { gc: { schedule: 120000 } } });
   const policy = loadHostOverloadSettings(opts);
-  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
+  expect(policy.settings).toEqual({ host: { capacitySignal: 'load',
+    capacity: { cpuIdleLowPct: 15, memFreeLowPct: 15, cpuIdleMediumPct: 30, memFreeMediumPct: 30 },
+    maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 120000 } } });
-  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
+  expect(Object.values(policy.sources)).toEqual(['standard', 'standard', 'standard', 'standard', 'standard',
+    'platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
   expect(hostLoadAdmission({ ...opts, interactive: false, load: () => [1], cores: () => 1 }).admitted).toBe(false);
 });
 
