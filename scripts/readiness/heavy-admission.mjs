@@ -703,6 +703,12 @@ export function createRemoteExec({
   };
 }
 
+/** Best-effort audit handoff to verify-lane; never affects admission or exit status. */
+export function appendVerifyRemoteReport(env, result) {
+  if (!env?.WE_VERIFY_REMOTE_REPORT) return;
+  try { appendFileSync(env.WE_VERIFY_REMOTE_REPORT, JSON.stringify(result) + '\n', { mode: 0o600 }); } catch { /* best-effort */ }
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -716,12 +722,13 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec,
+  remoteExec, onDecision,
   log = (line) => process.stderr.write(line),
 }) {
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
   const decision = decideRemote({ policy, loadPerCore: load, argv });
+  onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
@@ -804,7 +811,7 @@ export async function runWithRemoteDecision({
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
       await record(result);
-      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code };
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
@@ -2348,6 +2355,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Forge. Consume this internal handoff once; local fallback stays reentrant.
     const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
     delete process.env.WE_FORGE_GATE_DISPATCH;
+    let verifyRemoteFallback = false;
     if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
@@ -2364,9 +2372,14 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot,
+        onDecision: decision => { verifyRemoteFallback = decision.remote; },
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
+      verifyRemoteFallback = verifyRemoteFallback && !result.handled;
       if (result.handled) {
+        if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
+          location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
+        });
         // An unref'd drain timer permits natural exit if no IO remains; preserve the remote code there too.
         process.exitCode = result.exitCode;
         await settleClientProvenance();
@@ -2397,6 +2410,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
+    if (verifyRemoteFallback) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }
   process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);

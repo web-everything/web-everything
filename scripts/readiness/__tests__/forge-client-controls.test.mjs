@@ -278,9 +278,9 @@ describe('remote controls', () => {
     const server=runner.createRunner({testRoot:serverRoot,clock:()=>time});
     const ssh=vi.fn((_file,_args,_options,done)=>server.telemetry().then(value=>done(null,JSON.stringify(value)),done));
     f.clock=()=>time;f.readTelemetry=options=>readForgeTelemetry({...options,exec:ssh});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
     time+=60000;
-    expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
     expect(ssh).toHaveBeenCalledTimes(2);
     expect(f.remoteExec).toHaveBeenCalledTimes(2);
     expect(JSON.parse(readFileSync(join(serverRoot,'receipts','telemetry.json'),'utf8')).sampledAtET).toBe(runner.easternTimestamp(time));
@@ -293,7 +293,7 @@ describe('remote controls', () => {
       expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(true);
       return {mode:'remote',code:0};
     });
-    expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
     expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:8})).toHaveLength(0);
     expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(false);
   });
@@ -320,7 +320,7 @@ describe('remote controls', () => {
   it('validates freshness at completion of the SSH read, accepting a sample produced during the read', async () => {
     const f=fixture();let current=now;f.clock=()=>current;
     f.readTelemetry.mockImplementation(async()=>{current+=20;return sample(current);});
-    expect(await runWithRemoteDecision(f)).toEqual({handled:true,exitCode:0});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
   });
   it('caches unreachable telemetry for ten seconds even with backoff disabled', async () => {
@@ -400,7 +400,8 @@ describe('remote controls', () => {
     const f=fixture({maxConcurrent:1});
     const marker=join(f.cwd,'remote','slot-0.unconfirmed');
     f.remoteExec.mockImplementation(async()=>{expect(existsSync(marker)).toBe(true);return result;});
-    expect(await runWithRemoteDecision(f)).toEqual(result.mode==='remote'?{handled:true,exitCode:result.code}:{handled:false});
+    expect(await runWithRemoteDecision(f)).toEqual(result.mode==='remote'?
+      expect.objectContaining({handled:true,exitCode:result.code,remoteResult:expect.objectContaining(result)}):{handled:false});
     expect(existsSync(marker)).toBe(false);
     expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:1})).toHaveLength(0);
   });
@@ -471,7 +472,8 @@ describe('remote controls', () => {
       });
       release({mode:'remote',code:0});await first;
       await vi.advanceTimersByTimeAsync(1000);
-      expect(await waiting).toEqual(trigger?{handled:false}:{handled:true,exitCode:0});
+      expect(await waiting).toEqual(trigger?{handled:false}:
+        expect.objectContaining({handled:true,exitCode:0,remoteResult:expect.objectContaining({mode:'remote',code:0})}));
       expect(f.readTelemetry).toHaveBeenCalledTimes(waitMs>=10000?2:1);
       expect(f.remoteExec).toHaveBeenCalledTimes(trigger?0:1);
       expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);

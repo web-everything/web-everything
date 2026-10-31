@@ -189,7 +189,7 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     const lock = readFileSync(join(cwd, 'package-lock.json'));
     const lockHash = createHash('sha256').update(lock).digest('hex');
     for (const state of ['cold', 'warm']) {
-      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({mode:'remote', code:0});
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
       expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0');
       expect(readdirSync(join(f.root, 'cache', lockHash))).toHaveLength(1);
     }
@@ -208,7 +208,7 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     }
     for (const state of ['previously primed', 'repeated removed input', 'cold']) {
       if (state === 'cold') rmSync(join(f.root, 'cache'), {recursive:true, force:true});
-      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({mode:'remote', code:probe.status});
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toMatchObject({mode:'remote', code:probe.status, run: expect.any(String)});
       if (probe.status === 1) expect(f.runs.at(-1).stderr).toContain('MODULE_NOT_FOUND');
       else expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0');
       expect(readdirSync(join(f.root, 'cache', lockHash))).toHaveLength(state === 'cold' ? 1 : 2);
@@ -341,7 +341,7 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     const f = realRemoteFixture(['package-lock.json']);
     writeFileSync(join(f.bin, 'npm'), '#!/bin/bash\nif [ "$1" = ci ]; then exit 0; fi\necho COMMAND_RAN\nexit 97\n', { mode: 0o755 });
     for (const state of ['cold', 'warm']) {
-      expect(await runRemote(f), state).toEqual({ mode: 'remote', code: 97 });
+      expect(await runRemote(f), state).toMatchObject({ mode: 'remote', code: 97 , run: expect.any(String)});
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
       expect(f.local).not.toHaveBeenCalled();
     }
@@ -385,7 +385,7 @@ console.log('RESOLVED ' + versions.join(','));
     expect(lock.packages[`${workspace}/node_modules/cache-dependency`].version).toBe('2.0.0');
     for (const state of ['cold', 'warm']) {
       const result = await runRemote(f);
-      expect(result, `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
+      expect(result, `${state}: ${f.runs.at(-1)?.stderr}`).toMatchObject({ mode: 'remote', code: 0 , run: expect.any(String)});
       expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0,2.0.0');
       expect(existsSync(join(f.root, 'runs', f.serverRun))).toBe(false);
     }
@@ -401,7 +401,7 @@ console.log('RESOLVED ' + versions.join(','));
     }));
     const f = realRemoteFixture(['package.json', 'package-lock.json']);
     for (const state of ['cold', 'warm']) {
-      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toMatchObject({ mode: 'remote', code: 0 , run: expect.any(String)});
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
     }
     const hash = createHash('sha256').update(readFileSync(join(cwd, 'package-lock.json'))).digest('hex');
@@ -434,7 +434,7 @@ console.log('RESOLVED ' + versions.join(','));
       }
       return transport(call);
     });
-    expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
+    expect(await runRemote(f)).toMatchObject({ mode: 'remote', code: 0 , run: expect.any(String)});
     for (const file of files) {
       expect(transferred.get(file), file).toBe(file === 'tab\tfile' ? null : `contents: ${file}`);
     }
@@ -467,7 +467,7 @@ console.log('RESOLVED ' + versions.join(','));
     const f = realRemoteFixture(files);
     // Populate, then prove a valid cache hit can still execute.
     for (const attempt of [1, 2]) {
-      expect(await runRemote(f), `valid attempt ${attempt}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
+      expect(await runRemote(f), `valid attempt ${attempt}: ${f.runs.at(-1)?.stderr}`).toMatchObject({ mode: 'remote', code: 0 , run: expect.any(String)});
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
     }
     changedManifest.dependencies = { 'missing-lock-dependency': kind === 'root' ? 'file:vendor/missing-lock-dependency' : 'file:../../vendor/missing-lock-dependency' };
@@ -658,7 +658,7 @@ describe('standards input parity', () => {
         return original(call);
       });
       expect(await runRemote({...f,cwd:work,listFiles:undefined,env,argv:['npm','run','check:standards']}),scenario)
-        .toEqual({mode:'remote',code:local.exitCode});
+        .toMatchObject({mode:'remote',code:local.exitCode, run: expect.any(String)});
       expect(observed,scenario).toEqual(local);
     }
   }, 30000);
@@ -876,7 +876,7 @@ describe('runRemote', () => {
     });
     const result=await runRemote(f),copies=callsOf(f.exec).filter(c=>c.file==='rsync');
     if(slot==='forge-exec-2'){
-      expect(result).toEqual({mode:'remote',code:0});
+      expect(result).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
       expect(copies).toHaveLength(1);
       expect(copies[0].args).toContain('--rsync-path=sudo -u forge-exec-2 rsync');
       expect(copies[0].args.at(-1)).toMatch(/^forge:\/srv\/forge-exec\/slot-2\/r-[a-f0-9]{32}\/work\/$/);
@@ -958,7 +958,7 @@ describe('runRemote', () => {
     const result = await runRemote(f);
     const transport = await Promise.allSettled(f.exec.mock.results.map(call => call.type === 'throw' ? Promise.reject(call.value) : call.value));
     expect(transport.filter(call => call.status === 'rejected').map(call => call.reason?.stack ?? String(call.reason)), JSON.stringify(result)).toEqual([]);
-    expect(result, JSON.stringify(result)).toEqual({mode:'remote',code:0});
+    expect(result, JSON.stringify(result)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
     expect(copied).toBe(true);
   });
 
@@ -992,7 +992,7 @@ describe('runRemote', () => {
       }
       return transport(call);
     });
-    expect(await runRemote(f)).toEqual({mode:'remote', code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     expect(staging).toBeDefined();
     expect(existsSync(staging)).toBe(false);
   });
@@ -1138,7 +1138,7 @@ describe('runRemote', () => {
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
       ? remoteManifestAPI.defaultExec(call) : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
   });
   it.each([
     {code:1,stdout:Buffer.alloc(0)}, {code:0,stdout:''},
@@ -1227,7 +1227,7 @@ describe('runRemote', () => {
       return original(call);
     });
     f.argv = ['npm','run','check:standards',...args];
-    expect(await runRemote(f)).toEqual({mode:'remote',code:1});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:1, run: expect.any(String)});
     expect(observed.coverage).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
     expect(observed.coverage).toEqual(localCoverage);
     expect(observed.artifacts.errors.map(e=>e.descriptor.file)).toEqual(['reports','src/_data/researchTopics','src/_includes/research-descriptions']);
@@ -1297,7 +1297,7 @@ describe('runRemote', () => {
   it('rejects a prior valid receipt when the caller reuses the run id', async () => {
     let priorReceipt;
     const f = fixture({ receipt: (_nonce, value, request) => priorReceipt ??= JSON.stringify({...value, manifestDigest:request.manifestDigest}) });
-    expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
+    expect(await runRemote(f)).toMatchObject({ mode: 'remote', code: 0 , run: expect.any(String)});
     const log = vi.fn();
     expect(await runRemoteCli({ ...f, log })).toBe(124);
     const nonces = callsOf(f.exec).filter(isRun).map((call) => nonceOf(call.input));
@@ -1359,7 +1359,7 @@ describe('runRemote', () => {
   });
   it.each([0, 3, 97, 254])('returns confirmed remote exit code %s and cleans up after reading the receipt', async (code) => {
     const f = fixture({ runCode: code });
-    expect(await runRemote(f)).toEqual({ mode: 'remote', code });
+    expect(await runRemote(f)).toMatchObject({ mode: 'remote', code, run: expect.any(String) });
     const calls = callsOf(f.exec);
     const run = calls.find(isRun);
     expect(run).toMatchObject({ file: 'ssh', inherit: true, input: expect.any(String) });
@@ -1787,7 +1787,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const f = fixture();
     // Establish that this transport can certify the ordinary snapshot. A later
     // fallback must come from the excluded test, not an unrelated fixture error.
-    expect(await runRemote(f)).toEqual({mode:'remote', code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     f.exec.mockClear();
     const parts = name.split('/');
     if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
@@ -1818,7 +1818,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
     expect(manifest.excluded).toEqual([Buffer.from(name)]);
     const exec = acceptingTransport(paths);
-    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     const copy = callsOf(exec).find(call => call.file === 'rsync');
     expect(copy.input).toEqual(Buffer.from('./package-lock.json\0'));
     const sent = JSON.parse(callsOf(exec).find(isRun).input);
@@ -1843,7 +1843,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.excluded).toEqual([Buffer.from(name)]);
     expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
     const exec = acceptingTransport(paths);
-    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
   });
@@ -1888,7 +1888,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
     expect(manifest.excluded).toEqual([Buffer.from(name)]);
     const exec = acceptingTransport(paths);
-    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
   });
 
@@ -1912,7 +1912,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.excluded).toEqual([Buffer.from(name)]);
     expect(callsOf(inventory).some(call => call.args[0] === 'ls-tree')).toBe(false);
     const exec = acceptingTransport(paths, stage);
-    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
   });
@@ -2061,7 +2061,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const stage = Buffer.from(paths.map(path => `100644 ${'a'.repeat(40)} 0\t${path}\0`).join(''));
     const manifest = await build({cwd, exec:gitInventory(paths, stage)});
     const exec = acceptingTransport(paths, stage);
-    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     const copy = callsOf(exec).find(call => call.file === 'rsync');
     expect(copy.args).toEqual(expect.arrayContaining(['--from0','--files-from=-']));
     expect(Buffer.isBuffer(copy.input)).toBe(true);
@@ -2099,7 +2099,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     if (!readdirSync(cwd, {encoding:'buffer'}).some(name => name.equals(path))) {ctx.skip(); return;}
     const paths = [path, Buffer.from('package-lock.json')];
     const exec = acceptingTransport(paths);
-    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(await runRemote({argv, cwd, runId, exec})).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
     const ordered = [...paths].sort(Buffer.compare);
     expect(callsOf(exec).find(call => call.file === 'rsync').input)
       .toEqual(Buffer.concat(ordered.flatMap(name => [Buffer.from('./'),name,Buffer.from([0])])));
@@ -2127,7 +2127,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       expect(['copy-failed','gitlink-unsupported']).toContain(result.reason);
       expect(callsOf(exec).some(isRun)).toBe(false);
     } else {
-      expect(result).toEqual({mode:'remote', code:0});
+      expect(result).toMatchObject({mode:'remote', code:0, run: expect.any(String)});
       const sent = JSON.parse(callsOf(exec).find(isRun).input);
       expect(Buffer.from(sent.manifest.paths,'base64').includes(Buffer.from('vendor/nested.test.mjs\0'))).toBe(true);
       expect(callsOf(exec).find(call => call.file === 'rsync').input.includes(Buffer.from('./vendor/nested.test.mjs\0'))).toBe(true);
@@ -2223,7 +2223,7 @@ describe('allowlisted sibling snapshots', () => {
     mkdirSync(join(f.cwd, 'sub/dir'), {recursive:true});
     writeFileSync(join(f.cwd, 'sub/dir/x.md'), 'nested primary');
     f.listFiles.mockResolvedValue(['a.test.mjs', 'package-lock.json', 'vitest.shared.ts', 'sub/dir/x.md']);
-    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
     const copies = callsOf(f.exec).filter(call => call.file === 'rsync');
     expect(copies).toHaveLength(2);
     for (const copy of copies) {
@@ -2266,7 +2266,7 @@ describe('allowlisted sibling snapshots', () => {
     const result = await runRemote(f);
     const transport = await Promise.allSettled(f.exec.mock.results.map(call => call.type === 'throw' ? Promise.reject(call.value) : call.value));
     expect(transport.filter(call => call.status === 'rejected').map(call => call.reason?.stack ?? String(call.reason)), JSON.stringify(result)).toEqual([]);
-    expect(result, JSON.stringify(result)).toEqual({mode:'remote',code:0});
+    expect(result, JSON.stringify(result)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
     expect(copies).toBe(2);
   });
 
@@ -2287,7 +2287,7 @@ describe('allowlisted sibling snapshots', () => {
       }
       return fake(call);
     });
-    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
     expect(copies).toBe(1);
     const sent = JSON.parse(callsOf(f.exec).find(isRun).input);
     expect(sent.siblingShas).toEqual({frontierui:sha});
@@ -2326,7 +2326,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
       if (isReceipt(call)) return {code:0,stdout:JSON.stringify(await runner.finish(JSON.parse(call.input)))};
       return fake(call);
     });
-    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
     expect(existsSync(join(server,'runs',run))).toBe(false);
   });
   it.each(['dirty','staged','untracked','missing','symlink','root symlink','gitlink','unresolvable'])
@@ -2371,7 +2371,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     const f=siblingsFixture();
     writeFileSync(join(sibling,'webtheme',name),'PRIVATE');
     git('add','.'); git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','excluded');
-    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(await runRemote(f)).toMatchObject({mode:'remote',code:0, run: expect.any(String)});
     const request=JSON.parse(callsOf(f.exec).find(isRun).input);
     expect(Buffer.from(request.manifest.siblings.frontierui.excluded,'base64').includes(Buffer.from(`webtheme/${name}\0`))).toBe(true);
     expect(callsOf(f.exec).filter(call=>call.file==='rsync').every(call=>!call.input.includes(Buffer.from(name)))).toBe(true);

@@ -2003,6 +2003,24 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
 
+For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
+arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
+or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
+Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-report guards,
+isolated retries and unsupported shell syntax stay local. Keep both planning and actual
+spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
+Wrapper eligibility checks the entire command: compound commands, redirections and shell
+expansions retain a local slot and `WE_HEAVY_ADMISSION_HELD` for their full execution scope.
+Keep the compound-wrapper table for both npm scripts and the direct heavy-admission wrapper,
+plus the native spawn regression that observes HELD on both the wrapper and following scanner.
+Plan each phase's own command even when admission spans the whole gate; never reuse an
+earlier phase's rewrite for standards, scanners or guards. Strip only trailing
+`--passWithNoTests`, `--testTimeout=<digits>` (at least 5000) and `--hookTimeout=<digits>`
+(at least 10000) before checking the remaining arguments with Forge's existing `allowedCommand` guard.
+Smaller timeouts stay local so remote defaults cannot loosen them. Remote location evidence
+requires a non-empty receipt ID and an integer exit code; incomplete reports stay local.
+Keep allowlisted reporters; unknown options retain the original local command and admission.
+
 The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
 without `telemetry.json`; it never returns a saved timestamp as evidence of current health.
 Keep the stale-idle-file → SSH adapter → health-check regression alongside the ten-second
