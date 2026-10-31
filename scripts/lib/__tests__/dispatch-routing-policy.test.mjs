@@ -1,17 +1,21 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
+import fs, { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync } from 'node:fs';
 import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { validateRoutingPolicy, resolveOperationRoute, applyRoutingOverrides, DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
-import { OPERATION_PROVIDER_ROSTERS } from '../dispatch-routing-providers.mjs';
+import { rosterForKey } from '../dispatch-routing-providers.mjs';
 import { readRoutingPolicy, createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
 import { routeDispatchProvider } from '../../operations/dispatch-lane-io.mjs';
 import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
 import { readSettings } from '../settings-files.mjs';
+import { ROUTING_POLICY_PATH } from '../dispatch-routing-policy-source.mjs';
+import { planRoutingOverride } from '../../operations/routing-override.mjs';
+import { writeRoutingOverride } from '../../operations/routing-override-file.mjs';
+import { resolveRoutingOverrideRoute } from '../dispatch-routing-override-route.mjs';
 
 const copy = () => structuredClone(readRoutingPolicy());
 // Exercise an explicit launch override without replacing the default evidence/tier repair router.
@@ -23,9 +27,74 @@ const repairLaunchRoute = (kind, vetoes = []) => {
   return resolveOperationRoute({ operation: kind, policy, vetoes });
 };
 describe('operation routing policy', () => {
+  it('refuses unsupported providers for scoped added seats before writing preferences', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'scoped-seat-override-'));
+    const path = join(dir, 'preferences.json');
+    const key = 'review-seat:standards-conformance';
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations[key] = { inherit: true };
+    const original = '{"keep":true,"routingOverrides":{}}\n';
+    writeFileSync(path, original);
+    const realRead = fs.readFileSync;
+    const spy = vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) =>
+      file === ROUTING_POLICY_PATH ? JSON.stringify(policy) : realRead(file, ...args));
+    try {
+      expect(() => writeRoutingOverride({ key, patch: { provider: 'claude' } },
+        { env: { WE_PLATFORM_PREFERENCES_FILE: path } })).toThrow(/unsupported seat provider claude/);
+      expect(readFileSync(path, 'utf8')).toBe(original);
+      expect(() => planRoutingOverride({ operation: 'review-seat', taskType: 'standards-conformance',
+        provider: 'claude' }, policy)).toThrow(/unsupported provider claude/);
+    } finally { spy.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([...Object.keys(DEFAULT_ROUTING_POLICY.operations).filter(key => key.startsWith('review-seat')),
+    'review-seat:standards-conformance', 'review-seat:extra-juror:custom', 'review-seat:advisory:custom'])(
+    '%s allows exactly its launcher roster for primary and fallback routes', key => {
+      const settingsSeats = ['review-seat:mandatory:correctness', 'review-seat:mandatory:security',
+        'review-seat:advisory:agy-correctness'];
+      const expected = settingsSeats.includes(key)
+        ? ['claude', 'agy-claude', 'agy-gemini'] : ['codex', 'agy-claude', 'agy-gemini'];
+      expect(rosterForKey(key)).toEqual(expected);
+      for (const fallback of [false, true]) {
+        const accepted = Object.keys(DEFAULT_ROUTING_POLICY.aliases).filter(provider => {
+          const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+          const route = { provider, model: Object.values(policy.aliases[provider])[0] };
+          policy.operations[key] = fallback
+            ? { provider: 'agy-claude', model: 'sonnet', fallback: [route] } : { ...route, fallback: [] };
+          try { validateRoutingPolicy(policy); return true; } catch { return false; }
+        });
+        expect(accepted.sort()).toEqual([...expected].sort());
+      }
+    });
+  it.each(['build', 'review-seats:custom', 'toString', 'constructor', '__proto__'])(
+    'does not assign a seat roster to unrelated key %s', key => {
+      expect(rosterForKey(key)).toBeUndefined();
+    });
+  it('keeps the last good scoped-seat override when live reload receives an unsupported provider', () => {
+    const key = 'review-seat:standards-conformance';
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations[key] = { inherit: true };
+    let patch = { provider: 'codex' };
+    const log = vi.fn(); const emit = vi.fn();
+    const read = createRoutingPolicyReader({ initial: policy, read: () => JSON.stringify(policy), env: {}, log, emit,
+      preferences: () => ({ prefs: { routingOverrides: { [key]: patch } }, errors: [] }) });
+    const good = read();
+    expect(good.operations[key].provider).toBe('codex');
+    emit.mockClear();
+    patch = { provider: 'claude' };
+    expect(read()).toBe(good);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/keeping last good policy:.*unsupported seat provider claude/));
+    expect(emit).not.toHaveBeenCalled();
+  });
+  it.each(['review-seat:standards-conformance', 'review-seat:extra-juror:custom'])(
+    'applies launcher caps to inherited scoped seat %s', key => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations[key] = { inherit: true, disabledProviders: ['codex', 'agy-claude'] };
+      expect(() => resolveRoutingOverrideRoute(key, policy, { env: {} })).toThrow(/no available route/);
+      expect(() => resolveRoutingOverrideRoute(key, policy, { env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '25' } })).not.toThrow();
+    });
   it('shares the red-team launch roster with existing review-seat consumers', async () => {
     const { REVIEW_SEAT_PROVIDERS } = await import('../provider-routing.mjs');
-    expect(OPERATION_PROVIDER_ROSTERS['review-seat:red-team']).toBe(REVIEW_SEAT_PROVIDERS);
+    expect(rosterForKey('review-seat:red-team')).toBe(REVIEW_SEAT_PROVIDERS);
     expect(REVIEW_SEAT_PROVIDERS).toEqual(['codex', 'agy-claude', 'agy-gemini']);
   });
   it.each(['claude', 'antigravity', 'unknown-provider'])(
@@ -42,7 +111,7 @@ describe('operation routing policy', () => {
     'resolves a supported red-team override for %s against the launch roster', provider => {
       const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': { provider } });
       expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
-        available: OPERATION_PROVIDER_ROSTERS['review-seat:red-team'], policy })).toMatchObject({ provider });
+        available: rosterForKey('review-seat:red-team'), policy })).toMatchObject({ provider });
     });
   it.each(['antigravity', 'agy-gemini'])('resolves the %s Pro alias to the registered Argon high model', (provider) => {
     const policy = copy();

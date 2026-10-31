@@ -2,7 +2,7 @@
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { applyRoutingOverrides, DEFAULT_ROUTING_POLICY } from '../lib/dispatch-routing-policy.mjs';
-import { OPERATION_PROVIDER_ROSTERS } from '../lib/dispatch-routing-providers.mjs';
+import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { resolveRoutingOverrideRoute } from '../lib/dispatch-routing-override-route.mjs';
 export { resolveRoutingOverrideRoute } from '../lib/dispatch-routing-override-route.mjs';
 
@@ -17,7 +17,7 @@ export function planRoutingOverride(input, policy = DEFAULT_ROUTING_POLICY) {
   }
   if (clear && (provider || model)) throw new TypeError('routing-override: --clear cannot accompany --provider or --model');
   if (!clear && !provider) throw new TypeError('routing-override: --provider or --clear is required');
-  const allowedProviders = OPERATION_PROVIDER_ROSTERS[key];
+  const allowedProviders = rosterForKey(key);
   if (!clear && allowedProviders && !allowedProviders.includes(provider)) {
     throw new TypeError(`routing-override: ${key}: unsupported provider ${provider}; expected ${allowedProviders.join('|')}`);
   }

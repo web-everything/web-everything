@@ -10,3 +10,9 @@ export const OPERATION_PROVIDER_ROSTERS = Object.freeze({
   'review-seat:mandatory:security': SETTINGS_SEAT_PROVIDERS,
   'review-seat:advisory:agy-correctness': SETTINGS_SEAT_PROVIDERS,
 });
+
+/** Exact settings-seat exceptions take precedence over the added-seat launcher roster. */
+export function rosterForKey(key) {
+  if (Object.hasOwn(OPERATION_PROVIDER_ROSTERS, key)) return OPERATION_PROVIDER_ROSTERS[key];
+  return key.startsWith('review-seat:') ? REVIEW_SEAT_PROVIDERS : undefined;
+}

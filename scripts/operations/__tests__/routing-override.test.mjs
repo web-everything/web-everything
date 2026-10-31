@@ -85,6 +85,26 @@ it('replaces preferences by atomic rename and leaves no scratch or lock files', 
   expect(readdirSync(f.dir)).toEqual(['preferences.json']);
 });
 
+it('preserves preferences and removes scratch and lock files when rename fails', () => {
+  const f = fixture();
+  const original = '{"keep":true,"routingOverrides":{"review-seat:red-team":{"provider":"agy-claude"}}}\n';
+  writeFileSync(f.path, original);
+  const realRename = fs.renameSync;
+  const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    if (to === f.path) {
+      expect(readFileSync(from, 'utf8')).toContain('codex');
+      throw Object.assign(new Error('injected rename failure'), { code: 'EIO' });
+    }
+    return realRename(from, to);
+  });
+  try {
+    expect(() => writeRoutingOverride({ key, patch: { provider: 'codex' } }, { env: f.env })).toThrow('injected rename failure');
+    expect(spy).toHaveBeenCalled();
+    expect(readFileSync(f.path, 'utf8')).toBe(original);
+    expect(readdirSync(f.dir)).toEqual(['preferences.json']);
+  } finally { spy.mockRestore(); }
+});
+
 it.each(['review-seat:red-team', 'review-seat'])('accepts a %s disable that keeps an explicitly capped agy-gemini', target => {
   const f = fixture();
   const env = { ...f.env, WE_REVIEW_SEAT_CAP_AGY_GEMINI: '25' };

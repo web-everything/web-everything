@@ -56,7 +56,7 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
-import { OPERATION_PROVIDER_ROSTERS } from '../lib/dispatch-routing-providers.mjs';
+import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1698,7 +1698,7 @@ export async function speculateRedTeam({
     let deferredByCap = false;
     const routingPolicy = (io.readRoutingPolicy ?? readRoutingPolicy)();
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
-    const providers = OPERATION_PROVIDER_ROSTERS['review-seat:red-team'];
+    const providers = rosterForKey('review-seat:red-team');
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {

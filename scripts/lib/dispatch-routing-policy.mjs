@@ -1,7 +1,7 @@
 /** Pure validation and resolution for the declarative routing policy. */
 import { CODEX_EFFORT_MAP } from './codex-model-routing.mjs';
 import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-source.mjs';
-import { OPERATION_PROVIDER_ROSTERS } from './dispatch-routing-providers.mjs';
+import { rosterForKey } from './dispatch-routing-providers.mjs';
 
 const CATALOG = Object.freeze({
   claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
@@ -18,7 +18,7 @@ const fail = message => { throw new TypeError(`routing policy: ${message}`); };
 // These settings-backed seats use review-seat-provider's Claude/agy adapters.
 // Added review seats (including red-team) have a separate, wider provider roster.
 const SETTINGS_SEAT_TASKS = ['mandatory:correctness', 'mandatory:security', 'advisory:agy-correctness'];
-const SETTINGS_SEAT_PROVIDERS = OPERATION_PROVIDER_ROSTERS['review-seat:mandatory:correctness'];
+const SETTINGS_SEAT_PROVIDERS = rosterForKey('review-seat:mandatory:correctness');
 const OPTIONAL_ADVISORY_SEAT = 'review-seat:advisory:agy-correctness';
 function keys(value, allowed, path) {
   if (!object(value)) fail(`${path} must be an object`);
@@ -91,7 +91,7 @@ export function validateRoutingPolicy(input) {
         modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
         validateEffort(next.effort, next.provider);
       }
-      const allowedProviders = group === 'operations' && OPERATION_PROVIDER_ROSTERS[name];
+      const allowedProviders = group === 'operations' && rosterForKey(name);
       if (allowedProviders) {
         for (const route of [entry, ...entry.fallback]) {
           if (!allowedProviders.includes(route.provider)) fail(`${path}: unsupported seat provider ${route.provider}`);

@@ -1,6 +1,6 @@
 /** Shared usable-route probe for operator writes and live policy reloads. */
 import { resolveOperationRoute } from './dispatch-routing-policy.mjs';
-import { OPERATION_PROVIDER_ROSTERS, REVIEW_SEAT_PROVIDERS } from './dispatch-routing-providers.mjs';
+import { rosterForKey, REVIEW_SEAT_PROVIDERS } from './dispatch-routing-providers.mjs';
 import { resolveRoutingProviderCap } from './review-seat-caps.mjs';
 
 /** A task type no policy entry names, so resolution falls back to the bare review-seat entry. */
@@ -17,7 +17,7 @@ export function resolveRoutingOverrideRoute(key, policy, { env = process.env } =
   const taskType = split >= 0 ? key.slice(split + 1) : key === 'review-seat' ? ADDED_SEAT_PROBE_TASK : '';
   const entry = policy.operations[key];
   const disabled = entry.disabledProviders ?? [];
-  const roster = OPERATION_PROVIDER_ROSTERS[key];
+  const roster = rosterForKey(key);
   const capped = roster === REVIEW_SEAT_PROVIDERS;
   const available = roster?.filter(provider => !disabled.includes(provider)
     && (!capped || resolveRoutingProviderCap(provider, env, entry) > 0));
