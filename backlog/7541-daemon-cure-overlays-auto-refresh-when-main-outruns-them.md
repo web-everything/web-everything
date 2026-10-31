@@ -1,4 +1,5 @@
 ---
+bornAs: xbusgij
 kind: story
 size: 5
 status: open
