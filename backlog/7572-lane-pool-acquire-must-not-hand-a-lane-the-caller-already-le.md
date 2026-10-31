@@ -1,15 +1,16 @@
 ---
+bornAs: x587011
 kind: story
-size: 1
+size: 2
 status: open
-scope: ["we:scripts/__tests__/codex-direct-task.test.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# codex-direct-task.test 'kills a same-group straggler' fails on Forge
+# lane-pool acquire must not hand a lane the caller already leases to a second acquire
 
-Live 2026-10-31 16:28 ET: we:scripts/__tests__/codex-direct-task.test.mjs 'kills a same-group straggler' fails on Forge with and without #6140, and passes on the Mac (worker a1218e29 run on lane-44, 320/321). Make it pass on Forge, or mark it env-dependent with a stated reason.
+Live 2026-10-31 11:57 ET (#6059 review): lane-pool acquire returned the SAME lane (lane-14) to two acquires in one worker (driver + juror, different --purpose, same session), so juror and driver shared a tree. Reproduce with two acquires, different --purpose, same session; acquire must exclude lanes already leased to the caller. Related but different: #4093 (two sessions both reclaim one stale lease).
 
 ## Acceptance
 

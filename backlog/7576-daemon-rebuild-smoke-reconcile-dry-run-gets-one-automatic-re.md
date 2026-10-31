@@ -1,15 +1,16 @@
 ---
+bornAs: xc9k065
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/worker-brief.mjs", "we:scripts/operations/verify.mjs", "we:.claude/hooks"]
+scope: ["we:scripts/lib/daemon-rebuild"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Worker scoped test runs must go through heavy-admission, not bare npx vitest
+# Daemon rebuild smoke reconcile-dry-run gets one automatic retry and keeps its full stderr
 
-Live 2026-10-31 10:35 ET: workers run scoped tests as bare 'npx vitest ...' and verify --gate='npx vitest related ...'. That skips heavy-admission, so nothing routes to Forge even with heavyAdmission.remote.mode=always: Mac load 69 while Forge ~1. Fix: we:scripts/worker-brief.mjs and verify --gate wrap test commands in 'node we:scripts/readiness/heavy-admission.mjs run -- <cmd>'; a hook could rewrite or deny bare vitest from a lane cwd.
+Live 2026-10-31 14:42 ET: the rebuild smoke step reconcile-dry-run (120s budget) fails transiently under load / gh throttle (exit 1, truncated stderr) and HOLDS the clone (health-watch 538b3484 smoke-rejected 18:39Z, slice 2 candidate). By hand it passes in 81s (candidate) / 61s (HEAD). Add one automatic retry of that step and capture the full stderr; consider running the smoke on Forge. Related: #5810, #5539 (transient GitHub errors blamed on overlays), #6135 (smoke gh budget).
 
 ## Acceptance
 

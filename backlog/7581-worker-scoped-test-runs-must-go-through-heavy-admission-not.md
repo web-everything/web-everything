@@ -1,15 +1,16 @@
 ---
+bornAs: xxzxkth
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/fix-scope-policy.mjs"]
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/operations/verify.mjs", "we:.claude/hooks"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# fix-dispatch waitForLandingHolder must not wait on a holder that cannot land
+# Worker scoped test runs must go through heavy-admission, not bare npx vitest
 
-Live 2026-10-31 16:20 ET: fix-dispatch waitForLandingHolder treats a holder with review:accepted + ready-to-merge as 'landing' even when it is red-team:blocked or judge NON-CONVERGING (holder #6056 since 04:00 ET), so dependent #6132 waits forever. Fix: exclude red-team:blocked and judge-non-converging holders from holderStates and emit a 'holder-cannot-land' event instead. Evidence: we fix-dispatch-daemon.log 20:14:59Z.
+Live 2026-10-31 10:35 ET: workers run scoped tests as bare 'npx vitest ...' and verify --gate='npx vitest related ...'. That skips heavy-admission, so nothing routes to Forge even with heavyAdmission.remote.mode=always: Mac load 69 while Forge ~1. Fix: we:scripts/worker-brief.mjs and verify --gate wrap test commands in 'node we:scripts/readiness/heavy-admission.mjs run -- <cmd>'; a hook could rewrite or deny bare vitest from a lane cwd.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xoi0zbm
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/check-standards.mjs"]
+scope: ["we:scripts/readiness/heavy-admission.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Lane check:standards must match CI: the same 9 errors in every lane while main CI is green
+# heavy-admission should route an overloaded run to Forge instead of deferring it when remote mode is always
 
-Live 2026-10-31 15:25 ET: every lane reports the same 9 'npm run check:standards' errors (7 design-system themeTokens unresolved, 1 backlog graduatedTo, 1 stale we:AGENTS.md inventory) while main CI is green. Likely the lanes lack the sibling design-system/frontierui checkout or a generated file. Workers keep re-running and second-guessing. Fix: make lanes match CI (provision the sibling, or resolve tokens the way CI does).
+Live 2026-10-31 10:40 ET (lane-2): heavy-admission DEFERRED 'npm run check:standards' for host load (84 on 12 cores > 6/core) while heavyAdmission.remote.mode=always and Forge was idle (~1). Overload should route remote, not defer. Check the order of the load-cap test vs the remote decision, and whether check:standards is on the remote allowlist. Prove on a lane run under load.
 
 ## Acceptance
 

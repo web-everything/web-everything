@@ -1,15 +1,16 @@
 ---
+bornAs: xdss4kj
 kind: story
-size: 3
+size: 1
 status: open
-scope: ["we:scripts/readiness/heavy-admission.mjs"]
+scope: ["we:scripts/__tests__/codex-direct-task.test.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# heavy-admission should route an overloaded run to Forge instead of deferring it when remote mode is always
+# codex-direct-task.test 'kills a same-group straggler' fails on Forge
 
-Live 2026-10-31 10:40 ET (lane-2): heavy-admission DEFERRED 'npm run check:standards' for host load (84 on 12 cores > 6/core) while heavyAdmission.remote.mode=always and Forge was idle (~1). Overload should route remote, not defer. Check the order of the load-cap test vs the remote decision, and whether check:standards is on the remote allowlist. Prove on a lane run under load.
+Live 2026-10-31 16:28 ET: we:scripts/__tests__/codex-direct-task.test.mjs 'kills a same-group straggler' fails on Forge with and without #6140, and passes on the Mac (worker a1218e29 run on lane-44, 320/321). Make it pass on Forge, or mark it env-dependent with a stated reason.
 
 ## Acceptance
 

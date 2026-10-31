@@ -1,15 +1,16 @@
 ---
+bornAs: x5ffjwq
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/lib/daemon-rebuild"]
+scope: ["we:scripts/readiness"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Daemon rebuild smoke reconcile-dry-run gets one automatic retry and keeps its full stderr
+# Remote slot reaper: reap leaked Forge slot-N.unconfirmed markers (parked branch, low priority)
 
-Live 2026-10-31 14:42 ET: the rebuild smoke step reconcile-dry-run (120s budget) fails transiently under load / gh throttle (exit 1, truncated stderr) and HOLDS the clone (health-watch 538b3484 smoke-rejected 18:39Z, slice 2 candidate). By hand it passes in 81s (candidate) / 61s (HEAD). Add one automatic retry of that step and capture the full stderr; consider running the smoke on Forge. Related: #5810, #5539 (transient GitHub errors blamed on overlays), #6135 (smoke gh budget).
+Parked work, low priority after #6114 fixed the receipt-resources leak: lane/remote-slot-reaper@f5284d41bc770aaf8b392ee636ce580d32e948e3 reaps leaked slot-N.unconfirmed markers (JSON marker with runId/slot/startedAt/pid/host; reap-remote CLI; remote-slot-reaped event). Codex audits found 4 defects, fixed in rounds 2-5: (1) process age is not proof of termination (prepare/run are separate processes), so only whole-host-idle clears; (2) a live owner pid is never reaped, idle is rechecked right before unlink; (3) idle is read per marker host, not hardcoded forge; (4) lease-first: the reaper takes the slot-N lease, then rechecks and unlinks. Round-5 audit verdict not run, full verify not run, no PR. Caveat: Forge is rarely idle (activeRuns 3-6), so idle-only clearing seldom fires; the real fix needs Forge to persist the prepare label per run.
 
 ## Acceptance
 

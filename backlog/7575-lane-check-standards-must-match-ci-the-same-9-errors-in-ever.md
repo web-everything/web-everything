@@ -1,15 +1,16 @@
 ---
+bornAs: x8zv6ip
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/lane-pool.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:scripts/check-standards.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# lane-pool acquire must not hand a lane the caller already leases to a second acquire
+# Lane check:standards must match CI: the same 9 errors in every lane while main CI is green
 
-Live 2026-10-31 11:57 ET (#6059 review): lane-pool acquire returned the SAME lane (lane-14) to two acquires in one worker (driver + juror, different --purpose, same session), so juror and driver shared a tree. Reproduce with two acquires, different --purpose, same session; acquire must exclude lanes already leased to the caller. Related but different: #4093 (two sessions both reclaim one stale lease).
+Live 2026-10-31 15:25 ET: every lane reports the same 9 'npm run check:standards' errors (7 design-system themeTokens unresolved, 1 backlog graduatedTo, 1 stale we:AGENTS.md inventory) while main CI is green. Likely the lanes lack the sibling design-system/frontierui checkout or a generated file. Workers keep re-running and second-guessing. Fix: make lanes match CI (provision the sibling, or resolve tokens the way CI does).
 
 ## Acceptance
 

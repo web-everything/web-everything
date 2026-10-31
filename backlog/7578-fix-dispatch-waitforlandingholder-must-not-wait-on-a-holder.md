@@ -1,15 +1,16 @@
 ---
+bornAs: xgpwf6v
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/readiness"]
+scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/fix-scope-policy.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Remote slot reaper: reap leaked Forge slot-N.unconfirmed markers (parked branch, low priority)
+# fix-dispatch waitForLandingHolder must not wait on a holder that cannot land
 
-Parked work, low priority after #6114 fixed the receipt-resources leak: lane/remote-slot-reaper@f5284d41bc770aaf8b392ee636ce580d32e948e3 reaps leaked slot-N.unconfirmed markers (JSON marker with runId/slot/startedAt/pid/host; reap-remote CLI; remote-slot-reaped event). Codex audits found 4 defects, fixed in rounds 2-5: (1) process age is not proof of termination (prepare/run are separate processes), so only whole-host-idle clears; (2) a live owner pid is never reaped, idle is rechecked right before unlink; (3) idle is read per marker host, not hardcoded forge; (4) lease-first: the reaper takes the slot-N lease, then rechecks and unlinks. Round-5 audit verdict not run, full verify not run, no PR. Caveat: Forge is rarely idle (activeRuns 3-6), so idle-only clearing seldom fires; the real fix needs Forge to persist the prepare label per run.
+Live 2026-10-31 16:20 ET: fix-dispatch waitForLandingHolder treats a holder with review:accepted + ready-to-merge as 'landing' even when it is red-team:blocked or judge NON-CONVERGING (holder #6056 since 04:00 ET), so dependent #6132 waits forever. Fix: exclude red-team:blocked and judge-non-converging holders from holderStates and emit a 'holder-cannot-land' event instead. Evidence: we fix-dispatch-daemon.log 20:14:59Z.
 
 ## Acceptance
 
