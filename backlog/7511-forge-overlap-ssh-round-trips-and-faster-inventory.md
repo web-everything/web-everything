@@ -2,9 +2,11 @@
 bornAs: x84m553
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/tree-watchdog.mjs", "we:scripts/lib/worker-deadline.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-10-31"
+graduatedTo: 3ec5d7449cc42084d038b483e6fb510797b139aa
 tags: []
 ---
 

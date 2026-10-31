@@ -1977,6 +1977,11 @@ A core file that dynamically imports its CLI cannot await that import at module 
 its CLI statically imports the core. A staged Node probe of that cycle exits 13 with unsettled
 top-level await. Defer the import with `.then(...)`, and test both entry paths as subprocesses.
 
+Keep the local admission heartbeat import graph free of remote CLI modules with top-level
+await: terminating a watchdog worker during their evaluation can abort Node with SIGTRAP.
+Load remote health only after selecting remote execution. The subprocess startup/stop case
+in `scripts/__tests__/verify-lane.test.mjs` exercises that worker lifetime boundary.
+
 ### Daemon worker risk routing
 
 For the [daemon model rule](platform-decisions.md#daemon-claude-worker-risk), exercise
@@ -2236,6 +2241,98 @@ assert stage 0 content and no unmerged entries (taking ours can leave no cached 
 Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial completions carry
 `denied`, hold for 60 minutes, and surface a `permission-blocked` note immediately; they are
 separate from transient infrastructure failures and their retry streak.
+
+### Forge client telemetry and remote admission
+
+The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
+without `telemetry.json`; it never returns a saved timestamp as evidence of current health.
+Keep the stale-idle-file → SSH adapter → health-check regression alongside the ten-second
+cache boundary and SSH-failure/backoff recovery assertions. Boolean flags `--run`, `--silent`
+and `--no-color` must reject immediately following tokens beginning with `true` or `false`:
+Vitest can consume those positional-looking filters as flag values and change execution mode.
+
+`forge-client-controls.test.mjs` pins strict bounded telemetry, the read-only single-SSH CLI,
+runner sampling at prepare/run/finish and five-second in-process updates, fixed command
+classes, receipt argv binding, separate remote capacity, and persisted health/cache state.
+Use temporary lock roots and injected telemetry in legacy remote-contract fixtures; never
+contact Forge or consume the real host's remote slots from a unit test. Retain the original
+termination acknowledgements and refusal assertions when updating those fixtures.
+
+Coverage transport fixtures must use absolute Istanbul source keys and preserve report/source
+mtimes. Compare local and remote attribution after transport makes keys relative. Pin coverage
+base refs to local commit SHAs in the manifest; reject bases outside reconstructed public ancestry,
+including unrelated commits already present in the worker's object cache.
+
+Remote telemetry older than 30 seconds or more than 60 seconds ahead routes through local
+admission. Compare ET timestamps by instant with `Date.parse`, independent of the process timezone.
+`forge-health-fresh.test.mjs` pins both freshness boundaries, winter/summer offsets, strict optional
+boolean `prewarmed` entries, and stale persisted-cache recovery. Stale cached telemetry gets exactly
+one fresh read under the mutex before deciding; a failed read is `forge-unreachable`, and a still-stale
+sample is `telemetry-stale`. Fresh data and failed reads share the ten-second cache; an active backoff
+still returns before reading. Back-off and failure counts are host-shared too.
+Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
+remove it only after confirmed completion or termination. Abrupt client death skips `finally`,
+so quarantine cannot depend on cleanup running. A dead client PID or expired slot lease never
+authorizes reusing an outstanding execution's capacity. An operator must confirm Forge termination
+before manually clearing a retained marker. If marker creation fails, refuse remote dispatch and
+fall back through local admission. The SIGKILL subprocess regression leaves its simulated remote
+job alive and asserts that a second caller cannot reclaim that capacity. Keep this crash test
+alongside the returned-result and confirmed-cleanup cases when changing remote-slot lifecycle.
+Model the surviving job with `keepAliveScript()` anchored to the test runner, with a bounded
+lifetime; anchoring to the simulated client would invalidate the crash-survival assertion.
+The local host's heavy semaphore is acquired only on a safe local fallback.
+
+### Forge warm bases and delta snapshots
+
+The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
+ordering, exclusions, credential-name policy, and leaf hashing must stay identical.
+Run `forge-offload.test.mjs` alongside the existing remote client, runner, output-boundary,
+and admission-contract test files through heavy-admission when changing this protocol.
+Exercise the actual rsync file list and full reconstructed manifest, including executable
+bits, worktree deletions, public credential-named sources, and ignored/excluded tests.
+Give transport and retry cases an explicit 30-second deadline: they perform real Git and
+runner subprocess work, and a safe retry repeats the complete transport/run/finish cycle.
+
+Read-only `bases` discovery precedes local admission so older runners keep their original
+full-ship order: no prepared run or transported bytes before snapshot admission/staging.
+The subsequent `prepare` response must confirm the chosen base and pin it in ops-owned
+state. Base pin creation and pruning share a guard; unknown or unreadable evidence keeps
+pruning closed. A worker receives independent copies, and the existing full-tree manifest
+and input-digest checks still run before cache extraction or npm. Pre-run delta build or
+transport failures rebuild through full shipping; execution ambiguity never retries.
+Delta membership compares each final Mac worktree leaf (plus its executable bit) against the base.
+Git-clean leaves with verified base blob bytes and stable metadata reuse the base SHA-256; changed,
+untracked, filtered/CRLF, index-flagged or unverifiable leaves are read and hashed, and any Git
+evidence failure falls back to a full scan (see "Forge manifest reuse"). Transfer paths use byte order.
+Unchanged leaves skip staging and rsync. Pin this with real Git autocrlf and post-diff race fixtures.
+Each warm tick revalidates retained READY records and their tree count/metadata digest;
+a missing tree marker requires one full manifest verification before publication, while
+mismatched evidence removes and rebuilds the base. Test both legacy-marker migration and
+same-size corruption. A bound protected delta rejection with `started=false` permits
+exactly one fresh full prepare; test the second rejection and ambiguous receipt paths,
+and require `shipMode: delta-then-full` in transfer timings.
+
+The standalone installer embeds the fixed allowlisted dependency graph into both installed
+programs. Probe both installed programs outside the repository's ESM package boundary.
+The warmer fetches only the explicit public HTTPS URL with a fresh credential-free Git
+environment; private siblings always remain Mac snapshots. Its timer runs as ops under
+flock, and only atomically published READY trees are candidates.
+
+Cache profiles retain their complete snapshot/sibling binding. The fixed warmer may seed
+another complete profile only with matching registry-only install evidence (all package
+manifests, lock, runtime/platform, fixed install flags). Workspaces, local dependencies,
+unknown locks and unproven resolutions use the original full-input cache/install path.
+Check archive hashes on both source and destination; normal runs still validate npm before
+extracting a seeded profile. Cover sibling-bound profiles as well as primary-only runs.
+Negative reuse cases must seed both a valid archive and the exact candidate
+`.warm-inputs-*` index; a full profile alone cannot challenge the eligibility guard.
+Include a supported-input control proving the seeded evidence can actually reuse
+the archive, and inspect extracted dependency contents after changing the snapshot.
+
+Stage timings use an injected millisecond clock and Eastern timestamps with the actual
+seasonal offset. Install/run durations come from optional, strictly typed receipt timing
+fields; older runners provide only a combined wall run duration. Transfer byte counts
+represent staged file payload, including separately shipped sibling files.
 
 ### Direct heavy-run hook probes
 
@@ -3184,6 +3281,111 @@ refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
 
+## Forge worker reservations and Git gates
+
+The fixed Forge wrapper discovers `slot-K` directories and matching system users;
+client concurrency settings never define server identities. Pool prepare reserves
+`forge-exec-K` through finish using an ops-protected `worker-active-K` directory
+bound to run ID and nonce. An interrupted command leaves the reservation closed
+until shutdown is confirmed. Age and an empty UID scan alone never authorize
+reclamation: acquisition, prepare, execution, and finish hold shared leases on
+persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
+leases through scanning and deletion and proves UID process absence before
+removing a reservation.
+The root supervisor requires reservation evidence and rechecks it under its own shared lease;
+a forked child retains that lease through UID drop and closes it before task exec.
+Only reservations declaring `writerGuard: 1` participate; historical or uncertain
+reservations require operator cleanup. Missing, unreadable, malformed, or incomplete
+reservation identity preserves all expired receipts and caches; a known run without
+identifiable dependency-lock evidence preserves caches while unrelated receipts
+can still expire. The prune tests cover empty historical reservations and resume
+age pruning after operator removal. Never unlink writer guard files.
+The worker-pool suite pauses a holder before launch, runs the real prune program
+against an empty UID inventory, and proves a second controller cannot launch as
+that UID. It also tests pruning winning first and refusal at each writer entry.
+Hosts without pool directories retain the legacy UID and its own writer guard.
+Only `testRoot` fixtures without `testWorkerIdentity` or `testSlotStat` use the
+same-UID harness. Production and either explicit isolation injection enforce
+worker identity, private groups, slot ownership and identity uniqueness. Pair
+injected identities with matching slot stats unless the fixture sets real slot
+ownership. Choose synthetic IDs relative to the operator, so host accounts cannot
+mask the intended refusal. Model a distinct non-root receipt owner in prune
+handoff probes even when tests run as root; otherwise a missing transfer passes.
+The privileged fixed wrapper owns metadata operations; tasks and rsync run only
+as the reserved UID. Slot roots are ops-owned with the worker's private group
+and mode 0710 (traverse only); run containers remain operator-owned. Only work
+and sibling trees belong to the worker. Receipts remain ops-only. Worker-owned
+0700 slot roots from the earlier pool layout are refused until setup is redeployed.
+
+Every worker ownership handoff opens each component relative to pinned directory
+descriptors with `O_NOFOLLOW`, validates ownership, and uses `fchown`. Recursive
+handoffs reject hardlinks and hand directories over after their children. Never
+use path-following `chown` beneath a worker-writable parent, even for root-owned
+children: owning the parent permits replacement of any child entry. Keep the
+`forge-ownership.test.mjs` adversarial fixtures in the scoped gate. Its required
+Linux test uses actual distinct UIDs through passwordless python sudo to attempt
+work/container replacement during prepare and checks the other slot's ownership;
+macOS cannot establish that cross-identity proof and skips it explicitly.
+
+Git gates receive hash-bound logical Mac HEAD and per-entry `tracked` evidence
+from Mac `git ls-files` in manifest v2. Older manifests (including warm bases)
+are refused; rebuild bases or use local/full shipping rather than infer tracking.
+Forge fetches current `origin/main` and the exact manifest-bound Mac HEAD from
+the fixed public HTTPS origin with a credential-free environment, even when
+that object is already cached. Its detached HEAD must equal the Mac SHA. It
+stages exact tracked snapshot bytes and deletions, leaves Mac untracked leaves
+untracked, and creates no snapshot commit. Unfetchable/unpublished HEAD or failed
+Git setup returns protected `started:false`, `reason:git-head-unavailable` evidence;
+the client falls back through Mac admission without retrying remote execution.
+The separately installed wrapper advertises `gitWorktree:2`; clients refuse v1
+(the historical base-HEAD behavior) before rsync and use local admission.
+Snapshot inventory pins deletion evidence to that HEAD and refuses HEAD drift
+before prepare. A warm base only saves hash-verified file transfers and dependency
+work; its SHA/ancestry never defines Git scope. Pin both real guards
+(`scanDiffBranchCoverage` and `validateUntrackedDerivedArtifacts`) against
+materialized local-bare-origin fixtures, including Mac HEAD behind public main
+with working tier bytes equal to main, both full and delta shipping, unavailable
+HEAD, and Git setup failures with cached objects. Replace only public transport
+in hermetic tests; never contact a developer remote or the network.
+No Mac Git configuration, credentials, or verification marker path crosses SSH.
+Verification marker authorship stays in the Mac gate driver and requires a
+confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
+never execute setup in a development lane.
+
+The run-scoped temp allocator canonicalizes its base before creating fixtures: macOS's
+`/var` alias must not reach descriptor-relative snapshot copies, which reject symlink
+ancestors. Preserve those production no-follow guards; test the allocator with an explicit
+symlink alias rather than teaching the copy code to follow links.
+
+Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
+`core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
+`full-scan`. Unreadable or incomplete config evidence also requires that fallback.
+Use `git ls-files -f -v -z` for index flags: fsmonitor-valid entries become lowercase
+only with `-f` and must be hashed. The fast-manifest tests pin restored-mtime edits
+and fsmonitor-valid entries; the offload tests require every final leaf to be read
+and hashed when reuse is unavailable.
+
+Git metadata setup runs entirely under an operator-owned 0700 temporary parent;
+publish `.git` only after the final privileged Git command. A root-owned `.git`
+under worker-owned `work` can still be renamed and replaced by that worker.
+Never run privileged Git in `work`, or trust it through `safe.directory`; trust
+only the protected clone and warm mirror, and disable `core.fsmonitor` as well
+as hooks. The ownership tests substitute a real executable fsmonitor repository
+at `update-index` and include a positive payload control. A required Linux test
+uses root and an actual worker UID, proving that UID cannot reach the protected
+metadata and its substituted config never executes as root; macOS skips this
+cross-UID proof explicitly. Cross-UID fixtures that use absolute worker paths
+must have traversable ancestors: changing only the fixture root's mode does not
+grant traversal through Vitest's private 0700 run root. Allocate those Linux
+fixtures under the system shared temporary directory with a privileged
+`TemporaryDirectory` supervisor that cleans up on success, failure and child
+timeout; keep shared ancestor permissions unchanged. The executable fsmonitor
+positive control must still run as the actual worker UID before the attack.
+Exercise Git's ownership checks with
+`GIT_TEST_ASSUME_DIFFERENT_OWNER` and a mirror with only `origin/main`
+(an unborn bare `HEAD` is normal for the warmer). Active base pins must remain
+ops-owned and readable by the ops warmer even when the pool wrapper creates them
+as root; pin creation and ownership changes stay inside the shared base guard.
 ### Single-pid process identity evidence
 
 `scripts/lib/proc-identity.mjs` exposes `record` (canonical, null-free identity capture)
@@ -3276,6 +3478,208 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+### Security condition test shape
+
+Every new bypass-widening condition needs one negative test per conjunct. Security
+checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
+and other system evidence so hermetic tests exercise the production checks.
+
+Security review checklist: for each new `localFallback(` call site under
+`scripts/readiness/`, require a named negative test that reaches that call site,
+asserts no remote dispatch, and checks the fallback reason. For a guard after a
+wait, occupy capacity, change the evidence during the wait, and release capacity;
+pin the expiry boundary and reservation cleanup as well as the refusal.
+
+Standards-conformance review checklist: when remote execution consumes a gate's
+output string to detect incomplete inputs, require a producer-side test that runs
+the gate's emitting code with a skipping checker and asserts the warning. Test
+stdout and stderr, successful non-skipping output, and failed checker output;
+injecting a string only into the remote consumer does not cover the producer.
+
+Writer guards shared by root cron and operator controllers must stay on one
+private inode owned by the operator. Test first-use creation and migration of
+existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
+suite models ownership transfer on unprivileged hosts and includes a Linux/root
+integration case that runs prune as root then reserves every slot as the operator.
+
+### Remote diff coverage inputs
+
+Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
+and full shipping so the freshness guard retains local semantics; warm delta assembly
+recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
+a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
+
+The tracked `.claude/agent-memory` bridge is verified against its index blob and
+projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY.md`
+and the complete target corpus; reject unsafe links or incomplete inputs before
+transfer. These projected inputs require full shipping.
+
+For remote `check:standards`, observe both output streams for skipped gates,
+`no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
+remote result to fall back through local admission; an invalid receipt keeps the
+result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
+compares local and shipped discovery of the base, coverage report, and memory index.
+
+## Probe worker timeout teardown
+
+Worker timeout promises allow at most one second for `worker.terminate()` before
+rejecting. A synchronous native call such as `execFileSync` can prevent termination
+from settling: every timeout-path termination wait needs a separate hard deadline.
+Reserve the timeout outcome first so late message, error and exit events cannot
+replace it. Await normal shutdown within the grace period so callers can tear down
+safely; after the deadline, unreference the blocked worker and reject with the original
+timeout error. Shutdown remains best effort after this bound; the worker may survive
+until its native call returns or its owning process exits.
+`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` covers pending, rejected
+and synchronously throwing termination for both runners, plus a real probe blocked in
+`execFileSync`. The `probe-worker-termination-blocks-timeout` daemon soak break runs
+the equivalent real sweep worker case. Keep these bounded-wait cases when changing
+timeout teardown; awaiting termination without a secondary deadline must fail them.
+
+## Forge manifest reuse
+
+`forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
+file reads. Git status is not sufficient byte evidence for filters, encodings, index flags,
+or concurrent writes: hash those leaves normally, and use fresh stat/mode and base blob-size
+checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
+warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
+read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
+Outside dependency/Git internals, ignored test-shaped files force local fallback, including
+files under wholly ignored build directories: Git ignore evidence does not prove exclusion
+from the test runner. The named
+`refuses runnable scripts/build tests ignored by …` cases cover `.gitignore` and
+`.git/info/exclude` for full and delta manifests; `remote-exec.test.mjs`'s
+`falls back before transport for a whole-directory ignored test` table pins remote refusal.
+Run this fixture and the affected Forge tests through heavy admission.
+
+`forge-manifest-parity.test.mjs` checks full and delta inventories against an independent
+filesystem oracle, including hostile `GIT_*` environments, omitted tests, memory bridges,
+and replaced file identities. Mutation proofs remove each binding or walk guard separately
+and restore it before the next run. Transport fixtures must ship every test-shaped leaf
+they create; exact rsync lists and dependency-cache digests include those leaves. Keep
+fixture-only Git metadata outside the worker snapshot (or remove it after client manifest
+construction), since the runner rejects extra directories.
+
+Stub SSH reachability in manifest-refusal fixtures and reject later transport calls;
+real host availability must not decide whether a filesystem guard is exercised.
+
+The named `refuses missing tracked leaves without explicit deletion evidence` table
+must cover both Git inventories that retain a missing leaf and inventories that omit
+it. Failed, thrown, malformed, truncated, absent, wrong-path and non-deletion evidence
+must report `manifest-worktree-mismatch` before prepare or transfer, in full and delta
+builds. The `deletion-evidence mutation gate` imports isolated in-memory copies of
+the client and removes each cross-check (d) guard independently, including the whole
+check; the same bad inventory must escape only in the mutant. Production files are
+never rewritten by these probes, and a missing mutation target fails the test.
+
+Keep direct bound-exec missing-cwd cases and the delta builder's default-cwd case.
+Row 13 configures a side-effecting fsmonitor hook: require its sentinel to stay absent
+and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
+
+Remote discovery may overlap reachability, HEAD and base discovery, but drain every
+speculative process before returning fallback. `buildManifest` always lists ignored files
+fresh after base-manifest retrieval; ignored tests created during retrieval must still
+refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
+and index flags. Metadata capture uses at most 16 workers and drains failures before
+full scanning. Manifest timing substages appear inside the existing stage report;
+`inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
+share multiplexing options only after checking a short, owner-only 0700 directory;
+unavailable, unsafe or overlong control paths retain ordinary SSH.
+
+## Worker cancellation during module loading
+
+Never terminate a worker while its ESM graph is loading: Node 22 can abort the entire process in
+`AsyncModuleExecutionFulfilled`. The verify watchdog disarms its shared deadline before cooperative
+shutdown, and `verify-lane` awaits its exit before emitting the final verdict, including timeout and
+spawn-error paths. Keep the escape sweeps intact when the deadline already fired.
+
+The health probe worker uses `worker-deadline.mjs`: announce readiness after all imports and before
+synchronous probe work, check startup cancellation, and drain worker exit before reporting a timeout.
+Module evaluation is allowed to finish during cancellation; the timeout prevents probe work from
+starting but does not forcibly interrupt the loader. Do not use this readiness protocol for work
+that dynamically imports additional modules after announcing readiness.
+`bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
+imports to exercise cancellation without taking down the test runner on a native loader regression.
+Eval worker bootstraps must support inherited `--input-type=commonjs` and `--input-type=module`;
+use dynamic imports for dependencies shared by both modes. Keep both caller modes in the watchdog's
+heartbeat shutdown matrix, including live handles, in-flight imports and fired deadlines.
+The named `hashes Git-clean … leaves` table covers every sensitive attribute:
+`filter`, `working-tree-encoding`, `ident`, `text`, and `eol`, asserting actual leaf
+reads and equality with full hashing. Include an identity encoding as well as a
+byte-transforming encoding so base-blob size/hash checks cannot mask a missing
+attribute guard. Same-size hidden-edit cases pin uppercase `S` (skip-worktree),
+lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
+
+
+## Forge synchronous import closure
+
+Keep the Forge runner, client, telemetry, warmer and limits modules free of top-level
+`await` throughout their static import graph. Put async CLI execution inside the
+guarded async wrapper used by `forge-exec-run.mjs`. The `Forge synchronous module loading`
+cases in `forge-client-controls.test.mjs` use native Node require to check that importing
+each module succeeds without executing its CLI, including the limits dependency.
+
+## Forge prewarm claim boundary
+
+`forge-prewarm.test.mjs` exercises real private trees and marker files. Model a foreign UID
+through injected `lstat` results so ownership refusals run without root. Cover each pool/base/tree
+owner and writable-directory check, private tree permissions, marker ownership/mode/link count/type,
+and exact SHA/digest marker bytes. Rejection before claim must leave the source intact; verification
+failure after rename must remove the destination without following links or exposing its permissions.
+The success case observes mode 0700 during verification, inode preservation and single consumption.
+
+Keep the runner reconstruction cases in `forge-offload.test.mjs`: they compare the complete input
+digest and overlay/deletion results before worker commands run, including file-to-directory,
+directory-to-file and nested deletion, while preserving unchanged prewarm inodes. When changing
+these guards, check representative mutations for ownership, marker evidence, private verification,
+failure cleanup and parent-directory removal through the heavy-admission queue. Temporary Vite
+transform configs can substitute mutations without editing the working implementation.
+## Live operator routing fixtures
+
+Review-seat roster fixtures must cover scoped added seats as well as exact keys. Use
+`rosterForKey` at every lookup: exact settings-backed contracts win, and other `review-seat:`
+keys return the shared added-seat roster by identity so provider caps still apply. Pin primary
+and fallback rejection, unchanged preference bytes, and default-zero versus explicitly enabled caps.
+
+`dispatch-routing-policy-io.test.mjs` covers rejecting schema-valid live overrides with no usable
+route, retaining the last-good policy and applied-event state, and recovering on a valid edit.
+The reader and writer share the route probe and provider caps from `scripts/lib`; keep that
+validation ahead of reload events and snapshot mutation. Atomic writer fixtures must assert
+unchanged bytes and no leftover scratch/lock files on refusal, including a failed rename.
+`dispatch-routing-policy.test.mjs` pins unlisted lens and extra-juror roster identity, rejects
+lookalike operation names, and checks last-good retention and recovery for unsupported scoped overrides.
+The named `preserves preferences and removes scratch and lock files when rename fails` case in
+`routing-override.test.mjs` injects a native rename error in an isolated child, checks the scratch
+payload and held lock before failure, and proves cleanup permits the next write.
+`routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
+operator `routingOverrides` changes, including clearing and one event per applied change.
+`routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
+`WE_PLATFORM_PREFERENCES_FILE`; never point write tests at the operator's real preferences.
+The red-team live-reload case injects `io.readRoutingPolicy` and keeps CLI, quota and reservation
+checks in the selection path. Explicit provider selection enables a default-zero provider with a
+finite daily cap only when its env cap is unset; explicit env caps (including zero) remain binding.
+Clearing restores the repo/env defaults on the next pass. The preference writer holds the shared
+file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
+Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
+operations those names remain reserved juror controls; undeclared juror flags still fail closed.
+Repo platform files must ignore `routingOverrides` and warn, even when the operator file has no
+override; only the operator file (or its explicit replacement) can supply them. In added-seat
+fixtures, enable Gemini for one seat and leave other seats inherited or with Gemini fallbacks:
+only the enabled seat may use the default-zero provider. Check both synchronous and rejected
+event writes: neither may prevent applying or clearing a validated policy. Agy Sonnet aliases
+must resolve to an effort-suffixed catalog ID; historical persisted IDs remain readable.
+Provider-disable regressions must reach `decideDispatchRoute` with an inherited task such as
+`bugfix`, as well as concrete task routes and both prepare branches. Constrained inheritance
+refuses with a request for an explicit provider/fallback; it must never delegate an unchecked
+provider choice to the evidence router. Added review seats may retain inherited evidence selection
+when their supplied candidate list excludes every disabled provider and the critical-work gate is
+open. Test missing and unfiltered lists, a closed gate, and mandatory/work routes to keep that
+exception confined to added seats. Review settings seats accept only Claude and agy
+adapters: test rejection through the CLI before a preference write and retention of last-good
+settings during live reload. Disabling the optional agy advisory seat must still allow review
+initialization; exhausting a mandatory seat's routes must fail validation.
 
 ## CI-heal check evidence (R272)
 
@@ -3391,3 +3795,68 @@ indeterminate run must be inspected before starting a new pass. Focused proof li
 `scripts/operations/__tests__/manual-daemon-pass.test.mjs`; operation enumeration and declaration
 map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
 discovers script modules dynamically and has no hand-maintained operation list.
+
+## Forge coverage timestamp parity
+
+Remote transport stubs must answer the worktree-binding probe before inventory or SSH;
+use `fixtures/forge-bound-git.mjs` in injected-Git fixtures so transport-failure tests
+reach their intended run/finish branch. Keep their exact dispatch and no-local-rerun assertions.
+
+Coverage report rewrites must restore the timestamp captured from the open source file.
+Re-reading the staged timestamp and converting it again can truncate another microsecond,
+making coverage older than a source with the same original mtime. The absolute-path coverage
+table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
+compares staged nanoseconds before its `cpSync` transport loses sub-millisecond precision.
+
+## Forge tracked-symlink parity
+
+Forge projects stage-0 index symlinks to regular files; it never ships or follows a
+symlink during transfer. The link's working bytes must hash to its index blob OID,
+all parent and target directories must be real directories, and the target
+must stay inside the repository and contain tracked content. This rule applies to
+every path, including the memory and skills bridges. Untracked, changed, unmerged,
+escaping or incomplete links refuse with `unshipped-symlink`. Cyclic projections
+also refuse; expanding links share the walk's count/byte limits and report
+`manifest-walk-limit` when those limits are exceeded.
+
+Apply the path policy to every projected leaf, including nested aliases and normalized
+`node_modules` components. Excluded aliases refuse with `unshipped-symlink` in full
+and delta builds. Only the exact `.claude/skills/` and `.claude/agent-memory/` prefixes
+are exempt from the dot-directory exclusion; their remaining path components still
+must pass policy. The named policy-excluded tracked-alias table includes credential,
+dot-directory, NFKC and invisible-character variants and checks refusal before transport.
+
+Manifest refusals keep the reason code separate from `detail`: the offending path
+relative to the checkout, decoded as lossy UTF-8 and kept on one line. Preserve
+this detail through verification wrappers and remote fallback; heavy admission
+logs it with the shared `oneLine` sanitizer and bound.
+
+Symlink-detail fixtures must use valid manifest byte paths: invalid UTF-8, tabs,
+ESC, DEL and Unicode line separators can exercise lossy decoding and sanitization,
+but LF/CR are rejected by `pathParts` before the inventory symlink check. Keep
+separate negative cases for LF/CR that assert rejection before filesystem inspection.
+
+Projected entries retain their regular `sourcePath` and link evidence for staging
+reverification. Delta manifests always transfer projected leaves, including unchanged
+ones: their alias paths have no corresponding regular Git blob for digest assembly.
+Keep the full/delta filesystem oracle, negative admission cases and staging-swap
+case in `forge-manifest-parity.test.mjs`, plus the real manifest/stager/worker fixture
+in `remote-exec.test.mjs`. Run these and the affected fast-manifest/offload suites
+through the host heavy-admission queue.
+
+## Forge ignored leaves under tracked directory links
+
+Ignored non-test regular files under a tracked directory link's source are omitted
+at both ordinary and projected paths. The filesystem cross-check uses the fresh
+ignored byte inventory; it still refuses untracked symlinks, missing projections
+for non-ignored regular files, and policy-excluded source leaves, even when ignored.
+`forge-manifest-parity.test.mjs` rows 20–25 and 31 cover those boundaries for full and
+delta manifests, including ignored runtime JSON beside a `node_modules/.bin` symlink
+and the earlier `ignored-test-file` refusal. Row 20 omits ignored runtime data at the
+excluded `.claude/skills` alias only when the leaf is not source code and the remainder
+after the link prefix is not policy-excluded; row 31 retains omission parity through an allowed alias.
+Check every projected alias before skipping an ignored leaf, including nested link
+projections: a non-test source can become a test under `tests/`, or acquire an
+excluded component. Rows 26–30 pin those refusals and benign nested omissions for
+full and delta manifests. Alias expansion shares the filesystem walk's limits and
+refuses with `manifest-walk-limit` (local fallback) when that budget is exhausted.

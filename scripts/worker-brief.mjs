@@ -87,8 +87,10 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
 4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
    acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
-   It is SYNCHRONOUS: run it in the foreground, never backgrounded, never wrapped in a wait. Review the diff before
-   you commit. You keep root cause, design, edge adoption and live proof.
+   It is SYNCHRONOUS: run it as a normal Bash call with \`timeout: 600000\`, never wrapped in a wait; don't poll it and
+   don't start a second copy. If the harness moves a call running over ~180s to the background it is harness-tracked
+   and wakes you when done, so you may end your turn on it. A job you detach yourself (\`&\`, \`nohup\`, \`setsid\`) or an
+   untracked nested child never wakes you: never end a turn on one. Review the diff before you commit. You keep root cause, design, edge adoption and live proof.
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
    ${testsFirstWorkerRule()}
    Run tests with \`npm run test:unit -- <test files>\`. Running vitest directly is denied.

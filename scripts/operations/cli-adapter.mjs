@@ -231,7 +231,10 @@ export function buildCliSpec(declaration) {
     name, type: spec.type, required: spec.required, default: spec.default, enum: spec.enum ?? null,
     atConfirm: !!spec.atConfirm,
   }));
-  const collision = fields.find((f) => CONTROL_FLAGS.includes(f.name));
+  // A compute/effect operation may configure a target model/provider as real inputs.
+  // Judged operations keep these names reserved for juror controls.
+  const collision = fields.find((f) => CONTROL_FLAGS.includes(f.name)
+    && !(!declaresJudgeStep(declaration) && ['model', 'provider'].includes(f.name)));
   if (collision) {
     throw new Error(
       `operations: \`${declaration.name}\` declares an input field \`${collision.name}\` that collides with the `
@@ -406,7 +409,7 @@ export function parseOperationArgv(declaration, argv = []) {
     // Refused where there is no juror, because a flag that silently does nothing is the failure this card is
     // about; an empty value is refused here rather than downstream, where `assertLaneCwd`'s "no `cwd` was
     // supplied" would name a cause the operator can see they DID supply.
-    if (JUROR_FLAGS.includes(name)) {
+    if (JUROR_FLAGS.includes(name) && !known.has(name)) {
       if (!judged) {
         const purpose = name === 'cwd' ? 'point at a lane' : name === 'provider' ? 'pick an implementation for' : 'pick a model for';
         errors.push(
