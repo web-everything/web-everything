@@ -3143,3 +3143,29 @@ not the handoff CLI with its Git publishing dependencies; the CLI re-exports the
 unset settings, lazy adapter loading in native Node, and real override event/provenance writes.
 Run it alongside the remote-client, daemon closure/staleness, live-smoke and shape wiring regressions
 through the host heavy-run queue; do not weaken their complete-closure assertions.
+
+
+### Red-team recovery plan (PR #6056, R283)
+
+`planRedTeamOnSkip` returns a recovery plan containing the mode, owner verdict, resolved
+`WE_RED_TEAM_STALE_RUN_MS` deadline, accepting payload, completed seat, admission prior,
+abandonment claim and cleanup policy. `planRedTeamRecovery` is the same planning boundary
+for direct jobs and standalone runners. Execution carries this snapshot through the job
+envelope and admission; it may check identity or durable write readback, but must not
+reclassify owner liveness, payload usability or completed seats. Changed evidence refuses
+execution and requires a new plan. Compare recovery timestamps with
+`compareRecoveryTime`, which parses stamps and floors both sides to seconds.
+
+Exercise planner → abandonment → production queued admission → review arc → shared
+runner for first and second attempts. Use production run/status/scorecard writers,
+including the running writer's read-only payload. Completed seats always resume and
+retain their status on daily-cap or guard deferral. Unreadable owners or absent accepting
+payloads produce an explicit skip with an inspection reason. Keep a source-boundary
+regression so executors cannot silently regain their own recovery policy.
+
+A detached plan must also revalidate supersession after fetching the head, before queued
+admission or carry publication. Read current recovery evidence and refuse `carryConflict`
+or unreadable/incomplete evidence with an inspection reason. This validates the snapshot;
+it must not recompute owner staleness, payload eligibility or completed-seat classification.
+Exercise both fresh and resume plans with a conflict introduced after planning (including
+during fetch), and assert no admission write, provider call or publication.

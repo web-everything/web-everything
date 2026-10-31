@@ -29,7 +29,7 @@ export default {
       return recovery.includes('export function staleRedTeamRun(')
         && recovery.includes('abandonStale: true')
         && recovery.includes('redTeamStaleRecovery: true')
-        && job.includes('staleRedTeamRun(')
+        && job.includes('planRedTeamRecovery(')
         && job.includes('redTeamStaleRecovery === true');
     } catch { return false; }
   },

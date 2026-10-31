@@ -115,6 +115,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
+    completedRow: seats.filter(completedRedTeamSeat).at(-1) ?? null, seatRows: seats,
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = (exactHead = true) => {

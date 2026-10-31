@@ -4,7 +4,8 @@ import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
+import { pidNamespace } from '../../lib/pid-alive.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -201,9 +202,17 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
       }];
       await refused('resume', fakeIo('resume', { readRedTeamStatus: () => finished(result), readRecords: () => records }), 'no clean prior red-team row');
     });
+  it('standalone fresh recovery cannot bypass abandonment proof for a known-dead local owner', async () => {
+    const io = fakeIo('fresh', { readRedTeamStatus: () => ({ repo, pr, head: rev,
+      status: 'running', result: null, pid: 2147483647, host: hostname(),
+      pidNamespace: pidNamespace(), pidStart: new Date(0).toISOString() }) });
+    await refused('fresh', io, 'prior red-team status; not re-run');
+    noLaunch(io);
+  });
+
   it.each(['ok', 'error', 'quota-exhausted', 'unknown', undefined])('refuses fresh recovery with any prior row status %s and zero model calls', async status => {
     const io = fakeIo('fresh', { readRecords: vi.fn(() => [{ ...prior, status }]) });
-    await refused('fresh', io, 'prior red-team seat row; not re-run');
+    await refused('fresh', io, status === 'ok' ? 'prior red-team result is not resumable' : 'prior red-team seat row; not re-run');
     expect(io.readRecords).toHaveBeenCalledOnce();
     expect(io.readRedTeamStatus).toHaveBeenCalledWith({ pr, repo, head: rev });
   });

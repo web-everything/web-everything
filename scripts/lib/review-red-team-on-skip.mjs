@@ -17,7 +17,7 @@ import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-ou
 import { runGhSync } from './gh-throttle.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-result.mjs';
+import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
@@ -66,6 +66,113 @@ export function staleRedTeamRun({ status, now = Date.now(), deadlineMs = STALE_R
     : answer(false, 'unprobeable running red team owner within deadline or age unknown');
 }
 
+/** Keep raw writer identity separate from the confirmed-dead queued execution prior. */
+export function normalizeRecoveryStatus(status, readEvidence) {
+  const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
+  if (status?.status !== 'queued' || !Number.isInteger(status.pid) || status.pid <= 0
+    || priorComment === 'posted') return status;
+  const evidence = readEvidence();
+  if (evidence?.inFlight !== false || evidence.queued) return status;
+  return { ...status, status: 'finished', result: ['ran', 'resumed'].includes(priorResult) ? status.result : null };
+}
+
+/** One planning boundary for daemon, direct jobs and standalone recovery runners.
+ * Executors may verify identity/readback, but must not reinterpret these decisions.
+ */
+export function planRedTeamRecovery({ repo, pr, head, status = null, evidence = {}, mode,
+  env = process.env, now = Date.now(), probe, deadlineMs = staleRunDeadlineMs(env),
+  recoverPayload = recoverStaleRunPayload, records, redispatch, requireAbandoned = false, staleRecovery = false, speculativePid } = {}) {
+  const rows = records?.filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head) ?? evidence.seatRows;
+  const completedRow = rows?.filter(completedRedTeamSeat).at(-1) ?? evidence.completedRow ?? null;
+  const completed = completedRow != null || evidence.completedRecorded === true || evidence.cleanRecorded === true;
+  const owner = staleRedTeamRun({ status: status?.staleAbandoned ? { ...status, status: 'running', result: null } : status, now, probe, deadlineMs });
+  const verifiedRecovery = !requireAbandoned || (staleRecovery && owner.stale
+    && verifiedStaleRedTeamAbandonment({ repo, pr, head, env }, status)
+    && (evidence.inFlight === false || (evidence.inFlight === true
+      && evidence.status != null && JSON.stringify(evidence.status) === JSON.stringify(status)))
+    && [undefined, false].includes(evidence.queued));
+  let payload = evidence.loopPayload ?? status?.loopPayload ?? null;
+  const originalPayload = payload;
+  if (!redTeamOwedFor(payload) && payload?.verdict == null && payload?.carriedFrom == null
+    && (owner.stale || completed)) {
+    try { payload = recoverPayload({ repo, pr, head, env }); } catch { payload = null; }
+  }
+  const payloadUsable = !evidence.carryConflict && redTeamOwedFor(payload) && payload?.carriedFrom == null
+    && payload.findings?.read?.netBasis?.rev === head;
+  const retry = failedRedTeamRetry(status, rows ? { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
+    completedRecorded: completed } : evidence);
+  let prior = normalizeRecoveryStatus(status, () => evidence);
+  const normalizedStatus = prior;
+  if (completed && status?.status === 'running' && owner.stale && verifiedRecovery) prior = { ...prior, repo, pr, head, status: 'finished', result: 'ran' };
+  const withoutRun = redTeamStatusWithoutRun(prior, { originalStatus: status, allowAbandonedRunning: owner.stale });
+  if (mode === 'fresh' && !completed && !retry && (prior?.retryCount === undefined || prior.retryCount === 0)
+    && (redTeamSkipNeedsSettlement(prior) || (withoutRun && (status?.status !== 'running' || verifiedRecovery)) || (owner.stale && verifiedRecovery))) prior = null;
+  const selectedMode = completed ? 'resume' : mode ?? (retry || prior == null ? 'fresh' : 'resume');
+  const priorResult = ['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult) ? prior.result : null;
+  const ownerBlocked = ['queued', 'running'].includes(status?.status)
+    && !(owner.stale && verifiedRecovery) && (!Number.isInteger(status.pid) || status.pid <= 0
+      || evidence.inFlight !== false || ![undefined, false].includes(evidence.queued));
+  let guardReason = null;
+  if (selectedMode === 'fresh') {
+    if (status?.status === 'running' && !(owner.stale && verifiedRecovery)) guardReason = 'prior red-team status; not re-run';
+    else if (!retry && status?.retryCount !== undefined && status.retryCount !== 0) guardReason = 'red-team retry already spent';
+    else if (!retry && prior != null && !redTeamStatusWithoutRun(prior)) guardReason = 'prior red-team status; not re-run';
+    else if (!retry && (rows?.length > 0 || evidence.seatRecorded === true)) guardReason = 'prior red-team seat row; not re-run';
+  } else {
+    const result = normalizeRedTeamResult(prior?.result);
+    if (prior?.status !== 'finished' || !['ran', 'resumed'].includes(result.priorResult) || result.priorComment === 'posted') guardReason = 'prior red-team result is not resumable';
+    else if (!completed) guardReason = 'no clean prior red-team row';
+  }
+  const ownSpeculation = Number.isInteger(speculativePid) && speculativePid > 0
+    && status?.pid === speculativePid && status.host === hostname() && status.pidNamespace === pidNamespace();
+  const admissionRefusal = ownerBlocked && !(owner.stale && verifiedRecovery) ? 'red-team writer is live or unknown'
+    : mode && status?.status === 'running' && guardReason ? guardReason : null;
+  const abandon = owner.stale && status?.staleAbandoned == null;
+  if (completedRow && !Array.isArray(completedRow.findings)) guardReason = 'completed red-team row has unreadable findings';
+  let abandonAllowed = owner.stale;
+  const attempt = redispatch ? redispatch.nextOrdinal : 1;
+  if (redispatch) {
+    abandonAllowed = owner.stale && attempt != null && (attempt === 1
+      || (isRedispatchedRun(status, redispatch.firstMarkerMtimeMs) && Number.isFinite(now)
+        && now - redispatch.firstMarkerMtimeMs >= STALE_REDISPATCH_BACKOFF_MS));
+  }
+  return { repo, pr, head, mode: payloadUsable ? selectedMode : 'skip', requestedMode: selectedMode,
+    owner, ownerStale: owner.stale && verifiedRecovery, ownerBlocked, ownSpeculation, admissionRefusal, status, normalizedStatus, payload, originalPayload, payloadUsable,
+    completedRow, completed, seatRows: rows ?? null, abandon, abandonAllowed, attempt, deadlineMs, prior, priorResult, retry,
+    guardReason, redispatch,
+    movedCardOnly: selectedMode === 'fresh' && cardOnlyHeadMoveCandidate(evidence, head),
+    pendingCardOnly: selectedMode === 'fresh' && cardOnlySkipSettlementCandidate(evidence, head),
+    preserveStatus: selectedMode === 'resume' || completed,
+    cleanup: selectedMode === 'resume' || completed ? 'retain' : owner.stale ? 'restore' : 'delete',
+    why: evidence.carryConflict ? 'later review supersedes the carry' : payloadUsable ? guardReason : 'accepting review run unavailable; inspect stored evidence' };
+}
+
+/** Revalidate supersession without reclassifying a plan's owner, payload or completed seat. */
+export function recoverySupersessionRefusal(evidence) {
+  if (evidence?.carryConflict === true) return 'later review supersedes the carry; inspect current review evidence before retrying';
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)
+    || ![undefined, false].includes(evidence.carryConflict)
+    || !isRealHead(evidence.loopPayload?.findings?.read?.netBasis?.rev)) {
+    return 'recovery supersession evidence unreadable or incomplete; inspect current review evidence before retrying';
+  }
+  return null;
+}
+
+/** Verify the observed head's seat snapshot, without making a second eligibility decision. */
+export function recoverySeatSnapshotMatches(plan, records) {
+  if (plan.seatRows == null) return true;
+  const rows = records.filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && row.repo === plan.repo && Number(row.pr) === Number(plan.pr) && row.rev === plan.head);
+  return JSON.stringify(rows) === JSON.stringify(plan.seatRows);
+}
+
+/** Compare parsed instants at the precision available from ps lstart and marker files. */
+export function compareRecoveryTime(left, right) {
+  const parse = value => typeof value === 'number' ? value : parsePidStart(value);
+  return Math.floor(parse(left) / 1000) - Math.floor(parse(right) / 1000);
+}
+
 const staleStatusPath = ({ repo, pr, head, env = process.env }) =>
   join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
@@ -105,14 +212,13 @@ export function verifiedStaleRedTeamAbandonment(key, status) {
     const markers = readStaleRedispatchMarkers(key);
     const count = markers.filter(Boolean).length;
     if (!markers[0] || count < 1 || count > MAX_STALE_REDISPATCHES) return false;
-    const abandonedAt = typeof status.staleAbandoned.at === 'string'
-      ? Date.parse(status.staleAbandoned.at) : status.staleAbandoned.at;
+    const abandonedAt = status.staleAbandoned.at;
     // A known-dead local owner can have no birth stamp; its claimed abandonment still binds it.
     const birth = status.pidStart;
     const startedAt = parsePidStart(birth);
     const latestClaim = (markers[1] ?? markers[0]).mtimeMs;
-    return status.pid > 0 && (birth == null || (Number.isFinite(startedAt) && startedAt <= abandonedAt))
-      && abandonedAt >= latestClaim - 1000;
+    return status.pid > 0 && (birth == null || (Number.isFinite(startedAt) && compareRecoveryTime(startedAt, abandonedAt) <= 0))
+      && compareRecoveryTime(abandonedAt, latestClaim) >= 0;
   } catch { return false; } // Unreadable/inconsistent claims require operator inspection, never a fresh call.
 }
 
@@ -141,28 +247,28 @@ function isRedispatchedRun(status, firstMarkerMtimeMs) {
   return status?.status === 'running' && status.result == null
     && (status.retryCount === undefined || status.retryCount === 0)
     && Number.isFinite(started) && Number.isFinite(firstMarkerMtimeMs)
-    && started >= Math.floor(firstMarkerMtimeMs / 1000) * 1000;
+    && compareRecoveryTime(started, firstMarkerMtimeMs) >= 0;
 }
 
 /** The exclusive-create marker spends recovery; the re-read is a best-effort recheck, not an atomic lock.
  * Only a confirmed non-start may release the recovery spend.
  */
 export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(),
-  clock = Date.now, probe = {} }) {
+  clock = Date.now, probe = {}, plan }) {
   const key = { repo, pr, head, env }, path = staleStatusPath(key);
   let claim;
   try {
+    plan ??= planRedTeamRecovery({ repo, pr, head, status, env, now, probe,
+      redispatch: staleRedTeamRedispatch(key) });
     const snapshot = readFileSync(path, 'utf8');
     const current = JSON.parse(snapshot);
     if (current.repo !== repo || Number(current.pr) !== Number(pr) || current.head !== head
       || current.status !== 'running' || current.result != null
       || current.pid !== status?.pid || current.pidStart !== status?.pidStart
       || current.host !== status?.host || current.pidNamespace !== status?.pidNamespace) return { ok: false };
-    if (staleRedTeamRun({ status: current, now, probe, deadlineMs: staleRunDeadlineMs(env) }).stale !== true) return { ok: false };
+    if (!plan.ownerStale || !plan.abandonAllowed) return { ok: false };
     const markers = readStaleRedispatchMarkers(key);
-    const { nextOrdinal: attempt, firstMarkerMtimeMs } = staleRedTeamRedispatch(key);
-    if (attempt == null || (attempt === 2 && (!isRedispatchedRun(current, firstMarkerMtimeMs)
-      || !Number.isFinite(now) || now - firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS))) return { ok: false };
+    const attempt = plan.attempt;
     claim = claimStaleRecovery(key, `stale-redispatch-${attempt}`);
     if (!claim.ok) return claim;
     const at = new Date(clock()).toISOString();
@@ -291,16 +397,27 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, probe, staleSpent = staleRedTeamSpent,
-  staleRedispatch = staleRedTeamRedispatch, deadlineMs = STALE_RUN_DEADLINE_MS }) {
+  staleRedispatch = staleRedTeamRedispatch, env = process.env, recoverPayload = recoverStaleRunPayload,
+  deadlineMs = staleRunDeadlineMs(env) }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
     const head = rawPr?.headRefOid ?? null;
-    const row = { prNumber: pr, head, action: 'skip' };
-    const skip = why => ({ ...row, why });
+    let recovery, snapshotPlan;
+    const row = { prNumber: pr, head, action: 'skip', mode: 'skip', deadlineMs, ownerStale: false,
+      owner: { stale: false, reason: 'evidence unavailable' }, payload: null, payloadUsable: false,
+      completedRow: null, completed: false, abandon: false };
+    const skip = why => ({ ...row, ...snapshotPlan, action: 'skip', mode: 'skip', why });
     const dispatchDecision = decision => {
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
+      if (decision.action === 'dispatch') {
+        const recoveryPlan = planRedTeamRecovery({ repo, pr, head, status: recovery.plan.status,
+          evidence: recovery.evidence, mode: decision.mode, env, now, probe, deadlineMs, recoverPayload: () => recovery.plan.payload,
+          redispatch: recovery.redispatch });
+        if (!recoveryPlan.payloadUsable && !recoveryPlan.movedCardOnly && !recoveryPlan.pendingCardOnly) return skip(recoveryPlan.why);
+        return { ...row, ...recoveryPlan, ...decision, mode: recoveryPlan.payloadUsable ? recoveryPlan.mode : decision.mode, abandon: decision.abandonStale === true };
+      }
       return { ...row, ...decision };
     };
     try {
@@ -310,18 +427,24 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return skip('red-team result already on head');
-      const evidence = readEvidence({ repo, pr, head });
+      let evidence = readEvidence({ repo, pr, head });
+      const initialStatus = readStatus({ repo, pr, head });
+      const acceptedHead = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
+      const initialPlan = planRedTeamRecovery({ repo, pr, head, status: initialStatus, evidence, env, now, probe, deadlineMs,
+        recoverPayload: acceptedHead && initialStatus?.head === head ? recoverPayload : () => null });
+      snapshotPlan = initialPlan;
+      if (initialPlan.payloadUsable) evidence = { ...evidence, loopPayload: initialPlan.payload };
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return skip('red-team result already on head');
       const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
       if (evidence?.queued || (evidence?.inFlight && (!accepted
-        || !staleRedTeamRun({ status: readStatus({ repo, pr, head }), now, probe, deadlineMs }).stale))) return skip('red-team pass in flight');
+        || !initialPlan.ownerStale))) return skip('red-team pass in flight');
       const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
       const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
       if (acceptance?.sha === head
         && evidence?.inFlight === false && evidence.recorded !== true && evidence.seatRecorded !== true
-        && evidence.completedRecorded !== true && readStatus({ repo, pr, head }) == null
+        && evidence.completedRecorded !== true && initialStatus == null
         && /^📌 review — acceptance re-stamped after a rebase \(no new review\)/.test(rawPr.comments[acceptance.index]?.body ?? '')) {
         const priorComments = rawPr.comments.slice(0, acceptance.index);
         // Share numbering's trusted provenance parser; comment order alone cannot bind a carry.
@@ -351,9 +474,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       }
       const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
-      const status = unfinishedCarry ? evidence.status : readStatus({ repo, pr, head });
+      const status = unfinishedCarry ? evidence.status : initialPlan.normalizedStatus;
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
-      const stale = staleRedTeamRun({ status, now, probe, deadlineMs }).stale;
+      const stale = initialStatus?.status === 'running' && initialPlan.ownerStale;
+      recovery = { status, evidence, plan: initialPlan, redispatch: undefined };
       const staleOwed = stale && accepted && status?.head === head
         && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head;
       const owed = redTeamOwedFor(evidence?.loopPayload);
@@ -365,7 +489,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && evidence.recorded === false && evidence.seatRecorded === false
         && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
-        && readStatus({ repo, pr, head }) == null;
+        && initialStatus == null;
       if (needsReview) {
         const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
         if (refusal) return skip(refusal);
@@ -380,7 +504,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
           && (() => {
-            const status = readStatus({ repo, pr, head });
+            const status = initialStatus;
             // An accepting review with no status still owes its normal pass.
             // Both the selected evidence and the live status must permit clearing:
             // a raw reread must not resurrect a status discarded for a newer acceptance.
@@ -414,6 +538,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         // The owner may have died after recording the seat but before publishing its effects.
         const mode = completedSeat ? 'resume' : 'fresh';
         const key = { repo, pr, head }, spent = staleSpent(key), redispatch = staleRedispatch(key);
+        recovery.redispatch = redispatch;
         if (spent || redispatch.count > 0) {
           // Admission replaces the abandoned row with queued before a run starts.
           // An unchanged abandoned row means the prior job never launched a call.
@@ -437,7 +562,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       let mode;
       // Only one explicitly failed seat permits a fresh retry. Successful execution
       // can resume effects even when its verdict contains confirmed breaks.
-      if (movedCardOnly || failedRedTeamRetry(status, evidence)) mode = 'fresh';
+      if (completedSeat) mode = 'resume';
+      else if (movedCardOnly || failedRedTeamRetry(status, evidence)) mode = 'fresh';
       else if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
         && (completedSeat || (!placeholder && typeof status.result === 'object'
           && evidence.recorded === true && evidence.completedRecorded !== false))) {
@@ -510,7 +636,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, probe, staleSpent, staleRedispatch,
-      deadlineMs: staleRunDeadlineMs(env) }));
+      env, recoverPayload }));
     for (const row of rows) {
       let started = false;
       if (row.action === 'carry') {
@@ -553,18 +679,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         const budget = capacity?.budget;
         if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))
           || (capacity.remainingStarts != null && !(capacity.remainingStarts > 0))) row.why = 'no review capacity left';
-        else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
+        else if (dryRun) row.why = `dry run (${row.action === 'review' ? 'review' : row.mode})`;
         else {
           let abandonment, noRestart;
           if (row.abandonStale) {
             try {
-              if (!recoverPayload({ repo, pr: row.prNumber, head: row.head, env })) {
-                row.why = 'accepting review run unavailable; inspect stored evidence';
-              } else {
-                abandonment = abandonStale({ repo, pr: row.prNumber, head: row.head,
-                  status: readStatus({ repo, pr: row.prNumber, head: row.head }), env, now: at, probe });
-                if (abandonment?.ok !== true) row.why = 'stale red team abandonment refused; inspect review run';
-              }
+              abandonment = abandonStale({ repo, pr: row.prNumber, head: row.head,
+                status: row.status, plan: row, env, now: at, probe });
+              if (abandonment?.ok !== true) row.why = 'stale red team abandonment refused; inspect review run';
             } catch { row.why = 'stale review run recovery unreadable; inspect stored evidence'; }
             if (abandonment?.ok !== true) {
               row.action = 'skip';
@@ -590,7 +712,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           if (reserved) budget.left--;
           try {
             const result = dispatch({ pr: row.prNumber, repo,
-              ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
+              ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode, redTeamPlan: row } : {}),
               ...((row.abandonStale === true && abandonment?.ok === true)
                 || (row.abandonStale === false && noRestart?.ok === true) ? { redTeamStaleRecovery: true } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
@@ -612,7 +734,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               if (capacity.remainingStarts != null) capacity.remainingStarts--;
               capacity.take?.();
               history.set(`${repo}#${row.prNumber}@${row.head}`, at);
-              dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
+              dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.action === 'review' ? 'review' : row.mode });
               started = true;
             }
           } catch {

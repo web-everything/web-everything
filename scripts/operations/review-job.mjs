@@ -2,7 +2,6 @@
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
-import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
@@ -91,8 +90,8 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { recoverStaleRunPayload, staleRedTeamRun, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate, verifiedStaleRedTeamAbandonment } from '../lib/review-red-team-on-skip.mjs';
-import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
+import { planRedTeamRecovery, recoverStaleRunPayload, normalizeRecoveryStatus, recoverySupersessionRefusal } from '../lib/review-red-team-on-skip.mjs';
+import { reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -101,7 +100,7 @@ import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
+import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -286,14 +285,22 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 }
 
 /** PURE — carry recovery mode and pre-admission evidence to the shared red-team entry. */
-export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamStaleRecovery }) {
+export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamAdmissionFile, redTeamStaleRecovery }) {
   return [
     'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
     ...(redTeamMode === 'resume' ? ['--resume-only'] : []),
     ...(redTeamMode === undefined ? [] : [`--red-team-mode=${redTeamMode}`]),
     ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
-    ...(redTeamAdmission === undefined ? [] : [`--red-team-admission=${JSON.stringify(redTeamAdmission)}`]),
+    ...(redTeamAdmissionFile ? [`--red-team-admission-file=${redTeamAdmissionFile}`]
+      : redTeamAdmission === undefined ? [] : [`--red-team-admission=${JSON.stringify(redTeamAdmission)}`]),
   ];
+}
+
+/** Verify a snapshot still names the same writer; abandonment adds only its marker. */
+function sameRecoveryWriter(current, snapshot) {
+  const identity = row => row == null ? null : [row.repo, Number(row.pr), row.head, row.status, row.result,
+    row.pid, row.pidStart, row.host, row.pidNamespace, row.retryCount];
+  return JSON.stringify(identity(current)) === JSON.stringify(identity(snapshot));
 }
 
 /** A crashed resume keeps its clean prior result; a fresh admission has no run to resume.
@@ -303,13 +310,7 @@ export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, r
 export function readRedTeamRecoveryStatus(input, {
   readStatus = readRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
 } = {}) {
-  const status = readStatus(input);
-  const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
-  if (status?.status !== 'queued' || !Number.isInteger(status.pid) || status.pid <= 0
-    || priorComment === 'posted') return status;
-  const evidence = readEvidence(input);
-  if (evidence?.inFlight !== false || evidence.queued) return status;
-  return { ...status, status: 'finished', result: ['ran', 'resumed'].includes(priorResult) ? status.result : null };
+  return normalizeRecoveryStatus(readStatus(input), () => readEvidence(input));
 }
 
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -349,6 +350,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
     env,
+    planRedTeamRecovery: ({ repo, pr, head, redTeamMode, redTeamStaleRecovery }, fallback = {}) => {
+      const key = { repo, pr, head, env };
+      try {
+        return planRedTeamRecovery({ ...key, status: readStatus(key), evidence: { ...readEvidence(key), ...fallback },
+          mode: redTeamMode, requireAbandoned: true, staleRecovery: redTeamStaleRecovery === true });
+      } catch (error) { throw Error(`red-team recovery planning failed: ${error.message}; inspect stored evidence before retrying`); }
+    },
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
@@ -368,11 +376,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       }) } : {}),
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
-    clearRedTeamQueued: ({ repo, pr, head }) => {
+    clearRedTeamQueued: ({ repo, pr, head, redTeamPlan }) => {
+      if (redTeamPlan?.preserveStatus) return;
       const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
       // Deleting the status beside a spent retry marker would leave an orphan every reader refuses.
       // Restore the record this job's queued write replaced; without one, keep the status as it stands.
-      if (!existsSync(`${path}.retry-1`)) rmSync(path, { force: true });
+      if (redTeamPlan?.cleanup === 'restore' && replacedStatus.get(path) != null) writeJsonAtomic(path, replacedStatus.get(path));
+      else if (!existsSync(`${path}.retry-1`)) rmSync(path, { force: true });
       else if (replacedStatus.get(path) != null) writeJsonAtomic(path, replacedStatus.get(path));
     },
     redTeamStatus: input => {
@@ -383,58 +393,17 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       try {
         if (queued) {
           prior = readStatus(key);
-          const staleRecovery = ['fresh', 'resume'].includes(input.redTeamMode) && input.redTeamStaleRecovery === true
-            && verifiedStaleRedTeamAbandonment(key, prior)
-            && staleRedTeamRun({ status: prior, deadlineMs: staleRunDeadlineMs(env) }).stale
-            && (input.redTeamMode === 'fresh' || ((prior.retryCount === undefined || prior.retryCount === 0) && (() => {
-              const evidence = readEvidence(key);
-              return evidence?.completedRecorded === true || evidence?.cleanRecorded === true;
-            })()));
-          if (['queued', 'running'].includes(prior?.status)) {
-            // A normal review may adopt its own speculative child; another live/unknown writer keeps the head.
-            const ownSpeculation = Number.isInteger(input.speculativePid) && input.speculativePid > 0
-              && prior.pid === input.speculativePid && prior.host === hostname() && prior.pidNamespace === pidNamespace();
-            if (!ownSpeculation) {
-              if (!Number.isInteger(prior.pid) || prior.pid <= 0) throw Error('red-team writer is live or unknown');
-              const evidence = readEvidence(key);
-              // Foreign owners remain in-flight to the drain. Only verified stale recovery may
-              // supersede that hold, and only if the evidence still describes this exact prior.
-              const staleInFlight = staleRecovery && evidence?.inFlight === true
-                && JSON.stringify(evidence.status) === JSON.stringify(prior);
-              if ((evidence?.inFlight !== false && !staleInFlight)
-                || ![undefined, false].includes(evidence.queued)) throw Error('red-team writer is live or unknown');
-            }
-          }
-          // Carry the daemon's confirmed-dead queued/resumable normalization into
-          // the guard before replacing that evidence with our own queued writer.
-          admissionPrior = input.redTeamMode
-            ? readRedTeamRecoveryStatus(key, { readStatus: () => prior, readEvidence }) : prior;
-          // A recorded seat proves the pass completed before this verified-dead owner
-          // wrote its result. The shared resume guard still requires the matching seat row.
-          if (staleRecovery && input.redTeamMode === 'resume') {
-            admissionPrior = { ...admissionPrior, status: 'finished', result: 'ran' };
-          }
-          // A healed policy skip has no model result to resume. Let the fresh seat
-          // apply today's policy; its independent comment and scorecard guards remain active.
-          // readRedTeamStatus binds status.head to this job's head; the predicate
-          // separately requires the stored read's netBasis.rev to equal status.head.
-          // A null result is eligible only when normalized from the original queued
-          // writer above. An ordinary finished/null prior must reach the guard intact.
-          const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
-          const withoutRun = redTeamStatusWithoutRun(admissionPrior, {
-            originalStatus: prior, allowAbandonedRunning: staleRecovery
-              && verifiedStaleRedTeamAbandonment(key, admissionPrior)
-              && staleRedTeamRun({ status: admissionPrior, deadlineMs: staleRunDeadlineMs(env) }).stale,
-          });
-          if (input.redTeamMode === 'fresh' && admissionPrior?.status === 'running' && !withoutRun) {
-            throw Error('prior red-team status; not re-run');
-          }
-          if (input.redTeamMode === 'fresh'
-            && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
-            && !retry
-            && (redTeamSkipNeedsSettlement(admissionPrior)
-            || withoutRun)) admissionPrior = null;
-          if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
+          const plan = input.redTeamPlan ?? planRedTeamRecovery({ ...key, status: prior,
+            evidence: readEvidence(key), mode: input.redTeamMode,
+            requireAbandoned: true, staleRecovery: input.redTeamStaleRecovery === true, speculativePid: input.speculativePid });
+          // Identity verification is not a second owner/payload/seat decision.
+          if (input.redTeamPlan && (plan.repo !== key.repo || Number(plan.pr) !== Number(key.pr) || plan.head !== head
+            || !sameRecoveryWriter(prior, plan.status))) throw Error('red-team recovery evidence changed');
+          if (plan.admissionRefusal && !plan.ownSpeculation) throw Error(plan.admissionRefusal);
+          admissionPrior = plan.prior;
+          priorResult = plan.priorResult;
+          const retry = input.redTeamMode === 'fresh' && plan.retry;
+          input = { ...input, redTeamPlan: plan };
           input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }
         attempted = true;
@@ -466,6 +435,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           evidence: readEvidence(key), env, log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { pid: process.pid,
+        plan: input.redTeamPlan,
         ...(input.retryCount === 1 ? { retrySpent: true } : {}),
         prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
           status: admissionPrior.status, result: admissionPrior.result,
@@ -592,10 +562,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode, redTeamAdmission, redTeamStaleRecovery }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
+      const redTeamAdmissionFile = redTeamAdmission ? join(dir, `${slug}.red-team-admission.json`) : null;
+      if (redTeamAdmissionFile) writeJsonAtomic(redTeamAdmissionFile, redTeamAdmission);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
-        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamStaleRecovery }),
+        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamAdmissionFile, redTeamStaleRecovery }),
           { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -987,10 +959,11 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     const admissionDeferred = guardDeferred
       || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true);
     const prior = seatsBox.input?.redTeamAdmission?.prior;
-    if (admissionDeferred && seatsBox.priorRedTeamResult == null && prior == null) {
+    if (admissionDeferred && !seatsBox.input.redTeamPlan?.preserveStatus && seatsBox.priorRedTeamResult == null && prior == null) {
       try {
         io.clearRedTeamQueued({ repo: out.repo, pr: out.pr,
-          head: seatsBox.input.loopPayload.findings.read.netBasis.rev });
+          head: seatsBox.input.loopPayload.findings.read.netBasis.rev,
+          ...(seatsBox.input.redTeamPlan ? { redTeamPlan: seatsBox.input.redTeamPlan } : {}) });
       } catch (e) {
         io.log(`review-job ${out.sessionSlug}: red-team deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
       }
@@ -1044,8 +1017,9 @@ export function prepareReviewArc(input, io) {
 }
 
 function runReviewArc({
-  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false, redTeamPlan, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
 } = {}, io, seatsBox = {}) {
+  const detachedRecovery = Boolean(redTeamPlan);
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
   const t0 = io.now();
@@ -1176,30 +1150,24 @@ function runReviewArc({
     };
     if (redTeamOnly) {
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
-      const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
-      let loopPayload = stored?.loopPayload;
-      if (stored?.carryConflict) {
-        classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
-        return result({ ...classified, lanePath });
+      // Direct invocations enter the same planner once at the boundary. Detached jobs carry the plan.
+      if (!redTeamPlan) {
+        if (io.planRedTeamRecovery) redTeamPlan = io.planRedTeamRecovery({ repo: planned.repo, pr: planned.pr, head, redTeamMode, redTeamStaleRecovery });
+        else {
+          const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
+          redTeamPlan = planRedTeamRecovery({ repo: planned.repo, pr: planned.pr, head,
+            status: stored?.status, evidence: stored, mode: redTeamMode, env: io.env,
+            probe: io.staleProbe, recoverPayload: io.readStaleRunPayload ?? recoverStaleRunPayload });
+        }
       }
-      const deadlineMs = staleRunDeadlineMs(io.env ?? process.env);
-      // Recheck the stored owner before recovering a missing accepting payload, including marked abandonment.
-      const staleStored = redTeamMode === 'fresh' && !redTeamOwedFor(loopPayload)
-        && (staleRedTeamRun({ status: stored?.status, probe: io.staleProbe, deadlineMs }).stale
-          || (stored?.status?.staleAbandoned && staleRedTeamRun({
-            status: { ...stored.status, status: 'running', result: null }, probe: io.staleProbe, deadlineMs }).stale));
-      if (staleStored) {
-        let recovered;
-        try { recovered = (io.readStaleRunPayload ?? recoverStaleRunPayload)({ repo: planned.repo, pr: planned.pr, head }); }
-        catch { /* Missing or unreadable full review evidence stays not owed. */ }
-        if (redTeamOwedFor(recovered) && recovered.findings?.read?.netBasis?.rev === head
-          && recovered.carriedFrom == null && loopPayload?.carriedFrom == null) loopPayload = recovered;
+      if (redTeamPlan.repo !== planned.repo || Number(redTeamPlan.pr) !== planned.pr || redTeamPlan.head !== head) {
+        throw Error('red-team plan does not match live head; inspect recovery evidence');
       }
+      let loopPayload = redTeamPlan.payload;
+      redTeamMode = redTeamPlan.mode === 'skip' ? redTeamPlan.requestedMode : redTeamPlan.mode;
       let cardOnlyRecovery = false;
-      const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
-      const pendingCardOnly = redTeamMode === 'fresh' && stored?.head === head
-        && (!redTeamOwedFor(loopPayload) || loopPayload?.carriedFrom != null)
-        && cardOnlySkipSettlementCandidate(stored, head);
+      const movedCardOnly = redTeamPlan.movedCardOnly;
+      const pendingCardOnly = redTeamPlan.pendingCardOnly;
       // Re-prove at execution: planner evidence may have changed since dispatch. Never run
       // a model against the old read; this path only settles the card-only policy exemption.
       if (movedCardOnly
@@ -1217,10 +1185,8 @@ function runReviewArc({
         cardOnlyRecovery = true;
         loopPayload = { ...loopPayload, carriedFrom: loopPayload.carriedFrom ?? head, verdict: null };
       }
-      const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
-      if (!pinned || (!cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedFor(loopPayload)))) {
-        classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
-        return result({ ...classified, lanePath });
+      if (!cardOnlyRecovery && !redTeamPlan.payloadUsable) {
+        return result({ outcome: 'red-team-not-owed', reason: redTeamPlan.why, lanePath });
       }
       // Refuse before finishArc can persist admission; a missing commit must leave recovery retryable.
       const refuse = reason => {
@@ -1233,6 +1199,15 @@ function runReviewArc({
         if (fetched?.head !== head) throw Error('pinned red-team head mismatch');
       } catch {
         return refuse('reviewed head could not be fetched into the lane; retry next tick');
+      }
+      // A detached snapshot may be superseded while waiting for a lane or fetching the head.
+      // Validate that boundary before queued admission or carry publication, retaining the plan's eligibility.
+      if (detachedRecovery) {
+        let refusal = 'recovery supersession evidence unreadable; inspect current review evidence before retrying';
+        try {
+          refusal = recoverySupersessionRefusal(io.readRedTeamOnlyPayload({ repo: planned.repo, pr: planned.pr, head }));
+        } catch { /* Unknown supersession evidence must refuse execution. */ }
+        if (refusal) return result({ outcome: 'red-team-not-owed', refused: true, reason: refusal, lanePath });
       }
       if (cardOnlyRecovery) {
         // Historical provenance cannot authorize today's policy. Resolve after the
@@ -1252,7 +1227,7 @@ function runReviewArc({
         return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }
       classified = { outcome: 'red-team-only' };
-      return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode,
+      return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode, redTeamPlan,
         ...(redTeamStaleRecovery === true ? { redTeamStaleRecovery: true } : {}) });
     }
 
@@ -1344,7 +1319,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
-  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false,
+  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false, redTeamPlan,
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -1385,9 +1360,12 @@ export function dispatchReviewJob({
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
   mkdirSync(dir, { recursive: true });
+  const planFile = redTeamPlan ? join(dir, `${slug}.red-team-plan.json`) : null;
+  if (planFile) writeJsonAtomic(planFile, redTeamPlan);
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
+      ...(planFile ? [`--red-team-plan=${planFile}`] : []),
       ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
@@ -1537,6 +1515,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
+        ...(flag('red-team-plan') ? { redTeamPlan: JSON.parse(readFileSync(flag('red-team-plan'), 'utf8')) } : {}),
         ...(rest.includes('--red-team-stale-recovery') ? { redTeamStaleRecovery: true } : {}),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
