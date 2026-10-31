@@ -149,7 +149,6 @@ import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { checkRemoteHealth, recordRemoteResult } from './forge-remote-health.mjs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -467,7 +466,14 @@ const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'forge-unreachable',
   'copy-failed',
   'ignored-test-file',
+  'invalid-diff-coverage-base',
+  'diff-coverage-base-unavailable',
+  'coverage-report-not-portable',
   'unsupported-sibling-dependency',
+  'sibling-missing',
+  'sibling-not-git',
+  'sibling-dirty',
+  'sibling-unsafe',
 ]);
 
 /** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
@@ -717,6 +723,9 @@ export async function runWithRemoteDecision({
   const decision = decideRemote({ policy, loadPerCore: load, argv });
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
+  // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
+  // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
+  const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
   remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
@@ -2342,9 +2351,16 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
-      // fixed standards script contract at this client boundary.
-      const remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
+      // fixed standards and Vitest script contracts at this client boundary.
+      let remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
         ? ['npm','run','check:standards',...(requested.length>2?['--',...requested.slice(2)]:[])] : requested;
+      if(requested[0]==='vitest'&&requested[1]==='run') {
+        const integration=requested[2]==='--config'&&requested[3]==='vitest.integration.config.ts';
+        const coverage=requested[2]==='--coverage';
+        const script=integration?'test:integration:vitest':coverage?'test:coverage':'test:unit';
+        const rest=requested.slice(integration?4:coverage?3:2);
+        remoteArgv=['npm','run',script,...(rest.length?['--',...rest]:[])];
+      }
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot,

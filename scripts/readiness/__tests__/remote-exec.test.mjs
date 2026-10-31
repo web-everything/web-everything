@@ -17,6 +17,7 @@ import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision 
 import {materializeWorktree} from '../forge-exec-bases.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
+import {scanDiffBranchCoverage} from '../../lib/diff-branch-coverage.mjs';
 
 vi.mock('../forge-telemetry.mjs', async importOriginal => {
   const actual=await importOriginal();
@@ -592,6 +593,35 @@ describe('isAllowedCommand', () => {
 });
 
 describe('filterEnv', () => {
+  it.each(['HEAD', 'origin/main', 'refs/heads/fix.v1', 'a'.repeat(40)])('accepts safe coverage base %s for local commit resolution', base => {
+    const env = filterEnv({DIFF_COVERAGE_BASE:base});
+    expect(env).toEqual({DIFF_COVERAGE_BASE:base});
+    expect(forgeManifestAPI.allowedEnv(env)).toBe(true);
+  });
+  it.each([{code:128,stdout:''},{code:0,stdout:'main'},{code:0,stdout:'a'.repeat(40)+'\nextra'},new Error('unreadable ref')])
+  ('refuses unresolved or invalid coverage base commit evidence before prepare: %j', async evidence => {
+    const f=fixture(),original=f.exec;
+    f.env.DIFF_COVERAGE_BASE='main';
+    f.exec=vi.fn(async call=>{
+      if(call.file==='git'&&call.args.includes('--end-of-options')) {
+        expect(call.args).toEqual(['rev-parse','--verify','--end-of-options','main^{commit}']);
+        if(evidence instanceof Error)throw evidence;
+        return evidence;
+      }
+      return original(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'diff-coverage-base-unavailable'});
+    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
+  });
+  it.each(['', '-HEAD', 'HEAD..main', 'main branch', 'HEAD\n', 'HEAD\0', 'HEAD\t', '$(id)', 'HEAD;id', 'HEAD~1', 'main//branch', '.hidden', 'branch.lock', 'main/', 123])
+  ('refuses invalid coverage base with a local fallback reason before forwarding: %j', async base => {
+    const env = {DIFF_COVERAGE_BASE:base};
+    expect(() => filterEnv(env)).toThrow('Invalid DIFF_COVERAGE_BASE: use local fallback');
+    expect(forgeManifestAPI.allowedEnv(env)).toBe(false);
+    const f = fixture();
+    expect(await runRemote({...f,env})).toEqual({mode:'fallback',reason:'invalid-diff-coverage-base'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
   it('keeps exactly the allowlist and drops secret names, HOME, PATH, and unknown names', () => {
     const env = { ...allowedEnv, ...forbiddenEnv };
     expect(filterEnv(env)).toEqual(allowedEnv);
@@ -961,7 +991,7 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
   });
 
-  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('preserves both real standards guards at exact published Mac HEAD ahead of cache base: %j', async (args) => {
+  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].flatMap(args => [[args,true],[args,false]]))('full-ships absolute-path coverage and resolves local main behind HEAD to preserve remote guard parity: %j (dirty: %s)', async (args, dirty) => {
     const f = fixture({runCode:1}),original=f.exec;
     const git=(...args)=>{
       const result=spawnSync('git',args,{cwd,encoding:'utf8',timeout:10000});
@@ -970,12 +1000,14 @@ describe('runRemote', () => {
     git('init','-b','main');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid');
     const tier='scripts/lib/disposition-judge.mjs';
     mkdirSync(join(cwd,'scripts/lib'),{recursive:true});
+    writeFileSync(join(cwd,'.gitignore'),'coverage/\n');
     writeFileSync(join(cwd,tier),'export const changed = false;\n');
     git('add','.');git('commit','-m','public base');
     const base=git('rev-parse','HEAD'),baseRoot=join(cwd,'forge-base'),snapshot=join(cwd,'forge-work');
     mkdirSync(baseRoot);mkdirSync(snapshot);
     git('clone','--bare','.',join(baseRoot,'repo.git'));
     git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',base);
+    git('checkout','--detach',base); // Local main stays behind the published HEAD.
     writeFileSync(join(cwd,tier),'export const changed = true;\n');
     git('add',tier);git('commit','-m','published Mac change');
     const head=git('rev-parse','HEAD');
@@ -983,37 +1015,91 @@ describe('runRemote', () => {
     rmSync(join(baseRoot,'repo.git'),{recursive:true});
     git('clone','--bare','.',join(baseRoot,'repo.git'));
     git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',head);
-    writeFileSync(join(cwd,tier),'export const changed = 2;\n');
-    const localCoverage=scanMaterializedGuards(cwd).coverage;
-    expect(localCoverage.status).toBe('fail');
+    git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/heads/main',head);
+    const warm=forgeManifestAPI.manifestWire(await remoteManifestAPI.buildManifest({cwd,exec:remoteManifestAPI.defaultExec,listFiles:async()=>['a.test.mjs','package-lock.json',tier]}));
+    const warmDigest=forgeManifestAPI.digestManifest(warm);
+    if (dirty) writeFileSync(join(cwd,tier),'export const changed = 2;\n');
+    mkdirSync(join(cwd,'coverage'));
+    const loc={start:{line:1,column:0},end:{line:1,column:40}};
+    const entry={branchMap:{0:{loc,locations:[loc,loc]}},b:{0:[0,0]}};
+    const report=JSON.stringify({[join(cwd,tier)]:entry});
+    const portableReport=JSON.stringify({[tier]:entry});
+    writeFileSync(join(cwd,'coverage/coverage-final.json'),report);
+    writeFileSync(join(cwd,'coverage/private.json'),'must not ship');
+    f.env.DIFF_COVERAGE_BASE='main';
+    expect(git('rev-parse','main')).toBe(base);
+    const localCoverage=scanDiffBranchCoverage(cwd,{base});
+    expect(scanDiffBranchCoverage(cwd,{base:'main'})).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    expect(localCoverage).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    if (!dirty) expect(scanMaterializedGuards(cwd).coverage.status).toBe('no-scope');
     const artifacts=['reports/new.md','src/_data/researchTopics/new.json','src/_includes/research-descriptions/new.njk'];
     for(const name of artifacts){mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'new artifact');}
     f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',tier,...artifacts]);
     let observed;
     f.exec=vi.fn(async call=>{
       if(call.file==='git')return remoteManifestAPI.defaultExec(call);
-      if(call.file==='rsync')cpSync(call.cwd,snapshot,{recursive:true});
+      if(call.file==='ssh'&&sshText(call).endsWith(' bases'))return {code:0,stdout:JSON.stringify({delta:1,bases:[{sha:head,manifestDigest:warmDigest}]})};
+      if(call.file==='ssh'&&sshText(call).endsWith(' base-manifest'))return {code:0,stdout:JSON.stringify(warm)};
+      if(call.file==='rsync')cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
       if(isRun(call)){
         const request=JSON.parse(call.input);
+        expect(forgeManifestAPI.allowedEnv(request.env)).toBe(true);
+        expect(request.env.DIFF_COVERAGE_BASE).toBe(base);
+        expect(request.manifest.git.diffCoverageBase).toBe(base);
+        expect(request.manifestDigest).toBe(forgeManifestAPI.digestManifest(request.manifest));
+        expect(request.inputDigest).toBe(await digestInput(snapshot));
+        expect(request.baseSha).toBeUndefined();
+        const entries=forgeManifestAPI.splitPaths(Buffer.from(request.manifest.paths,'base64'));
+        const coverageIndex=entries.findIndex(path=>path.equals(Buffer.from('coverage/coverage-final.json')));
+        expect(coverageIndex).toBeGreaterThanOrEqual(0);
+        expect(request.manifest.hashes[coverageIndex]).toBe(createHash('sha256').update(portableReport).digest('hex'));
+        expect(request.manifest.tracked[coverageIndex]).toBe(false);
+        expect(readFileSync(join(snapshot,'coverage/coverage-final.json'),'utf8')).toBe(portableReport);
+        expect(readFileSync(join(cwd,'coverage/coverage-final.json'),'utf8')).toBe(report);
+        expect(statSync(join(snapshot,'coverage/coverage-final.json')).mtimeMs).toBeCloseTo(statSync(join(cwd,'coverage/coverage-final.json')).mtimeMs,0);
+        expect(existsSync(join(snapshot,'coverage/private.json'))).toBe(false);
         await materializeWorktree({work:snapshot,root:baseRoot,head:request.manifest.git.head,
           manifest:request.manifest,manifestDigest:request.manifestDigest,exec:cachedPublicGitExec});
-        mkdirSync(join(snapshot,'coverage'));
-        const loc={start:{line:1,column:0},end:{line:1,column:40}};
-        writeFileSync(join(snapshot,'coverage/coverage-final.json'),JSON.stringify({[tier]:{branchMap:{0:{loc,locations:[loc,loc]}},b:{0:[0,0]}}}));
         observed=scanMaterializedGuards(snapshot);
+        observed.coverage=scanDiffBranchCoverage(snapshot,{base:request.env.DIFF_COVERAGE_BASE});
       }
       return original(call);
     });
     f.argv = ['npm','run','check:standards',...args];
     expect(await runRemote(f)).toEqual({mode:'remote',code:1});
     expect(observed.coverage).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    expect(observed.coverage).toEqual(localCoverage);
     expect(observed.artifacts.errors.map(e=>e.descriptor.file)).toEqual(['reports','src/_data/researchTopics','src/_includes/research-descriptions']);
     expect(spawnSync('git',['rev-parse','HEAD'],{cwd:snapshot,encoding:'utf8'}).stdout.trim()).toBe(head);
     expect(spawnSync('git',['merge-base','--is-ancestor','HEAD','origin/main'],{cwd:snapshot}).status).toBe(0);
     expect(callsOf(f.exec).some(isPrepare)).toBe(true);
+    expect(callsOf(f.exec).some(call=>call.file==='ssh'&&sshText(call).endsWith(' base-manifest'))).toBe(true);
     expect(JSON.parse(callsOf(f.exec).find(isRun).input).manifest.git.head).toBe(head);
     expect(JSON.stringify(callsOf(f.exec))).not.toContain('verify-marker');
     expect(f.local).not.toHaveBeenCalled();
+  });
+  it.each(['invalid JSON','array','outside cwd','sibling prefix','Windows absolute','collision'])
+  ('falls back before transfer for a non-portable coverage report: %s',async fault=>{
+    const f=fixture();
+    const reports={
+      'invalid JSON':'{',array:'[]',
+      'outside cwd':JSON.stringify({[join(cwd,'../elsewhere/file.mjs')]:{}}),
+      'sibling prefix':JSON.stringify({[cwd+'-other/file.mjs']:{}}),
+      'Windows absolute':JSON.stringify({'C:\\other\\file.mjs':{}}),
+      collision:JSON.stringify({[join(cwd,'file.mjs')]:{},'file.mjs':{}}),
+    };
+    mkdirSync(join(cwd,'coverage'));
+    writeFileSync(join(cwd,'coverage/coverage-final.json'),reports[fault]);
+    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json','coverage/coverage-final.json']);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'coverage-report-not-portable'});
+    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
+  });
+  it('uses the protected coverage-base rejection as a safe local fallback',async()=>{
+    const f=fixture({receipt:(_nonce,_value,state)=>JSON.stringify({v:1,nonce:state.nonce,run:state.run,
+      phase:'rejected',reason:'diff-coverage-base-unavailable',siblings:false,started:false})});
+    f.argv=['npm','run','check:standards'];
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'diff-coverage-base-unavailable'});
+    expect(callsOf(f.exec).filter(isRun)).toHaveLength(1);
   });
   it.each([undefined,1])('requires exact-HEAD worktree capability before transferring a standards snapshot to an old runner (version=%s)',async version=>{
     const f=fixture(),original=f.exec;
@@ -1447,6 +1533,18 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
     return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
   }
+  it.each(['parent','leaf'])('rejects an allowlisted ignored coverage input with a %s symlink', async kind => {
+    const outside=join(cwd,'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside,'coverage-final.json'),'private bytes');
+    if(kind==='parent')symlinkSync(outside,join(cwd,'coverage'));
+    else {
+      mkdirSync(join(cwd,'coverage'));
+      symlinkSync(join(outside,'coverage-final.json'),join(cwd,'coverage/coverage-final.json'));
+    }
+    const exec=vi.fn(async call=>({code:0,stdout:call.args.includes('-i')?Buffer.from('coverage/coverage-final.json\0'):Buffer.alloc(0)}));
+    await expect(build({cwd,exec})).rejects.toThrow('Unsafe inventory component');
+  });
   function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
     return vi.fn(async call => {
       expect(call.file).toBe('git');
@@ -1563,6 +1661,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     'cert.pem', 'cert.key', 'cert.p12', 'cert.pfx', 'cert.jks', 'cert.keystore',
     'secrets.json', 'tokens.json', 'creds.json', 'credential.json', 'passwd.txt',
     'password.txt', 'oauth.json', 'apikey.json', 'api-key.json', 'ACCESS_TOKEN.json',
+    'api_key.json', 'API_KEY.json', 'api key.json', 'api.key.json',
     'secréts.json', 'tóken.json', 'créds.json', 'íd_backup', 'cert.pém', 'nested/sécrets/hosts.yml',
     '.netrc', '.npmrc', '.env', '.env.production',
   ])('excludes credential class path %s from entries and rsync inventory', async name => {
@@ -1627,7 +1726,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
   it.each([
-    '.claude/skills/x/SKILL.md', '.githooks/pre-commit.js', '.eleventy.js',
+    '.claude/skills/x/SKILL.md', '.eleventy.js',
     '.claude/secrets.md', '.secret.js', 'secret-directory/.hidden.md',
     'private.key/safe.md', 'secret.key/safe.js', '.env.local.js',
     '.netrc/safe.md', '.npmrc/safe.js',
@@ -1645,6 +1744,15 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it('keeps .githooks in the remote snapshot so remote check:standards sees hook files', async () => {
+    const name = '.githooks/pre-commit';
+    mkdirSync(join(cwd, '.githooks'), {recursive:true});
+    writeFileSync(join(cwd, name), '#!/bin/sh\n');
+    const manifest = await build({cwd, exec:gitInventory(['package-lock.json', name].map(value => Buffer.from(value)))});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain(name);
+    expect(manifest.excluded.map(entry => entry.toString())).not.toContain(name);
   });
 
   it.each(['.claude/skills/x/SKILL.test.md', '.eleventy.test.js', '.claude/secrets.test.js', 'private.key/safe.test.js'])
@@ -1912,6 +2020,22 @@ describe('allowlisted sibling snapshots', () => {
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
 
+  it('counts exact staged primary and sibling payload bytes, excluding private leaves',async()=>{
+    const f=siblingsFixture();
+    const primary=['a.test.mjs','package-lock.json','vitest.shared.ts'];
+    const siblingFiles=['plugs/index.js','webtheme/index.js','webtheme/sub/dir/x.md'];
+    // Read independently named fixture inputs, never the manifest or timing total.
+    const bytes=[...primary.map(name=>readFileSync(join(f.cwd,name))),
+      ...siblingFiles.map(name=>readFileSync(join(sibling,name)))].reduce((sum,data)=>sum+data.length,0);
+    const result=await timedRunRemote(f);
+    expect(result).toMatchObject({mode:'remote',code:0});
+    expect(result.timings.find(stage=>stage.stage==='rsync')).toMatchObject({
+      shipMode:'full',fileCount:6,bytesSent:bytes,deltaFileCount:0,deltaBytes:0});
+    const copies=callsOf(f.exec).filter(call=>call.file==='rsync');
+    expect(copies).toHaveLength(2);
+    expect(copies[1].input.toString()).not.toContain('credentials.txt');
+  });
+
   it('allows implied directories for both rsync calls and anchors nested inventory paths', async () => {
     const f = siblingsFixture();
     mkdirSync(join(f.cwd, 'sub/dir'), {recursive:true});
@@ -2105,7 +2229,8 @@ describe('offload stage evidence', () => {
     }
     expect(result.timings.find(s=>s.stage==='forge-install').ms).toBe(12);
     expect(result.timings.find(s=>s.stage==='forge-run').ms).toBe(34);
-    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:expect.any(Number)});
+    const bytes=Buffer.byteLength('fixture')+Buffer.byteLength('{"lockfileVersion":3,"packages":{}}\n');
+    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:bytes});
   });
   it('formats winter timestamps with the Eastern standard offset even for early fallback', async () => {
     const result=await timedRunRemote({argv:[],clock:()=>Date.parse('2026-01-01T12:00:00Z')});

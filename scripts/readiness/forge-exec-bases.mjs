@@ -29,6 +29,7 @@ function gitExec({args,cwd,env,input}) {
 export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
+  if(logical.diffCoverageBase!==undefined&&!revision(logical.diffCoverageBase))throw new Error('Invalid coverage base SHA');
   for(const entry of decodeManifest(primary).entries) {
     let leaf=Buffer.from(work);
     for(const part of pathParts(entry.path)){leaf=bytePath(leaf,part);if((await fs.lstat(leaf)).isSymbolicLink())throw new Error('Unsafe Git snapshot');}
@@ -62,6 +63,10 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       '+refs/heads/main:refs/remotes/origin/main',head],cloned);
     await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned);
     await git(['cat-file','-e',head+'^{commit}'],cloned);
+    if(logical.diffCoverageBase!==undefined
+      && await git(['merge-base','--is-ancestor',logical.diffCoverageBase,head],cloned,undefined,true)===null
+      && await git(['merge-base','--is-ancestor',logical.diffCoverageBase,'refs/remotes/origin/main'],cloned,undefined,true)===null)
+      throw Object.assign(new Error('Coverage base unavailable; use local fallback'),{code:'diff-coverage-base-unavailable'});
     // Detach without checking files out over the verified Mac snapshot.
     await git(['update-ref','--no-deref','HEAD',head],cloned);
     if(await git(['rev-parse','--verify','HEAD'],cloned)!==head)throw new Error('Git HEAD mismatch; use local fallback');
@@ -86,6 +91,7 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     // Publication is the final operation: no privileged Git may follow it.
     await fs.rename(join(cloned,'.git'),join(work,'.git'));
   } catch(error) {
+    if(error.code==='diff-coverage-base-unavailable')throw error;
     throw Object.assign(new Error('Git HEAD unavailable; use local fallback',{cause:error}),{code:'git-head-unavailable'});
   } finally {await fs.rm(pending,{recursive:true,force:true});}
 }

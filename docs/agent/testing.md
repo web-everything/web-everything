@@ -1736,6 +1736,11 @@ A core file that dynamically imports its CLI cannot await that import at module 
 its CLI statically imports the core. A staged Node probe of that cycle exits 13 with unsettled
 top-level await. Defer the import with `.then(...)`, and test both entry paths as subprocesses.
 
+Keep the local admission heartbeat import graph free of remote CLI modules with top-level
+await: terminating a watchdog worker during their evaluation can abort Node with SIGTRAP.
+Load remote health only after selecting remote execution. The subprocess startup/stop case
+in `scripts/__tests__/verify-lane.test.mjs` exercises that worker lifetime boundary.
+
 ### Daemon worker risk routing
 
 For the [daemon model rule](platform-decisions.md#daemon-claude-worker-risk), exercise
@@ -2011,6 +2016,11 @@ classes, receipt argv binding, separate remote capacity, and persisted health/ca
 Use temporary lock roots and injected telemetry in legacy remote-contract fixtures; never
 contact Forge or consume the real host's remote slots from a unit test. Retain the original
 termination acknowledgements and refusal assertions when updating those fixtures.
+
+Coverage transport fixtures must use absolute Istanbul source keys and preserve report/source
+mtimes. Compare local and remote attribution after transport makes keys relative. Pin coverage
+base refs to local commit SHAs in the manifest; reject bases outside reconstructed public ancestry,
+including unrelated commits already present in the worker's object cache.
 
 Remote telemetry older than 30 seconds or more than 60 seconds ahead routes through local
 admission. Compare ET timestamps by instant with `Date.parse`, independent of the process timezone.
@@ -3235,6 +3245,13 @@ existing root-owned guards, retaining mode 0600 and inode identity. The worker-p
 suite models ownership transfer on unprivileged hosts and includes a Linux/root
 integration case that runs prune as root then reserves every slot as the operator.
 
+### Remote diff coverage inputs
+
+Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
+and full shipping so the freshness guard retains local semantics; warm delta assembly
+recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
+a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
 ## Probe worker timeout teardown
 
 Worker timeout promises allow at most one second for `worker.terminate()` before

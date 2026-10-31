@@ -5,7 +5,7 @@ import {spawnSync} from 'node:child_process';
 import {dirname,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as remote from '../remote-exec.mjs';
-import {BASE_RETENTION,baseGuard,claimPrewarm,copyLeaves,createBasePin,pruneBases} from '../forge-exec-bases.mjs';
+import {BASE_RETENTION,baseGuard,claimPrewarm,copyLeaves,createBasePin,pruneBases,readyBases,readBase} from '../forge-exec-bases.mjs';
 import {parseGitTree} from '../forge-exec-manifest.mjs';
 import {createRunner,manifestWire,digestManifest,digestInput,digestArgv} from '../forge-exec-run.mjs';
 let root,repo;
@@ -36,6 +36,43 @@ async function pruningFixture() {
   await fs.mkdir(join(target,'failed.tmp'));
   return {target,shas};
 }
+describe('base directory trust boundary',()=>{
+  it.each([0o775,0o757,0o777,'symlink'])('refuses an unsafe base root (%s) at every reader and guard',async fault=>{
+    const {target}=await pruningFixture();
+    if(fault==='symlink'){await fs.rename(target,target+'.saved');await fs.symlink(target+'.saved',target);}
+    else await fs.chmod(target,fault);
+    const action=vi.fn();
+    await expect(readyBases(target)).rejects.toThrow('Unsafe base directory');
+    await expect(readBase(target,'0'.repeat(40),hash('manifest'))).rejects.toThrow('Unsafe base directory');
+    await expect(baseGuard(target,action)).rejects.toThrow('Unsafe base directory');
+    expect(action).not.toHaveBeenCalled();
+  });
+  it.each([0o775,0o757,0o777,'symlink'])('never advertises or reads an unsafe SHA directory (%s)',async fault=>{
+    const {target,shas}=await pruningFixture(),sha=shas[0],base=join(target,sha);
+    expect((await readyBases(target)).map(record=>record.sha)).toContain(sha);
+    if(fault==='symlink'){await fs.rename(base,base+'.saved');await fs.symlink(base+'.saved',base);}
+    else await fs.chmod(base,fault);
+    expect((await readyBases(target)).map(record=>record.sha)).not.toContain(sha);
+    await expect(readBase(target,sha,hash('manifest'))).rejects.toThrow('Unsafe base directory');
+  });
+  it.each(['symlink','directory'])('never advertises or reads READY replaced by a %s',async fault=>{
+    const {target,shas}=await pruningFixture(),sha=shas[0],ready=join(target,sha,'READY');
+    await fs.rename(ready,ready+'.saved');
+    if(fault==='symlink')await fs.symlink(ready+'.saved',ready);else await fs.mkdir(ready);
+    expect((await readyBases(target)).map(record=>record.sha)).not.toContain(sha);
+    await expect(readBase(target,sha,hash('manifest'))).rejects.toThrow();
+  });
+  it('refuses a symlinked guard without entering or modifying its target',async()=>{
+    const target=join(root,'guard-root'),victim=join(root,'guard-victim');
+    await fs.mkdir(target);await fs.mkdir(victim);await fs.writeFile(join(victim,'keep'),'unchanged');
+    await fs.symlink(victim,join(target,'.guard'));
+    const action=vi.fn();
+    await expect(baseGuard(target,action)).rejects.toThrow('Unsafe base guard');
+    expect(action).not.toHaveBeenCalled();expect(await fs.readFile(join(victim,'keep'),'utf8')).toBe('unchanged');
+    expect(await fs.readdir(target)).toEqual(['.guard']);
+  });
+});
+
 describe('active base pin safety',()=>{
   async function guardFixture(owner={pid:process.pid,timestamp:Date.now()}) {
     const target=join(root,'guard-test'),guard=join(target,'.guard');
@@ -514,6 +551,13 @@ describe('runner base materialization refuses before install',()=>{
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
     expect(stage.shipMode).toBe(['delta','retry succeeds','next base'].includes(mode)?'delta':'full');
+    // Independent fixture bytes: unchanged lock/mode/public source are reused
+    // only in delta mode; the deleted file and private credentials never ship.
+    const deltaMode=['delta','retry succeeds','next base'].includes(mode);
+    const payloads=deltaMode?['changed']:['changed','lock','mode','public'];
+    const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
+    expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
+      deltaFileCount:deltaMode?1:0,deltaBytes:deltaMode?Buffer.byteLength('changed'):0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
     if(mode==='late delta failure'){
       expect(copies).toHaveLength(2);
