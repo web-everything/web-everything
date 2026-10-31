@@ -6,7 +6,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 // cancelOnCiRed: default off (operator 2026-10-16: keep the option, don't use it yet).
 // fastChecks is keyed by repo: only WE's CI publishes these names. A repo without an entry waits on its required checks.
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
-  startAfter: 'fast-checks', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
+  startBeforeCi: false, startAfter: 'fast-checks', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
 });
 const checkNames = v => Array.isArray(v) && v.length > 0 && v.every(n => typeof n === 'string' && n.trim());
@@ -32,7 +32,7 @@ export function normalizeFastChecks(v) {
 /** Is this a valid fastChecks setting: a non-empty name list, or a map of repo key → non-empty name list? */
 export const validFastChecks = v => checkNames(v) || (!!v && typeof v === 'object' && !Array.isArray(v)
   && Object.keys(v).length > 0 && Object.entries(v).every(([key, names]) => repoKeyForSlug(key) === key && checkNames(names)));
-export const FIX_TIMING_DEFAULTS = Object.freeze({ joinCiAndReview: true, joinWaitMaxMin: 15 });
+export const FIX_TIMING_DEFAULTS = Object.freeze({ joinCiAndReview: true, joinWaitMaxMin: 15, pushAfterCi: false, pushAfterCiMaxMin: 30 });
 const RED = new Set(['failure', 'error', 'timed_out', 'cancelled', 'action_required', 'startup_failure']);
 /**
  * Checks that are never a CI failure a heal repairs: the review-dependent gates (red while a review is owed) and
@@ -61,11 +61,18 @@ export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
     && (!row.head_sha || row.head_sha === headSha)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
 }
-export function reviewStartGate({ headSha, checks, requiredChecks, repo, policy = REVIEW_TIMING_DEFAULTS } = {}) {
-  if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
+export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
   // Only required failures have a CI-heal owner. Optional failures, or any red under an unknown set, must not strand review.
   if (Array.isArray(requiredChecks) && requiredChecks.length && ciRedOnHead({ headSha, checks, requiredChecks }))
     return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+  if (policy.startBeforeCi && verifyGreen === true && typeof headSha === 'string' && headSha.trim()) {
+    // An unknown required set must not let a red check ride past the marker: any healable red blocks, as in CI-green.
+    if (ciRedOnHead({ headSha, checks, requiredChecks: Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null }))
+      return { allowed: false, headSha, reason: 'ci-red', affected: [] };
+    return { allowed: true, headSha, reason: 'verify-marker', affected: [] };
+  }
+  if (policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
   if (policy.startAfter === 'push') return { allowed: typeof headSha === 'string' && !!headSha.trim(), headSha, reason: typeof headSha === 'string' && headSha.trim() ? 'push' : 'missing-head', affected: [] };
   return reviewCiGate({ headSha, checks, requiredChecks: fastChecksFor(policy.fastChecks, repo) ?? requiredChecks });
 }
@@ -110,4 +117,28 @@ export function fixReadiness({ headSha, checks = [], findings = [], reviewPendin
       : latest.some(row => ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row.status ?? row.state).toLowerCase())),
     ciFailures: failed.map(row => ({ name: row.name ?? row.context, conclusion: row.conclusion ?? row.state,
       detailsUrl: row.details_url ?? row.detailsUrl ?? row.targetUrl ?? null })), findings };
+}
+
+/** Unknown or incomplete CI waits until the fixed bound; review holds never delay a fix push. */
+export function fixPushGate({ previousHeadChecks, requiredChecks, firstHeldAt, now, policy = FIX_TIMING_DEFAULTS } = {}) {
+  if (!policy.pushAfterCi) return { action: 'push', reason: 'off' };
+  const maxMin = Number.isSafeInteger(policy.pushAfterCiMaxMin) && policy.pushAfterCiMaxMin >= 0
+    ? policy.pushAfterCiMaxMin : FIX_TIMING_DEFAULTS.pushAfterCiMaxMin;
+  const deadline = firstHeldAt + maxMin * 60_000;
+  const latest = collapseRollupToLatestPerName(previousHeadChecks);
+  const rows = latest.filter(row => !isReviewHoldGate(row));
+  const required = Array.isArray(requiredChecks) && requiredChecks.length
+    ? requiredChecks.filter(name => name !== 'review-gate' && !latest
+      .some(row => (row.name ?? row.context) === name && isReviewHoldGate(row))) : [];
+  const complete = Array.isArray(previousHeadChecks) && required.length > 0 && required.every(name => {
+    const row = rows.find(row => (row.name ?? row.context) === name);
+    const conclusion = String(row?.conclusion ?? row?.state ?? '').toLowerCase();
+    return row && ['success', 'neutral', 'skipped', ...RED].includes(conclusion)
+      && (row.status === undefined || String(row.status).toLowerCase() === 'completed');
+  });
+  if (complete) return { action: 'push', reason: 'ci-complete',
+    ciFailures: fixReadiness({ checks: rows.map(({ head_sha, ...row }) => row), requiredChecks }).ciFailures };
+  if (Number.isFinite(now) && Number.isFinite(deadline) && now >= deadline)
+    return { action: 'push', reason: 'bound', deadline };
+  return { action: 'wait', reason: 'ci-pending', deadline };
 }
