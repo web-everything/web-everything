@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 
 const clean = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, 2000);
@@ -65,14 +65,37 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     }
     // Keep operator auth from global/system scope, but never give a lane's helper,
     // proxy, headers or TLS settings access to the unattended transport. Name-only
-    // records avoid confusing newlines in URL subsections with key/value separators.
-    const scoped = git(dir, ['config', '--null', '--name-only', '--show-scope', '--list', '--includes']);
+    // scope/origin/key records avoid confusing newlines in URL subsections with key/value separators.
+    const scoped = git(dir, ['config', '--null', '--name-only', '--show-scope', '--show-origin', '--list', '--includes']);
     const parts = scoped ? scoped.split('\0') : [];
     if (parts.length && parts.pop() !== '') throw new Error('incomplete transport config; inspect the lane manually');
-    if (parts.length % 2) throw new Error('incomplete transport config; inspect the lane manually');
-    for (let i = 0; i < parts.length; i += 2) {
-      const [scope, key] = parts.slice(i, i + 2);
-      if (!['system', 'global', 'local', 'worktree', 'command'].includes(scope) || !key) {
+    if (parts.length % 3) throw new Error('incomplete transport config; inspect the lane manually');
+    // Apple Git can label its toolchain config 'unknown'. Trust that only when
+    // its absolute file origin is outside every repository-controlled directory.
+    let laneRoots;
+    const externalFile = configOrigin => {
+      if (!configOrigin.startsWith('file:') || !isAbsolute(configOrigin.slice(5))) return false;
+      try {
+        const canonical = path => existsSync(path) ? realpathSync(path) : resolve(path);
+        if (!laneRoots) {
+          const dirs = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir']).split('\n');
+          const bare = git(dir, ['rev-parse', '--is-bare-repository']);
+          if (dirs.length !== 2 || dirs.some(path => !isAbsolute(path)) || !['true', 'false'].includes(bare)) return false;
+          if (bare === 'false') dirs.push(git(dir, ['rev-parse', '--show-toplevel']));
+          if (dirs.some(path => !isAbsolute(path))) return false;
+          laneRoots = [resolve(dir), ...dirs].map(canonical);
+        }
+        const path = canonical(configOrigin.slice(5));
+        return laneRoots.every(root => {
+          const rel = relative(root, path);
+          return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+        });
+      } catch { return false; }
+    };
+    for (let i = 0; i < parts.length; i += 3) {
+      const [scope, configOrigin, key] = parts.slice(i, i + 3);
+      if ((!['system', 'global', 'local', 'worktree', 'command'].includes(scope)
+        && !(scope === 'unknown' && externalFile(configOrigin))) || !key || !configOrigin) {
         throw new Error('unknown transport config scope; inspect the lane manually');
       }
       // Git resolves even a URL argument as a remote name first. Only the exact

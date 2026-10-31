@@ -6,7 +6,7 @@
  *   web-everything/web-everything#2783 (three ci-heal sessions in one evening, each escalating identically on the
  *   same head with nothing durable recorded).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -17,6 +17,7 @@ import {
   escalationStaleAgainstBase, enrichPrsWithEscalationBaseFacts, defaultReadBaseHead,
   buildInheritedRedBaseNote, CI_HEAL_INHERITED_BASE_NOTE_MARKER,
   composeCiHealEscalation, CI_HEAL_ESCALATION_MARKER, CI_HEAL_ESCALATION_OUTCOMES, postOrOweCiHealEscalation,
+  checkNeedsHumanEscalable, checkNotCiBreakRecordable,
 } from '../ci-heal-escalation-mark.mjs';
 import { collectCiAuthDiagnosis } from '../ci-auth-diagnosis.mjs';
 import { owedWriteAlreadyLive } from '../ci-heal-owed.mjs';
@@ -284,9 +285,9 @@ it('#4545 malformed enrichment cannot prevent the original escalation', () => {
 });
 
 describe('not-a-ci-break verdict invalidation — live #4535', async () => {
-  const { vi } = await import('vitest');
   const { CI_HEAL_VERDICT_VOID_MARKER, buildCiHealVerdictVoidComment, parseCiHealVerdictVoids,
-    notCiBreakRecordRefusal, checkNotCiBreakRecordable } = await import('../ci-heal-escalation-mark.mjs');
+    notCiBreakRecordRefusal, checkNotCiBreakRecordable, needsHumanGateOnlyRefusal,
+    checkNeedsHumanEscalable } = await import('../ci-heal-escalation-mark.mjs');
   const { MAX_VERDICT_VOIDS_PER_HEAD, planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
   const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
   const head = fixture.headRefOid;
@@ -362,6 +363,191 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
 
   const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
     readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
+
+  it.each([
+    ['not-a-ci-break', checkNotCiBreakRecordable],
+    ['needs-human', checkNeedsHumanEscalable],
+  ])('%s classification errors abort recording instead of becoming read warnings', async (outcome, preflight) => {
+    for (const malformed of [{}, { name: '' }, { context: '' }, { name: 123 }, null]) {
+      for (const reverse of [false, true]) {
+        const rows = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }, malformed];
+        await expect(preflight({ ...recordOptions(), outcome,
+          readPr: () => ({ ...fixture, statusCheckRollup: reverse ? rows.toReversed() : rows }),
+          readRequired: async () => ({ checks: ['test'] }),
+        })).rejects.toThrow(TypeError);
+      }
+    }
+  });
+
+  describe('gate-only red and cancelled-check recording regressions', () => {
+    const check = (name, conclusion, extra = {}) => ({ name, status: 'COMPLETED', conclusion, ...extra });
+    const gatePr = (statusCheckRollup = [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]) => ({
+      ...fixture, statusCheckRollup,
+    });
+    const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({
+      headSha: head, pr: gatePr(), requiredChecks: ['test'], ...overrides,
+    });
+    it.each([1, 2, 3])('does not match a --head prefix of %i characters', length => {
+      expect(humanRefusal({ headSha: head.slice(0, length) })).toBeNull();
+    });
+
+    const humanOptions = () => ({ ...recordOptions(), outcome: 'needs-human',
+      readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ checks: ['test'] })) });
+
+    const requiredStates = ['SUCCESS', 'FAILURE', 'CANCELLED', 'STALE', 'IN_PROGRESS', 'MISSING'];
+    const gateStates = ['SUCCESS', 'FAILURE', 'IN_PROGRESS', 'MISSING'];
+    it.each(['review-gate', 'merge-gate'].flatMap(gate => requiredStates.flatMap(required =>
+      gateStates.map(state => ({ gate, required, state })))))(
+      'both preflights: required=$required, $gate=$state', async ({ gate, required, state }) => {
+        const row = (name, value) => value === 'MISSING' ? []
+          : [check(name, value === 'IN_PROGRESS' ? null : value,
+            { status: value === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'COMPLETED',
+              ...(name === 'merge-gate' && value === 'FAILURE'
+                ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) })];
+        const readers = { readPr: () => gatePr([...row('test', required), ...row(gate, state)]),
+          readRequired: async () => ({ checks: ['test', gate] }) };
+        const human = await checkNeedsHumanEscalable({ ...humanOptions(), ...readers });
+        const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
+        expect(human.refusal !== null).toBe(required === 'SUCCESS' && state === 'FAILURE');
+        expect(notCi.refusal !== null).toBe(required !== 'SUCCESS'
+          || (gate === 'merge-gate' && ['IN_PROGRESS', 'MISSING'].includes(state)));
+      },
+    );
+
+    it.each([
+      ['needs-human', checkNeedsHumanEscalable], ['not-a-ci-break', checkNotCiBreakRecordable],
+    ])('%s honors explicit off and default settings resolution', async (outcome, preflight) => {
+      const opts = { ...humanOptions(), outcome,
+        readPr: vi.fn(() => gatePr(outcome === 'needs-human'
+          ? [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]
+          : [check('test', 'CANCELLED'), check('review-gate', 'FAILURE')])) };
+      expect(await preflight({ ...opts, settings: { recheckNotCiBreak: false } })).toEqual({ refusal: null });
+      expect(opts.readPr).not.toHaveBeenCalled();
+      expect(opts.readRequired).not.toHaveBeenCalled();
+      const previous = process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK;
+      try {
+        for (const value of ['off', 'on', undefined]) {
+          if (value === undefined) delete process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK;
+          else process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK = value;
+          opts.readPr.mockClear();
+          opts.readRequired.mockClear();
+          const result = await preflight({ ...opts, settings: undefined });
+          expect(result.refusal !== null).toBe(value !== 'off');
+          expect(opts.readPr).toHaveBeenCalledTimes(value === 'off' ? 0 : 1);
+          expect(opts.readRequired).toHaveBeenCalledTimes(value === 'off' ? 0 : 1);
+        }
+      } finally {
+        if (previous === undefined) delete process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK;
+        else process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK = previous;
+      }
+    });
+
+    it('#6004/#5979: green required test plus red review-gate permits not-a-ci-break and refuses needs-human', () => {
+      expect(refusal({ pr: gatePr(), requiredChecks: ['test'] })).toBeNull();
+      const message = humanRefusal();
+      expect(message).toEqual(expect.any(String));
+      expect(message).toContain('review-gate');
+      expect(message).toMatch(/not (?:a )?CI break|review.{0,30}owed/i);
+      expect(message).toMatch(/(?:do not|cannot|refus\w*|must not)[\s\S]*needs-human/i);
+    });
+
+    it('a proven merge-gate review hold refuses needs-human and names the gate', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('merge-gate', 'FAILURE',
+        { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } })]) }))
+        .toEqual(expect.stringContaining('merge-gate'));
+    });
+
+    it('does not refuse needs-human for a different head', () => {
+      expect(humanRefusal({ headSha: 'abcdef0123456789' })).toBeNull();
+    });
+
+    it('does not refuse needs-human for an empty required roster', () => {
+      expect(humanRefusal({ requiredChecks: [] })).toBeNull();
+    });
+
+    it('a real required test failure plus red review-gate may escalate needs-human', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'FAILURE'), check('review-gate', 'FAILURE')]) })).toBeNull();
+    });
+
+    it.each([false, true])('mixed attempt metadata keeps a real CI break escalatable through injected readers (reverse=%s)', async reverse => {
+      const rows = [
+        check('test', 'SUCCESS', { __typename: 'CheckRun', run_attempt: 1, id: 100, completedAt: '2026-10-28T01:00:00Z' }),
+        check('test', 'FAILURE', { __typename: 'CheckRun', completedAt: '2026-10-28T02:00:00Z' }),
+      ];
+      const pr = gatePr([...(reverse ? rows.toReversed() : rows), check('review-gate', 'FAILURE')]);
+      const readers = { readPr: vi.fn(() => pr), readRequired: vi.fn(async () => ({ checks: ['test'] })) };
+      await expect(checkNeedsHumanEscalable({ ...humanOptions(), ...readers })).resolves.toEqual({ refusal: null });
+      await expect(checkNotCiBreakRecordable({ ...recordOptions(), ...readers })).resolves.toEqual({ refusal: expect.stringContaining('red: test') });
+      expect(readers.readPr).toHaveBeenCalledTimes(2);
+      expect(readers.readRequired).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not refuse needs-human when there are no red checks', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('review-gate', 'SUCCESS')]) })).toBeNull();
+    });
+
+    it('optional CANCELLED smoke does not block recording not-a-ci-break', () => {
+      expect(refusal({ requiredChecks: ['test'], pr: gatePr([
+        check('test', 'SUCCESS'), check('smoke', 'CANCELLED'),
+      ]) })).toBeNull();
+    });
+
+    it('required CANCELLED test blocks recording as still running or pending, not as red', () => {
+      const message = refusal({ requiredChecks: ['test'], pr: gatePr([check('test', 'CANCELLED')]) });
+      expect(message).toEqual(expect.any(String));
+      expect(message).toMatch(/(?:still running|pending):[^.]*test/i);
+      expect(message).not.toMatch(/red:|IS a CI break/);
+    });
+
+    it('optional cancelled smoke cannot hide an IN_PROGRESS required test', () => {
+      const message = refusal({ requiredChecks: ['test'], pr: gatePr([
+        check('smoke', 'CANCELLED'), check('test', null, { status: 'IN_PROGRESS' }),
+      ]) });
+      expect(message).toEqual(expect.any(String));
+      expect(message).toMatch(/(?:still running|pending):[^.]*test/i);
+      expect(message).not.toContain('smoke');
+    });
+
+    it('checkNeedsHumanEscalable refuses gate-only red using injected PR and required-check readers', async () => {
+      const opts = humanOptions();
+      expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: humanRefusal() });
+      expect(opts.readPr).toHaveBeenCalledWith({ pr: 4535, repo: fixture.repo });
+      expect(opts.readRequired).toHaveBeenCalledWith({ repo: fixture.repo });
+    });
+
+    it('checkNeedsHumanEscalable permits a real CI failure with injected readers', async () => {
+      const opts = humanOptions();
+      opts.readPr.mockReturnValue(gatePr([check('test', 'FAILURE'), check('review-gate', 'FAILURE')]));
+      expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    });
+
+    it.each(['not-a-ci-break', 'waiting-on-system-fix', 'inherited-from-base'])(
+      'checkNeedsHumanEscalable skips both readers for outcome %s', async outcome => {
+        const opts = { ...humanOptions(), outcome };
+        expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+        expect(opts.readPr).not.toHaveBeenCalled();
+        expect(opts.readRequired).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['readPr', 'readRequired'])(
+      'checkNeedsHumanEscalable reports a warning and no refusal when %s fails', async reader => {
+        const opts = humanOptions();
+        opts[reader].mockImplementation(() => { throw new Error('offline'); });
+        expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null, warning: expect.stringContaining('offline') });
+        if (reader === 'readPr') expect(opts.readRequired).not.toHaveBeenCalled();
+      },
+    );
+
+    it('checkNeedsHumanEscalable reports an asynchronous required-roster read failure', async () => {
+      const opts = humanOptions();
+      opts.readRequired.mockRejectedValue(new Error('required roster unavailable'));
+      expect(await checkNeedsHumanEscalable(opts)).toEqual({
+        refusal: null, warning: expect.stringContaining('required roster unavailable'),
+      });
+    });
+  });
+
   it.each([{ outcome: 'needs-human' }, { settings: { recheckNotCiBreak: false } }])('skips reads for %j', async (overrides) => {
     const opts = { ...recordOptions(), ...overrides };
     expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: null });
@@ -542,6 +728,100 @@ describe('stacked base escalation facts (#4792)', () => {
 });
 
 
+describe('needs-human CLI preflight wiring — #6004/#5979', () => {
+  it.each([
+    ['review-gate', [], 'review'],
+    ['merge-gate', [{ name: 'ready-to-merge' }], 'review'], ['merge-gate', [], 'review'],
+    ['merge-gate', [], 'job-failure'], ['merge-gate', [], 'other-head'],
+    ['merge-gate', [], 'truncated'], ['merge-gate', [], 'unreadable'],
+    ['review-gate', [], 'malformed', 'not-a-ci-break'],
+    ['review-gate', [], 'malformed', 'needs-human'],
+    ['merge-gate', [], 'conflicting-flags', 'not-a-ci-break'],
+    ['merge-gate', [], 'conflicting-flags', 'needs-human'],
+  ])('classifies raw %s with labels %j and %s evidence before posting (outcome=%s)', (gate, labels, evidence, outcome = 'needs-human') => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-gate-cli-'));
+    try {
+      const log = join(dir, 'calls.jsonl');
+      const preload = join(dir, 'preload.mjs');
+      // Exercise the real CLI and default readers without launching gh or touching shared caches.
+      writeFileSync(join(dir, 'required-status-checks-cache.json'), JSON.stringify({ entries: {
+        'web-everything/web-everything@main': { checks: ['test', ...(gate === 'merge-gate' ? ['merge-gate'] : [])], fetchedAtMs: Date.now(), source: 'live' },
+      } }));
+      writeFileSync(preload, `
+import cp from 'node:child_process';
+import { appendFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, statusCheckRollup: [
+  { name: 'test', status: 'COMPLETED', conclusion: evidence === 'malformed' ? 'FAILURE' : 'SUCCESS' },
+  ...(evidence === 'malformed' ? [{}] : []),
+  ...(evidence === 'conflicting-flags' ? [
+    { name: gate, status: 'COMPLETED', conclusion: 'FAILURE', required: false },
+  ] : []),
+  { name: gate, status: 'COMPLETED', conclusion: 'FAILURE',
+    ...(gate === 'merge-gate' ? { detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/100/job/123' } : {}) },
+] })};
+for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile', 'spawn']) {
+  cp[method] = (...args) => {
+    appendFileSync(${JSON.stringify(log)}, JSON.stringify({ method, args: args.slice(0, 2) }) + '\\n');
+    if (method === 'execFileSync' && args[0] === 'gh') {
+      if (args[1][0] === 'pr' && args[1][1] === 'view') return JSON.stringify(facts);
+      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123') {
+        if (${JSON.stringify(evidence)} === 'unreadable') return 'invalid JSON';
+        return JSON.stringify({ head_sha: ${JSON.stringify(evidence === 'other-head' ? 'a'.repeat(40) : HEAD)}, completed_at: '2026-10-29T03:00:00Z' });
+      }
+      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
+        return ${JSON.stringify('#6042: HOLD\n  hold review-acceptance review pending\n'
+          + (evidence === 'job-failure' ? '  fail-closed codeql security check failed\n' : '')
+          + (evidence === 'truncated' ? '' : 'merge-gate: HOLD — held\n'))};
+    }
+    throw new Error('unexpected child process in CLI preflight test');
+  };
+}
+syncBuiltinESMExports();
+`);
+      const result = spawnSync(process.execPath, ['--import', preload,
+        join(dirname(fileURLToPath(import.meta.url)), '..', 'ci-heal-escalation-mark.mjs'), '6042',
+        `--head=${HEAD}`, `--base-head=${HEAD}`, `--outcome=${outcome}`, '--repo=web-everything/web-everything'], {
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, NODE_OPTIONS: '', WE_COORDINATION_ROOT: dir,
+          WE_CI_HEAL_RECHECK_NOT_CI_BREAK: 'on', MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE: 'on',
+          WE_GH_THROTTLE_COST_HEADERS: '0',
+          WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(1);
+      if (['malformed', 'conflicting-flags'].includes(evidence)) {
+        expect(result.stderr).toContain(evidence === 'malformed'
+          ? 'Check rows must have a non-empty string name or context'
+          : 'Check rows have conflicting required flags');
+        expect(result.stderr).not.toContain('could not re-check');
+        expect(result.stderr).not.toContain('could not post');
+      } else if (evidence === 'review') {
+        expect(result.stderr).toContain('refusing to record needs-human on PR #6042');
+        expect(result.stderr).toContain(gate);
+      } else {
+        expect(result.stderr).not.toContain('refusing to record needs-human');
+        // The posting seam is deliberately closed: real/unknown failures may
+        // escalate, but this fixture never writes a comment or changes labels.
+        expect(result.stderr).toContain('could not post CI-heal escalation comment');
+      }
+      expect(result.stdout).toBe('');
+      const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const reads = calls.filter(call => call.args[0] === 'gh' && ['pr', 'api'].includes(call.args[1]?.[0])
+        && call.args[1][1] !== 'comment');
+      expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
+        'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
+      expect(reads.map(call => call.args[1].slice(0, 2))).toEqual([
+        ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
+          ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
+          ...(evidence === 'unreadable' ? [] : [['api', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
+        ] : []),
+      ]);
+      if (['review', 'malformed', 'conflicting-flags'].includes(evidence)) expect(calls).toEqual(reads);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('inherited-red CLI routing', () => {
   it.each([false, true])('resolves the base on GitHub and tolerates a failed base note (%s)', failNote => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-base-'));
@@ -645,5 +925,170 @@ describe('needs-human verdict void', async () => {
       tick: () => ({ notes: [o.note], prsByNumber: new Map([[5012, o.pr]]) }) });
     expect(postComment).toHaveBeenCalledTimes(1);
     expect(postComment).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('voids: needs-human') }));
+  });
+});
+
+
+describe('R4: default CLI check reader classifies merge-gate review holds', () => {
+  const jobId = 123;
+  const options = (overrides = {}) => {
+    const facts = { number: 6042, url: 'https://github.com/example/repo/pull/6042',
+      headRefOid: HEAD, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'merge-gate', id: jobId, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T13:00:00-04:00' },
+      ] };
+    return { pr: 6042, repo: 'example/repo', headSha: HEAD, outcome: 'needs-human',
+      settings: { recheckNotCiBreak: true }, readRequired: () => ({ checks: ['test', 'merge-gate'] }),
+      prChecksOptions: {
+        runGh: vi.fn(() => JSON.stringify(facts)),
+        readMergeGateVerdict: vi.fn(() => ({ num: 6042, head_sha: HEAD, ok: false,
+          results: [{ id: 'review-acceptance', status: 'hold', reason: 'review pending' }] })),
+        readFreeze: vi.fn(() => { throw new Error('freeze should be lazy'); }),
+        mergeGateSetting: 'on', ...overrides,
+      },
+    };
+  };
+
+  it('refuses needs-human through the real default reader with injected classifier I/O', async () => {
+    const opts = options();
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: expect.stringContaining('merge-gate') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
+    expect(opts.prChecksOptions.runGh).toHaveBeenCalledWith(expect.arrayContaining([
+      'pr', 'view', '6042', '--json', 'number,labels,headRefOid,statusCheckRollup,url',
+    ]), expect.objectContaining({ maxBuffer: expect.any(Number), timeout: expect.any(Number) }));
+    expect(opts.prChecksOptions.readFreeze).not.toHaveBeenCalled();
+  });
+
+  it('also refuses a review:pending candidate whose merge-gate was excused for review work', async () => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.labels = [{ name: 'review:pending' }];
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: expect.stringContaining('merge-gate') });
+  });
+
+  it('R3: real npm ci job failure refuses not-a-ci-break through the default reader with a warning', async () => {
+    const opts = options({ readMergeGateVerdict: () => ({ error: 'npm ci failed before a verdict was printed' }) });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: merge-gate'), warning: expect.stringContaining('npm ci failed') });
+  });
+
+  it('R3: real npm ci job failure permits needs-human through the default reader with a warning', async () => {
+    const opts = options({ readMergeGateVerdict: () => ({ error: 'npm ci failed before a verdict was printed' }) });
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null, warning: expect.stringContaining('npm ci failed') });
+  });
+
+  it.each(['throw', 'error'])('required merge-gate FAILURE with an unreadable verdict (%s) refuses not-a-ci-break', async mode => {
+    const opts = options({ readMergeGateVerdict: () => {
+      if (mode === 'throw') throw new Error('verdict unreadable');
+      return { error: 'verdict unreadable' };
+    } });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: merge-gate'), warning: expect.stringContaining('verdict unreadable') });
+  });
+
+  it.each(['throw', 'error'])('classifier read failure (%s) keeps no-block plus warning policy', async mode => {
+    const opts = options({ readMergeGateVerdict: () => {
+      if (mode === 'throw') throw new Error('classifier unavailable');
+      return { error: 'classifier unavailable' };
+    } });
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null, warning: expect.stringContaining('classifier unavailable') });
+  });
+
+  it.each(['throw', 'error'])('freeze read failure (%s) on an unlabelled candidate surfaces a warning', async mode => {
+    const opts = options({
+      readMergeGateVerdict: vi.fn(() => ({ num: 6042, head_sha: HEAD, ok: false, mainCiGreen: true,
+        completed_at: '2026-10-28T13:00:00-04:00',
+        results: [{ id: 'red-main-freeze', status: 'hold', reason: 'main is RED (freeze: manual freeze: operator hold)' }] })),
+      readFreeze: vi.fn(() => {
+        if (mode === 'throw') throw new Error('freeze unavailable');
+        return { error: 'freeze unavailable' };
+      }),
+    });
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.labels = [];
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts))
+      .toEqual({ refusal: null, warning: expect.stringContaining('freeze unavailable') });
+    expect(opts.prChecksOptions.readFreeze).toHaveBeenCalledTimes(1);
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: merge-gate'), warning: expect.stringContaining('freeze unavailable') });
+  });
+
+  it('a verdict for another head cannot prove a review hold', async () => {
+    const opts = options({ readMergeGateVerdict: () => ({ num: 6042, head_sha: 'another-head', ok: false,
+      results: [{ id: 'review-acceptance', status: 'hold', reason: 'old review pending' }] }) });
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('merge-gate') });
+  });
+
+  it('classifies every failed merge-gate attempt independently', async () => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push({ name: 'merge-gate', id: 99, run_id: 1, run_attempt: 2,
+      status: 'COMPLETED', conclusion: 'FAILURE', completed_at: '2026-10-28T14:00:00-04:00' });
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: expect.stringContaining('merge-gate') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledTimes(2);
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId: 99 });
+  });
+
+  it.each([false, true])('a review hold cannot excuse another merge-gate job failure (reverse=%s)', async reverse => {
+    const opts = options({ readMergeGateVerdict: vi.fn(({ jobId: id }) => ({
+      num: 6042, head_sha: HEAD, ok: false,
+      results: [{ id: id === jobId ? 'review-acceptance' : 'main-ci',
+        status: id === jobId ? 'hold' : 'fail-closed', reason: 'job-specific evidence' }],
+    })) });
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push({ name: 'merge-gate', id: 99,
+      status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T12:00:00-04:00' });
+    if (reverse) facts.statusCheckRollup.reverse();
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: merge-gate') });
+  });
+
+  it.each([false, true])('CodeQL failure is never excused as gate-only through the default reader (reverse=%s)', async reverse => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push(
+      { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1 },
+      { name: 'CodeQL', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2 },
+    );
+    if (reverse) facts.statusCheckRollup.reverse();
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: CodeQL') });
+  });
+
+  it('keeps a distinct required MERGE-GATE failure through the default reader', async () => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push({ name: 'MERGE-GATE', id: 999,
+      status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T14:00:00-04:00' });
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.readRequired = () => ({ checks: ['test', 'merge-gate', 'MERGE-GATE'] });
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: MERGE-GATE') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
+  });
+
+  it.each(['SUCCESS', null])('newer success/pending evidence (%s) retains the older failed merge-gate and reads its verdict', async conclusion => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push({ name: 'merge-gate', id: 99,
+      status: conclusion ? 'COMPLETED' : 'IN_PROGRESS', conclusion,
+      started_at: '2026-10-28T14:00:00-04:00',
+      ...(conclusion ? { completed_at: '2026-10-28T14:01:00-04:00' } : {}) });
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: conclusion ? expect.stringContaining('merge-gate') : null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: conclusion ? null : expect.stringContaining('merge-gate') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
   });
 });

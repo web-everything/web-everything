@@ -28,6 +28,23 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
+
+/** R242: an invalid switch keeps the historical steps running; an absent switch inherits. Sources are logged by the cascade. */
+export function resolveFixDispatchSettings({ env = process.env, file = readSettings(), platform } = {}) {
+  const parse = value => value === undefined ? undefined : value === true;
+  const result = cascadePolicy('fixDispatch', {
+    skipEmptySteps: parse(file?.fixDispatch?.skipEmptySteps),
+  }, {
+    standard: { skipEmptySteps: true },
+    platform: { skipEmptySteps: parse((platform ?? platformPreference('fixDispatch', { env }))?.skipEmptySteps) },
+    env,
+    envValues: { skipEmptySteps: env.WE_FIX_SKIP_EMPTY_STEPS === undefined ? undefined
+      : ['true', '1', 'on'].includes(String(env.WE_FIX_SKIP_EMPTY_STEPS).trim().toLowerCase()) },
+    valid: { skipEmptySteps: value => typeof value === 'boolean' },
+  });
+  return { skipEmptySteps: result.value.skipEmptySteps, sources: result.sources };
+}
 
 export const FIX_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'fix.json');
 export const FIX_SETTINGS_DEFAULTS = Object.freeze({

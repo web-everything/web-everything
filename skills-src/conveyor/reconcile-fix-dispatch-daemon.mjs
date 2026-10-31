@@ -66,11 +66,11 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
-import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
+import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync } from 'node:fs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
@@ -84,6 +84,7 @@ import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconci
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
+import { readCompletePrComments } from '../../scripts/conveyor/pr-comments-complete.mjs';
 import { excusePrMergeGateHolds } from '../../scripts/lib/merge-gate-hold-class.mjs';
 import { ciGreenForEscalation, contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
 import { buildCiHealVerdictVoidComment, notCiBreakVerdictVoidState, needsHumanVoidState, latestCiHealEscalationForHead } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
@@ -91,7 +92,7 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
@@ -765,6 +766,8 @@ export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
   fixSettings = resolveFixSettings(),
+  // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
+  readPrs,
   // R123: resolve once per daemon pass, then carry permission through the fan-out and reconciliation.
   // An explicit boolean overrides policy for tests and read-only callers.
   allowStandDownAutoProceed = fixSettings.standDownAutoProceed,
@@ -878,30 +881,94 @@ export async function runTickAllRepos({
       }),
     });
   };
-  const fix = timed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, allowStandDownAutoProceed,
-      ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  // R242: share discovery only. Do not speculatively reconcile/hydrate active
+  // PRs: their owners still need those reads, and notes needs post-dispatch evidence.
+  const snapshots = new Map();
+  const skipEmptySteps = fixSettings.skipEmptySteps ?? resolveFixDispatchSettings().skipEmptySteps;
+  if (skipEmptySteps && (readPrs || realTick)) {
+    timed('snapshot', () => {
+      for (const repo of repos) {
+        try {
+          let commentsReadFailed = false;
+          const rows = (readPrs ?? defaultReadPrs)({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo,
+            // The default reader may omit a PR whose long thread is unreadable.
+            readComments: (...args) => {
+              try { return readCompletePrComments(...args); }
+              catch (error) { commentsReadFailed = true; throw error; }
+            },
+          });
+          // Missing/partial/truncated discovery runs the historical paths.
+          // defaultReadPrs coerces empty stdout and non-array JSON to [], so an
+          // empty snapshot is missing evidence, not proof that a step has no work.
+          const complete = !commentsReadFailed && Array.isArray(rows) && rows.length > 0 && rows.discoveryIncomplete !== true && rows.length < PR_LIST_LIMIT && rows.every(pr => pr && Number.isInteger(pr.number)
+            && typeof pr.headRefName === 'string' && typeof pr.headRefOid === 'string'
+            && typeof pr.baseRefName === 'string' && typeof pr.isDraft === 'boolean'
+            && typeof pr.body === 'string' && typeof pr.mergeStateStatus === 'string'
+            && Array.isArray(pr.labels) && Array.isArray(pr.statusCheckRollup)
+            && Array.isArray(pr.comments) && Array.isArray(pr.files));
+          if (complete) snapshots.set(repo, { rows });
+        } catch { /* Unknown discovery runs the historical paths. */ }
+      }
+    });
+  }
+  const skippedSteps = [];
+  const stepRepos = new Map();
+  for (const step of ['fix', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft']) {
+    const active = repos.filter(repo => snapshots.get(repo)?.rows.length !== 0);
+    stepRepos.set(step, active);
+    if (repos.length && !active.length) {
+      skippedSteps.push(step);
+      process.stderr.write(`reconcile-fix-dispatch-daemon: skipped ${step} — empty work list (no candidates in shared PR discovery)\n`);
+    }
+  }
+  const emptyResult = () => ({ repos: repos.map(repo => ({ repo, result: { dispatched: [], refusals: [] } })),
+    dispatched: [], refusals: [], reconcileRefusals: [], notes: [], comments: [], autoGrants: [] });
+  const stepTimed = (step, fn) => {
+    if (skippedSteps.includes(step)) { phaseMs[step] = 0; return emptyResult(); }
+    return timed(step, fn);
+  };
+  const sharedTick = (step, tick) => options => {
+    const snapshot = snapshots.get(options.repo);
+    if (!snapshot) return tick(options);
+    const sharedRead = () => structuredClone(snapshot.rows);
+    // Re-run each owner's reconciliation reads; only PR discovery is shared.
+    const reconcile = input => runReconcilePass({ ...input, readPrs: sharedRead });
+    if (step === 'fix' && tick === runReconcileFixDispatch) {
+      // Preserve reconcile's identity: fix uses it to enable net-scope and stack IO.
+      return tick({ ...options, readPrs: sharedRead });
+    }
+    const readOpenPrs = input => {
+      const fields = input?.extraFields ?? [];
+      return snapshot.rows.every(pr => fields.every(field => Object.hasOwn(pr, field)))
+        ? sharedRead() : defaultReadOpenPrs(input);
+    };
+    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile });
+  };
+  const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
+    : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
+      tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
+      ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
+  // ordering, and notes must write from fresh evidence, even on an empty snapshot.
+  // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
     : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
-  const hungCi = timed('hung-ci', () => runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) }));
+  const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = timed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos, ...(mainRedRebaseTick ? { tick: mainRedRebaseTick } : {}) }));
+  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const missingRun = timed('missing-run', () => runMissingRunRecoveryAllRepos({ repos, ...(missingRunTick ? { tick: missingRunTick } : {}) }));
+  const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = timed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos, ...(promoteDraftTick ? { tick: promoteDraftTick } : {}) }));
-  // #4191 (epic #4075/#3383) — the FIFTH half this daemon now owns: surface `planReconcile`'s own `notes`
-  // (`ci-heal-exhausted`/`awaiting-permission`) that neither `fix` nor `ci-heal` above ever forwards — see
-  // {@link runReconcileNotesAllRepos}'s own docblock for why this is a separate, independent read rather than a
-  // field threaded through either of those two.
+  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: stepRepos.get('promote-draft'), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  // #4191: surface notes using fresh evidence after the dispatch/promote steps.
   const notes = timed('notes', () => runReconcileNotesAllRepos({
     repos, ...(notesTick ? { tick: notesTick } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
@@ -924,7 +991,8 @@ export async function runTickAllRepos({
     }
   }
   return {
-    repos: fix.repos, // same repo list every half ticked — the shape onTick's log already reads from
+    repos: repos.map(repo => fix.repos.find(entry => entry.repo === repo)
+      ?? { repo, result: { dispatched: [], refusals: [] }, skipped: true }),
     dispatched: [...fix.dispatched, ...ciHeal.dispatched, ...hungCi.dispatched, ...mainRedRebase.dispatched, ...missingRun.dispatched, ...promoteDraft.dispatched],
     refusals: [...fix.refusals, ...ciHeal.refusals, ...hungCi.refusals, ...mainRedRebase.refusals, ...missingRun.refusals, ...promoteDraft.refusals, ...notes.refusals],
     reconcileRefusals: [...(fix.reconcileRefusals ?? []), ...(ciHeal.reconcileRefusals ?? []), ...(promoteDraft.reconcileRefusals ?? [])],
@@ -944,7 +1012,7 @@ export async function runTickAllRepos({
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
-    phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
+    skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
 

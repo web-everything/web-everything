@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import { defaultLogsDir } from '../conveyor/health-watch.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
@@ -25,6 +26,7 @@ const MAX_SOURCE_BYTES = 1024 * 1024;
 const MAX_JOURNAL_RECORD_BYTES = 4096;
 const JOURNAL_LOCK_STALE_MS = 30000;
 const JOURNAL_LOCK_ATTEMPTS = 10;
+const JOURNAL_LOCK_WAIT_MS = 1000;
 const domains = {
   prCi: { mainStateParity: ['on', 'off'] },
   mergeGate: { recheckWhenMainMoved: ['if-older-than-N-min', 'always', 'off'], recheckMaxAgeMin: 1, onMainRed: ['halt', 'warn', 'off'] },
@@ -316,7 +318,13 @@ export function appendPolicyJournal(path, record, options = {}) {
     return false;
   };
   let held;
-  for (let attempt = 0; attempt < JOURNAL_LOCK_ATTEMPTS; attempt++) {
+  // A time budget, not an attempt count: a live holder on a loaded host (CI shards run
+  // at load 40+) can keep the lock well past ten short sleeps, and a refused append is
+  // a silently lost event. The budget stays far below the 30s stale age.
+  // Monotonic time keeps wall-clock corrections from changing the wait budget.
+  const deadline = performance.now() + JOURNAL_LOCK_WAIT_MS;
+  // Every retry spends the budget, including stale reclamation without a sleep.
+  for (let attempt = 0; attempt === 0 || performance.now() < deadline; attempt++) {
     try {
       held = lock.open(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
       break;
@@ -326,9 +334,9 @@ export function appendPolicyJournal(path, record, options = {}) {
       if (existing && reclaimable(existing)) {
         // Recheck age and liveness under the generation's removal guard too.
         lock.remove(existing, reclaimable);
-      } else if (attempt + 1 < JOURNAL_LOCK_ATTEMPTS) {
+      } else if (performance.now() < deadline) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * (attempt + 1), 80));
-      }
+      } else break;
     }
   }
   if (!held) throw Error('Policy journal lock timeout; event not recorded');

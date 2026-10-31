@@ -1,0 +1,6 @@
+{
+  "$comment": "R242: fixDispatch.skipEmptySteps (boolean, standard true) shares PR discovery per repo/pass; steps skip only with a proven-empty PR list. CI-heal always runs to flush durable owed comments and timeout follow-ups. CI-heal and notes never consume the shared snapshot or skip; notes reads fresh post-dispatch evidence on every repository. Check hydration remains with the owning steps. Missing, unreadable or partial evidence runs the steps. false restores the historical path. Cascade: standard -> platform fixDispatch.skipEmptySteps -> this tool setting -> WE_FIX_SKIP_EMPTY_STEPS (true/1/on or false/0/off). The cascade logs effective value and source.",
+  "fixDispatch": {
+    "skipEmptySteps": true
+  }
+}

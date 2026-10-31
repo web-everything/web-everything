@@ -154,7 +154,8 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(resolveFixerSlotSettings({ env: {} })).toEqual({
       awaitVerifyLoopSeconds: 15, parkedReleasesSlot: true, parkedCapFactor: 2, releaseOnCompletion: true,
     });
-    expect(readSettings().fixDispatch).toMatchObject({ borrowBuildSlots: 'on', borrowAfterMinutes: 15, borrowExecutor: 'codex' });
+    expect(readSettings().fixDispatch).toMatchObject({ borrowBuildSlots: 'on', borrowAfterMinutes: 15, borrowExecutor: 'codex', skipEmptySteps: true });
+    expect(real.owners['fixDispatch.skipEmptySteps']).toBe('settings/fix-empty-steps.json');
     expect(resolveHeavyAdmissionCap({ env: {} })).toBe(3);
     expect(resolveCpuIdleMinPct('build', { env: {} })).toBe(15);
     expect(readCostAdmissionSettings({ env: {} })).toBeTruthy();
