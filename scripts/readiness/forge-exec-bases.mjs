@@ -237,19 +237,25 @@ export async function prewarmDirectory(path,io=fs,uid=process.getuid()) {
   await baseDirectory(path,io);
   if((await io.lstat(path)).uid!==uid)throw new Error('Untrusted prewarm owner');
 }
+// Cheap publication evidence for reuse. Content is still fully verified after
+// an exclusive claim, before any worker can access the tree.
+export async function prewarmEntry(root,sha,slot,manifestDigest,io=fs,uid=process.getuid()) {
+  if(!revision(sha)||!/^[1-9]\d*$/.test(slot))throw new Error('Invalid prewarm identity');
+  const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
+  for(const path of [join(root,'prewarm'),parent,source])await prewarmDirectory(path,io,uid);
+  if(((await io.lstat(source)).mode&0o077)!==0)throw new Error('Prewarm tree is not private');
+  const st=await io.lstat(marker);
+  if(st.uid!==uid||(st.mode&0o022)||!st.isFile()||st.isSymbolicLink()||st.nlink!==1)throw new Error('Untrusted prewarm marker');
+  if((await baseFile(marker,io)).toString()!==JSON.stringify({sha,manifestDigest}))throw new Error('Invalid prewarm marker');
+}
 export async function claimPrewarm(root,sha,slot,destination,manifest,manifestDigest,verify,io=fs,uid=process.getuid()) {
   if(!revision(sha)||!/^[1-9]\d*$/.test(slot))return false;
   const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
   let claimed=false;
   try {
-    for(const path of [join(root,'prewarm'),parent,source])await prewarmDirectory(path,io,uid);
-    // The tree root must be private until verified: the worker UID may traverse the run container.
-    if(((await io.lstat(source)).mode&0o077)!==0)throw new Error('Prewarm tree is not private');
-    const st=await io.lstat(marker);
-    if(st.uid!==uid||(st.mode&0o022)||!st.isFile()||st.isSymbolicLink()||st.nlink!==1)throw new Error('Untrusted prewarm marker');
+    await prewarmEntry(root,sha,slot,manifestDigest,io,uid);
     const existing=await io.lstat(destination).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
     if(existing)throw new Error('Prewarm destination already exists');
-    if((await baseFile(marker,io)).toString()!==JSON.stringify({sha,manifestDigest}))throw new Error('Invalid prewarm marker');
     await io.rename(source,destination);claimed=true;
     await verify(destination,manifest,manifestDigest,{fs:io});
     await io.chmod(destination,0o755);
