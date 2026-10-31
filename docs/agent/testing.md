@@ -3619,3 +3619,13 @@ projections: a non-test source can become a test under `tests/`, or acquire an
 excluded component. Rows 26–30 pin those refusals and benign nested omissions for
 full and delta manifests. Alias expansion shares the filesystem walk's limits and
 refuses with `manifest-walk-limit` (local fallback) when that budget is exhausted.
+
+
+## Forge ignored test discovery
+
+Git ignores do not define Vitest discovery. Full and delta manifest admission omit ignored
+test-shaped build outputs only when every cwd `vitest*.config.*` excludes them from its
+include-minus-exclude set. Missing/unreadable configs, evaluation errors and malformed globs
+retain the existing local fallback. Keep fixture discovery configs explicit; test the native
+Node loader against the repository configs as well as full/delta parity. Warm bases export
+tracked Git entries only; their policy exclusions still refuse test-shaped entries.

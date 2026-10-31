@@ -293,6 +293,7 @@ describe('fast Git manifest',()=>{
   });
 });
 describe('ignored build output test policy',()=>{
+  beforeEach(async()=>fs.copyFile(new URL('./fixtures/forge-vitest.config.mjs',import.meta.url),join(cwd,'vitest.config.mjs')));
   it.each(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static','nested/dist'])('refuses tests in ignored whole build directory %s',async dir=>{
     await write('.gitignore',dir+'/\n');await fs.mkdir(join(cwd,dir),{recursive:true});
     await write(dir+'/output.test.mjs','stale output');

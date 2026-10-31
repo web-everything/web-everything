@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
+import {loadTestSelector} from './forge-test-selection.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -257,7 +258,7 @@ const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local f
   code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
 });
 // Walk independently of Git's inventory. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,testSelected,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -281,8 +282,8 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
-        // (a) Ignored tests still belong to the runner's discovery universe.
-        if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
+        // (a) Only proven ignored, undiscovered tests may be omitted.
+        if(isTestFile(path)&&!shipped.has(key)&&(!ignoredPaths.has(key)||await testSelected(path)))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
         if(!shipped.has(key)&&ignoredPaths.has(key)&&!classifyManifestPath(path).excluded) {
@@ -294,7 +295,7 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
             if(++count>100000||(bytes+=projected.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',projected);
             const policy=classifyManifestPath(projected);
             // Ignored runtime data may be excluded solely by the tracked link's prefix.
-            if(isTestFile(projected)||policy.excluded&&(sourceExtension.test(policy.names.at(-1))
+            if(isTestFile(projected)&&await testSelected(projected)||policy.excluded&&(sourceExtension.test(policy.names.at(-1))
               ||classifyManifestPath(projected.subarray(directoryPrefix(link.linkPath).length)).excluded))throw manifestRefusal('unshipped-symlink',link.linkPath);
             seen.add(projectedKey);aliases.push(projected);
           }
@@ -347,14 +348,16 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Git ignore rules do not establish test-runner exclusions. Even a whole
-  // ignored build directory can contain runnable tests (scripts/build/__tests__).
+  // Git ignore rules alone do not establish runner exclusions. Load discovery
+  // evidence lazily, once per snapshot, and retain refusal on any uncertainty.
+  let testSelector;
+  const testSelected=async path=>(await (testSelector??=loadTestSelector({cwd,fs})))(path);
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredPaths = splitPaths(ignored.stdout);
   for (const path of ignoredPaths) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
-    if (isTestFile(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
+    if (isTestFile(path) && await testSelected(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
   }
   const walkDone=beginSub('inventory-walk');
   let files;
@@ -562,7 +565,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     }
   }
   try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
-    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
+    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),testSelected,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};

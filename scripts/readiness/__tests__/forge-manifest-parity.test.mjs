@@ -26,8 +26,44 @@ async function oracle(dir=cwd,prefix='') {
 beforeEach(async()=>{
   env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('GIT_')));
   root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-parity-')));cwd=join(root,'work');await fs.mkdir(cwd);
-  git(['init','-q']);await write('package-lock.json','{}');await write('keep.txt','keep');await write('a.test.mjs','test');commit();
+  git(['init','-q']);await write('package-lock.json','{}');await write('keep.txt','keep');await write('a.test.mjs','test');
+  await fs.copyFile(new URL('./fixtures/forge-vitest.config.mjs',import.meta.url),join(cwd,'vitest.config.mjs'));commit();
   const full=await buildManifest({cwd,env});base={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
+});
+
+it.each(['missing configs','unreadable config','evaluation failure','invalid include glob','invalid exclude glob'])
+('fails closed for an ignored build test with %s in full, delta and remote admission',async fault=>{
+  const path='_site/assets/js/__tests__/x.test.ts';
+  await write(path,'export {};');await write('.gitignore','_site/\n');
+  if(fault==='missing configs')await fs.unlink(join(cwd,'vitest.config.mjs'));
+  if(fault==='evaluation failure')await write('vitest.integration.config.mjs',"throw new Error('cannot evaluate discovery');\n");
+  if(fault==='invalid include glob'||fault==='invalid exclude glob')await write('vitest.integration.config.mjs',
+    `export default {test:{include:${fault==='invalid include glob'?"['[bad']":"[]"},exclude:${fault==='invalid exclude glob'?"['[bad']":"[]"}}};\n`);
+  const io={...fs,readFile:async(file,...args)=>{
+    if(fault==='unreadable config'&&String(file)===join(cwd,'vitest.config.mjs'))throw Object.assign(new Error('denied'),{code:'EACCES'});
+    return fs.readFile(file,...args);
+  }};
+  await expect(buildManifest({cwd,env,fs:io})).rejects.toMatchObject({code:'ignored-test-file'});
+  await expect(buildDeltaManifest({cwd,env,fs:io,base})).rejects.toMatchObject({code:'ignored-test-file'});
+  const calls=[],exec=async call=>{
+    calls.push(call);
+    if(call.file==='ssh'&&call.args.length===2&&call.args[1]==='true')return {code:0,stdout:Buffer.alloc(0)};
+    if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
+    return defaultExec(call);
+  };
+  expect(await runRemote({cwd,env,fs:io,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}}))
+    .toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file'});
+  expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+});
+
+it('omits a config-excluded ignored test from full and delta entries',async()=>{
+  const path='scripts/build/lost.test.mjs';
+  await write(path,'export {};');await write('.gitignore','scripts/build/\n');
+  await write('vitest.config.mjs',"export default {test:{include:['**/*.test.mjs'],exclude:['scripts/build/**']}};\n");
+  for(const actual of [await buildManifest({cwd,env}),await buildDeltaManifest({cwd,env,base})]){
+    expect(actual.entries.map(entry=>entry.path.toString())).not.toContain(path);
+    expect(actual.excluded.map(entry=>entry.toString())).not.toContain(path);
+  }
 });
 
 it('refuses a subdirectory or unreadable binding as unbound-worktree before remote dispatch',async()=>{
@@ -312,10 +348,17 @@ const rows=[
   [29,'nested tracked directory links refuse an ignored leaf projected into an excluded path'],
   [30,'nested tracked directory links omit an ignored non-test leaf at every alias'],
   [31,'allowed tracked directory alias omits ignored runtime files beside a node_modules/.bin symlink'],
+  [32,'ignored _site test outside all Vitest includes is omitted'],
+  [33,'ignored _site test selected only by integration config still refuses'],
 ];
 it.each(rows)('row %i: %s',async row=>{
-  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29].includes(row);
+  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29,33].includes(row);
   const omitted=[];
+  if(row===32||row===33){
+    const path='_site/assets/js/__tests__/x.test.ts';
+    await write(path,'export {};');await write('.gitignore','_site/\n');omitted.push(path);
+    if(row===33)await write('vitest.integration.config.mjs',"export default {test:{include:['_site/**/*.test.ts'],exclude:[]}};\n");
+  }
   if(row===2){const st=await fs.stat(join(cwd,'keep.txt'));await write('keep.txt','diff');await fs.utimes(join(cwd,'keep.txt'),st.atimeMs/1000,st.mtimeMs/1000);}
   if(row===3){const twin=join(root,'twin');await fs.cp(cwd,twin,{recursive:true});await fs.writeFile(join(twin,'keep.txt'),'twin');hostile.GIT_DIR=join(twin,'.git');hostile.GIT_WORK_TREE=twin;}
   if(row===4){const stale=join(root,'stale-index');await fs.copyFile(join(cwd,'.git/index'),stale);await write('new.txt','new');git(['add','new.txt']);hostile.GIT_INDEX_FILE=stale;}
@@ -385,7 +428,7 @@ it.each(rows)('row %i: %s',async row=>{
   for(const delta of [false,true]) {
     const build=()=>delta?buildDeltaManifest({cwd,env:hostile,exec,base}):buildManifest({cwd,env:hostile,exec});
     if(refuse){
-      if(row>=20)await expect(build()).rejects.toMatchObject({code:row===25?'ignored-test-file':'unshipped-symlink'});
+      if(row>=20)await expect(build()).rejects.toMatchObject({code:[25,33].includes(row)?'ignored-test-file':'unshipped-symlink'});
       else await expect(build()).rejects.toThrow();
       continue;
     }
@@ -405,7 +448,7 @@ it.each(rows)('row %i: %s',async row=>{
   if(refuse) {
     calls.length=0;
     const result=await runRemote({cwd,env:hostile,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
-    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:[7,25].includes(row)?'ignored-test-file':[6,8].includes(row)?'unshipped-test-file':'unshipped-symlink'});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:[7,25,33].includes(row)?'ignored-test-file':[6,8].includes(row)?'unshipped-test-file':'unshipped-symlink'});
     expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
   }
   if(row===3) {
