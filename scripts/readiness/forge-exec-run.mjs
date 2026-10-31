@@ -8,7 +8,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, materializeWorktree} from './forge-exec-bases.mjs';
+import {BASE_RETENTION, baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, claimPrewarm, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -735,7 +735,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       return publishTelemetry();
     },
     async bases() {
-      try{return {delta:1,bases:(await readyBases(bases)).slice(0,4).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
+      try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
       catch{return {delta:1,bases:[]};}
     },
     async ['base-manifest']({sha}) {
@@ -823,6 +823,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       const worker=selected??{user:'forge-exec',root:runs};
       const container=join(worker.root,request.run),work=join(container,'work');
       await directory(container,true,operator); await directory(work);
+      let prewarmed=false;
       if(request.baseSha!==undefined) {
         await baseGuard(bases,async()=>{
           const base=await readBase(bases,request.baseSha,request.baseManifestDigest);
@@ -841,8 +842,25 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
           const walk=async prefix=>{for(const name of await readdir(prefix.length?bytePath(work,prefix):work,{encoding:'buffer'})){const p=prefix.length?Buffer.concat([prefix,Buffer.from('/'),name]):name;pathParts(p);const st=await lstat(bytePath(work,p));if(st.isSymbolicLink())throw new Error('Delta symlink');if(st.isDirectory())await walk(p);else {if(!st.isFile())throw new Error('Delta special file');const entry=finalEntries.find(e=>e.path.equals(p));if(!entry)throw new Error('Unlisted delta leaf');incoming.push(entry);}}};
           await walk(Buffer.alloc(0));
           const overlay=new Set(incoming.map(e=>e.path.toString('hex'))),assembled=join(container,'assembled');
-          await mkdir(assembled,{mode:0o755});
-          await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
+          if(worker.active)prewarmed=await claimPrewarm(bases,request.baseSha,worker.user.slice('forge-exec-'.length),assembled,
+            base.manifest,request.baseManifestDigest,verifyManifest,filesystem,operator.uid);
+          if(prewarmed) {
+            const parents=new Map();
+            for(const entry of baseEntries) {
+              if(!deleted.has(entry.path.toString('hex'))&&!overlay.has(entry.path.toString('hex')))continue;
+              await rm(bytePath(assembled,entry.path));
+              for(let i=0;i<entry.path.length;i++)if(entry.path[i]===47) {
+                const parent=entry.path.subarray(0,i);parents.set(parent.toString('hex'),parent);
+              }
+            }
+            // Remove empty former parents too, including directory-to-file
+            // replacements. Surviving base leaves keep their original inodes.
+            for(const parent of [...parents.values()].sort((a,b)=>b.length-a.length))
+              await rmdir(bytePath(assembled,parent)).catch(error=>{if(!['ENOTEMPTY','EEXIST'].includes(error.code))throw error;});
+          } else {
+            await mkdir(assembled,{mode:0o755});
+            await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
+          }
           await copyLeaves(work,assembled,incoming);
           // Verify primary full M before installing and before exposing any of
           // the reconstructed bytes to the worker. Siblings remain Mac-shipped.
@@ -881,7 +899,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       let updates=Promise.resolve();
       const update=()=>{
         const record={runId:request.run,startedAtET,stageMs:{install:runAt===undefined?Math.max(0,Math.round(clock()-installAt)):installMs,
-          run:runAt===undefined?0:Math.max(0,Math.round(clock()-runAt))},code:null};
+          run:runAt===undefined?0:Math.max(0,Math.round(clock()-runAt))},code:null,prewarmed};
         updates=updates.then(()=>publishTelemetry(record)).catch(error=>{telemetryError=error;});
         return updates;
       };
@@ -903,7 +921,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       const {slot:reservedSlot,...receiptState}=prepared;
       const receipt={...receiptState,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
-      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code});
+      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed});
       if(telemetryError)throw telemetryError;
       return result;
       },prepared);

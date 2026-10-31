@@ -3106,6 +3106,11 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+The run-scoped temp allocator canonicalizes its base before creating fixtures: macOS's
+`/var` alias must not reach descriptor-relative snapshot copies, which reject symlink
+ancestors. Preserve those production no-follow guards; test the allocator with an explicit
+symlink alias rather than teaching the copy code to follow links.
+
 Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
 `core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
 `full-scan`. Unreadable or incomplete config evidence also requires that fallback.
