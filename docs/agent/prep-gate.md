@@ -52,3 +52,10 @@ general-purpose; other read-only agent types are allowed. Hook exceptions warn,
 log `hook-error`, and fail open. Open-pr skips prep for dry runs and warns/delegates
 unreadable body files to its existing handling. Missing or incomplete readable prep
 is refused. Tests inject readers/gates explicitly to isolate other runner checks.
+
+For `--body-file`, the prep gate and any pre-PR review bypass body copy use
+pr-land's `expandHome` behavior: replace **any** leading `~` with `homedir()` via
+`replace(/^~/, homedir())`. This includes `~draft.md` and `~someone/body.md`,
+which concatenate the home directory with the suffix rather than resolve a user
+name. `scripts/__tests__/open-pr-prep.test.mjs` checks that the gate and bypass
+copy read the same file selected by that expansion.

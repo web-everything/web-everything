@@ -98,15 +98,14 @@ function withBypassInBody(argv, b) {
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
-    // Expand only a standalone `~` or `~/`; other leading tildes are literal paths.
+    // Use the same leading-`~` expansion as the prep read and pr-land's expandHome.
     writeFileSync(out, readFileSync(expandBodyFileHome(argv[i].slice('--body-file='.length)), 'utf8') + renderBypassNote(b));
     return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
   } catch (e) { cleanup(); throw e; }
 }
 
-function expandBodyFileHome(path) {
-  return path === '~' || path.startsWith('~/') ? homedir() + path.slice(1) : path;
-}
+/** Match pr-land's expandHome exactly: replace any leading `~`, including in `~name`. */
+const expandBodyFileHome = (p) => (p && p.startsWith('~') ? p.replace(/^~/, homedir()) : p);
 
 /** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
 const GATE_ACTIONS = Object.freeze(['pass', 'advise', 'refuse']);

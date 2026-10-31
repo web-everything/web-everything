@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrLandRunner } from '../operations/open-pr-io.mjs';
 
@@ -43,15 +43,16 @@ describe('open-pr prep admission', () => {
       expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
     } else expect(spawn).toHaveBeenCalledOnce();
   }));
-  it.each(['~', '~draft.md', '~someone/body.md', '~\n'])('expands only standalone home syntax when reading prep from %j', (path) => fixture(({ dir, runner, argv, spawn }) => {
+  it.each(['~', '~draft.md', '~someone/body.md', '~\n'])('matches pr-land leading-home expansion when reading prep from %j', (path) => fixture(({ runner, argv, spawn }) => {
     const readPrepBody = vi.fn(() => prep);
     expect(runner({ readPrepBody })({ argv: [...argv.slice(0, 2), `--body-file=${path}`] }).outcome).toBe('opened');
-    expect(readPrepBody.mock.calls).toEqual([[path === '~' ? homedir() : join(dir, path), 'utf8']]);
+    expect(readPrepBody.mock.calls).toEqual([[path.replace(/^~/, homedir()), 'utf8']]);
     expect(spawn).toHaveBeenCalledOnce();
   }));
-  it.each(['~', '~/prep/body.md', '~draft.md', '~someone/body.md', '~\n'])('uses the same home syntax for the bypass body copy from %j', (path) => fixture(({ dir }) => {
+  it.each(['~', '~/prep/body.md', '~draft.md', '~someone/body.md', '~\n', 'body.md', 'nested/~body.md'])('prep gate and bypass copy read the file selected by pr-land home expansion for %j', (path) => fixture(({ dir }) => {
     const home = join(dir, path === '~' ? 'body.md' : 'home');
-    const source = path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : join(dir, path);
+    // The oracle is pr-land's expandHome, followed by resolution in its working directory.
+    const source = resolve(dir, path && path.startsWith('~') ? path.replace(/^~/, home) : path);
     mkdirSync(dirname(source), { recursive: true });
     writeFileSync(source, prep);
     const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../operations/open-pr-io.mjs')).href;
@@ -59,8 +60,17 @@ describe('open-pr prep admission', () => {
     const script = `
       import { readFileSync } from 'node:fs';
       import { createPrLandRunner } from ${JSON.stringify(moduleUrl)};
-      let copiedBody, spawns = 0;
+      import { prepVerdict } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lib/prep-block.mjs')).href)};
+      let copiedBody, gatedBody, prepPath, spawns = 0;
       const run = createPrLandRunner({
+        readPrepBody: (path, encoding) => {
+          prepPath = path;
+          return readFileSync(path, encoding);
+        },
+        prepGate: (body) => {
+          gatedBody = body;
+          return prepVerdict(body);
+        },
         prePrReview: () => ({ action: 'pass', bypass: { reason: 'operator reason', actor: 'operator', operatorInstruction: 'Ship this change' } }),
         spawn: (_command, args) => {
           spawns++;
@@ -69,14 +79,18 @@ describe('open-pr prep admission', () => {
         },
       });
       const result = run({ argv: ['--ref=lane/prep', '--title=feature', '--body-file=' + process.argv[1]] });
-      process.stdout.write(JSON.stringify({ result, copiedBody, spawns }));
+      process.stdout.write(JSON.stringify({ result, gatedBody, prepPath, copiedBody, spawns }));
     `;
     const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, path], {
       cwd: dir, env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     });
     expect(child.status, child.stderr).toBe(0);
-    const { result, copiedBody, spawns } = JSON.parse(child.stdout);
+    const { result, gatedBody, prepPath, copiedBody, spawns } = JSON.parse(child.stdout);
     expect(result).toMatchObject({ outcome: 'opened' });
+    // A native child's cwd can use the canonical spelling of a symlinked TMPDIR.
+    expect(realpathSync(prepPath)).toBe(realpathSync(source));
+    expect(gatedBody).toBe(prep);
+    expect(copiedBody.startsWith(gatedBody)).toBe(true);
     expect(copiedBody).toContain(prep);
     expect(copiedBody).toContain('operator reason');
     expect(spawns).toBe(1);
