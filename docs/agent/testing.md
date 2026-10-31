@@ -2009,6 +2009,21 @@ or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and lo
 Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-report guards,
 isolated retries and unsupported shell syntax stay local. Keep both planning and actual
 spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
+When a phase planned without a local slot exits non-zero, confirm it once locally through
+normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
+local timeout flags). Log the confirmation and use its result and failure details for the
+phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
+Only a remote-planned first attempt sets `WE_FORGE_GATE_DISPATCH`, without a held local slot.
+Local phases and confirmation clear even an inherited dispatch flag so nested wrappers cannot
+dispatch remotely while the local slot is held. Pin both environment shapes in the spawn fixture.
+Each attempt retains its own phase timeout and admission heartbeat. Remote green never
+reruns; watchdog timeouts and signal failures (including shell-inferred signals) retain their
+infrastructure verdict without local confirmation. Exit 124 never reruns and remains
+infrastructure/unconfirmed until an operator confirms remote termination. Cover green,
+red, 75 deferral, 124, watchdog timeouts, signals and local-planned red,
+including local confirmation failure and restoration of stripped flags in the spawn fixture.
+Set `WE_VERIFY_PHASE_ADMISSION` to `0`/`1` in fixtures and assert the recorded admission mode;
+`false`/`true` strings are ignored and can silently exercise the default twice.
 Wrapper eligibility checks the entire command: compound commands, redirections and shell
 expansions retain a local slot and `WE_HEAVY_ADMISSION_HELD` for their full execution scope.
 Keep the compound-wrapper table for both npm scripts and the direct heavy-admission wrapper,

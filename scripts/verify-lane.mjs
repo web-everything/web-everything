@@ -84,7 +84,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { phaseAdmissionPlan, decidePhaseRemote, readRemoteReport, phaseRunLocation, overallRunLocation, remoteInfrastructureFailure } from './lib/verify-remote-routing.mjs';
+import { phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, overallRunLocation, remoteInfrastructureFailure } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
@@ -619,9 +619,9 @@ const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? ''
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase, command) {
+async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   let decision = { remote: false, reason: 'raw-command' };
-  if (!phaseAdmissionPlan({ command, decision: { remote: true } }).takeLocalSlot) {
+  if (!forceLocal && !phaseAdmissionPlan({ command, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
   }
@@ -648,6 +648,7 @@ async function acquireAdmission(phase, command) {
 }
 const admission = await acquireAdmission('vitest', retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
 let currentAdmission = admission;
+let vitestAdmittedLocally = admission.ok;
 const ranOnPhases = {};
 let remoteUnconfirmed = false;
 let firstPhaseAdmission = admission;
@@ -688,12 +689,17 @@ let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
 const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal });
-async function runGate(command, args) {
+async function runGate(command, args, { forgeDispatch = false } = {}) {
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
-  const childEnv = { ...process.env, WE_FORGE_GATE_DISPATCH: '1', WE_VERIFY_REMOTE_REPORT: reportFile };
-  if (currentAdmission.remote) delete childEnv[ADMISSION_HELD_ENV];
-  else childEnv[ADMISSION_HELD_ENV] = '1';
+  const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
+  if (forgeDispatch) {
+    childEnv.WE_FORGE_GATE_DISPATCH = '1';
+    delete childEnv[ADMISSION_HELD_ENV];
+  } else {
+    delete childEnv.WE_FORGE_GATE_DISPATCH;
+    childEnv[ADMISSION_HELD_ENV] = '1';
+  }
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
   let bytes = 0;
@@ -796,18 +802,33 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
   }
   currentAdmission = acquired ?? admission;
-  if (currentAdmission.ok) {
-    slotHeartbeat = setInterval(() => {
-      try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
-    }, SLOT_HEARTBEAT_MS);
-    slotHeartbeat.unref();
+  function startHeartbeat() {
+    if (currentAdmission.ok) {
+      slotHeartbeat = setInterval(() => {
+        try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+      }, SLOT_HEARTBEAT_MS);
+      slotHeartbeat.unref();
+    }
   }
+  startHeartbeat();
   firstPhaseAdmission = null;
   const started = performance.now();
   try {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
     const plan = phaseAdmissionPlan({ command, decision: { remote: currentAdmission.remote === true } });
-    const result = await runGate(args ? command : plan.command, args);
+    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
+    if (shouldConfirmRemoteRed({ plan, ...result })) {
+      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
+      process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
+      acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command, { forceLocal: true });
+      currentAdmission = acquired;
+      process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
+      startHeartbeat();
+      // Run the original command, including flags stripped for Forge. One confirmation only;
+      // its verdict and failure inventory replace the remote result before isolated retry.
+      result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
+    }
+    if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok;
     const locationKey = outcomeKey ?? kind ?? (/^npm run test:unit(?=\s|$)/.test(command) ? 'vitest' : /^npm run check:standards(?=\s|$)/.test(command) ? 'standards' : 'gate');
     const previousLocation = ranOnPhases[locationKey];
     ranOnPhases[locationKey] = previousLocation ? {
@@ -853,7 +874,7 @@ try {
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
     retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
-  if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
+  if (retryableGate && vitestAdmittedLocally && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
     editedDuringRun = changedNow?.changedFiles ?? [];

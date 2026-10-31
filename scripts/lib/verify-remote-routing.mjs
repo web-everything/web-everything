@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand } from '../readiness/forge-exec-run.mjs';
+import { verificationInfrastructureFailure } from './lane-verify.mjs';
 
 function simpleShellWords(command) {
   if (/[\r\n]/.test(command)) return null;
@@ -48,6 +49,11 @@ export function phaseAdmissionPlan({ command, decision }) {
       && words[2] === 'run'));
   const remote = eligible && decision?.remote === true;
   return { command, takeLocalSlot: !remote, setHeld: !remote };
+}
+
+export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut } = {}) {
+  return plan?.takeLocalSlot === false && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
+    && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }
 
 // This is a preflight only. The nested wrapper remains the sole remote executor and fallback owner.

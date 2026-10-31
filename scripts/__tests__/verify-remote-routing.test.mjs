@@ -1,9 +1,31 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
-import { phaseAdmissionPlan, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 
 describe('verify remote routing', () => {
+  it.each([
+    ['remote green never reruns', false, 0, false],
+    ['remote red confirms locally', false, 1, true],
+    ['remote nested deferral confirms locally', false, 75, true],
+    ['remote termination unconfirmed never reruns', false, 124, false],
+    ['local-planned red never reruns', true, 1, false],
+    ['unknown plan never reruns', undefined, 1, false],
+    ['missing exit code never reruns', false, undefined, false],
+    ['unreadable exit code never reruns', false, '1', false],
+  ])('%s', (_name, takeLocalSlot, exitCode, expected) => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot }, exitCode })).toBe(expected);
+    if (exitCode === 124) expect(remoteInfrastructureFailure({ exitCode })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
+  });
+  it.each([
+    ['watchdog timeout without a signal', { exitCode: 2, timedOut: true }],
+    ['watchdog timeout with SIGKILL', { exitCode: 2, signal: 'SIGKILL', timedOut: true }],
+    ['signal normalized to exit 2', { exitCode: 2, signal: 'SIGTERM' }],
+    ['shell-inferred signal', { exitCode: 143 }],
+  ])('remote infrastructure failure never confirms locally: %s', (_name, result) => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, ...result })).toBe(false);
+  });
   it.each([
     'npm run test:unit',
     "npm run test:unit -- 'path with spaces.test.mjs' --reporter=dot",
@@ -170,7 +192,7 @@ import { pathToFileURL } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 const repo = process.cwd();
 describe('verify-lane remote phase spawn', () => {
-  it.each([
+  const cases = [
     ['remote', 0, 'remote', false],
     ['local', 0, 'local', true],
     ['local-fallback', 0, 'local', false],
@@ -192,7 +214,15 @@ describe('verify-lane remote phase spawn', () => {
     ...[false, true].map(phaseAdmission => ['remote', 0, 'remote', false,
       "npx vitest run 'one.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission]),
-  ])('%s phase (exit %i, %s, held=%s): %s preserves admission and terminal evidence (argv=%j, phaseAdmission=%s)', (mode, code, location, held, gateCommand, expectedArgs, phaseAdmission) => {
+    ['remote', 0, 'local', false, 'npm run check:standards', undefined, undefined, 75],
+    ['remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1],
+    ['local', 1, 'local', true, 'npm run test:unit', undefined, undefined, 0, 1],
+    ...[false, true].flatMap(phaseAdmission => [0, 1].map(localExit => ['remote', localExit, 'local', false,
+      "npx vitest run 'one.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
+      ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, localExit])),
+    ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], true, 1, 1, 0],
+  ];
+  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit) {
     const root = mkdtempSync(join(tmpdir(), 'verify-routing-'));
     try {
       execFileSync('git', ['init', '-q'], { cwd: root });
@@ -202,6 +232,9 @@ describe('verify-lane remote phase spawn', () => {
       const routing = pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href;
       const gate = pathToFileURL(resolve(repo, 'scripts/lib/verify-lane-gate.mjs')).href;
       const laterPhases = phaseAdmission !== undefined;
+      const confirmed = mode === 'remote' && remoteExit !== 0 && remoteExit !== 124;
+      const infrastructureReason = mode === 'watchdog' ? 'verify-timeout' : mode === 'signal' ? 'verify-signal'
+        : code === 124 ? 'remote-termination-unconfirmed' : null;
       const phasePlan = { command: `${gateCommand} && npm run check:standards`, testCommand: gateCommand,
         standardsCommand: 'npm run check:standards', scanCommands: [], gateReasons: [],
         decision: { mode: 'shrink', reasons: [], settingsSource: { standards: 'fixture' }, changedFiles: ['one.test.mjs'], targets: ['one.test.mjs'],
@@ -214,8 +247,8 @@ describe('verify-lane remote phase spawn', () => {
         if (url === ${JSON.stringify(heavy)}) return {format:'module',shortCircuit:true,source:
           'export * from ' + JSON.stringify(url+'?actual') + ';' +
           "import {appendFileSync} from 'node:fs';" +
-          "export async function acquireSlotBlocking() { appendFileSync(process.env.ROUTING_EVENTS, JSON.stringify({event:'acquire'})+'\\\\n'); return {ok:true,slot:0,waitedMs:0}; }" +
-          "export function releaseOwnedSlot() {} export function heartbeatOwnedSlot() { appendFileSync(process.env.ROUTING_EVENTS, JSON.stringify({event:'heartbeat'})+'\\\\n'); }"};
+          "export async function acquireSlotBlocking({kind}) { appendFileSync(process.env.ROUTING_EVENTS, JSON.stringify({event:'acquire',kind})+'\\\\n'); return {ok:true,slot:0,waitedMs:0}; }" +
+          "export function releaseOwnedSlot() { appendFileSync(process.env.ROUTING_EVENTS, JSON.stringify({event:'release'})+'\\\\n'); } export function heartbeatOwnedSlot() { appendFileSync(process.env.ROUTING_EVENTS, JSON.stringify({event:'heartbeat'})+'\\\\n'); }"};
         if (url === ${JSON.stringify(routing)}) return {format:'module',shortCircuit:true,source:
           'export * from ' + JSON.stringify(url+'?actual') + ';' +
           "export async function decidePhaseRemote() { return {remote:process.env.ROUTING_MODE !== 'local',reason:'fixture policy'}; }"};
@@ -228,34 +261,62 @@ describe('verify-lane remote phase spawn', () => {
 const fs=require('node:fs');
 const mode=process.env.ROUTING_MODE;
 const held=process.env.WE_HEAVY_ADMISSION_HELD === '1';
-fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'spawn',held, report:!!process.env.WE_VERIFY_REMOTE_REPORT, executable:require('node:path').basename(process.argv[1]), args:process.argv.slice(2)})+'\\n');
+const retry=process.argv.includes('--maxWorkers=1');
+const exitCode=held ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
+fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'spawn',held, env:{WE_HEAVY_ADMISSION_HELD:process.env.WE_HEAVY_ADMISSION_HELD,WE_FORGE_GATE_DISPATCH:process.env.WE_FORGE_GATE_DISPATCH}, report:!!process.env.WE_VERIFY_REMOTE_REPORT, executable:require('node:path').basename(process.argv[1]), args:process.argv.slice(2)})+'\\n');
 if(mode==='local-fallback') {
   if(held) throw Error('double local admission');
   fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'nested-acquire'})+'\\n');
 }
-if(['remote','local-fallback'].includes(mode))fs.appendFileSync(process.env.WE_VERIFY_REMOTE_REPORT,JSON.stringify({location:mode,receiptId:'run-123456',exitCode:0})+'\\n');
+if(['remote','local-fallback'].includes(mode) && !held)fs.appendFileSync(process.env.WE_VERIFY_REMOTE_REPORT,JSON.stringify({location:mode,receiptId:'run-123456',exitCode})+'\\n');
 if(mode==='unreadable')fs.writeFileSync(process.env.WE_VERIFY_REMOTE_REPORT,'{');
-if(mode === 'remote') setTimeout(() => process.exit(0), 1200);
-else process.exit(mode==='unconfirmed'?124:0);
+if(exitCode) {
+  const file=held ? (process.env.ROUTING_RETRY_EXIT ? 'local.test.mjs' : 'one.test.mjs') : 'remote.test.mjs';
+  fs.writeSync(2,' FAIL  '+file+' > '+(held?'local':'remote')+' failure\\nAssertionError: fixture failure\\n');
+  fs.writeSync(1,' Test Files  1 failed (1)\\n Tests  1 failed (1)\\n Duration  1s\\n');
+}
+if(mode === 'watchdog' && !held) { ${keepAliveScript({ maxLifetimeMs: 15000 })} }
+else if(mode === 'signal' && !held) process.kill(process.pid, 'SIGTERM');
+else if(mode === 'remote' && (!held || process.env.ROUTING_LOCAL_DELAY === '1')) setTimeout(() => process.exit(exitCode), 1200);
+else process.exit(mode==='unconfirmed'?124:exitCode);
 `;
       writeFileSync(join(bin, 'npm'), wrapper, { mode: 0o755 });
       writeFileSync(join(bin, 'npx'), wrapper, { mode: 0o755 });
       writeFileSync(join(root, 'raw.cjs'), wrapper.replace(/^#!.*\n/, ''));
+      if (retryExit !== undefined) {
+        writeFileSync(join(root, 'local.test.mjs'), '// untouched fixture\n');
+        execFileSync('git', ['add', 'local.test.mjs'], { cwd: root });
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'untouched test'], { cwd: root });
+        execFileSync('git', ['branch', 'origin/main'], { cwd: root });
+      }
       const command = gateCommand ?? (mode === 'raw' ? 'node raw.cjs' : 'npm run test:unit');
       const result = spawnSync(process.execPath, ['--import', preload, resolve(repo, 'scripts/verify-lane.mjs'),
         ...(laterPhases ? [] : ['--gate=' + command]), '--json'], {
         cwd: root, encoding: 'utf8', timeout: 30000,
         env: { ...process.env, PATH: bin + ':' + process.env.PATH, ROUTING_MODE: mode, ROUTING_EVENTS: events,
+          ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
+          ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
+          ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched',
+          WE_VERIFY_RUN_ALL_PHASES: '1', WE_FORGE_GATE_DISPATCH: '1',
+          ...(mode === 'watchdog' ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}),
           ROUTING_PHASES: laterPhases ? '1' : '0',
-          ...(laterPhases ? { WE_VERIFY_PHASE_ADMISSION: String(phaseAdmission), WE_VERIFY_ALWAYS_RUN_TESTS: '' } : {}),
+          ...(laterPhases ? { WE_VERIFY_PHASE_ADMISSION: phaseAdmission ? '1' : '0', WE_VERIFY_ALWAYS_RUN_TESTS: '' } : {}),
           WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' },
       });
       expect(result.error, result.stderr).toBeUndefined();
-      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(code === 124 ? 3 : 0);
+      const expectedStatus = infrastructureReason ? 3 : code === 0 ? 0 : 2;
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(expectedStatus);
       const marker = JSON.parse(readFileSync(join(root, '.git/.lane-verify'), 'utf8'));
       const observed = readFileSync(events, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(observed.filter(e => e.event === 'acquire')).toHaveLength(held ? 1 : 0);
+      const confirmationCount = confirmed ? (laterPhases ? 2 : 1) : 0;
+      expect(observed.filter(e => e.event === 'acquire')).toHaveLength((held ? 1 : confirmationCount) + (retryExit !== undefined ? 1 : 0));
+      expect(observed.filter(e => e.event === 'release')).toHaveLength(observed.filter(e => e.event === 'acquire').length);
       expect(observed.find(e => e.event === 'spawn')).toMatchObject({held,report:true});
+      for (const spawn of observed.filter(e => e.event === 'spawn')) {
+        expect(spawn.env).toEqual(spawn.held
+          ? { WE_HEAVY_ADMISSION_HELD: '1' }
+          : { WE_FORGE_GATE_DISPATCH: '1' });
+      }
       if (expectedArgs) expect(observed.find(e => e.event === 'spawn')).toMatchObject({
         executable: held ? 'npx' : 'npm', args: expectedArgs,
       });
@@ -267,27 +328,70 @@ else process.exit(mode==='unconfirmed'?124:0);
           ]);
       }
       if (laterPhases) {
+        expect(marker.phases.admissionMode).toBe(phaseAdmission ? 'phase' : 'gate');
         // Shared gate admission must never replay the first phase's rewritten Vitest command.
         expect(observed.filter(e => e.event === 'spawn').map(e => ({ executable: e.executable, args: e.args })))
           .toEqual([
             { executable: 'npm', args: expectedArgs },
+            ...(confirmed ? [{ executable: 'npx', args: ['vitest', ...gateCommand.split(' ').slice(2).map(arg => arg.replaceAll("'", ''))] }] : []),
+            ...(retryExit !== undefined ? [{ executable: 'npx', args: ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', './local.test.mjs'] }] : []),
             { executable: 'npm', args: ['run', 'check:standards'] },
+            ...(confirmed ? [{ executable: 'npm', args: ['run', 'check:standards'] }] : []),
           ]);
-        expect(marker.ranOn.phases.standards).toEqual({ location: 'remote', receiptId: 'run-123456' });
+        expect(marker.ranOn.phases.standards).toEqual(confirmed
+          ? { location: 'local', remoteRedConfirmedLocally: true }
+          : { location: 'remote', receiptId: 'run-123456' });
+        if (confirmed) expect(observed.filter(e => e.event === 'acquire').map(e => e.kind)).toEqual(
+          phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
       }
       expect(observed.filter(e => e.event === 'nested-acquire')).toHaveLength(mode === 'local-fallback' ? 1 : 0);
-      const phase = laterPhases || command.startsWith('npm run test:unit') ? 'vitest' : 'gate';
+      const phase = laterPhases || command.startsWith('npm run test:unit') ? 'vitest' : command.startsWith('npm run check:standards') ? 'standards' : 'gate';
       expect(marker.ranOn).toMatchObject({ location, phases: { [phase]: { location } } });
-      if (mode === 'remote') {
+      if (confirmed) {
+        expect(marker.ranOn.phases[phase]).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+        expect(result.stderr.split(`verify-lane: remote phase red (exit ${remoteExit}) - confirming locally`)).toHaveLength(confirmationCount + 1);
+        expect(observed.filter(e => e.event === 'spawn' && e.held)).toHaveLength(confirmationCount + (retryExit !== undefined ? 1 : 0));
+        if (!laterPhases) {
+          expect(observed.filter(e => e.event === 'spawn')).toHaveLength(2);
+          expect(observed.filter(e => e.event === 'heartbeat').length).toBeGreaterThan(0);
+        }
+      } else {
+        expect(result.stderr).not.toContain('confirming locally');
+        if (!laterPhases && command !== 'npm run test:unit && node raw.cjs') expect(observed.filter(e => e.event === 'spawn')).toHaveLength(1);
+      }
+      if (mode === 'remote' && !confirmed) {
         expect(marker.ranOn.phases[phase].receiptId).toBe('run-123456');
         expect(observed.filter(e => e.event === 'heartbeat')).toHaveLength(0);
       }
-      if (code === 124) {
+      if (infrastructureReason) {
         expect(marker.status).toBe('infrastructure-failure');
-        expect(marker.infrastructure.reason).toBe('remote-termination-unconfirmed');
-        expect(marker.exitCode).toBe(124);
-      } else expect(marker.status).toBe('green');
-      expect(result.status).toBe(code === 124 ? 3 : 0);
+        expect(marker.infrastructure.reason).toBe(infrastructureReason);
+        expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
+        if (code === 124) expect(marker.exitCode).toBe(124);
+        if (mode === 'watchdog') {
+          expect(result.stderr).toContain('phase exceeded phaseTimeoutMs=2000');
+          expect(marker.infrastructure).toMatchObject({ signal: 'SIGKILL', phase: 'gate', ceilingMs: 2000 });
+        }
+        if (mode === 'signal') expect(marker.infrastructure.signal).toBe('SIGTERM');
+      } else expect(marker.status).toBe(code === 0 ? 'green' : 'red');
+      if (code !== 0 && !infrastructureReason) {
+        expect(marker.failureDetails.summary).toContain('local failure');
+        expect(marker.failureDetails.summary).not.toContain('remote failure');
+      }
+      if (retryExit !== undefined) {
+        expect(marker.isolatedRetry).toBe('flaky-outside-diff');
+        expect(marker.retriedFailures).toEqual([{ file: 'local.test.mjs', kind: 'assertion' }]);
+      }
     } finally { rmSync(root, { recursive:true,force:true }); }
+  }
+  it.each(cases)('%s phase (exit %i, %s, held=%s): %s preserves admission and terminal evidence (argv=%j, phaseAdmission=%s, remoteExit=%s, localExit=%s, retryExit=%s)', verifyRemotePhase);
+  it('local confirmation holds admission and clears inherited Forge dispatch after a remote red', () => {
+    verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1);
+  });
+  it('remote watchdog timeout remains infrastructure failure without local confirmation', () => {
+    verifyRemotePhase('watchdog', 2, 'local', false);
+  }, 15000);
+  it('remote signal remains infrastructure failure without local confirmation', () => {
+    verifyRemotePhase('signal', 2, 'local', false);
   });
 });
