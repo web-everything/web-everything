@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
@@ -1580,6 +1581,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     reason: `${reason}; inspect stored evidence before retrying — no call launched` });
   if (!['fresh', 'resume'].includes(redTeamMode) || typeof repo !== 'string' || !repo.trim()
     || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !isPinnedRev(head)) return refuse('invalid red-team recovery identity or mode');
+  const refuseAdmission = reason => ({ ...refuse(reason), invalidAdmission: true });
   let records, status, comments, admittedStatus;
   try {
     records = io.readRecords({ strict: true });
@@ -1591,17 +1593,19 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     // Admission replaced the status while the job still held its claim. Only that
     // exact queued writer may carry its prior evidence through to this shared seat.
     if (redTeamAdmission !== undefined) {
+      redTeamAdmission = decodeRecoveryAdmission(redTeamAdmission);
+      if (JSON.stringify(status) !== JSON.stringify(redTeamAdmission.queued)) return refuseAdmission('queued admission mismatch');
       if (!redTeamAdmission || !Object.hasOwn(redTeamAdmission, 'prior')
         || !Number.isInteger(redTeamAdmission.pid) || redTeamAdmission.pid <= 0
-        || status?.status !== 'queued' || status.pid !== redTeamAdmission.pid) return refuse('red-team admission changed');
+        || status?.status !== 'queued' || status.pid !== redTeamAdmission.pid) return refuseAdmission('red-team admission changed');
       const prior = redTeamAdmission.prior;
-      if (prior !== null && (!prior || prior.repo !== repo || Number(prior.pr) !== Number(pr) || prior.head !== head)) return refuse('prior red-team status identity mismatch');
+      if (prior !== null && (!prior || prior.repo !== repo || Number(prior.pr) !== Number(pr) || prior.head !== head)) return refuseAdmission('prior red-team status identity mismatch');
       const result = ['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult) ? prior.result : null;
-      if (JSON.stringify(status.result) !== JSON.stringify(result)) return refuse('red-team admission result changed');
+      if (JSON.stringify(status.result) !== JSON.stringify(result)) return refuseAdmission('red-team admission result changed');
       admittedStatus = status;
       status = prior;
     }
-  } catch { return refuse('red-team status unreadable'); }
+  } catch { return redTeamAdmission !== undefined ? refuseAdmission('red-team admission unreadable') : refuse('red-team status unreadable'); }
   try {
     comments = io.readRecoveryComments({ pr, repo });
     if (!Array.isArray(comments)) throw Error('invalid comments');
@@ -2070,6 +2074,10 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
   };
+  const readAdmission = () => {
+    try { return decodeRecoveryAdmission(readFileSync(flag('red-team-admission'), 'utf8')); }
+    catch { return null; } // A missing/corrupt handoff must enter the guard, never ordinary execution.
+  };
   const readPayload = () => {
     try { return existsSync(flag('loop-json')) ? JSON.parse(readFileSync(flag('loop-json'), 'utf8')) : null; } catch { return null; }
   };
@@ -2082,7 +2090,7 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
     return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only'),
-      redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : JSON.parse(flag('red-team-admission')) }, redTeamIo)
+      redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : readAdmission() }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the

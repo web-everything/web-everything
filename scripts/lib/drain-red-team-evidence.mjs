@@ -1,4 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
+import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
@@ -47,8 +48,72 @@ function readStatusFile(path, { repo, pr, head }) {
   return [undefined, 0].includes(status.retryCount) && retryMarkerSpent(path) ? { ...status, retryCount: 1 } : status;
 }
 
+const digest = bytes => bytes === null ? null : createHash('sha256').update(bytes).digest('hex');
+const optionalBytes = path => { try { return readFileSync(path); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+
+/** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
+export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = sharedRunsDir(env),
+  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
+  const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
+  const parsed = bytes === null ? null : JSON.parse(bytes);
+  if (bytes !== null && (!parsed || parsed.repo !== repo || Number(parsed.pr) !== Number(pr) || parsed.head !== head)) throw Error('recovery writer identity mismatch');
+  const records = readScorecards();
+  const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
+    && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
+  const runs = readFilteredInOrder(listRunIds(runsDir).filter(id => id.startsWith('review-pr-')), id => readRun(id, runsDir),
+    run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
+      && run.findings?.read?.netBasis?.rev === head, (run, id) => ({ id, run }))
+    .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }))
+    .sort((a, b) => b.at - a.at || b.id.localeCompare(a.id));
+  const marker = optionalBytes(`${path}.stale-redispatch-1`);
+  return { ...key, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: runs[0]?.run ?? null,
+    // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
+    ...(runs.length ? {} : { carryEvidence: readDrainRedTeamEvidence({ ...key, env, runsDir, readScorecards: () => records }) }),
+    evidenceSha256: digest(JSON.stringify([seats, runs[0] ?? null])),
+    markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
+}
+
+/** CAS and atomic rename share an exclusive recovery claim; a loser never rolls back the winner. */
+export function recordRedTeamStatus(input, options = {}) {
+  const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
+  mkdirSync(dirname(path), { recursive: true });
+  const claim = `${path}.retry-claim`;
+  let fd;
+  try { fd = openSync(claim, 'wx', 0o600); }
+  catch (error) {
+    if (error.code === 'EEXIST') throw Object.assign(Error('retry already admitted'), { code: 'RED_TEAM_RETRY_ADMITTED' });
+    throw error;
+  }
+  try {
+    if (Object.hasOwn(options, 'expectedSha256') && digest(optionalBytes(path)) !== options.expectedSha256) throw Error('raw recovery writer changed');
+    return writeRedTeamStatus(input, options);
+  } finally { closeSync(fd); rmSync(claim, { force: true }); }
+}
+
+/** Roll back only this admission under the same claim; another writer always wins. */
+export function restoreRecoveryWriter(key, witness, admissionId) {
+  const path = statusPath(key, key.env ?? process.env), claim = `${path}.retry-claim`;
+  const fd = openSync(claim, 'wx', 0o600);
+  try {
+    const current = optionalBytes(path);
+    if (!current || JSON.parse(current).admissionId !== admissionId) return;
+    if (witness.rawWriter.parsed === null) rmSync(path, { force: true });
+    else writeJsonAtomic(path, witness.rawWriter.parsed);
+  } finally { closeSync(fd); rmSync(claim, { force: true }); }
+}
+
+/** Versioned job-to-runner codec: identity and queued writer are checked again by the runner. */
+export function decodeRecoveryAdmission(value) {
+  const data = typeof value === 'string' ? JSON.parse(value) : value;
+  if (!data || data.schema !== 1 || !Object.hasOwn(data, 'prior') || !Number.isInteger(data.pid) || data.pid <= 0
+    || data.queued?.status !== 'queued' || data.queued.pid !== data.pid || typeof data.queued.repo !== 'string'
+    || !Number.isSafeInteger(Number(data.queued.pr)) || Number(data.queued.pr) <= 0
+    || !/^[a-f0-9]{40}$/i.test(data.queued.head ?? '')) throw Error('invalid recovery admission schema');
+  return data;
+}
+
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
@@ -95,6 +160,7 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
+    ...(admissionId ? { admissionId } : {}),
     ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }

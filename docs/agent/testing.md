@@ -3460,3 +3460,11 @@ indeterminate run must be inspected before starting a new pass. Focused proof li
 `scripts/operations/__tests__/manual-daemon-pass.test.mjs`; operation enumeration and declaration
 map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
 discovers script modules dynamically and has no hand-maintained operation list.
+
+## Raw red-team recovery witnesses (#7537)
+
+Recovery fixtures persist the panel read as a `review-pr` run and inject the scorecard store;
+`status.loopPayload` is deliberately truncated. Bind abandonment to raw writer bytes and seat/run
+evidence, then test mutations before queued admission. Never normalize the status in a reader.
+Inject raw witness/probe failures directly for liveness refusals; do not infer them from normalized drain flags.
+The dead-owner and skip-settlement breaks are discovered from disk and run with `vitest.soak.config.ts` using the shared repo registry.
