@@ -99,17 +99,28 @@ export function readRemoteReport(path, read = readBoundedReport) {
     return reports;
   } catch { return []; }
 }
-export function phaseRunLocation(reports) {
-  if (!reports.length) return { location: 'local' };
+// `remoteAttempt` says whether this attempt was handed to the nested remote wrapper. Only an attempt that was
+// never dispatched (verify-lane held admission itself) is local without a report. A dispatched attempt without a
+// valid report is `unknown`: it may have run anywhere. A missing flag counts as dispatched (fails closed).
+export function phaseRunLocation(reports, { remoteAttempt } = {}) {
+  if (!reports.length) return { location: remoteAttempt === false ? 'local' : 'unknown' };
   const locations = new Set(reports.map(r => r.location === 'remote' ? 'remote' : 'local'));
   const receiptId = reports.find(r => r.location === 'remote' && r.receiptId)?.receiptId;
   return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}) };
 }
-export function overallRunLocation(phases) {
-  const locations = new Set(Object.values(phases).map(p => p.location));
-  return { location: locations.size > 1 || locations.has('mixed') ? 'mixed' : [...locations][0] ?? 'local', phases };
+export function mergeRunLocation(a, b) {
+  if (a === 'unknown' || b === 'unknown') return 'unknown';
+  return a === b ? a : 'mixed';
 }
-export function remoteInfrastructureFailure({ exitCode } = {}) {
-  return exitCode === 124 ? { reason: 'remote-termination-unconfirmed',
-    detail: 'verification infrastructure failure: remote termination unconfirmed (exit 124); confirm remote termination before retrying; no test verdict.' } : null;
+export function overallRunLocation(phases) {
+  const locations = [...new Set(Object.values(phases).map(p => p.location))];
+  return { location: locations.length ? locations.reduce(mergeRunLocation) : 'local', phases };
+}
+export const REMOTE_TERMINATION_UNCONFIRMED = Object.freeze({ reason: 'remote-termination-unconfirmed',
+  detail: 'verification infrastructure failure: remote termination unconfirmed (exit 124); confirm remote termination before retrying; no test verdict.' });
+// Exit 124 means "remote termination unconfirmed" only for an attempt dispatched to the remote wrapper whose report
+// does not prove it finished locally. A local attempt (never dispatched, or a local confirmation) exiting 124 is an
+// ordinary local exit code.
+export function remoteInfrastructureFailure({ exitCode, remoteAttempt, ranOn } = {}) {
+  return exitCode === 124 && remoteAttempt === true && ranOn?.location !== 'local' ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
 }

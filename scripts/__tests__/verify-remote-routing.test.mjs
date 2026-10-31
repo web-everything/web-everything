@@ -16,7 +16,7 @@ describe('verify remote routing', () => {
     ['unreadable exit code never reruns', false, '1', false],
   ])('%s', (_name, takeLocalSlot, exitCode, expected) => {
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot }, exitCode })).toBe(expected);
-    if (exitCode === 124) expect(remoteInfrastructureFailure({ exitCode })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
+    if (exitCode === 124) expect(remoteInfrastructureFailure({ exitCode, remoteAttempt: !takeLocalSlot })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
   });
   it.each([
     ['watchdog timeout without a signal', { exitCode: 2, timedOut: true }],
@@ -143,19 +143,31 @@ describe('verify remote routing', () => {
     expect(phaseRunLocation([{ location: 'local-fallback', exitCode: 0 }])).toEqual({ location: 'local' });
     expect(overallRunLocation({ vitest: { location: 'remote' }, scan: { location: 'local' } }).location).toBe('mixed');
   });
-  it('unreadable, malformed and oversized reports fail closed to local', () => {
+  it('an unknown phase location makes the overall location unknown, never mixed or local', () => {
+    expect(overallRunLocation({ vitest: { location: 'unknown' }, scan: { location: 'local' } }).location).toBe('unknown');
+    expect(overallRunLocation({ vitest: { location: 'mixed' }, scan: { location: 'unknown' } }).location).toBe('unknown');
+    expect(overallRunLocation({ vitest: { location: 'local' }, scan: { location: 'local' } }).location).toBe('local');
+    expect(overallRunLocation({ vitest: { location: 'mixed' }, scan: { location: 'local' } }).location).toBe('mixed');
+    expect(overallRunLocation({}).location).toBe('local');
+  });
+  it('unreadable, malformed and oversized reports of a dispatched attempt fail closed to unknown, never local', () => {
     for (const read of [() => { throw Error('unreadable'); }, () => '{', () => 'x'.repeat(65537)]) {
-      expect(phaseRunLocation(readRemoteReport('report', read))).toEqual({ location: 'local' });
+      expect(phaseRunLocation(readRemoteReport('report', read), { remoteAttempt: true })).toEqual({ location: 'unknown' });
+      // A caller that does not say whether it dispatched is treated as dispatched.
+      expect(phaseRunLocation(readRemoteReport('report', read))).toEqual({ location: 'unknown' });
     }
+  });
+  it('an attempt never dispatched to the remote wrapper is local without a report', () => {
+    expect(phaseRunLocation([], { remoteAttempt: false })).toEqual({ location: 'local' });
   });
   it.each([
     { location: 'remote', exitCode: 0 },
     ...['', ' ', null, 123].map(receiptId => ({ location: 'remote', receiptId, exitCode: 0 })),
     ...[undefined, null, '0', 0.5, -1, 255].map(exitCode => ({ location: 'remote', receiptId: 'run-123456', exitCode })),
-  ])('incomplete remote report fails closed to local: %j', report => {
+  ])('incomplete remote report fails closed to unknown: %j', report => {
     const reports = readRemoteReport('report', () => JSON.stringify(report));
     expect(reports).toEqual([]);
-    expect(phaseRunLocation(reports)).toEqual({ location: 'local' });
+    expect(phaseRunLocation(reports, { remoteAttempt: true })).toEqual({ location: 'unknown' });
   });
   it('accepts a completed remote report only with receipt and integer exit code', () => {
     const report = { location: 'remote', receiptId: 'run-123456', exitCode: 0 };
@@ -163,8 +175,15 @@ describe('verify remote routing', () => {
       .toEqual({ location: 'remote', receiptId: 'run-123456' });
   });
   it('exit 124 is infrastructure/unconfirmed rather than a test verdict', () => {
-    expect(remoteInfrastructureFailure({ exitCode: 124 })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
-    expect(remoteInfrastructureFailure({ exitCode: 1 })).toBeNull();
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'unknown' } })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'remote' } })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
+    expect(remoteInfrastructureFailure({ exitCode: 1, remoteAttempt: true })).toBeNull();
+  });
+  it('a local exit 124 (never dispatched, a local confirmation, or a proven local fallback) is not remote-unconfirmed', () => {
+    expect(remoteInfrastructureFailure({ exitCode: 124 })).toBeNull();
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: false, ranOn: { location: 'local', remoteRedConfirmedLocally: true } })).toBeNull();
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'local' } })).toBeNull();
   });
   it('report writes are best effort and heartbeat of a non-owned slot is harmless', () => {
     const root = mkdtempSync(join(tmpdir(), 'verify-report-'));
@@ -196,8 +215,8 @@ describe('verify-lane remote phase spawn', () => {
     ['remote', 0, 'remote', false],
     ['local', 0, 'local', true],
     ['local-fallback', 0, 'local', false],
-    ['unconfirmed', 124, 'local', false],
-    ['unreadable', 0, 'local', false],
+    ['unconfirmed', 124, 'unknown', false],
+    ['unreadable', 0, 'unknown', false],
     ['raw', 0, 'local', true],
     ['raw', 0, 'local', true, 'npm run test:unit && node raw.cjs'],
     ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
@@ -222,7 +241,7 @@ describe('verify-lane remote phase spawn', () => {
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, localExit])),
     ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], true, 1, 1, 0],
   ];
-  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit) {
+  function verifyRemotePhase(mode, code, location, held, gateCommand, expectedArgs, phaseAdmission, remoteExit = 0, localExit = 0, retryExit, localBehavior = '') {
     const root = mkdtempSync(join(tmpdir(), 'verify-routing-'));
     try {
       execFileSync('git', ['init', '-q'], { cwd: root });
@@ -233,8 +252,11 @@ describe('verify-lane remote phase spawn', () => {
       const gate = pathToFileURL(resolve(repo, 'scripts/lib/verify-lane-gate.mjs')).href;
       const laterPhases = phaseAdmission !== undefined;
       const confirmed = mode === 'remote' && remoteExit !== 0 && remoteExit !== 124;
-      const infrastructureReason = mode === 'watchdog' ? 'verify-timeout' : mode === 'signal' ? 'verify-signal'
-        : code === 124 ? 'remote-termination-unconfirmed' : null;
+      const watchdogKill = mode === 'watchdog' || localBehavior === 'watchdog';
+      const signalKill = mode === 'signal' || localBehavior === 'signal';
+      // Exit 124 is remote-unconfirmed only for the dispatched attempt; a local confirmation's 124 is a local exit code.
+      const infrastructureReason = watchdogKill ? 'verify-timeout' : signalKill ? 'verify-signal'
+        : code === 124 && !confirmed ? 'remote-termination-unconfirmed' : null;
       const phasePlan = { command: `${gateCommand} && npm run check:standards`, testCommand: gateCommand,
         standardsCommand: 'npm run check:standards', scanCommands: [], gateReasons: [],
         decision: { mode: 'shrink', reasons: [], settingsSource: { standards: 'fixture' }, changedFiles: ['one.test.mjs'], targets: ['one.test.mjs'],
@@ -262,6 +284,7 @@ const fs=require('node:fs');
 const mode=process.env.ROUTING_MODE;
 const held=process.env.WE_HEAVY_ADMISSION_HELD === '1';
 const retry=process.argv.includes('--maxWorkers=1');
+const localBehavior=held ? process.env.ROUTING_LOCAL_BEHAVIOR : '';
 const exitCode=held ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
 fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'spawn',held, env:{WE_HEAVY_ADMISSION_HELD:process.env.WE_HEAVY_ADMISSION_HELD,WE_FORGE_GATE_DISPATCH:process.env.WE_FORGE_GATE_DISPATCH}, report:!!process.env.WE_VERIFY_REMOTE_REPORT, executable:require('node:path').basename(process.argv[1]), args:process.argv.slice(2)})+'\\n');
 if(mode==='local-fallback') {
@@ -275,8 +298,9 @@ if(exitCode) {
   fs.writeSync(2,' FAIL  '+file+' > '+(held?'local':'remote')+' failure\\nAssertionError: fixture failure\\n');
   fs.writeSync(1,' Test Files  1 failed (1)\\n Tests  1 failed (1)\\n Duration  1s\\n');
 }
-if(mode === 'watchdog' && !held) { ${keepAliveScript({ maxLifetimeMs: 15000 })} }
+if((mode === 'watchdog' && !held) || localBehavior === 'watchdog') { ${keepAliveScript({ maxLifetimeMs: 15000 })} }
 else if(mode === 'signal' && !held) process.kill(process.pid, 'SIGTERM');
+else if(localBehavior === 'signal') setTimeout(() => process.kill(process.pid, 'SIGTERM'), 1200);
 else if(mode === 'remote' && (!held || process.env.ROUTING_LOCAL_DELAY === '1')) setTimeout(() => process.exit(exitCode), 1200);
 else process.exit(mode==='unconfirmed'?124:exitCode);
 `;
@@ -298,7 +322,7 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
           ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched',
           WE_VERIFY_RUN_ALL_PHASES: '1', WE_FORGE_GATE_DISPATCH: '1',
-          ...(mode === 'watchdog' ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}),
+          ...(watchdogKill ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}), ROUTING_LOCAL_BEHAVIOR: localBehavior,
           ROUTING_PHASES: laterPhases ? '1' : '0',
           ...(laterPhases ? { WE_VERIFY_PHASE_ADMISSION: phaseAdmission ? '1' : '0', WE_VERIFY_ALWAYS_RUN_TESTS: '' } : {}),
           WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' },
@@ -366,14 +390,19 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
       if (infrastructureReason) {
         expect(marker.status).toBe('infrastructure-failure');
         expect(marker.infrastructure.reason).toBe(infrastructureReason);
-        expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
+        if (confirmed) expect(marker.ranOn.phases[phase]).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+        else expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
         if (code === 124) expect(marker.exitCode).toBe(124);
-        if (mode === 'watchdog') {
+        if (watchdogKill) {
           expect(result.stderr).toContain('phase exceeded phaseTimeoutMs=2000');
           expect(marker.infrastructure).toMatchObject({ signal: 'SIGKILL', phase: 'gate', ceilingMs: 2000 });
         }
-        if (mode === 'signal') expect(marker.infrastructure.signal).toBe('SIGTERM');
+        if (signalKill) expect(marker.infrastructure.signal).toBe('SIGTERM');
       } else expect(marker.status).toBe(code === 0 ? 'green' : 'red');
+      if (confirmed && code === 124) {
+        expect(marker).not.toHaveProperty('infrastructure');
+        expect(marker.exitCode).toBe(124);
+      }
       if (code !== 0 && !infrastructureReason) {
         expect(marker.failureDetails.summary).toContain('local failure');
         expect(marker.failureDetails.summary).not.toContain('remote failure');
@@ -389,9 +418,18 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
     verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1);
   });
   it('remote watchdog timeout remains infrastructure failure without local confirmation', () => {
-    verifyRemotePhase('watchdog', 2, 'local', false);
+    verifyRemotePhase('watchdog', 2, 'unknown', false);
   }, 15000);
   it('remote signal remains infrastructure failure without local confirmation', () => {
-    verifyRemotePhase('signal', 2, 'local', false);
+    verifyRemotePhase('signal', 2, 'unknown', false);
+  });
+  it('local confirmation exit 124 is a local red, never remote-termination-unconfirmed', () => {
+    verifyRemotePhase('remote', 124, 'local', false, 'npm run test:unit', undefined, undefined, 1, 124);
+  });
+  it('local confirmation hitting the phase ceiling is a local verify-timeout, never remote-unconfirmed', () => {
+    verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'watchdog');
+  }, 20000);
+  it('local confirmation killed by a signal is a local verify-signal, never remote-unconfirmed', () => {
+    verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'signal');
   });
 });

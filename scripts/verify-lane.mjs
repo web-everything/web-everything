@@ -84,7 +84,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, overallRunLocation, remoteInfrastructureFailure } from './lib/verify-remote-routing.mjs';
+import { phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
@@ -688,7 +688,8 @@ let isolatedRetry = null;
 let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
-const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal });
+// The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
+const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 async function runGate(command, args, { forgeDispatch = false } = {}) {
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
@@ -775,7 +776,7 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
   });
   const reports = readRemoteReport(reportFile);
   if (reports.some(r => r.location === 'local-fallback')) process.stderr.write('verify-lane: remote attempt fell back to local admission (nested wrapper owns the slot)\n');
-  return { ...result, ranOn: phaseRunLocation(reports), failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
+  return { ...result, remoteAttempt: forgeDispatch, ranOn: phaseRunLocation(reports, { remoteAttempt: forgeDispatch }), failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
   } finally { rmSync(reportDir, { recursive: true, force: true }); }
 }
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
@@ -833,11 +834,12 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     const previousLocation = ranOnPhases[locationKey];
     ranOnPhases[locationKey] = previousLocation ? {
       ...previousLocation, ...result.ranOn,
-      location: previousLocation.location === result.ranOn.location ? result.ranOn.location : 'mixed',
+      location: mergeRunLocation(previousLocation.location, result.ranOn.location),
     } : result.ranOn;
-    if (result.exitCode === 124) remoteUnconfirmed = true;
+    const remoteFailure = remoteInfrastructureFailure(result);
+    if (remoteFailure) remoteUnconfirmed = true;
     if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
-    if (kind) recordOutcome(outcomeKey ?? kind, { ...buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }), ...(remoteInfrastructureFailure(result) ? { reason: 'remote-termination-unconfirmed', infrastructure: remoteInfrastructureFailure(result) } : {}) });
+    if (kind) recordOutcome(outcomeKey ?? kind, { ...buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }), ...(remoteFailure ? { reason: 'remote-termination-unconfirmed', infrastructure: remoteFailure } : {}) });
     return result;
   } catch (error) {
     if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ kind, signal: error?.signal,
@@ -1005,7 +1007,7 @@ const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudi
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
 const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
-  ?? (remoteUnconfirmed ? remoteInfrastructureFailure({ exitCode: 124 }) : null);
+  ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
