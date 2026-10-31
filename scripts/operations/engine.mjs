@@ -320,14 +320,11 @@ function resolvePending(run, declaration, resume) {
  * REFUSED on a `confirm` resume: a person answering a question spends no jurors, so `telemetry` there is a
  * caller confusion, and silently dropping it would make a lost cost figure look like a free run.
  *
- * `lens` and `effort` on the row come from the REQUEST the engine itself suspended with, never from the
- * adapter's copy — the row stays attributable to the declared call even if the caller reports nonsense. Only
- * `model` accepts a reported value, and ONLY as an override of the declared one (#3151): `--model` on the
- * command line means the spawn can legitimately differ from the declaration, and a row that reported the
- * declared model about a run judged by another one would be a false record. The asymmetry is deliberate and is
- * exactly as wide as the divergence: `effort` has no flag, and `lens` is a declaration INPUT field, so for both
- * the request already IS the truth. Widening this to all three would let any injected judge — the HTTP adapter
- * takes one as a dependency — stamp a run record with a lens the declaration never asked for.
+ * `lens` comes from the suspended REQUEST; `model` may report a provider override (#3151).
+ * Effort normally comes from the request too, ignoring a caller's bare `effort` report. The adapter can
+ * explicitly supply `effectiveEffort` when the provider resolves a different tier (e.g. agy's model suffix
+ * supersedes --effort). Store that tier under `effort`, keeping the declared request intact. Neither a model
+ * override nor an effective tier can relabel the declared lens.
  */
 function withTelemetry(run, kind, stepName, stepIndex, resume) {
   if (resume.telemetry === undefined || resume.telemetry === null) return run;
@@ -344,17 +341,13 @@ function withTelemetry(run, kind, stepName, stepIndex, resume) {
     stepIndex,
     telemetry: {
       ...reported,
-      // WHICH MODEL RAN BEATS WHICH WAS ASKED FOR (#3151) — and ONLY the model. `model` was read off `request`
-      // unconditionally, which was indistinguishable from the truth while it was a declared literal and became
-      // a false record the moment `--model` let an operator override it: the row would say `sonnet` about a run
-      // judged by `opus`. `lens` and `effort` stay declaration-authoritative, because nothing can make them
-      // diverge (no flag for `effort`; `lens` is an input field) and because a caller-supplied `lens` would
-      // reach `renderSpendLines` and the `--json` payload as a label the declaration never asked for.
+      // Keep the declared lens, but allow the provider to identify the actual model and effective tier.
       // `||`, not `??`: a reported empty string is not a model, and it must fall back rather than shadow the
       // declared one into a row that then records no model at all.
       lens: request.lens,
       model: reported.model || request.model,
-      effort: request.effort,
+      effort: typeof reported.effectiveEffort === 'string' && reported.effectiveEffort.trim()
+        ? reported.effectiveEffort : request.effort,
     },
   });
   return { ...run, telemetry: [...(run.telemetry ?? []), row] };

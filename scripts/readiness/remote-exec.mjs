@@ -555,7 +555,7 @@ export async function runRemote(options={}) {
 }
 
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
-  const fallback = (reason) => ({ mode: 'fallback', reason });
+  const fallback = (reason) => ({ mode: 'not-started', terminated: true, reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }

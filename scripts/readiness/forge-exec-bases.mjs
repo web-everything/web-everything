@@ -9,17 +9,19 @@ export const BASE_RETENTION=12;
 export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
 export const anonymousGitEnv=()=>({PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',
   GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'});
+const stderrTail=value=>String(value??'').replace(/[\x00-\x1f\x7f-\x9f]/g,'').slice(-300);
 function gitExec({args,cwd,env,input}) {
   return new Promise((resolve,reject)=>{
     const child=spawn('git',args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']});
-    const chunks=[];let size=0,overflow=false;
+    const chunks=[];let size=0,overflow=false,stderr='';
     const timer=setTimeout(()=>{overflow=true;child.kill('SIGKILL');},120000);
     for(const stream of [child.stdout,child.stderr])stream.on('data',chunk=>{
       size+=chunk.length;if(size>4*1024*1024){overflow=true;child.kill('SIGKILL');}
       else if(stream===child.stdout)chunks.push(chunk);
+      if(stream===child.stderr)stderr=(stderr+chunk.toString('utf8')).slice(-600);
     });
     child.on('error',error=>{clearTimeout(timer);reject(error);});
-    child.on('close',code=>{clearTimeout(timer);overflow?reject(new Error('Git bound exceeded; use local fallback')):resolve({code,stdout:Buffer.concat(chunks).toString('utf8')});});
+    child.on('close',code=>{clearTimeout(timer);overflow?reject(Object.assign(new Error('Git bound exceeded; use local fallback'),{stderr})):resolve({code,stdout:Buffer.concat(chunks).toString('utf8'),stderr});});
     if(input!==undefined){child.stdin.on('error',()=>{});child.stdin.end(input);}
   });
 }
@@ -41,16 +43,28 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
   const cloned=join(pending,'clone');
   const env=anonymousGitEnv();
   const git=async(args,cwd=cloned,input,allowMissing=false)=>{
-    const result=await exec({file:'git',args:['-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
-      '-c','protocol.ext.allow=never','-c','http.followRedirects=false',
-      '-c','safe.directory='+join(root,'repo.git'),'-c','safe.directory='+cloned,...args],cwd,env,input});
-    if(result.code!==0){if(allowMissing)return null;throw new Error('Anonymous Git unavailable; use local fallback');}
-    return result.stdout.toString().trim();
+    try {
+      const result=await exec({file:'git',args:['-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+        '-c','protocol.ext.allow=never','-c','http.followRedirects=false',
+        '-c','safe.directory='+join(root,'repo.git'),'-c','safe.directory='+cloned,...args],cwd,env,input});
+      if(result.code!==0){if(allowMissing)return null;throw Object.assign(new Error('Anonymous Git unavailable; use local fallback'),{stderr:result.stderr});}
+      return result.stdout.toString().trim();
+    } catch(error) {
+      throw new Error(`${args[0]}: ${stderrTail(error.stderr??error.message)}`,{cause:error});
+    }
   };
   try {
     const mirror=join(root,'repo.git');
     const local=await fs.lstat(mirror).then(()=>true,error=>{if(error.code!=='ENOENT')throw error;return false;});
-    if(local)await baseDirectory(mirror);
+    if(local) {
+      await baseDirectory(mirror);
+      // upload-pack does not inherit command-line -c settings. Its protected
+      // global config must explicitly trust only this mirror and run's clone.
+      const config=join(pending,'gitconfig');
+      const quote=value=>'"'+value.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\t/g,'\\t').replace(/\r/g,'\\r')+'"';
+      await fs.writeFile(config,`[safe]\n\tdirectory = ${quote(mirror)}\n\tdirectory = ${quote(cloned)}\n`,{flag:'wx',mode:0o600});
+      env.GIT_CONFIG_GLOBAL=config;
+    }
     await fs.mkdir(cloned);
     // Mirror cloning works even with the warmer's unborn bare HEAD and copies
     // no client configuration. A cached object never proves public availability.
@@ -92,7 +106,7 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     await fs.rename(join(cloned,'.git'),join(work,'.git'));
   } catch(error) {
     if(error.code==='diff-coverage-base-unavailable')throw error;
-    throw Object.assign(new Error('Git HEAD unavailable; use local fallback',{cause:error}),{code:'git-head-unavailable'});
+    throw Object.assign(new Error('Git HEAD unavailable; use local fallback: '+error.message,{cause:error}),{code:'git-head-unavailable'});
   } finally {await fs.rm(pending,{recursive:true,force:true});}
 }
 function validReady(ready,sha) {

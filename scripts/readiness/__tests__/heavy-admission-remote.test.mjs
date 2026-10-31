@@ -21,7 +21,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 }));
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
-const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3,
+const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15 };
 const testRoots=[];
 afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
@@ -137,9 +137,9 @@ describe('remote admission policy', () => {
     }
   });
   it('ignores conflicting tool remote settings on the shared pool', () => {
-    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
+    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = resolveAdmissionPolicy({
-      platform: { remote }, tool: { remote: { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 99 } }, env: {},
+      platform: { remote }, tool: { remote: { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 99, clientPath: 'ignored' } }, env: {},
     });
     expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
     for (const leaf of Object.keys(remote)) {
@@ -242,7 +242,7 @@ describe('remote admission policy', () => {
   });
 
   it('resolves valid platform remote settings and their provenance', () => {
-    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
+    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = policyFor(remote);
     expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
     expect(policy.sources).toMatchObject({
@@ -400,6 +400,14 @@ describe('runWithRemoteDecision', () => {
     expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expectFallback(f.log, reason);
+  });
+
+  it.each(['ignored-test-file', 'future-client-prelaunch-refusal'])('runs locally for confirmed non-start with arbitrary reason %s', async reason => {
+    const f = fixture({result:{mode:'not-started', terminated:true, reason}});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expectFallback(f.log, reason);
+    expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
   });
 
   describe.each(['not-started', 'cancelled'])('%s', (mode) => {

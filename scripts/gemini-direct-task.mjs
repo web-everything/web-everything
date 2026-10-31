@@ -38,7 +38,7 @@
  *
  * MODEL FAMILIES: --model/--effort are generic passthroughs, not Gemini-specific (effort vocabulary:
  * low|medium|high). A live `agy models` listing carries multiple real families under one CLI: the default
- * Gemini Pro tier (gemini-3.1-pro-high/low), a fast/cheap Gemini Flash tier for simple, low-judgment tasks
+ * Gemini Pro tier (gemini-4-argon-high/medium/low), a fast/cheap Gemini Flash tier for simple, low-judgment tasks
  * (gemini-3.8-flash-high/medium/low, and the 3.7/3.6 predecessor generations), and two Claude backends
  * (claude-sonnet-4-6, claude-opus-4-6-thinking) — this same escape hatch can route Claude through
  * Antigravity's separate quota, distinct from a Claude Code operator's own usage. This is not a validated
@@ -83,6 +83,7 @@
  */
 
 import { pickAgyEvidence, agyRunEvidence, readAgyHold, saveAgyHold } from './lib/antigravity-run-evidence.mjs';
+import { hasAntigravityEffortSuffix } from './lib/antigravity-model-effort.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -99,7 +100,8 @@ export const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
  * 2026-09-29 rejected --effort for claude-sonnet-4-6 with "invalid model selection (...): --effort is
  * not supported for model \"claude-sonnet-4-6\"". claude-opus-4-6-thinking is included by inference
  * from agy's other named Claude backend, not an independent live confirmation; revisit if a future
- * live trial contradicts it. Every other model id, known or future, still forwards effort to agy.
+ * live trial contradicts it. Effort-suffixed ids already select effort and omit the flag; other ids
+ * still forward effort to agy.
  */
 export const AGY_EFFORT_UNSUPPORTED_MODELS = Object.freeze(['claude-sonnet-4-6', 'claude-opus-4-6-thinking']);
 
@@ -155,7 +157,8 @@ export function buildAgyDirectTaskArgv({ addDirs = [], model, effort, jsonSchema
   }
   if (effort !== undefined) {
     if (!['low', 'medium', 'high'].includes(effort)) throw new TypeError('gemini-direct-task: effort must be low|medium|high');
-    const modelSupportsEffort = !(typeof model === 'string' && AGY_EFFORT_UNSUPPORTED_MODELS.includes(model.trim()));
+    const modelSupportsEffort = !hasAntigravityEffortSuffix(model)
+      && !(typeof model === 'string' && AGY_EFFORT_UNSUPPORTED_MODELS.includes(model.trim()));
     if (modelSupportsEffort) argv.push('--effort', effort); // vocabulary only; agy validates model/effort combinations for every other model.
   }
   if (typeof sandbox !== 'boolean') throw new TypeError('gemini-direct-task: sandbox must be boolean');
