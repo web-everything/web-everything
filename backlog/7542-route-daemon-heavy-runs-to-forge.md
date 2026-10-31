@@ -1,4 +1,5 @@
 ---
+bornAs: xz5f6n4
 kind: story
 size: 8
 status: open
