@@ -48,19 +48,30 @@ const timer = setInterval(()=>{
         WE_DISPATCH_PLAN_ALREADY_DONE_CACHE_FILE: cache, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'),
         WE_PR_SNAPSHOT_DIR: join(dir, 'snapshot'), SOAK_CALLS: callsPath, SOAK_RELEASE: release };
       const runPlanner = () => {
-        let output = ''; let stderr = '';
+        const output = []; const maxBytes = 8 * 1024 * 1024;
+        let outputBytes = 0; let overBudget = false; let stderr = '';
         const planner = child = spawn(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
           '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        planner.stdout.on('data', d => { output += d; }); planner.stderr.on('data', d => { stderr += d; });
+        planner.stdout.on('data', d => {
+          if (overBudget) return;
+          outputBytes += d.length;
+          if (outputBytes > maxBytes) {
+            overBudget = true;
+            try { process.kill(-planner.pid, 'SIGKILL'); } catch {}
+            return;
+          }
+          output.push(d);
+        });
+        planner.stderr.on('data', d => { stderr += d; });
         return new Promise((resolve, reject) => {
-          // Allow slow CLI startup on loaded hosts. The response barrier proves non-blocking behavior;
-          // this ceiling only bounds a hung process, matching the request-observation deadline below.
-          const timer = setTimeout(() => { try { process.kill(-planner.pid, 'SIGKILL'); } catch {} reject(new Error(`planner blocked on slow GitHub: ${stderr}`)); }, 10000);
+          // The response barrier proves non-blocking behavior; the base 5s watchdog bounds a hung planner.
+          const timer = setTimeout(() => { try { process.kill(-planner.pid, 'SIGKILL'); } catch {} reject(new Error(`planner blocked on slow GitHub: ${stderr}`)); }, 5000);
           planner.on('error', e => { clearTimeout(timer); reject(e); });
           planner.on('close', code => {
             clearTimeout(timer);
-            if (code !== 0) reject(new Error(`planner exit ${code}: ${stderr}`));
-            else { try { resolve(JSON.parse(output)); } catch (e) { reject(e); } }
+            if (overBudget) reject(new Error(`planner stdout exceeded ${maxBytes} bytes; inspect planner output manually`));
+            else if (code !== 0) reject(new Error(`planner exit ${code}: ${stderr}`));
+            else { try { resolve(JSON.parse(Buffer.concat(output).toString('utf8'))); } catch (e) { reject(e); } }
           });
         });
       };

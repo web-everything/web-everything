@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import b from '../breaks/large-queue-slow-already-done.mjs';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 
 const dirs = [];
 afterEach(() => {
@@ -47,6 +48,20 @@ console.log(JSON.stringify({ groundTruth: { pending: 444, refresh: { started: fa
 }
 
 describe('large-queue soak oracle', () => {
+  it.each(['x', 'é'])('rejects oversized planner stdout measured in bytes (%s)', async character => {
+    const dir = fixture();
+    const readiness = join(dir, 'scripts', 'readiness');
+    mkdirSync(readiness, { recursive: true });
+    writeFileSync(join(readiness, 'dispatch-plan.mjs'), `
+process.stdout.write(JSON.stringify({ padding: ${JSON.stringify(character)}.repeat(8 * 1024 * 1024 / Buffer.byteLength(${JSON.stringify(character)}) + 1) }));
+${keepAliveScript()}
+`);
+    const report = await b.run({ root: dir });
+    expect(report.violations).toEqual([{
+      invariant: 'crash', detail: expect.stringContaining('planner stdout exceeded 8388608 bytes; inspect planner output manually'),
+    }]);
+  }, 30000);
+
   it('accepts slow CLI startup while the real GitHub refresh stays detached and single-flight', async () => {
     const dir = fixture();
     const preload = join(dir, 'slow-start.cjs');
