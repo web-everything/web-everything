@@ -1,13 +1,13 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { closeSync, openSync, rmSync, readFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -42,9 +42,13 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
         const alive = probe.isAlive(raw.pid);
         if (alive === false) dead = true;
         else if (alive === true) {
-          const start = raw.pidStart ? probe.readPidStart?.(raw.pid) : null;
-          if (!raw.pidStart || start === raw.pidStart) return reject('owner live');
-          if (start != null) dead = true;
+          // An existence probe already proved a live pid. Only a verified birth-time
+          // mismatch proves reuse; an unavailable ps probe must never fall back to age.
+          let start;
+          try { start = raw.pidStart ? probe.readPidStart?.(raw.pid) : null; }
+          catch { return reject('owner live; start unreadable'); }
+          if (!raw.pidStart || start == null || start === raw.pidStart) return reject('owner live');
+          dead = true;
         }
       } catch { /* Unprobeable owners use the explicit age deadline. */ }
     }
@@ -79,21 +83,20 @@ export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(
 export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
   probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env) } = {}) {
   const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
-  let fd;
   try {
-    fd = openSync(`${path}.retry-claim`, 'wx', 0o600);
-    const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
-    if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
-    if (!p.abandon || p.mode === 'skip' || w.markers.redispatch) return { ok: false };
-    const marker = `${path}.stale-redispatch-1`;
-    closeSync(openSync(marker, 'wx', 0o600));
-    writeJsonAtomic(path, { ...w.rawWriter.parsed, staleAbandoned: { at: new Date(now()).toISOString() } });
-    writeJsonAtomic(marker, {});
-    const next = readWitness();
-    writeJsonAtomic(marker, { writer: next.rawWriter.sha256, evidence: next.evidenceSha256 });
-    return { ok: true };
+    return withRedTeamStatusClaim(path, () => {
+      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
+      if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
+      if (!p.abandon || p.mode === 'skip' || w.markers.redispatch) return { ok: false };
+      const marker = `${path}.stale-redispatch-1`;
+      closeSync(openSync(marker, 'wx', 0o600));
+      writeJsonAtomic(path, { ...w.rawWriter.parsed, staleAbandoned: { at: new Date(now()).toISOString() } });
+      writeJsonAtomic(marker, {});
+      const next = readWitness();
+      writeJsonAtomic(marker, { writer: next.rawWriter.sha256, evidence: next.evidenceSha256 });
+      return { ok: true };
+    });
   } catch { return { ok: false }; }
-  finally { if (fd !== undefined) { closeSync(fd); rmSync(`${path}.retry-claim`, { force: true }); } }
 }
 
 // review-labels.mjs exports names only. Fail closed for every review hold namespace,

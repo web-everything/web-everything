@@ -1192,10 +1192,11 @@ describe('red-team-only review job', () => {
         });
         process.stdout.write(JSON.stringify({ ...saved, result }));
       `;
+      const admissionIo = createReviewJobIo({ env, readEvidence: evidence });
       const io = fakeIo({
         readRedTeamOnlyPayload: () => ({ head, loopPayload }),
-        redTeamStatus: vi.fn(createReviewJobIo({ env, readEvidence: evidence }).redTeamStatus),
-        clearRedTeamQueued: vi.fn(createReviewJobIo({ env }).clearRedTeamQueued),
+        redTeamStatus: vi.fn(admissionIo.redTeamStatus),
+        clearRedTeamQueued: vi.fn(admissionIo.clearRedTeamQueued),
         runLoop: () => ({ status: 0, stdout: JSON.stringify(loopPayload), stderr: '' }),
         runRedTeam: input => {
           expect(read()).toMatchObject({ status: 'queued', result: null });

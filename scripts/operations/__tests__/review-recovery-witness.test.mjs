@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, 
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { pidNamespace } from '../../lib/pid-alive.mjs';
 import * as evidence from '../../lib/drain-red-team-evidence.mjs';
 import * as recovery from '../../lib/review-red-team-on-skip.mjs';
@@ -32,7 +33,7 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   const decide = () => recovery.planRedTeamRecovery(readWitness(), { now: Date.now(), probe, deadlineMs: 1000 });
   const abandon = () => recovery.abandonStaleRedTeamRun(key, { readWitness, probe, deadlineMs: 1000 });
   const io = createReviewJobIo({ env, root: dir, readWitness, recoveryProbe: probe });
-  const admit = () => io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: seats.length ? 'resume' : 'fresh' });
+  const admit = () => io.redTeamStatus({ repo, pr, loopPayload: readWitness().newest, status: 'queued', redTeamMode: seats.some(seat => seat.status === 'ok') ? 'resume' : 'fresh' });
   return { dir, env, key, path, run, seats, probe, readWitness, decide, abandon, io, admit };
 }
 
@@ -180,4 +181,146 @@ it('an exclusive claim loser cannot trigger ordinary-job rollback over the winne
     .toThrow(expect.objectContaining({ code: 'RED_TEAM_RETRY_ADMITTED' }));
   expect(readFileSync(f.path, 'utf8')).toBe(before);
   expect(readFileSync(`${f.path}.retry-claim`, 'utf8')).toBe('winner');
+});
+
+it.each(['99999999\n', '', 'legacy-claim'])('recovers a dead or incomplete stale status-write claim (%j)', owner => {
+  const f = fixture(), claim = `${f.path}.retry-claim`;
+  writeFileSync(claim, owner);
+  const old = new Date(Date.now() - 60_000); utimesSync(claim, old, old);
+  expect(f.abandon().ok).toBe(true);
+  expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+it('a stale claim held by a live writer is preserved', () => {
+  const f = fixture(), claim = `${f.path}.retry-claim`, before = readFileSync(f.path, 'utf8');
+  writeFileSync(claim, `${process.pid}\n`);
+  const old = new Date(Date.now() - 60_000); utimesSync(claim, old, old);
+  expect(f.abandon().ok).toBe(false);
+  expect(readFileSync(f.path, 'utf8')).toBe(before);
+  expect(readFileSync(claim, 'utf8')).toBe(`${process.pid}\n`);
+});
+
+it.each(['queued', 'running', 'finished'])('an ordinary %s write reclaims a dead status-write claim', status => {
+  const f = fixture(), claim = `${f.path}.retry-claim`;
+  writeFileSync(claim, '99999999\n');
+  const old = new Date(Date.now() - 60_000); utimesSync(claim, old, old);
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status }, { env: f.env });
+  expect(evidence.readRedTeamStatus(f.key).status).toBe(status);
+});
+
+it.each(['queued', 'running', 'finished'])('an ordinary %s writer waits for a concurrent live status writer', async status => {
+  const f = fixture(), claim = `${f.path}.retry-claim`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { writeFileSync, rmSync } from 'node:fs';
+    writeFileSync(process.argv[1], String(process.pid));
+    process.stdout.write('ready');
+    setTimeout(() => rmSync(process.argv[1]), 100);
+  `, claim], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', code => code === 0 ? resolve() : reject(Error(`holder exited ${code}`))); });
+  try {
+    await new Promise((resolve, reject) => { child.stdout.once('data', resolve); child.once('error', reject); });
+    evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status }, { env: f.env });
+    expect(evidence.readRedTeamStatus(f.key).status).toBe(status);
+  } finally { await exited; }
+});
+
+it('rollback refunds only a newly introduced retry spend', () => {
+  const f = fixture({ status: 'finished' }), witness = f.readWitness();
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'ours', retryCount: 1 }, { env: f.env });
+  evidence.restoreRecoveryWriter(f.key, witness, 'ours');
+  expect(f.readWitness().markers.retry).toBe(false);
+  expect(f.readWitness().rawWriter.parsed).toEqual(witness.rawWriter.parsed);
+});
+
+it.each([true, false, undefined, 'throws'].flatMap(alive => ['same', 'different', null, 'throws'].flatMap(start =>
+  ['fresh', 'aged', 'unparseable'].map(stamp => ({ alive, start, stamp })))))('liveness matrix: alive=$alive start=$start stamp=$stamp', ({ alive, start, stamp }) => {
+  const f = fixture(), raw = f.readWitness().rawWriter.parsed;
+  raw.pidStart = stamp === 'unparseable' ? 'unknown-start' : new Date(Date.now() - (stamp === 'aged' ? 2000 : 0)).toISOString();
+  writeFileSync(f.path, JSON.stringify(raw));
+  f.probe.isAlive = () => { if (alive === 'throws') throw Error('probe unavailable'); return alive; };
+  f.probe.readPidStart = () => { if (start === 'throws') throw Error('ps unavailable'); return start === 'same' ? raw.pidStart : start === 'different' ? 'another-start' : null; };
+  const dead = alive === false || (alive === true ? start === 'different' : stamp === 'aged');
+  expect(f.decide().mode).toBe(dead ? 'fresh' : 'skip');
+});
+
+it('readRecoveryWitness excludes unrelated repo, PR and head evidence', () => {
+  const seat = { dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' };
+  const f = fixture({ seats: [seat] });
+  const own = f.readWitness().newest;
+  for (const [i, identity] of [{ repo: 'other/repo' }, { pr: pr + 1 }, { rev: 'b'.repeat(40) }].entries()) {
+    f.seats.push({ ...seat, ...identity });
+    const id = `review-pr-unrelated-${i}`, run = { ...own, id, input: { repo, pr, ...identity },
+      findings: { read: { ...own.findings.read, netBasis: { rev: identity.rev ?? head } } } };
+    const path = join(f.env.WE_SHARED_RUNS_DIR, `${id}.json`);
+    writeFileSync(path, JSON.stringify(run));
+    const future = new Date(Date.now() + 10_000 + i); utimesSync(path, future, future);
+  }
+  expect(f.readWitness().seats).toEqual([seat]);
+  expect(f.readWitness().newest).toEqual(own);
+});
+
+it('rollback preserves a superseding admission', () => {
+  const f = fixture(), witness = f.readWitness();
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'earlier' }, { env: f.env });
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'winner' }, { env: f.env });
+  const winner = readFileSync(f.path, 'utf8');
+  evidence.restoreRecoveryWriter(f.key, witness, 'earlier');
+  expect(readFileSync(f.path, 'utf8')).toBe(winner);
+});
+
+it.each(['restoreRedTeamAdmission', 'clearRedTeamQueued'])('job %s preserves a superseding admission', cleanup => {
+  const f = fixture(); expect(f.abandon().ok).toBe(true); f.admit();
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'winner' }, { env: f.env });
+  const winner = readFileSync(f.path, 'utf8');
+  f.io[cleanup]({ repo, pr, head });
+  expect(readFileSync(f.path, 'utf8')).toBe(winner);
+});
+
+it('rollback preserves a runner that has started and its retry spend', () => {
+  const f = fixture(), witness = f.readWitness();
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'ours', retryCount: 1 }, { env: f.env });
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running', admissionId: 'ours' }, { env: f.env });
+  const running = readFileSync(f.path, 'utf8');
+  evidence.restoreRecoveryWriter(f.key, witness, 'ours');
+  expect(readFileSync(f.path, 'utf8')).toBe(running);
+  expect(f.readWitness().markers.retry).toBe(true);
+});
+
+it.each(['stale-recovery', 'failed-seat-retry'].flatMap(kind => [false, true].map(superseded => ({ kind, superseded }))))(
+  'invalid runner admission restores queued evidence and skips finished write and gate ($kind, superseded=$superseded)', ({ kind, superseded }) => {
+  const f = fixture();
+  if (kind === 'stale-recovery') expect(f.abandon().ok).toBe(true);
+  else {
+    f.seats.push({ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' });
+    evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result: 'failed' }, { env: f.env });
+  }
+  const before = readFileSync(f.path, 'utf8'), gate = vi.fn(), settle = vi.fn();
+  let winner;
+  const status = vi.fn(f.io.redTeamStatus);
+  const io = { root: f.dir, now: Date.now, newActorId: () => 'fixture', readPrevCompletion: () => null,
+    claim: () => ({ ok: true }), updateRecord: vi.fn(), unclaim: vi.fn(), acquireLane: () => ({ lanePath: f.dir }),
+    releaseLane: vi.fn(), report: vi.fn(), log: vi.fn(), prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),
+    readRedTeamOnlyPayload: f.io.readRedTeamOnlyPayload, redTeamStatus: status,
+    restoreRedTeamAdmission: f.io.restoreRedTeamAdmission, runRedTeamGate: gate, settleRedTeamSkip: settle,
+    runRedTeam: () => {
+      if (superseded) {
+        evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'winner' }, { env: f.env });
+        winner = readFileSync(f.path, 'utf8');
+      }
+      return { status: 'not-owed', invalidAdmission: true };
+    } };
+  expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io).redTeam.invalidAdmission).toBe(true);
+  expect(gate).not.toHaveBeenCalled(); expect(settle).not.toHaveBeenCalled();
+  expect(status.mock.calls.map(([input]) => input.status)).toEqual(['queued']);
+  expect(readFileSync(f.path, 'utf8')).toBe(superseded ? winner : before);
+  expect(f.decide().mode).toBe(superseded ? 'skip' : 'fresh');
+  const next = recovery.planRedTeamOnSkip({ repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+    rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readWitness: f.readWitness,
+    readStatus: () => evidence.readRedTeamStatus(f.key), readEvidence: () => ({ loopPayload: f.readWitness().newest,
+      inFlight: false, queued: false, recorded: f.seats.length > 0, seatRecorded: f.seats.length > 0,
+      completedRecorded: false, failedSeatCount: f.seats.length }),
+    setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(),
+    recoveryOptions: { now: Date.now(), probe: f.probe, deadlineMs: 1000 } });
+  expect(next[0].action).toBe(superseded ? 'skip' : 'dispatch');
+  if (!superseded) expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
 });

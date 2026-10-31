@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
-import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { readFilteredInOrder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
@@ -73,33 +73,43 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
 }
 
-/** CAS and atomic rename share an exclusive recovery claim; a loser never rolls back the winner. */
+/** Shared bounded lock: records the holder pid, waits for short concurrent writes, and
+ * reclaims dead/legacy/partially-written claims after 30s. Live holders are never aged out.
+ */
+export function withRedTeamStatusClaim(path, write) {
+  try { return withFileLock(`${path}.retry-claim`, write, { timeoutMs: 1000 }); }
+  catch (error) {
+    if (error.message?.startsWith('withFileLock: timed out')) {
+      throw Object.assign(Error('red-team status writer busy; retry next tick'), { code: 'RED_TEAM_RETRY_ADMITTED' });
+    }
+    throw error;
+  }
+}
+
+/** CAS and atomic rename share a reclaimable recovery claim; a loser never rolls back the winner. */
 export function recordRedTeamStatus(input, options = {}) {
   const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
   mkdirSync(dirname(path), { recursive: true });
-  const claim = `${path}.retry-claim`;
-  let fd;
-  try { fd = openSync(claim, 'wx', 0o600); }
-  catch (error) {
-    if (error.code === 'EEXIST') throw Object.assign(Error('retry already admitted'), { code: 'RED_TEAM_RETRY_ADMITTED' });
-    throw error;
-  }
-  try {
+  return withRedTeamStatusClaim(path, () => {
     if (Object.hasOwn(options, 'expectedSha256') && digest(optionalBytes(path)) !== options.expectedSha256) throw Error('raw recovery writer changed');
     return writeRedTeamStatus(input, options);
-  } finally { closeSync(fd); rmSync(claim, { force: true }); }
+  });
 }
 
 /** Roll back only this admission under the same claim; another writer always wins. */
 export function restoreRecoveryWriter(key, witness, admissionId) {
-  const path = statusPath(key, key.env ?? process.env), claim = `${path}.retry-claim`;
-  const fd = openSync(claim, 'wx', 0o600);
-  try {
+  if (typeof admissionId !== 'string' || !admissionId) throw Error('missing rollback admission identity');
+  const path = statusPath(key, key.env ?? process.env);
+  return withRedTeamStatusClaim(path, () => {
     const current = optionalBytes(path);
-    if (!current || JSON.parse(current).admissionId !== admissionId) return;
+    if (!current) return;
+    const writer = JSON.parse(current);
+    if (writer.admissionId !== admissionId || writer.status !== 'queued') return;
+    // No runner was admitted. Refund only the spend this queued writer introduced.
+    if (writer.retryCount === 1 && witness.markers?.retry === false) rmSync(`${path}.retry-1`, { force: true });
     if (witness.rawWriter.parsed === null) rmSync(path, { force: true });
     else writeJsonAtomic(path, witness.rawWriter.parsed);
-  } finally { closeSync(fd); rmSync(claim, { force: true }); }
+  });
 }
 
 /** Versioned job-to-runner codec: identity and queued writer are checked again by the runner. */

@@ -314,8 +314,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
 } = {}) {
-  // The record each queued write replaced, so a deferral rollback can restore it beside a retry marker.
-  const replacedStatus = new Map();
+  // Keep rollback authority in this process; the runner's admission file is untrusted.
+  const recoveryAdmissions = new Map();
+  const restoreAdmission = ({ repo, pr, head }) => {
+    const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+    const admission = recoveryAdmissions.get(path);
+    if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
+  };
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
@@ -332,6 +337,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
+    restoreRedTeamAdmission: restoreAdmission,
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
@@ -351,18 +357,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       }) } : {}),
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
-    clearRedTeamQueued: ({ repo, pr, head }) => {
-      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
-      // Deleting the status beside a spent retry marker would leave an orphan every reader refuses.
-      // Restore the record this job's queued write replaced; without one, keep the status as it stands.
-      if (!existsSync(`${path}.retry-1`) && !existsSync(`${path}.stale-redispatch-1`)) rmSync(path, { force: true });
-      else if (replacedStatus.get(path) != null) writeJsonAtomic(path, replacedStatus.get(path));
-    },
+    clearRedTeamQueued: restoreAdmission,
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
       const key = { repo: input.repo, pr: input.pr, head, env };
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${Number(input.pr)}-${head}.json`);
       const queued = input.status === 'queued';
-      let witness, recovery, prior, admissionPrior, stored, attempted = false, priorResult = null;
+      let witness, rollbackWitness, recovery, prior, admissionPrior, stored, attempted = false, priorResult = null;
       const admissionId = randomUUID();
       try {
         if (queued) {
@@ -373,6 +374,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
               || JSON.stringify(recovery.payload?.findings?.read) !== JSON.stringify(input.loopPayload?.findings?.read)) throw Error(recovery.why ?? 'recovery evidence changed; retry next tick');
           }
           prior = witness ? witness.rawWriter.parsed : readStatus(key);
+          rollbackWitness = witness ?? { rawWriter: { parsed: prior ?? null }, markers: { retry: existsSync(`${path}.retry-1`) } };
           if (!recovery && ['queued', 'running'].includes(prior?.status)) {
             // A normal review may adopt its own speculative child; another live/unknown writer keeps the head.
             const ownSpeculation = Number.isInteger(input.speculativePid) && input.speculativePid > 0
@@ -399,30 +401,23 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
             && (redTeamSkipNeedsSettlement(admissionPrior)
             || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
-          input = { ...input, result: priorResult, ...(witness ? { admissionId } : {}), ...(retry ? { retryCount: 1 } : {}) };
+          input = { ...input, result: priorResult, admissionId, ...(retry ? { retryCount: 1 } : {}) };
         }
         attempted = true;
         writeStatus(input, { env, ...(witness ? { expectedSha256: witness.rawWriter.sha256 } : {}) });
         if (queued) {
           stored = witness ? readWitness(key).rawWriter.parsed : readStatus(key);
           if (stored?.status !== 'queued' || stored.pid !== process.pid
+            || stored.admissionId !== admissionId
             || JSON.stringify(stored.result) !== JSON.stringify(priorResult)
             || (input.retryCount === 1 && stored.retryCount !== 1)) throw Error('queued red-team status readback mismatch');
-          replacedStatus.set(join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${Number(input.pr)}-${head}.json`), prior ?? null);
+          recoveryAdmissions.set(path, { witness: rollbackWitness, admissionId });
         }
       } catch (e) {
         if (queued) {
-          if (witness && attempted) {
-            try { restoreRecoveryWriter(key, witness, admissionId); }
+          if (rollbackWitness && attempted) {
+            try { restoreRecoveryWriter(key, rollbackWitness, admissionId); }
             catch (rollback) { process.stderr.write(`review-job: queued status rollback failed: ${rollback.message}\n`); }
-          }
-          // A losing exclusive retry claim never wrote the status; preserve the winner.
-          if (!witness && attempted && e.code !== 'RED_TEAM_RETRY_ADMITTED') {
-            try {
-              const path = join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${Number(input.pr)}-${head}.json`);
-              if (prior == null) rmSync(path, { force: true });
-              else writeJsonAtomic(path, prior);
-            } catch (rollback) { process.stderr.write(`review-job: queued status rollback failed: ${rollback.message}\n`); }
           }
           throw Error(`queued red-team status could not be persisted: ${tail(e.message, 300)}; inspect stored evidence before retrying`);
         }
@@ -896,7 +891,15 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         redTeam = { status: 'error', reason: tail(safeErrorText(e), 300) };
       }
     }
-    if (redTeam?.invalidAdmission) { out.redTeam = redTeam; return out; }
+    if (redTeam?.invalidAdmission) {
+      out.redTeam = redTeam;
+      // The runner launched no call. Restore only our queued admission so a spent
+      // stale-redispatch marker still points at the original abandoned writer.
+      try { io.restoreRedTeamAdmission?.({ repo: out.repo, pr: out.pr,
+        head: seatsBox.input.loopPayload.findings.read.netBasis.rev }); }
+      catch (e) { io.log(`review-job ${out.sessionSlug}: invalid admission cleanup failed (${tail(e?.message ?? e, 300)})`); }
+      return out;
+    }
     if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
     // Diagnostic formatting must never prevent settlement, the finished write or the gate.
     // String coercion can itself throw for malformed JSON objects such as { toString: null }.

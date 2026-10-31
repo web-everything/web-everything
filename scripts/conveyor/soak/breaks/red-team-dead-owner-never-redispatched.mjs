@@ -1,5 +1,5 @@
 /** #7537: real raw queued writer, daemon abandonment, argv parser, CAS admission and publication. */
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -8,7 +8,7 @@ export default {
   id: 'red-team-dead-owner-never-redispatched', title: 'a dead queued red-team owner recovers once and settles',
   card: '#7537', fixedBy: { sha: '7537', where: 'raw-witness recovery' },
   fixPresent: root => readFileSync(join(root, 'scripts/operations/review-job.mjs'), 'utf8').includes('planRedTeamRecovery(witness'),
-  async run({ sourceRoot = ROOT } = {}) {
+  async run({ sourceRoot = ROOT, staleClaim = false } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-dead-red-team-'));
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
@@ -22,8 +22,13 @@ export default {
         findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } } };
       runs.writeRun({ ...runs.newRunRecord({ id: 'review-pr-soak', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
       mkdirSync(e.redTeamStatusDir(env), { recursive: true });
-      writeFileSync(join(e.redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`), JSON.stringify({ repo, pr, head,
+      const statusPath = join(e.redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+      writeFileSync(statusPath, JSON.stringify({ repo, pr, head,
         status: 'queued', result: null, pid: 99999999, host: 'foreign', pidStart: new Date(Date.now() - 2000).toISOString(), loopPayload: {} }));
+      if (staleClaim) {
+        writeFileSync(`${statusPath}.retry-claim`, '99999999\n');
+        const old = new Date(Date.now() - 60_000); utimesSync(`${statusPath}.retry-claim`, old, old);
+      }
       const readWitness = () => e.readRecoveryWitness({ ...key, readScorecards: () => [] });
       const production = j.createReviewJobIo({ root: dir, env, readWitness, readEvidence: () => ({}) });
       let calls = 0, out;
