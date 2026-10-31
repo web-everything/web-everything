@@ -106,7 +106,7 @@ export function buildHeavyTestInvocation({ root, scratch, selected, testReport, 
   return { root: scratch, env: testEnv, testReport,
     args: [resolve(root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${io.realpathSync(scratch)}`,
       '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
-      '--reporter=tap', '--no-color'] };
+      '--reporter=basic', '--reporter=tap', '--no-color'] };
 }
 
 // Forge streams TAP back to the caller; a client-local outputFile cannot be written remotely.
@@ -116,13 +116,19 @@ export function heavyTestReport(stdout, { root, args }) {
   const lines = stdout.replace(/\r\n/g, '\n').split('\n');
   const header = lines.indexOf('TAP version 13');
   if (header < 0 || lines.lastIndexOf('TAP version 13') !== header) throw new Error('test inventory unavailable');
-  const selected = new Map(args.slice(8, -2).map(file => [file.replace(/\\/g, '\\\\').replace(/#/g, '\\#').replace(/\n/g, ' '), file]));
-  if (selected.size !== args.length - 10) throw new Error('ambiguous test inventory names');
+  const selected = new Map(args.slice(8, -3).map(file => [file.replace(/\\/g, '\\\\').replace(/#/g, '\\#').replace(/\n/g, ' '), file]));
+  if (selected.size !== args.length - 11) throw new Error('ambiguous test inventory names');
   const testResults = [], stack = [{ seen: 0, plan: null, skipped: false }];
   const invalid = () => { throw new Error('incomplete or malformed test inventory'); };
-  for (const line of lines.slice(header + 1)) {
+  let end = lines.length;
+  for (let index = header + 1; index < lines.length; index++) {
+    const line = lines[index];
     if (!line.trim()) continue;
     const frame = stack.at(-1), prefix = '    '.repeat(stack.length - 1);
+    // Reporter hooks may finish in either order. Only leave a complete TAP plan
+    // for the basic reporter's summary, never for an arbitrary trailing TAP line.
+    if (stack.length === 1 && frame.plan !== null && frame.seen === frame.plan
+      && /^(?: Test Files|  Snapshots)  /.test(line)) { end = index; break; }
     if (stack.length > 1 && line === '    '.repeat(stack.length - 2) + '}') {
       if (frame.plan === null || frame.plan !== frame.seen) invalid();
       stack.pop(); continue;
@@ -152,6 +158,31 @@ export function heavyTestReport(stdout, { root, args }) {
     }
   }
   if (stack.length !== 1 || stack[0].plan === null || stack[0].seen !== stack[0].plan) invalid();
+  // A passing TAP leaf can be an empty describe suite. Require an independent
+  // typed-test count before trusting any leaf as execution evidence. Ambiguous
+  // mixtures of real tests and empty suites fail closed for both callers.
+  const summaries = [...lines.slice(0, header), ...lines.slice(end)].filter(line => line.startsWith('      Tests  '));
+  if (summaries.length !== 1) invalid();
+  const summary = summaries[0].slice('      Tests  '.length);
+  let total = 0, passed = 0, pending = 0;
+  if (summary !== 'no tests') {
+    const counts = /^(.+) \((\d+)\)$/.exec(summary);
+    if (!counts) invalid();
+    const parts = counts[1].split(' | ');
+    const seen = new Set();
+    for (const part of parts) {
+      const match = /^(\d+) (passed|skipped|todo)$/.exec(part);
+      if (!match || seen.has(match[2]) || !Number.isSafeInteger(Number(match[1]))) invalid();
+      seen.add(match[2]);
+      if (match[2] === 'passed') passed = Number(match[1]);
+      else pending += Number(match[1]);
+    }
+    total = Number(counts[2]);
+    if (!Number.isSafeInteger(total) || total !== passed + pending) invalid();
+  }
+  const assertions = testResults.flatMap(result => result.assertionResults);
+  if (assertions.length !== total || assertions.filter(result => result.status === 'passed').length !== passed)
+    throw new Error('ambiguous test inventory: TAP leaves differ from typed-test counts; empty suites may be present');
   return { testResults };
 }
 

@@ -12,6 +12,8 @@ import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
+import { runHeavyTests } from '../daemon-rebuild/auto-rebase.mjs';
+import { scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
 
 vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
 
@@ -112,6 +114,19 @@ const unchanged = f => {
 };
 
 describe('overlay main sync', () => {
+
+  it('refuses a passing empty describe suite before publication', async () => {
+    const f = fixture();
+    f.deps.testRunner = options => runHeavyTests(options, { exec: async () => ({ status: 0,
+      stdout: await scratchTestOutput(options.args.slice(8, -3).map(name => ({ type: 'suite', name, mode: 'run',
+        result: { state: 'pass', duration: 0 }, tasks: [
+          { type: 'suite', name: 'empty describe', mode: 'run', result: { state: 'pass', duration: 0 }, tasks: [] },
+        ] })), { summary: options.args.includes('--reporter=basic') }), stderr: '' }) });
+    await expect(job(f)).rejects.toThrow(/inventory/);
+    expect(f.pushes).toEqual([]);
+    expect(synced(f)).toEqual([]);
+    expect(f.scratched.every(path => !fs.existsSync(path))).toBe(true);
+  });
 
   it("runs tests through the daemon checkout's wrapper with --repo=scratch", async () => {
     const f = fixture(), passing = f.deps.testRunner;

@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runAutoRebase, finishPendingSwaps, heavyTestReport } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
+import { runAutoRebase, finishPendingSwaps, heavyTestReport, runHeavyTests } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
+import { scratchTestOutput } from './scratch-tests-forge-command.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, persistStackBases } from '../../../lib/daemon-overlays.mjs';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -55,15 +56,24 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
       if (realRunner) {
         for (const file of files) {
           fs.mkdirSync(join(scratch, 'scripts/operations/__tests__'), { recursive: true });
-          fs.writeFileSync(join(scratch, file), `import { it, expect } from 'vitest'; it('assertion', () => expect(${file === integration ? 'false' : 'true'}).toBe(true));\n`);
+          fs.writeFileSync(join(scratch, file), mode === 'empty-suite'
+            ? "import { describe } from 'vitest'; describe('empty describe', () => {});\n"
+            : `import { it, expect } from 'vitest'; it('assertion', () => expect(${file === integration ? 'false' : 'true'}).toBe(true));\n`);
         }
         // Same exclusion as the repository's unit config; no project setup or external state.
-        fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
+        fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { passWithNoTests: true, exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
         runnerResult = spawnSync(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)], {
           cwd: scratch, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
         });
         if (runnerResult.status === 0) fs.writeFileSync(testReport, JSON.stringify(heavyTestReport(runnerResult.stdout, { root: fs.realpathSync(scratch), args })));
         return runnerResult;
+      }
+      if (mode === 'empty-suite') {
+        const stdout = await scratchTestOutput(files.map(name => ({ type: 'suite', name, mode: 'run',
+          result: { state: 'pass', duration: 0 }, tasks: [
+            { type: 'suite', name: 'empty describe', mode: 'run', result: { state: 'pass', duration: 0 }, tasks: [] },
+          ] })), { summary: args.includes('--reporter=basic') });
+        return runHeavyTests({ root: scratch, args, testReport, env }, { exec: async () => success(stdout) });
       }
       if (testReport && mode !== 'missing') {
         const reported = mode === 'excluded' ? [unit] : mode === 'all-excluded' ? [] : files;
