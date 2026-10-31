@@ -4,7 +4,7 @@
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
+  alertsFilePath, assertMarkerIdentity, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -74,9 +74,8 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
-  const rollbackQuick = (sha, failedHead) => {
-    // A legacy record without adoption identity cannot authorize resetting today's HEAD.
-    if (!failedHead || verifyRev(git, 'HEAD') !== failedHead) return { ok: false, reason: 'adopted-head-changed-or-unreadable' };
+  const rollbackQuick = sha => {
+    // Both quick recovery callers pass the shared identity fence before reaching this reset.
     try { return rollbackToSha({ root, sha, run, ignoreUntracked: true }); }
     catch { return { ok: false, reason: 'rollback-threw' }; }
   };
@@ -119,13 +118,17 @@ export async function prepareRebuild({
       const headNow = verifyRev(git, 'HEAD');
       const clean = findUnsafeLocalState({ git, knownInputs: knownInputsOf(state) }).safe;
       const ip = state.inProgress;
+      if (ip.quick && !assertMarkerIdentity(readRebuildState(root, stEnv), { token: ip.token, sha: ip.target,
+        prevHead: ip.prevHead, phase: 'interrupted', head: () => verifyRev(git, 'HEAD'), log }).ok) {
+        return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
+      }
       // PR #2731 review: only a record THIS design wrote (`verified: true` — its smoke passed before its reset)
       // may be promoted unsmoked. A record without the marker was written by the pre-fix code, which reset BEFORE
       // smoking, so HEAD == target there means a build that was never smoked is on disk: roll it back to the
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
-        const rolled = ip.quick ? rollbackQuick(ip.prevHead, ip.target).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
+        const rolled = ip.quick ? rollbackQuick(ip.prevHead).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
         if (ip.quick) {
           const detail = { sha: ip.target, lastGood: ip.prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: rolled } };
           reportQuickSoakNeedsYou({ root, env: stEnv, detail, log });
@@ -133,7 +136,7 @@ export async function prepareRebuild({
         }
         if (!rolled) {
           if (ip.quick) {
-            state.quarantine = { prevHead: ip.prevHead, failedHead: ip.target, reason: 'quick-soak-unavailable' };
+            state.quarantine = { token: ip.token, prevHead: ip.prevHead, failedHead: ip.target, reason: 'quick-soak-unavailable' };
             state.inProgress = null;
             writeState();
           }
@@ -200,6 +203,10 @@ export async function prepareRebuild({
   if (state.quarantine?.reason?.startsWith('quick-soak-')) {
     const quarantine = state.quarantine;
     const head = verifyRev(git, 'HEAD');
+    if (!assertMarkerIdentity(readRebuildState(root, stEnv), { token: quarantine.token, sha: quarantine.failedHead,
+      prevHead: quarantine.prevHead, phase: 'quarantine', head: () => verifyRev(git, 'HEAD'), log }).ok) {
+      return terminal({ moved: false, reason: 'quarantined' });
+    }
     const alreadyAtLastGood = !!head && head === quarantine.prevHead;
     // Settlement may already have refused this rollback. Never retry through the weaker legacy reset:
     // ignored files and ancestor-path obstructions need the same guard on every recovery tick.
@@ -213,7 +220,7 @@ export async function prepareRebuild({
           : status.stdout.trim() ? { ok: false, reason: 'dirty' } : { ok: true };
       } catch { rollback = { ok: false, reason: 'status-failed' }; }
     } else {
-      rollback = rollbackQuick(quarantine.prevHead, quarantine.failedHead);
+      rollback = rollbackQuick(quarantine.prevHead);
     }
     if (!rollback.ok) {
       const pageKey = JSON.stringify([quarantine.prevHead, rollback.reason]);

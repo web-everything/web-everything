@@ -38,7 +38,7 @@ export function resolveQuick(env = process.env, { path = SETTINGS_PATH, platform
 }
 
 const safePath = path => typeof path === 'string' && path.length > 0 && path.length <= 4096 && !path.startsWith('/')
-  && !path.includes('\\') && !path.split('/').some(part => part === '..' || part === '.') && !/[\p{Cc}\p{Cf}]/u.test(path);
+  && !path.includes('\\') && !path.split('/').some(part => part === '..' || part === '.') && !/[\p{Cc}\p{Cf}\p{Z}]/u.test(path);
 /** Conservative checkout identity, shared by policy and its per-pattern regression fixtures. */
 export const matchesQuickProtectedPath = (path, pattern) => {
   const canonical = value => value.normalize('NFC').toLowerCase().normalize('NFC');

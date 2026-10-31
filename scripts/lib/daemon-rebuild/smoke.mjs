@@ -488,7 +488,7 @@ export async function smokeAndAdopt({
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
       smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild,
         ...(quick ? { singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS } : {}) });
-      if (quick && !smokeResult?.disabled) smokeResult = { ...smokeResult, quick: true };
+      if (quick && env.WE_DAEMON_SMOKE_DISABLE !== '1' && !smokeResult?.disabled) smokeResult = { ...smokeResult, quick: true };
     } catch (e) {
       threw = e;
     }

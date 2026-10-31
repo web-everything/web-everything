@@ -6,7 +6,7 @@ import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
-import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate, assertMarkerIdentity } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -218,6 +218,10 @@ export async function finalizeRebuild({
     } catch { /* best-effort audit trail only */ }
   };
   const state = readRebuildState(root, stEnv);
+  if (quick && !assertMarkerIdentity(state, { token: lease?.token, sha: plan.finalSha, prevHead,
+    phase: 'adopt', inputsKey: plan.inputsKey, ready: readReadyCandidate(root, stEnv), head: () => verifyRev(git, 'HEAD'), log }).ok) {
+    return { moved: false, reason: 'root-changed-during-smoke', plan, alerts: alertsList };
+  }
   const writeState = () => writeRebuildState(root, state, stEnv);
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
@@ -301,7 +305,7 @@ export async function finalizeRebuild({
   state.inProgress = {
     pid: process.pid, host: hostname(), prevHead, target: plan.finalSha, startedAt: nowIso(),
     inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, verified: !quick,
-    ...(quick ? { quick: true } : {}),
+    ...(quick ? { quick: true, token: lease.token } : {}),
   };
   writeState();
   try {

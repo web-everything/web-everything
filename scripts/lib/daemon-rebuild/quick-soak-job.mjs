@@ -16,7 +16,7 @@ import { runLiveSmoke, rollbackToSha } from '../daemon-live-smoke.mjs';
 import { redactDiagnosticLine } from './smoke-classify/redact-detail.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runBounded, installChildReaper } from '../bounded-child.mjs';
-import { alertsFilePath, stateDir, readRebuildState, writeRebuildState } from './state.mjs';
+import { alertsFilePath, stateDir, readRebuildState, writeRebuildState, assertMarkerIdentity } from './state.mjs';
 import { QUICK_SOAK_CHECKS, QUICK_SOAK_MAX_MS, decideQuickSoakResult } from './quick.mjs';
 import { makeGit, verifyRev } from './shared.mjs';
 import { defineJobKind, kindRegistry, markFailed } from '../daemon-jobs.mjs';
@@ -78,20 +78,11 @@ function finishAttempt({ root, env, marker, outcome, now }) {
 /** Caller holds the write lock. A mismatched token can never settle or roll back a newer adoption. */
 export function settleQuickSoak({ root, env = process.env, marker, outcome, reason, error, run = gitRun, log = console, now = Date.now }) {
   const state = readRebuildState(root, env);
-  if (!same(state.unverified, marker)) return { settled: false };
+  if (!assertMarkerIdentity(state, { ...marker, head: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), log }).ok) return { settled: false };
   marker = state.unverified;
-  const head = verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   let rollback = null;
   if (!['passed', 'failed', 'unavailable'].includes(outcome)) outcome = 'unavailable';
-  if (!head || head !== marker.sha || state.adopted?.head !== marker.sha) {
-    outcome = 'unavailable'; reason = 'adopted-head-changed-or-unreadable';
-    // A provably different head is never reset by an old soak. Do not certify a pending adopted record
-    // merely because something else moved HEAD; preserve an independently recorded newer adoption.
-    if (!head || state.adopted?.head === marker.sha) {
-      state.quarantine = { prevHead: marker.prevHead, failedHead: marker.sha, reason: 'quick-soak-unavailable' };
-      state.adopted = marker.lastGood ?? null;
-    }
-  } else if (outcome === 'unavailable' && attemptsOf(marker) < QUICK_SOAK_MAX_ATTEMPTS && withinDeadline(marker, now())) {
+  if (outcome === 'unavailable' && attemptsOf(marker) < QUICK_SOAK_MAX_ATTEMPTS && withinDeadline(marker, now())) {
     // Retire the attempt under the write lock; only a later tick may launch the successor. A new token
     // fences late results, watchdogs and launcher completion from the previous worker.
     const retry = { ...marker, token: randomUUID(), soakAttempts: attemptsOf(marker), retryPending: true,
@@ -105,14 +96,14 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
   } else if (outcome !== 'passed') {
     try { rollback = rollbackToSha({ root, sha: marker.prevHead, run, ignoreUntracked: true }); }
     catch { rollback = { ok: false, reason: 'rollback-threw' }; }
-    const rejected = { inputsKey: state.adopted?.inputsKey, reason: `quick-soak-${outcome}`, at: new Date(now()).toISOString() };
+    const rejected = { sha: marker.sha, inputsKey: state.adopted?.inputsKey, reason: `quick-soak-${outcome}`, at: new Date(now()).toISOString() };
     if (rollback.ok) {
       state.adopted = marker.lastGood ?? null;
       state.rejected = rejected;
       state.held = { since: rejected.at, updatedAt: rejected.at, reason: rejected.reason,
         lastGood: marker.prevHead, target: marker.sha };
     } else {
-      state.quarantine = { prevHead: marker.prevHead, failedHead: marker.sha, reason: 'quick-soak-rollback-failed' };
+      state.quarantine = { token: marker.token, prevHead: marker.prevHead, failedHead: marker.sha, reason: 'quick-soak-rollback-failed' };
       // A failed rollback is never promoted to a verified last-good build.
       state.adopted = marker.lastGood ?? null;
     }
@@ -189,7 +180,7 @@ export async function handleQuickSoakFatal({ root, token, error, env = process.e
   // consumes the same result, including the diagnostic, rather than losing it in this process.
   return withWriteLock(root, () => {
     const state = readRebuildState(root, env);
-    if (!same(state.unverified, pending)) return;
+    if (!assertMarkerIdentity(state, { ...pending, head: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), log }).ok) return;
     return recoverQuickSoak({ root, env, state, run, log, pidAlive: () => false });
   }, lockOptions(env));
 }
@@ -211,6 +202,10 @@ export function recoverQuickSoak({ root, env, state = readRebuildState(root, env
   const nowMs = now();
   let workerAlive = false;
   try { workerAlive = Number.isSafeInteger(marker.pid) && marker.pid > 0 && pidAlive(marker) === true; } catch { /* unknown = unavailable */ }
+  if (!result && workerAlive && withinDeadline(marker, nowMs)) return { pending: true };
+  const fresh = readRebuildState(root, env);
+  if (!assertMarkerIdentity(fresh, { ...marker, head: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), log }).ok) return { pending: true };
+  Object.assign(state, fresh);
   if (result?.token === marker.token && result.sha === marker.sha && ['passed', 'failed', 'unavailable'].includes(result.outcome)) {
     settleQuickSoak({ root, env, marker, outcome: result.outcome,
       reason: result.outcome === 'unavailable' ? result.reason ?? 'soak-could-not-run' : undefined,
@@ -228,7 +223,7 @@ export function recoverQuickSoak({ root, env, state = readRebuildState(root, env
 export async function launchQuickSoak({ root, env, marker, run = gitRun, log = console, spawnFn = spawn, readStart = readProcStart }) {
   let store; let queued;
   const state = readRebuildState(root, env);
-  if (!same(state.unverified, marker)) return { started: false };
+  if (!assertMarkerIdentity(state, { ...marker, head: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), log }).ok) return { started: false };
   marker = state.unverified;
   if (marker.retryPending) {
     if (attemptsOf(marker) >= QUICK_SOAK_MAX_ATTEMPTS || !withinDeadline(marker, Date.now())) {
@@ -248,7 +243,7 @@ export async function launchQuickSoak({ root, env, marker, run = gitRun, log = c
     await new Promise((yes, no) => { child.once('spawn', yes); child.once('error', no); });
     if (!Number.isSafeInteger(child.pid) || child.pid <= 0) throw new Error('missing pid');
     const state = readRebuildState(root, env);
-    if (same(state.unverified, marker)) {
+    if (assertMarkerIdentity(state, { ...marker, head: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), log }).ok) {
       state.unverified.pid = child.pid;
       state.unverified.host = hostname();
       state.unverified.procStart = readStart(child.pid);
@@ -308,6 +303,8 @@ export async function runQuickSoak({ root, env = process.env, marker, token, run
  */
 export async function launchPinnedSoak({ root, token, jobId, env = process.env, run = gitRun, log = console,
   snapshot = { repoDir: root, install: cloneNodeModulesInstaller(root) } }) {
+  const original = readRebuildState(root, env).unverified;
+  if (!original?.quick || original.token !== token) return;
   const store = createJobStore(jobsDir(root, env));
   let child;
   let completion;
@@ -331,7 +328,7 @@ export async function launchPinnedSoak({ root, token, jobId, env = process.env, 
   await reattachTick({ store, kinds: KINDS, maxConcurrent: 1, launch: () => null });
   store.update(jobId, record => TERMINAL_JOB_STATUSES.includes(record.job.status) ? null
     : markFailed(record, { at: new Date().toISOString(), reason: JOB_FAIL_NO_COMPLETION }));
-  const marker = readRebuildState(root, env).unverified;
+  const marker = original;
   if (marker?.quick && marker.token === token) {
     // A worker may have persisted its result but failed its completion lock. Consume that evidence first.
     if ((!launched || !child) && !readQuickSoakResult(root, env, marker)) recordQuickSoakResult({ root, env, marker, outcome: 'unavailable', reason: 'worker-launch-failed' });
@@ -339,7 +336,7 @@ export async function launchPinnedSoak({ root, token, jobId, env = process.env, 
       const state = readRebuildState(root, env);
       // Waiting for the barrier may let another writer replace this adoption. The old launcher's
       // dead-worker observation applies only to its original token AND SHA.
-      if (!same(state.unverified, marker)) return;
+      if (!assertMarkerIdentity(state, { ...marker, head: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), log }).ok) return;
       return recoverQuickSoak({ root, env, state, run, log, pidAlive: () => false });
     }, lockOptions(env));
   }

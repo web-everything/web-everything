@@ -80,6 +80,34 @@ export function readRebuildState(root, env = process.env) {
   }
 }
 
+/** Identity fence for quick transitions. Call with freshly read state under the clone write lock.
+ * Historical interrupted/quarantine records may lack a token; they still need their exact snapshot
+ * and a proven HEAD. A mismatch preserves all state so a later tick/operator can reconcile it.
+ */
+export function assertMarkerIdentity(state, { token, sha, prevHead, phase = 'unverified', head, inputsKey, ready, log = console }) {
+  const marker = phase === 'quarantine' ? state.quarantine : phase === 'interrupted' ? state.inProgress : state.unverified;
+  const matches = phase === 'adopt'
+    ? !!token && (!state.building || (state.building.token === token && state.building.target === sha))
+      && ready?.quick === true && ready.token === token
+      && ready.prevHead === prevHead && ready.adopt?.finalSha === sha && !state.unverified && !state.quarantine && !state.inProgress
+      && !(state.rejected?.reason?.startsWith('quick-soak-') && (state.rejected.sha === sha || state.rejected.inputsKey === inputsKey))
+      && !(state.held?.reason?.startsWith('quick-soak-') && state.held.target === sha)
+    : !!marker && marker.token === token && marker.prevHead === prevHead
+      && (phase === 'quarantine' ? marker.failedHead === sha : phase === 'interrupted' ? marker.target === sha : marker.quick === true && !!token && marker.sha === sha)
+      && (phase === 'unverified' ? state.adopted?.head === sha : !state.unverified && !state.adopted?.unverified
+        && (phase === 'quarantine' ? !state.inProgress : !state.quarantine));
+  // Do not even probe Git for a foreign token/marker.
+  let liveHead = null;
+  try { if (matches) liveHead = head(); } catch { /* unreadable HEAD cannot authorize a mutation */ }
+  const headMatches = !!liveHead && (phase === 'adopt' ? liveHead === prevHead || (liveHead === sha && state.adopted?.head === sha && state.adopted.inputsKey === inputsKey)
+    : phase === 'quarantine' || phase === 'interrupted' ? liveHead === prevHead || (!!sha && liveHead === sha) : !!sha && liveHead === sha);
+  if (!matches || !headMatches || !prevHead) {
+    log?.error?.(`daemon-rebuild: marker-identity-mismatch phase=${phase}; quick transition deferred for reconciliation`);
+    return { ok: false };
+  }
+  return { ok: true };
+}
+
 /** Atomic write — `<file>.tmp-<pid>` then `renameSync`, same posture as `daemon-overlays.mjs#writeOverlays`. */
 export function writeRebuildState(root, state, env = process.env) {
   const file = rebuildStatePath(root, env);
