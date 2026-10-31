@@ -53,6 +53,18 @@ describe('open-pr prep admission', () => {
     writeFileSync(bodyFile, 'description');
     expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${text}`] }).outcome).toBe('opened');
   }));
+  it.each(['implement', 'build', 'add', 'fix', 'refactor', 'write'])('refuses build-worded title containing an exemption before review: %s', (verb) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
+    writeFileSync(bodyFile, 'Description without PREP.');
+    expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${verb} code review guard`] }))
+      .toMatchObject({ outcome: 'refused', reason: 'prep-block-missing', detail: expect.stringContaining('PREP:') });
+    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+  }));
+  it.each(['resolve merge conflict', 'fix merge conflict', 're-run CI; inspect the fix', 'retrigger CI; inspect the fix',
+    'file a backlog card for the fix', 'review the PR for the fix'])('opens explicit exempt title without PREP: %s', (title) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
+    writeFileSync(bodyFile, 'Description without PREP.');
+    expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${title}`] }).outcome).toBe('opened');
+    expect(spawn).toHaveBeenCalledOnce(); expect(review).toHaveBeenCalledOnce();
+  }));
   it.each(['The jury discussed this implementation.', 'This implementation needs code review.'])('refuses a build title whose body mentions exempt work: %s', (body) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, body);
     expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });

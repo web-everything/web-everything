@@ -2,7 +2,7 @@
 /** PreToolUse(Agent|Task) prep gate. Decisions are pure; the stdin boundary fails OPEN. */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { isPrepExempt, logPrepEvent, prepVerdict } from './lib/prep-block.mjs';
+import { isPrepExempt, logPrepEvent, PREP_BUILD_VERB, prepVerdict } from './lib/prep-block.mjs';
 
 function applies(event) {
   const type = event?.tool_input?.subagent_type;
@@ -10,7 +10,7 @@ function applies(event) {
   const prompt = event?.tool_input?.prompt;
   return event?.hook_event_name === 'PreToolUse' && ['Agent', 'Task'].includes(event.tool_name)
     && ['', 'codex-runner', 'worker', 'general-purpose'].includes(normalized)
-    && typeof prompt === 'string' && /\b(build|implement|add|fix|refactor|write)\b/i.test(prompt)
+    && typeof prompt === 'string' && PREP_BUILD_VERB.test(prompt)
     && /\b(open-pr|push|pull request|PR)\b/i.test(prompt)
     && !isPrepExempt(prompt.trim().slice(0, 240).split(/(?:[.!?](?:\s|$)|[\r\n])/, 1)[0]);
 }

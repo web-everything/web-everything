@@ -5,11 +5,13 @@ import { dirname, join } from 'node:path';
 const HEADINGS = ['Acceptance', 'Pre-mortem', 'Files', 'Tests'];
 const FORMAT = 'PREP:\nAcceptance: <criteria>\nPre-mortem: <risks>\nFiles: <paths>\nTests: <checks>\nOr: prep: waived — <reason>';
 const EXEMPT = /\b(?:resolve (?:the )?conflict|merge conflict|rebase onto|re-?run|rerun CI|retrigger|red-?team|review (?:the|this) PR|code review|jury|read-only|do not edit|no code changes|file (?:a |the )?(?:backlog )?(?:card|item)|card-only)\b/i;
+export const PREP_BUILD_VERB = /\b(?:implement|build|add|fix|refactor|write)\b/i;
+// Only these leading tasks win over build words; incidental exemption mentions do not.
+const EXEMPT_TASK = /^\s*(?:fix (?:the )?merge conflict(?=\s*(?:$|[.!?,;:])|\s+(?:and|then)\b)|resolve (?:the )?(?:merge )?conflict|rebase onto|(?:re-?run|retrigger) CI|file (?:a |the )?(?:backlog )?(?:card|item)|card-only|review (?:the|this) PR|code review)\b/i;
 
 export function isPrepExempt(text) {
   const statement = typeof text === 'string' ? text : '';
-  const build = /\b(?:implement|build|add\b[^.!?\r\n]*\b(?:feature|code|guard|function))\b/i;
-  return EXEMPT.test(statement) && !build.test(statement);
+  return EXEMPT.test(statement) && (EXEMPT_TASK.test(statement) || !PREP_BUILD_VERB.test(statement));
 }
 
 function nonTrivial(line) {

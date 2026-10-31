@@ -63,6 +63,28 @@ describe('prep block', () => {
     'add a jury feature', 'add code for read-only access', 'add a code review guard', 'add a rerun function'])('build instructions override exemption words: %s', (text) => {
     expect(isPrepExempt(text)).toBe(false);
   });
+  it.each(['implement', 'build', 'add', 'fix', 'refactor', 'write'])('gives %s precedence over incidental exemptions', (verb) => {
+    for (const phrase of ['code review guard', 'jury', 'read-only access', 're-run helper', 'merge conflict detector', 'card-only workflow']) {
+      expect(isPrepExempt(`${verb} ${phrase}`)).toBe(false);
+    }
+  });
+  it.each(['fix merge conflict', 'fix the merge conflict', 'resolve conflict', 'resolve the conflict',
+    'resolve merge conflict', 'resolve the merge conflict', 'rebase onto main', 're-run CI', 'rerun CI',
+    'retrigger CI', 'file a backlog card', 'file the item', 'card-only', 'review the PR', 'review this PR', 'code review'])('keeps explicit leading exempt task despite build words: %s', (task) => {
+    expect(isPrepExempt(`${task}; inspect the fix`)).toBe(true);
+    expect(isPrepExempt(`implement a guard for ${task}`)).toBe(false);
+  });
+  it.each(['red-team; fix', 'jury; refactor', 'read-only; write', 're-run checks; fix',
+    'retrigger jobs; build', 'merge conflict; fix', 'file a task; fix', 'review parser; fix',
+    'fix conflict', 'review fixes'])('does not widen the task allowlist: %s', (text) => {
+    expect(isPrepExempt(text)).toBe(false);
+  });
+  it.each(['', '   ', '.', '!', '?', ',', ';', ':', ' and open-pr', ' then open-pr'])('allows conflict resolution with task boundary %j', (suffix) => {
+    expect(isPrepExempt(`fix merge conflict${suffix}`)).toBe(true);
+  });
+  it.each([' detector', ' guard', '-detector', 's'])('refuses conflict-related builds with suffix %j', (suffix) => {
+    expect(isPrepExempt(`fix merge conflict${suffix}`)).toBe(false);
+  });
   it.each([undefined, null, 123, {}])('does not exempt non-string input %j', (text) => {
     expect(isPrepExempt(text)).toBe(false);
   });

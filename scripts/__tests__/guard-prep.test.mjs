@@ -36,8 +36,17 @@ describe('guard-prep', () => {
     expect(decide(event(prompt + prep.replace('visible outcome', text)))).not.toBeNull();
   });
   it.each(['resolve the conflict', 'resolve conflict', 'merge conflict', 'rebase onto main', 're-run checks', 'rerun CI', 'retrigger', 'red-team', 'redteam', 'review the PR', 'review this PR', 'code review', 'jury', 'read-only', 'do not edit', 'no code changes', 'file a backlog card', 'file the item', 'card-only'])('allows exempt task without PREP, but denies a build mentioning it: %s', (text) => {
-    expect(decide(event(`${text}; fix and open-pr`))).toBeNull();
+    expect(decide(event(`${text}. Fix and open-pr`))).toBeNull();
     expect(decide(event(`${prompt}; ${text}`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it.each(['implement', 'build', 'add', 'fix', 'refactor', 'write'])('denies %s with an incidental exemption', (verb) => {
+    expect(decide(event(`${verb} code review guard and open-pr`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it.each(['fix merge conflict', 'resolve merge conflict', 're-run CI', 'retrigger CI', 'file a backlog card', 'review the PR'])('allows leading exempt task with build words in the same sentence: %s', (task) => {
+    expect(decide(event(`${task}; inspect the fix and open-pr`))).toBeNull();
+  });
+  it.each(['merge conflict', 're-run checks', 'retrigger', 'red-team', 'redteam', 'jury', 'read-only', 'do not edit', 'no code changes'])('denies same-sentence build outside the task allowlist: %s', (text) => {
+    expect(decide(event(`${text}; fix and open-pr`))?.hookSpecificOutput.permissionDecision).toBe('deny');
   });
   it.each(['implement X, rerun the tests, then open-pr', 'implement X, re-run the tests, then open-pr',
     'build X, rerun the tests, then open-pr', 'add a jury guard, then open-pr'])('denies short mixed build/rerun task: %s', (text) => {
@@ -48,9 +57,9 @@ describe('guard-prep', () => {
     expect(decide(event(`jury${separator}Fix and open-pr`))).toBeNull();
   });
   it('uses the first 240 trimmed characters and provides prep/waiver guidance beyond the bound', () => {
-    expect(decide(event(`  \n${'Fix and open-pr '.padEnd(236)}jury`))).toBeNull();
+    expect(decide(event(`  \n${'Task '.padEnd(236)}jury\nFix and open-pr`))).toBeNull();
     for (const length of [240, 20_000]) {
-      expect(decide(event(`${'Fix and open-pr '.padEnd(length)}jury`))).toMatchObject({
+      expect(decide(event(`${'Task '.padEnd(length)}jury\nFix and open-pr`))).toMatchObject({
         hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: expect.stringContaining('prep: waived — <reason>') },
       });
     }
