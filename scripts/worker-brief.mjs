@@ -3,7 +3,8 @@ import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
- * drifting rules. Encodes operator handoff rules 20, 21, 23, 26 and "no pkill".
+ * drifting rules. Encodes operator handoff rules 20, 21, 23, 26, "no pkill" and the R302 speed rules
+ * (live Forge run early, one verify at the end, small fixes by hand, `--resume` for Codex follow-ups).
  * The renderer resolves the shared build and tests-first policies, including the living checklist,
  * for the injectable CLI and in-process callers.
  */
@@ -69,6 +70,12 @@ Anything else is out of scope: stop and report.
 The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
 cannot collide, and free-scope never counts other PRs' new cards against \`backlog/\`. List an existing card only if you edit it.
 
+**Speed.** These four rules keep a worker fast:
+- For Forge/remote work, do a real live Forge run in the first 15 minutes.
+- Narrow tests while iterating; ONE full verify at the end (re-run only if code changed after it).
+- Make small fixes (a few lines, a known finding) yourself; send Codex only larger builds.
+- For a Codex follow-up fix, pass \`--resume=<threadId>\` from its previous run, with the exact file, line range and finding in the task.
+
 1. **Free-scope pre-check.** Before editing, run
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
@@ -85,8 +92,10 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Never stack just to get edge-loaded: daemon-overlay add is stack-aware and a main-based lane loads on its own.
    Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
-4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
-   acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
+4. **Codex for larger builds.** Larger coding sub-tasks (a new feature, a multi-file change, a test suite) go to Codex:
+   \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
+   Do small fixes (a few lines, a known finding) yourself. For a follow-up fix on the same work, add
+   \`--resume=<threadId>\` (the \`threadId\` from the previous run's report) so Codex keeps its context instead of re-reading files.
    It is SYNCHRONOUS: run it as a normal Bash call with \`timeout: 600000\`, never wrapped in a wait; don't poll it and
    don't start a second copy. If the harness moves a call running over ~180s to the background it is harness-tracked
    and wakes you when done, so you may end your turn on it. A job you detach yourself (\`&\`, \`nohup\`, \`setsid\`) or an
@@ -101,8 +110,8 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    If over the limit, stop and propose a split plan instead of finishing the build.
    If unreadable, stop, restore readable git diff evidence, and retry before verify/converge.
 
-6. **One PR.** Commit with a tight pathspec (your files only), verify with
-   \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
+6. **One PR.** Commit with a tight pathspec (your files only), verify ONCE at the end with
+   \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it), then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
