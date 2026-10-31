@@ -515,12 +515,24 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
 
   it('code after a leading block comment on the same line is scanned; a wholly-prose line is not', () => {
     const check = treeCheck({
-      'scripts/d.mjs': "/* run it */ spawn(process.execPath, ['./live.mjs']);\n// spawn(process.execPath, ['./dead.mjs']);\n * 'also-dead.mjs'\n",
+      // Keep the prose inside a valid comment: parse errors deliberately make the closure incomplete.
+      'scripts/d.mjs': "/* run it */ spawn(process.execPath, ['./live.mjs']);\n// spawn(process.execPath, ['./dead.mjs']);\n/*\n * 'also-dead.mjs'\n */\n",
       'scripts/live.mjs': '1;\n',
       'scripts/dead.mjs': '1;\n',
+      'scripts/also-dead.mjs': '1;\n',
     });
     expect(check(['scripts/live.mjs']).skip).toBe(false);
     expect(check(['scripts/dead.mjs']).skip).toBe(true);
+    expect(check(['scripts/also-dead.mjs']).skip).toBe(true);
+  });
+
+  it('malformed source keeps the conservative fallback even when a line resembles comment prose', () => {
+    const check = treeCheck({
+      'scripts/d.mjs': " * 'also-dead.mjs'\n",
+      'scripts/unrelated.mjs': '1;\n',
+    });
+    expect(check(['scripts/unrelated.mjs']).skip).toBe(false);
+    expect(check(['docs/a.md']).skip).toBe(true);
   });
 
   it('path text is compared case- and Unicode-form-insensitively (git spelling vs the closure spelling)', () => {

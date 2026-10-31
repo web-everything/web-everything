@@ -21,6 +21,8 @@ let clone;
 beforeAll(() => {
   clone = mkdtempSync(join(tmpdir(), 'we-resolve-parent-'));
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true });
+  cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src/conveyor/daemon-manifest.mjs'),
+    join(clone, 'skills-src/conveyor/daemon-manifest.mjs'));
   // The transcript check imports this skill module during CLI startup.
   cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src', 'inspect-codex-transcript'),
     join(clone, 'skills-src', 'inspect-codex-transcript'), { recursive: true });

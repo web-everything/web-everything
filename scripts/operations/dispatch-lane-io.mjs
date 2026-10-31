@@ -11,6 +11,8 @@ import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-p
 import { resolvePolicyModel, resolveOperationEffort, resolveOperationRoute, readRoutingPolicy, resolveDispatchRoute as decideDispatchRoute } from '../lib/dispatch-routing-policy-io.mjs';
 import { meteredAlreadyDone, alreadyDoneRequest } from '../lib/gh-metered-reads.mjs';
 import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
+import { defaultReadSizePolicy } from '../lib/dispatch-size-policy.mjs';
+export { defaultReadSizePolicy } from '../lib/dispatch-size-policy.mjs';
 /**
  * @file scripts/operations/dispatch-lane-io.mjs
  * @description THE IO SHELL of the `dispatch-lane` declaration (#3037, under epic #3029) — the tick reader its
@@ -673,24 +675,6 @@ export function defaultReadScorecards({ readStore = () => readScorecardStore({ p
     return Array.isArray(records) ? records.filter((r) => r && typeof r === 'object') : [];
   } catch {
     return [];
-  }
-}
-
-/**
- * #3843 (#3801 Fork 4 (b)) — THE CHECKED-IN SIZE POLICY, `we:scripts/lib/dispatch-size-policy.json`, read at
- * this io edge and handed across as data. A missing or unreadable file returns `null`, which
- * `decideDispatchRoute`'s `validateSizePolicy` resolves field by field to `DEFAULT_SIZE_POLICY` — so a broken
- * read is byte-identical to the defaults rather than a refused route.
- *
- * @param {{root?: string, readText?: (p: string) => string}} [io]
- * @returns {object|null} the parsed setting, or `null`.
- */
-export function defaultReadSizePolicy({ root = REPO_ROOT, readText = (p) => readFileSync(p, 'utf8') } = {}) {
-  try {
-    const parsed = JSON.parse(String(readText(join(root, 'scripts', 'lib', 'dispatch-size-policy.json'))));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
   }
 }
 

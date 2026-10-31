@@ -16,7 +16,7 @@ import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, posix } from 'node:path';
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, archiveUncovered, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
@@ -24,6 +24,8 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -334,8 +336,10 @@ async function resolveDispatchSmoke(opt, env) {
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false, entries = [],
 }) {
+  const closureScopeMode = resolveClosureScopeMode(env).mode;
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries, env });
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
    *  never mid-fallback (a sibling must not start a build while B/C are still being smoked). Returns the
@@ -695,6 +699,24 @@ export async function smokeAndAdopt({
 
   // ── (a) plain main: drop every NON-pinned overlay and try again ──────────────────────────────────────
   const rawByRef = new Map((overlaysBefore || []).map((o) => [o?.ref, o]));
+  // Every registered carrier matters, including carriers excluded from this fallback's applied list.
+  // An unreadable archive is refused too; leave the running build and registrations available for retry.
+  const archiveFailure = (candidate) => {
+    if (!candidate.ok) return null;
+    let uncovered;
+    let error;
+    try { uncovered = archiveUncovered(git, overlaysBefore || [], candidate.finalSha); }
+    catch (e) {
+      uncovered = (overlaysBefore || []).filter(o => o.retiredSources?.length);
+      error = String(e?.message ?? e);
+    }
+    if (!uncovered.length && !error) return null;
+    const refs = uncovered.map(o => o.ref);
+    const failed = `archive-source-uncovered: ${refs.join(', ')}`;
+    alert('overlay-source-unavailable', { refs, failed, target: candidate.finalSha, ...(error ? { error } : {}),
+      message: 'Fallback cannot prove archived content is preserved; keeping the running build and overlay registrations.' });
+    return failed;
+  };
   const withPin = plan.applied.map((ap) => ({
     ...ap, pinned: pinnedStatus(git, rawByRef.get(ap.ref) ?? {}, plan.mainSha, ap.sha).pinned,
   }));
@@ -733,15 +755,19 @@ export async function smokeAndAdopt({
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
       const planA2 = await planRebuild({
+        entries: runtimeEntries, env, closureScopeMode,
         git, headSha: prevHead, mainRef: 'origin/main',
         overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
       });
       const failedNames = failedA.map((r) => r.name).join(',');
       let failed = planA2.reason ?? 'not planned';
+      const a2ArchiveFailure = archiveFailure(planA2);
       // x9diisp — setting the culprits aside must never also lose an overlay the running build carries (e.g. one a
       // culprit's change had let apply in the retry pass): such a fallback is refused like prepare refuses it.
-      if (planA2.ok && planA2.establishedLost?.length > 0) {
+      if (a2ArchiveFailure) {
+        failed = a2ArchiveFailure;
+      } else if (planA2.ok && planA2.establishedLost?.length > 0) {
         failed = `established-overlay-conflict: ${planA2.establishedLost.map((l) => l.ref).join(', ')}`;
       } else if (planA2.ok) {
         alert('overlay-set-aside-attributed', {
@@ -776,13 +802,15 @@ export async function smokeAndAdopt({
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
+      entries: runtimeEntries, env, closureScopeMode,
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
     // x9diisp/overlay-pin — like planA2, plain main must never lose an overlay the running build carries (e.g. a
     // pinned head that only merged thanks to a suspect it now leaves out): refused as unplannable instead.
     const bLost = planB.ok && planB.establishedLost?.length > 0;
-    if (planB.ok && !bLost) {
+    const bArchiveFailure = archiveFailure(planB);
+    if (planB.ok && !bLost && !bArchiveFailure) {
       const suspectInfo = suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr }));
       alert('fallback-plain-main', {
         failed: failedA.map((r) => r.name).join(','), suspects: suspectInfo, target: planB.finalSha,
@@ -853,7 +881,7 @@ export async function smokeAndAdopt({
       }
     } else {
       alert('fallback-plain-main-unplannable', {
-        reason: bLost ? `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}` : planB.reason,
+        reason: bArchiveFailure ?? (bLost ? `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}` : planB.reason),
       });
     }
   }

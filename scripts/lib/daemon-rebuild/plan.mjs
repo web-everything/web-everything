@@ -4,6 +4,9 @@
 
 import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
+import { computeClosureScope, fixpointExtend, finalClosureScope, isExcludable } from './closure-scope.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { createHash } from 'node:crypto';
 
@@ -328,10 +331,79 @@ export async function planOverlayStacks({
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
  *   alerts:Array<object>, inputsKey:string, upToDate:boolean}>}
  */
-export async function planRebuild({
+/** Scoped plans are provisional until the final closure proves their exclusions unreachable.
+ * Replan at most three times; exhaustion or incomplete evidence retains the ordinary conflict path. */
+export async function planRebuild(options) {
+  const { git, entries = [], env = process.env } = options;
+  const mode = lockClosureScopeMode(options.closureScopeMode ?? resolveClosureScopeMode(env).mode);
+  let initialEntries = entries;
+  if (mode === 'on') {
+    try {
+      initialEntries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(initialEntries) || !initialEntries.length) throw new Error('entries unreadable');
+    } catch {
+      const fallback = await planRebuildPass({ ...options, scopeContext: { mode: 'off' } });
+      fallback.alerts ??= [];
+      fallback.alerts.push({ kind: 'overlay-closure-scope-refused', detail: {
+        reason: 'entries-unreadable',
+        message: 'final closure unproven — retain full-merge conflict; rebase the overlay manually',
+      } });
+      return fallback;
+    }
+  }
+  let evidence;
+  const scopeContext = {
+    mode: ['on', 'shadow'].includes(mode) ? mode : 'off',
+    getScope(mainSha, listed) {
+      if (evidence !== undefined) return evidence?.scope;
+      try {
+        const overlays = listed.map(o => {
+          const sha = verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`);
+          const mb = git(['merge-base', mainSha, sha]);
+          if (mb.error || mb.status !== 0 || !FULL_SHA_RE.test(String(mb.stdout ?? '').trim())) throw new Error('scope merge-base unavailable');
+          const diff = git(['diff', '--name-only', '-z', String(mb.stdout).trim(), sha]);
+          if (diff.error || diff.status !== 0) throw new Error('scope diff unavailable');
+          const names = String(diff.stdout ?? '');
+          if (names && !names.endsWith('\0')) throw new Error('scope diff truncated');
+          return { sha, changedFiles: names.split('\0').filter(Boolean) };
+        });
+        evidence = computeClosureScope({ git, mainSha, overlays,
+          entries: typeof initialEntries === 'function' ? initialEntries() : initialEntries, env });
+        if (!evidence.ok) evidence = null;
+      } catch { evidence = null; }
+      return evidence?.scope;
+    },
+  };
+  for (let attempt = 0; ; attempt++) {
+    const plan = await planRebuildPass({ ...options, scopeContext });
+    if (!plan.ok || scopeContext.mode !== 'on') return plan;
+    const excluded = [...new Set([...plan.applied, ...plan.decisions].flatMap(a => a.excluded ?? []))];
+    if (!excluded.length) return plan;
+    const final = finalClosureScope({ git, sha: plan.finalSha, entries, env });
+    let additions;
+    try {
+      additions = fixpointExtend({ scope: evidence?.scope, excluded, finalClosure: final.closure });
+      if (!final.ok) throw new Error('final closure unproven');
+      additions = [...new Set([...additions, ...excluded.filter(p => !isExcludable(p, final.scope))])];
+      if (!additions.length) return plan;
+      if (attempt >= 3) throw new Error('closure fixpoint exhausted');
+    } catch {
+      const fallback = await planRebuildPass({ ...options, scopeContext: { mode: 'off' } });
+      fallback.alerts ??= [];
+      fallback.alerts.push({ kind: 'overlay-closure-scope-refused', detail: {
+        reason: final.ok ? 'fixpoint-exhausted' : final.reason,
+        message: 'final closure unproven — retain full-merge conflict; rebase the overlay manually',
+      } });
+      return fallback;
+    }
+    for (const path of additions) evidence.scope.add(path);
+  }
+}
+
+async function planRebuildPass({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(),
+  noPin = new Set(), scopeContext = { mode: 'off' },
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -592,7 +664,20 @@ export async function planRebuild({
     let resolution;
     let tree = String(mt.stdout ?? '').split('\n')[0].trim();
     if (mt.status === 1) {
-      if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
+      const scope = scopeContext.mode === 'off' ? undefined : () => scopeContext.getScope(mainSha, listed);
+      if (edgeResolve || scope?.()) resolution = resolveOverlayConflict({
+        git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw), edgeResolve,
+        scope,
+      });
+      if (resolution?.via === 'closure-scope' && scopeContext.mode === 'shadow') {
+        alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via,
+          mode: 'shadow', excluded: resolution.excluded,
+          message: `overlay ${ref} would resolve, excluded ${resolution.excluded.length}`,
+        } });
+        // Preserve all ordinary unresolved handling, including pinning, drops and holds.
+        resolution = edgeResolve ? resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) }) : undefined;
+      }
+      if (!edgeResolve && !resolution?.ok) resolution = undefined;
       if (resolution?.ok) tree = resolution.tree;
       else {
         const containers = deferredContainers.get(raw);
@@ -664,6 +749,11 @@ export async function planRebuild({
     //    compare against `cur` catches it regardless of history shape.
     const curTree = verifyRev(git, `${cur}^{tree}`);
     if (tree && curTree && tree === curTree) {
+      if (resolution?.via === 'closure-scope') {
+        decisions.push({ ref, pr, action: 'skip', reason: 'scoped-noop', sha: ovSha, excluded: resolution.excluded });
+        alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via, excluded: resolution.excluded } });
+        continue;
+      }
       // A PINNED overlay is only `in-main` when MAIN has it (tip an ancestor of main, or merging it onto main changes
       // nothing — the squash-merged shape). Content that only an already-applied overlay carries (listed after its
       // top, whether or not its exact tip is an ancestor of `cur`: a rebased base keeps the old head's content in its
@@ -693,7 +783,8 @@ export async function planRebuild({
       continue;
     }
     cur = newSha;
-    const edge = resolution?.edgeSha ? { edgeSha: resolution.edgeSha } : {};
+    const edge = { ...(resolution?.edgeSha ? { edgeSha: resolution.edgeSha } : {}),
+      ...(resolution?.excluded ? { excluded: resolution.excluded } : {}) };
     applied.push({ ref, pr, sha: ovSha, ...(resolution?.ok ? { resolvedVia: resolution.via, ...edge } : {}) });
     decisions.push({ ref, pr, action: 'apply', reason: resolution?.ok ? `applied-${resolution.via}` : 'applied', sha: ovSha });
     if (resolution?.ok) alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via, ...edge } });
@@ -757,9 +848,9 @@ export async function planRebuild({
     alerts.push({ kind: 'overlay-stack-fallback', detail: { ref: d.ref, pr: d.pr, sha: d.sha, tops: d.tops } });
   }
   if (lostBases.length > 0) {
-    return planRebuild({
+    return planRebuildPass({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, scopeContext,
     });
   }
 
@@ -815,7 +906,8 @@ export async function planRebuild({
 
   const inputsKey = createHash('sha256')
     .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
-      ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))
+      ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null, ...(a.excluded ? [a.excluded] : [])] : [a.ref, a.sha]),
+      ...(decisions.some(d => d.reason === 'scoped-noop') ? { scopedSkips: decisions.filter(d => d.reason === 'scoped-noop').map(d => [d.ref, d.sha, d.excluded]) } : {}) }))
     .digest('hex')
     .slice(0, 16);
 
@@ -857,9 +949,9 @@ export async function planRebuild({
         }
       }
       for (const refs of retryPinGroups()) {
-        const alt = await planRebuild({
+        const alt = await planRebuildPass({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs),
+          keepIndependent, noPin: new Set(refs), scopeContext,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));

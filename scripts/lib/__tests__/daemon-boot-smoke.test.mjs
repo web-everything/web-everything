@@ -18,10 +18,126 @@ import {
 } from '../daemon-boot-smoke.mjs';
 import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
 import { redactDetail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
 
 describe('resolveDaemonEntries', () => {
+  it.each([undefined, 'off', 'shadow', 'on'])('keeps boot discovery inert with unreadable LaunchAgents in mode %s', async mode => {
+    const home = mkdtempSync(join(tmpdir(), 'boot-shadow-home-'));
+    try {
+      const env = { HOME: home, WE_SMOKE_LIVE_CLONE: process.cwd(),
+        ...(mode === undefined ? {} : { WE_DAEMON_CLOSURE_SCOPE: mode }) };
+      const fixed = await checkDaemonEntriesBoot({ root: process.cwd(), env: { HOME: home },
+        runChild: async () => '{"ok":true}', now: () => 0 });
+      const result = await checkDaemonEntriesBoot({ root: process.cwd(), env,
+        runChild: async () => '{"ok":true}', now: () => 0 });
+      expect(result).toEqual(fixed);
+      expect(result.ok).toBe(true);
+      expect(result.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it.each(['off', 'shadow', 'on'])('keeps the skip surface fixed despite unreadable LaunchAgents in mode %s', mode => {
+    const home = mkdtempSync(join(tmpdir(), 'surface-home-'));
+    try {
+      const env = { HOME: home, WE_SMOKE_LIVE_CLONE: process.cwd(), WE_DAEMON_CLOSURE_SCOPE: mode };
+      expect(smokeSurfaceEntries(env)).toEqual(smokeSurfaceEntries({}));
+      expect(smokeSurfaceEntries({ ...env, [DAEMON_ENTRIES_ENV]: 'custom.mjs' })).toContain('custom.mjs');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it.each(['off', 'shadow', 'on'])('does not call an injected runtime discovery in mode %s', mode => {
+    let discovered = false;
+    const result = resolveDaemonEntries({ WE_DAEMON_CLOSURE_SCOPE: mode, WE_SMOKE_LIVE_CLONE: 'live-clone' }, {
+      runtimeEntries() { discovered = true; return [...DAEMON_ENTRY_MODULES, 'extra.mjs']; },
+    });
+    expect(discovered).toBe(false);
+    expect(result).toEqual({ entries: DAEMON_ENTRY_MODULES, overridden: false });
+  });
+
   it('uses the real list when no override is set', () => {
     expect(resolveDaemonEntries({})).toEqual({ entries: DAEMON_ENTRY_MODULES, overridden: false });
+  });
+
+  it('boots the fixed list for a minimal clone without daemon entries', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-minimal-'));
+    try {
+      const r = await checkDaemonEntriesBoot({ root, env: { WE_SMOKE_LIVE_CLONE: root },
+        runChild: async () => '{"ok":true}' });
+      expect(r.ok).toBe(true);
+      expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('boots the fixed list when only a candidate root is supplied', async () => {
+    const r = await checkDaemonEntriesBoot({ root: '.', env: {}, runChild: async () => '{"ok":true}' });
+    expect(r.ok).toBe(true);
+    expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+  });
+
+  it('falls back to booting the fixed entries in on mode when the candidate has no daemon entries', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-on-fallback-'));
+    const booted = [];
+    try {
+      const r = await checkDaemonEntriesBoot({ root, env: {
+        HOME: root, WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: join(root, 'missing-live-clone'),
+      }, runChild: async (_cmd, args) => { booted.push(args[2]); return '{"ok":true}'; } });
+      expect(r.ok).toBe(true);
+      expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+      expect(booted).toHaveLength(DAEMON_ENTRY_MODULES.length);
+      for (const entry of DAEMON_ENTRY_MODULES) expect(booted).toContain(buildEntryBootScript(entry));
+      expect(r.detail).toContain('daemon entries booted clean');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('fails closed on missing fixed entries in a real boot of a minimal clone', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-missing-'));
+    try {
+      const r = await checkDaemonEntriesBoot({ root, env: { ...process.env, WE_SMOKE_LIVE_CLONE: root, [DAEMON_ENTRIES_ENV]: '' },
+        budgets: { daemonBootMs: 15_000 }, diagnosticsDir: join(root, 'diagnostics') });
+      expect(r.ok).toBe(false);
+      expect(r.entries).toHaveLength(DAEMON_ENTRY_MODULES.length);
+      expect(r.entries.every(entry => !entry.ok && entry.kind === 'import failed')).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('locked on boots fixed entries despite an unreadable live clone', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-live-'));
+    let spawned = false;
+    try {
+      const r = await checkDaemonEntriesBoot({ root: process.cwd(), env: {
+        WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: join(root, 'missing') },
+        runChild: async () => { spawned = true; return '{"ok":true}'; } });
+      expect(r.ok).toBe(true);
+      expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+      expect(spawned).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('locked on keeps the fixed entries when a clone root is known', () => {
+    let observed;
+    const runtimeEntries = options => { observed = options; return [...DAEMON_ENTRY_MODULES, 'clone.mjs']; };
+    const env = { WE_DAEMON_CLOSURE_SCOPE: 'on' };
+    expect(resolveDaemonEntries(env, { root: 'clone-root', runtimeEntries }).entries).toEqual(DAEMON_ENTRY_MODULES);
+    expect(observed).toBeUndefined();
+  });
+
+  it('locked on never discovers live LaunchAgents while booting a disposable candidate', () => {
+    let observed;
+    const runtimeEntries = options => { observed = options; return DAEMON_ENTRY_MODULES; };
+    const env = { WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: 'live-clone', HOME: 'isolated-home' };
+    resolveDaemonEntries(env, { root: 'candidate-tree', runtimeEntries });
+    expect(observed).toBeUndefined();
+  });
+
+  it('locked on boots fixed entries without calling unreadable discovery', async () => {
+    let spawned = false;
+    const r = await checkDaemonEntriesBoot({ root: 'clone-root', env: { WE_DAEMON_CLOSURE_SCOPE: 'on' },
+      runtimeEntries() { throw new Error('plist unreadable'); },
+      runChild: async () => { spawned = true; return '{"ok":true}'; },
+    });
+    expect(r.ok).toBe(true);
+    expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+    expect(spawned).toBe(true);
   });
 
   it('parses a comma-separated override, trimming whitespace and dropping empties, and reports overridden:true', () => {
@@ -84,7 +200,8 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
   beforeEach(() => { diagnosticsDir = mkdtempSync(join(tmpdir(), 'we-boot-diag-')); });
   afterEach(() => rmSync(diagnosticsDir, { recursive: true, force: true }));
   const sevenEntries = { [DAEMON_ENTRIES_ENV]: Array.from({ length: 7 }, (_, i) => `fixture-${i}.mjs`).join(',') };
-  const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, runChild, env: {}, diagnosticsDir });
+  const ctx = (runChild) => ({ root: '/candidate', runtimeEntries: () => DAEMON_ENTRY_MODULES,
+    budgets: { daemonBootMs: 1000 }, runChild, env: {}, diagnosticsDir });
 
   it('refuses all seven boots at 1275ms left instead of starting doomed 45s children', async () => {
     let calls = 0;
@@ -404,7 +521,7 @@ describe('checkDaemonEntriesBoot — real subprocess, real dynamic import (no fa
   });
 
   it('boots every REAL production daemon entry clean on this tree (the wiring test)', async () => {
-    const r = await checkDaemonEntriesBoot({ root: process.cwd(), budgets: { daemonBootMs: 45_000 } });
+    const r = await checkDaemonEntriesBoot({ root: process.cwd(), runtimeEntries: () => DAEMON_ENTRY_MODULES, budgets: { daemonBootMs: 45_000 } });
     expect(r.ok).toBe(true);
     for (const entry of DAEMON_ENTRY_MODULES) expect(r.detail).toContain(entry);
   }, 60_000);

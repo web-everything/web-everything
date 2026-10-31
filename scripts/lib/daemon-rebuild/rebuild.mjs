@@ -32,7 +32,8 @@ export const FAILURE_REASONS = new Set([
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'overlay-source-unavailable', 'overlay-source-unverifiable', 'overlay-state-corrupt', 'overlay-state-malformed',
+  'pinned-overlay-conflict', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
@@ -69,7 +70,9 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     if (result.moved === true) {
       if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
         await emitEvent({
-          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head,
+            ...(result.plan?.applied?.some(a => a.resolvedVia === 'closure-scope') ? { resolvedVia: 'closure-scope' } : {}),
+          },
         }, eventOptions);
       }
     } else if (typeof result.reason === 'string' && FAILURE_REASONS.has(result.reason.split(':', 1)[0])) {
@@ -148,7 +151,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, entries,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
@@ -191,7 +194,7 @@ async function rebuildCloneInternal({
   try {
     return await smokeAndAdopt({
       root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly, entries,
     });
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.
