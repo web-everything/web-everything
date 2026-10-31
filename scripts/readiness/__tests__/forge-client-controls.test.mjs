@@ -24,7 +24,7 @@ const classes = [command,['npx','vitest','related','src/a.ts','--run'],['npm','r
 const withArg = (argv,arg) => argv[0]==='npm' ? [...argv,'--',arg] : [...argv,arg];
 
 describe('Forge synchronous module loading', () => {
-  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs'])
+  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs','forge-exec-limits.mjs'])
   ('loads %s synchronously without executing its CLI', module => {
     // Native require rejects any top-level await in the entire static import graph.
     const result=spawnSync(process.execPath,['--experimental-require-module','-e',

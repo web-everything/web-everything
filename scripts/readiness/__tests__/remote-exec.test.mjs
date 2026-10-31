@@ -2248,3 +2248,31 @@ it('includes an attempted manifest stage on failure and measures old-runner wall
   expect(completed.timings.find(t=>t.stage==='forge-run')).toMatchObject({ms:expect.any(Number)});
   expect(completed.timings.find(t=>t.stage==='forge-install')).toBeUndefined();
 });
+
+
+describe('overlapped Forge discovery',()=>{
+  it('starts reachability, HEAD and bases together before consuming failures',async()=>{
+    const f=fixture(),pending=new Map();
+    const exec=vi.fn(call=>new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
+    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec});
+    await new Promise(resolve=>setImmediate(resolve));
+    expect([...pending.keys()].sort()).toEqual(['bases','head','probe']);
+    pending.get('probe').resolve({code:0});
+    pending.get('head').reject(new Error('HEAD unavailable'));
+    pending.get('bases').reject(new Error('bases unavailable'));
+    expect((await result).mode).toBe('fallback');
+    expect(exec).toHaveBeenCalledTimes(3);
+  });
+  it.each(['nonzero','rejection'])('drains in-flight failures before unreachable fallback (%s)',async fault=>{
+    const f=fixture(),pending=new Map();let settled=false;
+    const exec=vi.fn(call=>new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
+    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec}).then(value=>{settled=true;return value;});
+    await new Promise(resolve=>setImmediate(resolve));
+    if(fault==='rejection')pending.get('probe').reject(new Error('unreachable'));
+    else pending.get('probe').resolve({code:255});
+    await new Promise(resolve=>setImmediate(resolve));expect(settled).toBe(false);
+    pending.get('head').reject(new Error('local failure'));pending.get('bases').reject(new Error('remote failure'));
+    expect(await result).toMatchObject({mode:'fallback',reason:'forge-unreachable'});
+    expect(exec).toHaveBeenCalledTimes(3);
+  });
+});

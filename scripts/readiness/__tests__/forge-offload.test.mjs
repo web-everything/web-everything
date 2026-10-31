@@ -2,16 +2,16 @@
 import {describe,it,expect,beforeEach,afterEach,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
-import {join} from 'node:path';
+import {dirname,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as remote from '../remote-exec.mjs';
+import {BASE_RETENTION,baseGuard,claimPrewarm,copyLeaves,createBasePin,pruneBases,readyBases,readBase} from '../forge-exec-bases.mjs';
 import {parseGitTree} from '../forge-exec-manifest.mjs';
 import {createRunner,manifestWire,digestManifest,digestInput,digestArgv} from '../forge-exec-run.mjs';
-import {baseGuard,createBasePin,pruneBases,readyBases,readBase} from '../forge-exec-bases.mjs';
 let root,repo;
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
-const exec=async ({file,args,cwd,env})=>{const r=spawnSync(file,args,{cwd,env,maxBuffer:4*1024*1024});return {code:r.status,stdout:r.stdout};};
+const exec=async ({file,args,cwd,env,input})=>{const r=spawnSync(file,args,{cwd,env,input,maxBuffer:4*1024*1024});return {code:r.status,stdout:r.stdout};};
 const commit=()=>git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
 beforeEach(async()=>{
   root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-offload-')));repo=join(root,'repo');await fs.mkdir(repo);
@@ -27,7 +27,7 @@ async function baseFixture() {
 }
 async function pruningFixture() {
   const target=join(root,'pruning');await fs.mkdir(target,{mode:0o700});
-  const shas=Array.from({length:6},(_,i)=>String(i).repeat(40));
+  const shas=Array.from({length:BASE_RETENTION+2},(_,i)=>i.toString(16).repeat(40));
   for(const [i,sha] of shas.entries()) {
     await fs.mkdir(join(target,sha));
     await fs.writeFile(join(target,sha,'READY'),JSON.stringify({sha,manifestDigest:hash('manifest'),lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));
@@ -287,6 +287,23 @@ describe('warm base selection and delta proof',()=>{
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs','mode.txt','other.txt']);
     expect(delta.deletions.map(p=>p.toString())).toEqual(['deleted.txt']);
   });
+  it('ranks twelve advertised bases by ancestor distance rather than advertisement order and rejects thirteen',async()=>{
+    const older=await baseFixture();
+    await fs.writeFile(join(repo,'mode.txt'),'next');git(['add','.']);commit();
+    const nearest=await baseFixture();
+    const bases=[older,...Array.from({length:10},(_,i)=>({...older,sha:i.toString(16).repeat(40)})),nearest];
+    expect(BASE_RETENTION).toBe(12);
+    expect(await remote.selectBase({cwd:repo,exec,bases})).toEqual(nearest);
+    expect(await remote.selectBase({cwd:repo,exec,bases:[...bases,older]})).toBeNull();
+  });
+  it('prefers fewer changed paths for nonancestors and safely retains newest order on missing distance',async()=>{
+    const bases=Array.from({length:3},(_,i)=>({sha:String(i).repeat(40),manifestDigest:'a'.repeat(64)}));
+    const probe=vi.fn(async({args})=>({code:args[0]==='merge-base'?1:0,stdout:args[0]==='diff'?Buffer.from(args.includes(bases[1].sha)?'a\0':'a\0b\0'):Buffer.alloc(0)}));
+    expect(await remote.selectBase({exec:probe,bases})).toEqual(bases[1]);
+    expect(probe.mock.calls.length).toBeLessThanOrEqual(4*bases.length);
+    const broken=async call=>call.args[0]==='diff'?{code:1,stdout:Buffer.alloc(0)}:probe(call);
+    expect(await remote.selectBase({exec:broken,bases})).toEqual(bases[0]);
+  });
   it('uses full shipping when no ready base exists locally',async()=>{
     const base=await baseFixture();
     expect(await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)}]})).toBeNull();
@@ -312,12 +329,31 @@ describe('warm base selection and delta proof',()=>{
     git(['checkout','--','oauth-source.mjs']);await fs.writeFile(join(repo,'.gitignore'),'ignored.test.mjs\n');await fs.writeFile(join(repo,'ignored.test.mjs'),'hidden');
     await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toThrow('Ignored test');
   });
-  it('reads and hashes every final worktree leaf, including git-clean paths',async()=>{
+  it('reuses clean leaves while hashing changed and public credential paths',async()=>{
     const base=await baseFixture();await fs.writeFile(join(repo,'a.test.mjs'),'changed');
     const read=vi.fn(path=>fs.readFile(path));
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base,fs:{...fs,readFile:read}});
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs']);
-    for(const entry of delta.entries)expect(read.mock.calls.some(([path])=>Buffer.from(path).equals(Buffer.from(join(repo,entry.path.toString()))))).toBe(true);
+    expect(delta.manifestMode).toBe('git-delta');
+    expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','oauth-source.mjs']);
+  });
+  it('reads and hashes every final leaf when the fast path is unavailable',async()=>{
+    const base=await baseFixture();
+    await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    await fs.writeFile(join(repo,'untracked.txt'),'new');
+    const read=vi.fn(path=>fs.readFile(path));
+    const unavailable=call=>call.args[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec:unavailable,base,fs:{...fs,readFile:read}});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(delta.manifestMode).toBe('full-scan');
+    expect(delta.manifestReason).toBeTruthy();
+    expect(delta.entries).toEqual(full.entries);
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    const reads=new Map(read.mock.calls.map(([path],i)=>[Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString(),read.mock.results[i].value]));
+    for(const entry of delta.entries) {
+      expect(reads.has(entry.path.toString())).toBe(true);
+      expect(entry.sha256).toBe(hash(await reads.get(entry.path.toString())));
+    }
   });
   it('includes autocrlf worktree bytes that git considers clean and matches full shipping',async()=>{
     await fs.writeFile(join(repo,'mode.txt'),'line\n');git(['add','.']);commit();
@@ -347,31 +383,97 @@ describe('warm base selection and delta proof',()=>{
 });
 
 describe('runner base materialization refuses before install',()=>{
-  async function setup() {
+  async function setup(pool=false,shape) {
+    if(shape==='file to directory')await fs.writeFile(join(repo,'node'),'old leaf');
+    if(['directory to file','nested deletion'].includes(shape)) {
+      await fs.mkdir(join(repo,'node','nested'),{recursive:true});await fs.writeFile(join(repo,'node','nested','leaf'),'old leaf');
+    }
     const base=await baseFixture();const server=join(root,'server');const dir=join(server,'bases',base.sha);await fs.mkdir(join(dir,'tree'),{recursive:true});
-    for(const path of Buffer.from(base.manifest.paths,'base64').toString().split('\0').filter(Boolean)) await fs.copyFile(join(repo,path),join(dir,'tree',path));
+    const copy=async(source,dest)=>{await fs.mkdir(dirname(dest),{recursive:true});await fs.copyFile(source,dest);};
+    for(const path of Buffer.from(base.manifest.paths,'base64').toString().split('\0').filter(Boolean)) await copy(join(repo,path),join(dir,'tree',path));
     await fs.writeFile(join(dir,'manifest.json'),JSON.stringify(base.manifest));await fs.writeFile(join(dir,'READY'),JSON.stringify({sha:base.sha,manifestDigest:base.manifestDigest,lockDigest:hash('lock'),readyAtMs:1,fetchedAtMs:0}));
     const bin=join(server,'bin');await fs.mkdir(bin);await fs.symlink(process.execPath,join(bin,'node'));
     await fs.writeFile(join(bin,'npm'),`#!/bin/sh\necho ran >> '${server}/npm.log'\necho \"$*\" >> '${server}/npm-args.log'\nexit 0\n`,{mode:0o755});
-    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin'});
+    if(pool){await fs.mkdir(join(server,'runs','slot-1'),{recursive:true,mode:0o710});await fs.chmod(join(server,'runs','slot-1'),0o710);}
+    const workerExec=vi.fn(async()=>({code:0,stdout:'',stderr:''}));
+    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin',...(pool?{testWorkerExec:workerExec}:{})});
     const nonce='e'.repeat(32),prepared=await runner.prepare({nonce});
     expect(prepared.capabilities).toMatchObject({delta:1,bases:[{sha:base.sha,manifestDigest:base.manifestDigest}]});
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    if(shape)await fs.rm(join(repo,'node'),{recursive:true});
+    if(shape==='file to directory'){await fs.mkdir(join(repo,'node'));await fs.writeFile(join(repo,'node','leaf'),'new leaf');}
+    if(shape==='directory to file')await fs.writeFile(join(repo,'node'),'new leaf');
     const manifest=await remote.buildManifest({cwd:repo,exec});
-    const work=join(server,'runs',prepared.run,'work');await fs.copyFile(join(repo,'a.test.mjs'),join(work,'a.test.mjs'));
+    const work=join(server,'runs',...(pool?['slot-1']:[]),prepared.run,'work');await fs.copyFile(join(repo,'a.test.mjs'),join(work,'a.test.mjs'));
+    if(shape==='file to directory')await copy(join(repo,'node','leaf'),join(work,'node','leaf'));
+    if(shape==='directory to file')await copy(join(repo,'node'),join(work,'node'));
     // Real fully materialized local tree supplies the unchanged legacy input binding.
     const full=join(root,'full');await fs.mkdir(full);
-    for(const entry of manifest.entries)await fs.copyFile(join(repo,entry.path.toString()),join(full,entry.path.toString()));
+    for(const entry of manifest.entries)await copy(join(repo,entry.path.toString()),join(full,entry.path.toString()));
     const argv=['npm','run','test:unit','--','a.test.mjs'];
     const request={v:1,nonce,run:prepared.run,argv,env:{},argvDigest:digestArgv(argv),lock:hash('lock'),inputDigest:await digestInput(full),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest,baseSha:base.sha,baseManifestDigest:base.manifestDigest,deletions:Buffer.from('deleted.txt\0').toString('base64')};
-    return {base,dir,server,runner,request,work};
+    if(shape)request.deletions=Buffer.concat([Buffer.from('deleted.txt\0'),Buffer.from(shape==='file to directory'?'node\0':'node/nested/leaf\0')]).toString('base64');
+    return {base,dir,server,runner,request,work,workerExec};
   }
   it('uses independent copies, applies deletion and delta, and verifies before install',async()=>{
     const f=await setup();expect((await f.runner.run(f.request)).code).toBe(0);
     expect(await fs.readFile(join(f.work,'a.test.mjs'),'utf8')).toBe('changed');
     await expect(fs.stat(join(f.work,'deleted.txt'))).rejects.toMatchObject({code:'ENOENT'});
     await fs.writeFile(join(f.work,'mode.txt'),'worker modification');expect(await fs.readFile(join(f.dir,'tree/mode.txt'),'utf8')).toBe('mode');
+    expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(false);
     const receipt=await f.runner.finish(f.request);expect(receipt.timings).toMatchObject({installMs:expect.any(Number),runMs:expect.any(Number)});
+  });
+  it.each(['valid','tampered','absent','symlink','bad marker','not private'])('prewarm %s claims exclusively or falls back to the ordinary copy, applying only delta',async kind=>{
+    const f=await setup(true),parent=join(f.server,'bases','prewarm',f.base.sha),tree=join(parent,'1');
+    if(kind!=='absent') {
+      await fs.mkdir(parent,{recursive:true,mode:0o700});await fs.mkdir(tree,{mode:0o700});
+      const {decodeManifest}=await import('../forge-exec-manifest.mjs');
+      await copyLeaves(join(f.dir,'tree'),tree,decodeManifest(f.base.manifest).entries);
+      await fs.writeFile(tree+'.json',JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}),{mode:0o600});
+      if(kind==='tampered')await fs.writeFile(join(tree,'mode.txt'),'evil');
+      if(kind==='symlink'){await fs.rm(join(tree,'mode.txt'));await fs.symlink(join(repo,'mode.txt'),join(tree,'mode.txt'));}
+      if(kind==='not private')await fs.chmod(tree,0o755);
+      if(kind==='bad marker')await fs.writeFile(tree+'.json','{}');
+    }
+    const inode=kind==='valid'?(await fs.stat(join(tree,'mode.txt'))).ino:null;
+    expect((await f.runner.run(f.request)).code).toBe(0);
+    expect(await fs.readFile(join(f.work,'a.test.mjs'),'utf8')).toBe('changed');
+    expect(await fs.readFile(join(f.work,'mode.txt'),'utf8')).toBe('mode');
+    await expect(fs.lstat(join(f.work,'deleted.txt'))).rejects.toMatchObject({code:'ENOENT'});
+    if(kind==='valid') {
+      expect((await fs.stat(join(f.work,'mode.txt'))).ino).toBe(inode);
+      await expect(fs.lstat(tree)).rejects.toMatchObject({code:'ENOENT'});
+      expect(await claimPrewarm(join(f.server,'bases'),f.base.sha,'1',join(parent,'second'),f.base.manifest,f.base.manifestDigest,()=>{})).toBe(false);
+    }
+    expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(kind==='valid');
+    await f.runner.finish(f.request);
+  });
+  it.each(['file to directory','directory to file','nested deletion'])('prewarm applies %s without stale parent directories',async shape=>{
+    const f=await setup(true,shape),tree=join(f.server,'bases','prewarm',f.base.sha,'1');
+    await fs.mkdir(tree,{recursive:true,mode:0o700});
+    const {decodeManifest}=await import('../forge-exec-manifest.mjs');
+    await copyLeaves(join(f.dir,'tree'),tree,decodeManifest(f.base.manifest).entries);
+    await fs.writeFile(tree+'.json',JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}),{mode:0o600});
+    const inode=(await fs.stat(join(tree,'mode.txt'))).ino;
+    f.workerExec.mockImplementation(async({cwd})=>{
+      // Observe exact reconstructed inputs before install/test consumers run.
+      if(cwd===f.work) {
+        expect(await digestInput(cwd)).toBe(f.request.inputDigest);
+        expect(await fs.readFile(join(cwd,'a.test.mjs'),'utf8')).toBe('changed');
+        expect((await fs.stat(join(cwd,'mode.txt'))).ino).toBe(inode);
+        await expect(fs.lstat(join(cwd,'deleted.txt'))).rejects.toMatchObject({code:'ENOENT'});
+        if(shape==='nested deletion')await expect(fs.lstat(join(cwd,'node'))).rejects.toMatchObject({code:'ENOENT'});
+        else expect(await fs.readFile(join(cwd,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
+      }
+      return {code:0,stdout:'',stderr:''};
+    });
+    expect((await f.runner.run(f.request)).code).toBe(0);
+    expect(f.workerExec.mock.calls.filter(([call])=>call.cwd===f.work).length).toBeGreaterThanOrEqual(2);
+    expect((await fs.stat(join(f.work,'mode.txt'))).ino).toBe(inode);
+    if(shape==='nested deletion')await expect(fs.lstat(join(f.work,'node'))).rejects.toMatchObject({code:'ENOENT'});
+    else expect(await fs.readFile(join(f.work,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
+    expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(true);
+    await f.runner.finish(f.request);
   });
   it.each(['base mutated','delta tamper','symlink delta','deletion traversal','unknown base','digest mismatch','unready base','malformed READY'])('rejects %s with protected non-start evidence and no npm',async fault=>{
     const f=await setup();
@@ -388,12 +490,26 @@ describe('runner base materialization refuses before install',()=>{
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
   // These cases run real Git, file copies and the install supervisor; allow for CI contention.
-  it.each(['delta','old runner','manifest unavailable','oversized manifest','late delta failure'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
-    const f=await setup(),requests=[],copies=[];
+  it.each(['delta','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+    const f=await setup(),requests=[],copies=[],log=vi.fn();
+    const sshOptions=['-o','BatchMode=yes','-o','ControlMaster=auto','-o','ControlPersist=60s','-o','ControlPath=private-cm/%C'];
+    let baseRetrieved=false,ignoredCalls=0,manifestCalls=0;
+    const attempts=[];
+    if(mode==='next base'){git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-qm','next']);}
     const transport=async call=>{
-      if(call.file==='git'){if(mode==='late delta failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='git'&&call.args.includes('-i')) {
+        ignoredCalls++;
+        if(mode==='delta')expect(baseRetrieved).toBe(true);
+        if(ignoredCalls===1&&mode==='ignored listing failure')return {code:1,stdout:Buffer.alloc(0)};
+        if(ignoredCalls===1&&mode==='ignored listing rejection')throw new Error('ignore inventory unavailable');
+      }
+      if(call.file==='git'){if(mode==='git failure'&&call.args[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='ssh')expect(call.sshOptions).toEqual(sshOptions);
       if(call.file==='rsync'){
+        expect(call.args[call.args.indexOf('-e')+1]).toBe(`ssh ${sshOptions.map(value=>`'${value}'`).join(' ')}`);
         copies.push(call.input);
+        // Fail after manifest construction, then allow the full-ship retry.
+        if(mode==='late delta failure'&&copies.length===1)return {code:1,stdout:Buffer.alloc(0)};
         const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
         for(const name of call.input.toString().split('\0').filter(Boolean)){const rel=name.slice(2);await fs.mkdir(join(destination,rel,'..'),{recursive:true});await fs.copyFile(join(call.cwd,rel),join(destination,rel));}
         return {code:0,stdout:Buffer.alloc(0)};
@@ -401,28 +517,77 @@ describe('runner base materialization refuses before install',()=>{
       const action=call.args.at(-1).split(' ').at(-1);
       if(action==='true')return {code:0,stdout:''};
       if(action==='bases'&&mode==='old runner')return {code:254,stdout:''};
+      if(action==='bases'&&mode==='next base')return {code:0,stdout:JSON.stringify({delta:1,bases:[{sha:git(['rev-parse','HEAD']).toString().trim(),manifestDigest:f.base.manifestDigest},f.base]})};
+      if(action==='bases'&&mode==='fallback reason')throw new Error('discovery\n\x1b'+ 'x'.repeat(250));
+      if(action==='base-manifest'){manifestCalls++;attempts.push(JSON.parse(call.input).sha);if(mode==='retry succeeds'&&manifestCalls===1||mode==='next base'&&manifestCalls<=2)return {code:254,stdout:''};}
       if(action==='base-manifest'&&mode==='manifest unavailable')return {code:254,stdout:''};
       if(action==='base-manifest'&&mode==='oversized manifest')return {code:0,stdout:'x'.repeat(4*1024*1024+1)};
       const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='base-manifest')baseRetrieved=true;
       if(action==='run'){requests.push(JSON.parse(call.input));return {code:value.code,stdout:''};}
       return {code:0,stdout:JSON.stringify(value)};
     };
-    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport});
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions});
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
-    const stage=result.timings.find(s=>s.stage==='rsync');
-    expect(stage.shipMode).toBe(mode==='delta'?'delta':'full');
+    if(mode==='retry succeeds')expect(manifestCalls).toBe(2);
+    if(mode==='next base'){expect(manifestCalls).toBe(3);expect(attempts[0]).toBe(attempts[1]);expect(attempts[2]).toBe(f.base.sha);}
+    if(mode==='fallback reason'){const reason=result.timings.find(s=>s.stage==='manifest-build').manifestReason;expect(reason).toHaveLength(200);expect(reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);expect(log).toHaveBeenCalledWith(`manifest: full-scan (${reason})\n`);}
+    if(mode.startsWith('ignored listing'))expect(ignoredCalls).toBe(2);
+    if(mode==='delta') {
+      expect(ignoredCalls).toBe(1);
+      const substages=result.timings.find(stage=>stage.stage==='manifest-build').substages;
+      expect(substages.map(stage=>stage.stage).sort()).toEqual(['base-blob-verification','git-evidence','hashing','ignored-file-listing','inventory-walk','lstat-pass']);
+      expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
+    }
+    const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
+    expect(stage.shipMode).toBe(['delta','retry succeeds','next base'].includes(mode)?'delta':'full');
+    const deltaShipped=['delta','retry succeeds','next base'].includes(mode);
     // Independent fixture bytes: unchanged lock/mode/public source are reused
-    // only in delta mode; the deleted file and private credentials never ship.
-    const payloads=mode==='delta'?['changed']:['changed','lock','mode','public'];
+    // only when delta shipping succeeds; the deleted file and private credentials never ship.
+    const payloads=deltaShipped?['changed']:['changed','lock','mode','public'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
-      deltaFileCount:mode==='delta'?1:0,deltaBytes:mode==='delta'?Buffer.byteLength('changed'):0});
+      deltaFileCount:deltaShipped?1:0,deltaBytes:deltaShipped?Buffer.byteLength('changed'):0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
+    if(mode==='late delta failure'){
+      expect(log).toHaveBeenCalledWith('manifest: full-scan (Full ship selected)\n');
+      expect(copies).toHaveLength(2);
+      expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
+    }
     if(mode==='delta'){
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
       expect(requests[0]).toMatchObject({baseSha:f.base.sha,deletions:Buffer.from('deleted.txt\0').toString('base64')});
-    }else expect(requests[0].baseSha).toBeUndefined();
+    }else if(!['retry succeeds','next base'].includes(mode))expect(requests[0].baseSha).toBeUndefined();
   },30_000);
+  it('refuses an ignored test created while the SSH base-manifest response is in flight',async()=>{
+    const f=await setup(),ignoredListings=[];
+    await fs.writeFile(join(repo,'.git/info/exclude'),'late.test.mjs\n');
+    const transport=vi.fn(async call=>{
+      if(call.file==='git') {
+        const result=await exec(call);
+        if(call.args.includes('-i'))ignoredListings.push(result.stdout);
+        return result;
+      }
+      if(call.file!=='ssh')throw new Error('Unexpected transport before admission');
+      const action=call.args.at(-1).split(' ').at(-1);
+      if(action==='true')return {code:0,stdout:''};
+      if(!['bases','base-manifest'].includes(action))throw new Error('Unexpected remote preparation before admission');
+      const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='base-manifest') {
+        // Let any speculative listing finish before the ignored file appears.
+        await new Promise(resolve=>setImmediate(resolve));
+        await fs.writeFile(join(repo,'late.test.mjs'),'hidden test');
+      }
+      return {code:0,stdout:JSON.stringify(value)};
+    });
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log:vi.fn()});
+    expect(result).toMatchObject({mode:'fallback',reason:'ignored-test-file'});
+    expect(transport.mock.calls.some(([call])=>call.file==='ssh'&&call.args.at(-1).endsWith(' base-manifest'))).toBe(true);
+    expect(ignoredListings.length).toBeGreaterThan(0);
+    for(const listing of ignoredListings)expect(listing.toString().split('\0')).toContain('late.test.mjs');
+    expect(transport.mock.calls.some(([call])=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+  });
   it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('retries only a proven pre-start delta rejection once: %s',async fault=>{
     const f=await setup(),requests=[],prepares=[],finishes=[],copies=[];
     const transport=async call=>{
@@ -623,7 +788,7 @@ describe('warm-base tick',()=>{
       return exec({...call,args:['-C',repo,...args]});
     });
     const install=vi.fn(async()=>({code:0}));
-    return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs}};
+    return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs,runs:join(root,'slots'),receipts:join(root,'receipts')}};
   }
   it('publishes only ready verified trees, logs latency and does not pass tokens to anonymous git',async()=>{
     const f=await tickFixture();await f.warm.warmTick(f.options);
@@ -632,6 +797,31 @@ describe('warm-base tick',()=>{
     const log=JSON.parse((await fs.readFile(join(f.target,'latency.log'),'utf8')).trim());
     expect(log).toMatchObject({sha:f.base.sha,mergeCommitDate:expect.any(String),fetchedAt:expect.any(String),readyAt:expect.any(String),latencyMs:expect.any(Number)});
     expect(f.install).toHaveBeenCalledOnce();await f.warm.warmTick(f.options);expect(f.install).toHaveBeenCalledOnce();
+  });
+  it('prewarms idle slots on publication and reuse, skips busy slots and preserves pinned older trees',async()=>{
+    const f=await tickFixture();
+    await fs.mkdir(f.options.runs,{mode:0o700});await fs.mkdir(f.options.receipts,{mode:0o700});
+    for(const n of [1,2]){await fs.mkdir(join(f.options.runs,'slot-'+n),{mode:0o710});await fs.chmod(join(f.options.runs,'slot-'+n),0o710);}
+    await fs.mkdir(join(f.options.receipts,'worker-active-2'));
+    await f.warm.warmTick(f.options);
+    const pool=join(f.target,'prewarm'),tree=join(pool,f.base.sha,'1');
+    expect(await fs.readFile(join(tree,'mode.txt'),'utf8')).toBe('mode');
+    await expect(fs.lstat(join(pool,f.base.sha,'2'))).rejects.toMatchObject({code:'ENOENT'});
+    await fs.rm(tree,{recursive:true});await f.warm.warmTick(f.options);
+    expect(await fs.readFile(join(tree,'mode.txt'),'utf8')).toBe('mode');expect(f.install).toHaveBeenCalledOnce();
+    await fs.writeFile(join(f.target,'active','run'),f.base.sha);
+    await fs.writeFile(join(repo,'new.txt'),'new');git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    await f.warm.warmTick(f.options);
+    expect(await fs.readFile(join(tree,'mode.txt'),'utf8')).toBe('mode');
+    await fs.rm(join(f.target,'active','run'));await f.warm.warmTick(f.options);
+    await expect(fs.lstat(tree)).rejects.toMatchObject({code:'ENOENT'});
+    expect(await fs.readdir(pool)).toEqual([git(['rev-parse','HEAD']).toString().trim()]);
+  });
+  it('warm tick tolerates a transient shared guard EEXIST',async()=>{
+    const f=await tickFixture();let collisions=0;
+    const mkdir=async(path,options)=>{if(path===join(f.target,'.guard')&&collisions++<2)throw Object.assign(new Error('busy'),{code:'EEXIST'});return fs.mkdir(path,options);};
+    await f.warm.warmTick({...f.options,fs:{...fs,mkdir}});
+    expect(f.install).toHaveBeenCalledOnce();expect(collisions).toBeGreaterThanOrEqual(3);
   });
   it.each(['missing tree','missing leaf','extra leaf','same-size corruption','bad marker','oversized marker','overdeep tree','symlink leaf','malformed READY'])('removes and rebuilds a previously advertised %s base',async fault=>{
     const f=await tickFixture();await f.warm.warmTick(f.options);
@@ -683,12 +873,63 @@ describe('warm-base tick',()=>{
     expect(await fs.readdir(f.target)).not.toContain(f.base.sha);
     expect((await fs.readdir(f.target)).filter(n=>n.endsWith('.tmp'))).toEqual([]);
   });
-  it('retains newest four plus active bases, prunes stale tmp dirs and never follows symlinks',async()=>{
+  it('retains newest twelve plus active bases, prunes stale tmp dirs and never follows symlinks',async()=>{
     const f=await tickFixture();
     await f.warm.warmTick(f.options);
-    for(let i=0;i<6;i++){const sha=String(i).repeat(40);await fs.cp(join(f.target,f.base.sha),join(f.target,sha),{recursive:true});await fs.rm(join(f.target,sha,'tree-digest.json'));await fs.writeFile(join(f.target,sha,'READY'),JSON.stringify({sha,manifestDigest:f.base.manifestDigest,lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));}
+    for(let i=0;i<14;i++){const sha=i.toString(16).repeat(40);await fs.cp(join(f.target,f.base.sha),join(f.target,sha),{recursive:true});await fs.rm(join(f.target,sha,'tree-digest.json'));await fs.writeFile(join(f.target,sha,'READY'),JSON.stringify({sha,manifestDigest:f.base.manifestDigest,lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));}
     await fs.mkdir(join(f.target,'failed.tmp'));await fs.mkdir(join(f.target,'active'),{recursive:true});await fs.writeFile(join(f.target,'active','run-one'),'0'.repeat(40));
     await f.warm.warmTick(f.options);
     const dirs=await fs.readdir(f.target);expect(dirs).toContain('0'.repeat(40));expect(dirs).not.toContain('1'.repeat(40));expect(dirs).not.toContain('2'.repeat(40));expect(dirs).not.toContain('failed.tmp');
+    const advertised=await createRunner({testRoot:root}).bases();
+    expect(advertised.bases).toHaveLength(12);expect(advertised.bases.some(b=>b.sha==='0'.repeat(40))).toBe(false);
+  });
+});
+
+describe('bounded shared base guard contention',()=>{
+  it.each([
+    ['pending','EACCES'],['pending','EPERM'],['guard','EACCES'],['guard','EPERM'],
+  ])('does not retry a %s mkdir %s failure or execute the guarded action',async(stage,code)=>{
+    const target=join(root,'guard-test'),guard=join(target,'.guard');
+    await fs.mkdir(target,{mode:0o700});
+    const sleep=vi.fn(),action=vi.fn(),denied=vi.fn();
+    const io={...fs,mkdir:async(path,options)=>{
+      if(stage==='pending'?path.startsWith(join(target,'.guard-pending-')):path===guard) {
+        denied();throw Object.assign(new Error('denied'),{code});
+      }
+      return fs.mkdir(path,options);
+    }};
+    await expect(baseGuard(target,action,io,{sleep})).rejects.toMatchObject({code});
+    expect(denied).toHaveBeenCalledOnce();expect(sleep).not.toHaveBeenCalled();expect(action).not.toHaveBeenCalled();
+    expect(await fs.readdir(target)).toEqual([]);
+  });
+  it.each([0,3,6])('retries EEXIST within the deadline with at most five waits (failures=%s)',async failures=>{
+    const target=join(root,'guard-test'),guard=join(target,'.guard'),owner='owner-'+'a'.repeat(32);
+    await fs.mkdir(target,{mode:0o700});
+    const holder=JSON.stringify({pid:process.pid,timestamp:0});
+    if(failures){await fs.mkdir(guard,{mode:0o700});await fs.writeFile(join(guard,owner),holder);}
+    let now=0,tries=0;
+    const sleep=vi.fn(async ms=>{
+      now+=ms;
+      if(sleep.mock.calls.length===failures){await fs.unlink(join(guard,owner));await fs.rmdir(guard);}
+    }),action=vi.fn(async()=>42);
+    const io={...fs,mkdir:async(path,options)=>{
+      if(path===guard)tries++;
+      return fs.mkdir(path,options);
+    },unlink:vi.fn(fs.unlink),rmdir:vi.fn(fs.rmdir),rm:vi.fn(fs.rm)};
+    const result=baseGuard(target,action,io,{clock:()=>now,sleep,waitMs:125,retryMs:25});
+    if(failures===6){
+      await expect(result).rejects.toThrow('Base guard wait exceeded; use local fallback and inspect the guard owner');
+      expect(action).not.toHaveBeenCalled();expect(io.unlink).not.toHaveBeenCalled();expect(io.rmdir).not.toHaveBeenCalled();
+      expect(await fs.readFile(join(guard,owner),'utf8')).toBe(holder);
+      expect(await fs.readdir(target)).toEqual(['.guard']);
+    } else {
+      expect(await result).toBe(42);expect(action).toHaveBeenCalledOnce();expect(io.unlink).toHaveBeenCalledOnce();expect(io.rmdir).toHaveBeenCalledOnce();
+      expect(await fs.readdir(target)).toEqual([]);
+    }
+    expect(tries).toBe(Math.min(failures+1,6));
+    expect(sleep.mock.calls).toEqual(Array.from({length:Math.min(failures,5)},()=>[25]));
+    expect(now).toBe(Math.min(failures,5)*25);
+    expect(io.rm).toHaveBeenCalledOnce();
+    expect(io.rm).toHaveBeenCalledWith(expect.stringMatching(/\/\.guard-pending-[a-f0-9]{32}$/),{recursive:true,force:true});
   });
 });

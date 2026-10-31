@@ -116,8 +116,10 @@ export async function applyLimits({testConfigPath}={}) {
 }
 const limitsCliPath=(()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
 if(process.argv[1] && limitsCliPath===realpathSync(fileURLToPath(import.meta.url))) {
+  (async()=>{
   try {
     if(process.argv.length!==3||process.argv[2]!=='apply') throw new Error('Expected apply');
     await applyLimits();
   } catch(error) {console.error('forge-exec-limits: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' '));process.exitCode=1;}
+  })();
 }

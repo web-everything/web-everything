@@ -158,3 +158,30 @@ describe('bounded persistent Git blob reader',()=>{
     await expect(reader.close()).rejects.toThrow(/full ship/i);expect(child.kill).toHaveBeenCalled();
   });
 });
+
+
+describe('SSH multiplexing directory boundary',()=>{
+  const directory='private-cm';
+  const safeFs=()=>({mkdirSync:vi.fn(),lstatSync:vi.fn(()=>({
+    isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o700,uid:process.getuid(),
+  }))});
+  it('uses a private directory, short hashed socket name and short persistence',()=>{
+    const fs=safeFs(),options=remote.connectionOptions({directory,fs});
+    expect(fs.mkdirSync).toHaveBeenCalledWith(directory,{mode:0o700});
+    expect(options).toEqual(['-o','BatchMode=yes','-o','ConnectTimeout=10','-o','ControlMaster=auto','-o','ControlPersist=60s','-o',`ControlPath=${directory}/%C`]);
+  });
+  it.each(['unwritable','symlink','permissions','owner','long path'])('disables reuse for %s directory evidence',fault=>{
+    const fs=safeFs();
+    if(fault==='unwritable')fs.mkdirSync.mockImplementation(()=>{throw Object.assign(new Error('denied'),{code:'EACCES'});});
+    if(fault==='symlink')fs.lstatSync.mockReturnValue({isDirectory:()=>true,isSymbolicLink:()=>true});
+    if(fault==='permissions')fs.lstatSync.mockReturnValue({isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o755});
+    if(fault==='owner')fs.lstatSync.mockReturnValue({isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o700,uid:process.getuid()+1});
+    expect(remote.connectionOptions({directory:fault==='long path'?'x'.repeat(101):directory,fs})).toEqual(['-o','BatchMode=yes','-o','ConnectTimeout=10']);
+  });
+  it('passes the selected reuse options to the SSH child',async()=>{
+    const child=capturedChild(),sshOptions=remote.connectionOptions({directory,fs:safeFs()});
+    const result=defaultExec({file:'ssh',args:['forge','true'],sshOptions});
+    expect(spawn.mock.calls[0][1]).toEqual([...sshOptions,'forge','true']);
+    child.emit('close',0);await result;
+  });
+});

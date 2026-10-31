@@ -2048,11 +2048,11 @@ state. Base pin creation and pruning share a guard; unknown or unreadable eviden
 pruning closed. A worker receives independent copies, and the existing full-tree manifest
 and input-digest checks still run before cache extraction or npm. Pre-run delta build or
 transport failures rebuild through full shipping; execution ambiguity never retries.
-Delta membership compares a fresh no-follow read and SHA-256 of every final Mac worktree
-leaf (plus its executable bit) against the base, including Git-clean CRLF/filter output;
-Git diff validates working changes against the pinned HEAD; transfer paths use byte order.
-Unchanged leaves skip staging and rsync, not the
-initial read/hash. Pin this with real Git autocrlf and post-diff race fixtures.
+Delta membership compares each final Mac worktree leaf (plus its executable bit) against the base.
+Git-clean leaves with verified base blob bytes and stable metadata reuse the base SHA-256; changed,
+untracked, filtered/CRLF, index-flagged or unverifiable leaves are read and hashed, and any Git
+evidence failure falls back to a full scan (see "Forge manifest reuse"). Transfer paths use byte order.
+Unchanged leaves skip staging and rsync. Pin this with real Git autocrlf and post-diff race fixtures.
 Each warm tick revalidates retained READY records and their tree count/metadata digest;
 a missing tree marker requires one full manifest verification before publication, while
 mismatched evidence removes and rebuilds the base. Test both legacy-marker migration and
@@ -3100,6 +3100,14 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
+`core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
+`full-scan`. Unreadable or incomplete config evidence also requires that fallback.
+Use `git ls-files -f -v -z` for index flags: fsmonitor-valid entries become lowercase
+only with `-f` and must be hashed. The fast-manifest tests pin restored-mtime edits
+and fsmonitor-valid entries; the offload tests require every final leaf to be read
+and hashed when reuse is unavailable.
+
 Git metadata setup runs entirely under an operator-owned 0700 temporary parent;
 publish `.git` only after the final privileged Git command. A root-owned `.git`
 under worker-owned `work` can still be renamed and replaced by that worker.
@@ -3178,3 +3186,86 @@ then assert its manifest digest and snapshot bytes. Preserve source mtimes throu
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
 a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
+## Probe worker timeout teardown
+
+Worker timeout promises allow at most one second for `worker.terminate()` before
+rejecting. A synchronous native call such as `execFileSync` can prevent termination
+from settling: every timeout-path termination wait needs a separate hard deadline.
+Reserve the timeout outcome first so late message, error and exit events cannot
+replace it. Await normal shutdown within the grace period so callers can tear down
+safely; after the deadline, unreference the blocked worker and reject with the original
+timeout error. Shutdown remains best effort after this bound; the worker may survive
+until its native call returns or its owning process exits.
+`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` covers pending, rejected
+and synchronously throwing termination for both runners, plus a real probe blocked in
+`execFileSync`. The `probe-worker-termination-blocks-timeout` daemon soak break runs
+the equivalent real sweep worker case. Keep these bounded-wait cases when changing
+timeout teardown; awaiting termination without a secondary deadline must fail them.
+
+## Forge manifest reuse
+
+`forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
+file reads. Git status is not sufficient byte evidence for filters, encodings, index flags,
+or concurrent writes: hash those leaves normally, and use fresh stat/mode and base blob-size
+checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
+warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
+read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
+Ignored test-shaped build output is exempt only when `check-ignore`
+confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
+Run this fixture and the affected Forge tests through heavy admission.
+
+Remote discovery may overlap reachability, HEAD and base discovery, but drain every
+speculative process before returning fallback. `buildManifest` always lists ignored files
+fresh after base-manifest retrieval; ignored tests created during retrieval must still
+refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
+and index flags. Metadata capture uses at most 16 workers and drains failures before
+full scanning. Manifest timing substages appear inside the existing stage report;
+`inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
+share multiplexing options only after checking a short, owner-only 0700 directory;
+unavailable, unsafe or overlong control paths retain ordinary SSH.
+
+## Worker cancellation during module loading
+
+Never terminate a worker while its ESM graph is loading: Node 22 can abort the entire process in
+`AsyncModuleExecutionFulfilled`. The verify watchdog disarms its shared deadline before cooperative
+shutdown, and `verify-lane` awaits its exit before emitting the final verdict, including timeout and
+spawn-error paths. Keep the escape sweeps intact when the deadline already fired.
+
+The health probe worker uses `worker-deadline.mjs`: announce readiness after all imports and before
+synchronous probe work, check startup cancellation, and drain worker exit before reporting a timeout.
+Module evaluation is allowed to finish during cancellation; the timeout prevents probe work from
+starting but does not forcibly interrupt the loader. Do not use this readiness protocol for work
+that dynamically imports additional modules after announcing readiness.
+`bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
+imports to exercise cancellation without taking down the test runner on a native loader regression.
+The named `hashes Git-clean … leaves` table covers every sensitive attribute:
+`filter`, `working-tree-encoding`, `ident`, `text`, and `eol`, asserting actual leaf
+reads and equality with full hashing. Include an identity encoding as well as a
+byte-transforming encoding so base-blob size/hash checks cannot mask a missing
+attribute guard. Same-size hidden-edit cases pin uppercase `S` (skip-worktree),
+lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
+
+
+## Forge synchronous import closure
+
+Keep the Forge runner, client, telemetry, warmer and limits modules free of top-level
+`await` throughout their static import graph. Put async CLI execution inside the
+guarded async wrapper used by `forge-exec-run.mjs`. The `Forge synchronous module loading`
+cases in `forge-client-controls.test.mjs` use native Node require to check that importing
+each module succeeds without executing its CLI, including the limits dependency.
+
+## Forge prewarm claim boundary
+
+`forge-prewarm.test.mjs` exercises real private trees and marker files. Model a foreign UID
+through injected `lstat` results so ownership refusals run without root. Cover each pool/base/tree
+owner and writable-directory check, private tree permissions, marker ownership/mode/link count/type,
+and exact SHA/digest marker bytes. Rejection before claim must leave the source intact; verification
+failure after rename must remove the destination without following links or exposing its permissions.
+The success case observes mode 0700 during verification, inode preservation and single consumption.
+
+Keep the runner reconstruction cases in `forge-offload.test.mjs`: they compare the complete input
+digest and overlay/deletion results before worker commands run, including file-to-directory,
+directory-to-file and nested deletion, while preserving unchanged prewarm inodes. When changing
+these guards, check representative mutations for ownership, marker evidence, private verification,
+failure cleanup and parent-directory removal through the heavy-admission queue. Temporary Vite
+transform configs can substitute mutations without editing the working implementation.
