@@ -2490,6 +2490,9 @@ mark("9a′-ii. Agent-memory citation integrity (#2921)");
 try {
   const { spawnSync } = require('node:child_process');
   const r = spawnSync(process.execPath, [join(ROOT, 'scripts/check-memory.mjs')], { encoding: 'utf8' });
+  // Keep a successful no-op visible: remote execution must refuse skipped inputs.
+  if (r.status === 0 && /\bskipping\b/i.test(`${r.stdout || ''}\n${r.stderr || ''}`))
+    warn(`memory-index: ${(r.stdout || r.stderr).trim()}`, { kind: 'memory-index', file: '.claude/agent-memory/MEMORY.md' });
   if (r.status !== 0) {
     const msg = (r.stderr || r.stdout || '').trim();
     // extract individual violation lines; fall back to the raw output as one error

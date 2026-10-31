@@ -3170,6 +3170,26 @@ evidence yields unknown; retry or inspect the mount configuration manually. Keep
 visible-leader/hidden-member regression alongside the omitted-leader case.
 The real-host cases require permission to execute `ps` and read the boot UUID on macOS;
 a sandbox denying either operation produces unknown and cannot certify those cases.
+## Optional early review and delayed fix push
+
+`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
+head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
+since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
+agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
+the same first-held deadline; unreadable evidence waits until the bound, whose fallback is a
+normal push. Inject the clock, sleep and checks; reads must be at least 30 seconds apart.
+Claude repairs mark verify directly, so the verify harness must apply the same gate to both
+early and green-verdict pushes. Persist its previous head and first-held time independently of
+verify retries, retain the waiter on read/write failures, and log the timing policy's source.
+`await-verify-pass-push-after-ci.test.mjs` and the `claude-fix-push-after-ci` soak scenario cover
+this path with injected CI reads, including the bounded fallback when evidence is unavailable.
+Completed previous-head failures must reach the fixer in a shared untrusted-data fence before
+either push path runs. Persist the handoff and pending delivery together; retain the inventory
+across busy/failed resumes and same-session re-marks until the repair push succeeds. A delivered
+resume waits for a new mark; exhausted delivery retains the record for operator recovery.
+Exercise busy, paused and failed delivery across multiple ticks with both push policies:
+zero pushes until delivery and a subsequent re-mark, then a push of the follow-up commit.
 
 ## Archive-only host retention (R217)
 
@@ -3310,6 +3330,39 @@ directory-to-file and nested deletion, while preserving unchanged prewarm inodes
 these guards, check representative mutations for ownership, marker evidence, private verification,
 failure cleanup and parent-directory removal through the heavy-admission queue. Temporary Vite
 transform configs can substitute mutations without editing the working implementation.
+
+The tracked `.claude/agent-memory` bridge is verified against its index blob and
+projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY.md`
+and the complete target corpus; reject unsafe links or incomplete inputs before
+transfer. These projected inputs require full shipping.
+
+For remote `check:standards`, observe both output streams for skipped gates,
+`no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
+remote result to fall back through local admission; an invalid receipt keeps the
+result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
+compares local and shipped discovery of the base, coverage report, and memory index.
+
+## CI-heal check evidence (R272)
+
+Check names and required rosters match exactly, including case: a passing `TEST`
+never clears a failing or missing required `test`. Only status and conclusion values
+are case-insensitive; CodeQL and hold-gate names retain their exact identity.
+Every row for a required name must classify green under the shared check-state
+predicate. Any failed, cancelled, stale, unfinished, unknown or unreadable row blocks
+successful admission, even beside a success. No source tier, workflow run, attempt,
+id or timestamp can discard evidence. Compatibility exports `latestAttempts` and
+`latestRollupAttempts` retain all rows without ranking or mutation.
+The regression suites retain timestamp, metadata, source-tier, undated and input-order
+scenarios and require mixed evidence to fail closed. CodeQL failures always block
+`not-a-ci-break` and gate-only excusal, including when CodeQL is outside the required
+roster and the drain's CodeQL switch is off. A merge-gate name is excusable only when
+every non-green row is positively classified as a review hold; each row is classified
+independently, so one held job cannot excuse another job's failure or unfinished state.
+The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence, with
+`prChecksOptions` supplying hermetic readers. A failed PR or roster read permits recording with a warning; an unreadable merge-gate verdict or freeze read still permits `needs-human` with a warning, but keeps the red-check refusal for `not-a-ci-break`.
+Classification errors, including malformed rollup identities, propagate to the CLI's error handler and abort
+before any escalation comment is posted. The read-error fallback never catches refusal classification.
+`ci-heal-escalation-mark.test.mjs` pins both preflights and both CLI outcomes with nameless evidence beside a required failure.
 ## Remote client import failures
 
 Importing a host-selected remote client executes its top-level code. Neither an import exception nor
@@ -3369,3 +3422,37 @@ not the handoff CLI with its Git publishing dependencies; the CLI re-exports the
 unset settings, lazy adapter loading in native Node, and real override event/provenance writes.
 Run it alongside the remote-client, daemon closure/staleness, live-smoke and shape wiring regressions
 through the host heavy-run queue; do not weaken their complete-closure assertions.
+## Manual daemon pass (R247)
+
+`node scripts/operations/run.mjs manual-daemon-pass --daemon=review --pr=123 --repo=owner/name --reason="daemon unavailable"`
+runs one existing single-PR dispatch from the module's checkout, resolved from `import.meta.url`
+independently of the caller's working directory. It reuses
+`assertOperatorCliFresh` with automatic fallback disabled so a manual pass cannot silently move
+to another checkout. The event and PR comment identify the executing checkout HEAD as `sha`.
+
+Review uses `dispatchReviewByMode`; red-team uses `dispatchReviewJob({ redTeamOnly: true })`,
+which owns the existing seat dispatch, result writing and gate application. Both belong to the
+review daemon for health admission. A healthy, non-quarantined daemon refuses unless
+`--force-while-healthy` is supplied. Unknown health or corrupt quarantine evidence refuses even
+with that flag; restore the daemon-status readers before retrying.
+Dispatch leaves `root` to the shared dispatcher's module checkout default, as the review daemon
+does. Its lane-checkout refusal still applies; run from an up-to-date control clone when refused.
+
+Fix refuses with “no entry point”: `reconcile-fix-dispatch.mjs#dispatchFix` requires the prepared
+daemon plan and `fix-run.mjs#runFixCli` requires a session, ref and prompt file;
+`runReconcileFixDispatch` sweeps a repository. Verify also refuses: `verify`/`createChecksRunner`
+accepts a checkout, the verify daemon calls `verify-dispatch.mjs#runVerifyDispatch` to scan pools,
+and `runLaneGate`/`createVerifyGateJobs.launch` require prepared lane/head/marker evidence.
+Neither daemon exports a single-PR entry point accepting repo/pr. These refusals remain explicit until their owners
+expose reusable entry points; do not reconstruct daemon planning in this operation.
+
+Admitted passes post a manual R247 PR comment only after dispatch returns, so dispatch refusals
+(including the real job/session lane-checkout guard) leave no comment. Every sink attempt, including
+freshness/health/no-entry-point refusal, appends one `manual-daemon-pass` JSONL event using the
+shared handoff event path (`WE_DAEMON_EVENTS` overrides it in tests). Events retain `at`, `kind`,
+`repo`, `pr`, `daemon` and add `ts`, `reason`, `sha`, `result`. Invalid CLI arguments are rejected
+by the generated declaration/parser before the sink runs. The effect is non-idempotent, so an
+indeterminate run must be inspected before starting a new pass. Focused proof lives in
+`scripts/operations/__tests__/manual-daemon-pass.test.mjs`; operation enumeration and declaration
+map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
+discovers script modules dynamically and has no hand-maintained operation list.
