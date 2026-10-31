@@ -69,9 +69,18 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
 
   it.each([['review:accepted'], [{ name: 'review:accepted' }]].map(labels => [labels]))(
     'refuses historical non-accepting stored review despite accepted labels %j', labels => {
-      const f = storedFixture(); f.rawPrs[0].labels = labels;
-      expect(planRedTeamOnSkip(f)).toMatchObject([{ prNumber: storedPr, head: storedHead,
-        action: 'skip', why: 'stored review does not owe a red team' }]);
+      const f = storedFixture({ deadlineMs: 7_200_000 }); f.rawPrs[0].labels = labels;
+      expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead,
+        action: 'skip', why: 'stored review does not owe a red team',
+        repo, pr: storedPr, mode: 'skip', requestedMode: 'fresh', deadlineMs: 7_200_000,
+        owner: { stale: false, reason: 'no incomplete running pass' }, ownerStale: false,
+        ownerBlocked: false, ownSpeculation: false, admissionRefusal: null,
+        status: null, normalizedStatus: null, payload: f.readEvidence().loopPayload,
+        originalPayload: f.readEvidence().loopPayload, payloadUsable: false,
+        completedRow: null, completed: false, seatRows: null,
+        abandon: false, abandonAllowed: false, attempt: 1, prior: null, priorResult: null,
+        retry: false, guardReason: null, redispatch: undefined,
+        movedCardOnly: false, pendingCardOnly: false, preserveStatus: false, cleanup: 'delete' }]);
     });
 
   it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
@@ -1112,14 +1121,24 @@ describe('R100 recovery regressions', () => {
   ]))('publication guard preserves the complete $mode dispatch plan with $label / $body', ({ mode, label, body }) => {
     const o = publicationOptions('null-status');
     const completed = mode === 'resume';
-    const input = fixture({ rawPrs: o.rawPrs,
+    const input = fixture({ rawPrs: o.rawPrs, deadlineMs: 7_200_000,
       readEvidence: () => ({ loopPayload: payload(), recorded: completed,
         seatRecorded: completed, completedRecorded: completed }),
       readStatus: () => completed ? { status: 'finished', result: 'ran' } : null,
     });
     const expected = planRedTeamOnSkip(input);
-    expect(expected).toMatchObject([{ prNumber: pr, head, action: 'dispatch', mode,
-      why: completed ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' }]);
+    const status = completed ? { status: 'finished', result: 'ran' } : null;
+    expect(expected).toEqual([{ prNumber: pr, head, action: 'dispatch', mode,
+      why: completed ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass',
+      repo, pr, requestedMode: mode, deadlineMs: 7_200_000,
+      owner: { stale: false, reason: 'no incomplete running pass' }, ownerStale: false,
+      ownerBlocked: false, ownSpeculation: false, admissionRefusal: null,
+      status, normalizedStatus: status, payload: payload(), originalPayload: payload(), payloadUsable: true,
+      completedRow: null, completed, seatRows: null,
+      abandon: false, abandonAllowed: false, attempt: 1, prior: status,
+      priorResult: completed ? 'ran' : null, retry: false, guardReason: null, redispatch: undefined,
+      movedCardOnly: false, pendingCardOnly: false, preserveStatus: completed,
+      cleanup: completed ? 'retain' : 'delete' }]);
     if (label) input.rawPrs[0].labels.push(label);
     if (body) input.rawPrs[0].comments.push(trusted(body));
     expect(planRedTeamOnSkip(input)).toEqual(expected);
@@ -1980,9 +1999,9 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
     const finished = { ...running, status: 'finished', result: 'not-owed' };
     const evidence = { ...o.readEvidence(), inFlight: true, status: finished };
     o.readEvidence = () => evidence;
-    // A new planning snapshot observes the completed decision once; executors do not re-read it.
-    o.readStatus = vi.fn(() => finished);
-    evidence.inFlight = false;
+    // The in-flight check and selected status observe a stale owner; the accepted-head
+    // re-read observes a completed policy decision. That must still pass every guard.
+    o.readStatus = vi.fn().mockReturnValueOnce(running).mockReturnValueOnce(running).mockReturnValue(finished);
     const raw = o.rawPrs[0];
     raw.labels = ['review:accepted'];
     if (kind === 'missing acceptance') raw.comments = [];
@@ -1996,6 +2015,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(numbering.strandedNumberingRecords(raw.comments, raw.reviews)).not.toHaveLength(0);
     }
     expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }], dispatched: [] });
+    expect(o.readStatus.mock.results.map(({ value }) => value)).toEqual([running, running, finished]);
     expect(o.abandonStale).not.toHaveBeenCalled();
     expect(o.dispatch).not.toHaveBeenCalled();
   });
