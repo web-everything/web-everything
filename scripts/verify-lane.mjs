@@ -56,6 +56,7 @@
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import './lib/tools-root-guard.mjs';
 import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
@@ -688,7 +689,7 @@ async function runGate(command, args) {
   const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
   const result = await new Promise((resolveGate, reject) => {
     const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
-      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
+      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', WE_FORGE_GATE_DISPATCH:'1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
@@ -717,15 +718,15 @@ async function runGate(command, args) {
     const finish = (code, closeSignal) => {
       if (settled) return;
       settled = true;
-      watchdog?.stop();
+      const stopped = watchdog?.stop();
       clearTimeout(grace);
       const timedOut = Boolean(watchdog?.fired());
       if (timedOut) announce();
       const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) };
       // The tree can close before the escape sweeps finish (an escapee that holds no pipe): the phase, and with it the
       // slot, is not over until they ran.
-      if (timedOut && watchdog) watchdog.settled().then(() => resolveGate(result));
-      else resolveGate(result);
+      if (timedOut && watchdog) Promise.all([watchdog.settled(), stopped]).then(() => resolveGate(result));
+      else Promise.resolve(stopped).then(() => resolveGate(result));
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
       pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
@@ -742,7 +743,11 @@ async function runGate(command, args) {
         grace.unref();
       },
     }) : null;
-    child.on('error', (e) => { watchdog?.stop(); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    child.on('error', (e) => {
+      const stopped = watchdog?.stop();
+      clearTimeout(grace);
+      if (!settled) { settled = true; Promise.resolve(stopped).then(() => reject(e)); }
+    });
     child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
     child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });

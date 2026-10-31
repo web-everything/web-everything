@@ -1,3 +1,5 @@
+import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { pidIdentity } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
@@ -1565,7 +1567,7 @@ export function runReconcilePass({
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
   const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
-  const prs = enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug });
+  const rulingPrs = enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
@@ -1575,6 +1577,7 @@ export function runReconcilePass({
   const standDownHoldsAcrossHeads = loadStandDownHoldsAcrossHeads({ env });
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
+  const prs = enrichVerifyGreen(rulingPrs, { policy: timing.review, env });
   const plan = planReconcile({
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
@@ -1972,5 +1975,16 @@ export function enrichPrsWithTimeoutEvidence(prs, {
         : { eligible: false, reason: 'infra-cancelled-heal-mode' };
     }
     return { ...pr, timeoutRetry, timeoutRetryBudget };
+  });
+}
+
+/** IO shell enrichment: never consult the ledger when the policy is off. */
+export function enrichVerifyGreen(prs, { policy, coordinationRoot, env = process.env, read = hasGreenLedger } = {}) {
+  if (!policy?.startBeforeCi) return prs;
+  const dir = greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot({ env }), env });
+  return prs.map(pr => {
+    let verifyGreen = false;
+    try { verifyGreen = read({ dir, sha: pr.headRefOid }) === true; } catch { /* Missing evidence waits for CI. */ }
+    return { ...pr, verifyGreen };
   });
 }

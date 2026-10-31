@@ -64,14 +64,14 @@ export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activit
  *  operation's io into the health tick); `health-investigate-dispatch.test.mjs` asserts it covers every id in
  *  `run.mjs#OPERATIONS`, so a new operation cannot silently become reachable. */
 export const NON_READ_OPERATIONS = Object.freeze([
-  'land-human-only',
+  'land-human-only', 'manual-daemon-pass',
   'review-pr', 'review-prep', 'record-verdict', 'verify', 'pr-size', 'mutation-check', 'revert-red-check', 'gap-sweep-status', 'clear-stuck-session',
   'resolve', 'close-items', 'reopen-items', 'scaffold', 'file-item', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership', 'pr-sweep',
-  'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'review-seat-caps', 'gate-health', 'telemetry-summary',
+  'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'host-capacity', 'review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'graduate-chain', 'judge-sweep-facts', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
   'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
   'free-scope', 'operator-session-bootstrap', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status', 'prototype-load',
-  'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim',
+  'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'routing-override',
 ]);
 
 /** Pre-approved commands, as `node <root>/…` prefixes (the agent's cwd is a scratch dir outside any checkout). */

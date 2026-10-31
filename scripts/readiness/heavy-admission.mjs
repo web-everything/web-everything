@@ -97,12 +97,15 @@
  * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
  * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
  * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
- * Cap, fastSlots, fastScale, priority and remote (enabled/mode/loadPerCoreThreshold) use one host-wide resolver
+ * Cap, fastSlots, fastScale, priority and remote (enabled/mode/loadPerCoreThreshold/clientPath) use one host-wide resolver
  * (standard → platform preferences); remote has no env mapping. Their env and
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
+ * Settings: heavyAdmission.remote.clientPath selects an external remote-exec.mjs outside all lane pools.
+ * Remove the setting to revert to the bundled client; no environment mapping.
+ *
  * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
- * Only { mode: 'remote', code: <integer> } exits with that code. Local admission may follow only
+ * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
  * only the cancelled+terminated acknowledgement permits local admission. Everything else, including
  * legacy { mode: 'fallback' }, throws, malformed results and unacknowledged timeouts, exits 124.
@@ -140,12 +143,17 @@
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import '../lib/tools-root-guard.mjs';
+import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
+import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
-import { createHash } from 'node:crypto';
-import { basename, dirname, join, resolve } from 'node:path';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { checkRemoteHealth, recordRemoteResult } from './forge-remote-health.mjs';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import { daemonEventsPath } from '../lib/daemon-events.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
@@ -231,7 +239,8 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
-  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 }),
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
+    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -256,9 +265,15 @@ const ADMISSION_VALID = {
   'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
+  'remote.clientPath': (v) => v === null || typeof v === 'string',
   'remote.enabled': (v) => typeof v === 'boolean',
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
+  'remote.maxConcurrent': admissionInt(1),
+  'remote.backoffMs': isValidRunWaitMs,
+  'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
+  'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
+  'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -291,6 +306,11 @@ export function canonicalPath(p) {
 /** The real user's home, independent of a caller's `$HOME` (a sandboxed or launchd caller may carry another one). */
 const realHomeDir = () => { try { return userInfo().homedir || homedir(); } catch { return homedir(); } };
 const oneLine = (v) => String(v).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+const clientPathForLog = (path) => {
+  // Never invoke hooks on untrusted settings objects just to report an ignored/invalid path.
+  if ((path !== null && typeof path === 'object') || typeof path === 'function' || typeof path === 'symbol') return '<unprintable>';
+  return String(path).replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
+};
 
 /**
  * A pool is PRIVATE only when `LANE_POOL_ROOT` points somewhere other than the host-shared pool the checkout
@@ -316,7 +336,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
  * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
  * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
  * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
- * keeps both local override layers.
+ * keeps both local override layers, except remote.clientPath is always platform-only.
  */
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
@@ -328,14 +348,23 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     let value = admissionLeaf(settings, leaf);
     sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
-      const v = admissionLeaf(block, leaf);
+      let v;
+      try { v = admissionLeaf(block, leaf); }
+      catch (error) {
+        if (leaf !== 'remote.clientPath') throw error;
+        v = Symbol('unreadable clientPath'); // invalid even in the trusted platform layer
+      }
       if (v === undefined) continue;
+      if (layer === 'tool' && leaf === 'remote.clientPath') {
+        ignored.push(`tool.${leaf}=${clientPathForLog(v)} (only platform preferences may select executable client code)`);
+        continue;
+      }
       if (layer === 'tool' && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
         continue;
       }
       if (valid(v)) { value = v; sources[leaf] = layer; }
-      else invalid.push(`${layer}.${leaf}=${oneLine(JSON.stringify(v))}`);
+      else invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
     }
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
@@ -362,18 +391,22 @@ const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
- * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test). A read that fails keeps the last
+ * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
+ * remote client code. A read that fails keeps the last
  * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
-  let platform; let tool; let path; const errors = []; let readFailed = false;
+  let platform; let tool; let path; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   checkoutRoot ??= repoRoot;
   const overrideOk = privateAdmissionPool(env, checkoutRoot) || isUnderTest(env) || isUnderTest(process.env);
-  try { path = (overrideOk && env.WE_PLATFORM_PREFERENCES) || join(home ?? realHomeDir(), '.claude', 'platform-preferences.json'); }
+  try {
+    envSelected = Boolean(overrideOk && env.WE_PLATFORM_PREFERENCES);
+    path = envSelected ? env.WE_PLATFORM_PREFERENCES : join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
+  }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
@@ -389,12 +422,19 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
       if (platformLastGood.has(path)) platform = platformLastGood.get(path);
     } else platformLastGood.delete(path);
   }
+  // Strip after last-good fallback, without changing the block cached for host-file readers.
+  if (envSelected && platform?.remote?.clientPath !== undefined) {
+    const { clientPath, ...remote } = platform.remote;
+    platform = { ...platform, remote };
+    ignored.push(`platform.remote.clientPath=${clientPathForLog(clientPath)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`);
+  }
   if (repoRoot) try {
     const settingsDir = join(repoRoot, 'scripts', 'settings');
     const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
     if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
+  policy.ignored.push(...ignored);
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);
   if (!readFailed) admissionPolicyCache.set(key, { policy, expiresAt: nowMs + 10_000 });
@@ -403,8 +443,10 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
-    'remote.enabled', 'remote.mode', 'remote.loadPerCoreThreshold']
-    .map((leaf) => `${leaf}=${admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
+    ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
+      .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
+      .map(key => `remote.${key}`)]
+    .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
@@ -421,34 +463,253 @@ export function decideRemote({ policy, loadPerCore, argv }) {
 
 const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'command-not-allowed',
-  'requires-git-worktree',
   'invalid-parameters',
   'forge-unreachable',
   'copy-failed',
+  'ignored-test-file',
   'unsupported-sibling-dependency',
 ]);
 
 /** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
 export function adaptLegacyRemoteResult(result) {
   if (result?.mode === 'fallback' && LEGACY_REMOTE_PRE_EXECUTION_REASONS.includes(result.reason)) {
-    return { mode: 'not-started', terminated: true, reason: result.reason };
+    return { mode: 'not-started', terminated: true, reason: result.reason, ...(result.timings ? {timings:result.timings}: {}) };
   }
   return result;
 }
 
+const realClientFs = () => ({ realpathSync, statSync });
+
+// Static closure reference only; execution stays behind the native CJS adapter below.
+void (() => import('./remote-exec.mjs'));
+
+// Command-only adapter: daemon import closures must stay statically complete even though a host
+// can select arbitrary client code. Load it only when executing remotely, through native CJS so
+// Vitest does not transform the adapter's computed import. Relative clients still resolve beside it.
+const requireRemoteClient = createRequire(import.meta.url);
+const importRemoteClient = (specifier) => requireRemoteClient('./remote-client-import.cjs').importRemoteClient(specifier);
+
+/** Validate both the named path and its target; symlinks cannot smuggle a lane client outside the pool. */
+export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClientFs() }) {
+  if (clientPath == null) return { clientPath: null };
+  try {
+    if (typeof clientPath !== 'string' || !isAbsolute(clientPath)) return { reason: 'clientPath must be absolute' };
+    if (basename(clientPath) !== 'remote-exec.mjs') return { reason: 'basename must be remote-exec.mjs' };
+    const named = resolve(clientPath);
+    const real = fs.realpathSync(clientPath);
+    const roots = laneRoots.flatMap((root) => [resolve(root), canonicalPath(root)]).map((root) => root.toLowerCase());
+    if ([named, real].map((path) => path.toLowerCase()).some((path) => path.includes(sep + '.lanes' + sep)
+      || roots.some((root) => path === root || path.startsWith(root + sep)))) return { reason: 'clientPath is inside a lane pool' };
+    if (basename(real) !== 'remote-exec.mjs') return { reason: 'target basename must be remote-exec.mjs' };
+    if (!fs.statSync(real).isFile()) return { reason: 'clientPath must be a regular file' };
+    return { clientPath: real };
+  } catch (error) { return { reason: `clientPath unreadable: ${oneLine(error?.code ?? error?.message ?? error)}` }; }
+}
+
+const remoteClientNotice = { logged: false };
+const pendingClientProvenance = new Set();
+const CLIENT_PROVENANCE_SETTLE_MAX_MS = 1500;
+
+/** Best-effort CLI shutdown drain, outside the remote execution deadline. False means skip the
+ * remaining provenance and exit with the remote result; even a stuck IO/log promise cannot hold exit. */
+export async function settleClientProvenance(maxMs = CLIENT_PROVENANCE_SETTLE_MAX_MS) {
+  if (pendingClientProvenance.size === 0) return true;
+  const timeoutMs = Number.isFinite(maxMs)
+    ? Math.max(0, Math.min(maxMs, CLIENT_PROVENANCE_SETTLE_MAX_MS)) : CLIENT_PROVENANCE_SETTLE_MAX_MS;
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.all([...pendingClientProvenance]).then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+const CLIENT_PROVENANCE_MAX_BYTES = 4096;
+const CLIENT_PROVENANCE_OPEN_FLAGS = (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0);
+
+/** Only an absent path or a regular, non-symlink file is safe for optional persistence. */
+async function clientProvenanceStat(file, stat = lstat) {
+  let info;
+  try { info = await stat(file); }
+  catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!info.isFile()) throw new Error('remote client provenance is not a regular file');
+  return info;
+}
+
+/** Nonblocking open cannot strand Node on a FIFO; validate the opened destination before writing. */
+async function appendClientOverrideEvent(event) {
+  try {
+    const destination = daemonEventsPath();
+    if (!(await lstat(dirname(destination))).isDirectory()) return false;
+    const handle = await open(destination,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | CLIENT_PROVENANCE_OPEN_FLAGS);
+    try {
+      if (!(await handle.stat()).isFile()) return false;
+      // Match appendDaemonEvent's JSON line, including default repo and omitted optional fields.
+      const { kind, repo = 'web-everything', pr, daemon, detail } = event;
+      const line = `${JSON.stringify({ at: new Date().toISOString(), kind, repo, pr, daemon, detail })}\n`;
+      await handle.writeFile(line);
+    } finally { await handle.close(); }
+    return true;
+  } catch { return false; }
+}
+
+/** Oversized state is missing provenance: record the current pair and replace it on this run. */
+async function readClientProvenance(file, { signal }) {
+  const handle = await open(file, constants.O_RDONLY | CLIENT_PROVENANCE_OPEN_FLAGS);
+  try {
+    signal.throwIfAborted();
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > CLIENT_PROVENANCE_MAX_BYTES) return '';
+    signal.throwIfAborted();
+    const buffer = Buffer.alloc(CLIENT_PROVENANCE_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return bytesRead > CLIENT_PROVENANCE_MAX_BYTES ? '' : buffer.toString('utf8', 0, bytesRead);
+  } finally { await handle.close(); }
+}
+
+/** Never open the destination for writing: publish a complete sibling file by rename. */
+async function writeClientProvenance(file, data, { signal, encoding }) {
+  const temporary = join(dirname(file), `.client-override-${randomUUID()}.tmp`);
+  let handle;
+  let created = false;
+  try {
+    signal.throwIfAborted();
+    handle = await open(temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | CLIENT_PROVENANCE_OPEN_FLAGS, 0o600);
+    created = true;
+    await handle.writeFile(data, { encoding, signal });
+    await handle.close();
+    handle = null;
+    await clientProvenanceStat(file);
+    signal.throwIfAborted();
+    await rename(temporary, file);
+  } finally {
+    try { if (handle) await handle.close(); }
+    finally { if (created) await unlink(temporary).catch(() => {}); }
+  }
+}
+
+/** Provenance is optional: storage deadlines skip it without changing remote execution semantics. */
+async function boundedClientProvenance(work, timeoutMs, fallback) {
+  const controller = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => work(controller.signal)),
+      new Promise((resolve) => {
+        timer = setTimeout(() => { controller.abort(); resolve(fallback); }, timeoutMs);
+      }),
+    ]);
+  } catch { return fallback; }
+  finally { clearTimeout(timer); }
+}
+
+/** Importing executes top-level code, so import exceptions or invalid exports cannot confirm a non-start.
+ * Import/export failures and runRemote results/throws retain the existing safety contract:
+ * unconfirmed termination refuses a local rerun with exit 124. */
+export function createRemoteExec({
+  policy, cwd = process.cwd(), env = process.env, lockRoot,
+  laneRoots = [defaultPoolRoot(cwd, env), defaultPoolRoot(MODULE_CHECKOUT, {})],
+  fs = realClientFs(), importClient = importRemoteClient,
+  provenanceFs = { lstat, readFile: readClientProvenance, mkdir, writeFile: writeClientProvenance },
+  log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
+  readSha = (path) => new Promise((resolve, reject) => {
+    execFile('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
+      { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096 },
+      (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
+  }),
+  notice = remoteClientNotice,
+} = {}) {
+  return async (options) => {
+    const client = resolveRemoteClient({ clientPath: policy.settings.remote.clientPath, laneRoots, fs });
+    if (client.clientPath === null) return adaptLegacyRemoteResult(await (await importClient('./remote-exec.mjs')).runRemote(options));
+    const ignored = (reason) => {
+      reason = oneLine(reason);
+      log(`heavy-admission: remote client override ignored (${reason}) - falling back to local admission\n`);
+      return { mode: 'not-started', terminated: true, reason: `remote client override: ${reason}` };
+    };
+    if (client.reason) return ignored(client.reason);
+    let remote;
+    try {
+      remote = await importClient(pathToFileURL(client.clientPath).href);
+    } catch (error) {
+      throw new Error(`remote client override import failed: ${oneLine(error?.message ?? error)}`, { cause: error });
+    }
+    if (typeof remote.runRemote !== 'function') throw new Error('remote client override runRemote export is not a function');
+    let result;
+    try {
+      // Invoke the validated client before starting any optional provenance work.
+      result = remote.runRemote(options);
+    } finally {
+      const provenance = (async () => {
+        const sha = oneLine(await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown');
+        if (!notice.logged) {
+          notice.logged = true;
+          const displayPath = clientPathForLog(client.clientPath);
+          await log(`heavy-admission: remote client override ${displayPath} @ ${oneLine(sha)}\n`);
+        }
+        await boundedClientProvenance(async (signal) => {
+          const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
+          const info = await clientProvenanceStat(file, provenanceFs.lstat);
+          if (signal.aborted) return;
+          let previous = null;
+          let previousPathKey = null;
+          try {
+            const raw = info && info.size <= CLIENT_PROVENANCE_MAX_BYTES
+              ? await provenanceFs.readFile(file, { encoding: 'utf8', signal }) : '';
+            if (typeof raw === 'string' && Buffer.byteLength(raw, 'utf8') <= CLIENT_PROVENANCE_MAX_BYTES) {
+              const parsed = JSON.parse(raw);
+              if (typeof parsed?.clientPath === 'string' && typeof parsed?.sha === 'string'
+                && !/[^\x20-\x7e]/.test(parsed.clientPath) && !/[^\x20-\x7e]/.test(parsed.sha)
+                && (parsed.pathKey === undefined || (typeof parsed.pathKey === 'string'
+                  && parsed.pathKey.length === 64 && !/[^a-f0-9]/.test(parsed.pathKey)))) {
+                previous = { clientPath: clientPathForLog(parsed.clientPath), sha: oneLine(parsed.sha) };
+                previousPathKey = parsed.pathKey ?? null;
+              }
+            }
+          } catch { /* first use, invalid or unreadable state is missing provenance */ }
+          if (signal.aborted) return;
+          const pair = { clientPath: clientPathForLog(client.clientPath), sha };
+          // Display sanitization is lossy; identify the raw resolved path independently.
+          // Legacy state without a key deliberately emits fresh provenance once.
+          const pathKey = createHash('sha256').update(client.clientPath).digest('hex');
+          if (previousPathKey !== pathKey || previous?.sha !== pair.sha) {
+            if (await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } }) === false) return;
+            if (signal.aborted) return;
+            await provenanceFs.mkdir(dirname(file), { recursive: true });
+            if (signal.aborted) return;
+            await provenanceFs.writeFile(file, JSON.stringify({ ...pair, pathKey }) + '\n', { encoding: 'utf8', signal });
+          }
+        }, 100);
+      })().catch(() => {}).finally(() => pendingClientProvenance.delete(provenance));
+      pendingClientProvenance.add(provenance);
+    }
+    return adaptLegacyRemoteResult(await result);
+  };
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
- * Only { mode: 'remote', code: <integer> } exits with that code. Local admission requires
+ * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
  * Everything else (including legacy fallback, throws, malformed results and unacknowledged
  * timeouts) refuses local reruns with exit 124. */
 export async function runWithRemoteDecision({
-  argv, policy, cwd, env,
+  argv, policy, cwd, env, host = 'forge', clock = Date.now,
+  lockRoot = admissionLockRoot(cwd, env), readTelemetry,
   timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec = async (options) => adaptLegacyRemoteResult(await (await import('./remote-exec.mjs')).runRemote(options)),
+  remoteExec,
   log = (line) => process.stderr.write(line),
 }) {
   let load;
@@ -456,21 +717,64 @@ export async function runWithRemoteDecision({
   const decision = decideRemote({ policy, loadPerCore: load, argv });
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
+  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
+  const remoteRoot = join(dirname(lockRoot), 'remote');
+  const localFallback = (reason) => {
+    log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
+    return { handled: false };
+  };
+  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
+  const healthy = await health();
+  if (!healthy.ok) return localFallback(healthy.reason);
+  const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
+  const cap = policy.settings.remote.maxConcurrent;
+  const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
+  const waitAt = clock();
+  let slot;
+  try {
+    for (;;) {
+      const nowMs = clock();
+      const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
+      slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
+      if(slot.ok)break;
+      if(nowMs-waitAt>=30000)return localFallback('remote-full (30s wait exhausted)');
+      await new Promise(resolve=>setTimeout(resolve,Math.min(1000,30000-(nowMs-waitAt))));
+    }
+  } catch { return localFallback('remote-slot-unreadable'); }
+  const heartbeat = setInterval(() => heartbeatOwnedSlot({...slotOptions,fastSlots:0}),60000);
+  heartbeat.unref();
+  const record = async result => {
+    try {await recordRemoteResult({root:remoteRoot,settings:policy.settings.remote,clock,result,host});}
+    catch {log('heavy-admission: remote-health-unreadable; subsequent remote admission requires readable health state\n');}
+  };
+  const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
+  let outstanding = false;
+  let terminated = false;
   const refuseLocal = (reason) => {
-    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n`);
+    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
   };
   let reason; let timer;
   const controller = new AbortController();
   const timedOut = Symbol('remote-timeout');
   try {
+    // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
+    if(clock()-waitAt>=10000){const checked=await health();if(!checked.ok)return localFallback(checked.reason);}
+    // Persist dispatch intent BEFORE invoking the executor. SIGKILL bypasses
+    // finally, and a dead client PID cannot prove a Forge job has terminated.
+    // Exclusive creation also catches a marker created after the slot scan;
+    // never overwrite another execution's outstanding evidence.
+    try {
+      writeFileSync(executionMarker,'remote termination unconfirmed\n',{flag:'wx',mode:0o600});
+      outstanding = true;
+    } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => {
         resolve(timedOut);
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, signal: controller.signal }));
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {
       const termination = await Promise.race([
@@ -480,18 +784,35 @@ export async function runWithRemoteDecision({
         }),
       ]);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
+        await record({mode:'unconfirmed'});
         return refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
+      terminated = true;
+      await record(termination);
     } else {
-      if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
+      terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
+        || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
+      await record(result);
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
     }
-  } catch (error) { return refuseLocal(error?.message ?? error); }
-  finally { clearTimeout(timer); }
+  } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
+  finally {
+    clearTimeout(timer); clearInterval(heartbeat);
+    if(!outstanding) releaseOwnedSlot({...slotOptions,fastSlots:0});
+    else if(terminated) {
+      // Unconfirmed results, throws and client death leave the pre-dispatch
+      // marker intact across PID reclaim and lease expiry. Only confirmed
+      // completion/termination can make this index available again.
+      try {unlinkSync(executionMarker);outstanding = false;}
+      catch {log(`heavy-admission: remote slot-${slot.slot} retained; execution confirmed terminated but its .unconfirmed marker could not be removed; operator cleanup required\n`);}
+      if(!outstanding)releaseOwnedSlot({...slotOptions,fastSlots:0});
+    }
+  }
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
@@ -1852,7 +2173,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec } = {}) {
+export async function main(argv, { remoteExec, readTelemetry } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -2014,13 +2335,27 @@ export async function main(argv, { remoteExec } = {}) {
       process.exit(1);
     }
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
-    if (!bypass && !useContainer && !process.env[ADMISSION_HELD_ENV]) {
+    // The Mac verify driver holds local phase capacity, but its gate may run on
+    // Forge. Consume this internal handoff once; local fallback stays reentrant.
+    const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
+    delete process.env.WE_FORGE_GATE_DISPATCH;
+    if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
+      const requested=argv.slice(dashDashIdx+1);
+      // package.json wraps the underlying executable, so reconstruct only the
+      // fixed standards script contract at this client boundary.
+      const remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
+        ? ['npm','run','check:standards',...(requested.length>2?['--',...requested.slice(2)]:[])] : requested;
       const result = await runWithRemoteDecision({
-        argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec,
+        argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
+        env: process.env, remoteExec, readTelemetry, lockRoot,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
-      if (result.handled) process.exit(result.exitCode);
+      if (result.handled) {
+        // An unref'd drain timer permits natural exit if no IO remains; preserve the remote code there too.
+        process.exitCode = result.exitCode;
+        await settleClientProvenance();
+        process.exit(result.exitCode);
+      }
     }
     if (useContainer) {
       // Fail with a clear, actionable message rather than a raw ENOENT/"image not found" surfaced from deep

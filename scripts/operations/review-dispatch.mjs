@@ -201,17 +201,17 @@ export const EXTRA_JUROR_MANDATE = MANDATE_LENSES.CORRECTNESS;
 
 /** The pinned model + effort per provider for an added seat — never left to a CLI's implicit default. Card
  *  xn2wf9t split the old single `gemini` entry into the `agy` CLI's two real backends (see
- *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` keeps the exact model/effort the old
- *  `gemini` entry ran, byte for byte; `agy-claude` is new. */
+ *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` uses the shared Gemini pin;
+ *  `agy-claude` selects the Claude backend. */
 const codexReviewDefault = resolveCodexTaskRoute({ kind: 'review', log: false });
 export const REVIEW_SEAT_MODELS = Object.freeze({
   codex: Object.freeze({ model: codexReviewDefault.model, effort: codexReviewDefault.effort }),
-  // `gemini-3.1-pro` offers only `low`/`high` (agy refused `medium` live, 2026-09-26); `low` is the combination
-  // the review-pr Antigravity seat already runs (`ANTIGRAVITY_REVIEW_EFFORT`).
-  'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'low' }),
+  // Argon high effort is baked into ANTIGRAVITY_MODEL. The launchers omit --effort for suffixed ids,
+  // so a separately requested routing effort cannot override the pinned tier.
+  'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'high' }),
   // The `agy` CLI running a Claude-family model — untried live at this effort for a review seat, so it starts
-  // at the same effort Codex's own seat runs rather than assuming the Gemini backend's `low`/`high`-only quirk
-  // carries over; the first live runs are the proof either way (see the plist/backlog note this card leaves).
+  // at the same effort Codex's own seat runs, independently of the Gemini model's effort suffix.
+  // The first live runs are the proof either way (see the plist/backlog note this card leaves).
   'agy-claude': Object.freeze({ model: AGY_CLAUDE_MODEL_BY_TIER.sonnet, effort: 'medium' }),
 });
 
@@ -229,11 +229,11 @@ export function reviewSeatKey(seat) {
  * `callsRemaining` is the day's remaining non-Claude call budget. One provider is one call (its seats share a
  * prompt), so with 0 left every seat is skipped (`daily-cap`) and with 1 left every seat goes to the provider
  * the first seat picked.
- * @param {{available?: string[], scorecards?: Array<object>, callsRemaining?: number}} [o]
+ * @param {{available?: string[], providerAvailable?: (provider:string, seatKey:string)=>boolean, scorecards?: Array<object>, callsRemaining?: number}} [o]
  * @returns {{routes: Array<{seat:string, lens:string, key:string, provider:string, model:string, effort:string, reasoning:string}>,
  *   skipped: Array<{seat:string, lens:string, key:string, reason:string}>}}
  */
-export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
+export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
   const seats = [
     { seat: 'extra-juror', lens: EXTRA_JUROR_MANDATE },
     ...ROUTED_ADVISORY_LENSES.map((lens) => ({ seat: 'advisory-lens', lens })),
@@ -246,10 +246,11 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards
   let usable = [...available];
   const plannedLoad = {};
   for (const s of seats) {
+    const seatAvailable = usable.filter(provider => providerAvailable(provider, s.key));
     let configured;
-    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: usable, policy: routingPolicy }); }
+    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: seatAvailable, policy: routingPolicy }); }
     catch (error) { skipped.push({ ...s, reason: error.message }); continue; }
-    const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: usable, scorecards, plannedLoad });
+    const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: seatAvailable, scorecards, plannedLoad });
     if (!pick.provider) { skipped.push({ ...s, reason: pick.reasoning }); continue; }
     plannedLoad[pick.provider] = (plannedLoad[pick.provider] ?? 0) + 1;
     // One call left: every later seat rides the call this first pick already costs.

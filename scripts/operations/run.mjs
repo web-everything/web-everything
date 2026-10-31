@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
+import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
@@ -33,6 +35,8 @@ import { fileURLToPath } from 'node:url';
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry } from './registry.mjs';
+import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
+import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
 import {
@@ -74,6 +78,8 @@ import { createRunnerActivityReader, createRunnerActivityCliStores } from './run
 import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
+import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './host-capacity.mjs';
+import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
 import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
@@ -186,6 +192,8 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 
 export const OPERATIONS = Object.freeze({
+  [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
+  [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
     declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
@@ -402,6 +410,12 @@ export const OPERATIONS = Object.freeze({
   [DAEMON_STATUS_OP]: () => ({
     declaration: daemonStatusOperation({ collect: collectDaemonStatus }),
     sinks: {},
+  }),
+  // R258 — measured CPU/memory capacity; read-only, no effect sinks.
+  [HOST_CAPACITY_OP]: () => ({
+    declaration: hostCapacityOperation({ collect: collectHostCapacity }),
+    sinks: {},
+    finish: finishHostCapacity,
   }),
   // Card xb0iuxq (epic #4075, under #3383) — the mechanical "who's holding/waiting on the heavy-admission pool"
   // report (the operator's own hand-built report, made mechanical). Read-only, same no-sinks reasoning as

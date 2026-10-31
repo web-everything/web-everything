@@ -70,6 +70,7 @@ import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-se
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
 import { DEFAULT_ROUTING_POLICY } from './dispatch-routing-policy.mjs';
+import { REVIEW_SEAT_PROVIDERS } from './dispatch-routing-providers.mjs';
 export { DEFAULT_ROUTING_POLICY, resolveOperationRoute } from './dispatch-routing-policy.mjs';
 
 import { isUsableForExploration } from './model-capability-ratings.mjs';
@@ -1230,7 +1231,7 @@ export function selectSupervisionLevel(provider, model, taskType, scorecards, ba
  *  (the same CLI running its native Gemini model) — the operator confirmed live both are separate, generous
  *  quotas, while `codex`'s own weekly allowance is comparatively tight. Splitting the identity (not just the
  *  cap) lets a seat fall back from one antigravity backend to the other without touching Codex at all. */
-export const REVIEW_SEAT_PROVIDERS = Object.freeze(['codex', 'agy-claude', 'agy-gemini']);
+export { REVIEW_SEAT_PROVIDERS };
 
 /** The `dispatchKind` every added-review-seat evidence row carries. */
 export const REVIEW_SEAT_DISPATCH_KIND = 'review-seat';
