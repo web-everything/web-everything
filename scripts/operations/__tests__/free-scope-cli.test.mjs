@@ -100,6 +100,22 @@ describe('heartbeat (live 2026-10-31 dead-owner reap)', () => {
     clock = t0 + 80 * 60e3;
     expect(go(['register', '--agent=intruder', '--owner=B', '--purpose=p', '--files=x.mjs']).code).toBe(1);
   });
+  it('heartbeats before the slow collection, and registers with the clock read after it (Codex audit)', () => {
+    go(['register', '--agent=live', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat']);
+    clock = t0 + 44 * 60e3;
+    let seenDuringCollect;
+    const slow = (args) => { seenDuringCollect = entry('live').lastSeenAt; clock += 2 * 60e3; return regCollect(args); };
+    main(['check', '--files=x.mjs', '--exclude-agent=live', '--exclude-owner=A'], { env, now: () => clock, collect: slow,
+      stdout: { write: () => {} }, stderr: { write: () => {} } });
+    expect(seenDuringCollect).toBe(new Date(t0 + 44 * 60e3).toISOString());
+    main(['register', '--agent=r', '--owner=R', '--purpose=p', '--files=y.mjs', '--heartbeat'], { env, now: () => clock, collect: slow,
+      stdout: { write: () => {} }, stderr: { write: () => {} } });
+    expect(entry('r').lastSeenAt).toBe(new Date(clock).toISOString());
+  });
+  it('a heartbeat that finds no entry of its own says the reservation is gone', () => {
+    const r = go(['check', '--files=x.mjs', '--exclude-agent=ghost', '--exclude-owner=G']);
+    expect(r.err).toMatch(/reservation is gone/);
+  });
   it('a check without the owner token never heartbeats anyone', () => {
     go(['register', '--agent=live', '--owner=A', '--purpose=p', '--files=x.mjs', '--heartbeat']);
     clock = t0 + 40 * 60e3;
