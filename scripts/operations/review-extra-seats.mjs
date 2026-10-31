@@ -56,6 +56,7 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { OPERATION_PROVIDER_ROSTERS } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1697,9 +1698,10 @@ export async function speculateRedTeam({
     let deferredByCap = false;
     const routingPolicy = (io.readRoutingPolicy ?? readRoutingPolicy)();
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
-    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
-    const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
-    for (const p of REVIEW_SEAT_PROVIDERS) {
+    const providers = OPERATION_PROVIDER_ROSTERS['review-seat:red-team'];
+    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
+    for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) {
@@ -1718,7 +1720,7 @@ export async function speculateRedTeam({
     let callId = null;
     let lastReason = null;
     let configuredRoute = null;
-    for (let attempt = 0; attempt <= REVIEW_SEAT_PROVIDERS.length && available.length && !callId; attempt += 1) {
+    for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
       try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
       catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });

@@ -223,7 +223,8 @@ describe('operator routing overrides', () => {
     expect(base.operations[key].provider).toBe('codex');
   });
 
-  it.each([null, [], { typo: {} }, { [key]: { provider: 'unknown' } }, { [key]: { model: 'made-up' } },
+  it.each([null, [], { typo: {} }, { [key]: { provider: 'unknown' } },
+    { [key]: { provider: 'claude' } }, { [key]: { provider: 'antigravity' } }, { [key]: { model: 'made-up' } },
     { [key]: { disabledProviders: ['typo'] } }, { [key]: { provider: 'codex', disabledProviders: ['codex'] } }])(
     'retains last good on invalid override and logs once: %j', invalid => {
       const f = fixture(); f.set({ [key]: { provider: 'agy-gemini' } });
@@ -314,7 +315,7 @@ describe('operator routing overrides', () => {
     for (const provider of ['agy-claude', 'antigravity']) {
       expect(resolvePolicyModel(provider, 'sonnet')).toBe('claude-sonnet-5-5-high');
       const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-      policy.operations[key] = { provider, model: policy.aliases[provider].sonnet, fallback: [] };
+      policy.operations['review-seat'] = { provider, model: policy.aliases[provider].sonnet, fallback: [] };
       expect(() => validateRoutingPolicy(policy)).not.toThrow();
       policy.aliases[provider].sonnet = 'claude-sonnet-5-5-unknown';
       expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);

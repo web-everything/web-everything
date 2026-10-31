@@ -5,7 +5,8 @@ import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync } from '
 import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { validateRoutingPolicy, resolveOperationRoute } from '../dispatch-routing-policy.mjs';
+import { validateRoutingPolicy, resolveOperationRoute, applyRoutingOverrides, DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
+import { OPERATION_PROVIDER_ROSTERS } from '../dispatch-routing-providers.mjs';
 import { readRoutingPolicy, createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
 import { routeDispatchProvider } from '../../operations/dispatch-lane-io.mjs';
@@ -22,6 +23,27 @@ const repairLaunchRoute = (kind, vetoes = []) => {
   return resolveOperationRoute({ operation: kind, policy, vetoes });
 };
 describe('operation routing policy', () => {
+  it('shares the red-team launch roster with existing review-seat consumers', async () => {
+    const { REVIEW_SEAT_PROVIDERS } = await import('../provider-routing.mjs');
+    expect(OPERATION_PROVIDER_ROSTERS['review-seat:red-team']).toBe(REVIEW_SEAT_PROVIDERS);
+    expect(REVIEW_SEAT_PROVIDERS).toEqual(['codex', 'agy-claude', 'agy-gemini']);
+  });
+  it.each(['claude', 'antigravity', 'unknown-provider'])(
+    'rejects unsupported red-team provider %s in policy and override validation', provider => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      const route = { provider, model: 'sonnet', fallback: [] };
+      policy.operations['review-seat:red-team'] = route;
+      expect(() => validateRoutingPolicy(policy)).toThrow(/provider/);
+      expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': { provider } })).toThrow(/provider/);
+      policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', fallback: [{ provider, model: 'sonnet' }] };
+      expect(() => validateRoutingPolicy(policy)).toThrow(/provider/);
+    });
+  it.each(['codex', 'agy-claude', 'agy-gemini'])(
+    'resolves a supported red-team override for %s against the launch roster', provider => {
+      const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'review-seat:red-team': { provider } });
+      expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team',
+        available: OPERATION_PROVIDER_ROSTERS['review-seat:red-team'], policy })).toMatchObject({ provider });
+    });
   it.each(['antigravity', 'agy-gemini'])('resolves the %s Pro alias to the registered Argon high model', (provider) => {
     const policy = copy();
     policy.operations.judge = { provider, model: 'pro', effort: 'high', fallback: [] };
@@ -97,7 +119,7 @@ describe('operation routing policy', () => {
 it('a child uses the inherited last-good snapshot even while the policy file is syntactically broken', () => {
   const dir = mkdtempSync(join(tmpdir(), 'routing-policy-child-'));
   try {
-    for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
+    for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
     writeFileSync(join(dir, 'dispatch-routing-policy.json'), '{broken edit');
     const moduleUrl = pathToFileURL(join(dir, 'dispatch-routing-policy.mjs')).href;
     const result = execFileSync(process.execPath, ['--input-type=module', '-e', `import { resolveOperationRoute } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(resolveOperationRoute({operation:'prepare-item'})));`], {

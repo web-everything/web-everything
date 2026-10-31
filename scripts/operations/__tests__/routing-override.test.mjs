@@ -8,7 +8,8 @@ import { once } from 'node:events';
 import { resolveOperation } from '../run.mjs';
 import { runOperationCli, buildCliSpec, parseOperationArgv } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
-import { createRoutingOverrideSinks } from '../routing-override-file.mjs';
+import { createRoutingOverrideSinks, writeRoutingOverride } from '../routing-override-file.mjs';
+import { applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute } from '../../lib/dispatch-routing-policy.mjs';
 import { routingOverrideOperation, planRoutingOverride } from '../routing-override.mjs';
 import { op } from '../registry.mjs';
 import { compute, judge } from '../step-kinds.mjs';
@@ -16,6 +17,30 @@ import { compute, judge } from '../step-kinds.mjs';
 const dirs = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const key = 'review-seat:red-team';
+it.each(['claude', 'antigravity', 'unknown-provider'])(
+  'refuses unsupported red-team provider %s and preserves working file bytes', async provider => {
+    const f = fixture();
+    const original = '{\n  "unrelated": true, "routingOverrides": {"review-seat:red-team": {"provider":"codex"}}\n}\n';
+    writeFileSync(f.path, original);
+    expect(() => planRoutingOverride({ operation: 'review-seat', taskType: 'red-team', provider })).toThrow(/unsupported provider/);
+    expect(() => writeRoutingOverride({ key, patch: { provider } }, { env: f.env })).toThrow(/provider/);
+    expect((await f.command(['--operation=review-seat', '--taskType=red-team', `--provider=${provider}`])).code).not.toBe(0);
+    expect(readFileSync(f.path, 'utf8')).toBe(original);
+  });
+
+it.each([
+  ['inherited', { disabledProviders: ['codex', 'agy-claude', 'agy-gemini'] }, /no available route/],
+  ['explicit', { provider: 'codex', disabledProviders: ['codex', 'agy-claude', 'agy-gemini'] }, /both enabled and disabled/],
+])('refuses disabling all red-team providers (%s) and preserves working file bytes', (mode, patch, error) => {
+  const f = fixture();
+  const original = '{\n "routingOverrides": {"review-seat:red-team": {"provider":"agy-claude"}}, "keep": true\n}\n';
+  writeFileSync(f.path, original);
+  expect(() => writeRoutingOverride({ key, patch }, { env: f.env })).toThrow(error);
+  expect(readFileSync(f.path, 'utf8')).toBe(original);
+  const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, JSON.parse(readFileSync(f.path, 'utf8')).routingOverrides);
+  expect(resolveOperationRoute({ operation: 'review-seat', taskType: 'red-team', policy })).toMatchObject({ provider: 'agy-claude' });
+});
+
 it.each(['advisory:agy-correctness', 'mandatory:correctness', 'mandatory:security'])(
   'refuses an unsupported provider for %s without writing preferences', async taskType => {
     const f = fixture();
@@ -27,14 +52,35 @@ it.each(['advisory:agy-correctness', 'mandatory:correctness', 'mandatory:securit
   });
 
 function fixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'routing-override-cli-')); dirs.push(dir);
+  const dir = fs.realpathSync(mkdtempSync(join(tmpdir(), 'routing-override-cli-'))); dirs.push(dir);
   const path = join(dir, 'preferences.json');
   const env = { WE_PLATFORM_PREFERENCES_FILE: path };
   const command = argv => runOperationCli({ ...resolveOperation('routing-override'),
     sinks: createRoutingOverrideSinks({ env }), argv, store: createMemoryRunStore(),
     newRunId: () => 'routing-override-test' });
-  return { dir, path, command };
+  return { dir, path, env, command };
 }
+
+it('refuses an override that exhausts the effective fallback route and preserves file bytes', () => {
+  const f = fixture();
+  const original = '{"routingOverrides":{"prepare-item":{"provider":"codex"}},"keep":true}\n';
+  writeFileSync(f.path, original);
+  expect(() => writeRoutingOverride({ key: 'prepare-item', patch: { disabledProviders: ['codex', 'claude'] } },
+    { env: f.env })).toThrow(/no available route/);
+  expect(readFileSync(f.path, 'utf8')).toBe(original);
+});
+
+it('updates the real preferences target and preserves its symlink', async () => {
+  const f = fixture();
+  const target = join(f.dir, 'target.json');
+  writeFileSync(target, '{"keep":true}');
+  fs.symlinkSync('target.json', f.path);
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=agy-gemini'])).code).toBe(0);
+  expect(fs.lstatSync(f.path).isSymbolicLink()).toBe(true);
+  expect(fs.readlinkSync(f.path)).toBe('target.json');
+  expect(JSON.parse(readFileSync(target, 'utf8'))).toEqual({ keep: true, routingOverrides: { [key]: { provider: 'agy-gemini' } } });
+  expect(readdirSync(f.dir).sort()).toEqual(['preferences.json', 'target.json']);
+});
 
 it('declares and executes CLI write and clear, preserving unrelated preferences and entries atomically', async () => {
   const f = fixture();

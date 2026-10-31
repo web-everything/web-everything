@@ -1,17 +1,19 @@
 /** Serialized, atomic operator-file update, preserving every unrelated preference and routing entry. */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, realpathSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { operatorPreferencesPath } from '../lib/policy-cascade.mjs';
 import { applyRoutingOverrides } from '../lib/dispatch-routing-policy.mjs';
 import { ROUTING_POLICY_PATH } from '../lib/dispatch-routing-policy-source.mjs';
-import { ROUTING_OVERRIDE_EFFECT, planRoutingOverride } from './routing-override.mjs';
+import { ROUTING_OVERRIDE_EFFECT, planRoutingOverride, resolveRoutingOverrideRoute } from './routing-override.mjs';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 export function writeRoutingOverride({ key, patch }, { env = process.env } = {}) {
-  const path = operatorPreferencesPath(env);
+  let path = operatorPreferencesPath(env);
+  try { path = realpathSync(path); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
   mkdirSync(dirname(path), { recursive: true });
   return withFileLock(`${path}.lock`, () => {
     let prefs = {};
@@ -23,15 +25,16 @@ export function writeRoutingOverride({ key, patch }, { env = process.env } = {})
     }
     const policy = JSON.parse(readFileSync(ROUTING_POLICY_PATH, 'utf8'));
     const split = key.indexOf(':');
-    planRoutingOverride({ operation: split < 0 ? key : key.slice(0, split), taskType: split < 0 ? '' : key.slice(split + 1),
-      clear: patch === null, ...patch }, policy);
+    if (patch === null) planRoutingOverride({ operation: split < 0 ? key : key.slice(0, split),
+      taskType: split < 0 ? '' : key.slice(split + 1), clear: true }, policy);
     if (prefs.routingOverrides !== undefined && (prefs.routingOverrides === null || typeof prefs.routingOverrides !== 'object' || Array.isArray(prefs.routingOverrides))) {
       throw new TypeError('routing-override: routingOverrides must be an object');
     }
     const overrides = { ...prefs.routingOverrides };
     if (patch === null) delete overrides[key];
     else overrides[key] = patch;
-    applyRoutingOverrides(policy, overrides);
+    const effectivePolicy = applyRoutingOverrides(policy, overrides);
+    resolveRoutingOverrideRoute(key, effectivePolicy);
     prefs.routingOverrides = overrides;
     const scratch = `${path}.${randomUUID()}.tmp`;
     try {
