@@ -4,7 +4,8 @@ import {isAbsolute, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const refuse = async () => true;
-const execute = promisify(execFile);
+// Bound at call time: importing this module must not touch child_process.
+const execute = (...args) => promisify(execFile)(...args);
 const child = fileURLToPath(new URL('./forge-vitest-select.mjs', import.meta.url));
 const MAX_OUTPUT = 4 * 1024 * 1024;
 
