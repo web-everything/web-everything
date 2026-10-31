@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { once } from 'node:events';
+import { execFileSync } from 'node:child_process';
 import { resolveOperation } from '../run.mjs';
 import { runOperationCli, buildCliSpec, parseOperationArgv } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
@@ -82,6 +83,46 @@ it('replaces preferences by atomic rename and leaves no scratch or lock files', 
   writeRoutingOverride({ key, patch: { provider: 'codex' } }, { env: f.env });
   expect(statSync(f.path).ino).not.toBe(before); // a new inode means rename-over, never in-place truncate
   expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ keep: true, routingOverrides: { [key]: { provider: 'codex' } } });
+  expect(readdirSync(f.dir)).toEqual(['preferences.json']);
+});
+
+it('preserves preferences and removes scratch and lock files when rename fails', () => {
+  const f = fixture();
+  const original = Buffer.from('{\n  "keep": true, "routingOverrides": {"review-seat:red-team":{"provider":"agy-claude"}}\n}\n');
+  writeFileSync(f.path, original);
+  // Isolate the native ESM binding replacement from Vitest and concurrent test workers.
+  execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import fs from 'node:fs';
+    import assert from 'node:assert/strict';
+    import { syncBuiltinESMExports } from 'node:module';
+    const [path, moduleUrl] = process.argv.slice(1);
+    const { writeRoutingOverride } = await import(moduleUrl);
+    const failure = Object.assign(new Error('injected rename failure'), { code: 'EACCES' });
+    const originalRename = fs.renameSync;
+    let calls = 0;
+    fs.renameSync = (scratch, target) => {
+      calls++;
+      assert.equal(target, path);
+      assert.deepEqual(JSON.parse(fs.readFileSync(scratch, 'utf8')).routingOverrides['review-seat:red-team'], { provider: 'codex' });
+      assert.ok(fs.existsSync(path + '.lock'));
+      throw failure;
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => writeRoutingOverride({ key: 'review-seat:red-team', patch: { provider: 'codex' } },
+        { env: { WE_PLATFORM_PREFERENCES_FILE: path } }), error => error === failure);
+      assert.equal(calls, 1);
+    } finally {
+      fs.renameSync = originalRename;
+      syncBuiltinESMExports();
+    }
+  `, f.path, pathToFileURL(join(process.cwd(), 'scripts/operations/routing-override-file.mjs')).href],
+  { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 });
+  expect(readFileSync(f.path)).toEqual(original);
+  expect(readdirSync(f.dir)).toEqual(['preferences.json']);
+  // Cleanup also leaves the writer usable for the next operator edit.
+  writeRoutingOverride({ key, patch: { provider: 'codex' } }, { env: f.env });
+  expect(JSON.parse(readFileSync(f.path, 'utf8')).routingOverrides[key]).toEqual({ provider: 'codex' });
   expect(readdirSync(f.dir)).toEqual(['preferences.json']);
 });
 

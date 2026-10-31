@@ -3313,6 +3313,11 @@ route, retaining the last-good policy and applied-event state, and recovering on
 The reader and writer share the route probe and provider caps from `scripts/lib`; keep that
 validation ahead of reload events and snapshot mutation. Atomic writer fixtures must assert
 unchanged bytes and no leftover scratch/lock files on refusal, including a failed rename.
+`dispatch-routing-policy.test.mjs` pins unlisted lens and extra-juror roster identity, rejects
+lookalike operation names, and checks last-good retention and recovery for unsupported scoped overrides.
+The named `preserves preferences and removes scratch and lock files when rename fails` case in
+`routing-override.test.mjs` injects a native rename error in an isolated child, checks the scratch
+payload and held lock before failure, and proves cleanup permits the next write.
 `routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
 operator `routingOverrides` changes, including clearing and one event per applied change.
 `routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary

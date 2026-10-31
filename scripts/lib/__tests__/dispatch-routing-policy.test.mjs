@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { validateRoutingPolicy, resolveOperationRoute, applyRoutingOverrides, DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
 import { OPERATION_PROVIDER_ROSTERS, rosterForKey } from '../dispatch-routing-providers.mjs';
+import { resolveRoutingOverrideRoute } from '../dispatch-routing-override-route.mjs';
 import { planRoutingOverride } from '../../operations/routing-override.mjs';
 import { readRoutingPolicy, createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
 import { decideDispatchRoute } from '../dispatch-contracts.mjs';
@@ -24,6 +25,45 @@ const repairLaunchRoute = (kind, vetoes = []) => {
   return resolveOperationRoute({ operation: kind, policy, vetoes });
 };
 describe('operation routing policy', () => {
+  it.each(['review-seat:future-lens', 'review-seat:extra-juror:future-mandate'])(
+    'uses the added-seat launcher roster for an unlisted scoped key %s', key => {
+      expect(Object.hasOwn(OPERATION_PROVIDER_ROSTERS, key)).toBe(false);
+      expect(rosterForKey(key)).toBe(rosterForKey('review-seat'));
+      expect(rosterForKey(key)).toEqual(['codex', 'agy-claude', 'agy-gemini']);
+    });
+  it.each(['review-seats:future-lens', 'review-seat-other', 'prepare-item', 'constructor', '__proto__'])(
+    'does not assign a review-seat roster to unrelated key %s', key => {
+      expect(rosterForKey(key)).toBeUndefined();
+    });
+  it.each(['review-seat:standards-conformance', 'review-seat:extra-juror:future-mandate'])(
+    'keeps the last good scoped seat %s on an unsupported live override and recovers', key => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations[key] = { inherit: true };
+      let patch = { provider: 'codex' };
+      const log = vi.fn(), emit = vi.fn();
+      const reader = createRoutingPolicyReader({ initial: policy, read: () => JSON.stringify(policy),
+        preferences: () => ({ prefs: { routingOverrides: { [key]: patch } }, errors: [] }),
+        log, emit, env: {},
+      });
+      const good = reader();
+      expect(good.operations[key].provider).toBe('codex');
+      emit.mockClear();
+      patch = { provider: 'claude' };
+      expect(reader()).toBe(good);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/keeping last good policy:.*unsupported seat provider claude/));
+      expect(emit).not.toHaveBeenCalled();
+      patch = { provider: 'agy-claude' };
+      expect(reader().operations[key].provider).toBe('agy-claude');
+      expect(emit).toHaveBeenCalledOnce();
+    });
+  it.each(['review-seat:standards-conformance', 'review-seat:extra-juror:future-mandate'])(
+    'probes inherited scoped seat %s with the capped launcher roster', key => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations[key] = { inherit: true, disabledProviders: ['codex', 'agy-claude'] };
+      expect(() => resolveRoutingOverrideRoute(key, policy, { env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } }))
+        .toThrow(/no available route/);
+      expect(resolveRoutingOverrideRoute(key, policy, { env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '25' } })).toBeNull();
+    });
   it('refuses unsupported providers for scoped added seats before writing preferences', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'routing-scoped-seat-'));
     const path = join(dir, 'preferences.json');
