@@ -1,14 +1,15 @@
 ---
+bornAs: xddrhne
 kind: task
 status: open
-scope: ["we:.claude/hooks"]
+scope: ["we:scripts/conveyor/enqueue-on-event.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Hook must deny run_in_background for codex-direct-task and gemini-direct-task
+# enqueue-on-event: give every revalidationAborted push site an explicit outcome kind
 
-2026-10-31 07:43 ET: a codex-runner worker ran we:scripts/codex-direct-task.mjs in the background then stopped, violating the pinned we:CLAUDE.md rule again. Make the hook deny run_in_background for we:scripts/codex-direct-task.mjs and we:scripts/gemini-direct-task.mjs.
+2026-10-30 18:10 ET, #6113 review carve-out: we:scripts/conveyor/enqueue-on-event.mjs line 835: with no enqueueOutcomes entry every revalidationAborted reason is hold-eligible, so transient gh/git/pending-check aborts wait up to 30 min. Add an explicit kind per push site.
 
 ## Acceptance
 

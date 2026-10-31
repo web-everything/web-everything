@@ -1,13 +1,14 @@
 ---
+bornAs: xci12hp
 kind: task
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# #6044 review carve-outs: rebuild-job reader-wait timeout wiring and unredacted ps command log
+# #6109 security notes: clientPath symlink-swap window and WE_PLATFORM_PREFERENCES override
 
-2026-10-30 20:48 ET: no test for reader-wait timeout wiring in jobMain (we:scripts/conveyor/rebuild-job.mjs line 359); we:scripts/conveyor/rebuild-job.mjs line 334 logs the timed-out reader ps command unredacted (control chars stripped, 200-char cap).
+2026-10-30 17:39 ET, #6109 security notes: clientPath does realpath-validate then import, leaving a symlink-swap window; the WE_PLATFORM_PREFERENCES override lets a private pool pick another prefs file.
 
 ## Acceptance
 

@@ -1,13 +1,15 @@
 ---
-kind: task
+bornAs: xufllgh
+kind: story
+size: 3
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# lane reclaim --salvage fails spawnSync git ENOENT on stale locked worktree records
+# red-team:pending label while status row is finished/not-owed stalls the PR
 
-2026-10-30 15:44 ET: lane reclaim --salvage fails 'spawnSync git ENOENT' on lanes with a stale locked .claude/worktrees/* entry whose dir is gone (lane-24, lane-29). Salvage should prune or skip dead worktree records. Caused lane starvation 3 times on 2026-10-30.
+2026-10-31 01:16 ET: red-team label red-team:pending while the status row = finished/not-owed, so the red team never runs and the PR stalls (#6023 61+ min, #6059). Reconcile label vs status; dispatch when owed. Prove on the next stalled PR.
 
 ## Acceptance
 

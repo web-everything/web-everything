@@ -1,14 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xb76fl5
+kind: task
 status: open
+scope: ["we:.github/workflows/soak-replay-gate.yml"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# remote-exec falls back to the Mac on backoff-telemetry-stale despite fresh Forge telemetry
+# soak-replay-gate fails closed on gh api pulls 422 too many files changed
 
-2026-10-30 09:22 ET, must fix before routing ON: the remote-exec CLI falls back with backoff-telemetry-stale from the shared admission remote health file even when Forge telemetry is fresh, which would keep most heavy runs on the Mac. Also the #6059 client (02ed5eae) has no delta so every run ships about 15k files (52s); land #6100/#6101 soon after #6059. Prewarm hit only 1 of 3 delta runs; slot trees exist only for the newest base.
+2026-10-30 09:46 ET: we:.github/workflows/soak-replay-gate.yml fails closed when gh api pulls/N returns 422 'too many files changed' (cached-diff glitch; #6059 has 27 files). Fall back to gh pr view --json body or GraphQL for the body fetch. Instance cleared by a no-op merge push (3da43988b4).
 
 ## Acceptance
 

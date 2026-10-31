@@ -1,14 +1,14 @@
 ---
+bornAs: xztm9rx
 kind: task
 status: open
-scope: ["we:scripts/conveyor/enqueue-on-event.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# enqueue-on-event: give every revalidationAborted push site an explicit outcome kind
+# Flaky proc-identity test: procfs reader closes on rejection
 
-2026-10-30 18:10 ET, #6113 review carve-out: we:scripts/conveyor/enqueue-on-event.mjs line 835: with no enqueueOutcomes entry every revalidationAborted reason is hold-eligible, so transient gh/git/pending-check aborts wait up to 30 min. Add an explicit kind per push site.
+2026-10-31: we:scripts/lib/proc-identity.test.mjs 'procfs reader closes on rejection' flakes with a read on a closed or reused fd (on main; hit #6033 shard 10).
 
 ## Acceptance
 

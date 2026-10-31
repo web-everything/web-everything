@@ -1,13 +1,15 @@
 ---
-kind: task
+bornAs: xljb0dm
+kind: story
+size: 3
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# test-shard 4 hits the 25-minute wall with no failing assertion
+# bundle-repair must emit the ready record and tests-run id for the combined top it audits
 
-2026-10-31: test-shard 4 hits a 25-min wall with no failing assertion (#6033 at 7b748b41). Find the slow or hung test.
+2026-10-30 21:14 ET: bundle-repair builds and audits a combined top but writes no ready record or tests-run id, so prototype-load cannot adopt it (control hold control-a48e86d0, top c4328a37). Bundle-repair must emit the ready record it already earned.
 
 ## Acceptance
 

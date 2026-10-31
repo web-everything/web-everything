@@ -1,13 +1,15 @@
 ---
-kind: task
+bornAs: xkpnwg1
+kind: story
+size: 3
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Drain overlap-yield must skip blocked or stacked PRs
+# remote-exec falls back to the Mac on backoff-telemetry-stale despite fresh Forge telemetry
 
-2026-10-30 17:56 ET: drain overlap-yield made #6109 (priority:now, green) wait on #6041, which is stacked on unmerged #6059 and cannot merge. The yield must skip blocked/stacked PRs.
+2026-10-30 09:22 ET, must fix before routing ON: the remote-exec CLI falls back with backoff-telemetry-stale from the shared admission remote health file even when Forge telemetry is fresh, which would keep most heavy runs on the Mac. Also the #6059 client (02ed5eae) has no delta so every run ships about 15k files (52s); land #6100/#6101 soon after #6059. Prewarm hit only 1 of 3 delta runs; slot trees exist only for the newest base.
 
 ## Acceptance
 

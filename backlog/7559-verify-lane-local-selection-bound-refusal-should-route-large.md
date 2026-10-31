@@ -1,13 +1,15 @@
 ---
-kind: task
+bornAs: xpnc1t9
+kind: story
+size: 3
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# worker-brief standard block must require timeout 600000 on every Codex, verify and test Bash call
+# verify-lane local-selection-bound refusal should route large selections to Forge
 
-2026-10-31 07:45 ET: workers hit the Bash default timeout, so long Codex/verify calls auto-background and the worker stops mid-task (2 of 3 workers this morning). The we:scripts/worker-brief.mjs standard block must say 'timeout: 600000 on every Codex/verify/test Bash call'.
+2026-10-30 21:44 ET: verify-lane refuses large test selections with local-selection-bound (exit 3), blocking prototype-load receipts for the #6059 head and the control bundle-repair top. Large selections should route to Forge (remote-exec) instead of refusing.
 
 ## Acceptance
 

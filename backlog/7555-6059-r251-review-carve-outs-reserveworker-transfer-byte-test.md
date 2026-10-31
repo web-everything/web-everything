@@ -1,13 +1,16 @@
 ---
-kind: task
+bornAs: xix6jja
+kind: story
+size: 3
 status: open
+scope: ["we:docs/agent/testing.md"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# review-pr --answer=accept records accept but the review label stays pending
+# #6059 R251 review carve-outs: reserveWorker, transfer-byte test, snapshot cap, test gaps
 
-2026-10-31: review-pr --answer=accept on #6101 recorded the accept but the label stayed review:pending (PR BLOCKED).
+2026-10-30 16:07 ET: (1) reserveWorker validates the requested slot but allocates the first available (CONFIRMED); (2) remote-exec.test lacks an exact transfer-byte total incl. sibling payloads while we:docs/agent/testing.md claims it (CONFIRMED x2); (3) forge-exec-bases worktree materialize fails on a snapshot file over 4MiB while manifest/staging have no cap (PLAUSIBLE); (4) test gaps: warm-cache archive hash, slot-quarantine marker removal failure, prod ops-identity wiring, bypass==='held' conjunct.
 
 ## Acceptance
 

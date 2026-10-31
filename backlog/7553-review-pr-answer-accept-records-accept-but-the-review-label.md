@@ -1,14 +1,14 @@
 ---
+bornAs: xiherp2
 kind: task
 status: open
-scope: ["we:.github/workflows/soak-replay-gate.yml"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# soak-replay-gate fails closed on gh api pulls 422 too many files changed
+# review-pr --answer=accept records accept but the review label stays pending
 
-2026-10-30 09:46 ET: we:.github/workflows/soak-replay-gate.yml fails closed when gh api pulls/N returns 422 'too many files changed' (cached-diff glitch; #6059 has 27 files). Fall back to gh pr view --json body or GraphQL for the body fetch. Instance cleared by a no-op merge push (3da43988b4).
+2026-10-31: review-pr --answer=accept on #6101 recorded the accept but the label stayed review:pending (PR BLOCKED).
 
 ## Acceptance
 

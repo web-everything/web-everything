@@ -1,14 +1,14 @@
 ---
+bornAs: x42upo7
 kind: task
 status: open
-scope: ["we:scripts/conveyor/review-red-team-on-skip.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Red-team skip: stale recovery chosen when a completed seat row already exists
+# test-shard 4 hits the 25-minute wall with no failing assertion
 
-2026-10-30 13:50 ET (R255): we:scripts/conveyor/review-red-team-on-skip.mjs line 425 chooses stale recovery when a completed seat row already exists. Confirmed red-team edge-case break on #6056, carded at approval.
+2026-10-31: test-shard 4 hits a 25-min wall with no failing assertion (#6033 at 7b748b41). Find the slow or hung test.
 
 ## Acceptance
 

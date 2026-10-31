@@ -1,13 +1,14 @@
 ---
+bornAs: x009vfs
 kind: task
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# PRs approved over the round cap: open review findings become follow-up cards
+# worker-brief standard block must require timeout 600000 on every Codex, verify and test Bash call
 
-2026-10-30 18:02 ET (R269): #6023 was approved over its round cap; its open review findings must become follow-up cards, read from its last review comment.
+2026-10-31 07:45 ET: workers hit the Bash default timeout, so long Codex/verify calls auto-background and the worker stops mid-task (2 of 3 workers this morning). The we:scripts/worker-brief.mjs standard block must say 'timeout: 600000 on every Codex/verify/test Bash call'.
 
 ## Acceptance
 

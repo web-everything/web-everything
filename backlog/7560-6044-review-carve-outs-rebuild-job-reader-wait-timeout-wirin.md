@@ -1,13 +1,14 @@
 ---
+bornAs: xtn9mfw
 kind: task
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# #6042 review carve-outs: three test gaps in ci-heal-escalation-mark and check-state-predicate
+# #6044 review carve-outs: rebuild-job reader-wait timeout wiring and unredacted ps command log
 
-2026-10-30 19:45 ET: test gaps: 7-char SHA minimum only tested for 1-3 char prefixes (ci-heal-escalation-mark.test line 370); no test of several merge-gate rows sharing one lazy freeze read (line 496); conflicting-flags test only covers tied-rank rows (check-state-predicate.test line 70).
+2026-10-30 20:48 ET: no test for reader-wait timeout wiring in jobMain (we:scripts/conveyor/rebuild-job.mjs line 359); we:scripts/conveyor/rebuild-job.mjs line 334 logs the timed-out reader ps command unredacted (control chars stripped, 200-char cap).
 
 ## Acceptance
 

@@ -1,14 +1,14 @@
 ---
-kind: story
-size: 3
+bornAs: xi8klzr
+kind: task
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# verify-lane local-selection-bound refusal should route large selections to Forge
+# #6042 review carve-outs: three test gaps in ci-heal-escalation-mark and check-state-predicate
 
-2026-10-30 21:44 ET: verify-lane refuses large test selections with local-selection-bound (exit 3), blocking prototype-load receipts for the #6059 head and the control bundle-repair top. Large selections should route to Forge (remote-exec) instead of refusing.
+2026-10-30 19:45 ET: test gaps: 7-char SHA minimum only tested for 1-3 char prefixes (ci-heal-escalation-mark.test line 370); no test of several merge-gate rows sharing one lazy freeze read (line 496); conflicting-flags test only covers tied-rank rows (check-state-predicate.test line 70).
 
 ## Acceptance
 

@@ -1,13 +1,15 @@
 ---
-kind: task
+bornAs: x4q918s
+kind: story
+size: 3
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# #6109 security notes: clientPath symlink-swap window and WE_PLATFORM_PREFERENCES override
+# Red-team policy-clear skip fails with carry refused: policy
 
-2026-10-30 17:39 ET, #6109 security notes: clientPath does realpath-validate then import, leaving a symlink-swap window; the WE_PLATFORM_PREFERENCES override lets a private pool pick another prefs file.
+2026-10-31 01:04 ET: red-team policy-clear skip fails with 'carry refused: policy' (#6115 22:17, #6117 01:03). Card-only/prepare PRs get stuck red-team-skipped instead of policy-cleared. Fix the carry rule in the red-team skip path; prove on #6115/#6117.
 
 ## Acceptance
 

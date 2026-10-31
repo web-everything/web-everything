@@ -1,13 +1,14 @@
 ---
+bornAs: xaqijsi
 kind: task
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Flaky proc-identity test: procfs reader closes on rejection
+# PRs approved over the round cap: open review findings become follow-up cards
 
-2026-10-31: we:scripts/lib/proc-identity.test.mjs 'procfs reader closes on rejection' flakes with a read on a closed or reused fd (on main; hit #6033 shard 10).
+2026-10-30 18:02 ET (R269): #6023 was approved over its round cap; its open review findings must become follow-up cards, read from its last review comment.
 
 ## Acceptance
 

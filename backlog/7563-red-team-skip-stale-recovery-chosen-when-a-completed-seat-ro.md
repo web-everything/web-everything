@@ -1,14 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xwlvcva
+kind: task
 status: open
+scope: ["we:scripts/conveyor/review-red-team-on-skip.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# bundle-repair must emit the ready record and tests-run id for the combined top it audits
+# Red-team skip: stale recovery chosen when a completed seat row already exists
 
-2026-10-30 21:14 ET: bundle-repair builds and audits a combined top but writes no ready record or tests-run id, so prototype-load cannot adopt it (control hold control-a48e86d0, top c4328a37). Bundle-repair must emit the ready record it already earned.
+2026-10-30 13:50 ET (R255): we:scripts/conveyor/review-red-team-on-skip.mjs line 425 chooses stale recovery when a completed seat row already exists. Confirmed red-team edge-case break on #6056, carded at approval.
 
 ## Acceptance
 

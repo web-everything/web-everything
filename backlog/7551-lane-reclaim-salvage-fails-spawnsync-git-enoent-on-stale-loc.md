@@ -1,15 +1,14 @@
 ---
-kind: story
-size: 3
+bornAs: xfnmyls
+kind: task
 status: open
-scope: ["we:docs/agent/testing.md"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# #6059 R251 review carve-outs: reserveWorker, transfer-byte test, snapshot cap, test gaps
+# lane reclaim --salvage fails spawnSync git ENOENT on stale locked worktree records
 
-2026-10-30 16:07 ET: (1) reserveWorker validates the requested slot but allocates the first available (CONFIRMED); (2) remote-exec.test lacks an exact transfer-byte total incl. sibling payloads while we:docs/agent/testing.md claims it (CONFIRMED x2); (3) forge-exec-bases worktree materialize fails on a snapshot file over 4MiB while manifest/staging have no cap (PLAUSIBLE); (4) test gaps: warm-cache archive hash, slot-quarantine marker removal failure, prod ops-identity wiring, bypass==='held' conjunct.
+2026-10-30 15:44 ET: lane reclaim --salvage fails 'spawnSync git ENOENT' on lanes with a stale locked .claude/worktrees/* entry whose dir is gone (lane-24, lane-29). Salvage should prune or skip dead worktree records. Caused lane starvation 3 times on 2026-10-30.
 
 ## Acceptance
 

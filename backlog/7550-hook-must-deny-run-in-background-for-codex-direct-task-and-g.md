@@ -1,14 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xdsqhci
+kind: task
 status: open
+scope: ["we:.claude/hooks"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# red-team:pending label while status row is finished/not-owed stalls the PR
+# Hook must deny run_in_background for codex-direct-task and gemini-direct-task
 
-2026-10-31 01:16 ET: red-team label red-team:pending while the status row = finished/not-owed, so the red team never runs and the PR stalls (#6023 61+ min, #6059). Reconcile label vs status; dispatch when owed. Prove on the next stalled PR.
+2026-10-31 07:43 ET: a codex-runner worker ran we:scripts/codex-direct-task.mjs in the background then stopped, violating the pinned we:CLAUDE.md rule again. Make the hook deny run_in_background for we:scripts/codex-direct-task.mjs and we:scripts/gemini-direct-task.mjs.
 
 ## Acceptance
 

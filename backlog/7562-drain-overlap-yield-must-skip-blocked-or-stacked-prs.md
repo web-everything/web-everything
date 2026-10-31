@@ -1,14 +1,14 @@
 ---
-kind: story
-size: 3
+bornAs: xveyxml
+kind: task
 status: open
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Red-team policy-clear skip fails with carry refused: policy
+# Drain overlap-yield must skip blocked or stacked PRs
 
-2026-10-31 01:04 ET: red-team policy-clear skip fails with 'carry refused: policy' (#6115 22:17, #6117 01:03). Card-only/prepare PRs get stuck red-team-skipped instead of policy-cleared. Fix the carry rule in the red-team skip path; prove on #6115/#6117.
+2026-10-30 17:56 ET: drain overlap-yield made #6109 (priority:now, green) wait on #6041, which is stacked on unmerged #6059 and cannot merge. The yield must skip blocked/stacked PRs.
 
 ## Acceptance
 
