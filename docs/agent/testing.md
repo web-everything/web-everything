@@ -3347,6 +3347,30 @@ byte-transforming encoding so base-blob size/hash checks cannot mask a missing
 attribute guard. Same-size hidden-edit cases pin uppercase `S` (skip-worktree),
 lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
 
+
+## Forge synchronous import closure
+
+Keep the Forge runner, client, telemetry, warmer and limits modules free of top-level
+`await` throughout their static import graph. Put async CLI execution inside the
+guarded async wrapper used by `forge-exec-run.mjs`. The `Forge synchronous module loading`
+cases in `forge-client-controls.test.mjs` use native Node require to check that importing
+each module succeeds without executing its CLI, including the limits dependency.
+
+## Forge prewarm claim boundary
+
+`forge-prewarm.test.mjs` exercises real private trees and marker files. Model a foreign UID
+through injected `lstat` results so ownership refusals run without root. Cover each pool/base/tree
+owner and writable-directory check, private tree permissions, marker ownership/mode/link count/type,
+and exact SHA/digest marker bytes. Rejection before claim must leave the source intact; verification
+failure after rename must remove the destination without following links or exposing its permissions.
+The success case observes mode 0700 during verification, inode preservation and single consumption.
+
+Keep the runner reconstruction cases in `forge-offload.test.mjs`: they compare the complete input
+digest and overlay/deletion results before worker commands run, including file-to-directory,
+directory-to-file and nested deletion, while preserving unchanged prewarm inodes. When changing
+these guards, check representative mutations for ownership, marker evidence, private verification,
+failure cleanup and parent-directory removal through the heavy-admission queue. Temporary Vite
+transform configs can substitute mutations without editing the working implementation.
 ## Live operator routing fixtures
 
 Review-seat roster fixtures must cover scoped added seats as well as exact keys. Use

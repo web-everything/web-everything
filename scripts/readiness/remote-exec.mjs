@@ -815,7 +815,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -848,7 +848,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -878,7 +878,11 @@ export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
     return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
-      && Object.keys(receipt).filter(key=>key!=='timings').sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
+      && Object.keys(receipt).filter(key=>key!=='timings'&&key!=='resources').sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
+      && (!Object.hasOwn(receipt,'resources') || (receipt.resources && !Array.isArray(receipt.resources)
+        && Object.keys(receipt.resources).sort().join(',')==='cpuUsec,memoryPeakBytes,oomKills,slotCpus'
+        && ['cpuUsec','memoryPeakBytes','oomKills'].every(key=>receipt.resources[key]===null || Number.isSafeInteger(receipt.resources[key])&&receipt.resources[key]>=0)
+        && Number.isSafeInteger(receipt.resources.slotCpus)&&receipt.resources.slotCpus>=1))
       && (!Object.hasOwn(receipt,'timings') || (!!receipt.timings && Object.keys(receipt.timings).sort().join(',')==='installMs,runMs' && [receipt.timings.installMs,receipt.timings.runMs].every(ms=>Number.isSafeInteger(ms)&&ms>=0)))
       && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)
       && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
