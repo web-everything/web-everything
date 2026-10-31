@@ -1,8 +1,8 @@
 /** Clone-specific runtime roots. Throws on unreadable/malformed LaunchAgents evidence;
  * callers must retain the full conflict rather than proceed with narrowed entries. */
-import { readdirSync, realpathSync } from 'node:fs';
+import { readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DAEMON_ENTRY_MODULES } from './daemon-boot-smoke.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
@@ -47,6 +47,15 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
       throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
     }
     for (const arg of args) {
+      if (!arg.startsWith('-')) {
+        const path = resolve(realRoot, arg);
+        // Canonicalize even missing paths: only ENOENT may mean absent evidence.
+        const rel = inside(path);
+        const file = statSync(path, { throwIfNoEntry: false });
+        if (rel && file?.isFile() && !['.mjs', '.js', '.cjs'].includes(extname(path))) {
+          throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
+        }
+      }
       if (isAbsolute(arg) || arg.startsWith('--pass=')) continue;
       if (/^--(?:import|require|(?:experimental-)?loader)(?:=|$)/.test(arg)
         || /^-r/.test(arg)

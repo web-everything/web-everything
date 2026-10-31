@@ -40,6 +40,27 @@ it('reads a commit with NUL filenames and byte-framed UTF-8 blobs, without readi
     .toEqual(new Set(['entry.mjs', 'space name.mjs', 'child.mjs']));
 });
 
+it('caps each cat-file batch at 32 objects and reads every script across batches', () => {
+  const f = fixture();
+  const files = Array.from({ length: 70 }, (_, i) => [`script-${i}.mjs`, `// café 🐢 ${i}\n`]);
+  for (const [name, source] of files) writeFileSync(join(dir, name), source);
+  const sha = f.commit();
+  const batches = [];
+  const reader = treeReader((args, opts) => {
+    if (args[0] === 'cat-file' && args[1] === '--batch') {
+      const objects = opts.input.trimEnd().split('\n');
+      expect(objects.length).toBeLessThanOrEqual(32);
+      batches.push(objects);
+    }
+    return f.git(args, opts);
+  }, sha);
+  for (const [name, source] of files) expect(reader.readFile(name), name).toBe(source);
+  expect(batches.map(batch => batch.length)).toEqual([32, 32, 6]);
+  expect(new Set(batches.flat()).size).toBe(files.length);
+  for (const [name, source] of files) expect(reader.readFile(name), name).toBe(source);
+  expect(batches).toHaveLength(3);
+});
+
 it('resolves bare spawned basenames from the snapshot, excluding checkout-only decoys', () => {
   const f = fixture();
   mkdirSync(join(dir, 'snapshot'));

@@ -252,8 +252,19 @@ it('readyBuildVerified refuses reachable exclusions even when every recorded mer
 it.each(['read-tree', 'write-tree', 'update-index', 'commit-tree', 'log', 'merge-base', '--literal-pathspecs'])(
   'strategy fails closed on %s Git errors', failedCommand => {
   const f = fixture();
-  const git = (args, opts) => args[0] === failedCommand ? { status: 128, stdout: '' } : f.git(args, opts);
-  expect(resolveOverlayConflict({ git, cur: f.main, ovSha: f.overlay, ref: 'lane/a', scope: new Set(['entry.mjs']) }).ok).toBe(false);
+  const result = closureScope.computeClosureScope({ git: f.git, mainSha: f.main,
+    overlays: [{ sha: f.overlay, changedFiles: ['entry.mjs', 'new.mjs', 'unused.mjs'] }],
+    entries: ['entry.mjs'], env: {} });
+  expect(result.ok).toBe(true);
+  expect(closureScope.isExcludable('unused.mjs', result.scope)).toBe(true);
+  const failures = [];
+  const git = (args, opts) => {
+    if (args[0] !== failedCommand) return f.git(args, opts);
+    failures.push(args);
+    return { status: 128, stdout: '' };
+  };
+  expect(resolveOverlayConflict({ git, cur: f.main, ovSha: f.overlay, ref: 'lane/a', scope: result.scope }).ok).toBe(false);
+  expect(failures.length).toBeGreaterThan(0);
 });
 
 it('prepare discovers caller runtime entries lazily and emits the shadow would-resolve alert', async () => {

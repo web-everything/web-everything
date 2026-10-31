@@ -3040,7 +3040,11 @@ The integration-only fallback suite has no `unit` entry in `scripts/ci/test-timi
 `daemon-clone-entries.test.mjs`, `closure-scope.test.mjs` and
 `daemon-rebuild-tree-reader.test.mjs` cover the pure R171 helpers. Clone entry discovery
 throws on unreadable LaunchAgents evidence, including a missing directory; inject a directory
-and plutil runner for portable tests. Discovery canonicalizes both the clone root and absolute
+and plutil runner for portable tests. Argument fixtures must create real files to exercise the
+entrypoint allowlist: non-flag arguments resolve against the clone realpath, and existing files
+inside it must use `.mjs`, `.js` or `.cjs`. Missing bare tokens and ordinary flags remain accepted;
+loader flags and relative path/extension patterns still refuse. Non-ENOENT filesystem errors
+must throw. Discovery canonicalizes both the clone root and absolute
 arguments (including missing entries' existing ancestors), so symlink aliases discover the same daemon
 and mapped pass entries; aliases pointing outside the clone stay excluded. Discovery uses the supplied environment's `HOME` in both
 planning and boot smoke. Simulator homes provide an empty `Library/LaunchAgents` directory,
