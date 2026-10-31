@@ -211,6 +211,12 @@ function soakFixture() {
   return { root, env, marker, state, run, alerts };
 }
 describe('quick transition identity fence', () => {
+  it.each(['quick-soak-launcher-replacement-adoption', 'quick-soak-recovery-replacement-head'])(
+    'quick soak scenario registration recognizes the shared identity fix: %s', async id => {
+      const { default: scenario } = await import(`../../conveyor/soak/breaks/${id}.mjs`);
+      // A stale detector inverts defineBreakTest into it.fails even when the guard works.
+      expect(scenario.fixPresent(process.cwd())).toBe(true);
+    });
   it.each(['settle', 'recover', 'launch', 'fatal', 'launcher', 'prepare-quarantine', 'prepare-interrupted', 'finalize'].flatMap(transition =>
     ['token', 'sha', 'prevHead', 'HEAD'].map(field => ({ transition, field }))).concat(
       ['existing', 'retired', 'target', 'missing-target', 'rejected', 'rejected-sha'].map(field => ({ transition: 'finalize', field }))))(

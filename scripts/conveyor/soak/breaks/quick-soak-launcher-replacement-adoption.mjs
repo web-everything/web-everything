@@ -16,11 +16,12 @@ export default {
   id: 'quick-soak-launcher-replacement-adoption',
   title: 'A stale quick-soak launcher preserves a replacement adoption after the write barrier',
   card: 'PR #6084',
-  fixedBy: { sha: '6084-launcher-lock-identity', where: 'lane/daemon-rebuild-quick-mode',
+  // Undo the shared fence before the original launcher fence when replaying the pre-fix tree.
+  fixedBy: { sha: '1195bffdd7,35900b9739', where: 'lane/daemon-rebuild-quick-mode',
     paths: ['scripts/lib/daemon-rebuild/quick-soak-job.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lib/daemon-rebuild/quick-soak-job.mjs'), 'utf8')
-      .includes('if (!same(state.unverified, marker)) return;');
+      .includes('if (!assertMarkerIdentity(state, { ...marker, head:');
   },
   async run() {
     const root = mkdtempSync(join(tmpdir(), 'quick-launcher-race-'));
