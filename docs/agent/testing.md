@@ -3223,40 +3223,6 @@ heuristic. The operator must arrange actual writer exclusion before reclamation 
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
 
-## Live operator routing fixtures
-
-`dispatch-routing-policy-io.test.mjs` covers rejecting schema-valid live overrides with no usable
-route, retaining the last-good policy and applied-event state, and recovering on a valid edit.
-The reader and writer share the route probe and provider caps from `scripts/lib`; keep that
-validation ahead of reload events and snapshot mutation. Atomic writer fixtures must assert
-unchanged bytes and no leftover scratch/lock files on refusal, including a failed rename.
-`routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
-operator `routingOverrides` changes, including clearing and one event per applied change.
-`routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
-`WE_PLATFORM_PREFERENCES_FILE`; never point write tests at the operator's real preferences.
-The red-team live-reload case injects `io.readRoutingPolicy` and keeps CLI, quota and reservation
-checks in the selection path. Explicit provider selection enables a default-zero provider with a
-finite daily cap only when its env cap is unset; explicit env caps (including zero) remain binding.
-Clearing restores the repo/env defaults on the next pass. The preference writer holds the shared
-file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
-Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
-operations those names remain reserved juror controls; undeclared juror flags still fail closed.
-Repo platform files must ignore `routingOverrides` and warn, even when the operator file has no
-override; only the operator file (or its explicit replacement) can supply them. In added-seat
-fixtures, enable Gemini for one seat and leave other seats inherited or with Gemini fallbacks:
-only the enabled seat may use the default-zero provider. Check both synchronous and rejected
-event writes: neither may prevent applying or clearing a validated policy. Agy Sonnet aliases
-must resolve to an effort-suffixed catalog ID; historical persisted IDs remain readable.
-Provider-disable regressions must reach `decideDispatchRoute` with an inherited task such as
-`bugfix`, as well as concrete task routes and both prepare branches. Constrained inheritance
-refuses with a request for an explicit provider/fallback; it must never delegate an unchecked
-provider choice to the evidence router. Added review seats may retain inherited evidence selection
-when their supplied candidate list excludes every disabled provider and the critical-work gate is
-open. Test missing and unfiltered lists, a closed gate, and mandatory/work routes to keep that
-exception confined to added seats. Review settings seats accept only Claude and agy
-adapters: test rejection through the CLI before a preference write and retention of last-good
-settings during live reload. Disabling the optional agy advisory seat must still allow review
-initialization; exhausting a mandatory seat's routes must fail validation.
 ### Security condition test shape
 
 Every new bypass-widening condition needs one negative test per conjunct. Security
@@ -3334,6 +3300,42 @@ reads and equality with full hashing. Include an identity encoding as well as a
 byte-transforming encoding so base-blob size/hash checks cannot mask a missing
 attribute guard. Same-size hidden-edit cases pin uppercase `S` (skip-worktree),
 lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
+
+## Live operator routing fixtures
+
+`dispatch-routing-policy-io.test.mjs` covers rejecting schema-valid live overrides with no usable
+route, retaining the last-good policy and applied-event state, and recovering on a valid edit.
+The reader and writer share the route probe and provider caps from `scripts/lib`; keep that
+validation ahead of reload events and snapshot mutation. Atomic writer fixtures must assert
+unchanged bytes and no leftover scratch/lock files on refusal, including a failed rename.
+`routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
+operator `routingOverrides` changes, including clearing and one event per applied change.
+`routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
+`WE_PLATFORM_PREFERENCES_FILE`; never point write tests at the operator's real preferences.
+The red-team live-reload case injects `io.readRoutingPolicy` and keeps CLI, quota and reservation
+checks in the selection path. Explicit provider selection enables a default-zero provider with a
+finite daily cap only when its env cap is unset; explicit env caps (including zero) remain binding.
+Clearing restores the repo/env defaults on the next pass. The preference writer holds the shared
+file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
+Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
+operations those names remain reserved juror controls; undeclared juror flags still fail closed.
+Repo platform files must ignore `routingOverrides` and warn, even when the operator file has no
+override; only the operator file (or its explicit replacement) can supply them. In added-seat
+fixtures, enable Gemini for one seat and leave other seats inherited or with Gemini fallbacks:
+only the enabled seat may use the default-zero provider. Check both synchronous and rejected
+event writes: neither may prevent applying or clearing a validated policy. Agy Sonnet aliases
+must resolve to an effort-suffixed catalog ID; historical persisted IDs remain readable.
+Provider-disable regressions must reach `decideDispatchRoute` with an inherited task such as
+`bugfix`, as well as concrete task routes and both prepare branches. Constrained inheritance
+refuses with a request for an explicit provider/fallback; it must never delegate an unchecked
+provider choice to the evidence router. Added review seats may retain inherited evidence selection
+when their supplied candidate list excludes every disabled provider and the critical-work gate is
+open. Test missing and unfiltered lists, a closed gate, and mandatory/work routes to keep that
+exception confined to added seats. Review settings seats accept only Claude and agy
+adapters: test rejection through the CLI before a preference write and retention of last-good
+settings during live reload. Disabling the optional agy advisory seat must still allow review
+initialization; exhausting a mandatory seat's routes must fail validation.
+
 ## CI-heal check evidence (R272)
 
 Check names and required rosters match exactly, including case: a passing `TEST`
