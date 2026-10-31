@@ -82,6 +82,8 @@ export function normalizeRecoveryStatus(status, readEvidence) {
 export function planRedTeamRecovery({ repo, pr, head, status = null, evidence = {}, mode,
   env = process.env, now = Date.now(), probe, deadlineMs = staleRunDeadlineMs(env),
   recoverPayload = recoverStaleRunPayload, records, redispatch, requireAbandoned = false, staleRecovery = false, speculativePid } = {}) {
+  // No stored review is unavailable evidence, never infrastructure failure or permission to run.
+  evidence ??= {};
   const rows = records?.filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head) ?? evidence.seatRows;
   const completedRow = rows?.filter(completedRedTeamSeat).at(-1) ?? evidence.completedRow ?? null;
@@ -474,7 +476,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       }
       const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
-      const status = unfinishedCarry ? evidence.status : initialPlan.normalizedStatus;
+      // Re-read at selection: an owner observed during the in-flight check may have finished.
+      const status = unfinishedCarry ? evidence.status
+        : normalizeRecoveryStatus(readStatus({ repo, pr, head }), () => evidence);
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
       const stale = initialStatus?.status === 'running' && initialPlan.ownerStale;
       recovery = { status, evidence, plan: initialPlan, redispatch: undefined };
@@ -504,7 +508,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
           && (() => {
-            const status = initialStatus;
+            const status = readStatus({ repo, pr, head });
             // An accepting review with no status still owes its normal pass.
             // Both the selected evidence and the live status must permit clearing:
             // a raw reread must not resurrect a status discarded for a newer acceptance.
