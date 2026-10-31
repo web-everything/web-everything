@@ -513,6 +513,30 @@ export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClien
   } catch (error) { return { reason: `clientPath unreadable: ${oneLine(error?.code ?? error?.message ?? error)}` }; }
 }
 
+/** Per-run client override (`run --remote-client=` / WE_REMOTE_CLIENT_OVERRIDE): only a lane-pool lane's own
+ * scripts/readiness/remote-exec.mjs, or the host clientPath, may be selected. Repo config never feeds this. */
+export function resolveRunClientOverride({ overridePath, hostClientPath = null, laneRoots = [], fs = realClientFs() }) {
+  try {
+    if (typeof overridePath !== 'string' || !isAbsolute(overridePath)) return { reason: 'per-run override must be an absolute path' };
+    const real = fs.realpathSync(overridePath);
+    if (!fs.statSync(real).isFile()) return { reason: 'per-run override must be a regular file' };
+    const lower = (p) => p.toLowerCase();
+    if (hostClientPath != null) {
+      const host = resolveRemoteClient({ clientPath: hostClientPath, laneRoots, fs });
+      if (host.clientPath && lower(host.clientPath) === lower(real)) return { clientPath: real };
+    }
+    const tail = sep + join('scripts', 'readiness', 'remote-exec.mjs');
+    for (const root of laneRoots.flatMap((r) => [resolve(r), canonicalPath(r)])) {
+      const prefix = lower(root + sep);
+      const path = lower(real);
+      if (!path.startsWith(prefix) || !path.endsWith(tail)) continue;
+      const lane = real.slice(prefix.length, real.length - tail.length);
+      if (/^(?:[^/\\]+[/\\])?lane-\d+$/.test(lane)) return { clientPath: real };
+    }
+    return { reason: 'per-run override is not a lane-pool lane remote-exec.mjs or the host clientPath' };
+  } catch (error) { return { reason: `per-run override unreadable: ${oneLine(error?.code ?? error?.message ?? error)}` }; }
+}
+
 const remoteClientNotice = { logged: false };
 const pendingClientProvenance = new Set();
 const CLIENT_PROVENANCE_SETTLE_MAX_MS = 1500;
@@ -633,10 +657,13 @@ export function createRemoteExec({
       { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096 },
       (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
   }),
-  notice = remoteClientNotice,
+  notice = remoteClientNotice, runOverride = null,
 } = {}) {
   return async (options) => {
-    const client = resolveRemoteClient({ clientPath: policy.settings.remote.clientPath, laneRoots, fs });
+    const scope = runOverride != null ? 'run' : 'host';
+    const client = scope === 'run'
+      ? resolveRunClientOverride({ overridePath: runOverride, hostClientPath: policy.settings.remote.clientPath, laneRoots, fs })
+      : resolveRemoteClient({ clientPath: policy.settings.remote.clientPath, laneRoots, fs });
     if (client.clientPath === null) return adaptLegacyRemoteResult(await (await importClient('./remote-exec.mjs')).runRemote(options));
     const ignored = (reason) => {
       reason = oneLine(reason);
@@ -661,7 +688,12 @@ export function createRemoteExec({
         if (!notice.logged) {
           notice.logged = true;
           const displayPath = clientPathForLog(client.clientPath);
-          await log(`heavy-admission: remote client override ${displayPath} @ ${oneLine(sha)}\n`);
+          await log(`heavy-admission: remote client override${scope === 'run' ? ' (per-run)' : ''} ${displayPath} @ ${oneLine(sha)}\n`);
+        }
+        if (scope === 'run') { // per-run: never touches the shared host provenance state
+          await boundedClientProvenance(() => appendEvent({ kind: 'remote-client-override',
+            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), 100);
+          return;
         }
         await boundedClientProvenance(async (signal) => {
           const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
@@ -716,7 +748,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec,
+  remoteExec, remoteClientOverride = null,
   log = (line) => process.stderr.write(line),
 }) {
   let load;
@@ -759,7 +791,7 @@ export async function runWithRemoteDecision({
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
   let outstanding = false;
   let terminated = false;
-  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
+  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
@@ -2307,7 +2339,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
   }
   if (mode === 'run') {
     if (dashDashIdx === -1 || dashDashIdx === argv.length - 1) {
-      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--container] [--container-node-modules] -- <command…>\n`);
+      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--remote-client=] [--container] [--container-node-modules] -- <command…>\n`);
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
@@ -2334,6 +2366,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // every existing caller (and the bare default here) still runs on the host, byte-identical to before this
     // flag existed. See scripts/lib/container-exec.mjs's own header for exactly what is proven to work this
     // way (check:standards, and — with `--container-node-modules` below — test:unit).
+    // Per-run remote client override: CLI flag or this process's env only; never repo config.
+    const remoteClientOverride = typeof flags['remote-client'] === 'string' ? flags['remote-client']
+      : process.env.WE_REMOTE_CLIENT_OVERRIDE || null;
     const useContainer = !!flags.container || process.env.WE_HEAVY_ADMISSION_CONTAINER === '1';
     // The `test:unit` slice's own opt-in — layered ON TOP of `--container` (meaningless without it, checked
     // below). See this file's own header and container-exec.mjs's "test:unit slice" section for why a plain
@@ -2363,7 +2398,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       }
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec, readTelemetry, lockRoot,
+        env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
