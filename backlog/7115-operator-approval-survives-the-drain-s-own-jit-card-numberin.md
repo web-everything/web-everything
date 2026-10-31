@@ -25,7 +25,7 @@ tags: []
 ## Non-goals
 
 - [N1] Numbering cards earlier (at PR open or before review). Considered and rejected for this card, see *Design — why not renumber first*.
-- [N2] Carrying across any other head move (rebase onto main, CI heal, main merge). Those keep their existing carries (#4708 byte-identical net diff, accept-carry-forward).
+- [N2] Carrying across any other head move (rebase onto main, CI heal, main merge). Those keep their existing carries (#4708 byte-identical net diff, accept-carry-forward). The conflicting-main-merge loss is decided in *Design — Case 2* and built as a follow-up.
 - [N3] The human-enqueue tool itself (card 6249).
 
 ## Design
@@ -49,6 +49,11 @@ The durable verdict record gains `kind: "numbering"` plus the proof reason in `r
 **Gap 3 — count lost approvals.** `finishBranchPreparation` (`we:scripts/lib/queue-branch-numbering.mjs:312`) emits one `appendDaemonEvent({ kind: 'approval-lost', pr, from, to, cause: 'renumber', reason })` when the re-stamp still fails. The coroner can then count every remaining loss.
 
 **Why not renumber first** (the other option the brief named). Numbering is just-in-time at enqueue on purpose. Numbers are allocated under the drain numbering mutex against the live `main` floor (`reservationPlan`, `:276-279`). Numbering at PR open or before review would still collide with parallel lanes, and the collision-heal (#2071/#2181) would then move the head anyway. So the carry is needed either way. Renumber-first stays a follow-up that would only reduce how often the carry fires.
+
+**Case 2 — approval lost to a conflicting main merge while waiting (decided here, built as a follow-up).** Live: #6059 was approved at 08:51 ET. At 10:17 ET it was `review:changes` with merge status conflicting: main moved during the wait, the PR got a merge commit, and the approval did not carry. Most of that wait came from Case 1: the failed re-stamp kept it out of the queue until the 10:07 re-ruling. Fixing Case 1 shrinks the window but does not close it. The three options weighed:
+- (a) **Enqueue approved human-required PRs at once, ahead of the catch-up order.** This is the pick. A PR in the GitHub merge queue is tested against the moving main by the queue itself. The drain never writes a merge commit on the branch, so the approved head never moves. A real conflict ejects it, and it comes back for a fresh look. The hook already exists: `planCatchUp` order `priority-then-first-accept` (`we:scripts/lib/enqueue-on-event.mjs:508`). It needs an "operator-approved human-required" top tier, and an approval event must wake it instead of waiting for the 10-minute catch-up tick.
+- (b) Carry the approval across a conflict-free main merge when the PR's own patch is unchanged (range-diff / patch-id). Rejected as the fix. The conflict-free case is already covered by the #4708 byte-identical net-diff carry (`referralEvidenceCarry`, `we:scripts/review-set-label.mjs:2741`). And #6059's case was a *conflict*: the resolution is new code the operator never saw, so no carry is safe there.
+- (c) Bind approval to the net patch instead of the head SHA. Rejected. It changes the identity model of every gate (review, referral, red team, ruling ids keyed by head), which is far wider than this bug. It still could not carry across a conflict resolution.
 
 ## MVP
 
@@ -99,6 +104,7 @@ One line per class: either the handling, or `n/a: <why>`.
 
 - Renumber-first: number hash cards at PR open, so most approvals land on an already-numbered head (cuts carry frequency, not needed for correctness).
 - Re-enqueue a human-enqueued PR after the drain's own numbering push (the #5608/#5878 half; tool side is card 6249).
+- **Approved human-required PRs enqueue at once (Case 2, option a).** Scope: `we:scripts/lib/enqueue-on-event.mjs` (`planCatchUp` top tier + wake on the approval event) and its test. Acceptance: an approved human-required PR is enqueued in the same pass as its approval, before any other ready PR. A main move after that never writes a merge commit on its branch. Proof: the next approved human-required PR goes from approval to queued in under one catch-up interval.
 - Extend the `approval-lost` event to the rebase / main-merge / CI-heal paths (`we:scripts/merge-ai-prs.mjs:5649`, `:6586`; `we:scripts/lib/merge-queue-enqueue.mjs:138`).
 
 ## Progress
