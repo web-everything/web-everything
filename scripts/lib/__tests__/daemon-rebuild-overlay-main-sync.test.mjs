@@ -11,6 +11,7 @@ import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
+import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 
 vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
 
@@ -80,9 +81,9 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     io: { ...fs, mkdtempSync: prefix => { const p = fs.mkdtempSync(prefix); scratched.push(p); temps.push(p); return p; } },
     git: vi.fn((args, opts) => { if (args[0] === 'push') pushes.push([...args]); return run(args, opts); }),
     appendOverlayEvent: (root, event, opts) => { events.push(event); return appendOverlayEvent(root, event, opts); },
-    testRunner: vi.fn(async ({ root: scratch, args }) => {
-      const report = args.find(a => a.startsWith('--outputFile.json='));
-      if (report) fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({
+    testRunner: vi.fn(async ({ root: scratch, args, testReport }) => {
+      expect(allowedCommand(args.slice(args.indexOf('--') + 1))).toBe(true);
+      fs.writeFileSync(testReport, JSON.stringify({
         testResults: args.filter(a => /\.test\.mjs$/.test(a)).map(file => ({
           name: join(fs.realpathSync(scratch), file), assertionResults: [{ status: 'passed' }],
         })),
@@ -262,7 +263,7 @@ describe('overlay main sync', () => {
       const result = await passing(options);
       if (++calls === 2) {
         if (outcome === 'failed') return { status: 1, stdout: '', stderr: 'chunk failed' };
-        const path = options.args.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length);
+        const path = options.testReport;
         const report = json(path);
         if (outcome === 'missing') report.testResults.pop();
         else report.testResults[0].assertionResults = [];
@@ -977,7 +978,7 @@ describe('overlay main sync', () => {
     expect(result.pushed).toBe(true); expect(result.tests).toHaveLength(102);
     const calls = f.deps.testRunner.mock.calls.map(([o]) => o.args);
     expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([50, 50, 2]);
-    expect(new Set(calls.map(args => args.find(a => a.startsWith('--outputFile.json=')))).size).toBe(3);
+    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(3);
     expect(alerts(f)).toEqual([]); unchanged(f);
   });
 
@@ -1199,7 +1200,7 @@ describe('overlay main sync', () => {
     ageFailure(f);
     f.deps.testRunner = vi.fn(async options => {
       const result = await passing(options);
-      const reportFile = options.args.find(a => a.startsWith('--outputFile.json=')).split('=')[1];
+      const reportFile = options.testReport;
       const report = json(reportFile);
       for (const test of report.testResults) test.assertionResults = outcome === 'failed' ? [{ status: 'failed' }] : [];
       fs.writeFileSync(reportFile, JSON.stringify(report));
@@ -1240,7 +1241,7 @@ describe('overlay main sync', () => {
     ageFailure(f);
     f.deps.testRunner = vi.fn(async options => {
       const result = await passing(options);
-      const reportFile = options.args.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length);
+      const reportFile = options.testReport;
       // Valid passing JSON remains valid after padding, so removing the cap would publish.
       fs.appendFileSync(reportFile, ' '.repeat(8 * 1024 * 1024));
       return result;

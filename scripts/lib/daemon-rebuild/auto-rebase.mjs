@@ -103,10 +103,64 @@ const writePending = (io, file, data) => {
 export function buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io = fs }) {
   const testEnv = { ...env };
   delete testEnv.LANE_POOL_ROOT;
-  return { root: scratch, env: testEnv,
+  return { root: scratch, env: testEnv, testReport,
     args: [resolve(root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${io.realpathSync(scratch)}`,
       '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
-      '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`] };
+      '--reporter=tap', '--no-color'] };
+}
+
+// Forge streams TAP back to the caller; a client-local outputFile cannot be written remotely.
+// Consume Vitest's nested TAP plans completely, including skipped suites and empty files.
+export function heavyTestReport(stdout, { root, args }) {
+  if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw new Error('test inventory unavailable or over 8 MiB');
+  const lines = stdout.replace(/\r\n/g, '\n').split('\n');
+  const header = lines.indexOf('TAP version 13');
+  if (header < 0 || lines.lastIndexOf('TAP version 13') !== header) throw new Error('test inventory unavailable');
+  const selected = new Map(args.slice(8, -2).map(file => [file.replace(/\\/g, '\\\\').replace(/#/g, '\\#').replace(/\n/g, ' '), file]));
+  if (selected.size !== args.length - 10) throw new Error('ambiguous test inventory names');
+  const testResults = [], stack = [{ seen: 0, plan: null, skipped: false }];
+  const invalid = () => { throw new Error('incomplete or malformed test inventory'); };
+  for (const line of lines.slice(header + 1)) {
+    if (!line.trim()) continue;
+    const frame = stack.at(-1), prefix = '    '.repeat(stack.length - 1);
+    if (stack.length > 1 && line === '    '.repeat(stack.length - 2) + '}') {
+      if (frame.plan === null || frame.plan !== frame.seen) invalid();
+      stack.pop(); continue;
+    }
+    if (!line.startsWith(prefix)) invalid();
+    const text = line.slice(prefix.length);
+    const plan = /^1\.\.(\d+)$/.exec(text);
+    if (plan) {
+      if (frame.plan !== null || frame.seen) invalid();
+      frame.plan = Number(plan[1]);
+      if (!Number.isSafeInteger(frame.plan) || frame.plan > 100_000) invalid();
+      continue;
+    }
+    const task = /^ok (\d+) - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/.exec(text);
+    if (!task || frame.plan === null || Number(task[1]) !== ++frame.seen || frame.seen > frame.plan) invalid();
+    const skipped = frame.skipped || task[3] === 'SKIP' || task[3] === 'TODO';
+    let result = frame.result;
+    if (stack.length === 1) {
+      const file = selected.get(task[2]);
+      result = { name: file ? join(root, file) : '', assertionResults: [] };
+      testResults.push(result);
+    } else if (!task[4]) result.assertionResults.push({ status: skipped ? 'pending' : 'passed' });
+    if (task[4]) {
+      if (stack.length >= 128) invalid();
+      stack.push({ seen: 0, plan: null, skipped, result });
+    }
+  }
+  if (stack.length !== 1 || stack[0].plan === null || stack[0].seen !== stack[0].plan) invalid();
+  return { testResults };
+}
+
+export async function runHeavyTests(invocation, { io = fs, exec = executeAsync } = {}) {
+  const result = await exec(process.execPath, invocation.args, { cwd: invocation.root, env: invocation.env });
+  if (result?.status === 0 && !result.error) {
+    const report = heavyTestReport(result.stdout, { ...invocation, root: io.realpathSync(invocation.root) });
+    io.writeFileSync(invocation.testReport, JSON.stringify(report));
+  }
+  return result;
 }
 
 export function isRemoteTerminationUnconfirmed(result) {
@@ -254,7 +308,7 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       io.mkdirSync(p.dir, { recursive: true });
       testReport = join(p.dir, `${randomUUID()}.vitest-report`);
       const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
-      const result = await (deps.testRunner ?? (o => execAsync(process.execPath, o.args, { cwd: o.root, env: o.env })))(invocation);
+      const result = await (deps.testRunner ?? (o => runHeavyTests(o, { io, exec: execAsync })))(invocation);
       if (isRemoteTerminationUnconfirmed(result)) {
         event(root, { kind: 'auto-rebase-skipped', ref, reason: 'remote-termination-unconfirmed' }, { env });
         return { skipped: true, reason: 'remote-termination-unconfirmed' };

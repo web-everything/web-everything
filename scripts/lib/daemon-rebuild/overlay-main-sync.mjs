@@ -1,6 +1,6 @@
 /** Clean-only main merges into registered overlay tops, isolated from daemon working trees. */
 import * as fs from 'node:fs';
-import { execFile, spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFil
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { tryLease } from '../../operations/coordination-lock.mjs';
+import { buildHeavyTestInvocation, runHeavyTests } from './auto-rebase.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
@@ -317,10 +318,6 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   }
   return result;
 }
-const runTests = ({ root, args, env }) => new Promise(resolveResult => {
-  execFile(process.execPath, args, { cwd: root, env, encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024 },
-    (error, stdout, stderr) => resolveResult({ status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0, error, stdout, stderr }));
-});
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
   const now = deps.now ?? (() => new Date().toISOString());
@@ -432,17 +429,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const frontier = resolve(root, '..', 'frontierui');
     if (io.existsSync(frontier)) io.symlinkSync(frontier, join(scratchParent, 'frontierui'), 'dir');
     setStep('tests');
-    const testEnv = { ...env };
-    // The daemon wrapper finds the host pool; scratch tests must not inherit an explicit pool.
-    delete testEnv.LANE_POOL_ROOT;
-    const admission = resolve(root, 'scripts/readiness/heavy-admission.mjs');
-    const testRepo = io.realpathSync(scratch);
     for (let offset = 0; offset < tests.length; offset += 50) {
       const chunk = tests.slice(offset, offset + 50);
       const reportFile = join(scratchParent, `tests-${offset / 50}.json`);
-      const args = [admission, 'run', `--repo=${testRepo}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...chunk,
-        '--reporter=default', '--reporter=json', `--outputFile.json=${reportFile}`];
-      const result = await (deps.testRunner ?? runTests)({ root: scratch, args, env: testEnv });
+      const invocation = buildHeavyTestInvocation({ root, scratch, selected: chunk, testReport: reportFile, env, io });
+      const result = await (deps.testRunner ?? (o => runHeavyTests(o, { io })))(invocation);
       // The remote process may still be running: neither publication nor a local rerun is safe.
       if (result?.status === 124 && typeof result.stderr === 'string'
         && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).')) {
