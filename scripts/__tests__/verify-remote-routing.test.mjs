@@ -160,6 +160,23 @@ describe('verify remote routing', () => {
   it('an attempt never dispatched to the remote wrapper is local without a report', () => {
     expect(phaseRunLocation([], { remoteAttempt: false })).toEqual({ location: 'local' });
   });
+  it('the default report reader accepts only a bounded regular file: never a symlink, FIFO or directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-report-reader-'));
+    try {
+      const report = JSON.stringify({ location: 'remote', receiptId: 'run-123456', exitCode: 0 });
+      const file = join(root, 'report.jsonl');
+      writeFileSync(file, report + '\n');
+      expect(readRemoteReport(file)).toEqual([JSON.parse(report)]);
+      symlinkSync(file, join(root, 'link.jsonl'));
+      expect(readRemoteReport(join(root, 'link.jsonl'))).toEqual([]);
+      execFileSync('mkfifo', [join(root, 'fifo.jsonl')]);
+      expect(readRemoteReport(join(root, 'fifo.jsonl'))).toEqual([]);
+      mkdirSync(join(root, 'dir.jsonl'));
+      expect(readRemoteReport(join(root, 'dir.jsonl'))).toEqual([]);
+      writeFileSync(join(root, 'big.jsonl'), report + '\n' + ' '.repeat(65536));
+      expect(readRemoteReport(join(root, 'big.jsonl'))).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it.each([
     { location: 'remote', exitCode: 0 },
     ...['', ' ', null, 123].map(receiptId => ({ location: 'remote', receiptId, exitCode: 0 })),
@@ -204,7 +221,7 @@ describe('verify remote routing', () => {
 });
 
 // Native child-process fixture: only admission IO and the nested npm wrapper are faked.
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';

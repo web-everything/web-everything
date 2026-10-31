@@ -277,13 +277,14 @@ describe('killProcessTree', () => {
     expect(sent).toEqual([40, 11, 10]);
   });
 
-  it('orphansOfGroup also kills members adopted by a subreaper outside the group (Linux PR_SET_CHILD_SUBREAPER), never a member whose parent is in the group', () => {
+  it('orphansOfGroup never kills a group member whose parent is outside the group (a pipeline sibling such as tee)', () => {
+    // Leading the group does not prove ancestry: `verify-lane | tee` puts tee in verify-lane's group with the shell
+    // (outside the group) as its parent. A Linux subreaper-adopted orphan looks the same, so it is left to the env
+    // marker and output-pipe sweeps rather than widening this one (Codex audit of #6141).
     const sent = [];
-    // 900 is a subreaper outside group 77 (the Forge runner supervisor): 42 was adopted by it. 43 is a child of the
-    // orphan 42 (its parent is in the group), and 44 has a parent in another group but is itself in group 99.
-    const ps = ['900 1 5', '10 5 77', '11 10 77', '42 900 77', '43 42 77', '44 900 99', '77 900 77', '50 77 77'].join('\n');
-    killProcessTree(10, 'SIGKILL', { orphansOfGroup: 77, selfPid: 50, listProcesses: () => ps, kill: (pid) => sent.push(pid) });
-    expect(sent).toEqual([42, 11, 10]);
+    const ps = ['900 1 5', '10 77 77', '11 10 77', '42 900 77', '77 900 77'].join('\n');
+    killProcessTree(10, 'SIGKILL', { orphansOfGroup: 77, selfPid: 77, listProcesses: () => ps, kill: (pid) => sent.push(pid) });
+    expect(sent).toEqual([11, 10]);
   });
 
   it('also kills escaped descendants found by the env marker and by the caller output pipes, never self or init', () => {

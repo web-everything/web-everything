@@ -205,7 +205,9 @@ try {
     expect(r.error).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
     const result = JSON.parse(r.stdout.trim());
-    // Reparented out of the group (to init or a subreaper outside it): exactly what the leader's orphan sweep targets.
+    // Reparented out of the group, to init or (Linux) a subreaper outside it. Where init reaps (macOS) this is exactly
+    // what the leader's ppid-1 orphan sweep targets, so the test proves the leader guard. Under a subreaper (Forge) that
+    // sweep never targets it; there the test proves only that no other sweep (env marker, output pipes) kills it.
     expect(Number(result.before[1])).not.toBe(result.spawner);
     expect(Number(result.reaper[0])).toBe(Number(result.before[1]));
     expect(Number(result.reaper[2])).not.toBe(result.leader);
