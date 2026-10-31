@@ -139,7 +139,9 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
 export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
-  prepGate = prepVerdict, readPrepBody = readFileSync, prepLogPath,
+  // Advisory rollout until automated producers have migrated their generated bodies.
+  // Enforce remains injectable so admission and path-parity tests cover the eventual strict gate.
+  prepMode = 'advise', prepGate = prepVerdict, readPrepBody = readFileSync, prepLogPath,
   // Card 6931 — the credential env is resolved per run, inside the runner, so a daemon's guard refusal is a refused
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
@@ -172,7 +174,9 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         const prep = prepGate(body);
         if (prep.waived) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
         else if (!isPrepExempt(arg('title')) && !prep.ok) {
-          return { outcome: 'refused', reason: 'prep-block-missing', detail: prep.reason };
+          if (prepMode !== 'advise') return { outcome: 'refused', reason: 'prep-block-missing', detail: prep.reason };
+          logPrepEvent({ kind: 'prep-advisory', detail: prep.reason }, { logPath: prepLogPath });
+          process.stderr.write(`open-pr: prep advisory (rollout pending caller migration) — ${String(prep.reason).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}\n`);
         }
       }
     }

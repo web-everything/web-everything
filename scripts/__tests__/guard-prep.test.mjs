@@ -14,6 +14,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const guard = join(here, '..', 'guard-prep.mjs');
 
 describe('guard-prep', () => {
+  it.each(['Build locally', 'Fix the parser bug', 'Implement retry logic and commit'])('denies build/fix dispatch without publication wording: %s', (text) => {
+    expect(decide(event(text))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it.each(['read-only', 'jury', 'merge conflict', 're-run', 'card-only workflow'])('denies a bare exemption label before a build: %s', (text) => {
+    expect(decide(event(`${text}\nImplement X and open-pr`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it.each([' Explore ', 'PLAN', ' CLAUDE-CODE-GUIDE '])('allows read-only types regardless of case and whitespace: %s', (type) => {
+    expect(decide(event(prompt, type))).toBeNull();
+  });
   it('denies build publication without prep with format and waiver guidance', () => {
     expect(decide(event())).toMatchObject({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: expect.stringContaining('prep: waived — <reason>') } });
   });
@@ -41,7 +50,7 @@ describe('guard-prep', () => {
   it.each(['', 'TODO', '........'])('denies empty/placeholder heading %j', (text) => {
     expect(decide(event(prompt + prep.replace('visible outcome', text)))).not.toBeNull();
   });
-  it.each(['resolve the conflict', 'resolve conflict', 'merge conflict', 'rebase onto main', 're-run checks', 'rerun CI', 'retrigger', 'red-team', 'redteam', 'review the PR', 'review this PR', 'code review', 'jury', 'read-only', 'do not edit', 'no code changes', 'file a backlog card', 'file the item', 'card-only'])('allows exempt task without PREP, but denies a build mentioning it: %s', (text) => {
+  it.each(['resolve the conflict', 'resolve conflict', 'rebase onto main', 're-run CI', 'rerun CI', 'retrigger CI', 'red-team the PR', 'redteam this PR', 'review the PR', 'review this PR', 'code review', 'file a backlog card', 'file the item', 'card-only'])('allows explicit exempt task without PREP, but denies a build mentioning it: %s', (text) => {
     expect(decide(event(`${text}. Fix and open-pr`))).toBeNull();
     expect(decide(event(`${prompt}; ${text}`))?.hookSpecificOutput.permissionDecision).toBe('deny');
   });
@@ -60,10 +69,11 @@ describe('guard-prep', () => {
   });
   it.each(['. ', '! ', '? ', '\n', '\r\n'])('ignores exemption after the first sentence/line (%j)', (separator) => {
     expect(decide(event(`Fix and open-pr${separator}jury`))?.hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(decide(event(`jury${separator}Fix and open-pr`))).toBeNull();
+    expect(decide(event(`jury${separator}Fix and open-pr`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(decide(event(`review the PR${separator}Fix and open-pr`))).toBeNull();
   });
   it('uses the first 240 trimmed characters and provides prep/waiver guidance beyond the bound', () => {
-    expect(decide(event(`  \n${'Task '.padEnd(236)}jury\nFix and open-pr`))).toBeNull();
+    expect(decide(event(`  \nreview the PR${' '.repeat(240)}\nFix and open-pr`))).toBeNull();
     for (const length of [240, 20_000]) {
       expect(decide(event(`${'Task '.padEnd(length)}jury\nFix and open-pr`))).toMatchObject({
         hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: expect.stringContaining('prep: waived — <reason>') },
@@ -73,7 +83,7 @@ describe('guard-prep', () => {
   it.each(['Explore', 'Plan', 'claude-code-guide'])('allows read-only type %s', (type) => {
     expect(decide(event(prompt, type))).toBeNull();
   });
-  it.each(['Inspect source and open-pr', 'Build locally', 'Review implementation'])('allows non-build-publication prompt %s', (text) => {
+  it.each(['Inspect source and open-pr', 'Review implementation'])('allows non-build prompt %s', (text) => {
     expect(decide(event(text))).toBeNull();
   });
   it.each([null, {}, { ...event(), tool_name: 'Bash' }, { ...event(), hook_event_name: 'PostToolUse' }])('ignores unrelated envelope %j', (input) => {

@@ -4,14 +4,13 @@ import { dirname, join } from 'node:path';
 
 const HEADINGS = ['Acceptance', 'Pre-mortem', 'Files', 'Tests'];
 const FORMAT = 'PREP:\nAcceptance: <criteria>\nPre-mortem: <risks>\nFiles: <paths>\nTests: <checks>\nOr: prep: waived — <reason>';
-const EXEMPT = /\b(?:resolve (?:the )?conflict|merge conflict|rebase onto|re-?run|retrigger|red-?team|review (?:the|this) PR|code review|jury|read-only|do not edit|no code changes|file (?:a |the )?(?:backlog )?(?:card|item)|card-only)\b/i;
 export const PREP_BUILD_VERB = /\b(?:implement|build|add|fix|refactor|write)\b/i;
-// Only these leading tasks win over build words; incidental exemption mentions do not.
-const EXEMPT_TASK = /^\s*(?:fix (?:the )?merge conflict(?=\s*(?:$|[.!?,;:])|\s+(?:and|then)\b)|resolve (?:the )?(?:merge )?conflict|rebase onto|(?:re-?run|retrigger) CI|file (?:a |the )?(?:backlog )?(?:card|item)|card-only|review (?:the|this) PR|code review)\b/i;
+// Only explicit leading tasks exempt work. Bare topic labels never grant an exemption.
+const EXEMPT_TASK = /^\s*(?:fix (?:the )?merge conflict(?=\s*(?:$|[.!?,;:])|\s+(?:and|then)\b)|resolve (?:the )?(?:merge )?conflict|rebase onto|(?:re-?run|retrigger) CI|file (?:a |the )?(?:backlog )?(?:card|item)|card-only(?=\s*(?:$|[.!?,;:]))|review (?:the|this) PR|code review(?=\s*(?:$|[.!?,;:]))|red-?team (?:the|this) PR)\b/i;
 
 export function isPrepExempt(text) {
   const statement = typeof text === 'string' ? text : '';
-  return EXEMPT.test(statement) && (EXEMPT_TASK.test(statement) || !PREP_BUILD_VERB.test(statement));
+  return EXEMPT_TASK.test(statement);
 }
 
 function nonTrivial(line) {
@@ -29,7 +28,7 @@ function stripMarkdown(line) {
 export function parsePrep(text) {
   const lines = (typeof text === 'string' ? text : '').split(/\r?\n/);
   const waiver = lines.map((line) => line.match(/^\s*prep:\s*waived\s*[—–-]\s*(\S.{3,})/i))
-    .find((match) => match && match[1].trim().length >= 4);
+    .find((match) => match && nonTrivial(match[1]));
   const start = lines.findIndex((line) => /^PREP:/i.test(stripMarkdown(line)));
   const sections = new Map();
   let current;
@@ -65,5 +64,8 @@ export function logPrepEvent(entry, { logPath = join(homedir(), 'workspace', '.o
   try {
     mkdirSync(dirname(logPath), { recursive: true });
     appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), kind: entry.kind, detail: entry.detail }) + '\n');
-  } catch { /* fail open */ }
+  } catch (error) {
+    const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+    try { process.stderr.write(`prep-gate: WARNING — ${entry.kind} audit write failed: ${detail}\n`); } catch { /* fail open even if stderr is unavailable */ }
+  }
 }

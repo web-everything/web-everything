@@ -12,7 +12,6 @@ function applies(event) {
     // Only known read-only types bypass preparation; fork and unknown types can carry tools.
     && !['explore', 'plan', 'claude-code-guide'].includes(normalized)
     && typeof prompt === 'string' && PREP_BUILD_VERB.test(prompt)
-    && /\b(open-pr|push|pull request|PR)\b/i.test(prompt)
     && !isPrepExempt(prompt.trim().slice(0, 240).split(/(?:[.!?](?:\s|$)|[\r\n])/, 1)[0]);
 }
 

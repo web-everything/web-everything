@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -8,6 +8,20 @@ import { isPrepExempt, logPrepEvent, parsePrep, prepVerdict } from '../lib/prep-
 const prep = 'PREP:\nAcceptance: observable outcome\nPre-mortem: parser may fail\nFiles: scripts/example.mjs\nTests: focused unit tests';
 
 describe('prep block', () => {
+  it.each(['<reason>', '**<reason>**', 'TODO', '........', 'a b c d e f g'])('rejects placeholder/short waiver reason %s', (reason) => {
+    expect(prepVerdict(`prep: waived — ${reason}`).ok).toBe(false);
+  });
+  it.each(['Handle merge conflict markers in parser', 'read-only', 'jury', 'merge conflict', 'card-only workflow'])('does not exempt feature-like titles or bare labels: %s', (title) => {
+    expect(isPrepExempt(title)).toBe(false);
+  });
+  it('warns when waiver audit IO fails, without throwing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prep-log-error-'));
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(() => logPrepEvent({ kind: 'waiver', detail: 'urgent incident' }, { logPath: dir })).not.toThrow();
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/WARNING.*waiver.*audit/i));
+    } finally { stderr.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
   it('names all missing headings and shows both formats', () => {
     expect(parsePrep('')).toEqual({ present: false, waived: false, waiverReason: '', missing: ['Acceptance', 'Pre-mortem', 'Files', 'Tests'], empty: [] });
     expect(prepVerdict('').reason).toMatch(/Acceptance:[\s\S]*Pre-mortem:[\s\S]*Files:[\s\S]*Tests:[\s\S]*prep: waived — <reason>/);
@@ -84,7 +98,7 @@ describe('prep block', () => {
   it.each(['prep: waived', 'prep: waived —', 'prep: waived — abc', 'prep: waived — a   '])('rejects incomplete waiver %s', (text) => {
     expect(prepVerdict(text).ok).toBe(false);
   });
-  it.each(['resolve the conflict', 'resolve conflict', 'merge conflict', 'rebase onto main', 're-run checks', 'rerun CI', 'retrigger', 'red-team', 'redteam', 'review the PR', 'review this PR', 'code review', 'jury', 'read-only', 'do not edit', 'no code changes', 'file a backlog card', 'file the item', 'card-only'])('shares narrow exemption %s', (text) => {
+  it.each(['resolve the conflict', 'resolve conflict', 'rebase onto main', 're-run CI', 'rerun CI', 'retrigger CI', 'red-team the PR', 'redteam this PR', 'review the PR', 'review this PR', 'code review', 'file a backlog card', 'file the item', 'card-only'])('shares explicit leading task exemption %s', (text) => {
     expect(isPrepExempt(text)).toBe(true);
   });
   it.each(['review parser implementation', 'merge feature', 'cards UI', 'team build', 'run tests'])('does not exempt broad words: %s', (text) => {
