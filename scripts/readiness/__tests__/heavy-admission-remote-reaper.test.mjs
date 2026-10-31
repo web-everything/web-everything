@@ -129,10 +129,10 @@ describe('remote slot reaper', () => {
     expect(existsSync(forge)).toBe(false);
     expect(existsSync(other)).toBe(true);
     expect(existsSync(another)).toBe(true);
-    expect(f.readForgeStatus.mock.calls).toEqual([[{ host: 'forge' }], [{ host: 'other' }]]);
+    expect(f.readForgeStatus.mock.calls).toEqual([[{ host: 'forge' }], [{ host: 'forge' }], [{ host: 'other' }]]);
     expect(f.appendEvent).toHaveBeenCalledTimes(1);
   });
-  it('reads each distinct host once and reaps hostless markers only against Forge', async () => {
+  it('caches the first sample per host but refreshes before each unlink, using Forge for hostless markers', async () => {
     const f = fixture();
     const text = marker(f, { legacy: true, age: oldAge });
     const json = marker(f, { slot: 1, age: oldAge });
@@ -146,7 +146,9 @@ describe('remote slot reaper', () => {
     expect(existsSync(json)).toBe(true);
     expect(existsSync(other)).toBe(false);
     expect(existsSync(another)).toBe(false);
-    expect(f.readForgeStatus.mock.calls).toEqual([[{ host: 'forge' }], [{ host: 'other' }]]);
+    expect(f.readForgeStatus.mock.calls).toEqual([
+      [{ host: 'forge' }], [{ host: 'other' }], [{ host: 'other' }], [{ host: 'other' }],
+    ]);
   });
   it.each(['', '-oProxyCommand=bad', 'forge;bad', 'forge\n', null, 123, ['forge'], {}])(
     'retains invalid host %j without reading status or issuing SSH', async host => {
@@ -226,6 +228,7 @@ describe('remote slot reaper', () => {
     });
     expect(await reapRemoteSlots({ ...f, beforeMarkerUnlink })).toEqual([]);
     expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
+    expect(f.readForgeStatus).toHaveBeenCalledTimes(1);
     if (change === 'vanished') expect(existsSync(file)).toBe(false);
     else expect(readFileSync(file, 'utf8')).toBe(change === 'content' ? replacement : original);
     expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(1);
@@ -245,21 +248,68 @@ describe('remote slot reaper', () => {
     expect(JSON.parse(readFileSync(file, 'utf8')).runId).toBe('replacement-run');
     expect(f.appendEvent).not.toHaveBeenCalled();
   });
-  it('keeps a live pid younger than maxRun plus margin, then clears at the ceiling', async () => {
+  describe.each([true, false])('fresh host evidence (legacy=%s)', legacy => {
+    it.each([
+      ['busy runs', { ...idle, activeRuns: 1 }],
+      ['busy processes', { ...idle, procCount: 1 }],
+      ['unreachable', { reachable: false }],
+      ['incomplete', { reachable: true, activeRuns: 0 }],
+      ['unparseable', { ...idle, procCount: '0' }],
+      ['negative count', { ...idle, activeRuns: -1 }],
+      ['reader throws', null],
+    ])('retains the marker and lease when status turns %s between first sample and unlink', async (_, status) => {
+      const f = fixture();
+      const host = legacy ? 'forge' : 'other';
+      const file = marker(f, { age: oldAge, legacy, overrides: { host } });
+      const original = readFileSync(file, 'utf8');
+      tryAcquireSlot({ lockRoot: f.remoteRoot, cap: 1, owner: 'old', nowMs: now - oldAge,
+        nowIso: new Date(now - oldAge).toISOString(), pid: process.pid });
+      let changed = false;
+      f.readForgeStatus.mockImplementation(async () => {
+        if (!changed) return idle;
+        if (status === null) throw new Error('status unavailable');
+        return status;
+      });
+      const beforeMarkerUnlink = vi.fn(() => { changed = true; });
+      expect(await reapRemoteSlots({ ...f, beforeMarkerUnlink })).toEqual([]);
+      expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
+      expect(f.readForgeStatus.mock.calls).toEqual([[{ host }], [{ host }]]);
+      expect(readFileSync(file, 'utf8')).toBe(original);
+      expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(1);
+      expect(f.appendEvent).not.toHaveBeenCalled();
+      expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('reaped ('));
+    });
+  });
+  it('retains a replacement marker written during the fresh idle status read', async () => {
+    const f = fixture(); const file = marker(f);
+    const replacement = JSON.stringify({ v: 1, runId: 'replacement-run', slot: 0,
+      startedAt: new Date(now).toISOString(), pid: process.pid }) + '\n';
+    f.readForgeStatus.mockResolvedValueOnce(idle).mockImplementationOnce(async () => {
+      const next = join(f.remoteRoot, 'replacement');
+      writeFileSync(next, replacement);
+      renameSync(next, file);
+      return idle;
+    });
+    expect(await reapRemoteSlots(f)).toEqual([]);
+    expect(f.readForgeStatus).toHaveBeenCalledTimes(2);
+    expect(readFileSync(file, 'utf8')).toBe(replacement);
+    expect(f.appendEvent).not.toHaveBeenCalled();
+  });
+  it.each([oldAge - 1, oldAge, oldAge * 100])('never reaps a live owner pid even with idle host evidence (age=%s)', async age => {
     const f = fixture(); f.pidAlive.mockReturnValue(true);
-    const file = marker(f, { age: oldAge - 1 });
+    const file = marker(f, { age });
     expect(await reapRemoteSlots(f)).toEqual([]);
     expect(existsSync(file)).toBe(true);
-    marker(f, { age: oldAge });
-    expect(await reapRemoteSlots(f)).toEqual([{ slot: 0, runId, evidence: expect.any(String), cleared: true }]);
+    expect(f.pidAlive).toHaveBeenCalledWith(12345);
+    expect(f.appendEvent).not.toHaveBeenCalled();
   });
-  it('defaults to real pid liveness and preserves a young marker owned by this process', async () => {
-    const f = fixture(); const file = marker(f, { overrides: { pid: process.pid } });
+  it('defaults to real pid liveness and preserves a very old marker owned by this process', async () => {
+    const f = fixture(); const file = marker(f, { age: oldAge * 100, overrides: { pid: process.pid } });
     expect(await reapRemoteSlots({ ...f, pidAlive: undefined })).toEqual([]);
     expect(existsSync(file)).toBe(true);
   });
   it('treats EPERM as alive and unknown pid-probe errors as insufficient evidence', async () => {
-    const f = fixture(); const file = marker(f);
+    const f = fixture(); const file = marker(f, { age: oldAge * 100 });
     const kill = vi.spyOn(process, 'kill');
     for (const code of ['EPERM', 'EIO']) {
       kill.mockImplementation(() => { throw Object.assign(new Error('probe failed'), { code }); });
@@ -267,12 +317,26 @@ describe('remote slot reaper', () => {
       expect(existsSync(file)).toBe(true);
     }
   });
-  it('honors injected grace, run ceiling and margin', async () => {
-    const f = fixture(); f.pidAlive.mockReturnValue(true);
-    const file = marker(f, { age: 500 });
-    expect(await reapRemoteSlots({ ...f, graceMs: 501, maxRunMs: 300, marginMs: 200 })).toEqual([]);
+  it.each([undefined, null, 0])('keeps very old markers when pid liveness is unknown (%s)', async alive => {
+    const f = fixture(); const file = marker(f, { age: oldAge * 100 });
+    f.pidAlive.mockReturnValue(alive);
+    expect(await reapRemoteSlots(f)).toEqual([]);
     expect(existsSync(file)).toBe(true);
-    expect(await reapRemoteSlots({ ...f, graceMs: 500, maxRunMs: 300, marginMs: 200 })).toHaveLength(1);
+    expect(f.appendEvent).not.toHaveBeenCalled();
+  });
+  it('honors injected grace for a dead pid independently of the run ceiling and margin', async () => {
+    const f = fixture();
+    const file = marker(f, { age: 500 });
+    expect(await reapRemoteSlots({ ...f, graceMs: 501, maxRunMs: 1000, marginMs: 200 })).toEqual([]);
+    expect(existsSync(file)).toBe(true);
+    expect(await reapRemoteSlots({ ...f, graceMs: 500, maxRunMs: 1000, marginMs: 200 })).toHaveLength(1);
+  });
+  it('honors injected run ceiling and margin for legacy markers without probing a pid', async () => {
+    const f = fixture(); const file = marker(f, { age: 500, legacy: true });
+    expect(await reapRemoteSlots({ ...f, maxRunMs: 301, marginMs: 200 })).toEqual([]);
+    expect(existsSync(file)).toBe(true);
+    expect(await reapRemoteSlots({ ...f, maxRunMs: 300, marginMs: 200 })).toHaveLength(1);
+    expect(f.pidAlive).not.toHaveBeenCalled();
   });
   it('dry-run reports candidates without unlinking leases, logging clears or emitting events', async () => {
     const f = fixture(); const file = marker(f);
@@ -333,9 +397,9 @@ describe('remote slot reaper', () => {
     vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(null, ''));
     vi.mocked(readForgeTelemetry).mockResolvedValue({ activeRuns: 0 });
     expect(await reapRemoteSlots({ ...f, readForgeStatus: undefined })).toHaveLength(1);
-    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(execFile).toHaveBeenCalledTimes(2);
     expect(vi.mocked(execFile).mock.calls[0][1][4]).toBe(host);
-    expect(readForgeTelemetry).toHaveBeenCalledTimes(1);
+    expect(readForgeTelemetry).toHaveBeenCalledTimes(2);
     expect(readForgeTelemetry).toHaveBeenCalledWith({ host });
     expect(existsSync(file)).toBe(false);
   });
@@ -376,7 +440,7 @@ describe('remote admission markers', () => {
     const f = fixture(); marker(f, { legacy: true, age: oldAge });
     const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0 }));
     expect(await admission(f, remoteExec)).toEqual({ handled: true, exitCode: 0 });
-    expect(f.readForgeStatus).toHaveBeenCalledTimes(1);
+    expect(f.readForgeStatus).toHaveBeenCalledTimes(2);
     expect(remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('slot-0 reaped'));
   });

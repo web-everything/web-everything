@@ -761,6 +761,7 @@ export async function reapRemoteSlots({
     const names = readdirSync(remoteRoot).filter(name => /^slot-\d+\.unconfirmed$/.test(name));
     if (!names.length) return results;
     const statuses = new Map();
+    const isIdle = status => status?.reachable === true && status.activeRuns === 0 && status.procCount === 0;
     const nowMs = clock();
     if (![nowMs, maxRunMs, marginMs, graceMs].every(n => Number.isFinite(n) && n >= 0)) return results;
     for (const name of names) {
@@ -794,10 +795,8 @@ export async function reapRemoteSlots({
           statuses.set(host, status);
         }
         const status = statuses.get(host);
-        if (status?.reachable !== true || !Number.isSafeInteger(status.activeRuns) || status.activeRuns < 0
-          || !Number.isSafeInteger(status.procCount) || status.procCount < 0) continue;
         // Prepare and run use separate processes; process age cannot prove termination.
-        if (status.activeRuns !== 0 || status.procCount !== 0) continue;
+        if (!isIdle(status)) continue;
         let age; let runId = null;
         if (!legacy) {
           if (marker?.v !== 1 || marker.slot !== slot || !Number.isSafeInteger(marker.pid) || marker.pid <= 0
@@ -805,7 +804,7 @@ export async function reapRemoteSlots({
             || typeof marker.startedAt !== 'string') continue;
           age = nowMs - Date.parse(marker.startedAt);
           if (!Number.isFinite(age) || age < graceMs || age < 0) continue;
-          if (age < maxRunMs + marginMs && pidAlive(marker.pid) !== false) continue;
+          if (pidAlive(marker.pid) !== false) continue;
           runId = marker.runId;
         } else {
           age = nowMs - info.mtimeMs;
@@ -815,10 +814,17 @@ export async function reapRemoteSlots({
         if (!dryRun) {
           await beforeMarkerUnlink({ file, slot });
           // Re-read immediately before unlinking: a new owner may have replaced this marker.
-          const current = lstatSync(file);
-          if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino
-            || current.mtimeMs !== info.mtimeMs || current.size !== info.size
-            || !readFileSync(file).equals(content)) continue;
+          const markerUnchanged = () => {
+            const current = lstatSync(file);
+            return current.isFile() && current.dev === info.dev && current.ino === info.ino
+              && current.mtimeMs === info.mtimeMs && current.size === info.size
+              && readFileSync(file).equals(content);
+          };
+          if (!markerUnchanged()) continue;
+          // Cached idle evidence can go stale while an owner prepares to dispatch.
+          if (!isIdle(await readForgeStatus({ host }))) continue;
+          // The fresh status read is asynchronous; preserve identity across that wait too.
+          if (!markerUnchanged()) continue;
           unlinkSync(file);
           // Guard lease removal against a replacement or heartbeat since the stale read.
           try {

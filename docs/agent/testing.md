@@ -3417,9 +3417,13 @@ before any escalation comment is posted. The read-error fallback never catches r
 
 Remote prepare and run are separate processes with a transfer between them: process age never
 proves termination. Reaping requires reachable telemetry for the marker's dispatch host (hostless legacy markers use only `forge`; invalid/unreachable hosts retain their markers), with zero active runs and zero
-prepare/run/finish processes, plus the marker age/pid checks. Only the exact trimmed legacy text
+prepare/run/finish processes. A valid v1 marker requires a provably dead owner pid and age at least
+`graceMs`; a live owner is never reaped, regardless of age. Legacy markers require mtime age at
+least `maxRunMs + marginMs`. Only the exact trimmed legacy text
 `remote termination unconfirmed` or a valid v1 JSON marker is eligible. Unknown markers remain
 operator cleanup holds. Before unlinking, re-read and match the marker's bytes, inode and mtime;
+then freshly check the dispatch host is still reachable and idle, retaining the marker if that
+read fails or is incomplete. Recheck marker identity after this asynchronous status read;
 replacement or disappearance must skip deletion and emit no reap event. The injected
 `beforeMarkerUnlink` seam in `heavy-admission-remote-reaper.test.mjs` exercises this race.
 
