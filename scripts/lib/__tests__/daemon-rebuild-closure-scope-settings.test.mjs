@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+// Keep Vite's browser asset transformation active using the repository's declared DOM runner.
 import { afterAll, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,7 @@ const expectedPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 it('default rebuild settings resolve to the module-relative filesystem path in a DOM environment', () => {
+  expect(document.defaultView).toBe(window);
   expect(daemonRebuildSettingsPath()).toBe(expectedPath);
   expect(JSON.parse(readFileSync(daemonRebuildSettingsPath(), 'utf8')).closureScope).toEqual({ mode: 'shadow' });
 });

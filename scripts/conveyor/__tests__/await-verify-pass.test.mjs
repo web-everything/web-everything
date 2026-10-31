@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, lstatSync, existsSync, utimesSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -193,6 +193,15 @@ describe('runAwaitVerifyPass', () => {
   });
   // PR #4462 review: a FAILED listing is not an absent session. The pass must keep the await record and push nothing.
   describe('an incomplete session listing fails closed', () => {
+    let incompleteListingIo;
+    // The default adapter cold-loads the dispatch/claim module graph. Keep that
+    // setup outside the behavioral test's five-second budget on loaded CI shards.
+    beforeAll(async () => {
+      incompleteListingIo = await defaultAwaitVerifyIo({
+        dispatchIo: { defaultListAgents: () => { throw new Error('claude agents timed out'); } },
+        listWrappedWorkers: () => [],
+      });
+    }, 60_000);
     const incomplete = (rows, why = 'claude agents listing failed: timed out', session = null) => Object.defineProperty([...rows], 'incomplete', { value: [{ reason: why, session }] });
     it('one unrelated torn wrapped record does not pin another session\'s record; its own torn record does', async () => {
       const unrelated = harness({ session: null });
@@ -255,11 +264,7 @@ describe('runAwaitVerifyPass', () => {
     it('end to end through the default IO: a throwing `claude agents` listing keeps the await record and pushes nothing', async () => {
       const h = harness();
       h.state.marker = marker('green');
-      const real = await defaultAwaitVerifyIo({
-        dispatchIo: { defaultListAgents: () => { throw new Error('claude agents timed out'); } },
-        listWrappedWorkers: () => [],
-      });
-      h.io.listSessions = real.listSessions;
+      h.io.listSessions = incompleteListingIo.listSessions;
       const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
       expect(rows[0].result).toMatch(/^error: session listing incomplete \(claude agents listing failed: claude agents timed out\)/);
       expect(h.calls.push).toEqual([]);
