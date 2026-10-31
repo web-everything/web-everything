@@ -1165,7 +1165,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(Date.now() - started).toBeLessThan(300 + 2000);
       const pid = Number(readFileSync(pidFile, 'utf8'));
       await new Promise(resolveWait => setTimeout(resolveWait, 200));
-      expect(() => process.kill(pid, 0)).toThrow();
+      // Its parent exited, so a Linux subreaper (Forge's runner supervisor) may hold the killed straggler as an
+      // unreaped zombie, where kill(pid, 0) still succeeds. Dead means gone or zombie; unreadable is not dead.
+      const { pidIdentity } = await import('../lib/pid-alive.mjs');
+      expect(pidIdentity(pid)).toMatchObject({ alive: false });
     } finally {
       try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
       rmSync(dir, { recursive: true, force: true });
