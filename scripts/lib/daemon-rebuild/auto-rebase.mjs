@@ -77,7 +77,7 @@ const execute = (bin, args, opts) => spawnSync(bin, args, { encoding: 'utf8', ti
 // Long-running agents and tests must leave the event loop free to heartbeat the lock.
 const executeAsync = (bin, args, opts) => new Promise(resolve => {
   execFile(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
-    (error, stdout, stderr) => resolve({ status: error ? 1 : 0, error, stdout, stderr }));
+    (error, stdout, stderr) => resolve({ status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0, error, stdout, stderr }));
 });
 const requireOutput = (r, failure = 'command failed or incomplete') => { if (r?.status !== 0 || r?.error) throw new Error(failure); return String(r.stdout ?? ''); };
 const requireOk = (r, failure) => requireOutput(r, failure).trim();
@@ -98,6 +98,21 @@ const writePending = (io, file, data) => {
     throw error;
   }
 };
+
+// Use the daemon's admission policy while executing against the canonical scratch checkout.
+export function buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io = fs }) {
+  const testEnv = { ...env };
+  delete testEnv.LANE_POOL_ROOT;
+  return { root: scratch, env: testEnv,
+    args: [resolve(root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${io.realpathSync(scratch)}`,
+      '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
+      '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`] };
+}
+
+export function isRemoteTerminationUnconfirmed(result) {
+  return result?.status === 124 && typeof result.stderr === 'string'
+    && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
+}
 
 export async function runAutoRebase({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, exec = deps.exec ?? execute, now = deps.now ?? (() => new Date().toISOString());
@@ -238,9 +253,13 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       // A fresh report outside the candidate tree proves every selected file actually executed.
       io.mkdirSync(p.dir, { recursive: true });
       testReport = join(p.dir, `${randomUUID()}.vitest-report`);
-      const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
-        '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`];
-      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }), 'selected test failed or incomplete');
+      const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
+      const result = await (deps.testRunner ?? (o => execAsync(process.execPath, o.args, { cwd: o.root, env: o.env })))(invocation);
+      if (isRemoteTerminationUnconfirmed(result)) {
+        event(root, { kind: 'auto-rebase-skipped', ref, reason: 'remote-termination-unconfirmed' }, { env });
+        return { skipped: true, reason: 'remote-termination-unconfirmed' };
+      }
+      requireOk(result, 'selected test failed or incomplete');
       let reportText;
       try {
         if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test inventory over 8 MiB');

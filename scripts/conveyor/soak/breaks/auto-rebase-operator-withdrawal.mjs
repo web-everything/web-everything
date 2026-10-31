@@ -59,7 +59,7 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
         }
         // Same exclusion as the repository's unit config; no project setup or external state.
         fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
-        runnerResult = spawnSync(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(6)], {
+        runnerResult = spawnSync(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)], {
           cwd: scratch, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
         });
         return runnerResult;
