@@ -33,6 +33,17 @@ describe('prep block', () => {
   it('accepts case, markdown prefixes, bullets and continuation items', () => {
     expect(prepVerdict('prep:\n- **aCCeptance:**\n- visible result\n## **PRE-MORTEM:**\n  likely failure\n**Files:** scripts/example.mjs\n# Tests:\n* focused tests').ok).toBe(true);
   });
+  it.each(['- npm test: unit suite', 'npm test: unit suite', 'Summary: focused unit suite', '## Summary'])('counts %s as section content', (content) => {
+    const text = prep.replace('Tests: focused unit tests', `Tests:\n${content}`);
+    expect(parsePrep(text)).toEqual({ present: true, waived: false, waiverReason: '', missing: [], empty: [] });
+    expect(prepVerdict(text)).toEqual({ ok: true, reason: '', waived: false });
+  });
+  it.each(['Acceptance', 'Pre-mortem', 'Files', 'Tests'])('ends the preceding section at the known %s heading', (heading) => {
+    const previous = heading === 'Acceptance' ? 'Tests' : 'Acceptance';
+    const result = parsePrep(`PREP:\n${previous}:\n${heading}: concrete section content`);
+    expect(result.empty).toEqual([previous]);
+    expect(result.missing).toEqual(['Acceptance', 'Pre-mortem', 'Files', 'Tests'].filter((name) => name !== previous && name !== heading));
+  });
   it('reports missing and empty separately', () => {
     const result = parsePrep('PREP:\nAcceptance:\nFiles: scripts/example.mjs');
     expect(result.missing).toEqual(['Pre-mortem', 'Tests']);
@@ -42,10 +53,10 @@ describe('prep block', () => {
   it.each(['tbd', 'TODO', 'n/a', 'none', '-', '...', '**TODO**', 'a b c d e f g', '........'])('rejects placeholder/short item %s', (value) => {
     expect(prepVerdict(prep.replace('observable outcome', value)).ok).toBe(false);
   });
-  it('requires headings inside PREP and does not borrow from later unrelated headings', () => {
+  it('requires headings inside PREP and does not borrow content across a new PREP line', () => {
     expect(prepVerdict(prep.replace('PREP:\n', '')).ok).toBe(false);
-    expect(parsePrep('PREP:\nAcceptance:\nSummary: unrelated text\nlong unrelated prose').empty).toEqual(['Acceptance']);
-    expect(parsePrep('PREP:\nAcceptance:\n## Summary\nlong unrelated prose').empty).toEqual(['Acceptance']);
+    expect(parsePrep('PREP:\nAcceptance:\nPREP:\nSummary: unrelated text\nlong unrelated prose').empty).toEqual(['Acceptance']);
+    expect(parsePrep('PREP:\nAcceptance:\nprep: another block\n## Summary\nlong unrelated prose').empty).toEqual(['Acceptance']);
   });
   it.each(['—', '–', '-'])('accepts a reasoned waiver with %s', (dash) => {
     expect(prepVerdict(`  PREP: waived ${dash} urgent incident`)).toEqual({ ok: true, reason: 'urgent incident', waived: true });
