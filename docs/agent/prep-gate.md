@@ -13,7 +13,10 @@ Tests: <checks to run>
 
 Each heading needs an inline item or continuation/bullet item with at least eight
 non-whitespace characters; placeholders do not count. Headings ignore case and
-accept Markdown prefixes. An operator can explicitly waive prep with
+accept Markdown prefixes, as does the `PREP:` start marker, which may have trailing
+text. A Markdown heading (`#` through `######` followed by whitespace) other than
+the four PREP headings ends the current section; following prose cannot fill it.
+An operator can explicitly waive prep with
 `prep: waived — <reason>` (at least four characters). Waivers append a local audit
 event to `~/workspace/.operations/prep-gate.log`.
 

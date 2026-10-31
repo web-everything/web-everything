@@ -98,10 +98,14 @@ function withBypassInBody(argv, b) {
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
-    // pr-land expands a leading `~` in --body-file; read the same file it will.
-    writeFileSync(out, readFileSync(argv[i].slice('--body-file='.length).replace(/^~/, homedir()), 'utf8') + renderBypassNote(b));
+    // Expand only a standalone `~` or `~/`; other leading tildes are literal paths.
+    writeFileSync(out, readFileSync(expandBodyFileHome(argv[i].slice('--body-file='.length)), 'utf8') + renderBypassNote(b));
     return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
   } catch (e) { cleanup(); throw e; }
+}
+
+function expandBodyFileHome(path) {
+  return path === '~' || path.startsWith('~/') ? homedir() + path.slice(1) : path;
 }
 
 /** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
@@ -153,7 +157,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       let readable = true;
       const bodyFile = arg('body-file');
       if (bodyFile) {
-        try { body = readPrepBody(resolve(cwd, bodyFile.replace(/^~/, homedir())), 'utf8'); }
+        try { body = readPrepBody(resolve(cwd, expandBodyFileHome(bodyFile)), 'utf8'); }
         catch (error) {
           readable = false;
           const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');

@@ -21,22 +21,26 @@ function nonTrivial(line) {
     && !/^(?:tbd|todo|n\/a|none|[-.…]+)[.!]?$/i.test(item);
 }
 
+function stripMarkdown(line) {
+  return line.trim().replace(/^(?:(?:[-+]\s+)|(?:\*\s+)|(?:#+\s*)|\*\*)+/, '').replace(/\*\*/g, '');
+}
+
 /** Parse only sections following PREP, without IO or mutation of caller data. */
 export function parsePrep(text) {
   const lines = (typeof text === 'string' ? text : '').split(/\r?\n/);
   const waiver = lines.map((line) => line.match(/^\s*prep:\s*waived\s*[—–-]\s*(\S.{3,})/i))
     .find((match) => match && match[1].trim().length >= 4);
-  const start = lines.findIndex((line) => /^\s*PREP:\s*$/i.test(line));
+  const start = lines.findIndex((line) => /^PREP:/i.test(stripMarkdown(line)));
   const sections = new Map();
   let current;
   for (const line of start < 0 ? [] : lines.slice(start + 1)) {
-    const clean = line.trim().replace(/^(?:(?:[-+]\s+)|(?:\*\s+)|(?:#+\s*)|\*\*)+/, '').replace(/\*\*/g, '');
+    const clean = stripMarkdown(line);
     const heading = clean.match(/^(Acceptance|Pre-mortem|Files|Tests):\s*(.*)$/i);
     if (heading) {
       current = HEADINGS.find((name) => name.toLowerCase() === heading[1].toLowerCase());
       if (!sections.has(current)) sections.set(current, []);
       sections.get(current).push(heading[2]);
-    } else if (/^PREP:/i.test(clean)) {
+    } else if (/^PREP:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
       current = undefined;
     } else if (current) sections.get(current).push(line);
   }

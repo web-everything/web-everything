@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrLandRunner } from '../operations/open-pr-io.mjs';
 
 const prep = 'PREP:\nAcceptance: visible outcome\nPre-mortem: missing events\nFiles: scripts/example.mjs\nTests: focused unit tests';
@@ -40,6 +42,45 @@ describe('open-pr prep admission', () => {
       expect(result.reason).toBe('prep-block-missing');
       expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
     } else expect(spawn).toHaveBeenCalledOnce();
+  }));
+  it.each(['~', '~draft.md', '~someone/body.md', '~\n'])('expands only standalone home syntax when reading prep from %j', (path) => fixture(({ dir, runner, argv, spawn }) => {
+    const readPrepBody = vi.fn(() => prep);
+    expect(runner({ readPrepBody })({ argv: [...argv.slice(0, 2), `--body-file=${path}`] }).outcome).toBe('opened');
+    expect(readPrepBody.mock.calls).toEqual([[path === '~' ? homedir() : join(dir, path), 'utf8']]);
+    expect(spawn).toHaveBeenCalledOnce();
+  }));
+  it.each(['~', '~/prep/body.md', '~draft.md', '~someone/body.md', '~\n'])('uses the same home syntax for the bypass body copy from %j', (path) => fixture(({ dir }) => {
+    const home = join(dir, path === '~' ? 'body.md' : 'home');
+    const source = path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : join(dir, path);
+    mkdirSync(dirname(source), { recursive: true });
+    writeFileSync(source, prep);
+    const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../operations/open-pr-io.mjs')).href;
+    // A child gives relative paths a real scratch cwd without changing the Vitest worker's cwd.
+    const script = `
+      import { readFileSync } from 'node:fs';
+      import { createPrLandRunner } from ${JSON.stringify(moduleUrl)};
+      let copiedBody, spawns = 0;
+      const run = createPrLandRunner({
+        prePrReview: () => ({ action: 'pass', bypass: { reason: 'operator reason', actor: 'operator', operatorInstruction: 'Ship this change' } }),
+        spawn: (_command, args) => {
+          spawns++;
+          copiedBody = readFileSync(args.find(arg => arg.startsWith('--body-file=')).slice(12), 'utf8');
+          return { status: 0, stdout: '{"pr":123,"url":"example"}' };
+        },
+      });
+      const result = run({ argv: ['--ref=lane/prep', '--title=feature', '--body-file=' + process.argv[1]] });
+      process.stdout.write(JSON.stringify({ result, copiedBody, spawns }));
+    `;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script, path], {
+      cwd: dir, env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(child.status, child.stderr).toBe(0);
+    const { result, copiedBody, spawns } = JSON.parse(child.stdout);
+    expect(result).toMatchObject({ outcome: 'opened' });
+    expect(copiedBody).toContain(prep);
+    expect(copiedBody).toContain('operator reason');
+    expect(spawns).toBe(1);
+    expect(readFileSync(source, 'utf8')).toBe(prep);
   }));
   it('allows a waiver and records its reason', () => fixture(({ bodyFile, logPath, runner, argv }) => {
     writeFileSync(bodyFile, 'prep: waived — urgent incident');

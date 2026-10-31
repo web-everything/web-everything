@@ -16,6 +16,13 @@ describe('prep block', () => {
   it('accepts all four populated headings', () => {
     expect(prepVerdict(prep)).toEqual({ ok: true, reason: '', waived: false });
   });
+  it.each(['PREP:', '## PREP:', '**PREP:**', '- PREP:', '* PREP:', '+ PREP:', '## - **pReP:**'])('accepts start marker %s with or without trailing text', (marker) => {
+    for (const suffix of ['', ' implementation plan']) {
+      const text = prep.replace('PREP:', marker + suffix);
+      expect(parsePrep(text)).toEqual({ present: true, waived: false, waiverReason: '', missing: [], empty: [] });
+      expect(prepVerdict(text)).toEqual({ ok: true, reason: '', waived: false });
+    }
+  });
   it('refuses the unchanged documented PREP template verbatim', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const doc = readFileSync(join(here, '../../docs/agent/prep-gate.md'), 'utf8');
@@ -33,10 +40,23 @@ describe('prep block', () => {
   it('accepts case, markdown prefixes, bullets and continuation items', () => {
     expect(prepVerdict('prep:\n- **aCCeptance:**\n- visible result\n## **PRE-MORTEM:**\n  likely failure\n**Files:** scripts/example.mjs\n# Tests:\n* focused tests').ok).toBe(true);
   });
-  it.each(['- npm test: unit suite', 'npm test: unit suite', 'Summary: focused unit suite', '## Summary'])('counts %s as section content', (content) => {
+  it.each(['- npm test: unit suite', 'npm test: unit suite', 'Summary: focused unit suite', '##Summary', '####### Summary'])('counts %s as section content', (content) => {
     const text = prep.replace('Tests: focused unit tests', `Tests:\n${content}`);
     expect(parsePrep(text)).toEqual({ present: true, waived: false, waiverReason: '', missing: [], empty: [] });
     expect(prepVerdict(text)).toEqual({ ok: true, reason: '', waived: false });
+  });
+  it.each(['# Summary', '## Summary', '### Summary', '#### Summary', '##### Summary', '###### Summary', '  ## Summary'])('ends Tests at unrelated markdown heading %s without borrowing following prose', (heading) => {
+    const text = prep.replace('Tests: focused unit tests', `Tests:\n${heading}\nUnrelated summary prose`);
+    expect(parsePrep(text)).toEqual({ present: true, waived: false, waiverReason: '', missing: [], empty: ['Tests'] });
+    expect(prepVerdict(text)).toEqual({ ok: false, reason: expect.stringContaining('empty or placeholder: Tests'), waived: false });
+  });
+  it('keeps populated Tests valid when followed by a summary heading', () => {
+    expect(prepVerdict(`${prep}\n## Summary\nUnrelated summary prose`)).toEqual({ ok: true, reason: '', waived: false });
+  });
+  it.each(['Acceptance', 'Pre-mortem', 'Files', 'Tests'])('recognizes markdown %s as a PREP heading before applying the section boundary', (heading) => {
+    const result = parsePrep(`PREP:\n## **${heading}:**\nConcrete continuation content`);
+    expect(result).toEqual({ present: true, waived: false, waiverReason: '', empty: [],
+      missing: ['Acceptance', 'Pre-mortem', 'Files', 'Tests'].filter((name) => name !== heading) });
   });
   it.each(['Acceptance', 'Pre-mortem', 'Files', 'Tests'])('ends the preceding section at the known %s heading', (heading) => {
     const previous = heading === 'Acceptance' ? 'Tests' : 'Acceptance';
