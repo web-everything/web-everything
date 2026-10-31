@@ -21,8 +21,10 @@ try {
     .replace("from './bounded-child.mjs'", `from '${helperUrl}'`);
   OWN_SOURCE_URL = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 } catch { /* the fallback timer covers it */ }
-const WATCHDOG_SOURCE = `const { workerData, parentPort } = require('node:worker_threads');
-import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort));`;
+// Eval workers inherit the caller's --input-type on newer Node releases. Dynamic imports work in both
+// CommonJS and ESM, so a module-mode caller must not downgrade the ceiling to the main-thread fallback.
+const WATCHDOG_SOURCE = `import('node:worker_threads').then(({ workerData, parentPort }) =>
+  import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort)));`;
 
 // flag[0]: -1 cancelled, 0 armed, 1 fired (escape sweeps running), 2 swept (the kill is complete).
 function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {

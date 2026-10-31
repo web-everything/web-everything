@@ -42,7 +42,7 @@ describe('escaped-descendant listings (PR #5768)', () => {
 });
 
 describe('startTreeWatchdog (PR #5768)', () => {
-  it.each([
+  const heartbeatCases = [
     { liveHandle: false, loading: false },
     { liveHandle: true, loading: false },
     { liveHandle: false, loading: true },
@@ -51,7 +51,8 @@ describe('startTreeWatchdog (PR #5768)', () => {
     { liveHandle: true, loading: false, fire: true },
     { liveHandle: false, loading: true, fire: true },
     { liveHandle: true, loading: true, fire: true },
-  ])('stop() resolves with a heartbeat module (live handle: $liveHandle, import in flight: $loading, fired: $fire)', ({ liveHandle, loading, fire = false }) => {
+  ].flatMap((testCase) => ['commonjs', 'module'].map((inputType) => ({ ...testCase, inputType })));
+  it.each(heartbeatCases)('stop() resolves with a heartbeat module (input type: $inputType, live handle: $liveHandle, import in flight: $loading, fired: $fire)', ({ inputType, liveHandle, loading, fire = false }) => {
     // Isolate the probe so a regression cannot leave a ref'd watchdog hanging the test runner.
     const liveInterval = liveHandle ? 'setInterval(() => {}, 1000);' : ''; // keepalive-helper-ok: deliberate worker handle leak; bounded subprocess exits after the stop race.
     const module = `import { workerData } from 'node:worker_threads';
@@ -64,8 +65,8 @@ await new Promise((r) => setTimeout(r, 450));` : ''}
 Atomics.store(state, 1, 1);
 export const ready = () => { heartbeat(); Atomics.store(state, 0, 1); Atomics.notify(state, 0); };
 `;
-    const probe = `import { spawn } from 'node:child_process';
-import { startTreeWatchdog } from ${JSON.stringify(pathToFileURL(resolve(process.cwd(), 'scripts/lib/tree-watchdog.mjs')).href)};
+    const probe = `const { spawn } = await import('node:child_process');
+const { startTreeWatchdog } = await import(${JSON.stringify(pathToFileURL(resolve(process.cwd(), 'scripts/lib/tree-watchdog.mjs')).href)});
 const victim = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { stdio: 'ignore' });
 const exited = new Promise((r) => victim.once('exit', r));
 const state = new Int32Array(new SharedArrayBuffer(8));
@@ -83,7 +84,11 @@ try {
 } finally { clearTimeout(timer); victim.kill('SIGKILL'); await exited; }
 process.exit(0);
 `;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', probe], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
+    // Newer Node inherits this mode in eval workers; exercise both without stripping the caller's flags.
+    const source = inputType === 'commonjs'
+      ? `(async () => { ${probe} })().catch((error) => { console.error(error); process.exitCode = 1; });`
+      : probe;
+    const result = spawnSync(process.execPath, [`--input-type=${inputType}`, '-e', source], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout.trim())).toEqual({ entered: 1, completedBeforeStop: loading ? 0 : 1, completed: 1, result: 'stopped', fired: fire, alive: !fire, warned: [] });
   }, 20_000);
