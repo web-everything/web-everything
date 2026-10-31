@@ -157,6 +157,10 @@ describe('constellation ownership', () => {
     }
   });
 
+  it('counts one working-tree leaf for repeated unmerged index paths', () => {
+    expect(existingTrackedPaths(['AGENTS.md', 'AGENTS.md', 'AGENTS.md'])).toEqual(['AGENTS.md']);
+  });
+
   it('counts empty files, final unterminated lines and binary files deterministically', () => {
     const files = classify(['empty', 'terminated', 'unterminated', 'binary'], fixture([
       { glob: '*', destination: 'plateau' },
