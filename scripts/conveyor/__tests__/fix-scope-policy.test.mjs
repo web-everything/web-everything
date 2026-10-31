@@ -226,6 +226,20 @@ describe('landing holder policy', () => {
     expect(decide({ labels: [], inMergeQueue: true })).toMatchObject({ hold: true, landing: true, why: expect.stringContaining('in-merge-queue') });
     expect(decide({ labels: ['review:pending'] })).toMatchObject({ hold: false });
   });
+  it.each([
+    ['draft', { labels: ['review:accepted'], isDraft: true }, 'holder cannot land: draft'],
+    ['red-team:blocked', { labels: ['review:accepted', 'red-team:blocked'] }, 'holder cannot land: red-team:blocked'],
+    ['queued draft blocked by red team', { labels: [{ name: 'red-team:blocked' }], inMergeQueue: true, isDraft: true }, 'holder cannot land: draft, red-team:blocked'],
+  ])('releases a matched holder that cannot land (%s)', (_name, state, reason) => {
+    const d = policyApi.landingHolderDecision({ state, setting: policy().value.waitForLandingHolder });
+    expect(d).toMatchObject({ hold: false });
+    expect(d).not.toHaveProperty('landing');
+    expect(d.why).toContain(reason);
+  });
+  it('keeps the landing hold for a ready, unblocked holder', () => {
+    const d = policyApi.landingHolderDecision({ state: { labels: ['review:accepted'], isDraft: false }, setting: policy().value.waitForLandingHolder });
+    expect(d).toMatchObject({ hold: true, landing: true });
+  });
   it('marks trial merge conflicts explicitly', () => {
     expect(policyApi.regionOverlapDecision({ file: 'x', hunksA: new Map([['x', [[1, 1]]]]), hunksB: new Map([['x', [[1, 1]]]]), mergeConflict: true }))
       .toEqual({ overlap: true, conflict: true, why: 'trial merge conflicts' });
@@ -270,6 +284,18 @@ describe('holder state reader', () => {
     expect(policyApi.landingHolderDecision({ state: reader.stateFor(1), setting })).toMatchObject({ hold: false });
     expect(reader.landingPrs(setting.holderStates)).toEqual([]);
   });
+  it('reads isDraft from the snapshot and fails closed on a malformed isDraft', () => {
+    const calls = [];
+    const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec: (cmd, args) => {
+      calls.push(args); return page([{ ...node(1, ['review:accepted']), isDraft: true }, { ...node(2, ['review:accepted']), isDraft: false }]);
+    } });
+    expect(reader.stateFor(1)).toMatchObject({ isDraft: true });
+    expect(calls[0].find(arg => arg.startsWith('query='))).toContain('isDraft');
+    const setting = policy().value.waitForLandingHolder;
+    expect(policyApi.landingHolderDecision({ state: reader.stateFor(1), setting })).toMatchObject({ hold: false, why: expect.stringContaining('holder cannot land: draft') });
+    expect(policyApi.landingHolderDecision({ state: reader.stateFor(2), setting })).toMatchObject({ hold: true, landing: true });
+    expect(policyApi.parseHolderStates(page([{ ...node(1, ['review:accepted']), isDraft: 'yes' }]))).toBeNull();
+  });
   it('fails closed and caches subprocess or malformed response failures', () => {
     for (const exec of [() => { throw Error('offline'); }, () => '{}']) {
       const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec });
@@ -297,6 +323,16 @@ describe('wait only for a landing holder', () => {
     const out = run({ labels: ['review:accepted'] });
     expect(out.planned).toEqual([]);
     expect(out.scopeDecisions[0]).toMatchObject({ rule: 'waitForLandingHolder', decision: 'blocked', why: expect.stringContaining('holder is landing (review:accepted)') });
+  });
+  it.each([
+    ['draft', { labels: ['review:accepted'], isDraft: true }, 'holder cannot land: draft'],
+    ['red-team:blocked', { labels: ['review:accepted', 'red-team:blocked'] }, 'holder cannot land: red-team:blocked'],
+  ])('admits a waiter past an accepted holder that cannot land (%s), including a landing-only holder', (_name, state, reason) => {
+    for (const [options, claims] of [[{}, [claim(1)]], [{ landingHolders: [{ pr: 1, scope: [F] }] }, []]]) {
+      const out = run(state, {}, options, claims);
+      expect(out.planned.map(e => e.pr)).toEqual([2]);
+      expect(out.scopeDecisions[0]).toMatchObject({ rule: 'waitForLandingHolder', decision: 'admitted', why: expect.stringContaining(reason) });
+    }
   });
   it('retains the hold on unreadable state', () => {
     expect(run(null).scopeDecisions[0]).toMatchObject({ decision: 'blocked', rule: 'waitForLandingHolder', failedClosed: true });
