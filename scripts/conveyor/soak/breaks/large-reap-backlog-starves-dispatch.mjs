@@ -57,10 +57,13 @@ const BACKLOG_SIZE = 300;
  *  past `TICK_BOUND_MS` below. Never the production-sized default — that value is pinned by
  *  session-reaper.test.mjs's own unit tests. */
 const MAX_STOPS_OVERRIDE = '5';
-/** Comfortably above the bare-tick floor + a budgeted reap's own real cost (~4.7s + ~0.7s ≈ 5.5s measured),
- *  comfortably below BACKLOG_SIZE stops' unbounded real cost on top of that same floor (~4.7s + ~17s ≈ 22s) —
- *  see calibration above. */
-const TICK_BOUND_MS = 12_000;
+/** Comfortably above the bare-tick floor + a budgeted reap's own real cost, comfortably below BACKLOG_SIZE
+ *  stops' unbounded real cost on top of that same floor — see calibration above. The LOCAL floor is ~5.5s, but
+ *  the CI runner's first review tick is much slower: main CI measured 10.1s green (run 41004478390) and 12.04s
+ *  against a 12s bound (run 41006327928, first red commit f16501bd7 — no code on the reap/tick path changed),
+ *  so 12s left ~2s of runner-variance margin and flaked. 18s keeps the same separation from the unbounded path
+ *  (>= ~4.7s + ~17s ≈ 22s locally, and the stop spawns only get slower on a CI runner). */
+const TICK_BOUND_MS = 18_000;
 
 export default {
   id: 'large-reap-backlog-starves-dispatch',
