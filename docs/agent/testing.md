@@ -1,5 +1,7 @@
 # Testing — Three-Tier Strategy
 
+> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
 The real-Git daemon rebuild suites `daemon-rebuild-keep-established.test.mjs` and
 `daemon-rebuild-fallback.test.mjs` run in the blocking integration tier's serial fork.
 Their multi-rebuild cases exceeded the five-second deadline in concurrent unit shards.
@@ -1260,6 +1262,12 @@ holds apply globally. Reads leave legacy files untouched. A skipped run retains
 `servedModel: 'unknown'` and `modelEvidence: 'not-launched'`; `heldBackend` and
 `heldModel` identify the observation responsible for the refusal.
 
+Judge scorecards and run-record telemetry keep the effective agy effort: a model-id
+suffix takes precedence, otherwise apply the CLI map and legacy model override.
+Use `antigravity-model-effort.mjs`'s shared predicate in both launchers. Regression
+coverage lives in `antigravity-judge-spawn.test.mjs`; `parallel-judges.test.mjs` checks
+that both drive modes preserve provider effort while retaining the request fallback.
+
 ## Shadow reviewer agreement evidence
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
@@ -1490,6 +1498,19 @@ temporary git repo to verify gate arguments and green/red handling without recur
 suite. Exercise real subprocesses and git transport. Emit gate chatter in the fixture too: a CLI's
 machine-readable JSON stdout must remain parseable when its child gate prints output.
 
+Keep real-Git fixtures compatible with Forge's Git 2.43. An unsupported repository extension can
+prevent even read-only repository commands: inspect configuration with `git config --file`, and
+prove refusal by comparing filesystem bytes. Git's fetch negotiation may avoid a stale commit-graph,
+so verify an existing graph explicitly when testing corruption admission and repair. An `ls-files`
+exit 1 alone does not prove an untracked path: sparse-tree read failures can share that exit status.
+For a narrowed catch, keep one negative test per independent condition: the expected status with
+an unrelated diagnostic, and the expected diagnostic with another status. Fail-closed hook checks
+also need nonempty stdout and extra or partial stderr cases, in both reporting and repair modes.
+A test promising "only" or "never" must exercise the excluded case as well as the permitted one;
+assert the absence of retries or writes, not just the returned error.
+Send repository-sized path lists through NUL-delimited stdin, not argv; real-Git regressions should
+exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` while stdin succeeds.
+
 ### Passive-wait hook regression probes
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
@@ -1645,6 +1666,11 @@ A large seed commit can launch detached maintenance/repack that outlives `execFi
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
 do not hide the race with sleeps, cleanup retries, or exclusions from the snapshot.
 
+Git path safety tests must preserve raw command-output bytes until UTF-8 round-trip validation;
+include invalid filename bytes as well as a valid U+FFFD name. For generated safety attributes,
+probe the effective value with `git check-attr`, and test encoded line lengths near Git 2.43's
+2048-byte limit. An ignored override must refuse the merge before Git can allocate conflict markers.
+
 1. Test behavior, not implementation.
 2. One concept per test; descriptive names (`should notify listeners on setItem`).
 3. Arrange-Act-Assert. Reset state in `beforeEach`/`afterEach`.
@@ -1701,6 +1727,24 @@ npx vitest run --coverage           # coverage report
 ```
 
 ## Developing & manually testing in a lane
+
+An entry guard placed in the first side-effect import must finish synchronously before
+transferring execution. Awaiting IO in that guard lets sibling entry dependencies evaluate.
+The tools-root subprocess fixture pins this: a later dependency throws if local evaluation
+starts, while the selected tools entry records its actual cwd, argv and exit status.
+Tools-root redirection accepts only the three entries declared in `TOOLS_ROOT_ENTRIES`;
+an ordinary `scripts/` runner importing one of them as a library must stay local, even
+when a counterpart exists in the tools checkout. Pin both the no-spawn seam and the real
+import path. Pin every explicit resolver rejection reason, including a successful Git
+probe that names a different checkout root. The default event-writer fixtures must cover
+both timeout and excessive-output recovery before selected tooling starts.
+
+The synchronous tools-root wrapper cannot forward a signal addressed only to its PID;
+the selected child (or the event writer) can outlive it. Supervisors must terminate the
+whole process group. Moving to async signal forwarding also requires deferring sibling
+entry imports; awaiting the first side-effect import alone does not defer them.
+Oversized-input fixtures must measure requested ranges and cumulative bytes through the
+filesystem seam, including short reads; rejection alone does not prove bounded IO.
 
 Every edit — including an ad-hoc "just fix this one thing" — happens in an **isolated lane clone**, never the main checkout (#2123; the writer model in [platform-decisions.md#pr-flow-rollout-mechanism](platform-decisions.md#pr-flow-rollout-mechanism)). The lane trigger is *making an edit*, not *running a command*. The main checkout stays the human's — its dev server on `:3000`/`:8080` is theirs; don't build or serve into it.
 
@@ -3140,6 +3184,62 @@ refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
 
+### Single-pid process identity evidence
+
+`scripts/lib/proc-identity.mjs` exposes `record` (canonical, null-free identity capture)
+and `probe` (positive-evidence tri-state checks). UID remains a captured filter, not
+a key for `probe`; legacy `liveness` and `sameIdentity` retain their UID comparison.
+Live-process fixtures must supply Linux cmdline and namespace links as well as stat/status.
+For an exited Linux leader, `probe` uses stat plus a bounded task census without reading
+the namespace link (which can disappear at exit): all exited tasks plus an unchanged
+task-ID set in a final census prove dead; any live task yields `unknown` with
+`zombie-leader-live-tasks`. Changed, duplicate, unreadable, incomplete or over-budget
+censuses yield `unknown` with `evidence-unavailable`; retry or inspect manually.
+An initial task-directory `ENOENT`/`ESRCH` can also mean hidepid concealed live workers:
+require independent absence confirmation (readable boot ID and signal-zero `ESRCH`)
+before returning dead. Test both directory errors with signal-zero success, `EPERM`,
+`EACCES`, and other failures (unknown), alongside confirmed absence (dead).
+Race fixtures must include a worker spawning a live successor before its own stat is
+read as Z/X/x, and a same-count task replacement. Reordering an unchanged set must
+still permit dead. `record` still requires the namespace
+link to capture a complete identity. Model removed evidence with a read error, not
+an empty successful output or ENOENT: those can be positive absence evidence. Exhaustive
+subset tests cover both absence and exited-task death as well as live and reused keys.
+Race fixtures must change the second per-PID stat read: a changed start time or parent
+PID makes `record` fail and `probe` return `unknown`, both with
+`identity-changed-during-read`. Exercise each field separately and together so removing
+either comparison is detectable. A second-read transition to Z/X/x keeps the captured
+identity recordable when evidence is complete; `probe` must consult the task census,
+returning dead for all exited tasks or unknown for a live task, never alive.
+Linux `listGroup` fixtures must also provide `/proc/self/mountinfo`: a visible leader
+does not prove that procfs exposes other users' group members. Require one full procfs
+mount at `/proc`, with hidepid absent or explicitly zero, and unchanged mount evidence
+before and after the census. Hidden, missing, malformed, unreadable or oversized mount
+evidence yields unknown; retry or inspect the mount configuration manually. Keep a
+visible-leader/hidden-member regression alongside the omitted-leader case.
+The real-host cases require permission to execute `ps` and read the boot UUID on macOS;
+a sandbox denying either operation produces unknown and cannot certify those cases.
+## Optional early review and delayed fix push
+
+`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
+head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
+since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
+agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
+the same first-held deadline; unreadable evidence waits until the bound, whose fallback is a
+normal push. Inject the clock, sleep and checks; reads must be at least 30 seconds apart.
+Claude repairs mark verify directly, so the verify harness must apply the same gate to both
+early and green-verdict pushes. Persist its previous head and first-held time independently of
+verify retries, retain the waiter on read/write failures, and log the timing policy's source.
+`await-verify-pass-push-after-ci.test.mjs` and the `claude-fix-push-after-ci` soak scenario cover
+this path with injected CI reads, including the bounded fallback when evidence is unavailable.
+Completed previous-head failures must reach the fixer in a shared untrusted-data fence before
+either push path runs. Persist the handoff and pending delivery together; retain the inventory
+across busy/failed resumes and same-session re-marks until the repair push succeeds. A delivered
+resume waits for a new mark; exhausted delivery retains the record for operator recovery.
+Exercise busy, paused and failed delivery across multiple ticks with both push policies:
+zero pushes until delivery and a subsequent re-mark, then a push of the follow-up commit.
+
 ## Archive-only host retention (R217)
 
 `scripts/lib/archive-retention.mjs` uses the run store's shared directory resolver without triggering
@@ -3176,3 +3276,118 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+## CI-heal check evidence (R272)
+
+Check names and required rosters match exactly, including case: a passing `TEST`
+never clears a failing or missing required `test`. Only status and conclusion values
+are case-insensitive; CodeQL and hold-gate names retain their exact identity.
+Every row for a required name must classify green under the shared check-state
+predicate. Any failed, cancelled, stale, unfinished, unknown or unreadable row blocks
+successful admission, even beside a success. No source tier, workflow run, attempt,
+id or timestamp can discard evidence. Compatibility exports `latestAttempts` and
+`latestRollupAttempts` retain all rows without ranking or mutation.
+The regression suites retain timestamp, metadata, source-tier, undated and input-order
+scenarios and require mixed evidence to fail closed. CodeQL failures always block
+`not-a-ci-break` and gate-only excusal, including when CodeQL is outside the required
+roster and the drain's CodeQL switch is off. A merge-gate name is excusable only when
+every non-green row is positively classified as a review hold; each row is classified
+independently, so one held job cannot excuse another job's failure or unfinished state.
+The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence, with
+`prChecksOptions` supplying hermetic readers. A failed PR or roster read permits recording with a warning; an unreadable merge-gate verdict or freeze read still permits `needs-human` with a warning, but keeps the red-check refusal for `not-a-ci-break`.
+Classification errors, including malformed rollup identities, propagate to the CLI's error handler and abort
+before any escalation comment is posted. The read-error fallback never catches refusal classification.
+`ci-heal-escalation-mark.test.mjs` pins both preflights and both CLI outcomes with nameless evidence beside a required failure.
+## Remote client import failures
+
+Importing a host-selected remote client executes its top-level code. Neither an import exception nor
+a missing or non-callable `runRemote` export establishes that remote work never started: preserve
+exit 124 and the operator instruction to confirm termination before retrying. Changes to this boundary must run
+`scripts/readiness/__tests__/heavy-admission-remote-client.test.mjs` and
+`scripts/readiness/__tests__/heavy-admission-remote.test.mjs` through the host heavy-run queue.
+Only the real host preferences file may select `heavyAdmission.remote.clientPath`; fixtures use
+`loadAdmissionPolicy({ home })` for this trust boundary, never an env-selected executable path.
+An env-selected preferences file keeps its other settings but strips this leaf after last-good fallback,
+logs the ignored path with bounded diagnostics, and uses a separate policy cache key from host selection.
+Keep the named regression **refuses local rerun when import starts work before throwing**: it observes
+an initialization side effect before the throw and requires exit 124 without local fallback.
+Also keep **refuses local rerun when import starts work before a missing runRemote export**: it
+observes initialization before export validation fails and requires the same refusal.
+
+Remote override provenance runs after client invocation as a detached, best-effort task. SHA lookup
+uses asynchronous Git so it cannot block the execution timer; neither its one-second bound nor the
+100 ms persistence bound belongs on the client path. The never-resolving SHA/event regressions require
+client invocation and success before advancing fake time. Provenance assertions must await background
+writes explicitly while preserving once-per-process logs and change-only events.
+Identify path changes with the persisted SHA-256 `pathKey` of the raw resolved client path plus the SHA;
+sanitized display paths can collide. Legacy state without `pathKey` emits fresh provenance once, while
+event details keep only sanitized paths and SHAs.
+The real CLI drains tracked provenance only after the remote decision, for at most 1500 ms, with
+an unref'd timer cleared on completion. Set the remote exit code before awaiting so natural exit
+also preserves nonzero results. Keep native CLI regressions for fast event/state persistence and
+never-settling provenance both with and without another live handle; fake timers separately prove
+the drain cap, oversized/invalid budget clamping, timer cleanup, and removal of settled tasks.
+
+The persistence deadline cannot cancel a filesystem open blocked on a FIFO. Before reading override
+state, use `lstat` to reject symlinks and special files, and skip reads above the 4096-byte cap.
+Open descriptors with `O_NONBLOCK | O_NOFOLLOW` where supported and verify the descriptor is regular.
+Publish through an exclusive sibling temp file plus rename, checking the destination is still absent
+or regular before replacement. Unreadable or special state skips persistence while the client runs.
+The native FIFO regression in `heavy-admission-import-boundary.test.mjs` must let its subprocess exit
+naturally under a timeout: observing the client result alone misses a live, abandoned filesystem request.
+For the default override event append, resolve the destination with `daemonEventsPath`, then open it
+with `O_WRONLY | O_APPEND | O_CREAT | O_NONBLOCK | O_NOFOLLOW` (guard optional flags). Check the
+opened descriptor with `fstat` and write only to a regular file, always closing it. A path `lstat`
+before a blocking append leaves a swap-to-FIFO race that the persistence timeout cannot cancel.
+Skip errors and non-regular destinations without recording the pair as emitted; injected event
+writers retain their IO seam. Keep the existing parent-directory restriction. Compare the emitted
+JSON line byte-for-byte with `appendDaemonEvent` for the same input and timestamp.
+Keep the separate native daemon-events FIFO case, including client success and absent pair state,
+alongside symlink, directory and invalid-parent cases and real missing/existing regular-file writes.
+
+## Admission imports and daemon closures
+
+Heavy admission is imported by review, promotion, self-sync and smoke machinery. A computed import
+anywhere in its static closure makes those consumers fall back to treating unrelated code as relevant.
+Keep the host-selected client loader command-only: `remote-client-import.cjs` is required lazily at
+remote execution, outside that static closure and Vitest's ESM transform. Preserve the bundled client's
+relative resolution when `clientPath` is unset. Location-only event consumers import `handoff-path.mjs`,
+not the handoff CLI with its Git publishing dependencies; the CLI re-exports the same path function.
+`heavy-admission-import-boundary.test.mjs` proves the complete closure, actual bundled execution for
+unset settings, lazy adapter loading in native Node, and real override event/provenance writes.
+Run it alongside the remote-client, daemon closure/staleness, live-smoke and shape wiring regressions
+through the host heavy-run queue; do not weaken their complete-closure assertions.
+## Manual daemon pass (R247)
+
+`node scripts/operations/run.mjs manual-daemon-pass --daemon=review --pr=123 --repo=owner/name --reason="daemon unavailable"`
+runs one existing single-PR dispatch from the module's checkout, resolved from `import.meta.url`
+independently of the caller's working directory. It reuses
+`assertOperatorCliFresh` with automatic fallback disabled so a manual pass cannot silently move
+to another checkout. The event and PR comment identify the executing checkout HEAD as `sha`.
+
+Review uses `dispatchReviewByMode`; red-team uses `dispatchReviewJob({ redTeamOnly: true })`,
+which owns the existing seat dispatch, result writing and gate application. Both belong to the
+review daemon for health admission. A healthy, non-quarantined daemon refuses unless
+`--force-while-healthy` is supplied. Unknown health or corrupt quarantine evidence refuses even
+with that flag; restore the daemon-status readers before retrying.
+Dispatch leaves `root` to the shared dispatcher's module checkout default, as the review daemon
+does. Its lane-checkout refusal still applies; run from an up-to-date control clone when refused.
+
+Fix refuses with “no entry point”: `reconcile-fix-dispatch.mjs#dispatchFix` requires the prepared
+daemon plan and `fix-run.mjs#runFixCli` requires a session, ref and prompt file;
+`runReconcileFixDispatch` sweeps a repository. Verify also refuses: `verify`/`createChecksRunner`
+accepts a checkout, the verify daemon calls `verify-dispatch.mjs#runVerifyDispatch` to scan pools,
+and `runLaneGate`/`createVerifyGateJobs.launch` require prepared lane/head/marker evidence.
+Neither daemon exports a single-PR entry point accepting repo/pr. These refusals remain explicit until their owners
+expose reusable entry points; do not reconstruct daemon planning in this operation.
+
+Admitted passes post a manual R247 PR comment only after dispatch returns, so dispatch refusals
+(including the real job/session lane-checkout guard) leave no comment. Every sink attempt, including
+freshness/health/no-entry-point refusal, appends one `manual-daemon-pass` JSONL event using the
+shared handoff event path (`WE_DAEMON_EVENTS` overrides it in tests). Events retain `at`, `kind`,
+`repo`, `pr`, `daemon` and add `ts`, `reason`, `sha`, `result`. Invalid CLI arguments are rejected
+by the generated declaration/parser before the sink runs. The effect is non-idempotent, so an
+indeterminate run must be inspected before starting a new pass. Focused proof lives in
+`scripts/operations/__tests__/manual-daemon-pass.test.mjs`; operation enumeration and declaration
+map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
+discovers script modules dynamically and has no hand-maintained operation list.

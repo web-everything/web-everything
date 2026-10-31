@@ -32,6 +32,11 @@ const ports = {
     const child = children.get(Number(handle.split(':')[1]));
     return child && child.exitCode === null && child.signalCode === null ? 'alive' : 'dead';
   },
+  // Fixture-owned children: stop() SIGKILLs the whole group and awaits close, so a dead owner here means the group is gone.
+  reapGroup: handle => {
+    const child = children.get(Number(handle.split(':')[1]));
+    return !child || (child.exitCode !== null || child.signalCode !== null);
+  },
   stop: async handle => {
     const child = children.get(Number(handle.split(':')[1]));
     await new Promise(resolve => {

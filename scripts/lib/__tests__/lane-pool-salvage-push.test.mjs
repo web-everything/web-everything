@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -254,7 +254,7 @@ describe('real salvage preservation and transport', () => {
     it('allows ordinary exact-origin URL and fetch configuration', () => {
       const runGit = vi.fn((_command, args) => args.includes('config')
         ? args.includes('--show-scope')
-          ? `${scope}\0remote.origin.url\0${scope}\0remote.origin.fetch\0`
+          ? `${scope}\0file:.git/config\0remote.origin.url\0${scope}\0file:.git/config\0remote.origin.fetch\0`
           : 'remote.origin.url\0remote.origin.fetch\0' : '');
       const io = realSalvageIo({ repo, runGit });
       expect(io.push(laneDir, ref, head)).toEqual({ ok: true });
@@ -298,7 +298,7 @@ describe('real salvage preservation and transport', () => {
       'refuses lane-controlled %s before every transport', key => {
         for (const scope of ['local', 'worktree']) {
           const runGit = vi.fn((_command, args) => args.includes('config')
-            ? args.includes('--show-scope') ? `${scope}\0${key}\0` : `${key}\0` : '');
+            ? args.includes('--show-scope') ? `${scope}\0file:.git/config\0${key}\0` : `${key}\0` : '');
           const io = realSalvageIo({ repo, runGit });
           for (const operation of [() => io.unmatchedShas(laneDir, [head]),
             () => io.push(laneDir, ref, head), () => io.remoteSha(ref)]) {
@@ -312,7 +312,7 @@ describe('real salvage preservation and transport', () => {
       let scrubbed = false;
       const runGit = vi.fn((_command, args) => {
         if (args.includes('config')) return scrubbed ? '' : args.includes('--show-scope')
-          ? 'local\0credential.helper\0' : 'credential.helper\0';
+          ? 'local\0file:.git/config\0credential.helper\0' : 'credential.helper\0';
         return args.includes('rev-list') ? head : '';
       });
       const io = realSalvageIo({ repo, runGit, preflightLaneDir: laneDir });
@@ -325,13 +325,85 @@ describe('real salvage preservation and transport', () => {
 
     it.each(['global', 'system'])('preserves operator transport credentials from %s scope', scope => {
       const runGit = vi.fn((_command, args) => args.includes('config')
-        ? args.includes('--show-scope') ? `${scope}\0credential.helper\0` : 'credential.helper\0' : '');
+        ? args.includes('--show-scope') ? `${scope}\0file:/operator/gitconfig\0credential.helper\0` : 'credential.helper\0' : '');
       const io = realSalvageIo({ repo, runGit });
       expect(io.push(laneDir, ref, head)).toEqual({ ok: true });
       expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(true);
     });
 
-    it.each(['local\0credential.helper', 'local\0', 'unknown\0credential.helper\0'])(
+    it.each(['credential.helper', 'init.defaultbranch'])(
+      'allows unknown scope from an absolute external toolchain file for %s', key => {
+        const runGit = vi.fn((_command, args) => {
+          if (args.includes('config')) return args.includes('--show-scope')
+            ? `unknown\0file:${join(tmpdir(), 'toolchain', 'gitconfig')}\0${key}\0` : `${key}\0`;
+          if (args.includes('--is-bare-repository')) return 'false';
+          if (args.includes('--git-dir')) return `${resolve(laneDir, '.git')}\n${resolve(laneDir, '.git')}`;
+          if (args.includes('--show-toplevel')) return resolve(laneDir);
+          return '';
+        });
+        const io = realSalvageIo({ repo, runGit });
+        expect(io.push(laneDir, ref, head)).toEqual({ ok: true });
+        expect(runGit.mock.calls.find(([, args]) => args.includes('--show-scope'))[1]).toContain('--show-origin');
+      });
+
+    it.each([
+      'file:relative/gitconfig', 'file:.git/config', `file:${resolve(laneDir, 'included.config')}`,
+      `file:${resolve(laneDir, '.git', 'config')}`, 'command line:', 'blob:HEAD:config', 'standard input', '',
+      `file:${resolve('separate-git', 'config')}`, `file:${resolve('separate-worktree', 'config')}`,
+    ])('refuses unknown scope from untrusted origin %j before transport', origin => {
+      const runGit = vi.fn((_command, args) => {
+        if (args.includes('config')) return args.includes('--show-scope')
+          ? `unknown\0${origin}\0credential.helper\0` : 'credential.helper\0';
+        if (args.includes('--is-bare-repository')) return 'false';
+        if (args.includes('--git-dir')) return `${resolve('separate-git')}\n${resolve('separate-git')}`;
+        if (args.includes('--show-toplevel')) return resolve('separate-worktree');
+        return '';
+      });
+      const io = realSalvageIo({ repo, runGit });
+      expect(() => io.push(laneDir, ref, head)).toThrow('unknown transport config scope; inspect the lane manually');
+      expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
+    });
+
+    it.each(['', 'relative/gitdir', 'unreadable'])(
+      'refuses unknown scope when repository path evidence is %j', evidence => {
+        const runGit = vi.fn((_command, args) => {
+          if (args.includes('config')) return args.includes('--show-scope')
+            ? `unknown\0file:${join(tmpdir(), 'toolchain', 'gitconfig')}\0credential.helper\0` : 'credential.helper\0';
+          if (evidence === 'unreadable') throw new Error('cannot read repository paths');
+          return evidence;
+        });
+        const io = realSalvageIo({ repo, runGit });
+        expect(() => io.push(laneDir, ref, head)).toThrow('unknown transport config scope; inspect the lane manually');
+        expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
+      });
+
+    it('reads real Git scope/origin/key NUL triples and permits an external system file', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'salvage-origin-layout-'));
+      try {
+        const lane = join(dir, 'lane'), system = join(dir, 'toolchain.gitconfig');
+        writeFileSync(system, '[credential]\nhelper = osxkeychain\n[init]\ndefaultBranch = main\n');
+        const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '0', GIT_CONFIG_SYSTEM: system, GIT_CONFIG_GLOBAL: '/dev/null' };
+        execFileSync('git', ['init', '-q', lane], { env });
+        const runGit = vi.fn((command, args, options) => {
+          if (args.includes('push')) return ''; // Probe config and repo paths without transport.
+          const output = execFileSync(command, args, { ...options, env: { ...options.env,
+            GIT_CONFIG_NOSYSTEM: '0', GIT_CONFIG_SYSTEM: system, GIT_CONFIG_GLOBAL: '/dev/null' } });
+          if (!args.includes('--show-scope')) return output;
+          const parts = output.split('\0');
+          expect(parts.at(-1)).toBe('');
+          expect((parts.length - 1) % 3).toBe(0);
+          const records = [];
+          for (let i = 0; i < parts.length - 1; i += 3) records.push(parts.slice(i, i + 3));
+          expect(records).toContainEqual(['system', `file:${system}`, 'credential.helper']);
+          // Reproduce Apple Git's toolchain scope while preserving real origin/key bytes.
+          return records.map(([scope, origin, key]) =>
+            `${origin === `file:${system}` ? 'unknown' : scope}\0${origin}\0${key}\0`).join('');
+        });
+        expect(realSalvageIo({ repo, runGit }).push(lane, ref, head)).toEqual({ ok: true });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it.each(['local\0file:.git/config\0credential.helper', 'local\0', 'local\0file:.git/config\0', 'mystery\0file:/operator/gitconfig\0credential.helper\0'])(
       'fails closed on incomplete or unknown config evidence %j', scoped => {
         const runGit = vi.fn((_command, args) => args.includes('--show-scope') ? scoped : '');
         const io = realSalvageIo({ repo, runGit });

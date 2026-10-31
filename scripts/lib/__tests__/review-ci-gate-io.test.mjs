@@ -192,3 +192,17 @@ it('a repo without its own fast checks waits on its trusted required set', () =>
   expect(readGate(we)).toMatchObject({ allowed: true, source: 'timing-policy' });
   expect(we.readRequired).not.toHaveBeenCalled();
 });
+
+it('publish-time gate reads the exact head marker only when enabled', () => {
+  const readVerifyGreen = vi.fn(({ sha }) => sha === headSha);
+  const args = { repo: 'other/product', pr: 7, readHead: () => headSha, readChecks: () => [],
+    readRequired: () => ({ source: 'live', checks: ['test'] }), readVerifyGreen,
+    policy: { startAfter: 'ci-green', startBeforeCi: true } };
+  expect(readGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
+  expect(readVerifyGreen).toHaveBeenCalledWith(expect.objectContaining({ sha: headSha }));
+  expect(readGate({ ...args, readVerifyGreen: () => false }).allowed).toBe(false);
+  expect(readGate({ ...args, readVerifyGreen: () => { throw Error('unreadable'); } }).allowed).toBe(false);
+  readVerifyGreen.mockClear();
+  expect(readGate({ ...args, policy: { startAfter: 'ci-green' } }).allowed).toBe(false);
+  expect(readVerifyGreen).not.toHaveBeenCalled();
+});
