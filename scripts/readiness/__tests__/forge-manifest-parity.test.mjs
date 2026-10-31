@@ -26,7 +26,7 @@ beforeEach(async()=>{
   env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('GIT_')));
   root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-parity-')));cwd=join(root,'work');await fs.mkdir(cwd);
   git(['init','-q']);await write('package-lock.json','{}');await write('keep.txt','keep');await write('a.test.mjs','test');
-  await fs.copyFile(new URL('./fixtures/forge-vitest.config.mjs',import.meta.url),join(cwd,'vitest.config.mjs'));commit();
+  await fs.copyFile(new URL('./fixtures/forge-selection-patterns.mjs',import.meta.url),join(cwd,'vitest.config.mjs'));commit();
   const full=await buildManifest({cwd,env});base={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
 });
 
