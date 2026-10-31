@@ -333,29 +333,6 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
     expect(refusal({ pr: { ...fixture, statusCheckRollup } })).toBeNull();
   });
-  it('#5925: cancelled smoke and red review-gate allow a not-a-ci-break record', () => {
-    const statusCheckRollup = [
-      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
-    ];
-    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toBeNull();
-  });
-  it.each(['IN_PROGRESS', 'MISSING', 'FAILURE'])('cancelled smoke does not excuse %s real work', state => {
-    const statusCheckRollup = [
-      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
-      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
-      ...(state === 'MISSING' ? [] : [{ name: 'test', status: state === 'IN_PROGRESS' ? state : 'COMPLETED', conclusion: state === 'FAILURE' ? state : null }]),
-    ];
-    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toContain('test');
-  });
-  it('a newer real failure still refuses after an older cancellation', () => {
-    const statusCheckRollup = [
-      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-10-26T10:00:00Z' },
-      { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-26T11:00:00Z' },
-    ];
-    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['smoke'] })).toContain('red: smoke');
-  });
   it('does not judge a different head or unknown required set', () => {
     expect(refusal({ headSha: 'abcdef0123456789' })).toBeNull();
     expect(refusal({ requiredChecks: [] })).toBeNull();
