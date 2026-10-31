@@ -61,51 +61,28 @@ export function classifyCheck(check = {}) {
   return check.required === false && state !== 'green' ? 'ignore' : state;
 }
 
-// Only canonical non-negative integers rank; missing/garbage evidence is zero.
-// Keep string IDs exact above Number.MAX_SAFE_INTEGER; never consult dates.
-const numeric = (value) => {
-  if (typeof value !== 'number' && typeof value !== 'string') return 0n;
-  const integer = String(value);
-  return /^(0|[1-9][0-9]*)(?![\s\S])/.test(integer) ? BigInt(integer) : 0n;
-};
-
-const severity = (check) => ({ green: 0, pending: 1, red: 2 })[
-  classifyCheck({ ...check, required: true })
-];
-
 /**
- * Select the greatest (run_attempt, id) exact integer pair per exact name || context.
- * Exact ties retain the worse state (red > pending > green), then the first row.
- * Nameless rows and tied rows with conflicting required flags throw TypeError.
- * Inputs are never mutated.
- * @param {object[]} checks Check attempts.
- * @returns {object[]} Original winning rows, in first-seen name order.
+ * Compatibility export: retain every original row, without selecting an attempt.
+ * Names are exact and conflicting required flags fail closed. Inputs are not mutated.
+ * @param {object[]} checks Check evidence.
+ * @returns {object[]} All original rows in input order.
  * @example latestAttempts([{ name: 'ci', id: 1 }, { name: 'ci', id: 2 }]);
  */
 export function latestAttempts(checks = []) {
-  const latest = new Map();
+  const requiredByName = new Map();
   for (const check of checks) {
     const name = checkName(check);
-    const previous = latest.get(name);
-    const attempt = numeric(check.run_attempt);
-    const previousAttempt = numeric(previous?.run_attempt);
-    const id = numeric(check.id);
-    const previousId = numeric(previous?.id);
-    const tied = previous && attempt === previousAttempt && id === previousId;
-    if (tied && (check.required === false) !== (previous.required === false)) {
-      throw new TypeError('Tied check attempts have conflicting required flags');
+    const required = check.required !== false;
+    if (requiredByName.has(name) && requiredByName.get(name) !== required) {
+      throw new TypeError('Check rows have conflicting required flags');
     }
-    if (!previous || attempt > previousAttempt
-      || (attempt === previousAttempt && id > previousId)
-      || (tied && severity(check) > severity(previous))) {
-      latest.set(name, check);
-    }
+    requiredByName.set(name, required);
   }
-  return [...latest.values()];
+  return [...checks];
 }
 
 /**
- * Summarize latest required attempts; absent roster entries remain pending.
+ * Summarize every required row; absent roster entries remain pending.
  * An explicit roster determines requiredness; otherwise row flags apply.
  * Names match exactly and retain their original case, whitespace, and Unicode.
  * Malformed name rosters or check identities throw TypeError rather than admit.
@@ -121,11 +98,11 @@ export function summarize(checks = [], {
 } = {}) {
   const required = requiredNames === undefined ? null : nameSet(requiredNames, 'requiredNames');
   const gates = nameSet(holdGateNames, 'holdGateNames');
-  const latest = latestAttempts(checks);
+  const rows = latestAttempts(checks);
   const observed = new Set();
   const redSet = new Set();
   const pendingSet = new Set();
-  for (const check of latest) {
+  for (const check of rows) {
     const name = checkName(check);
     observed.add(name);
     const state = classifyCheck(required === null
@@ -133,6 +110,8 @@ export function summarize(checks = [], {
     if (state === 'red') redSet.add(name);
     if (state === 'pending') pendingSet.add(name);
   }
+  // A name with both red and pending evidence is reported as red once.
+  for (const name of redSet) pendingSet.delete(name);
   for (const name of required ?? []) {
     if (!observed.has(name)) pendingSet.add(name);
   }
