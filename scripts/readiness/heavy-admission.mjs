@@ -520,7 +520,7 @@ export function resolveRunClientOverride({ overridePath, hostClientPath = null, 
     if (typeof overridePath !== 'string' || !isAbsolute(overridePath)) return { reason: 'per-run override must be an absolute path' };
     const real = fs.realpathSync(overridePath);
     if (!fs.statSync(real).isFile()) return { reason: 'per-run override must be a regular file' };
-    const lower = (p) => p.toLowerCase();
+    const lower = (p) => p; // realpaths are canonical; exact compare (case-sensitive FS safe)
     if (hostClientPath != null) {
       const host = resolveRemoteClient({ clientPath: hostClientPath, laneRoots, fs });
       if (host.clientPath && lower(host.clientPath) === lower(real)) return { clientPath: real };
