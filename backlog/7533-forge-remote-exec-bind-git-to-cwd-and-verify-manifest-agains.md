@@ -3,9 +3,10 @@ bornAs: xw51scb
 kind: story
 size: 5
 parent: "7518"
-status: open
+status: resolved
 scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/__tests__/"]
 dateOpened: "2026-10-31"
+dateResolved: "2026-10-31"
 preparedDate: "2026-10-31"
 preparedAgainstSha: "2ee4dcbf9bf17c1674e7948339d0b15c164151b6"
 tags: []
