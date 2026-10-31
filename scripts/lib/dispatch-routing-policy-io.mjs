@@ -6,6 +6,7 @@ import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { decideDispatchRoute } from './dispatch-contracts.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
+import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
 function initialPolicy() {
   return trustedSnapshot(process.env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
 }
@@ -24,6 +25,7 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
       const nextSeen = signature([text, overrides]);
       if (nextSeen !== seen) {
         const next = applyRoutingOverrides(JSON.parse(text), overrides);
+        for (const key of Object.keys(overrides)) resolveRoutingOverrideRoute(key, next, { env });
         for (const name of new Set([...Object.keys(applied), ...Object.keys(overrides)])) {
           if (signature(applied[name]) === signature(overrides[name])) continue;
           const split = name.indexOf(':');

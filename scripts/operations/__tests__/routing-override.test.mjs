@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import fs, { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -72,6 +72,17 @@ it.each([
   writeFileSync(f.path, original);
   expect(() => writeRoutingOverride({ key: target, patch }, { env: f.env })).toThrow(error);
   expect(readFileSync(f.path, 'utf8')).toBe(original);
+  expect(readdirSync(f.dir)).toEqual(['preferences.json']);
+});
+
+it('replaces preferences by atomic rename and leaves no scratch or lock files', () => {
+  const f = fixture();
+  writeFileSync(f.path, '{"keep":true}\n');
+  const before = statSync(f.path).ino;
+  writeRoutingOverride({ key, patch: { provider: 'codex' } }, { env: f.env });
+  expect(statSync(f.path).ino).not.toBe(before); // a new inode means rename-over, never in-place truncate
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ keep: true, routingOverrides: { [key]: { provider: 'codex' } } });
+  expect(readdirSync(f.dir)).toEqual(['preferences.json']);
 });
 
 it.each(['review-seat:red-team', 'review-seat'])('accepts a %s disable that keeps an explicitly capped agy-gemini', target => {

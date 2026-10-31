@@ -3038,6 +3038,11 @@ unavailable exclusion, and queue a cooperating writer through the same exclusion
 
 ## Live operator routing fixtures
 
+`dispatch-routing-policy-io.test.mjs` covers rejecting schema-valid live overrides with no usable
+route, retaining the last-good policy and applied-event state, and recovering on a valid edit.
+The reader and writer share the route probe and provider caps from `scripts/lib`; keep that
+validation ahead of reload events and snapshot mutation. Atomic writer fixtures must assert
+unchanged bytes and no leftover scratch/lock files on refusal, including a failed rename.
 `routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
 operator `routingOverrides` changes, including clearing and one event per applied change.
 `routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
