@@ -3226,6 +3226,18 @@ Every new bypass-widening condition needs one negative test per conjunct. Securi
 checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
 and other system evidence so hermetic tests exercise the production checks.
 
+Security review checklist: for each new `localFallback(` call site under
+`scripts/readiness/`, require a named negative test that reaches that call site,
+asserts no remote dispatch, and checks the fallback reason. For a guard after a
+wait, occupy capacity, change the evidence during the wait, and release capacity;
+pin the expiry boundary and reservation cleanup as well as the refusal.
+
+Standards-conformance review checklist: when remote execution consumes a gate's
+output string to detect incomplete inputs, require a producer-side test that runs
+the gate's emitting code with a skipping checker and asserts the warning. Test
+stdout and stderr, successful non-skipping output, and failed checker output;
+injecting a string only into the remote consumer does not cover the producer.
+
 Writer guards shared by root cron and operator controllers must stay on one
 private inode owned by the operator. Test first-use creation and migration of
 existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
