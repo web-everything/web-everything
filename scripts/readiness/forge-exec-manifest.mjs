@@ -67,7 +67,7 @@ const safeDotDirectory = /^(?:\.github|\.githooks|\.husky|\.vscode|\.storybook|\
 const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
 const keyComponent = /(?:_rsa|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
 const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|api[-_ .]?key|^id_/;
-const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
+export const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
 function normalizedComponent(part) {
   const utf8 = part.toString('utf8');
   // Non-test opaque byte names retain their existing byte-path contract. Only
@@ -121,7 +121,9 @@ export function decodeManifest(manifest) {
 }
 // Decode Git's byte-safe tree protocol. Only policy-excluded paths may have
 // non-regular modes; retain them so callers record the same exclusions as full ship.
-export function parseGitTree(bytes, {sizes = false} = {}) {
+// The delta reader may retain links as inventory evidence, never reusable blobs.
+// Warm export keeps the default refusal for non-excluded links.
+export function parseGitTree(bytes, {sizes = false, links = false} = {}) {
   if(!Buffer.isBuffer(bytes)||bytes.length>LIMIT||(bytes.length&&bytes.at(-1)!==0))throw new Error('Invalid git tree');
   const entries=[];let start=0;
   for(let i=0;i<bytes.length;i++)if(bytes[i]===0){
@@ -130,10 +132,11 @@ export function parseGitTree(bytes, {sizes = false} = {}) {
     if(tab<0||!pattern.test(header))throw new Error('Unsupported git tree mode');
     const path=record.subarray(tab+1),policy=classifyManifestPath(path);
     const excluded=(policy.excluded&&!policy.credentialSource)||policy.names.includes('node_modules');
-    if(!excluded&&!/^100(?:644|755) blob /.test(header))throw new Error('Unsupported git tree mode');
+    const symlink=/^120000 blob /.test(header);
+    if(!excluded&&!/^100(?:644|755) blob /.test(header)&&!(links&&symlink))throw new Error('Unsupported git tree mode');
     const [mode,,oid,size]=header.split(/ +/);
     if(sizes && size!=='-' && !Number.isSafeInteger(Number(size)))throw new Error('Invalid git blob size');
-    entries.push({path,oid,executable:mode==='100755',...(sizes?{size:size==='-'?null:Number(size)}:{})});start=i+1;
+    entries.push({path,oid,executable:mode==='100755',...(links&&symlink?{symlink:true}:{}),...(sizes?{size:size==='-'?null:Number(size)}:{})});start=i+1;
   }
   return entries;
 }

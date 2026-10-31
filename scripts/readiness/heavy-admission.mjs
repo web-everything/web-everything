@@ -794,7 +794,7 @@ export async function runWithRemoteDecision({
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
   };
-  let reason; let timer;
+  let reason; let detail; let timer;
   const controller = new AbortController();
   const timedOut = Symbol('remote-timeout');
   try {
@@ -839,6 +839,7 @@ export async function runWithRemoteDecision({
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
+      detail = result?.detail;
     }
   } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
   finally {
@@ -853,7 +854,7 @@ export async function runWithRemoteDecision({
       if(!outstanding)releaseOwnedSlot({...slotOptions,fastSlots:0});
     }
   }
-  const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}`;
+  const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
 }

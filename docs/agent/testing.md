@@ -3313,6 +3313,30 @@ from the test runner. The named
 `falls back before transport for a whole-directory ignored test` table pins remote refusal.
 Run this fixture and the affected Forge tests through heavy admission.
 
+`forge-manifest-parity.test.mjs` checks full and delta inventories against an independent
+filesystem oracle, including hostile `GIT_*` environments, omitted tests, memory bridges,
+and replaced file identities. Mutation proofs remove each binding or walk guard separately
+and restore it before the next run. Transport fixtures must ship every test-shaped leaf
+they create; exact rsync lists and dependency-cache digests include those leaves. Keep
+fixture-only Git metadata outside the worker snapshot (or remove it after client manifest
+construction), since the runner rejects extra directories.
+
+Stub SSH reachability in manifest-refusal fixtures and reject later transport calls;
+real host availability must not decide whether a filesystem guard is exercised.
+
+The named `refuses missing tracked leaves without explicit deletion evidence` table
+must cover both Git inventories that retain a missing leaf and inventories that omit
+it. Failed, thrown, malformed, truncated, absent, wrong-path and non-deletion evidence
+must report `manifest-worktree-mismatch` before prepare or transfer, in full and delta
+builds. The `deletion-evidence mutation gate` imports isolated in-memory copies of
+the client and removes each cross-check (d) guard independently, including the whole
+check; the same bad inventory must escape only in the mutant. Production files are
+never rewritten by these probes, and a missing mutation target fails the test.
+
+Keep direct bound-exec missing-cwd cases and the delta builder's default-cwd case.
+Row 13 configures a side-effecting fsmonitor hook: require its sentinel to stay absent
+and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
+
 Remote discovery may overlap reachability, HEAD and base discovery, but drain every
 speculative process before returning fallback. `buildManifest` always lists ignored files
 fresh after base-manifest retrieval; ignored tests created during retrieval must still
@@ -3530,3 +3554,68 @@ indeterminate run must be inspected before starting a new pass. Focused proof li
 `scripts/operations/__tests__/manual-daemon-pass.test.mjs`; operation enumeration and declaration
 map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
 discovers script modules dynamically and has no hand-maintained operation list.
+
+## Forge coverage timestamp parity
+
+Remote transport stubs must answer the worktree-binding probe before inventory or SSH;
+use `fixtures/forge-bound-git.mjs` in injected-Git fixtures so transport-failure tests
+reach their intended run/finish branch. Keep their exact dispatch and no-local-rerun assertions.
+
+Coverage report rewrites must restore the timestamp captured from the open source file.
+Re-reading the staged timestamp and converting it again can truncate another microsecond,
+making coverage older than a source with the same original mtime. The absolute-path coverage
+table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
+compares staged nanoseconds before its `cpSync` transport loses sub-millisecond precision.
+
+## Forge tracked-symlink parity
+
+Forge projects stage-0 index symlinks to regular files; it never ships or follows a
+symlink during transfer. The link's working bytes must hash to its index blob OID,
+all parent and target directories must be real directories, and the target
+must stay inside the repository and contain tracked content. This rule applies to
+every path, including the memory and skills bridges. Untracked, changed, unmerged,
+escaping or incomplete links refuse with `unshipped-symlink`. Cyclic projections
+also refuse; expanding links share the walk's count/byte limits and report
+`manifest-walk-limit` when those limits are exceeded.
+
+Apply the path policy to every projected leaf, including nested aliases and normalized
+`node_modules` components. Excluded aliases refuse with `unshipped-symlink` in full
+and delta builds. Only the exact `.claude/skills/` and `.claude/agent-memory/` prefixes
+are exempt from the dot-directory exclusion; their remaining path components still
+must pass policy. The named policy-excluded tracked-alias table includes credential,
+dot-directory, NFKC and invisible-character variants and checks refusal before transport.
+
+Manifest refusals keep the reason code separate from `detail`: the offending path
+relative to the checkout, decoded as lossy UTF-8 and kept on one line. Preserve
+this detail through verification wrappers and remote fallback; heavy admission
+logs it with the shared `oneLine` sanitizer and bound.
+
+Symlink-detail fixtures must use valid manifest byte paths: invalid UTF-8, tabs,
+ESC, DEL and Unicode line separators can exercise lossy decoding and sanitization,
+but LF/CR are rejected by `pathParts` before the inventory symlink check. Keep
+separate negative cases for LF/CR that assert rejection before filesystem inspection.
+
+Projected entries retain their regular `sourcePath` and link evidence for staging
+reverification. Delta manifests always transfer projected leaves, including unchanged
+ones: their alias paths have no corresponding regular Git blob for digest assembly.
+Keep the full/delta filesystem oracle, negative admission cases and staging-swap
+case in `forge-manifest-parity.test.mjs`, plus the real manifest/stager/worker fixture
+in `remote-exec.test.mjs`. Run these and the affected fast-manifest/offload suites
+through the host heavy-admission queue.
+
+## Forge ignored leaves under tracked directory links
+
+Ignored non-test regular files under a tracked directory link's source are omitted
+at both ordinary and projected paths. The filesystem cross-check uses the fresh
+ignored byte inventory; it still refuses untracked symlinks, missing projections
+for non-ignored regular files, and policy-excluded source leaves, even when ignored.
+`forge-manifest-parity.test.mjs` rows 20–25 and 31 cover those boundaries for full and
+delta manifests, including ignored runtime JSON beside a `node_modules/.bin` symlink
+and the earlier `ignored-test-file` refusal. Row 20 omits ignored runtime data at the
+excluded `.claude/skills` alias only when the leaf is not source code and the remainder
+after the link prefix is not policy-excluded; row 31 retains omission parity through an allowed alias.
+Check every projected alias before skipping an ignored leaf, including nested link
+projections: a non-test source can become a test under `tests/`, or acquire an
+excluded component. Rows 26–30 pin those refusals and benign nested omissions for
+full and delta manifests. Alias expansion shares the filesystem walk's limits and
+refuses with `manifest-walk-limit` (local fallback) when that budget is exhausted.
