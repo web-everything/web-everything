@@ -74,11 +74,33 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
 }
 
-/** Shared bounded lock: records the holder pid, waits for short concurrent writes, and
- * reclaims dead/legacy/partially-written claims after 30s. Live holders are never aged out.
+/** Shared bounded lock: bind the pid to its birth time, host and namespace so PID reuse
+ * cannot strand recovery. Legacy numeric claims retain their liveness guard. Unreadable
+ * identities and live holders are never aged out; incomplete claims retain the 30s grace.
  */
-export function withRedTeamStatusClaim(path, write) {
-  try { return withFileLock(`${path}.retry-claim`, write, { timeoutMs: 1000 }); }
+export function withRedTeamStatusClaim(path, write, { readPidStart = pidStartTime } = {}) {
+  const host = hostname(), namespace = pidNamespace();
+  // Keep the numeric first line so older writers still recognize a live holder.
+  const holderText = `${process.pid}\n${JSON.stringify({ pid: process.pid,
+    pidStart: readPidStart(process.pid), host, pidNamespace: namespace })}\n`;
+  const probeHolderLiveness = claimPath => {
+    const [pidText, identityText] = readFileSync(claimPath, 'utf8').trim().split('\n');
+    const pid = Number(pidText);
+    if (!Number.isSafeInteger(pid) || pid <= 0) return 'unknown';
+    let identity;
+    try { identity = JSON.parse(identityText); } catch { /* legacy numeric or interrupted metadata write */ }
+    // A local pid says nothing about a process on another host or in another pid namespace.
+    if (identity && (identity.pid !== pid || identity.host !== host || identity.pidNamespace !== namespace)) return 'alive';
+    try { process.kill(pid, 0); }
+    catch (error) { return error.code === 'ESRCH' ? 'dead' : 'alive'; }
+    if (typeof identity?.pidStart !== 'string' || !identity.pidStart.trim()) return 'alive';
+    let start;
+    try { start = readPidStart(pid); } catch { return 'alive'; }
+    if (typeof start !== 'string' || !start.trim()) return 'alive';
+    const normalize = value => value.trim().replace(/\s+/g, ' ');
+    return normalize(start) === normalize(identity.pidStart) ? 'alive' : 'dead';
+  };
+  try { return withFileLock(`${path}.retry-claim`, write, { timeoutMs: 1000, holderText, probeHolderLiveness }); }
   catch (error) {
     if (error.message?.startsWith('withFileLock: timed out')) {
       throw Object.assign(Error('red-team status writer busy; retry next tick'), { code: 'RED_TEAM_RETRY_ADMITTED' });

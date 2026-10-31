@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { pidNamespace } from '../../lib/pid-alive.mjs';
+import { pidNamespace, pidStartTime } from '../../lib/pid-alive.mjs';
+import { withFileLock } from '../../lib/atomic-json-file.mjs';
 import * as evidence from '../../lib/drain-red-team-evidence.mjs';
 import * as recovery from '../../lib/review-red-team-on-skip.mjs';
 import { createReviewJobIo, dispatchReviewJob, runReviewJob, runReviewJobCli } from '../review-job.mjs';
@@ -15,6 +16,12 @@ import { runRedTeam, runExtraSeatsCli } from '../review-extra-seats.mjs';
 import { resumeRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 
 const interruption = vi.hoisted(() => ({ boundary: null }));
+// Keep process metadata deterministic even where the OS sandbox prohibits ps.
+// Numeric PID liveness and all claim/status filesystem operations remain real.
+vi.mock('../../lib/pid-alive.mjs', async importOriginal => {
+  const pid = await importOriginal();
+  return { ...pid, pidStartTime: owner => owner === process.pid ? 'fixture-current-start' : pid.pidStartTime(owner) };
+});
 vi.mock('node:fs', async importOriginal => {
   const fs = await importOriginal();
   return { ...fs, openSync: (...args) => {
@@ -339,6 +346,94 @@ it.each(['99999999\n', '', 'legacy-claim'])('recovers a dead or incomplete stale
   const old = new Date(Date.now() - 60_000); utimesSync(claim, old, old);
   expect(f.abandon().ok).toBe(true);
   expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+it.each(['recovery', 'queued', 'running', 'finished'])('reclaims a stale %s claim after its pid is reused', status => {
+  const f = fixture(), claim = `${f.path}.retry-claim`;
+  // The pid really exists; its birth time proves this claim belongs to an earlier process.
+  writeFileSync(claim, `${process.pid}\n${JSON.stringify({ pid: process.pid, pidStart: 'an-earlier-process',
+    host: hostname(), pidNamespace: pidNamespace() })}\n`);
+  const old = new Date(Date.now() - 86_400_000); utimesSync(claim, old, old);
+  if (status === 'recovery') {
+    expect(f.abandon().ok).toBe(true);
+    expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+  } else {
+    evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status }, { env: f.env });
+    expect(evidence.readRedTeamStatus(f.key).status).toBe(status);
+  }
+});
+
+it('a status claim persists the actual holder process identity before entering the write', () => {
+  const f = fixture(), claim = `${f.path}.retry-claim`;
+  evidence.withRedTeamStatusClaim(f.path, () => {
+    const [pid, identity] = readFileSync(claim, 'utf8').trim().split('\n');
+    expect(Number(pid)).toBe(process.pid);
+    expect(JSON.parse(identity)).toEqual({ pid: process.pid, pidStart: pidStartTime(process.pid),
+      host: hostname(), pidNamespace: pidNamespace() });
+    expect(JSON.parse(identity).pidStart).toEqual(expect.any(String));
+  });
+  expect(() => statSync(claim)).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+});
+
+it.each(['matching', 'normalized', 'unreadable', 'throws', 'foreign-host', 'foreign-namespace', 'missing-start', 'mismatched-pid', 'partial'])
+('preserves an aged status claim when its owner identity is %s', kind => {
+  const f = fixture(), claim = `${f.path}.retry-claim`;
+  const identity = { pid: process.pid, pidStart: 'original start', host: hostname(), pidNamespace: pidNamespace() };
+  if (kind === 'foreign-host') identity.host = 'another-host';
+  if (kind === 'foreign-namespace') identity.pidNamespace = 'another-namespace';
+  if (kind === 'missing-start') delete identity.pidStart;
+  if (kind === 'mismatched-pid') identity.pid++;
+  const bytes = `${process.pid}\n${kind === 'partial' ? '{' : JSON.stringify(identity)}\n`;
+  writeFileSync(claim, bytes);
+  const old = new Date(Date.now() - 86_400_000); utimesSync(claim, old, old);
+  const write = vi.fn(), before = readFileSync(f.path, 'utf8');
+  const readPidStart = () => {
+    if (kind === 'throws') throw Error('identity unavailable');
+    return kind === 'unreadable' ? null : kind === 'matching' ? 'original start'
+      : kind === 'normalized' ? ' original   start ' : 'replacement start';
+  };
+  // Let our own stamp be read normally; the injected failures apply only to the holder probe.
+  let reads = 0;
+  expect(() => evidence.withRedTeamStatusClaim(f.path, write, {
+    readPidStart: () => ++reads === 1 ? pidStartTime(process.pid) : readPidStart(),
+  })).toThrow(expect.objectContaining({ code: 'RED_TEAM_RETRY_ADMITTED' }));
+  expect(write).not.toHaveBeenCalled();
+  expect(readFileSync(claim, 'utf8')).toBe(bytes);
+  expect(readFileSync(f.path, 'utf8')).toBe(before);
+});
+
+it('a fresh status claim with a reused pid retains the initialization grace', () => {
+  const f = fixture(), claim = `${f.path}.retry-claim`, write = vi.fn();
+  const bytes = `${process.pid}\n${JSON.stringify({ pid: process.pid, pidStart: 'an-earlier-process',
+    host: hostname(), pidNamespace: pidNamespace() })}\n`;
+  writeFileSync(claim, bytes);
+  expect(() => evidence.withRedTeamStatusClaim(f.path, write))
+    .toThrow(expect.objectContaining({ code: 'RED_TEAM_RETRY_ADMITTED' }));
+  expect(write).not.toHaveBeenCalled(); expect(readFileSync(claim, 'utf8')).toBe(bytes);
+});
+
+it('rollback reclaims a status claim whose owner pid was reused', () => {
+  const f = fixture({ status: 'finished' }), witness = f.readWitness();
+  evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', admissionId: 'ours' }, { env: f.env });
+  const claim = `${f.path}.retry-claim`;
+  writeFileSync(claim, `${process.pid}\n${JSON.stringify({ pid: process.pid, pidStart: 'an-earlier-process',
+    host: hostname(), pidNamespace: pidNamespace() })}\n`);
+  const old = new Date(Date.now() - 86_400_000); utimesSync(claim, old, old);
+  evidence.restoreRecoveryWriter(f.key, witness, 'ours');
+  expect(f.readWitness().rawWriter.parsed).toEqual(witness.rawWriter.parsed);
+});
+
+it('the shared lock probes the actual moved claim before completing identity-based takeover', () => {
+  const f = fixture(), claim = `${f.path}.retry-claim`, write = vi.fn();
+  writeFileSync(claim, 'dead-identity');
+  const old = new Date(Date.now() - 60_000); utimesSync(claim, old, old);
+  // The competing holder is aged too: only the post-move identity check protects it.
+  expect(() => withFileLock(claim, write, { timeoutMs: 20, pollMs: 1,
+    holderText: 'our-identity',
+    probeHolderLiveness: path => readFileSync(path, 'utf8') === 'dead-identity' ? 'dead' : 'alive',
+    onBeforeStaleTakeover: () => { writeFileSync(claim, 'live-identity'); utimesSync(claim, old, old); },
+  })).toThrow(/timed out/);
+  expect(write).not.toHaveBeenCalled(); expect(readFileSync(claim, 'utf8')).toBe('live-identity');
 });
 
 it('a stale claim held by a live writer is preserved', () => {

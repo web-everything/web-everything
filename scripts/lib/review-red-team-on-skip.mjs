@@ -104,7 +104,7 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
         priorWriter: w.rawWriter.sha256, abandonedAt }, { mode: 0o600 });
       writeJson(path, next);
       return { ok: true };
-    });
+    }, { readPidStart: probe.readPidStart });
   } catch { return { ok: false }; }
 }
 
