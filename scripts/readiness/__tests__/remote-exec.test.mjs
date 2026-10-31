@@ -1446,6 +1446,19 @@ original_fstat = os.fstat`);
 });
 
 describe('receipt field binding', () => {
+  it.each([
+    {memoryPeakBytes:200,cpuUsec:30,oomKills:0,slotCpus:8},
+    {memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8},
+  ])('accepts additive resource measurements %j',async resources=>{
+    expect(await runRemote(fixture({receipt:(_n,v)=>JSON.stringify({...v,resources})}))).toEqual({mode:'remote',code:0});
+  });
+  it.each([{},null,{memoryPeakBytes:-1,cpuUsec:0,oomKills:0,slotCpus:8},
+    {memoryPeakBytes:0,cpuUsec:0,oomKills:0,slotCpus:0},
+    {memoryPeakBytes:0,cpuUsec:0,oomKills:0,slotCpus:8,extra:true},
+  ])('rejects malformed additive resource evidence %j',async resources=>{
+    expect(await runRemote(fixture({receipt:(_n,v)=>JSON.stringify({...v,resources})}))).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
   function expectValidReceipt(value) {
     const {phase,code,...expected} = value;
     expect(phase).toBe('test');

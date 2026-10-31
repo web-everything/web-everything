@@ -280,7 +280,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect(log).not.toContain('production');
     expect(log).not.toContain(process.env.HOME);
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,inputDigest:request.inputDigest,
-      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
+      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,resources:{memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8},timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
     expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
@@ -486,7 +486,7 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 2
+    assert chown.call_count == 3
     assert chown.call_args.args[1:] == (0, 0)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
@@ -495,7 +495,7 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(installed.status,installed.stderr).toBe(0);
     const names=await readdir(join(local,'libexec'));
-    expect(names.sort()).toEqual(['forge-exec-run.mjs','forge-warm-base.mjs']);
+    expect(names.sort()).toEqual(['forge-exec-limits.mjs','forge-exec-run.mjs','forge-warm-base.mjs']);
     const entry=join(local,'libexec','forge-exec-run.mjs');
     expect((await stat(entry)).mode & 0o777).toBe(0o755);
     // Disable newer Node's syntax detection to retain the Node 22.1 default.
@@ -506,6 +506,12 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(result.status,result.stderr).toBe(254);
     expect(result.stderr).toBe('forge-exec-run: Invalid subcommand\n');
+    const limiter=join(local,'libexec','forge-exec-limits.mjs');
+    expect((await stat(limiter)).mode & 0o777).toBe(0o755);
+    const limitsResult=spawnSync(limiter,['unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
+    expect(limitsResult.status,limitsResult.stderr).toBe(1);
+    expect(limitsResult.stderr).toBe('forge-exec-limits: Expected apply\n');
     const warmer=join(local,'libexec','forge-warm-base.mjs');
     expect((await stat(warmer)).mode & 0o777).toBe(0o755);
     const warmResult=spawnSync(warmer,['unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
@@ -1132,4 +1138,73 @@ describe('sibling manifest verification', () => {
     expect((await stat(rejected)).mode & 0o777).toBe(0o600);
     expect(await runner.finish(request)).toMatchObject({phase:'rejected',started:false});
   });
+});
+
+
+describe('slot resource environment and receipts',()=>{
+  it.each([undefined,'3'])('defaults worker count while permitting a request override %s',async workers=>{
+    const seen=[];
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async call=>{
+      seen.push(call);
+      return {code:0,stdout:'',stderr:''};
+    }});
+    request.env={CI:'true',...(workers?{WE_VITEST_MAX_WORKERS:workers}:{})};
+    await runner.run(request);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    for(const call of seen) expect(call.env.FORGE_SLOT_CPUS).toBe('8');
+    expect(seen[0].env.WE_VITEST_MAX_WORKERS).toBe('8');
+    expect(seen.at(-1).env.WE_VITEST_MAX_WORKERS).toBe(workers??'8');
+    expect(JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8')).resources)
+      .toEqual({memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8});
+  });
+  it('refuses request overrides of the slot CPU ceiling before execution',async()=>{
+    request.env.FORGE_SLOT_CPUS='100';
+    await expect(runner.run(request)).rejects.toThrow('Invalid execution parameters');
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('accumulates per-command usage in the protected receipt',async()=>{
+    let count=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      count++;
+      return {code:0,stdout:'',stderr:'',usage:{memoryPeakBytes:count===1?200:100,cpuUsec:10,oomKills:1}};
+    }});
+    await runner.run(request);
+    expect(count).toBeGreaterThanOrEqual(2);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(receipt.resources).toEqual({memoryPeakBytes:200,cpuUsec:count*10,oomKills:count,slotCpus:8});
+    expect((await runner.finish(request)).resources).toEqual(receipt.resources);
+  });
+});
+
+it.each([false,true])('reads supervisor cgroup counters with missing counters=%s',async missing=>{
+  const usage=join(root,'usage.json');
+  const source=supervisorSource.slice(supervisorSource.indexOf("if 'usage' in cfg:"),supervisorSource.indexOf("fd = os.open(cfg['status']"));
+  const probe=String.raw`import os, sys, json, io, builtins
+from unittest.mock import patch
+source, usage, missing = sys.argv[1:]
+cfg = {'usage': usage}
+files = {'/proc/self/cgroup': '0::/forge-exec.slice/forge-exec-3.slice/scope\n',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.peak': '12345',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.events': 'oom 2\noom_kill 1\n'}
+def counter_open(path, *args, **kwargs):
+    if missing == 'true' and path != '/proc/self/cgroup': raise FileNotFoundError(path)
+    return io.StringIO(files[path])
+with patch.object(builtins, 'open', side_effect=counter_open):
+    exec(source)
+# A second write must refuse to overwrite existing protected evidence.
+try:
+    with patch.object(builtins, 'open', side_effect=counter_open):
+        exec(source)
+except FileExistsError:
+    pass
+else:
+    raise AssertionError('usage write was not exclusive')
+`;
+  const result=spawnSync('python3',['-I','-c',probe,source,usage,String(missing)],{encoding:'utf8',timeout:10000});
+  expect(result.status,result.stderr).toBe(0);
+  expect(JSON.parse(await readFile(usage,'utf8'))).toEqual(missing
+    ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null}
+    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1});
+  expect(supervisorSource.indexOf("if 'usage' in cfg:")).toBeGreaterThan(supervisorSource.indexOf('if not uid_processes(): break'));
 });
