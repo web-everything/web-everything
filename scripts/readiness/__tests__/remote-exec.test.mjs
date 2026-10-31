@@ -905,6 +905,38 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ignored-test-file'});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
+  it.each([
+    'scripts/build/__tests__/unit/lost.test.mjs',
+    'scripts/out/__tests__/unit/lost.test.mjs',
+    'scripts/coverage/__tests__/unit/lost.test.mjs',
+    'scripts/.next/__tests__/unit/lost.test.mjs',
+    'scripts/.vite/__tests__/unit/lost.test.mjs',
+    'scripts/.cache/__tests__/unit/lost.test.mjs',
+    'scripts/storybook-static/__tests__/unit/lost.test.mjs',
+    'scripts/_site/__tests__/unit/lost.test.mjs',
+    'scripts/dist/__tests__/unit/lost.test.mjs',
+    '_site/output.test.mjs',
+    'dist/output.test.mjs',
+    'scripts/quote\' space 雪/build/__tests__/unit/lost.test.mjs',
+  ])('falls back before transport for a whole-directory ignored test: %s', async name => {
+    const f = fixture();
+    f.argv = ['npm', 'run', 'test:unit'];
+    const exec = f.exec;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'git' && call.args.includes('-i')) {
+        return {code:0, stdout:Buffer.from(name+'\0')};
+      }
+      // Model check-ignore evidence from a whole-directory rule (including info/exclude).
+      if (call.file === 'git' && call.args[0] === 'check-ignore') {
+        return {code:0, stdout:call.input};
+      }
+      return exec(call);
+    });
+    await expect(remoteManifestAPI.buildManifest(f)).rejects.toMatchObject({code:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ignored-test-file'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
   it('allows ignored non-tests and dependency/Git internals', async () => {
     spawnSync('git',['init','--quiet'],{cwd});
     writeFileSync(join(cwd,'.gitignore'),'secret.txt\nnode_modules/\n');
