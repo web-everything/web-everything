@@ -3303,6 +3303,11 @@ lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
 
 ## Live operator routing fixtures
 
+Review-seat roster fixtures must cover scoped added seats as well as exact keys. Use
+`rosterForKey` at every lookup: exact settings-backed contracts win, and other `review-seat:`
+keys return the shared added-seat roster by identity so provider caps still apply. Pin primary
+and fallback rejection, unchanged preference bytes, and default-zero versus explicitly enabled caps.
+
 `dispatch-routing-policy-io.test.mjs` covers rejecting schema-valid live overrides with no usable
 route, retaining the last-good policy and applied-event state, and recovering on a valid edit.
 The reader and writer share the route probe and provider caps from `scripts/lib`; keep that
