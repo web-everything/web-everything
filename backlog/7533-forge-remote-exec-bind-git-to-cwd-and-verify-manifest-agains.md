@@ -21,12 +21,13 @@ In we:scripts/readiness/remote-exec.mjs:
 
 1. bindGit({cwd, env}) covers every git call (buildManifest, buildDeltaManifest, selectBase, both rev-parse HEAD calls, createGitBlobReader, digestDeltaInput, checkSibling). It strips all GIT_* env (including GIT_CONFIG_*, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY), resolves the toplevel and absolute git dir once, requires realpath(toplevel) equal to realpath(cwd) or refuses with `unbound-worktree`, and prefixes every call with --git-dir, --work-tree and -c core.fsmonitor=false. exec takes an env param; test execs go through the binding.
 2. After the manifest is built, a git-free filesystem walk (skipping node_modules and .git) fails closed to fallback(), never not-started, when: (a) a test file in the walk is not shipped (`unshipped-test-file`); (b) a symlink other than we:.claude/agent-memory exists, the link fails verifyMemoryLink, or an we:agent-memory-src file lacks a projection (`unshipped-symlink`); (c) a manifest entry is missing or has a type or dev/ino mismatch (`manifest-worktree-mismatch`); (d) a tracked path is missing from the walk and is not a deletion. Cost about 0.2s.
+3. File-time fidelity: staged files keep their source mtime at full (nanosecond, statSync bigint mtimeNs) precision, and the walk check fails closed on any mtime mismatch.
 
 ## MVP
 
 Steps 1 and 2 above, plus the parity test below. Nothing else ships in this card.
 
-## Test plan (15-row matrix)
+## Test plan (16-row matrix)
 
 New file we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs, table-driven. An oracle (pure filesystem walk plus sha256) is compared with the full manifest and the delta manifest. Rows:
 
@@ -45,6 +46,7 @@ New file we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs, table-dr
 13. fsmonitor hook
 14. filter= attribute
 15. deleted tracked file
+16. coverage report older than its source by < 1 ms must stay stale after staging (red-team result abdcb020387f660a, PR #6059, we:scripts/readiness/remote-exec.mjs:724 passes a ms-truncated Date to utimes)
 
 ## Proof plan
 
@@ -57,6 +59,10 @@ Cards: 7532 (GIT_DIR inventory/HEAD gap on PR 6059, closed by this card), 7529 (
 ## Ordering
 
 Stacks on PR 6059 (branch lane/forge-remote-exec-s2); must land after it.
+
+## Progress
+
+- 2026-10-31: operator ruling R285 ("A", 2026-10-31 08:39 ET) added the file-time fidelity requirement (Design step 3) and matrix row 16.
 
 ## Acceptance
 
