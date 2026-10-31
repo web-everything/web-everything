@@ -19,7 +19,7 @@ import {
   acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
   runUnderAdmission, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
-  admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
+  admissionLockRoot, admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
   DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_SWITCH_ENV,
   DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, LOAD_ADMISSION_MIN_IDLE_PCT_ENV,
   DEFAULT_LOAD_ADMISSION_WINDOW, LOAD_ADMISSION_WINDOW_ENV,
@@ -127,6 +127,27 @@ const iso = (ms) => new Date(ms).toISOString();
 let lockRoot;
 beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'heavy-admission-test-')); });
 afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+
+describe('daemon scratch pool resolution (GUARD)', () => {
+  it('a temp-dir repo resolves the own-checkout pool', () => {
+    const ownCheckout = join(lockRoot, 'workspace', '.lanes', 'web-everything', 'lane-1');
+    const pool = join(lockRoot, 'workspace', '.lanes');
+    const exists = vi.fn(path => path === pool);
+    expect(admissionLockRoot(join(lockRoot, 'scratch', 'repo'), {}, { ownCheckout, exists }))
+      .toBe(join(pool, '.admission', 'heavy'));
+    expect(exists.mock.calls.map(([path]) => path)).toEqual([join(lockRoot, 'scratch', '.lanes'), pool]);
+  });
+
+  it('does not use the own-checkout pool under test or over an explicit pool', () => {
+    const ownCheckout = join(lockRoot, 'workspace', '.lanes', 'web-everything', 'lane-1');
+    const repo = join(lockRoot, 'scratch', 'repo'), exists = vi.fn(() => true);
+    expect(admissionLockRoot(repo, { VITEST: 'true' }, { ownCheckout, exists }))
+      .toBe(join(lockRoot, 'scratch', '.lanes', '.admission', 'heavy'));
+    expect(admissionLockRoot(repo, { LANE_POOL_ROOT: join(lockRoot, 'private-pool') }, { ownCheckout, exists }))
+      .toBe(join(lockRoot, 'private-pool', '.admission', 'heavy'));
+    expect(exists).not.toHaveBeenCalled();
+  });
+});
 
 describe('CLI relative --repo', () => {
   it('resolves the repo before deriving the shared admission root and owner', () => {
