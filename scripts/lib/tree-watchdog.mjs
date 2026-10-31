@@ -43,14 +43,14 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
     clearTimeout(timer);
     clearInterval(beat);
     // Do not tear down an isolate during ESM evaluation (Node 22 can abort in AsyncModuleExecutionFulfilled).
-    // Close the port only after the import settles; cancellation also exits any handles the module left alive.
-    if (!loading) port.close();
+    // Exit only after imports and any escape sweeps finish. Closing the port alone leaves heartbeat-owned
+    // handles alive, so stop() would hang after the deadline fired just as it would during cancellation.
+    if (!loading) process.exit(0); // Ends only this worker thread, including the module's live handles.
   };
   const stop = () => {
     stopRequested = true;
     if (loading) return;
     cleanup();
-    process.exit(0); // Ends only this worker thread, even if the heartbeat module owns live handles.
   };
   port.on('message', (message) => { if (message === 'stop') stop(); });
   const timer = setTimeout(() => {
