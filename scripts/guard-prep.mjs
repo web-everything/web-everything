@@ -9,7 +9,8 @@ function applies(event) {
   const normalized = typeof type === 'string' ? type.trim().toLowerCase() : '';
   const prompt = event?.tool_input?.prompt;
   return event?.hook_event_name === 'PreToolUse' && ['Agent', 'Task'].includes(event.tool_name)
-    && ['', 'codex-runner', 'worker', 'general-purpose'].includes(normalized)
+    // Only known read-only types bypass preparation; fork and unknown types can carry tools.
+    && !['explore', 'plan', 'claude-code-guide'].includes(normalized)
     && typeof prompt === 'string' && PREP_BUILD_VERB.test(prompt)
     && /\b(open-pr|push|pull request|PR)\b/i.test(prompt)
     && !isPrepExempt(prompt.trim().slice(0, 240).split(/(?:[.!?](?:\s|$)|[\r\n])/, 1)[0]);

@@ -28,6 +28,12 @@ describe('guard-prep', () => {
     expect(decide(input)).not.toBeNull();
     expect(decide({ ...input, tool_name: 'Task' })).not.toBeNull();
   });
+  it.each(['fork', ' FORK ', 'statusline-setup', 'custom-writer', 42, {}])('requires prep for writable or unknown type %j', (type) => {
+    for (const tool_name of ['Agent', 'Task']) {
+      expect(decide({ ...event(prompt, type), tool_name })?.hookSpecificOutput.permissionDecision).toBe('deny');
+      expect(decide({ ...event(prompt + prep, type), tool_name })).toBeNull();
+    }
+  });
   it('allows complete prep and a reasoned waiver', () => {
     expect(decide(event(prompt + prep))).toBeNull();
     expect(decide(event(prompt + '\nprep: waived — urgent incident'))).toBeNull();
@@ -64,7 +70,7 @@ describe('guard-prep', () => {
       });
     }
   });
-  it.each(['Explore', 'Plan', 'claude-code-guide', 'statusline-setup'])('allows read-only type %s', (type) => {
+  it.each(['Explore', 'Plan', 'claude-code-guide'])('allows read-only type %s', (type) => {
     expect(decide(event(prompt, type))).toBeNull();
   });
   it.each(['Inspect source and open-pr', 'Build locally', 'Review implementation'])('allows non-build-publication prompt %s', (text) => {
@@ -77,6 +83,15 @@ describe('guard-prep', () => {
     const output = spawnSync(process.execPath, [guard], { input: JSON.stringify(event()), encoding: 'utf8' });
     expect(output.status).toBe(0);
     expect(JSON.parse(output.stdout)).toEqual(decide(event()));
+    expect(output.stderr).toBe('');
+  });
+  it('denies a tool-bearing fork via real stdin', () => {
+    const output = spawnSync(process.execPath, [guard], {
+      input: JSON.stringify(event(prompt, 'fork')), encoding: 'utf8', timeout: 10_000,
+    });
+    expect(output.status).toBe(0);
+    expect(output.stdout).not.toBe('');
+    expect(JSON.parse(output.stdout)).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny' } });
     expect(output.stderr).toBe('');
   });
   it('allows waiver and writes an audit line through the boundary using one verdict and applicability check', () => {

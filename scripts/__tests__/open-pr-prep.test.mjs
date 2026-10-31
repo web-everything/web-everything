@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -32,6 +32,44 @@ describe('open-pr prep admission', () => {
     writeFileSync(bodyFile, prep);
     expect(runner()({ argv: [...argv.slice(0, 2), '--body-file=body.md'] }).outcome).toBe('opened');
     expect(spawn).toHaveBeenCalledOnce();
+  }));
+  it.each([
+    ['relative', undefined, 'no preparation', 'refused'],
+    ['absolute', undefined, 'no preparation', 'refused'],
+    ['relative', prep, 'no preparation', 'refused'],
+    ['absolute', prep, 'no preparation', 'refused'],
+    ['relative', 'no preparation', prep, 'opened'],
+    ['absolute', 'no preparation', prep, 'opened'],
+  ])('uses filesystem traversal for %s symlink/.. paths (decoy %j, target %j)', (kind, decoy, body, outcome) => fixture(({ dir, runner, argv, spawn, review }) => {
+    mkdirSync(join(dir, '.claude'));
+    mkdirSync(join(dir, 'skills-src'));
+    symlinkSync('../skills-src', join(dir, '.claude', 'skills'));
+    writeFileSync(join(dir, 'AGENTS.md'), body);
+    if (decoy !== undefined) writeFileSync(join(dir, '.claude', 'AGENTS.md'), decoy);
+    const relativePath = '.claude/skills/../AGENTS.md';
+    const bodyPath = kind === 'absolute' ? `${dir}/${relativePath}` : relativePath;
+    const publisherPath = kind === 'absolute' ? bodyPath : `${dir}/${bodyPath}`;
+    expect(readFileSync(publisherPath, 'utf8')).toBe(body);
+    review.mockReturnValue({ action: 'pass', bypass: { reason: 'operator reason', actor: 'operator', operatorInstruction: 'Ship this change' } });
+    let publishedBody;
+    spawn.mockImplementation((_command, args, options) => {
+      expect(options.cwd).toBe(dir);
+      publishedBody = readFileSync(args.find((arg) => arg.startsWith('--body-file=')).slice(12), 'utf8');
+      return { status: 0, stdout: '{"pr":123,"url":"example"}' };
+    });
+    const readPrepBody = vi.fn(readFileSync);
+    const result = runner({ readPrepBody })({ argv: [...argv.slice(0, 2), `--body-file=${bodyPath}`] });
+    expect(result.outcome).toBe(outcome);
+    expect(readPrepBody).toHaveReturnedWith(body);
+    if (outcome === 'refused') {
+      expect(result.reason).toBe('prep-block-missing');
+      expect(review).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
+    } else {
+      expect(spawn).toHaveBeenCalledOnce();
+      expect(publishedBody.startsWith(body)).toBe(true);
+      expect(publishedBody).toContain('operator reason');
+      expect(readFileSync(publisherPath, 'utf8')).toBe(body);
+    }
   }));
   it.each([['description without prep', 'refused'], [prep, 'opened']])('expands ~/ in body-file and enforces prep: %s', (body, outcome) => fixture(({ runner, argv, spawn, review }) => {
     const readPrepBody = vi.fn(() => body);

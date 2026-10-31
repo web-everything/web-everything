@@ -15,7 +15,7 @@
  */
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
@@ -91,21 +91,26 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
  * span) to a COPY of the PR body file. FAILS CLOSED: a bypass whose PR-body note cannot be written throws, so the
  * caller refuses it rather than opening a PR whose body does not record the bypass. `cleanup` removes the copy.
  */
-function withBypassInBody(argv, b) {
+function withBypassInBody(argv, b, cwd) {
   const i = argv.findIndex((a) => a.startsWith('--body-file='));
   if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
-    // Use the same leading-`~` expansion as the prep read and pr-land's expandHome.
-    writeFileSync(out, readFileSync(expandBodyFileHome(argv[i].slice('--body-file='.length)), 'utf8') + renderBypassNote(b));
+    writeFileSync(out, readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8') + renderBypassNote(b));
     return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
   } catch (e) { cleanup(); throw e; }
 }
 
 /** Match pr-land's expandHome exactly: replace any leading `~`, including in `~name`. */
 const expandBodyFileHome = (p) => (p && p.startsWith('~') ? p.replace(/^~/, homedir()) : p);
+
+/** Prefix the publisher's cwd without collapsing symlink/.. traversal (join/resolve would change the target). */
+function bodyFilePath(path, cwd) {
+  const expanded = expandBodyFileHome(path);
+  return isAbsolute(expanded) ? expanded : `${cwd}${sep}${expanded}`;
+}
 
 /** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
 const GATE_ACTIONS = Object.freeze(['pass', 'advise', 'refuse']);
@@ -156,7 +161,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       let readable = true;
       const bodyFile = arg('body-file');
       if (bodyFile) {
-        try { body = readPrepBody(resolve(cwd, expandBodyFileHome(bodyFile)), 'utf8'); }
+        try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
         catch (error) {
           readable = false;
           const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
@@ -185,7 +190,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       // Gate and push are bound to the SAME commit: pr-land publishes exactly the sha the gate judged.
       if (gate.sha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${gate.sha}`];
       if (gate.bypass) {
-        try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, gate.bypass)); }
+        try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, gate.bypass, cwd)); }
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);

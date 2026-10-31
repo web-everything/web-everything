@@ -47,8 +47,10 @@ guard` and `red-team; fix and open-pr` require prep. Other existing exemptions
 still apply when none of the six build words occurs in the statement. Open-pr
 matches exemptions against the entire title only (including `card-only`), never
 the body, with the same precedence and leading-phrase allowlist.
-Omitted/blank agent types are treated as
-general-purpose; other read-only agent types are allowed. Hook exceptions warn,
+Only the known read-only agent types `Explore`, `Plan` and `claude-code-guide`
+bypass the dispatch gate (case and surrounding whitespace are ignored).
+All other types, including `fork`, `statusline-setup`, custom types and omitted/blank types,
+require preparation for build/publication tasks. Hook exceptions warn,
 log `hook-error`, and fail open. Open-pr skips prep for dry runs and warns/delegates
 unreadable body files to its existing handling. Missing or incomplete readable prep
 is refused. Tests inject readers/gates explicitly to isolate other runner checks.
@@ -59,3 +61,6 @@ pr-land's `expandHome` behavior: replace **any** leading `~` with `homedir()` vi
 which concatenate the home directory with the suffix rather than resolve a user
 name. `scripts/__tests__/open-pr-prep.test.mjs` checks that the gate and bypass
 copy read the same file selected by that expansion.
+Both reads use the publisher's working directory for relative paths and preserve
+symlink/`..` segments for filesystem traversal; lexical path normalization can
+select a different body file.
