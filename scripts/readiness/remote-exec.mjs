@@ -253,8 +253,8 @@ async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
 }
 
 const manifestRefusal=code=>Object.assign(new Error(`${code}: use local fallback`),{code});
-// Independent of Git's inventory/ignore rules. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,exec,head,rootInfo,scoped}) {
+// Walk independently of Git's inventory. Never follow a directory link.
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -280,6 +280,20 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       else if(st.isFile()) {
         // (a) Ignored tests still belong to the runner's discovery universe.
         if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file');
+        // Ignored leaves may become tests or excluded paths through directory
+        // aliases. Follow projections transitively, sharing the walk's limits.
+        if(!shipped.has(key)&&ignoredPaths.has(key)&&!classifyManifestPath(path).excluded) {
+          const aliases=[path],seen=new Set([key]);
+          for(const alias of aliases)for(const link of trackedLinks.values())if(underPath(alias,link.sourcePrefix)) {
+            const projected=Buffer.concat([directoryPrefix(link.linkPath),alias.subarray(link.sourcePrefix.length)]);
+            const projectedKey=projected.toString('hex');
+            if(seen.has(projectedKey))continue;
+            if(++count>100000||(bytes+=projected.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
+            if(isTestFile(projected)||classifyManifestPath(projected).excluded)throw manifestRefusal('unshipped-symlink');
+            seen.add(projectedKey);aliases.push(projected);
+          }
+          continue;
+        }
         for(const link of trackedLinks.values())if(underPath(path,link.sourcePrefix)) {
           const projection=shipped.get(Buffer.concat([directoryPrefix(link.linkPath),path.subarray(link.sourcePrefix.length)]).toString('hex'));
           const source=shipped.get(key);
@@ -484,7 +498,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if(projected.has(key))return projected.get(key);
     if(projecting.has(key))throw manifestRefusal('unshipped-symlink');
     projecting.add(key);
-    if ([...excluded,...ignoredPaths].some(path=>underPath(path,link.sourcePrefix)))
+    if (excluded.some(path=>underPath(path,link.sourcePrefix)))
       throw manifestRefusal('unshipped-symlink');
     const targets = sourceEntries.filter(entry=>underPath(entry.path,link.sourcePrefix));
     for(const nested of trackedLinks.values())if(underPath(nested.linkPath,link.sourcePrefix))targets.push(...project(nested));
@@ -531,7 +545,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       throw error;
     }
   }
-  try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
+  try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
+    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch');}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
