@@ -33,6 +33,8 @@ import { fileURLToPath } from 'node:url';
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry } from './registry.mjs';
+import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
+import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
 import {
@@ -188,6 +190,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 
 export const OPERATIONS = Object.freeze({
+  [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
     declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
