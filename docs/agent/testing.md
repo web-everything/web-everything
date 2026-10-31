@@ -3162,8 +3162,12 @@ or concurrent writes: hash those leaves normally, and use fresh stat/mode and ba
 checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
 warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
 read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
-Ignored test-shaped build output is exempt only when `check-ignore`
-confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
+Outside dependency/Git internals, ignored test-shaped files force local fallback, including
+files under wholly ignored build directories: Git ignore evidence does not prove exclusion
+from the test runner. The named
+`refuses runnable scripts/build tests ignored by …` cases cover `.gitignore` and
+`.git/info/exclude` for full and delta manifests; `remote-exec.test.mjs`'s
+`falls back before transport for a whole-directory ignored test` table pins remote refusal.
 Run this fixture and the affected Forge tests through heavy admission.
 
 Remote discovery may overlap reachability, HEAD and base discovery, but drain every

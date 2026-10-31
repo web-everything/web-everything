@@ -292,19 +292,29 @@ describe('fast Git manifest',()=>{
   });
 });
 describe('ignored build output test policy',()=>{
-  it.each(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static','nested/dist'])('skips ignored whole build directory %s',async dir=>{
+  it.each(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static','nested/dist'])('refuses tests in ignored whole build directory %s',async dir=>{
     await write('.gitignore',dir+'/\n');await fs.mkdir(join(cwd,dir),{recursive:true});
     await write(dir+'/output.test.mjs','stale output');
-    const result=await buildManifest({cwd,exec});
-    expect(result.entries.some(entry=>entry.path.toString().includes('output.test'))).toBe(false);
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'ignored-test-file'});
+    await expect(buildDeltaManifest({cwd,exec,base})).rejects.toMatchObject({code:'ignored-test-file'});
+  });
+  it.each(['.gitignore','.git/info/exclude'])('refuses runnable scripts/build tests ignored by %s in full and delta manifests',async ignoreFile=>{
+    const path='scripts/build/__tests__/unit/lost.test.mjs';
+    await write(ignoreFile,'/scripts/build/\n');
+    await fs.mkdir(join(cwd,path,'..'),{recursive:true});
+    await write(path,"import {it,expect} from 'vitest'; it('lost',()=>expect(true).toBe(false));\n");
+    expect((await git(['check-ignore','--no-index','scripts/build'])).toString().trim()).toBe('scripts/build');
+    expect((await git(['ls-files','-o','-i','--exclude-standard','-z'])).toString()).toContain(path+'\0');
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'ignored-test-file'});
+    await expect(buildDeltaManifest({cwd,exec,base})).rejects.toMatchObject({code:'ignored-test-file'});
   });
   it.each(['tests/foo.test.mjs','dist/foo.test.mjs','nested/build/foo.test.mjs'])('refuses ignored tests when only the file is ignored: %s',async path=>{
     await fs.mkdir(join(cwd,path,'..'),{recursive:true});await write('.gitignore',path+'\n');await write(path,'hidden');
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'ignored-test-file'});
   });
-  it('refuses when whole-directory ignore evidence fails',async()=>{
+  it('refuses ignored tests even when whole-directory ignore evidence is unavailable',async()=>{
     await write('.gitignore','dist/\n');await fs.mkdir(join(cwd,'dist'));await write('dist/a.test.mjs','hidden');
     const broken=call=>call.args[0]==='check-ignore'?Promise.resolve({code:2,stdout:Buffer.alloc(0)}):exec(call);
-    await expect(buildManifest({cwd,exec:broken})).rejects.toThrow('Ignored directory evidence unavailable');
+    await expect(buildManifest({cwd,exec:broken})).rejects.toMatchObject({code:'ignored-test-file'});
   });
 });
