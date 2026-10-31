@@ -1,8 +1,18 @@
 import * as filesystem from 'node:fs/promises';
-import {join, resolve} from 'node:path';
+import {isAbsolute, join, resolve, win32} from 'node:path';
 import micromatch from 'micromatch';
 
 const refuse = () => true;
+
+// Only reproduce relative globs with ordinary wildcards and flat literal brace
+// lists. Everything else retains the ignored/unshipped-test local fallback;
+// micromatch accepting syntax does not prove parity with fast-glob discovery.
+function supportedPattern(pattern) {
+  if (isAbsolute(pattern) || win32.isAbsolute(pattern) || pattern.startsWith('!')
+    || pattern.split('/').some(part => !part || part === '.' || part === '..')) return false;
+  const plain = pattern.replace(/\{[A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)+\}/g, 'literal');
+  return /^[A-Za-z0-9_./*?-]+$/.test(plain);
+}
 
 // Pure discovery predicate: every config contributes include minus exclude.
 // Unknown evidence retains the existing ignored/unshipped-test local fallback.
@@ -10,7 +20,7 @@ export function createTestSelector(configs) {
   try {
     if (!Array.isArray(configs) || !configs.length) return refuse;
     const compile = patterns => {
-      if (!Array.isArray(patterns) || patterns.some(p => typeof p !== 'string' || !p.length)) throw new Error('Unknown test globs');
+      if (!Array.isArray(patterns) || patterns.some(p => typeof p !== 'string' || !p.length || !supportedPattern(p))) throw new Error('Unknown test globs');
       return patterns.map(pattern => micromatch.matcher(pattern, {dot:true, strictBrackets:true}));
     };
     const selectors = configs.map(({include, exclude}) => ({include:compile(include), exclude:compile(exclude)}));

@@ -31,7 +31,8 @@ beforeEach(async()=>{
   const full=await buildManifest({cwd,env});base={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
 });
 
-it.each(['missing configs','unreadable config','evaluation failure','invalid include glob','invalid exclude glob'])
+it.each(['missing configs','unreadable config','evaluation failure','invalid include glob','invalid exclude glob',
+  'absolute include glob','absolute exclude glob','negated include glob','negated exclude glob'])
 ('fails closed for an ignored build test with %s in full, delta and remote admission',async fault=>{
   const path='_site/assets/js/__tests__/x.test.ts';
   await write(path,'export {};');await write('.gitignore','_site/\n');
@@ -39,6 +40,12 @@ it.each(['missing configs','unreadable config','evaluation failure','invalid inc
   if(fault==='evaluation failure')await write('vitest.integration.config.mjs',"throw new Error('cannot evaluate discovery');\n");
   if(fault==='invalid include glob'||fault==='invalid exclude glob')await write('vitest.integration.config.mjs',
     `export default {test:{include:${fault==='invalid include glob'?"['[bad']":"[]"},exclude:${fault==='invalid exclude glob'?"['[bad']":"[]"}}};\n`);
+  if(fault.startsWith('absolute')||fault.startsWith('negated')) {
+    const field=fault.includes('include')?'include':'exclude';
+    const pattern=fault.startsWith('absolute')?join(cwd,'_site/**/*.test.ts'):'!other/**';
+    const test={include:['_site/**/*.test.ts'],exclude:[],[field]:[pattern]};
+    await write('vitest.integration.config.mjs',`export default ${JSON.stringify({test})};\n`);
+  }
   const io={...fs,readFile:async(file,...args)=>{
     if(fault==='unreadable config'&&String(file)===join(cwd,'vitest.config.mjs'))throw Object.assign(new Error('denied'),{code:'EACCES'});
     return fs.readFile(file,...args);
