@@ -1098,6 +1098,7 @@ describe('runRemote', () => {
 
   it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
   ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
+    writeFileSync(join(cwd,'vitest.config.mjs'), "export default {test:{include:['**/*.{test,spec}.{ts,mjs}', '**/__tests__/**/*.js'],exclude:[]}};");
     spawnSync('git',['init','--quiet'],{cwd});
     writeFileSync(join(cwd,'.gitignore'), name+'\n');
     mkdirSync(join(cwd, ...name.split('/').slice(0,-1)),{recursive:true});
@@ -1123,6 +1124,7 @@ describe('runRemote', () => {
     'dist/output.test.mjs',
     'scripts/quote\' space 雪/build/__tests__/unit/lost.test.mjs',
   ])('falls back before transport for a whole-directory ignored test: %s', async name => {
+    writeFileSync(join(cwd,'vitest.config.mjs'), readFileSync(new URL('./fixtures/forge-vitest.config.mjs',import.meta.url)));
     const f = fixture();
     f.argv = ['npm', 'run', 'test:unit'];
     const exec = f.exec;
