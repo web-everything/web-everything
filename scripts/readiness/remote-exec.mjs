@@ -834,8 +834,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
             // Pin the leaf and reject special files before reading; NONBLOCK also
             // prevents a raced-in FIFO from hanging admission before fstat.
             const fd = await fs.open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+            let sourceStamp;
             try {
               const st = await fd.stat({bigint:true});
+              sourceStamp = st;
               if (!st.isFile() || !!(st.mode & 0o111n) !== entry.executable) throw new Error('Invalid staging source');
               const mode = entry.executable ? 0o755 : 0o644;
               await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode});
@@ -854,9 +856,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
             if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
             if (snapshot.source === cwd && entry.path.equals(Buffer.from('coverage/coverage-final.json'))) {
               const portable=portableCoverage(stagedContent,cwd);
-              const stamp=await fs.lstat(destination,{bigint:true});
               await fs.writeFile(destination,portable);
-              await fs.utimes(destination,timestampSeconds(stamp,'atime'),timestampSeconds(stamp,'mtime'));
+              // Reuse the pinned source stamp: a second timestamp round trip can
+              // truncate another microsecond and make fresh coverage look stale.
+              await fs.utimes(destination,timestampSeconds(sourceStamp,'atime'),timestampSeconds(sourceStamp,'mtime'));
               transferBytes+=portable.length-stagedContent.length;
               entry.sha256=createHash('sha256').update(portable).digest('hex');
             }

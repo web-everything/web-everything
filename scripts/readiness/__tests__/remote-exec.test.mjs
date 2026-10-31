@@ -2,7 +2,7 @@
 import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync } from 'node:fs';
+import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -1186,6 +1186,10 @@ describe('runRemote', () => {
     const report=JSON.stringify({[join(cwd,tier)]:entry});
     const portableReport=JSON.stringify({[tier]:entry});
     writeFileSync(join(cwd,'coverage/coverage-final.json'),report);
+    // Equal source/report mtimes are fresh. This fractional value loses another
+    // microsecond if the portable rewrite restores the already-staged timestamp.
+    const stamp = 1700000000 + 123406 / 1e6;
+    for (const name of [tier,'coverage/coverage-final.json']) utimesSync(join(cwd,name),stamp,stamp);
     writeFileSync(join(cwd,'coverage/private.json'),'must not ship');
     f.env.DIFF_COVERAGE_BASE='main';
     expect(git('rev-parse','main')).toBe(base);
@@ -1201,7 +1205,12 @@ describe('runRemote', () => {
       if(call.file==='git')return remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}});
       if(call.file==='ssh'&&sshText(call).endsWith(' bases'))return {code:0,stdout:JSON.stringify({delta:1,bases:[{sha:head,manifestDigest:warmDigest}]})};
       if(call.file==='ssh'&&sshText(call).endsWith(' base-manifest'))return {code:0,stdout:JSON.stringify(warm)};
-      if(call.file==='rsync')cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
+      if(call.file==='rsync'){
+        // Check before cpSync's Date-based timestamp preservation loses precision.
+        expect(statSync(join(call.cwd,'coverage/coverage-final.json'),{bigint:true}).mtimeNs)
+          .toBe(statSync(join(call.cwd,tier),{bigint:true}).mtimeNs);
+        cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
+      }
       if(isRun(call)){
         const request=JSON.parse(call.input);
         expect(forgeManifestAPI.allowedEnv(request.env)).toBe(true);

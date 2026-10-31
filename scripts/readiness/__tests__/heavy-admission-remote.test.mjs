@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
 import { runRemote } from '../remote-exec.mjs';
+import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
@@ -428,6 +429,8 @@ describe('runWithRemoteDecision', () => {
       let request;
       const actions = [];
       const exec = vi.fn(async (call) => {
+        const binding = bindingEvidence(call);
+        if (binding) return binding;
         if (call.file === 'git' && call.args.includes('-i')) return { code: 0, stdout: Buffer.alloc(0) };
         if (call.file === 'git' && call.args.includes('--stage')) return { code: 0, stdout: Buffer.alloc(0) };
         if (call.file === 'rsync') return { code: 0, stdout: '' };
@@ -435,6 +438,7 @@ describe('runWithRemoteDecision', () => {
           const action = call.args.at(-1).split(' ').at(-1);
           actions.push(action);
           if (action === 'true') return { code: 0, stdout: '' };
+          if (action === 'bases') return { code: 254, stdout: '' };
           if (action === 'prepare') return { code: 0, stdout: JSON.stringify({ run: 'r-' + JSON.parse(call.input).nonce }) };
           if (action === 'run') {
             request = JSON.parse(call.input);
