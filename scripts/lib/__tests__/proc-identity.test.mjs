@@ -642,7 +642,9 @@ describe('bounded filesystem adapters', () => {
     const nativeRead = readSync.getMockImplementation();
     let total = 0;
     const ranges = [];
+    const readFds = new Set();
     readSync.mockImplementation((fd, buffer, offset, length, position) => {
+      readFds.add(fd);
       ranges.push({ offset, length, capacity: buffer.length });
       const count = nativeRead(fd, buffer, offset, Math.min(length, 65536), position);
       total += count;
@@ -658,7 +660,9 @@ describe('bounded filesystem adapters', () => {
         expect(range.offset + range.length).toBe(maxBytes + 1);
       }
       expect(closeSync).toHaveBeenCalledTimes(1);
-      expect(() => nativeRead(closeSync.mock.calls[0][0], Buffer.alloc(1), 0, 1, null)).toThrow();
+      // The reader closes the exact fd it read from. Never re-read that number: the OS may already have recycled it.
+      expect(readFds.size).toBe(1);
+      expect(closeSync.mock.calls[0][0]).toBe([...readFds][0]);
     } finally {
       readSync.mockImplementation(nativeRead);
       rmSync(root, { recursive: true, force: true });
@@ -757,7 +761,11 @@ describe('real host process identity', () => {
   });
 
   it.skipIf(process.platform === 'win32')('a REAL zombie reads dead on the real host', async () => {
-    const parent = spawn('sh', ['-c', 'true & echo $!; exec sleep 30'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    // An immediately exiting child can be reaped by sh before exec. Keep the
+    // child alive until its parent is observably stopped and cannot reap it.
+    const parent = spawn('sh', ['-c', 'sleep 30 & echo $!; kill -STOP $$; wait'], {
+      detached: true, stdio: ['ignore', 'pipe', 'ignore'],
+    });
     let timer;
     try {
       const pid = await new Promise((resolve, reject) => {
@@ -775,22 +783,29 @@ describe('real host process identity', () => {
         });
       });
       const deadline = Date.now() + 20000;
-      const waitForZombie = async () => {
-        const result = readIdentity(pid);
-        if (result.status === 'ok' && result.identity.state === 'Z') return result.identity;
-        if (Date.now() >= deadline) throw new Error(`Zombie state not observed within 20s: ${JSON.stringify(result)}`);
+      const waitForState = async (target, state) => {
+        const result = readIdentity(target);
+        if (result.status === 'ok' && result.identity.state === state) return result.identity;
+        if (result.status === 'gone') throw new Error(`Process ${target} disappeared before state ${state}`);
+        if (Date.now() >= deadline) throw new Error(`Process ${target} state ${state} not observed within 20s: ${JSON.stringify(result)}`);
         await new Promise((resolve) => setTimeout(resolve, 20));
-        return waitForZombie();
+        return waitForState(target, state);
       };
-      const identity = await waitForZombie();
+      await waitForState(parent.pid, 'T');
+      process.kill(pid, 'SIGKILL');
+      const identity = await waitForState(pid, 'Z');
       expect(identity.state).toBe('Z');
       expect(liveness({ ...identity })).toBe('dead');
     } finally {
       clearTimeout(timer);
       if (parent.pid) {
-        try { process.kill(parent.pid, 'SIGKILL'); } catch (error) {
+        const exited = parent.exitCode !== null || parent.signalCode !== null
+          ? Promise.resolve() : new Promise((resolve) => parent.once('exit', resolve));
+        // Kill the whole fixture group, including the sleeper on setup failure.
+        try { process.kill(-parent.pid, 'SIGKILL'); } catch (error) {
           if (error.code !== 'ESRCH') throw error;
         }
+        await exited;
       }
     }
   }, 30000);
