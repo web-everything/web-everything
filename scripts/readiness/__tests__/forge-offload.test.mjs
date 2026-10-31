@@ -1,4 +1,5 @@
 // @vitest-environment node
+import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 import {describe,it,expect,beforeEach,afterEach,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
@@ -249,24 +250,13 @@ describe('warm base selection and delta proof',()=>{
   it.each([['120000','blob','skills'],['160000','commit','module'],['120000','blob','oauth-source.mjs']])('rejects non-excluded %s tree entry %s %s', (mode,type,path)=>{
     expect(()=>parseGitTree(Buffer.from(`${mode} ${type} ${'a'.repeat(40)}\t${path}\0`))).toThrow('Unsupported git tree mode');
   });
-  it('matches the full-ship digest with excluded symlinks in the base tree',async()=>{
+  it('refuses excluded symlinks in full and delta manifests even when the base predates them',async()=>{
+    const base=await baseFixture();
     await fs.mkdir(join(repo,'.claude'));
     await fs.symlink('../mode.txt',join(repo,'.claude/skills'));
-    await fs.mkdir(join(repo,'agent-memory-src'));
-    await fs.writeFile(join(repo,'agent-memory-src/MEMORY.md'),'# Memory\n');
-    await fs.symlink('../agent-memory-src',join(repo,'.claude/agent-memory'));
     git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
-    const base=await baseFixture();
-    // Keep the link in the base tree, but untrack it for the delta: indexed
-    // memory bridges intentionally require full shipping.
-    git(['rm','--cached','.claude/agent-memory']);
-    await fs.writeFile(join(repo,'mode.txt'),'changed');
-    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
-    const full=await remote.buildManifest({cwd:repo,exec});
-    expect(delta.excluded.map(path=>path.toString())).toEqual(expect.arrayContaining(['.claude/skills','.claude/agent-memory']));
-    expect(delta.entries.some(entry=>entry.path.toString().startsWith('.claude/'))).toBe(false);
-    expect(delta.manifestDigest).toBe(full.manifestDigest);
-    expect(manifestWire(delta)).toEqual(manifestWire(full));
+    await expect(remote.buildManifest({cwd:repo,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+    await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
   it('prefers the newest local ancestor over a newer nonancestor base',async()=>{
     const base=await baseFixture();
@@ -303,11 +293,11 @@ describe('warm base selection and delta proof',()=>{
   });
   it('prefers fewer changed paths for nonancestors and safely retains newest order on missing distance',async()=>{
     const bases=Array.from({length:3},(_,i)=>({sha:String(i).repeat(40),manifestDigest:'a'.repeat(64)}));
-    const probe=vi.fn(async({args})=>({code:args[0]==='merge-base'?1:0,stdout:args[0]==='diff'?Buffer.from(args.includes(bases[1].sha)?'a\0':'a\0b\0'):Buffer.alloc(0)}));
-    expect(await remote.selectBase({exec:probe,bases})).toEqual(bases[1]);
-    expect(probe.mock.calls.length).toBeLessThanOrEqual(4*bases.length);
-    const broken=async call=>call.args[0]==='diff'?{code:1,stdout:Buffer.alloc(0)}:probe(call);
-    expect(await remote.selectBase({exec:broken,bases})).toEqual(bases[0]);
+    const probe=vi.fn(async call=>bindingEvidence(call)??(({args})=>({code:args[0]==='merge-base'?1:0,stdout:args[0]==='diff'?Buffer.from(args.includes(bases[1].sha)?'a\0':'a\0b\0'):Buffer.alloc(0)}))({args:gitArgs(call)}));
+    expect(await remote.selectBase({cwd:repo,exec:probe,bases})).toEqual(bases[1]);
+    expect(probe.mock.calls.filter(([call])=>!call.args.includes('--show-toplevel')).length).toBeLessThanOrEqual(4*bases.length);
+    const broken=async call=>gitArgs(call)[0]==='diff'?{code:1,stdout:Buffer.alloc(0)}:probe(call);
+    expect(await remote.selectBase({cwd:repo,exec:broken,bases})).toEqual(bases[0]);
   });
   it('uses full shipping when no ready base exists locally',async()=>{
     const base=await baseFixture();
@@ -347,7 +337,7 @@ describe('warm base selection and delta proof',()=>{
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
     await fs.writeFile(join(repo,'untracked.txt'),'new');
     const read=vi.fn(path=>fs.readFile(path));
-    const unavailable=call=>call.args[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
+    const unavailable=call=>gitArgs(call)[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
     const delta=await remote.buildDeltaManifest({cwd:repo,exec:unavailable,base,fs:{...fs,readFile:read}});
     const full=await remote.buildManifest({cwd:repo,exec});
     expect(delta.manifestMode).toBe('full-scan');
@@ -373,7 +363,7 @@ describe('warm base selection and delta proof',()=>{
     const base=await baseFixture();let raced=false;
     const racingExec=async call=>{
       const result=await exec(call);
-      if(!raced&&call.args[0]==='diff'&&call.args.at(-2)==='HEAD') {
+      if(!raced&&gitArgs(call)[0]==='diff'&&call.args.at(-2)==='HEAD') {
         raced=true;
         if(fault==='bytes')await fs.writeFile(join(repo,'mode.txt'),'race');
         else await fs.chmod(join(repo,'mode.txt'),0o755);
@@ -517,7 +507,7 @@ describe('runner base materialization refuses before install',()=>{
         if(ignoredCalls===1&&mode==='ignored listing failure')return {code:1,stdout:Buffer.alloc(0)};
         if(ignoredCalls===1&&mode==='ignored listing rejection')throw new Error('ignore inventory unavailable');
       }
-      if(call.file==='git'){if(mode==='git failure'&&call.args[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='git'){if(mode==='git failure'&&gitArgs(call)[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&gitArgs(call)[0]==='cat-file'&&gitArgs(call)[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
       if(call.file==='ssh')expect(call.sshOptions).toEqual(sshOptions);
       if(call.file==='rsync'){
         expect(call.args[call.args.indexOf('-e')+1]).toBe(`ssh ${sshOptions.map(value=>`'${value}'`).join(' ')}`);

@@ -78,10 +78,10 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
-      cwd, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
+      cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
     });
     const stdout = [];
     let bytes = 0;
@@ -109,11 +109,48 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
   });
 }
 
+// A binding is scoped to one real worktree; sibling calls receive their own binding.
+const gitBinding=Symbol('gitBinding');
+export async function bindGit({cwd=process.cwd(),env=process.env,exec=defaultExec}={}) {
+  if(exec[gitBinding]?.cwd===cwd)return exec;
+  const raw=exec[gitBinding]?.raw??exec;
+  const cleanEnv=Object.fromEntries(Object.entries(env).filter(([key])=>!key.startsWith('GIT_')));
+  const unbound=()=>Object.assign(new Error('unbound-worktree: use local fallback'),{code:'unbound-worktree'});
+  let top,dir;
+  try {
+    const result=await raw({file:'git',args:['rev-parse','--show-toplevel','--absolute-git-dir'],cwd,env:cleanEnv});
+    if(result.code!==0)throw unbound();
+    const lines=protocolText(result.stdout,LIMIT).trimEnd().split('\n');
+    if(lines.length!==2||!lines.every(isAbsolute))throw unbound();
+    [top,dir]=lines;
+    if(await filesystem.realpath(top)!==await filesystem.realpath(cwd))throw unbound();
+    dir=await filesystem.realpath(dir);
+  } catch {throw unbound();}
+  const prefix=[`--git-dir=${dir}`,`--work-tree=${top}`,'-c','core.fsmonitor=false'];
+  const bound=async call=>{
+    if(call.file!=='git')return raw(call);
+    if(call.cwd!==cwd)return (await bindGit({cwd:call.cwd,env:cleanEnv,exec:raw}))(call);
+    return raw({...call,args:[...prefix,...call.args],env:cleanEnv});
+  };
+  bound[gitBinding]={cwd,raw,prefix,env:cleanEnv,default:raw===defaultExec};
+  return bound;
+}
+// Keep nanoseconds for reuse comparisons; Number millisecond timestamps lose bits.
+async function inventoryStat(fs,path) {
+  const st=await fs.lstat(path,{bigint:true});
+  if(typeof st.size!=='bigint')return st;
+  return Object.assign(Object.create(st),Object.fromEntries(['dev','ino','size','mode'].map(key=>[key,Number(st[key])])),
+    Object.fromEntries(['isFile','isDirectory','isSymbolicLink'].map(key=>[key,st[key].bind(st)])));
+}
+const timestampSeconds=(st,key)=>typeof st[key+'Ns']==='bigint'
+  ? Number(st[key+'Ns']/1000000000n)+Number(st[key+'Ns']%1000000000n)/1e9 : st[key+'Ms']/1000;
+
 export { isTestFile };
 // One outstanding request, bounded framing and a deadline keep a broken Git
 // process from authorizing partial evidence or hanging delta admission.
-export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
-  const child=spawn('git',['cat-file','--batch'],{cwd,stdio:['pipe','pipe','pipe']});
+export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
+  if(!binding?.[gitBinding]||binding[gitBinding].cwd!==cwd)throw new Error('unbound-worktree');
+  const child=spawn('git',[...binding[gitBinding].prefix,'cat-file','--batch'],{cwd,env:binding[gitBinding].env,stdio:['pipe','pipe','pipe']});
   let pending, buffer=Buffer.alloc(0), failure, closing=false, closed=false, stderrBytes=0;
   let resolveClosed;
   const completion=new Promise(resolve=>{resolveClosed=resolve;});
@@ -178,7 +215,78 @@ async function verifyMemoryLink(cwd, oid, fs) {
     throw new Error('Unverified memory bridge; use local fallback');
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, beginSub=noTiming} = {}) {
+const manifestRefusal=code=>Object.assign(new Error(`${code}: use local fallback`),{code});
+// Independent of Git's inventory/ignore rules. Never follow a directory link.
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,memoryOid,exec,head,rootInfo,scoped}) {
+  const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
+  const walked=new Map();
+  let count=0,bytes=0;
+  async function walk(directory,prefix=Buffer.alloc(0)) {
+    const before=await fs.lstat(directory);
+    if(!before.isDirectory()||before.isSymbolicLink())throw manifestRefusal('manifest-worktree-mismatch');
+    const names=await fs.readdir(directory,{encoding:'buffer'});
+    if(names.length>100000-count)throw manifestRefusal('manifest-walk-limit');
+    for(const name of names) {
+      if(name.equals(Buffer.from('.git'))||name.equals(Buffer.from('node_modules')))continue;
+      const path=prefix.length?bytePath(prefix,name):name;
+      if(++count>100000||(bytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
+      const absolute=bytePath(cwd,path),st=await inventoryStat(fs,absolute),key=path.toString('hex');
+      walked.set(key,st);
+      // (b) Only the verified memory bridge may project a link into regular files.
+      if(st.isSymbolicLink()||path.equals(Buffer.from(MEMORY_LINK))) {
+        if(!path.equals(Buffer.from(MEMORY_LINK)))throw manifestRefusal('unshipped-symlink');
+        try {await verifyMemoryLink(cwd,memoryOid,fs);}catch {throw manifestRefusal('unshipped-symlink');}
+        continue;
+      }
+      if(st.isDirectory())await walk(absolute,path);
+      else if(st.isFile()) {
+        // (a) Ignored tests still belong to the runner's discovery universe.
+        if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file');
+        if(path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE))) {
+          const projection=shipped.get(Buffer.concat([Buffer.from(MEMORY_LINK+'/'),path.subarray(MEMORY_SOURCE.length)]).toString('hex'));
+          const source=shipped.get(key);
+          if(!memoryOid||!source||!projection||projection.sha256!==source.sha256
+            ||!projection.sourcePath?.equals(path))throw manifestRefusal('unshipped-symlink');
+        }
+      } else throw manifestRefusal('manifest-worktree-mismatch');
+    }
+    const after=await fs.lstat(directory);
+    if(!after.isDirectory()||after.isSymbolicLink()||before.dev!==after.dev||before.ino!==after.ino)
+      throw manifestRefusal('manifest-worktree-mismatch');
+  }
+  // Sibling manifests deliberately cover only these contract roots.
+  if(scoped) {
+    for(const root of Object.values(SIBLING_PATHS).map(path=>Buffer.from(path.slice('../frontierui/'.length))))
+      await walk(bytePath(cwd,root),root);
+  } else await walk(Buffer.from(cwd));
+  // (c) Match every shipped source to the identity captured before hashing/reuse.
+  for(const entry of entries) {
+    const path=entry.sourcePath??entry.path,key=path.toString('hex');
+    const actual=walked.get(key),expected=identities.get(key);
+    if(!actual?.isFile()||!expected||actual.dev!==expected.dev||actual.ino!==expected.ino)
+      throw manifestRefusal('manifest-worktree-mismatch');
+  }
+  const rootAfter=await fs.lstat(Buffer.from(cwd));
+  if(!rootAfter.isDirectory()||rootAfter.isSymbolicLink()||rootInfo.dev!==rootAfter.dev||rootInfo.ino!==rootAfter.ino)
+    throw manifestRefusal('manifest-worktree-mismatch');
+  // (d) Missing tracked leaves require explicit deletion evidence.
+  const missing=[...indexBlobs.keys()].map(key=>Buffer.from(key,'base64')).filter(path=>
+    !walked.has(path.toString('hex'))&&!pathParts(path).some(p=>p.equals(Buffer.from('.git'))||p.equals(Buffer.from('node_modules')))
+    &&(!scoped||Object.values(SIBLING_PATHS).some(root=>path.toString().startsWith(root.slice('../frontierui/'.length)+'/'))));
+  if(missing.length) {
+    const result=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});
+    if(result.code!==0)throw manifestRefusal('manifest-worktree-mismatch');
+    const fields=splitPaths(result.stdout),deleted=new Set();
+    for(let i=0;i<fields.length;i+=2) {
+      if(!fields[i+1]||!/^[ACDMTUXB]$/.test(fields[i].toString()))throw manifestRefusal('manifest-worktree-mismatch');
+      if(fields[i].equals(Buffer.from('D')))deleted.add(fields[i+1].toString('hex'));
+    }
+    if(missing.some(path=>!deleted.has(path.toString('hex'))))throw manifestRefusal('manifest-worktree-mismatch');
+  }
+}
+
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
+  exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Git ignore rules do not establish test-runner exclusions. Even a whole
   // ignored build directory can contain runnable tests (scripts/build/__tests__).
@@ -264,7 +372,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   validateTestNames(files);
   const rootInfo = await fs.lstat(Buffer.from(cwd));
   if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Invalid inventory root');
-  const entries = [], excluded = [];
+  const entries = [], excluded = [], identities = new Map();
   let deletedWorktreePaths;
   for (const path of files) {
     if (memoryOid && path.equals(Buffer.from(MEMORY_LINK))) continue;
@@ -303,12 +411,13 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     let absolute = Buffer.from(cwd), st;
     for (const [i,part] of parts.entries()) {
       absolute = bytePath(absolute,part);
-      st = await fs.lstat(absolute);
+      st = await inventoryStat(fs,absolute);
       if (st.isSymbolicLink() || (i === parts.length-1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe inventory component');
     }
+    identities.set(path.toString('hex'),st);
     const previous=!trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
     const executable=!!(st.mode & 0o111), tracked=indexBlobs.has(path.toString('base64'));
-    const stable=previous?.stat && ['dev','ino','size','mode','mtimeMs','ctimeMs'].every(key=>st[key]===previous.stat[key]);
+    const stable=previous?.stat && ['dev','ino','size','mode','mtimeNs','ctimeNs','mtimeMs','ctimeMs'].every(key=>st[key]===previous.stat[key]);
     if(previous && stable && st.size===previous.size && executable===previous.executable) {
       entries.push({path,sha256:previous.sha256,executable,tracked});
       continue;
@@ -365,6 +474,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       throw error;
     }
   }
+  try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,memoryOid,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
+  catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
+    ? error : manifestRefusal('manifest-worktree-mismatch');}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
   const wire = manifestWire(manifest);
   if (Buffer.byteLength(JSON.stringify(wire)) > LIMIT - 16384) throw new Error('Manifest wire limit exceeded; use local fallback');
@@ -373,7 +485,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
 
 // Bound discovery work to at most four Git calls per advertised base. Missing
 // ranking evidence retains advertised (newest-first) order as the safe tie-break.
-export async function rankBases({cwd,exec=defaultExec,bases}={}) {
+export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.env,bases}={}) {
+  exec=await bindGit({cwd,env,exec});
   if(!Array.isArray(bases)||bases.length>BASE_RETENTION)return [];
   if(bases.some(base=>!base||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha)||!/^[a-f0-9]{64}$/.test(base.manifestDigest)))return [];
   const ranked=[];
@@ -399,7 +512,8 @@ export async function rankBases({cwd,exec=defaultExec,bases}={}) {
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
+  exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
   const git=async (args,input)=>{const result=await timed(beginSub,args[0]==='cat-file'?'base-blob-verification':'git-evidence',()=>exec({file:'git',args,cwd,...(input===undefined?{}:{input})}));if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Delta git evidence unavailable; use full ship');return result.stdout;};
@@ -421,6 +535,8 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     for(const record of records.toString('utf8').split('\0').slice(0,-1)) {
       const newline=record.indexOf('\n'),key=newline<0?record:record.slice(0,newline);
       if(!/^core\.(trustctime|checkstat|fsmonitor|untrackedcache|splitindex)$/.test(key))throw new Error('Invalid Git stat config key');
+      if(key==='core.fsmonitor'&&!/^(false|no|off|0)$/i.test(newline<0?'':record.slice(newline+1)))
+        throw new Error('Unsafe Git stat config');
       settings.set(key,newline<0?'':record.slice(newline+1));
     }
     // Let Git normalize boolean spellings (including bare keys and numbers);
@@ -442,7 +558,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
       const workers=Array.from({length:Math.min(16,snapshot.entries.length)},async()=>{
         while(next<snapshot.entries.length) {
           const entry=snapshot.entries[next++];
-          try {stats.set(entry.path.toString('hex'),await fs.lstat(bytePath(cwd,entry.path)));}
+          try {stats.set(entry.path.toString('hex'),await inventoryStat(fs,bytePath(cwd,entry.path)));}
           catch(error){if(error.code!=='ENOENT')throw error;}
         }
       });
@@ -482,7 +598,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
         // Git cleanliness binds the worktree to the Git blob, not to arbitrary
         // warm snapshot bytes. Prove that the snapshot hash names those bytes.
         if(!blobHashes.has(blob.oid)) {
-          if(exec===defaultExec)reader ??= createGitBlobReader({cwd});
+          if(exec[gitBinding]?.default)reader ??= createGitBlobReader({cwd,binding:exec});
           const content=reader ? await timed(beginSub,'base-blob-verification',()=>reader.read(blob.oid)) : await git(['cat-file','blob',blob.oid]);
           const oid=createHash(blob.oid.length===64?'sha256':'sha1')
             .update(`blob ${content.length}\0`).update(content).digest('hex');
@@ -510,7 +626,8 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
 // Reproduce the legacy length-prefixed input binding without staging base
 // files: unchanged content is read from local Git objects, delta from staging.
 async function digestDeltaInput(delta,stage,cwd,exec) {
-  const reader=exec===defaultExec?createGitBlobReader({cwd}):null;
+  exec=await bindGit({cwd,exec});
+  const reader=exec[gitBinding]?.default?createGitBlobReader({cwd,binding:exec}):null;
   const changed=new Set(delta.deltaPaths.map(p=>p.toString('hex'))),hash=createHash('sha256'),nodes=new Map();
   const field=data=>{const b=Buffer.from(data);hash.update(String(b.length)+':');hash.update(b);};
   for(const entry of delta.entries){nodes.set(entry.path.toString('hex'),entry);for(let i=0;i<entry.path.length;i++)if(entry.path[i]===47){const path=entry.path.subarray(0,i);nodes.set(path.toString('hex'),{path,directory:true});}}
@@ -535,6 +652,7 @@ async function digestDeltaInput(delta,stage,cwd,exec) {
 
 // All sibling evidence is local Git evidence; never ask Forge to resolve a revision.
 async function checkSibling(root, exec, fs) {
+  exec=await bindGit({cwd:root,exec});
   const roots = [];
   for (const path of [root,...Object.values(SIBLING_PATHS).map(path => resolve(root,'..',path.slice(3)))]) {
     const info = await fs.lstat(path);
@@ -590,6 +708,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const needsGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
+  try {exec=await bindGit({cwd,env,exec});}catch(error){return fallback(error.code??'unbound-worktree');}
   sshOptions ??= connectionOptions();
   const start=work=>Promise.resolve().then(work);
   const initial=await Promise.allSettled([
@@ -716,12 +835,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
             // prevents a raced-in FIFO from hanging admission before fstat.
             const fd = await fs.open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
             try {
-              const st = await fd.stat();
-              if (!st.isFile() || !!(st.mode & 0o111) !== entry.executable) throw new Error('Invalid staging source');
+              const st = await fd.stat({bigint:true});
+              if (!st.isFile() || !!(st.mode & 0o111n) !== entry.executable) throw new Error('Invalid staging source');
               const mode = entry.executable ? 0o755 : 0o644;
               await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode});
               await fs.chmod(destination, mode);
-              await fs.utimes(destination, st.atime, st.mtime);
+              await fs.utimes(destination, timestampSeconds(st,'atime'), timestampSeconds(st,'mtime'));
               const staged = await fs.lstat(destination);
               if (!staged.isFile() || staged.isSymbolicLink() || (staged.mode & 0o7777) !== mode)
                 throw new Error('Invalid staging file mode');
@@ -735,9 +854,9 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
             if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
             if (snapshot.source === cwd && entry.path.equals(Buffer.from('coverage/coverage-final.json'))) {
               const portable=portableCoverage(stagedContent,cwd);
-              const stamp=await fs.lstat(destination);
+              const stamp=await fs.lstat(destination,{bigint:true});
               await fs.writeFile(destination,portable);
-              await fs.utimes(destination,stamp.atime,stamp.mtime);
+              await fs.utimes(destination,timestampSeconds(stamp,'atime'),timestampSeconds(stamp,'mtime'));
               transferBytes+=portable.length-stagedContent.length;
               entry.sha256=createHash('sha256').update(portable).digest('hex');
             }
@@ -821,7 +940,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
-      return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed');
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');

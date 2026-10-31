@@ -3308,6 +3308,17 @@ from the test runner. The named
 `falls back before transport for a whole-directory ignored test` table pins remote refusal.
 Run this fixture and the affected Forge tests through heavy admission.
 
+`forge-manifest-parity.test.mjs` checks full and delta inventories against an independent
+filesystem oracle, including hostile `GIT_*` environments, omitted tests, memory bridges,
+and replaced file identities. Mutation proofs remove each binding or walk guard separately
+and restore it before the next run. Transport fixtures must ship every test-shaped leaf
+they create; exact rsync lists and dependency-cache digests include those leaves. Keep
+fixture-only Git metadata outside the worker snapshot (or remove it after client manifest
+construction), since the runner rejects extra directories.
+
+Stub SSH reachability in manifest-refusal fixtures and reject later transport calls;
+real host availability must not decide whether a filesystem guard is exercised.
+
 Remote discovery may overlap reachability, HEAD and base discovery, but drain every
 speculative process before returning fallback. `buildManifest` always lists ignored files
 fresh after base-manifest retrieval; ignored tests created during retrieval must still
