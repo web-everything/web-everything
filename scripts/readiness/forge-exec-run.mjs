@@ -103,11 +103,13 @@ export function formatTelemetry(value,host='forge') {
   const last=v.recent.find(r=>r.code!==null);
   return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
 }
-const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR'];
+const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE'];
 export function allowedEnv(env) {
   return env && typeof env === 'object' && !Array.isArray(env) && Object.entries(env).every(([key,value]) =>
     ENV_KEYS.includes(key) && !/secret|token|password|credential|auth|key/i.test(key)
-    && typeof value === 'string' && !value.includes('\0'));
+    && typeof value === 'string' && !value.includes('\0')
+    && (key !== 'DIFF_COVERAGE_BASE' || (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)
+      && !/\s/.test(value) && !value.includes('..') && !value.includes('//') && !/(?:^|\/)\.|\.lock(?:\/|$)|[/.]$/.test(value))));
 }
 async function directory(path, trusted = false, operator = {uid:process.getuid(),gid:process.getgid()}) {
   const fd = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -161,7 +163,9 @@ export async function readManifestFile(path, st, fs = filesystem) {
 
 export async function verifyManifest(root, manifest, manifestDigest, {fs = filesystem, sibling = false} = {}) {
   const {git,...content}=manifest??{};
-  if(git!==undefined && (sibling || !git || Object.keys(git).join(',')!=='head' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(git.head)))throw new Error('Invalid Git evidence');
+  if(git!==undefined && (sibling || !git || !['head','diffCoverageBase,head'].includes(Object.keys(git).sort().join(','))
+    || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(git.head)
+    || Object.hasOwn(git,'diffCoverageBase')&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(git.diffCoverageBase)))throw new Error('Invalid Git evidence');
   const keys = manifest && Object.keys(content).sort().join(',');
   if (!manifest || manifest.v!==2 || !['excluded,executable,hashes,paths,tracked,v', ...(!sibling ? ['excluded,executable,hashes,paths,siblings,tracked,v'] : [])].includes(keys)
     || !hex(manifestDigest) || Buffer.byteLength(JSON.stringify(manifest)) > LIMIT
@@ -878,13 +882,14 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
       }
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
-      if(request.argv[2]==='check:standards') {
+      if(request.argv[2]==='check:standards'||request.env.DIFF_COVERAGE_BASE!==undefined) {
         if(!request.manifest.git)throw new Error('Missing Git evidence');
+        if(request.env.DIFF_COVERAGE_BASE!==request.manifest.git.diffCoverageBase)throw new Error('Coverage base mismatch');
         try {
           await materializeWorktree({work,root:bases,baseSha:request.baseSha,head:request.manifest.git.head,manifest:request.manifest,manifestDigest:request.manifestDigest,
             ...(testRoot&&testGitExec?{exec:testGitExec}:{})});
           await handoff(worker,join(work,'.git'),{recursive:true,workerParent:true});
-        } catch(error) {throw Object.assign(error,{code:'git-head-unavailable'});}
+        } catch(error) {throw Object.assign(error,{code:error.code==='diff-coverage-base-unavailable'?error.code:'git-head-unavailable'});}
       }
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
@@ -925,8 +930,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         // protected ops state. Never infer not-started from worker-owned files.
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
-          const reason=error.code==='git-head-unavailable' ? error.code
+          const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
             : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+          if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
         }
         throw error;
@@ -978,7 +984,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
       });
     },

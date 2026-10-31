@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -9,6 +9,7 @@ import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
+import {verifiedCopySource} from '../forge-exec-bases.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -61,6 +62,93 @@ exit 3
     ...await snapshotBinding(work),inputDigest:await digestInput(work),argvDigest:digestArgv(argv)};
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
+describe('sibling root snapshot acceptance', () => {
+  const siblingRoot = () => join(root,'runs',request.run,'frontierui');
+  async function siblingSnapshot() {
+    const sibling = siblingRoot();
+    await mkdir(join(sibling,'plugs'),{recursive:true});
+    await mkdir(join(sibling,'webtheme'),{recursive:true});
+    await writeFile(join(sibling,'plugs','runtime.js'),'export const plug = true;\n');
+    await writeFile(join(sibling,'webtheme','theme.js'),'export const theme = true;\n');
+    const {manifest} = await snapshotBinding(sibling);
+    request.manifest.siblings = {frontierui:{sha:'a'.repeat(40),...manifest}};
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    request.siblingShas = {frontierui:'a'.repeat(40)};
+    return sibling;
+  }
+  async function expectNoExecutionOrReceipt({siblings = true} = {}) {
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toEqual(siblings
+      ? {v:1,nonce:request.nonce,run:request.run,phase:'rejected',reason:'snapshot-rejected',siblings:true,started:false}
+      : null);
+  }
+
+  it('prepare creates an empty sibling root beside work with mode 0755 when requested', async () => {
+    const prepared = await runner.prepare({nonce:request.nonce,siblings:true});
+    const preparedWork = join(root,'runs',prepared.run,'work');
+    const sibling = join(root,'runs',prepared.run,'frontierui');
+    expect((await stat(sibling)).mode & 0o777).toBe(0o755);
+    expect(await readdir(sibling)).toEqual([]);
+    expect(await realpath(join(preparedWork,'..','frontierui'))).toBe(sibling);
+  });
+
+  it('accepts the matching sibling snapshot and binds its digest in the test receipt', async () => {
+    const sibling = await siblingSnapshot();
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(sibling,'plugs','runtime.js'),'utf8')).toBe('export const plug = true;\n');
+    expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
+      inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
+      manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3,
+      timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
+  });
+
+  it.each([
+    ['changed byte', /snapshot digest/],
+    ['extra file', /snapshot digest/],
+    ['missing file', /Manifest inventory/],
+    ['file symlink', /Manifest symlink/],
+    ['directory symlink', /Manifest symlink/],
+    ['wrong digest', /Manifest digest mismatch/],
+  ])('refuses sibling %s before installation and never certifies a receipt', async (fault, error) => {
+    const sibling = await siblingSnapshot();
+    const plug = join(sibling,'plugs','runtime.js');
+    const outside = join(root,'outside.js');
+    await writeFile(outside,'export const outside = true;');
+    if (fault === 'changed byte') await writeFile(plug,'export const plug = false;\n');
+    if (fault === 'extra file') await writeFile(join(sibling,'plugs','extra.js'),'extra');
+    if (fault === 'missing file') await rm(plug);
+    if (fault === 'file symlink') {
+      await rm(plug);
+      await symlink(outside,plug);
+    }
+    if (fault === 'directory symlink') {
+      await rm(join(sibling,'plugs'),{recursive:true});
+      await symlink(root,join(sibling,'plugs'));
+    }
+    if (fault === 'wrong digest') request.manifestDigest = '0'.repeat(64);
+    await expect(runner.run(request)).rejects.toThrow(error);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it('accepts an empty sibling root without adding a sibling digest to the receipt', async () => {
+    await mkdir(siblingRoot(),{recursive:true});
+    expect((await runner.run(request)).code).toBe(3);
+    const receipt = await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'test',code:3,manifestDigest:request.manifestDigest});
+    expect(receipt).not.toHaveProperty('siblingShas');
+  });
+
+  it('requires an empty sibling root when no sibling manifest was supplied', async () => {
+    await siblingSnapshot();
+    delete request.manifest.siblings;
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    delete request.siblingShas;
+    await expect(runner.run(request)).rejects.toThrow('Extra sibling snapshot');
+    await expectNoExecutionOrReceipt({siblings:false});
+  });
+});
+
 describe('fixed wrapper security boundary', () => {
   it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
     const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
@@ -695,6 +783,98 @@ syncBuiltinESMExports();
     expect(result.stdout).toBe('');
     await expect(stat(attempts)).rejects.toMatchObject({code:'ENOENT'});
   });
+  it.each(['base', 'temporary parent', 'tree', 'nested directory', 'leaf'])
+  ('warm-install refuses a symlinked %s even when the redirected bytes match the manifest', async component => {
+    const base=join(root,'warm-source'),parent=join(base,'a'.repeat(40)+'.tmp'),tree=join(parent,'tree');
+    await mkdir(join(tree,'nested'),{recursive:true});
+    await writeFile(join(tree,'package-lock.json'),'lock');
+    await writeFile(join(tree,'nested','sentinel'),'fixture bytes');
+    const {manifest}=await snapshotBinding(tree);
+    const replaced={base,'temporary parent':parent,tree,'nested directory':join(tree,'nested'),leaf:join(tree,'nested','sentinel')}[component];
+    await rename(replaced,replaced+'.saved');
+    await symlink(replaced+'.saved',replaced);
+    await expect(runner.warmInstall(tree,manifest)).rejects.toThrow(/warm source|copy/i);
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+    expect(await readFile(join(tree,'nested','sentinel'),'utf8')).toBe('fixture bytes');
+  });
+  it.each(['temporary parent', 'tree', 'nested directory'])
+  ('warm copying stays on the pinned source after replacing its %s pathname', async component => {
+    const parent=join(root,'a'.repeat(40)+'.tmp'),tree=join(parent,'tree'),destination=join(root,'warm-copy');
+    const victim=join(root,'warm-victim'),name=Buffer.from("quote' space 雪.txt");
+    await mkdir(join(tree,'nested'),{recursive:true});await mkdir(destination);
+    await mkdir(join(victim,'tree','nested'),{recursive:true});
+    const original=Buffer.concat([Buffer.from(join(tree,'nested')+'/'),name]);
+    await writeFile(original,'public fixture');
+    await writeFile(join(victim,'tree','nested','sentinel'),'private fixture');
+    const replaced=component==='temporary parent'?parent:component==='tree'?tree:join(tree,'nested');
+    const trigger=component==='temporary parent'?Buffer.from('tree'):component==='tree'?Buffer.from('nested'):name;
+    // Replace the already-open ancestor immediately before the next openat.
+    // A pathname-based copy would resolve into the victim or lose the source.
+    const driver=`import os, sys, json, base64
+attack=json.loads(sys.argv[2])
+original=os.open
+fired=False
+def swapped(name, flags, *args, **kwargs):
+    global fired
+    if not fired and name == base64.b64decode(attack['trigger']) and 'dir_fd' in kwargs:
+        fired=True
+        os.rename(attack['replaced'], attack['replaced']+'.saved')
+        os.symlink(attack['victim'], attack['replaced'])
+    return original(name, flags, *args, **kwargs)
+os.open=swapped
+exec(sys.argv[1])
+assert fired
+`;
+    const entry={path:Buffer.concat([Buffer.from('nested/'),name]).toString('base64'),sha256:hash('public fixture'),executable:false};
+    const result=spawnSync('/usr/bin/python3',['-I','-c',driver,verifiedCopySource,
+      JSON.stringify({trigger:trigger.toString('base64'),replaced,victim})],{
+      input:JSON.stringify({source:tree,destination,entries:[entry]}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(Buffer.concat([Buffer.from(join(destination,'nested')+'/'),name]),'utf8')).toBe('public fixture');
+    expect(await readdir(victim)).toEqual(['tree']);
+  });
+  it.each(['digest mismatch', 'FIFO', 'hardlink'])
+  ('warm copying refuses %s before writing any destination file', async fault => {
+    const source=join(root,'source'),destination=join(root,'destination'),leaf=join(source,'sentinel');
+    await mkdir(source);await mkdir(destination);
+    if(fault==='FIFO') {
+      const fifo=spawnSync('mkfifo',[leaf],{timeout:1000});expect(fifo.status).toBe(0);
+    } else {
+      await writeFile(leaf,'private fixture');
+      if(fault==='hardlink')await link(leaf,join(root,'linked-sentinel'));
+    }
+    const result=spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+      input:JSON.stringify({source,destination,entries:[{path:Buffer.from('sentinel').toString('base64'),sha256:hash(fault==='digest mismatch'?'public fixture':'private fixture'),executable:false}]}),
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Invalid copy source');expect(await readdir(destination)).toEqual([]);
+    expect(result.stdout).toBe('');expect(result.stderr).not.toContain('private fixture');
+  });
+  it('warm-install accepts an ordinary source and completes dependency installation', async () => {
+    const source=join(root,'ordinary-warm-source');await mkdir(source);
+    await writeFile(join(source,'package-lock.json'),'lock');
+    const {manifest}=await snapshotBinding(source);
+    expect(await runner.warmInstall(source,manifest)).toEqual({code:0});
+    expect(await readFile(join(root,'install.log'),'utf8')).toContain('ci --include=dev --ignore-scripts');
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+  });
+  it.skipIf(process.platform!=='linux'||process.getuid()!==0)
+  ('root warm copying refuses a redirected ancestor before copying a root-only sentinel', async () => {
+    const parent=join(root,'root-source'),tree=join(parent,'tree'),destination=join(root,'root-destination');
+    await mkdir(tree,{recursive:true});await mkdir(destination);
+    await writeFile(join(tree,'sentinel'),'root-only fixture',{mode:0o600});
+    await rename(parent,parent+'.saved');await symlink(parent+'.saved',parent);
+    const result=spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+      input:JSON.stringify({source:tree,destination,entries:[{path:Buffer.from('sentinel').toString('base64'),sha256:hash('root-only fixture'),executable:false}]}),
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
+    expect(await readdir(destination)).toEqual([]);expect(result.stdout).toBe('');
+    expect(result.stderr).not.toContain('root-only fixture');
+  });
   it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
     // Observe the real CLI's first filesystem operation after createRunner().
@@ -1078,10 +1258,10 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
       .flatMap(pattern => ['', 'nested/'].map(depth => pattern.replaceAll('**/', depth).replaceAll('*', 'identity'))));
     const names = [...new Set([...positives, 'scripts/__tests__/support.json',
       'scripts/__tests__/credentials.js', 'notes.test.txt', 'support.js'])];
-    for (const name of names) {
+    await Promise.all(names.map(async name => {
       await mkdir(join(work, name, '..'), {recursive:true});
       await writeFile(join(work, name), 'fixture');
-    }
+    }));
     const binding = await snapshot(['package-lock.json', ...names]);
     const verified = await verify(binding.manifest, binding.manifestDigest);
     const selected = new Set(verified.testPaths.map(path => path.toString()));

@@ -23,6 +23,7 @@ try {
 } catch { /* the fallback timer covers it */ }
 // Eval workers inherit the caller's --input-type on newer Node releases. Dynamic imports work in both
 // CommonJS and ESM, so a module-mode caller must not downgrade the ceiling to the main-thread fallback.
+// Keep startup promise-based so stop() can drain a heartbeat import without top-level await.
 const WATCHDOG_SOURCE = `import('node:worker_threads').then(({ workerData, parentPort }) =>
   import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort)));`;
 

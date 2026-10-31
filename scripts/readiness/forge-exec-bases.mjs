@@ -9,17 +9,19 @@ export const BASE_RETENTION=12;
 export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
 export const anonymousGitEnv=()=>({PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',
   GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'});
-function gitExec({args,cwd,env,input}) {
+const stderrTail=value=>String(value??'').replace(/[\x00-\x1f\x7f-\x9f]/g,'').slice(-300);
+function gitExec({file='git',args,cwd,env,input}) {
   return new Promise((resolve,reject)=>{
-    const child=spawn('git',args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']});
-    const chunks=[];let size=0,overflow=false;
+    const child=spawn(file,args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']});
+    const chunks=[];let size=0,overflow=false,stderr='';
     const timer=setTimeout(()=>{overflow=true;child.kill('SIGKILL');},120000);
     for(const stream of [child.stdout,child.stderr])stream.on('data',chunk=>{
       size+=chunk.length;if(size>4*1024*1024){overflow=true;child.kill('SIGKILL');}
       else if(stream===child.stdout)chunks.push(chunk);
+      if(stream===child.stderr)stderr=(stderr+chunk.toString('utf8')).slice(-600);
     });
     child.on('error',error=>{clearTimeout(timer);reject(error);});
-    child.on('close',code=>{clearTimeout(timer);overflow?reject(new Error('Git bound exceeded; use local fallback')):resolve({code,stdout:Buffer.concat(chunks).toString('utf8')});});
+    child.on('close',code=>{clearTimeout(timer);overflow?reject(Object.assign(new Error('Git bound exceeded; use local fallback'),{stderr})):resolve({code,stdout:Buffer.concat(chunks).toString('utf8'),stderr});});
     if(input!==undefined){child.stdin.on('error',()=>{});child.stdin.end(input);}
   });
 }
@@ -29,6 +31,7 @@ function gitExec({args,cwd,env,input}) {
 export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
+  if(logical.diffCoverageBase!==undefined&&!revision(logical.diffCoverageBase))throw new Error('Invalid coverage base SHA');
   for(const entry of decodeManifest(primary).entries) {
     let leaf=Buffer.from(work);
     for(const part of pathParts(entry.path)){leaf=bytePath(leaf,part);if((await fs.lstat(leaf)).isSymbolicLink())throw new Error('Unsafe Git snapshot');}
@@ -40,16 +43,28 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
   const cloned=join(pending,'clone');
   const env=anonymousGitEnv();
   const git=async(args,cwd=cloned,input,allowMissing=false)=>{
-    const result=await exec({file:'git',args:['-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
-      '-c','protocol.ext.allow=never','-c','http.followRedirects=false',
-      '-c','safe.directory='+join(root,'repo.git'),'-c','safe.directory='+cloned,...args],cwd,env,input});
-    if(result.code!==0){if(allowMissing)return null;throw new Error('Anonymous Git unavailable; use local fallback');}
-    return result.stdout.toString().trim();
+    try {
+      const result=await exec({file:'git',args:['-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+        '-c','protocol.ext.allow=never','-c','http.followRedirects=false',
+        '-c','safe.directory='+join(root,'repo.git'),'-c','safe.directory='+cloned,...args],cwd,env,input});
+      if(result.code!==0){if(allowMissing)return null;throw Object.assign(new Error('Anonymous Git unavailable; use local fallback'),{stderr:result.stderr});}
+      return result.stdout.toString().trim();
+    } catch(error) {
+      throw new Error(`${args[0]}: ${stderrTail(error.stderr??error.message)}`,{cause:error});
+    }
   };
   try {
     const mirror=join(root,'repo.git');
     const local=await fs.lstat(mirror).then(()=>true,error=>{if(error.code!=='ENOENT')throw error;return false;});
-    if(local)await baseDirectory(mirror);
+    if(local) {
+      await baseDirectory(mirror);
+      // upload-pack does not inherit command-line -c settings. Its protected
+      // global config must explicitly trust only this mirror and run's clone.
+      const config=join(pending,'gitconfig');
+      const quote=value=>'"'+value.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\t/g,'\\t').replace(/\r/g,'\\r')+'"';
+      await fs.writeFile(config,`[safe]\n\tdirectory = ${quote(mirror)}\n\tdirectory = ${quote(cloned)}\n`,{flag:'wx',mode:0o600});
+      env.GIT_CONFIG_GLOBAL=config;
+    }
     await fs.mkdir(cloned);
     // Mirror cloning works even with the warmer's unborn bare HEAD and copies
     // no client configuration. A cached object never proves public availability.
@@ -62,6 +77,10 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       '+refs/heads/main:refs/remotes/origin/main',head],cloned);
     await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned);
     await git(['cat-file','-e',head+'^{commit}'],cloned);
+    if(logical.diffCoverageBase!==undefined
+      && await git(['merge-base','--is-ancestor',logical.diffCoverageBase,head],cloned,undefined,true)===null
+      && await git(['merge-base','--is-ancestor',logical.diffCoverageBase,'refs/remotes/origin/main'],cloned,undefined,true)===null)
+      throw Object.assign(new Error('Coverage base unavailable; use local fallback'),{code:'diff-coverage-base-unavailable'});
     // Detach without checking files out over the verified Mac snapshot.
     await git(['update-ref','--no-deref','HEAD',head],cloned);
     if(await git(['rev-parse','--verify','HEAD'],cloned)!==head)throw new Error('Git HEAD mismatch; use local fallback');
@@ -86,7 +105,8 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     // Publication is the final operation: no privileged Git may follow it.
     await fs.rename(join(cloned,'.git'),join(work,'.git'));
   } catch(error) {
-    throw Object.assign(new Error('Git HEAD unavailable; use local fallback',{cause:error}),{code:'git-head-unavailable'});
+    if(error.code==='diff-coverage-base-unavailable')throw error;
+    throw Object.assign(new Error('Git HEAD unavailable; use local fallback: '+error.message,{cause:error}),{code:'git-head-unavailable'});
   } finally {await fs.rm(pending,{recursive:true,force:true});}
 }
 function validReady(ready,sha) {
@@ -171,26 +191,69 @@ export async function readBase(root,sha,expected,io=fs) {
   decodeManifest(manifest);
   return {ready,manifest,tree:join(root,sha,'tree')};
 }
-// Copy regular, verified leaves only; no reflinks or hardlinks and no inherited
-// writable metadata. Each destination is new inside an ops-owned tree.
-export async function copyLeaves(source,destination,entries,io=fs) {
-  const root=await io.lstat(source);if(root.isSymbolicLink()||!root.isDirectory())throw new Error('Unsafe copy root');
-  for(const entry of entries) {
-    let from=Buffer.from(source),to=Buffer.from(destination);
-    const parts=pathParts(entry.path);
-    for(const [i,part] of parts.entries()) {
-      from=bytePath(from,part);to=bytePath(to,part);
-      const st=await io.lstat(from);
-      if(st.isSymbolicLink()||(i===parts.length-1?!st.isFile():!st.isDirectory()))throw new Error('Unsafe copy component');
-      if(i<parts.length-1)await io.mkdir(to,{recursive:true,mode:0o755});
-      else {
-        const handle=await io.open(from,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-        let content;try{const pinned=await handle.stat();if(!pinned.isFile()||pinned.ino!==st.ino||pinned.dev!==st.dev||pinned.mode!==st.mode)throw new Error('Copy source swapped');content=await handle.readFile();}finally{await handle.close();}
-        await io.writeFile(to,content,{flag:'wx',mode:entry.executable?0o755:0o644});
-        await io.chmod(to,entry.executable?0o755:0o644);
-      }
-    }
-  }
+// Privileged snapshot copies must never resolve a source through a mutable ancestor.
+// Keep directory descriptors through every open, including the absolute source
+// ancestors, and verify pinned file bytes before creating a destination leaf.
+export const verifiedCopySource = String.raw`
+import os, sys, json, stat, base64, hashlib
+cfg = json.load(sys.stdin)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+def unsafe():
+    raise RuntimeError('Invalid copy source; use full shipping and inspect the source tree')
+def parts(path):
+    values = path.split(b'/')
+    if not values or len(values) > 128 or any(p in (b'', b'.', b'..') or b'\x00' in p for p in values): unsafe()
+    return values
+def descend(parent, values, create=False):
+    fd = os.dup(parent)
+    try:
+        for name in values:
+            if create:
+                try: os.mkdir(name, 0o755, dir_fd=fd)
+                except FileExistsError: pass
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+def absolute(path):
+    if not isinstance(path, str) or not path.startswith('/'): unsafe()
+    root = os.open('/', flags)
+    try: return descend(root, parts(os.fsencode(path)[1:]))
+    finally: os.close(root)
+source = absolute(cfg['source'])
+try:
+    destination = absolute(cfg['destination'])
+    try:
+        for entry in cfg['entries']:
+            names = parts(base64.b64decode(entry['path'], validate=True))
+            parent = descend(source, names[:-1])
+            try: leaf = os.open(names[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            finally: os.close(parent)
+            with os.fdopen(leaf, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or bool(info.st_mode & 0o111) != entry['executable']: unsafe()
+                content = stream.read(info.st_size + 1)
+                if len(content) != info.st_size or hashlib.sha256(content).hexdigest() != entry['sha256']: unsafe()
+            parent = descend(destination, names[:-1], create=True)
+            try:
+                mode = 0o755 if entry['executable'] else 0o644
+                leaf = os.open(names[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+                with os.fdopen(leaf, 'wb') as stream:
+                    os.fchmod(stream.fileno(), mode)
+                    stream.write(content)
+            finally: os.close(parent)
+    finally: os.close(destination)
+finally: os.close(source)
+`;
+export async function copyLeaves(source,destination,entries) {
+  const result=await gitExec({file:'/usr/bin/python3',args:['-I','-c',verifiedCopySource],
+    env:{PATH:'/usr/bin:/bin',LANG:'C'},
+    input:JSON.stringify({source,destination,entries:entries.map(entry=>({...entry,path:entry.path.toString('base64')}))}),
+  });
+  if(result.code!==0)throw new Error('Invalid copy source; use full shipping and inspect the source tree');
 }
 // Root-created pins must be readable by the ops warmer. The privileged caller
 // supplies the operator identity; unprivileged creation needs no transfer.

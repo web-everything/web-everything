@@ -912,3 +912,33 @@ describe('red-team scheduling status', () => {
     expect(redTeamStatus).not.toHaveBeenCalled();
   });
 });
+
+
+it('reloads red-team routing each pass, enables unset Gemini, preserves explicit zero, and restores disable on clear', async () => {
+  const { createRoutingPolicyReader } = await import('../../lib/dispatch-routing-policy-io.mjs');
+  const { DEFAULT_ROUTING_POLICY, resolveOperationRoute: pureRoute } = await import('../../lib/dispatch-routing-policy.mjs');
+  let overrides = { 'review-seat:red-team': { provider: 'agy-gemini', model: 'pro', disabledProviders: ['codex', 'agy-claude'] } };
+  const reader = createRoutingPolicyReader({ read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ prefs: { routingOverrides: overrides }, errors: [] }), emit: () => true });
+  resolveOperationRoute.mockImplementation(pureRoute);
+  try {
+    const env = {};
+    const first = fakeIo({ readRoutingPolicy: reader });
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: payload('accept').findings.read, env }, first.io);
+    expect(pass.status).toBe('speculated');
+    expect(first.calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-argon-high' });
+    const capped = fakeIo({ readRoutingPolicy: reader });
+    expect((await speculateRedTeam({ pr: 8, repo: REPO, read: payload('accept').findings.read,
+      env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } }, capped.io)).status).toBe('skipped');
+    expect(capped.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
+    overrides = {};
+    const cleared = fakeIo({ readRoutingPolicy: reader, cliAvailable: p => p === 'agy-gemini' });
+    const result = await speculateRedTeam({ pr: 6, repo: REPO, read: payload('accept').findings.read, env }, cleared.io);
+    expect(result.status).toBe('skipped');
+    expect(cleared.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
+    overrides = { 'review-seat:red-team': { enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
+    const enabled = fakeIo({ readRoutingPolicy: reader });
+    expect((await speculateRedTeam({ pr: 7, repo: REPO, read: payload('accept').findings.read, env }, enabled.io)).status).toBe('speculated');
+    expect(enabled.calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+  } finally { resolveOperationRoute.mockReturnValue(null); }
+});
