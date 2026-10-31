@@ -1,19 +1,20 @@
 ---
+bornAs: xlvqba8
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/lib/enqueue-on-event.mjs", "we:scripts/settings/merge-queue.json"]
+scope: ["we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/forge-exec-bases.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/lib/repo-scan-tests.mjs", "we:scripts/verify-lane.mjs", "we:scripts/readiness/heavy-admission.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Drain catch-up miss backoff for repeat not-enqueued picks
+# Forge git-based delta manifest for remote-exec
 
-Delivered by PR #6113 (R260; R280 retro card). Drain catch-up kept retrying a PR whose fast drain ended 'not enqueued'. It now backs off until the head sha or labels change or catchUp.missBackoff.ttlMinutes (default 30) passes; logged once per hold; enabled:false reverts. Core: we:scripts/lib/enqueue-on-event.mjs.
+Delivered by PR #6100 (stacked on #6059; R280 retro card). Remote runs shipped about 15k files (~52s) because the manifest hashed everything. The manifest now reuses base hashes for git-clean files and hashes only changed or untracked ones, falling back to a logged full scan on any git failure. Ignored build dirs are skipped (fixes the ignored-test-file fallback). Core: we:scripts/readiness/forge-exec-manifest.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/enqueue-on-event.test.mjs` (delivered by #6113).
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-fast-manifest.test.mjs` (delivered by #6100).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

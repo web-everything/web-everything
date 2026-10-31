@@ -1,19 +1,20 @@
 ---
+bornAs: xfo5nr2
 kind: story
-size: 5
+size: 2
 status: open
-scope: ["we:scripts/readiness/host-capacity.mjs", "we:scripts/operations/host-capacity.mjs", "we:scripts/lib/host-load.mjs", "we:scripts/lib/host-overload-settings.mjs", "we:scripts/settings/host-overload.json", "we:scripts/conveyor/health-investigate-dispatch.mjs"]
+scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/red-team-run-result.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Honest host capacity reading for admission (cpu and memory)
+# Record a failed red-team seat as failed and retry it
 
-Delivered by PR #6111 (R258; R280 retro card). macOS load average (~50 on 12 cores) counts IO and lock waiters and throttled work while the CPU was idle. New host-capacity reader reports CPU idle, memory pressure, swap, compressor, heavy queue and Forge, with a headroom verdict and admitNewWorkers. Core: we:scripts/readiness/host-capacity.mjs.
+Delivered by PR #6099 (R280 retro card). A non-ok red-team seat was reported as ran/unpublished, which held #6096 for 48 min. We now return status failed with a reason and retry via the existing cooldown/cap-guarded retry. Drain evidence stays fail-closed. Touches we:scripts/lib/red-team-run-result.mjs, we:scripts/operations/review-job.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/host-capacity.test.mjs` (delivered by #6111).
+- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/review-red-team.test.mjs we:scripts/lib/__tests__/drain-red-team-evidence.test.mjs` (delivered by #6099).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

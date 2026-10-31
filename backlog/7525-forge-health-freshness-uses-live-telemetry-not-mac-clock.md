@@ -1,19 +1,20 @@
 ---
+bornAs: xylvhc4
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:.claude/skills/mechanical-delivery-doctrine/SKILL.md", "we:docs/agent/backlog-workflow.md"]
+scope: ["we:scripts/readiness/forge-remote-health.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Orchestrator focus lock: one current-focus file checked by every schedule and triage
+# Forge health freshness uses live telemetry, not Mac clock
 
-HIGH cards-to-file entry 2026-10-30 14:30 ET (operator: we need to improve assistant focus). Keep a single current-focus file (goal, done-when, allowed side work). Every schedule prompt and event triage starts by reading it; any worker or thread off the focus path must be named as a deviation with a one-line justification or operator OK; the 10-minute update reports only focus-path progress. Root cause 2026-10-30: the R228/R254 lane prototype path was identified at 12:39 but effort went to side quests.
+Delivered by PR #6106 (stacked on #6059; R280 retro card). Freshness compared the Mac clock to Forge's sampledAtET; Forge runs a few seconds ahead, so fresh samples had negative age and tripped telemetry-stale plus a sticky 120s backoff, silently keeping runs local. Freshness now reflects live Forge telemetry. Core: we:scripts/readiness/forge-remote-health.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-health-fresh.test.mjs` (delivered by #6106).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

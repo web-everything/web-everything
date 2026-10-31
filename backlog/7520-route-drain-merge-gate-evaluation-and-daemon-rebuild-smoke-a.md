@@ -1,19 +1,20 @@
 ---
+bornAs: xrhnzh0
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/readiness/forge-remote-health.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:docs/agent/testing.md"]
+scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/lib/merge-gate-ci.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Forge health freshness uses live telemetry, not Mac clock
+# Route drain merge-gate evaluation and daemon rebuild smoke and soak runs to Forge
 
-Delivered by PR #6106 (stacked on #6059; R280 retro card). Freshness compared the Mac clock to Forge's sampledAtET; Forge runs a few seconds ahead, so fresh samples had negative age and tripped telemetry-stale plus a sticky 120s backoff, silently keeping runs local. Freshness now reflects live Forge telemetry. Core: we:scripts/readiness/forge-remote-health.mjs.
+HIGH cards-to-file entry 2026-10-30 20:38 ET (R278). Move to Forge next: (a) drain merge-gate evaluation (classifyGateReads and pre-merge checks); (b) daemon rebuild smoke and soak runs. Both run on the Mac today; route through heavy-admission remote or remote-exec once cgroup limits are in. Core: we:scripts/readiness/heavy-admission.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-health-fresh.test.mjs` (delivered by #6106).
+- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

@@ -1,19 +1,20 @@
 ---
+bornAs: xb8z4kn
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/forge-exec-bases.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/lib/repo-scan-tests.mjs", "we:scripts/verify-lane.mjs", "we:scripts/readiness/heavy-admission.mjs"]
+scope: ["we:scripts/readiness/host-capacity.mjs", "we:scripts/operations/host-capacity.mjs", "we:scripts/lib/host-load.mjs", "we:scripts/lib/host-overload-settings.mjs", "we:scripts/settings/host-overload.json", "we:scripts/conveyor/health-investigate-dispatch.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Forge git-based delta manifest for remote-exec
+# Honest host capacity reading for admission (cpu and memory)
 
-Delivered by PR #6100 (stacked on #6059; R280 retro card). Remote runs shipped about 15k files (~52s) because the manifest hashed everything. The manifest now reuses base hashes for git-clean files and hashes only changed or untracked ones, falling back to a logged full scan on any git failure. Ignored build dirs are skipped (fixes the ignored-test-file fallback). Core: we:scripts/readiness/forge-exec-manifest.mjs.
+Delivered by PR #6111 (R258; R280 retro card). macOS load average (~50 on 12 cores) counts IO and lock waiters and throttled work while the CPU was idle. New host-capacity reader reports CPU idle, memory pressure, swap, compressor, heavy queue and Forge, with a headroom verdict and admitNewWorkers. Core: we:scripts/readiness/host-capacity.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-fast-manifest.test.mjs` (delivered by #6100).
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/host-capacity.test.mjs` (delivered by #6111).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

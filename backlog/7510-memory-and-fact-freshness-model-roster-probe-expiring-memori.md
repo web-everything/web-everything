@@ -1,19 +1,20 @@
 ---
+bornAs: x565wfl
 kind: story
-size: 2
+size: 8
 status: open
-scope: ["we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/lib/red-team-run-result.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-job.mjs"]
+scope: ["we:scripts/lib/model-probation.mjs", "we:scripts/lib/model-probation.json", "we:scripts/lib/dispatch-routing-policy.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Record a failed red-team seat as failed and retry it
+# Memory and fact freshness: model-roster probe, expiring memories, stale-memory resurfacing
 
-Delivered by PR #6099 (R280 retro card). A non-ok red-team seat was reported as ran/unpublished, which held #6096 for 48 min. We now return status failed with a reason and retry via the existing cooldown/cap-guarded retry. Drain evidence stays fail-closed. Touches we:scripts/lib/red-team-run-result.mjs, we:scripts/operations/review-job.mjs.
+HIGH cards-to-file entry 2026-10-30 06:49 ET (operator OK, build after Forge). Retired model ids (gemini-3.1-pro, claude-sonnet-4-6, claude-opus-4-6-thinking) stayed configured unnoticed. Build: (1) a daily probe of the models each CLI offers that flags any configured id not offered; (2) conditional memories carry a machine-checkable expiry condition that resurfaces them when met; (3) session start lists memories naming a file, flag or model older than N days for re-verify; (4) end of session turns session rulings into one memory-update PR. Core: we:scripts/lib/model-probation.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/review-red-team.test.mjs we:scripts/lib/__tests__/drain-red-team-evidence.test.mjs` (delivered by #6099).
+- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

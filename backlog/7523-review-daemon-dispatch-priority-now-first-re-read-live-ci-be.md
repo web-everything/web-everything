@@ -1,15 +1,16 @@
 ---
+bornAs: xu3z4ey
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs", "we:scripts/operations/prototype-load-io.mjs"]
+scope: ["we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# prototype-load must require real test and audit receipts
+# Review daemon: dispatch priority:now first, re-read live CI before skipping, stacked PRs never outrank their base
 
-HIGH cards-to-file entry 2026-10-30 13:25 ET (P5 slip). A worker passed a made-up --tests-run id and free-text --audit 'NOT WEAKENED' to load #6059 onto verify. The commit was in fact audited and green, but the gate accepted unverifiable inputs. The operation must require a real audit file and a resolvable tests-run id, and refuse otherwise. Core: we:scripts/operations/prototype-load.mjs.
+HIGH cards-to-file entry 2026-10-30 16:50 ET. The review daemon skipped #6109 at 20:37Z as ci:failed using a stale failing test result. Needs: dispatch priority:now PRs first; re-read live CI before skipping as ci:failed; stacked PRs must not outrank their base. Core: we:scripts/operations/review-dispatch.mjs.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xig5aoo
 kind: story
-size: 8
+size: 5
 status: open
-scope: ["we:scripts/lib/model-probation.mjs", "we:scripts/lib/model-probation.json", "we:scripts/lib/dispatch-routing-policy.mjs"]
+scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/forge-exec-bases.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Memory and fact freshness: model-roster probe, expiring memories, stale-memory resurfacing
+# Forge progressive sync: ship a lane's edits in the background while the worker edits
 
-HIGH cards-to-file entry 2026-10-30 06:49 ET (operator OK, build after Forge). Retired model ids (gemini-3.1-pro, claude-sonnet-4-6, claude-opus-4-6-thinking) stayed configured unnoticed. Build: (1) a daily probe of the models each CLI offers that flags any configured id not offered; (2) conditional memories carry a machine-checkable expiry condition that resurfaces them when met; (3) session start lists memories naming a file, flag or model older than N days for re-verify; (4) end of session turns session rulings into one memory-update PR. Core: we:scripts/lib/model-probation.mjs.
+HIGH cards-to-file entry 2026-10-30 07:08 ET (operator: yes to track). Baseline: 42s wall for a 3s test (manifest 11.8s, rsync 5.9s, receipt 2.3s, Forge setup). The delta manifest (#6100) and pre-warmed slots (#6104) are built; the remaining item is pushing a lane's changes to Forge in the background as the worker edits, so run time ships almost nothing. Core: we:scripts/readiness/remote-exec.mjs.
 
 ## Acceptance
 

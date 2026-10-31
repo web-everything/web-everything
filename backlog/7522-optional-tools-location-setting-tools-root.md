@@ -1,19 +1,20 @@
 ---
+bornAs: xsg9540
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/tree-watchdog.mjs", "we:scripts/lib/worker-deadline.mjs"]
+scope: ["we:scripts/lib/tools-root.mjs", "we:scripts/lib/tools-root-guard.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/verify-lane.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Forge: overlap SSH round trips and faster inventory
+# Optional tools-location setting (tools.root)
 
-Delivered by PR #6101 (stacked on #6100; R280 retro card). Forge sync spent most wall time on sequential SSH round trips. SSH ControlMaster reuse (private 0700 dir, graceful degrade, also for rsync) plus parallel reachability, HEAD and bases discovery cut it. Core: we:scripts/readiness/remote-exec.mjs.
+Delivered by PR #6112 (R259 prototype; R280 retro card). Heavy tooling always ran from the lane's own checkout. An optional tools.root (platform-preferences) or WE_TOOLS_ROOT makes heavy-admission, remote-exec and verify-lane re-exec from a configured checkout, validated (absolute, repo checkout, outside .lanes, script present); invalid or unset runs locally. Core: we:scripts/lib/tools-root.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/remote-exec.test.mjs` (delivered by #6101).
+- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/tools-root.test.mjs` (delivered by #6112).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

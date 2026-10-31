@@ -1,19 +1,20 @@
 ---
+bornAs: xk6mrey
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs"]
+scope: ["we:scripts/readiness/forge-exec-bases.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/forge-warm-base.mjs", "we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Overlay main-sync survives a timed-out checkout retry
+# Forge pre-warmed slots and reliable warm base
 
-Delivered by PR #6110 (R280 retro card). A 60s git timeout under host load killed a big checkout, leaving a partial index and untracked files in the scratch clone, so the retry aborted. On retry the scratch is now dropped and recreated (scratch clone only). Core: we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs.
+Delivered by PR #6104 (stacked on #6101; R280 retro card). Prewarm hit only 1 of 3 delta runs and slot trees existed only for the newest base. We now keep 12 bases and pick the one nearest HEAD, retry the guard a bounded number of times, and claim per-slot pre-assembled base trees exclusively (falls back to normal copy on any doubt). Core: we:scripts/readiness/forge-exec-bases.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs` (delivered by #6110).
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-offload.test.mjs` (delivered by #6104).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

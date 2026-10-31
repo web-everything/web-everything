@@ -1,19 +1,20 @@
 ---
+bornAs: x4yadqc
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/lib/merge-gate-ci.mjs"]
+scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/codex-direct-task.mjs", "we:scripts/gemini-direct-task.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Route drain merge-gate evaluation and daemon rebuild smoke and soak runs to Forge
+# Keep raw seat answers and robust JSON extraction for red-team seats
 
-HIGH cards-to-file entry 2026-10-30 20:38 ET (R278). Move to Forge next: (a) drain merge-gate evaluation (classifyGateReads and pre-merge checks); (b) daemon rebuild smoke and soak runs. Both run on the Mac today; route through heavy-admission remote or remote-exec once cgroup limits are in. Core: we:scripts/readiness/heavy-admission.mjs.
+Delivered by PR #6107 (R280 retro card). Codex and agy-gemini seat calls ended unparseable and classifySeatCall kept only stderr, losing the raw answer. The raw final message (cap 64 KB) is now saved to seat-raw/<callId>.txt for any non-ok call, and JSON extraction handles fenced, echoed, truncated and trailing-prose answers. Core: we:scripts/operations/review-extra-seats.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
+- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/review-extra-seats.test.mjs` (delivered by #6107).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

@@ -1,19 +1,20 @@
 ---
+bornAs: xqgz49u
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/tools-root.mjs", "we:scripts/lib/tools-root-guard.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/remote-exec.mjs", "we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/lib/merge-gate-inventory.mjs", "we:scripts/lib/merge-gate-ci.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Optional tools-location setting (tools.root)
+# Fix the incomplete failure inventory that burns the one-time recovery rerun
 
-Delivered by PR #6112 (R259 prototype; R280 retro card). Heavy tooling always ran from the lane's own checkout. An optional tools.root (platform-preferences) or WE_TOOLS_ROOT makes heavy-admission, remote-exec and verify-lane re-exec from a configured checkout, validated (absolute, repo checkout, outside .lanes, script present); invalid or unset runs locally. Core: we:scripts/lib/tools-root.mjs.
+HIGH cards-to-file entry 2026-10-30 06:57 ET. The message 'incomplete failure inventory; one-time recovery rerun spent' hit #6059, #6023 and #6033 within 50 minutes, so it is systemic, likely the CI failure-inventory reader versus the current CI run shape after the we:.github/workflows/ci.yml restore. Trace once across all three and fix the reader. Core: we:scripts/lib/merge-gate-inventory.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/tools-root.test.mjs` (delivered by #6112).
+- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

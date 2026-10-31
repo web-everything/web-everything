@@ -1,19 +1,20 @@
 ---
+bornAs: x4a0xpx
 kind: story
-size: 3
+size: 1
 status: open
-scope: ["we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/review-job.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Review daemon: dispatch priority:now first, re-read live CI before skipping, stacked PRs never outrank their base
+# Overlay main-sync takes merge attributes from origin/main
 
-HIGH cards-to-file entry 2026-10-30 16:50 ET. The review daemon skipped #6109 at 20:37Z as ci:failed using a stale failing test result. Needs: dispatch priority:now PRs first; re-read live CI before skipping as ci:failed; stacked PRs must not outrank their base. Core: we:scripts/operations/review-dispatch.mjs.
+Delivered by PR #6108 (R280 retro card). Overlay main-sync merged origin/main with the checked-out top's attributes, so tops older than #6096 never applied the we:docs/agent/testing.md merge=union rule and refused on conflict. The merge now uses --attr-source=origin/main. Core: we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
+- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs` (delivered by #6108).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

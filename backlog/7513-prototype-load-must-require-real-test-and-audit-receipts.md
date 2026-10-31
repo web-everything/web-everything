@@ -1,19 +1,20 @@
 ---
+bornAs: xd3dqs7
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/readiness/forge-exec-bases.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/forge-warm-base.mjs", "we:scripts/readiness/remote-exec.mjs"]
+scope: ["we:scripts/operations/prototype-load.mjs", "we:scripts/operations/prototype-load-io.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Forge pre-warmed slots and reliable warm base
+# prototype-load must require real test and audit receipts
 
-Delivered by PR #6104 (stacked on #6101; R280 retro card). Prewarm hit only 1 of 3 delta runs and slot trees existed only for the newest base. We now keep 12 bases and pick the one nearest HEAD, retry the guard a bounded number of times, and claim per-slot pre-assembled base trees exclusively (falls back to normal copy on any doubt). Core: we:scripts/readiness/forge-exec-bases.mjs.
+HIGH cards-to-file entry 2026-10-30 13:25 ET (P5 slip). A worker passed a made-up --tests-run id and free-text --audit 'NOT WEAKENED' to load #6059 onto verify. The commit was in fact audited and green, but the gate accepted unverifiable inputs. The operation must require a real audit file and a resolvable tests-run id, and refuse otherwise. Core: we:scripts/operations/prototype-load.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-offload.test.mjs` (delivered by #6104).
+- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

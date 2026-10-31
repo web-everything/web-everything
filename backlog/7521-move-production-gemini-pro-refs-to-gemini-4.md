@@ -1,19 +1,20 @@
 ---
+bornAs: xrw7q22
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/lib/merge-gate-inventory.mjs", "we:scripts/lib/merge-gate-ci.mjs"]
+scope: ["we:scripts/lib/dispatch-routing-policy.json", "we:scripts/lib/dispatch-routing-policy.mjs", "we:scripts/lib/model-probation.json", "we:scripts/lib/antigravity-model-effort.mjs", "we:scripts/gemini-direct-task.mjs", "we:scripts/operations/review-dispatch.mjs", "we:docs/agent/agent-cli-capability-map.md"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Fix the incomplete failure inventory that burns the one-time recovery rerun
+# Move production Gemini Pro refs to Gemini 4
 
-HIGH cards-to-file entry 2026-10-30 06:57 ET. The message 'incomplete failure inventory; one-time recovery rerun spent' hit #6059, #6023 and #6033 within 50 minutes, so it is systemic, likely the CI failure-inventory reader versus the current CI run shape after the we:.github/workflows/ci.yml restore. Trace once across all three and fix the reader. Core: we:scripts/lib/merge-gate-inventory.mjs.
+Delivered by PR #6103 (R280 retro card). Configured Gemini Pro ids were retired (gemini-3.1-pro was rejected as invalid). Production refs now use gemini-4-argon-high across routing policy, probation and the antigravity/gemini spawners. Core: we:scripts/lib/dispatch-routing-policy.json.
 
 ## Acceptance
 
-- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
+- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/dispatch-routing-policy.test.mjs` (delivered by #6103).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

@@ -1,19 +1,20 @@
 ---
+bornAs: x84m553
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/codex-direct-task.mjs", "we:scripts/gemini-direct-task.mjs"]
+scope: ["we:scripts/readiness/remote-exec.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/tree-watchdog.mjs", "we:scripts/lib/worker-deadline.mjs"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Keep raw seat answers and robust JSON extraction for red-team seats
+# Forge: overlap SSH round trips and faster inventory
 
-Delivered by PR #6107 (R280 retro card). Codex and agy-gemini seat calls ended unparseable and classifySeatCall kept only stderr, losing the raw answer. The raw final message (cap 64 KB) is now saved to seat-raw/<callId>.txt for any non-ok call, and JSON extraction handles fenced, echoed, truncated and trailing-prose answers. Core: we:scripts/operations/review-extra-seats.mjs.
+Delivered by PR #6101 (stacked on #6100; R280 retro card). Forge sync spent most wall time on sequential SSH round trips. SSH ControlMaster reuse (private 0700 dir, graceful degrade, also for rsync) plus parallel reachability, HEAD and bases discovery cut it. Core: we:scripts/readiness/remote-exec.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/review-extra-seats.test.mjs` (delivered by #6107).
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/remote-exec.test.mjs` (delivered by #6101).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

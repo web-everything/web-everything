@@ -1,19 +1,20 @@
 ---
+bornAs: xllgkfb
 kind: story
-size: 1
+size: 3
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs"]
+scope: ["we:.claude/skills/mechanical-delivery-doctrine/SKILL.md", "we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-10-30"
 tags: []
 ---
 
-# Overlay main-sync takes merge attributes from origin/main
+# Orchestrator focus lock: one current-focus file checked by every schedule and triage
 
-Delivered by PR #6108 (R280 retro card). Overlay main-sync merged origin/main with the checked-out top's attributes, so tops older than #6096 never applied the we:docs/agent/testing.md merge=union rule and refused on conflict. The merge now uses --attr-source=origin/main. Core: we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs.
+HIGH cards-to-file entry 2026-10-30 14:30 ET (operator: we need to improve assistant focus). Keep a single current-focus file (goal, done-when, allowed side work). Every schedule prompt and event triage starts by reading it; any worker or thread off the focus path must be named as a deviation with a one-line justification or operator OK; the 10-minute update reports only focus-path progress. Root cause 2026-10-30: the R228/R254 lane prototype path was identified at 12:39 but effort went to side quests.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs` (delivered by #6108).
+- [A1] **Executable** — a new test, written first, that fails before this item lands and passes after, covering the behaviour in the digest.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
