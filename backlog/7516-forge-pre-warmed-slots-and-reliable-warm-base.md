@@ -2,9 +2,11 @@
 bornAs: xk6mrey
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/readiness/forge-exec-bases.mjs", "we:scripts/readiness/forge-exec-run.mjs", "we:scripts/readiness/forge-warm-base.mjs", "we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-10-30"
+dateResolved: "2026-10-31"
+graduatedTo: 2ee4dcbf9bf17c1674e7948339d0b15c164151b6
 tags: []
 ---
 
