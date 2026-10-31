@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -9,6 +9,7 @@ import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
+import {verifiedCopySource} from '../forge-exec-bases.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -694,6 +695,98 @@ syncBuiltinESMExports();
     expect(result.stderr).toBe('forge-exec-run: Invalid warm source\n');
     expect(result.stdout).toBe('');
     await expect(stat(attempts)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it.each(['base', 'temporary parent', 'tree', 'nested directory', 'leaf'])
+  ('warm-install refuses a symlinked %s even when the redirected bytes match the manifest', async component => {
+    const base=join(root,'warm-source'),parent=join(base,'a'.repeat(40)+'.tmp'),tree=join(parent,'tree');
+    await mkdir(join(tree,'nested'),{recursive:true});
+    await writeFile(join(tree,'package-lock.json'),'lock');
+    await writeFile(join(tree,'nested','sentinel'),'fixture bytes');
+    const {manifest}=await snapshotBinding(tree);
+    const replaced={base,'temporary parent':parent,tree,'nested directory':join(tree,'nested'),leaf:join(tree,'nested','sentinel')}[component];
+    await rename(replaced,replaced+'.saved');
+    await symlink(replaced+'.saved',replaced);
+    await expect(runner.warmInstall(tree,manifest)).rejects.toThrow(/warm source|copy/i);
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+    expect(await readFile(join(tree,'nested','sentinel'),'utf8')).toBe('fixture bytes');
+  });
+  it.each(['temporary parent', 'tree', 'nested directory'])
+  ('warm copying stays on the pinned source after replacing its %s pathname', async component => {
+    const parent=join(root,'a'.repeat(40)+'.tmp'),tree=join(parent,'tree'),destination=join(root,'warm-copy');
+    const victim=join(root,'warm-victim'),name=Buffer.from("quote' space 雪.txt");
+    await mkdir(join(tree,'nested'),{recursive:true});await mkdir(destination);
+    await mkdir(join(victim,'tree','nested'),{recursive:true});
+    const original=Buffer.concat([Buffer.from(join(tree,'nested')+'/'),name]);
+    await writeFile(original,'public fixture');
+    await writeFile(join(victim,'tree','nested','sentinel'),'private fixture');
+    const replaced=component==='temporary parent'?parent:component==='tree'?tree:join(tree,'nested');
+    const trigger=component==='temporary parent'?Buffer.from('tree'):component==='tree'?Buffer.from('nested'):name;
+    // Replace the already-open ancestor immediately before the next openat.
+    // A pathname-based copy would resolve into the victim or lose the source.
+    const driver=`import os, sys, json, base64
+attack=json.loads(sys.argv[2])
+original=os.open
+fired=False
+def swapped(name, flags, *args, **kwargs):
+    global fired
+    if not fired and name == base64.b64decode(attack['trigger']) and 'dir_fd' in kwargs:
+        fired=True
+        os.rename(attack['replaced'], attack['replaced']+'.saved')
+        os.symlink(attack['victim'], attack['replaced'])
+    return original(name, flags, *args, **kwargs)
+os.open=swapped
+exec(sys.argv[1])
+assert fired
+`;
+    const entry={path:Buffer.concat([Buffer.from('nested/'),name]).toString('base64'),sha256:hash('public fixture'),executable:false};
+    const result=spawnSync('/usr/bin/python3',['-I','-c',driver,verifiedCopySource,
+      JSON.stringify({trigger:trigger.toString('base64'),replaced,victim})],{
+      input:JSON.stringify({source:tree,destination,entries:[entry]}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(Buffer.concat([Buffer.from(join(destination,'nested')+'/'),name]),'utf8')).toBe('public fixture');
+    expect(await readdir(victim)).toEqual(['tree']);
+  });
+  it.each(['digest mismatch', 'FIFO', 'hardlink'])
+  ('warm copying refuses %s before writing any destination file', async fault => {
+    const source=join(root,'source'),destination=join(root,'destination'),leaf=join(source,'sentinel');
+    await mkdir(source);await mkdir(destination);
+    if(fault==='FIFO') {
+      const fifo=spawnSync('mkfifo',[leaf],{timeout:1000});expect(fifo.status).toBe(0);
+    } else {
+      await writeFile(leaf,'private fixture');
+      if(fault==='hardlink')await link(leaf,join(root,'linked-sentinel'));
+    }
+    const result=spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+      input:JSON.stringify({source,destination,entries:[{path:Buffer.from('sentinel').toString('base64'),sha256:hash(fault==='digest mismatch'?'public fixture':'private fixture'),executable:false}]}),
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Invalid copy source');expect(await readdir(destination)).toEqual([]);
+    expect(result.stdout).toBe('');expect(result.stderr).not.toContain('private fixture');
+  });
+  it('warm-install accepts an ordinary source and completes dependency installation', async () => {
+    const source=join(root,'ordinary-warm-source');await mkdir(source);
+    await writeFile(join(source,'package-lock.json'),'lock');
+    const {manifest}=await snapshotBinding(source);
+    expect(await runner.warmInstall(source,manifest)).toEqual({code:0});
+    expect(await readFile(join(root,'install.log'),'utf8')).toContain('ci --include=dev --ignore-scripts');
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+  });
+  it.skipIf(process.platform!=='linux'||process.getuid()!==0)
+  ('root warm copying refuses a redirected ancestor before copying a root-only sentinel', async () => {
+    const parent=join(root,'root-source'),tree=join(parent,'tree'),destination=join(root,'root-destination');
+    await mkdir(tree,{recursive:true});await mkdir(destination);
+    await writeFile(join(tree,'sentinel'),'root-only fixture',{mode:0o600});
+    await rename(parent,parent+'.saved');await symlink(parent+'.saved',parent);
+    const result=spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+      input:JSON.stringify({source:tree,destination,entries:[{path:Buffer.from('sentinel').toString('base64'),sha256:hash('root-only fixture'),executable:false}]}),
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
+    expect(await readdir(destination)).toEqual([]);expect(result.stdout).toBe('');
+    expect(result.stderr).not.toContain('root-only fixture');
   });
   it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');

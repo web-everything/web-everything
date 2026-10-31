@@ -51,7 +51,7 @@ describe('prepare PR publication', () => {
     edit('backlog/4368-card.md');
     const sha = snapshot([main], 'Merge pull request #3073 from chalbert/lane/4341-prepare-wip-queue');
     const spawn = vi.fn(() => ({ status: 0, stdout: '{}' }));
-    createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request()).argv });
+    createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request()).argv });
     expect(spawn).toHaveBeenCalledOnce();
     expect(spawn.mock.calls[0][1]).toContain('--title=WE #4368: prepare — Original card title');
     expect(spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
@@ -62,7 +62,7 @@ describe('prepare PR publication', () => {
     const sha = snapshot([main]);
     const spawn = vi.fn(() => ({ status: 0, stdout: '{}' }));
     const plan = planOpen(request({ title: 'prepare: 4368, 4341' }));
-    createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: plan.argv });
+    createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: plan.argv });
     expect(spawn).toHaveBeenCalledOnce();
     expect(spawn.mock.calls[0][1]).toContain('--title=prepare: 4368, 4341');
     expect(spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
@@ -70,7 +70,7 @@ describe('prepare PR publication', () => {
   it('refuses an unlisted card in a batch before publication', () => fixture(({ cwd, git, snapshot, main, edit }) => {
     edit('backlog/4368-card.md'); edit('backlog/4341-card.md'); snapshot([main]);
     const spawn = vi.fn();
-    const result = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request({ title: 'prepare: 4368' })).argv });
+    const result = createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request({ title: 'prepare: 4368' })).argv });
     expect(result.outcome).toBe('refused'); expect(spawn).not.toHaveBeenCalled();
   }));
   it('refuses publication when the card content read fails', () => fixture(({ cwd, git, snapshot, main, edit }) => {
@@ -81,7 +81,7 @@ describe('prepare PR publication', () => {
       if (args[0] === 'show') throw new Error('card unavailable');
       return git(args);
     };
-    expect(createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git: metadataUnavailable, spawn })({ argv: planOpen(request()).argv })).toMatchObject({ outcome: 'refused', reason: expect.stringMatching(/specific change subject/) });
+    expect(createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), cwd, git: metadataUnavailable, spawn })({ argv: planOpen(request()).argv })).toMatchObject({ outcome: 'refused', reason: expect.stringMatching(/specific change subject/) });
     expect(spawn).not.toHaveBeenCalled();
   }));
 
@@ -91,7 +91,7 @@ describe('prepare PR publication', () => {
     edit('backlog/4368-card.md');
     snapshot([predecessor]);
     const spawn = vi.fn();
-    const result = createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request()).argv });
+    const result = createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request()).argv });
     expect(result.outcome).toBe('refused');
     expect(result.reason).toContain(`diff outside backlog/4368-card.md: ${path}`);
     expect(spawn).not.toHaveBeenCalled();
@@ -102,14 +102,14 @@ describe('prepare PR publication', () => {
     edit('backlog/4368-card.md');
     snapshot([main, other]);
     const spawn = vi.fn();
-    expect(createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request()).argv }).reason).toContain('lane contains merge commits');
+    expect(createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), cwd, git, spawn })({ argv: planOpen(request()).argv }).reason).toContain('lane contains merge commits');
     expect(spawn).not.toHaveBeenCalled();
   }));
 
   it('fails closed when git cannot observe the diff', () => {
     const spawn = vi.fn();
     const git = () => { throw new Error('fetch unavailable'); };
-    expect(createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), git, spawn })({ argv: planOpen(request()).argv })).toEqual({ outcome: 'refused', reason: 'fetch unavailable' });
+    expect(createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), git, spawn })({ argv: planOpen(request()).argv })).toEqual({ outcome: 'refused', reason: 'fetch unavailable' });
     expect(spawn).not.toHaveBeenCalled();
   });
 });
@@ -132,7 +132,7 @@ describe('prepare guard scope (only prepare-item PRs are guarded)', () => {
     const git = vi.fn(() => { throw new Error('guard must not run'); });
     const spawn = vi.fn(() => ({ status: 0, stdout: '{}' }));
     const argv = planOpen(request({ ref: 'lane/4400-prepare-decision-x', title: 'WE #4400: author decision forks' })).argv;
-    createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), git, spawn })({ argv });
+    createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), git, spawn })({ argv });
     expect(git).not.toHaveBeenCalled();
     expect(spawn.mock.calls[0][1]).toContain('--title=WE #4400: author decision forks');
   });

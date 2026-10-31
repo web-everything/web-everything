@@ -444,8 +444,9 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
-    ...Object.keys(ADMISSION_POLICY_STANDARD.remote).filter(key => key !== 'clientPath').map(key => `remote.${key}`),
-    ...(settings.remote?.clientPath != null ? ['remote.clientPath'] : [])]
+    ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
+      .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
+      .map(key => `remote.${key}`)]
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }

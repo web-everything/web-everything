@@ -2054,11 +2054,11 @@ state. Base pin creation and pruning share a guard; unknown or unreadable eviden
 pruning closed. A worker receives independent copies, and the existing full-tree manifest
 and input-digest checks still run before cache extraction or npm. Pre-run delta build or
 transport failures rebuild through full shipping; execution ambiguity never retries.
-Delta membership compares a fresh no-follow read and SHA-256 of every final Mac worktree
-leaf (plus its executable bit) against the base, including Git-clean CRLF/filter output;
-Git diff validates working changes against the pinned HEAD; transfer paths use byte order.
-Unchanged leaves skip staging and rsync, not the
-initial read/hash. Pin this with real Git autocrlf and post-diff race fixtures.
+Delta membership compares each final Mac worktree leaf (plus its executable bit) against the base.
+Git-clean leaves with verified base blob bytes and stable metadata reuse the base SHA-256; changed,
+untracked, filtered/CRLF, index-flagged or unverifiable leaves are read and hashed, and any Git
+evidence failure falls back to a full scan (see "Forge manifest reuse"). Transfer paths use byte order.
+Unchanged leaves skip staging and rsync. Pin this with real Git autocrlf and post-diff race fixtures.
 Each warm tick revalidates retained READY records and their tree count/metadata digest;
 a missing tree marker requires one full manifest verification before publication, while
 mismatched evidence removes and rebuilds the base. Test both legacy-marker migration and
@@ -3106,6 +3106,14 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
+`core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
+`full-scan`. Unreadable or incomplete config evidence also requires that fallback.
+Use `git ls-files -f -v -z` for index flags: fsmonitor-valid entries become lowercase
+only with `-f` and must be hashed. The fast-manifest tests pin restored-mtime edits
+and fsmonitor-valid entries; the offload tests require every final leaf to be read
+and hashed when reuse is unavailable.
+
 Git metadata setup runs entirely under an operator-owned 0700 temporary parent;
 publish `.git` only after the final privileged Git command. A root-owned `.git`
 under worker-owned `work` can still be renamed and replaced by that worker.
@@ -3263,6 +3271,71 @@ remote result to fall back through local admission; an invalid receipt keeps the
 result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
 compares local and shipped discovery of the base, coverage report, and memory index.
 
+## Probe worker timeout teardown
+
+Worker timeout promises allow at most one second for `worker.terminate()` before
+rejecting. A synchronous native call such as `execFileSync` can prevent termination
+from settling: every timeout-path termination wait needs a separate hard deadline.
+Reserve the timeout outcome first so late message, error and exit events cannot
+replace it. Await normal shutdown within the grace period so callers can tear down
+safely; after the deadline, unreference the blocked worker and reject with the original
+timeout error. Shutdown remains best effort after this bound; the worker may survive
+until its native call returns or its owning process exits.
+`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` covers pending, rejected
+and synchronously throwing termination for both runners, plus a real probe blocked in
+`execFileSync`. The `probe-worker-termination-blocks-timeout` daemon soak break runs
+the equivalent real sweep worker case. Keep these bounded-wait cases when changing
+timeout teardown; awaiting termination without a secondary deadline must fail them.
+
+## Forge manifest reuse
+
+`forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
+file reads. Git status is not sufficient byte evidence for filters, encodings, index flags,
+or concurrent writes: hash those leaves normally, and use fresh stat/mode and base blob-size
+checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
+warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
+read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
+Outside dependency/Git internals, ignored test-shaped files force local fallback, including
+files under wholly ignored build directories: Git ignore evidence does not prove exclusion
+from the test runner. The named
+`refuses runnable scripts/build tests ignored by …` cases cover `.gitignore` and
+`.git/info/exclude` for full and delta manifests; `remote-exec.test.mjs`'s
+`falls back before transport for a whole-directory ignored test` table pins remote refusal.
+Run this fixture and the affected Forge tests through heavy admission.
+
+Remote discovery may overlap reachability, HEAD and base discovery, but drain every
+speculative process before returning fallback. `buildManifest` always lists ignored files
+fresh after base-manifest retrieval; ignored tests created during retrieval must still
+refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
+and index flags. Metadata capture uses at most 16 workers and drains failures before
+full scanning. Manifest timing substages appear inside the existing stage report;
+`inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
+share multiplexing options only after checking a short, owner-only 0700 directory;
+unavailable, unsafe or overlong control paths retain ordinary SSH.
+
+## Worker cancellation during module loading
+
+Never terminate a worker while its ESM graph is loading: Node 22 can abort the entire process in
+`AsyncModuleExecutionFulfilled`. The verify watchdog disarms its shared deadline before cooperative
+shutdown, and `verify-lane` awaits its exit before emitting the final verdict, including timeout and
+spawn-error paths. Keep the escape sweeps intact when the deadline already fired.
+
+The health probe worker uses `worker-deadline.mjs`: announce readiness after all imports and before
+synchronous probe work, check startup cancellation, and drain worker exit before reporting a timeout.
+Module evaluation is allowed to finish during cancellation; the timeout prevents probe work from
+starting but does not forcibly interrupt the loader. Do not use this readiness protocol for work
+that dynamically imports additional modules after announcing readiness.
+`bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
+imports to exercise cancellation without taking down the test runner on a native loader regression.
+Eval worker bootstraps must support inherited `--input-type=commonjs` and `--input-type=module`;
+use dynamic imports for dependencies shared by both modes. Keep both caller modes in the watchdog's
+heartbeat shutdown matrix, including live handles, in-flight imports and fired deadlines.
+The named `hashes Git-clean … leaves` table covers every sensitive attribute:
+`filter`, `working-tree-encoding`, `ident`, `text`, and `eol`, asserting actual leaf
+reads and equality with full hashing. Include an identity encoding as well as a
+byte-transforming encoding so base-blob size/hash checks cannot mask a missing
+attribute guard. Same-size hidden-edit cases pin uppercase `S` (skip-worktree),
+lowercase `h` (assume-unchanged), and lowercase `s` (both flags).
 ## CI-heal check evidence (R272)
 
 Check names and required rosters match exactly, including case: a passing `TEST`

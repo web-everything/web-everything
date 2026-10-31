@@ -1096,6 +1096,38 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file'});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
+  it.each([
+    'scripts/build/__tests__/unit/lost.test.mjs',
+    'scripts/out/__tests__/unit/lost.test.mjs',
+    'scripts/coverage/__tests__/unit/lost.test.mjs',
+    'scripts/.next/__tests__/unit/lost.test.mjs',
+    'scripts/.vite/__tests__/unit/lost.test.mjs',
+    'scripts/.cache/__tests__/unit/lost.test.mjs',
+    'scripts/storybook-static/__tests__/unit/lost.test.mjs',
+    'scripts/_site/__tests__/unit/lost.test.mjs',
+    'scripts/dist/__tests__/unit/lost.test.mjs',
+    '_site/output.test.mjs',
+    'dist/output.test.mjs',
+    'scripts/quote\' space 雪/build/__tests__/unit/lost.test.mjs',
+  ])('falls back before transport for a whole-directory ignored test: %s', async name => {
+    const f = fixture();
+    f.argv = ['npm', 'run', 'test:unit'];
+    const exec = f.exec;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'git' && call.args.includes('-i')) {
+        return {code:0, stdout:Buffer.from(name+'\0')};
+      }
+      // Model check-ignore evidence from a whole-directory rule (including info/exclude).
+      if (call.file === 'git' && call.args[0] === 'check-ignore') {
+        return {code:0, stdout:call.input};
+      }
+      return exec(call);
+    });
+    await expect(remoteManifestAPI.buildManifest(f)).rejects.toMatchObject({code:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
   it('allows ignored non-tests and dependency/Git internals', async () => {
     spawnSync('git',['init','--quiet'],{cwd});
     writeFileSync(join(cwd,'.gitignore'),'secret.txt\nnode_modules/\n');
@@ -2416,4 +2448,32 @@ it('includes an attempted manifest stage on failure and measures old-runner wall
   const completed=await timedRunRemote(fixture());
   expect(completed.timings.find(t=>t.stage==='forge-run')).toMatchObject({ms:expect.any(Number)});
   expect(completed.timings.find(t=>t.stage==='forge-install')).toBeUndefined();
+});
+
+
+describe('overlapped Forge discovery',()=>{
+  it('starts reachability, HEAD and bases together before consuming failures',async()=>{
+    const f=fixture(),pending=new Map();
+    const exec=vi.fn(call=>new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
+    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec});
+    await new Promise(resolve=>setImmediate(resolve));
+    expect([...pending.keys()].sort()).toEqual(['bases','head','probe']);
+    pending.get('probe').resolve({code:0});
+    pending.get('head').reject(new Error('HEAD unavailable'));
+    pending.get('bases').reject(new Error('bases unavailable'));
+    expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-unreachable'});
+    expect(exec).toHaveBeenCalledTimes(3);
+  });
+  it.each(['nonzero','rejection'])('drains in-flight failures before unreachable fallback (%s)',async fault=>{
+    const f=fixture(),pending=new Map();let settled=false;
+    const exec=vi.fn(call=>new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
+    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec}).then(value=>{settled=true;return value;});
+    await new Promise(resolve=>setImmediate(resolve));
+    if(fault==='rejection')pending.get('probe').reject(new Error('unreachable'));
+    else pending.get('probe').resolve({code:255});
+    await new Promise(resolve=>setImmediate(resolve));expect(settled).toBe(false);
+    pending.get('head').reject(new Error('local failure'));pending.get('bases').reject(new Error('remote failure'));
+    expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-unreachable'});
+    expect(exec).toHaveBeenCalledTimes(3);
+  });
 });

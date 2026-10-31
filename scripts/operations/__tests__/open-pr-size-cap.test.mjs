@@ -20,7 +20,7 @@ function wrapper(overrides = {}) {
   const diffStat = vi.fn(() => text);
   const fileItem = vi.fn(() => card);
   const spawn = vi.fn(() => ({ status: 0, stdout: JSON.stringify(opened) }));
-  const run = openPrIo.createPrLandRunner({ prePrReview: () => ({ action: 'pass' }),
+  const run = openPrIo.createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }),
     diffStat, fileItem, spawn, dupBornAs: () => [], env: {}, ...overrides });
   return { run, diffStat, fileItem, spawn };
 }

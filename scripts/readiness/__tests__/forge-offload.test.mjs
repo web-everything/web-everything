@@ -11,7 +11,7 @@ import {baseGuard,createBasePin,pruneBases,readyBases,readBase} from '../forge-e
 let root,repo;
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
-const exec=async ({file,args,cwd,env})=>{const r=spawnSync(file,args,{cwd,env,maxBuffer:4*1024*1024});return {code:r.status,stdout:r.stdout};};
+const exec=async ({file,args,cwd,env,input})=>{const r=spawnSync(file,args,{cwd,env,input,maxBuffer:4*1024*1024});return {code:r.status,stdout:r.stdout};};
 const commit=()=>git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
 beforeEach(async()=>{
   root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-offload-')));repo=join(root,'repo');await fs.mkdir(repo);
@@ -317,12 +317,31 @@ describe('warm base selection and delta proof',()=>{
     git(['checkout','--','oauth-source.mjs']);await fs.writeFile(join(repo,'.gitignore'),'ignored.test.mjs\n');await fs.writeFile(join(repo,'ignored.test.mjs'),'hidden');
     await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toThrow('Ignored test');
   });
-  it('reads and hashes every final worktree leaf, including git-clean paths',async()=>{
+  it('reuses clean leaves while hashing changed and public credential paths',async()=>{
     const base=await baseFixture();await fs.writeFile(join(repo,'a.test.mjs'),'changed');
     const read=vi.fn(path=>fs.readFile(path));
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base,fs:{...fs,readFile:read}});
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs']);
-    for(const entry of delta.entries)expect(read.mock.calls.some(([path])=>Buffer.from(path).equals(Buffer.from(join(repo,entry.path.toString()))))).toBe(true);
+    expect(delta.manifestMode).toBe('git-delta');
+    expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','oauth-source.mjs']);
+  });
+  it('reads and hashes every final leaf when the fast path is unavailable',async()=>{
+    const base=await baseFixture();
+    await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    await fs.writeFile(join(repo,'untracked.txt'),'new');
+    const read=vi.fn(path=>fs.readFile(path));
+    const unavailable=call=>call.args[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec:unavailable,base,fs:{...fs,readFile:read}});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(delta.manifestMode).toBe('full-scan');
+    expect(delta.manifestReason).toBeTruthy();
+    expect(delta.entries).toEqual(full.entries);
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    const reads=new Map(read.mock.calls.map(([path],i)=>[Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString(),read.mock.results[i].value]));
+    for(const entry of delta.entries) {
+      expect(reads.has(entry.path.toString())).toBe(true);
+      expect(entry.sha256).toBe(hash(await reads.get(entry.path.toString())));
+    }
   });
   it('includes autocrlf worktree bytes that git considers clean and matches full shipping',async()=>{
     await fs.writeFile(join(repo,'mode.txt'),'line\n');git(['add','.']);commit();
@@ -393,12 +412,24 @@ describe('runner base materialization refuses before install',()=>{
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
   // These cases run real Git, file copies and the install supervisor; allow for CI contention.
-  it.each(['delta','old runner','manifest unavailable','oversized manifest','late delta failure'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
-    const f=await setup(),requests=[],copies=[];
+  it.each(['delta','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+    const f=await setup(),requests=[],copies=[],log=vi.fn();
+    const sshOptions=['-o','BatchMode=yes','-o','ControlMaster=auto','-o','ControlPersist=60s','-o','ControlPath=private-cm/%C'];
+    let baseRetrieved=false,ignoredCalls=0;
     const transport=async call=>{
-      if(call.file==='git'){if(mode==='late delta failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='git'&&call.args.includes('-i')) {
+        ignoredCalls++;
+        if(mode==='delta')expect(baseRetrieved).toBe(true);
+        if(ignoredCalls===1&&mode==='ignored listing failure')return {code:1,stdout:Buffer.alloc(0)};
+        if(ignoredCalls===1&&mode==='ignored listing rejection')throw new Error('ignore inventory unavailable');
+      }
+      if(call.file==='git'){if(mode==='git failure'&&call.args[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='ssh')expect(call.sshOptions).toEqual(sshOptions);
       if(call.file==='rsync'){
+        expect(call.args[call.args.indexOf('-e')+1]).toBe(`ssh ${sshOptions.map(value=>`'${value}'`).join(' ')}`);
         copies.push(call.input);
+        // Fail after manifest construction, then allow the full-ship retry.
+        if(mode==='late delta failure'&&copies.length===1)return {code:1,stdout:Buffer.alloc(0)};
         const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
         for(const name of call.input.toString().split('\0').filter(Boolean)){const rel=name.slice(2);await fs.mkdir(join(destination,rel,'..'),{recursive:true});await fs.copyFile(join(call.cwd,rel),join(destination,rel));}
         return {code:0,stdout:Buffer.alloc(0)};
@@ -409,12 +440,21 @@ describe('runner base materialization refuses before install',()=>{
       if(action==='base-manifest'&&mode==='manifest unavailable')return {code:254,stdout:''};
       if(action==='base-manifest'&&mode==='oversized manifest')return {code:0,stdout:'x'.repeat(4*1024*1024+1)};
       const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='base-manifest')baseRetrieved=true;
       if(action==='run'){requests.push(JSON.parse(call.input));return {code:value.code,stdout:''};}
       return {code:0,stdout:JSON.stringify(value)};
     };
-    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport});
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions});
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(mode==='delta'||mode==='late delta failure'?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
-    const stage=result.timings.find(s=>s.stage==='rsync');
+    if(mode.startsWith('ignored listing'))expect(ignoredCalls).toBe(2);
+    if(mode==='delta') {
+      expect(ignoredCalls).toBe(1);
+      const substages=result.timings.find(stage=>stage.stage==='manifest-build').substages;
+      expect(substages.map(stage=>stage.stage).sort()).toEqual(['base-blob-verification','git-evidence','hashing','ignored-file-listing','inventory-walk','lstat-pass']);
+      expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
+    }
+    const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
     expect(stage.shipMode).toBe(mode==='delta'?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
     // only in delta mode; the deleted file and private credentials never ship.
@@ -423,11 +463,43 @@ describe('runner base materialization refuses before install',()=>{
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
       deltaFileCount:mode==='delta'?1:0,deltaBytes:mode==='delta'?Buffer.byteLength('changed'):0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
+    if(mode==='late delta failure'){
+      expect(copies).toHaveLength(2);
+      expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
+    }
     if(mode==='delta'){
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
       expect(requests[0]).toMatchObject({baseSha:f.base.sha,deletions:Buffer.from('deleted.txt\0').toString('base64')});
     }else expect(requests[0].baseSha).toBeUndefined();
   },30_000);
+  it('refuses an ignored test created while the SSH base-manifest response is in flight',async()=>{
+    const f=await setup(),ignoredListings=[];
+    await fs.writeFile(join(repo,'.git/info/exclude'),'late.test.mjs\n');
+    const transport=vi.fn(async call=>{
+      if(call.file==='git') {
+        const result=await exec(call);
+        if(call.args.includes('-i'))ignoredListings.push(result.stdout);
+        return result;
+      }
+      if(call.file!=='ssh')throw new Error('Unexpected transport before admission');
+      const action=call.args.at(-1).split(' ').at(-1);
+      if(action==='true')return {code:0,stdout:''};
+      if(!['bases','base-manifest'].includes(action))throw new Error('Unexpected remote preparation before admission');
+      const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='base-manifest') {
+        // Let any speculative listing finish before the ignored file appears.
+        await new Promise(resolve=>setImmediate(resolve));
+        await fs.writeFile(join(repo,'late.test.mjs'),'hidden test');
+      }
+      return {code:0,stdout:JSON.stringify(value)};
+    });
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log:vi.fn()});
+    expect(result).toMatchObject({mode:'fallback',reason:'ignored-test-file'});
+    expect(transport.mock.calls.some(([call])=>call.file==='ssh'&&call.args.at(-1).endsWith(' base-manifest'))).toBe(true);
+    expect(ignoredListings.length).toBeGreaterThan(0);
+    for(const listing of ignoredListings)expect(listing.toString().split('\0')).toContain('late.test.mjs');
+    expect(transport.mock.calls.some(([call])=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+  });
   it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('retries only a proven pre-start delta rejection once: %s',async fault=>{
     const f=await setup(),requests=[],prepares=[],finishes=[],copies=[];
     const transport=async call=>{
