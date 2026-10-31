@@ -1,6 +1,6 @@
 /** Serialized, atomic operator-file update, preserving every unrelated preference and routing entry. */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, realpathSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, realpathSync, readlinkSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { operatorPreferencesPath } from '../lib/policy-cascade.mjs';
 import { applyRoutingOverrides } from '../lib/dispatch-routing-policy.mjs';
@@ -10,10 +10,19 @@ import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
+/** Follow symlinks to the file to update, including a dangling link whose target does not exist yet. */
+function preferencesWriteTarget(path) {
+  for (let hops = 0; hops < 40; hops += 1) {
+    try { return realpathSync(path); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try { path = resolve(dirname(path), readlinkSync(path)); }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'EINVAL') return path; throw error; }
+  }
+  throw new Error(`routing-override: too many symlink hops resolving ${path}`);
+}
+
 export function writeRoutingOverride({ key, patch }, { env = process.env } = {}) {
-  let path = operatorPreferencesPath(env);
-  try { path = realpathSync(path); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const path = preferencesWriteTarget(operatorPreferencesPath(env));
   mkdirSync(dirname(path), { recursive: true });
   return withFileLock(`${path}.lock`, () => {
     let prefs = {};

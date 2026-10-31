@@ -82,6 +82,16 @@ it('updates the real preferences target and preserves its symlink', async () => 
   expect(readdirSync(f.dir).sort()).toEqual(['preferences.json', 'target.json']);
 });
 
+it('creates a dangling symlink target instead of replacing the symlink', async () => {
+  const f = fixture();
+  fs.mkdirSync(join(f.dir, 'real'));
+  fs.symlinkSync(join('real', 'target.json'), f.path);
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=codex'])).code).toBe(0);
+  expect(fs.readlinkSync(f.path)).toBe(join('real', 'target.json'));
+  expect(JSON.parse(readFileSync(join(f.dir, 'real', 'target.json'), 'utf8'))).toEqual({ routingOverrides: { [key]: { provider: 'codex' } } });
+  expect(readdirSync(join(f.dir, 'real'))).toEqual(['target.json']);
+});
+
 it('declares and executes CLI write and clear, preserving unrelated preferences and entries atomically', async () => {
   const f = fixture();
   const other = { 'review-seat:advisory:agy-correctness': { model: 'sonnet' } };
