@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRemoteExec, resolveAdmissionPolicy, resolveRunClientOverride, settleClientProvenance } from '../heavy-admission.mjs';
@@ -26,7 +26,7 @@ function make() {
 }
 
 describe('per-run remote client override', () => {
-  it('uses a lane-pool lane client, logs it per-run, and emits scope:run', async () => {
+  it('imports a lane-pool lane client', async () => {
     const f = make();
     await f.exec(f.laneClient)({});
     await settleClientProvenance();
@@ -53,6 +53,22 @@ describe('per-run remote client override', () => {
     mkdirSync(dirname(link), { recursive: true });
     symlinkSync(f.outside, link);
     expect(resolveRunClientOverride({ overridePath: link, laneRoots: [f.pool] }).reason).toMatch(/not a lane-pool lane/);
+  });
+  it('refuses a non-lane directory, a deeper path and a wrong filename under the pool', () => {
+    const f = make();
+    const mk = (rel) => { const p = join(f.pool, ...rel); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, src); return p; };
+    for (const rel of [['web-everything', 'lane-x', 'scripts', 'readiness', 'remote-exec.mjs'],
+      ['a', 'b', 'lane-5', 'scripts', 'readiness', 'remote-exec.mjs'],
+      ['web-everything', 'lane-6', 'scripts', 'readiness', 'other.mjs']]) {
+      expect(resolveRunClientOverride({ overridePath: mk(rel), laneRoots: [f.pool] }).reason).toMatch(/not a lane-pool lane/);
+    }
+  });
+  it('never writes the shared host provenance file on the per-run path', async () => {
+    const f = make();
+    await f.exec(f.laneClient)({});
+    await settleClientProvenance();
+    expect(f.appendEvent).toHaveBeenCalled();
+    expect(existsSync(join(f.root, 'a', 'remote', 'client-override.json'))).toBe(false);
   });
   it('accepts the host clientPath and refuses relative paths', () => {
     const f = make();

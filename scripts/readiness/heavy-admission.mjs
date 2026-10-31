@@ -520,16 +520,14 @@ export function resolveRunClientOverride({ overridePath, hostClientPath = null, 
     if (typeof overridePath !== 'string' || !isAbsolute(overridePath)) return { reason: 'per-run override must be an absolute path' };
     const real = fs.realpathSync(overridePath);
     if (!fs.statSync(real).isFile()) return { reason: 'per-run override must be a regular file' };
-    const lower = (p) => p; // realpaths are canonical; exact compare (case-sensitive FS safe)
     if (hostClientPath != null) {
       const host = resolveRemoteClient({ clientPath: hostClientPath, laneRoots, fs });
-      if (host.clientPath && lower(host.clientPath) === lower(real)) return { clientPath: real };
+      if (host.clientPath && host.clientPath === real) return { clientPath: real };
     }
     const tail = sep + join('scripts', 'readiness', 'remote-exec.mjs');
     for (const root of laneRoots.flatMap((r) => [resolve(r), canonicalPath(r)])) {
-      const prefix = lower(root + sep);
-      const path = lower(real);
-      if (!path.startsWith(prefix) || !path.endsWith(tail)) continue;
+      const prefix = root + sep;
+      if (!real.startsWith(prefix) || !real.endsWith(tail)) continue; // exact compare on realpaths
       const lane = real.slice(prefix.length, real.length - tail.length);
       if (/^(?:[^/\\]+[/\\])?lane-\d+$/.test(lane)) return { clientPath: real };
     }
