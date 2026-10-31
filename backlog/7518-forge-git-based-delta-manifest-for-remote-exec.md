@@ -24,6 +24,11 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 - [N1] n/a: nothing beyond the digest is in scope.
 
+## Must
+
+- Must refuse the delta path on any git/walk mismatch and fall back to the full scan (card xw51scb).
+- Must treat non-source inputs (agent memory, coverage output, config files) cautiously: they are checked against the filesystem walk, not trusted from git alone (card xw51scb).
+
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
@@ -31,7 +36,7 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — n/a: no new input path beyond the digest; existing handling unchanged.
 2. **Truncated reads** — n/a: no new input path beyond the digest; existing handling unchanged.
 3. **Shared state files** — n/a: no new input path beyond the digest; existing handling unchanged.
-4. **Fail closed** — n/a: no new input path beyond the digest; existing handling unchanged.
+4. **Fail closed** — Must: refuse (fall back to the full scan) on any git/filesystem-walk mismatch; the binding and walk check are specified in xw51scb.
 5. **Identity scoping** — n/a: no new input path beyond the digest; existing handling unchanged.
 6. **State over time** — n/a: no new input path beyond the digest; existing handling unchanged.
 7. **Who wrote it** — n/a: no new input path beyond the digest; existing handling unchanged.
