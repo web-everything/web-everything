@@ -567,7 +567,7 @@ export function detachedGateExecFn(bin, args, opts = {}) {
       const stdout = Buffer.concat(output.stdout).toString('utf8');
       const stderr = Buffer.concat(output.stderr).toString('utf8');
       if (failure || code !== 0 || signal) {
-        const error = failure ?? new Error(`gate exited ${signal ?? code}`);
+        const error = failure ?? Object.assign(new Error(`gate exited ${signal ?? code}`), { status: code });
         reject(Object.assign(error, { stdout, stderr: stderr || error.message }));
       } else resolveExec(stdout);
     };
@@ -816,11 +816,23 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
     ? [['node', ['scripts/verify-lane.mjs', 'run', '--gate=npm run test:unit && npm run check:standards']]]
     : mode === 'related' ? [['node', ['scripts/verify-lane.mjs', 'run']]]
       : [['npm', ['run', 'check:standards']]];
+  // Route the heavy standards gate through the target dir's own admission wrapper (so heavyAdmission.remote can
+  // offload it to Forge). Skipped when the wrapper is absent or we already hold admission (no double-wrapping);
+  // the wrapper passes the gate's exit code through unchanged.
+  const admissionCli = join('scripts', 'readiness', 'heavy-admission.mjs');
+  if (mode === 'standards' && !env.WE_HEAVY_ADMISSION_HELD && existsFn(join(dir, admissionCli))) {
+    plan[0] = ['node', [admissionCli, 'run', '--', ...plan[0].flat()]];
+  }
   const gateEnv = mode === 'related' ? { ...env, WE_BUILD_FINAL_GATE: 'related' } : env;
   const [bin, args] = plan[0];
   const result = (pass, output) => ({ ran: true, mode, pass,
     steps: [{ cmd: `${bin} ${args.join(' ')}`, pass, output }] });
-  const failed = e => result(false, `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`);
+  const failed = e => {
+    const r = result(false, `${e.stdout ?? ''}${e.stderr ?? e.message ?? ''}`);
+    // Exit 124 from the admission wrapper = remote termination unconfirmed: never a pass, named distinctly.
+    if (e.status === 124 || e.code === 124) r.unavailable = 'gate-unconfirmed';
+    return r;
+  };
   if (asyncExecFn) {
     return Promise.resolve().then(() => asyncExecFn(bin, args, { cwd: dir, env: gateEnv }))
       .then(output => result(true, output), failed);
