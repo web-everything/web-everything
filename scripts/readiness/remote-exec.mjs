@@ -50,16 +50,22 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...SSH_OPTIONS, ...args] : args, {
-      cwd, stdio: [input === undefined ? 'inherit' : 'pipe', inherit ? 'inherit' : 'pipe', inherit ? 'inherit' : 'pipe'],
+      cwd, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
     });
     const stdout = [];
     let bytes = 0;
     let exceeded = false;
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on('data', (chunk) => {
+        if (onOutput) onOutput(chunk, stream === child.stdout ? 'stdout' : 'stderr');
+        if (inherit) {
+          const output = stream === child.stdout ? process.stdout : process.stderr;
+          if (!output.write(chunk)) { stream.pause(); output.once('drain',()=>stream.resume()); }
+          return;
+        }
         bytes += chunk.length;
         if (bytes > LIMIT) { exceeded = true; child.kill('SIGKILL'); return; }
         if (stream === child.stdout) stdout.push(chunk);
@@ -129,6 +135,21 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
   };
 }
 import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, nulPaths} from './forge-exec-manifest.mjs';
+
+// Project the committed memory bridge into regular leaves. The wire protocol
+// rejects symlinks, so neither rsync nor the worker ever follows a client link.
+const MEMORY_LINK = '.claude/agent-memory';
+const MEMORY_SOURCE = 'agent-memory-src/';
+async function verifyMemoryLink(cwd, oid, fs) {
+  const parent = await fs.lstat(join(cwd,'.claude'));
+  const link = await fs.lstat(join(cwd,MEMORY_LINK));
+  if (parent.isSymbolicLink() || !parent.isDirectory() || !link.isSymbolicLink()) throw new Error('Unsafe memory bridge');
+  const target = await fs.readlink(join(cwd,MEMORY_LINK), {encoding:'buffer'});
+  if (!oid || !target.equals(Buffer.from('../agent-memory-src'))
+    || createHash(oid.length === 64 ? 'sha256' : 'sha1').update(`blob ${target.length}\0`).update(target).digest('hex') !== oid)
+    throw new Error('Unverified memory bridge; use local fallback');
+}
+
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head} = {}) {
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Only dependency and Git internals are exempt. In particular, secret/hidden
@@ -157,7 +178,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
   if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
     || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
-  const indexBlobs = new Map();
+  const indexBlobs = new Map(), indexLinks = new Map();
   let start = 0;
   for (let i = 0; i < stage.stdout.length; i++) if (stage.stdout[i] === 0) {
     const record = stage.stdout.subarray(start,i), tab = record.indexOf(9);
@@ -169,7 +190,16 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const key = record.subarray(tab+1).toString('base64');
     const [, oid, indexStage] = record.subarray(0,tab).toString('ascii').split(' ');
     indexBlobs.set(key, indexStage === '0' && !indexBlobs.has(key) ? oid : null);
+    if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
+  }
+  const memoryKey = Buffer.from(MEMORY_LINK).toString('base64');
+  const memoryOid = indexLinks.has(memoryKey) ? indexBlobs.get(memoryKey) : undefined;
+  if (indexLinks.has(memoryKey)) {
+    await verifyMemoryLink(cwd,memoryOid,fs);
+    // An injected inventory cannot omit the tracked bridge or its target corpus.
+    files.push(Buffer.from(MEMORY_LINK), ...[...indexBlobs.keys()].map(key=>Buffer.from(key,'base64'))
+      .filter(path=>path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE))));
   }
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
@@ -208,6 +238,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const entries = [], excluded = [];
   let deletedWorktreePaths;
   for (const path of files) {
+    if (memoryOid && path.equals(Buffer.from(MEMORY_LINK))) continue;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
     let publicOid;
     if (credentialSource && !names.includes('node_modules')) {
@@ -256,6 +287,17 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     entries.push(manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64'))));
+  }
+  if (memoryOid) {
+    if ([...excluded,...ignoredPaths].some(path=>path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE))))
+      throw new Error('Incomplete memory corpus; use local fallback');
+    const targets = entries.filter(entry=>entry.path.subarray(0,MEMORY_SOURCE.length).equals(Buffer.from(MEMORY_SOURCE)));
+    if (!targets.some(entry=>entry.path.equals(Buffer.from(MEMORY_SOURCE+'MEMORY.md')))) throw new Error('Missing memory index; use local fallback');
+    for (const entry of targets) entries.push({...entry,
+      path:Buffer.concat([Buffer.from(MEMORY_LINK+'/'),entry.path.subarray(MEMORY_SOURCE.length)]),
+      tracked:false,sourcePath:entry.path,memoryOid});
+    entries.sort((a,b)=>Buffer.compare(a.path,b.path));
+    validateTestNames(entries.map(entry=>entry.path));
   }
   let siblings;
   if (!trackedOnly && entries.some(entry => entry.path.equals(Buffer.from('vitest.shared.ts')))) {
@@ -320,6 +362,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
   changedPaths(await git(['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--']));
   splitPaths(await git(['ls-files','-o','--exclude-standard','-z']));
   const manifest=await buildManifest({cwd,exec,fs,head});
+  if (manifest.entries.some(entry=>entry.sourcePath)) throw new Error('Projected memory inputs require full ship');
   // This is a byte-transfer delta, not Git scope. Reuse a warm leaf only when
   // its hash and mode match the complete Mac snapshot at the pinned HEAD.
   const baseEntries=new Map(snapshot.entries.map(entry=>[entry.path.toString('hex'),entry]));
@@ -419,9 +462,17 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
   } catch { return fallback('forge-unreachable'); }
   const nonce = randomBytes(16).toString('hex');
+  const tails = {stdout:'',stderr:''};
+  let incompleteStandards = false;
+  const observeStandards = (chunk, stream = 'stdout') => {
+    const text = tails[stream] + String(chunk);
+    if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(text)) incompleteStandards = true;
+    tails[stream] = text.slice(-128);
+  };
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
-    input:JSON.stringify(request), cwd, inherit});
+    input:JSON.stringify(request), cwd, inherit,
+    ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
   let run;
   let staging;
   let finished = false;
@@ -447,7 +498,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           const evidence=await exec({file:'git',args:['rev-parse','--verify','--end-of-options',executionEnv.DIFF_COVERAGE_BASE+'^{commit}'],cwd});
           const sha=protocolText(evidence.stdout,128).trim();
           if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha))throw new Error('Invalid coverage base SHA');
-          executionEnv.DIFF_COVERAGE_BASE=sha;
+          executionEnv=filterEnv({...executionEnv,DIFF_COVERAGE_BASE:sha});
         } catch {throw Object.assign(new Error('Coverage base unavailable; use local fallback'),{code:'diff-coverage-base-unavailable'});}
       }
       // Discovery is read-only. Older separately installed wrappers reject this
@@ -495,11 +546,15 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           for (const entry of snapshot.entries) {
             const parts = pathParts(entry.path);
             let source = Buffer.from(snapshot.source), destination = Buffer.from(snapshot.destination);
-            for (const [i, part] of parts.entries()) {
+            if (entry.sourcePath) await verifyMemoryLink(snapshot.source,entry.memoryOid,fs);
+            const sourceParts = pathParts(entry.sourcePath ?? entry.path);
+            for (const [i, part] of sourceParts.entries()) {
               source = bytePath(source, part);
-              destination = bytePath(destination, part);
               const st = await fs.lstat(source);
-              if (st.isSymbolicLink() || (i === parts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
+              if (st.isSymbolicLink() || (i === sourceParts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
+            }
+            for (const [i, part] of parts.entries()) {
+              destination = bytePath(destination, part);
               if (i < parts.length - 1) await stageDirectory(destination);
             }
             // Pin the leaf and reject special files before reading; NONBLOCK also
@@ -645,6 +700,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         return {mode:'not-started',terminated:true,reason:'forge-rejected:'+reply.reason};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if (argv[2] === 'check:standards') {
+        observeStandards(result.stdout ?? '', 'stdout');
+        observeStandards(result.stderr ?? '', 'stderr');
+        // Only a matching protected receipt proves it is safe to rerun locally.
+        if (incompleteStandards) return {mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'};
+      }
       if(reply.timings) {
         timings.splice(timings.findLastIndex(t=>t.stage==='forge-run'),1);
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');

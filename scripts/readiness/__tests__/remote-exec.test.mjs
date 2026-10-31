@@ -592,6 +592,167 @@ describe('isAllowedCommand', () => {
   });
 });
 
+describe('standards input parity', () => {
+  it('discovers the same base, ignored coverage report and tracked memory index locally and through the real manifest + filterEnv', async () => {
+    for (const scenario of ['coverage base', 'coverage report', 'memory index']) {
+      let observed;
+      const f = fixture({receipt:(_nonce,value)=>JSON.stringify({...value,code:observed.exitCode})});
+      const original = f.exec, work = join(cwd, scenario), snapshot = join(cwd, `${scenario}-remote`);
+      mkdirSync(work); mkdirSync(snapshot);
+      const git = (...args) => {
+        const result = spawnSync('git', args, {cwd:work,encoding:'utf8',timeout:10000});
+        expect(result.status,result.stderr).toBe(0); return result.stdout.trim();
+      };
+      git('init','-b','main'); git('config','user.name','Fixture'); git('config','user.email','fixture@example.invalid');
+      const tier = 'scripts/lib/disposition-judge.mjs';
+      mkdirSync(join(work,'scripts/lib'),{recursive:true});
+      for (const file of ['check-memory.mjs','lib/write-all-sync.mjs','lib/secret-scrub.mjs'])
+        cpSync(new URL(`../../${file}`,import.meta.url),join(work,'scripts',file));
+      writeFileSync(join(work,'package-lock.json'),'{}');
+      writeFileSync(join(work,'.gitignore'),'coverage/\n');
+      mkdirSync(join(work,'.claude')); mkdirSync(join(work,'agent-memory-src'));
+      symlinkSync('../agent-memory-src',join(work,'.claude/agent-memory'));
+      writeFileSync(join(work,'agent-memory-src/MEMORY.md'),scenario === 'memory index' ? 'x'.repeat(201) : '# Memory\n');
+      writeFileSync(join(work,tier),'export const changed = false;\n');
+      git('add','.'); git('commit','-m','base');
+      const base = git('rev-parse','HEAD');
+      git('branch','coverage-base',base);
+      writeFileSync(join(work,tier),'export const changed = true;\n');
+      if (scenario === 'coverage base') { git('add',tier); git('commit','-m','changed tier at clean HEAD'); }
+      git('update-ref','refs/remotes/origin/main','HEAD');
+      const loc = {start:{line:1,column:0},end:{line:1,column:40}};
+      mkdirSync(join(work,'coverage'));
+      // Only the local input exists here; the real builder/stager must ship it.
+      writeFileSync(join(work,'coverage/coverage-final.json'),JSON.stringify({[tier]:{
+        branchMap:{0:{loc,locations:[loc,loc]}},b:{0:scenario === 'memory index' ? [1,1] : [0,0]},
+      }}));
+      const discover = (root, env) => {
+        const coverage = scanDiffBranchCoverage(root,{base:env.DIFF_COVERAGE_BASE ?? 'HEAD'});
+        const memory = spawnSync(process.execPath,[join(root,'scripts/check-memory.mjs'),'--json'],{
+          cwd:root,env:{...env,PATH:process.env.PATH,HOME:join(root,'.fixture-home')},encoding:'utf8',timeout:10000,
+        });
+        expect(memory.error).toBeUndefined();
+        return {coverage:{status:coverage.status,total:coverage.total,exercised:coverage.exercised,ok:coverage.ok},
+          memory:{code:memory.status,output:memory.stdout.replaceAll(root,'<root>')},
+          exitCode:coverage.errors.length || memory.status ? 1 : 0};
+      };
+      const env = {...allowedEnv,...forbiddenEnv,...(scenario === 'coverage base' ? {DIFF_COVERAGE_BASE:'coverage-base'} : {})};
+      const local = discover(work,env);
+      expect(local.exitCode,scenario).toBe(1);
+      f.exec = vi.fn(async call => {
+        if (call.file === 'git') return remoteManifestAPI.defaultExec(call);
+        if (call.file === 'rsync') {
+          cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
+        }
+        if (isRun(call)) {
+          const request = JSON.parse(call.input);
+          await forgeManifestAPI.verifyManifest(snapshot,request.manifest,request.manifestDigest);
+          expect(await digestInput(snapshot)).toBe(request.inputDigest);
+          // Supply Git evidence only. Do not seed any gate input in the remote tree.
+          cpSync(join(work,'.git'),join(snapshot,'.git'),{recursive:true});
+          expect(request.env).toEqual(filterEnv({...env,...(scenario === 'coverage base' ? {DIFF_COVERAGE_BASE:base} : {})}));
+          observed = discover(snapshot,request.env);
+          const result = await original(call);
+          return {...result,code:observed.exitCode};
+        }
+        return original(call);
+      });
+      expect(await runRemote({...f,cwd:work,listFiles:undefined,env,argv:['npm','run','check:standards']}),scenario)
+        .toEqual({mode:'remote',code:local.exitCode});
+      expect(observed,scenario).toEqual(local);
+    }
+  }, 30000);
+
+  it.each(['untracked', 'wrong target', 'changed index bytes', 'linked parent', 'linked target', 'missing index'])
+  ('refuses an unsafe or incomplete memory bridge: %s', async fault => {
+    mkdirSync(join(cwd,'.claude')); mkdirSync(join(cwd,'agent-memory-src'));
+    writeFileSync(join(cwd,'agent-memory-src/MEMORY.md'),'# Memory\n');
+    const target = fault === 'wrong target' ? '../private' : '../agent-memory-src';
+    symlinkSync(target,join(cwd,'.claude/agent-memory'));
+    let oid = createHash('sha1').update(`blob ${target.length}\0${target}`).digest('hex');
+    if (fault === 'changed index bytes') oid = 'a'.repeat(40);
+    if (fault === 'linked parent') {
+      renameSync(join(cwd,'.claude'),join(cwd,'private'));
+      symlinkSync('private',join(cwd,'.claude'));
+    }
+    if (fault === 'linked target') {
+      renameSync(join(cwd,'agent-memory-src'),join(cwd,'private'));
+      symlinkSync('private',join(cwd,'agent-memory-src'));
+    }
+    if (fault === 'missing index') rmSync(join(cwd,'agent-memory-src/MEMORY.md'));
+    const exec = async call => ({code:0,stdout:call.args.includes('--stage')
+      ? Buffer.from(`${fault === 'untracked' ? '' : `120000 ${oid} 0\t.claude/agent-memory\0`}100644 ${'b'.repeat(40)} 0\tagent-memory-src/MEMORY.md\0`)
+      : Buffer.alloc(0)});
+    const build = () => remoteManifestAPI.buildManifest({cwd,exec,listFiles:async()=>['.claude/agent-memory','agent-memory-src/MEMORY.md']});
+    if (fault === 'untracked') {
+      const manifest = await build();
+      expect(manifest.excluded).toContainEqual(Buffer.from('.claude/agent-memory'));
+      expect(manifest.entries.some(entry=>entry.path.toString().startsWith('.claude/agent-memory/'))).toBe(false);
+    } else await expect(build()).rejects.toThrow();
+  });
+
+  it.each(['stdout','stderr'])('observes real streamed %s while retaining inherited output', async stream => {
+    const output = vi.spyOn(process[stream],'write').mockImplementation(()=>true);
+    const chunks = [];
+    try {
+      expect(await remoteManifestAPI.defaultExec({file:process.execPath,
+        args:['-e',`process.${stream}.write('skipping input')`],cwd,inherit:true,
+        onOutput:(chunk,source)=>chunks.push({chunk:String(chunk),source}),
+      })).toMatchObject({code:0});
+      expect(chunks.map(item=>item.chunk).join('')).toBe('skipping input');
+      expect(chunks.every(item=>item.source===stream)).toBe(true);
+      expect(output).toHaveBeenCalled();
+    } finally { output.mockRestore(); }
+  });
+
+  it.each(['skipping', 'no-scope', 'ENOENT', 'no changed tier lines; nothing to attribute'])
+  ('falls back through local admission after confirmed standards completion reports %s', async outcome => {
+    const f = fixture(), original = f.exec;
+    f.argv = ['npm','run','check:standards'];
+    f.exec = vi.fn(async call => {
+      const result = await original(call);
+      if (isRun(call)) {
+        // Exercise streaming detection across chunk boundaries, not a seeded result file.
+        call.onOutput?.(outcome.slice(0,3),'stdout');
+        call.onOutput?.(outcome.slice(3),'stdout');
+      }
+      return result;
+    });
+    const log = vi.fn();
+    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async () => {
+        const result = await runRemote(f);
+        expect(result).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
+        expect(callsOf(f.exec).filter(isReceipt)).toHaveLength(1);
+        return result;
+      },
+    })).toEqual({handled:false});
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+  });
+
+  it.each(['skipping', 'no-scope', 'ENOENT'])('refuses captured standards %s on stderr after bounded streaming history', async outcome => {
+    const f = fixture(), original = f.exec;
+    f.argv = ['npm','run','check:standards'];
+    f.exec = vi.fn(async call => {
+      const result = await original(call);
+      if (isRun(call)) {
+        call.onOutput?.('x'.repeat(4*1024*1024),'stdout');
+        return {...result,stderr:outcome};
+      }
+      return result;
+    });
+    expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
+  });
+
+  it('keeps skipped standards unconfirmed when the completion receipt is invalid', async () => {
+    const f = fixture({receipt:'untrusted completion'}), original = f.exec;
+    f.argv = ['npm','run','check:standards'];
+    f.exec = vi.fn(async call => ({...await original(call),...(isRun(call) ? {stdout:'skipping'} : {})}));
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+});
+
 describe('filterEnv', () => {
   it.each(['HEAD', 'origin/main', 'refs/heads/fix.v1', 'a'.repeat(40)])('accepts safe coverage base %s for local commit resolution', base => {
     const env = filterEnv({DIFF_COVERAGE_BASE:base});
