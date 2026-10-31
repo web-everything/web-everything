@@ -3413,6 +3413,16 @@ The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence,
 Classification errors, including malformed rollup identities, propagate to the CLI's error handler and abort
 before any escalation comment is posted. The read-error fallback never catches refusal classification.
 `ci-heal-escalation-mark.test.mjs` pins both preflights and both CLI outcomes with nameless evidence beside a required failure.
+## Remote slot reaper safety
+
+Remote prepare and run are separate processes with a transfer between them: process age never
+proves termination. Reaping requires reachable Forge telemetry with zero active runs and zero
+prepare/run/finish processes, plus the marker age/pid checks. Only the exact trimmed legacy text
+`remote termination unconfirmed` or a valid v1 JSON marker is eligible. Unknown markers remain
+operator cleanup holds. Before unlinking, re-read and match the marker's bytes, inode and mtime;
+replacement or disappearance must skip deletion and emit no reap event. The injected
+`beforeMarkerUnlink` seam in `heavy-admission-remote-reaper.test.mjs` exercises this race.
+
 ## Remote client import failures
 
 Importing a host-selected remote client executes its top-level code. Neither an import exception nor

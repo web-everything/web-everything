@@ -55,7 +55,7 @@
  * `waiting` intent markers this module writes, which `tick-core.mjs` surfaces as `waiting-for-capacity` notes).
  *
  * REMOTE SLOT CLEANUP — `node scripts/readiness/heavy-admission.mjs reap-remote [--dry-run]`
- * clears abandoned execution markers with affirmative Forge-idle or process-age evidence.
+ * clears abandoned execution markers only with affirmative Forge-idle evidence.
  *
  * A GENERAL-PURPOSE `run` CLI MODE — `node scripts/readiness/heavy-admission.mjs run [--container] -- <cmd…>`
  * wraps `acquire → run <cmd> → release` in one call ({@link runUnderAdmission}), so any caller can opt into
@@ -713,20 +713,19 @@ async function readRemoteForgeStatus() {
     const [output, telemetry] = await Promise.all([
       new Promise((resolve, reject) => execFile('ssh', [
         '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'forge',
-        "set -o pipefail; ps -eo etimes=,args= | { grep -E '[f]orge-exec-run.mjs (prepare|run|finish)$'; rc=$?; [ \"$rc\" -le 1 ]; }",
+        "set -o pipefail; ps -eo args= | { grep -E '[f]orge-exec-run.mjs (prepare|run|finish)$'; rc=$?; [ \"$rc\" -le 1 ]; }",
       ], { encoding: 'utf8', timeout: 8000, maxBuffer: 4096 },
       (error, stdout) => error ? reject(error) : resolve(stdout))),
       readForgeTelemetry(),
     ]);
-    const procEtimesSec = [];
+    let procCount = 0;
     for (const line of output === '' ? [] : output.replace(/\n$/, '').split('\n')) {
-      const match = /^\s*(\d+)\s+.*forge-exec-run\.mjs (prepare|run|finish)$/.exec(line);
-      if (!match || !Number.isSafeInteger(Number(match[1]))) return { reachable: false };
-      procEtimesSec.push(Number(match[1]));
+      if (!/^.*forge-exec-run\.mjs (prepare|run|finish)$/.test(line)) return { reachable: false };
+      procCount++;
     }
     if (!Number.isSafeInteger(telemetry?.activeRuns)
       || telemetry.activeRuns < 0) return { reachable: false };
-    return { reachable: true, activeRuns: telemetry.activeRuns, procCount: procEtimesSec.length, procEtimesSec };
+    return { reachable: true, activeRuns: telemetry.activeRuns, procCount };
   } catch { return { reachable: false }; }
 }
 
@@ -739,14 +738,14 @@ function remoteMarkerPidAlive(pid) {
   }
 }
 
-/** Reclaim abandoned remote markers after proving Forge idle or no process old enough to own them. Never throws.
+/** Reclaim abandoned remote markers only after proving Forge idle. Never throws.
  * Invalid/oversized markers require operator inspection via reap-remote; they remain admission holds.
  * Returns candidates only; dryRun reports them without changing markers, leases or events. */
 export async function reapRemoteSlots({
   remoteRoot, clock = Date.now, readForgeStatus = readRemoteForgeStatus,
   log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   dryRun = false, maxRunMs = DEFAULT_ADMISSION_CEILING_MS, marginMs = 600000,
-  graceMs = 120000, pidAlive = remoteMarkerPidAlive,
+  graceMs = 120000, pidAlive = remoteMarkerPidAlive, beforeMarkerUnlink = () => {},
 }) {
   const results = [];
   const notice = (line) => { try { log(line); } catch { /* diagnostics must not break admission */ } };
@@ -757,11 +756,8 @@ export async function reapRemoteSlots({
     const status = await readForgeStatus();
     if (status?.reachable !== true || !Number.isSafeInteger(status.activeRuns) || status.activeRuns < 0
       || !Number.isSafeInteger(status.procCount) || status.procCount < 0) return results;
-    const idle = status.activeRuns === 0 && status.procCount === 0;
-    const ages = status.procEtimesSec;
-    const validAges = Array.isArray(ages) && ages.length === status.procCount
-      && ages.every(age => Number.isSafeInteger(age) && age >= 0);
-    if ((!idle || ages !== undefined) && !validAges) return results;
+    // Prepare and run use separate processes; process age cannot prove termination.
+    if (status.activeRuns !== 0 || status.procCount !== 0) return results;
     const nowMs = clock();
     if (![nowMs, maxRunMs, marginMs, graceMs].every(n => Number.isFinite(n) && n >= 0)) return results;
     for (const name of names) {
@@ -774,12 +770,16 @@ export async function reapRemoteSlots({
           notice(`heavy-admission: remote slot-${slot} marker unreadable or oversized; inspect with reap-remote before operator cleanup\n`);
           continue;
         }
-        const text = readFileSync(file, 'utf8');
+        const content = readFileSync(file);
+        const text = content.toString('utf8');
         let marker;
-        try { marker = JSON.parse(text); }
-        catch { if (/^[\s]*[\[{]/.test(text)) continue; }
+        const legacy = text.trim() === 'remote termination unconfirmed';
+        if (!legacy) {
+          try { marker = JSON.parse(text); }
+          catch { continue; }
+        }
         let age; let runId = null;
-        if (marker !== undefined) {
+        if (!legacy) {
           if (marker?.v !== 1 || marker.slot !== slot || !Number.isSafeInteger(marker.pid) || marker.pid <= 0
             || typeof marker.runId !== 'string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(marker.runId)
             || typeof marker.startedAt !== 'string') continue;
@@ -791,14 +791,16 @@ export async function reapRemoteSlots({
           age = nowMs - info.mtimeMs;
           if (!Number.isFinite(age) || age < 0 || age < maxRunMs + marginMs) continue;
         }
-        const markerAgeSec = age / 1000;
-        if (!idle && (age < maxRunMs + marginMs || ages.some(age => age >= markerAgeSec - 300))) continue;
-        const maxProcAgeSec = validAges ? ages.reduce((max, age) => Math.max(max, age), 0) : 0;
-        const evidence = idle ? `forge-idle activeRuns=0 procs=0 age=${Math.floor(age)}ms`
-          : `no-forge-proc-as-old-as-marker maxProcAgeSec=${maxProcAgeSec} markerAgeSec=${markerAgeSec}`;
+        const evidence = `forge-idle activeRuns=0 procs=0 age=${Math.floor(age)}ms`;
         if (!dryRun) {
-          // Guard lease removal against a replacement or heartbeat since the stale read.
+          await beforeMarkerUnlink({ file, slot });
+          // Re-read immediately before unlinking: a new owner may have replaced this marker.
+          const current = lstatSync(file);
+          if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino
+            || current.mtimeMs !== info.mtimeMs || current.size !== info.size
+            || !readFileSync(file).equals(content)) continue;
           unlinkSync(file);
+          // Guard lease removal against a replacement or heartbeat since the stale read.
           try {
             const entry = readLockEntry(remoteRoot, slotPath(slot));
             if (entry && isLeaseExpired(entry, nowMs, ADMISSION_LEASE_MINUTES)) {

@@ -1,7 +1,8 @@
 // @vitest-environment node
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync,
+  renameSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { main, reapRemoteSlots, runWithRemoteDecision, resolveAdmissionPolicy, tryAcquireSlot,
   heldSlots, DEFAULT_ADMISSION_CEILING_MS } from '../heavy-admission.mjs';
@@ -72,8 +73,8 @@ describe('remote slot reaper', () => {
     ['unreachable', { reachable: false }],
     ['incomplete', { reachable: true, activeRuns: 0 }],
     ['unparseable', { ...idle, procCount: '0' }],
-    ['invalid process age', { ...idle, activeRuns: 3, procCount: 1, procEtimesSec: [-1] }],
-    ['incomplete process ages', { ...idle, activeRuns: 3, procCount: 2, procEtimesSec: [10] }],
+    ['negative process count', { ...idle, procCount: -1 }],
+    ['negative active runs', { ...idle, activeRuns: -1 }],
   ])('keeps markers and emits nothing when Forge status is %s', async (_, status) => {
     const f = fixture(); const file = marker(f, { age: oldAge });
     f.readForgeStatus.mockResolvedValue(status);
@@ -81,28 +82,21 @@ describe('remote slot reaper', () => {
     expect(existsSync(file)).toBe(true);
     expect(f.appendEvent).not.toHaveBeenCalled();
   });
-  it.each([true, false])('busy Forge with only short processes clears an aged marker (legacy=%s)', async legacy => {
+  it.each([true, false])('busy Forge with only young run processes retains an aged marker after prepare handoff (legacy=%s)', async legacy => {
     const f = fixture(); const file = marker(f, { age: oldAge, legacy });
-    f.readForgeStatus.mockResolvedValue({ reachable: true, activeRuns: 4, procCount: 2, procEtimesSec: [10, 60] });
-    // New markers use startedAt, even if their filesystem timestamp is fresh.
-    if (!legacy) utimesSync(file, new Date(now), new Date(now));
-    const detail = { slot: 0, runId: legacy ? null : runId,
-      evidence: `no-forge-proc-as-old-as-marker maxProcAgeSec=60 markerAgeSec=${oldAge / 1000}` };
-    expect(await reapRemoteSlots(f)).toEqual([{ ...detail, cleared: true }]);
-    expect(existsSync(file)).toBe(false);
-    expect(f.appendEvent.mock.calls).toEqual([[{ kind: 'remote-slot-reaped', detail }]]);
-  });
-  it.each([oldAge / 1000, oldAge / 1000 - 300])('busy Forge keeps a marker when one process is old enough (%s seconds)', async age => {
-    const f = fixture(); const file = marker(f, { age: oldAge });
-    f.readForgeStatus.mockResolvedValue({ reachable: true, activeRuns: 4, procCount: 2, procEtimesSec: [10, age] });
-    expect(await reapRemoteSlots(f)).toEqual([]);
+    // The run process just started after transfer from prepare; neither phase's age is evidence.
+    vi.mocked(execFile).mockImplementation((file, args, options, callback) => {
+      callback(null, 'node /srv/forge-exec-run.mjs run\n');
+    });
+    vi.mocked(readForgeTelemetry).mockResolvedValue({ activeRuns: 1 });
+    expect(await reapRemoteSlots({ ...f, readForgeStatus: undefined })).toEqual([]);
     expect(existsSync(file)).toBe(true);
     expect(f.appendEvent).not.toHaveBeenCalled();
   });
   it.each([true, false])('busy Forge retains a marker below maxRun plus margin (live pid=%s)', async live => {
     const f = fixture(); const file = marker(f, { age: oldAge - 1 });
     f.pidAlive.mockReturnValue(live);
-    f.readForgeStatus.mockResolvedValue({ reachable: true, activeRuns: 3, procCount: 1, procEtimesSec: [10] });
+    f.readForgeStatus.mockResolvedValue({ reachable: true, activeRuns: 3, procCount: 1 });
     expect(await reapRemoteSlots(f)).toEqual([]);
     expect(existsSync(file)).toBe(true);
     expect(f.appendEvent).not.toHaveBeenCalled();
@@ -135,6 +129,69 @@ describe('remote slot reaper', () => {
     expect(await reapRemoteSlots(f)).toEqual([]);
     expect(existsSync(file)).toBe(true);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('operator cleanup'));
+  });
+  it.each([
+    '', 'garbage', 'remote termination unconfirmed extra', 'REMOTE termination unconfirmed',
+    '"remote termination unconfirmed"', '{broken', '[broken', 'null', 'true', '1', '[]', '{}',
+  ])('never reaps unparseable aged marker text %j', async text => {
+    const f = fixture(); const file = marker(f, { age: oldAge });
+    writeFileSync(file, text);
+    utimesSync(file, new Date(now - oldAge), new Date(now - oldAge));
+    expect(await reapRemoteSlots(f)).toEqual([]);
+    expect(readFileSync(file, 'utf8')).toBe(text);
+    expect(f.appendEvent).not.toHaveBeenCalled();
+  });
+  it('accepts only the exact trimmed legacy string', async () => {
+    const f = fixture(); const file = marker(f, { age: oldAge });
+    writeFileSync(file, ' \tremote termination unconfirmed\n ');
+    utimesSync(file, new Date(now - oldAge), new Date(now - oldAge));
+    expect(await reapRemoteSlots(f)).toEqual([
+      { slot: 0, runId: null, evidence: expect.any(String), cleared: true },
+    ]);
+    expect(existsSync(file)).toBe(false);
+  });
+  it.each(['content', 'inode', 'mtime', 'vanished'])('does not unlink or emit an event when marker %s changes before unlink', async change => {
+    const f = fixture(); const file = marker(f);
+    const original = readFileSync(file, 'utf8');
+    const info = statSync(file);
+    tryAcquireSlot({ lockRoot: f.remoteRoot, cap: 1, owner: 'old', nowMs: now - oldAge,
+      nowIso: new Date(now - oldAge).toISOString(), pid: process.pid });
+    const replacement = original.replace(runId, runId.slice(0, -1) + '5');
+    const beforeMarkerUnlink = vi.fn(({ file: inspected, slot }) => {
+      expect(inspected).toBe(file);
+      expect(slot).toBe(0);
+      if (change === 'vanished') unlinkSync(file);
+      else if (change === 'content') {
+        writeFileSync(file, replacement);
+        utimesSync(file, info.atime, info.mtime);
+      } else if (change === 'inode') {
+        // Same bytes and mtime, but a different owner's inode.
+        const next = join(f.remoteRoot, 'replacement');
+        writeFileSync(next, original);
+        utimesSync(next, info.atime, info.mtime);
+        renameSync(next, file);
+      } else utimesSync(file, new Date(now), new Date(now));
+    });
+    expect(await reapRemoteSlots({ ...f, beforeMarkerUnlink })).toEqual([]);
+    expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
+    if (change === 'vanished') expect(existsSync(file)).toBe(false);
+    else expect(readFileSync(file, 'utf8')).toBe(change === 'content' ? replacement : original);
+    expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(1);
+    expect(f.appendEvent).not.toHaveBeenCalled();
+    expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('reaped ('));
+  });
+  it('preserves a new marker replacing the inspected marker before unlink', async () => {
+    const f = fixture(); const file = marker(f);
+    const beforeMarkerUnlink = vi.fn(() => {
+      const next = join(f.remoteRoot, 'replacement');
+      writeFileSync(next, JSON.stringify({ v: 1, runId: 'replacement-run', slot: 0,
+        startedAt: new Date(now).toISOString(), pid: process.pid }) + '\n');
+      renameSync(next, file);
+    });
+    expect(await reapRemoteSlots({ ...f, beforeMarkerUnlink })).toEqual([]);
+    expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(file, 'utf8')).runId).toBe('replacement-run');
+    expect(f.appendEvent).not.toHaveBeenCalled();
   });
   it('keeps a live pid younger than maxRun plus margin, then clears at the ceiling', async () => {
     const f = fixture(); f.pidAlive.mockReturnValue(true);
@@ -187,22 +244,24 @@ describe('remote slot reaper', () => {
   });
   it.each([
     ['', 0, true],
-    ['  60 node /srv/forge-exec-run.mjs run\n 10 node /srv/forge-exec-run.mjs finish\n', 4, true],
-    [`10 node /srv/forge-exec-run.mjs prepare\n${oldAge / 1000} node /srv/forge-exec-run.mjs run\n`, 4, false],
-    ['10 node /srv/forge-exec-run.mjs run\ninvalid', 0, false],
+    ['', 1, false],
+    ['node /srv/forge-exec-run.mjs run\nnode /srv/forge-exec-run.mjs finish\n', 4, false],
+    ['node /srv/forge-exec-run.mjs prepare\n', 0, false],
+    ['node /srv/forge-exec-run.mjs run\n', 0, false],
+    ['node /srv/forge-exec-run.mjs finish\n', 0, false],
+    ['node /srv/forge-exec-run.mjs run\ninvalid', 0, false],
     ['\n', 0, false],
-    ['10 node /srv/forge-exec-run.mjs run\n\n', 0, false],
-    ['9007199254740992 node /srv/forge-exec-run.mjs run', 0, false],
+    ['node /srv/forge-exec-run.mjs run\n\n', 0, false],
     ['ssh-error', 0, false],
     ['telemetry-error', 0, false],
     ['', '0', false],
     ['oversized-output', 0, false],
-  ])('default status reader requires bounded SSH process ages and telemetry: %j', async (output, activeRuns, cleared) => {
+  ])('default status reader requires bounded SSH process listing and idle telemetry: %j', async (output, activeRuns, cleared) => {
       const f = fixture(); const file = marker(f, { age: oldAge });
       vi.mocked(execFile).mockImplementation((file, args, options, callback) => {
         expect(file).toBe('ssh');
         expect(args).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'forge',
-          "set -o pipefail; ps -eo etimes=,args= | { grep -E '[f]orge-exec-run.mjs (prepare|run|finish)$'; rc=$?; [ \"$rc\" -le 1 ]; }"]);
+          "set -o pipefail; ps -eo args= | { grep -E '[f]orge-exec-run.mjs (prepare|run|finish)$'; rc=$?; [ \"$rc\" -le 1 ]; }"]);
         expect(options).toMatchObject({ timeout: 8000, maxBuffer: 4096 });
         callback(['ssh-error', 'oversized-output'].includes(output) ? new Error('SSH failed or maxBuffer exceeded') : null, output);
       });
@@ -214,8 +273,6 @@ describe('remote slot reaper', () => {
       expect(results).toHaveLength(cleared ? 1 : 0);
       expect(existsSync(file)).toBe(!cleared);
       expect(f.appendEvent.mock.calls).toEqual(results.map(({ cleared, ...detail }) => [{ kind: 'remote-slot-reaped', detail }]));
-      if (cleared && activeRuns > 0) expect(results[0].evidence).toBe(
-        `no-forge-proc-as-old-as-marker maxProcAgeSec=60 markerAgeSec=${oldAge / 1000}`);
     },
   );
 });
