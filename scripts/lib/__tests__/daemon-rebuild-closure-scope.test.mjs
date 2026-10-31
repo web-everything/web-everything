@@ -13,7 +13,7 @@ import { addOverlay } from '../daemon-overlays.mjs';
 import * as cloneEntries from '../daemon-clone-entries.mjs';
 import * as edgeFetch from '../daemon-rebuild/edge-fetch.mjs';
 import * as closureScope from '../daemon-rebuild/closure-scope.mjs';
-import { resolveOverlayConflict } from '../daemon-rebuild/overlay-strategies.mjs';
+import { resolveClosureScopedConflict, resolveOverlayConflict } from '../daemon-rebuild/overlay-strategies.mjs';
 
 const temps = [];
 afterEach(() => { vi.restoreAllMocks(); for (const p of temps.splice(0)) rmSync(p, { recursive: true, force: true }); });
@@ -39,25 +39,39 @@ function fixture({ path = 'unused.mjs', entry = '', noop = false, files = {}, ma
   return { root, git, ok, commit, args, main, overlay, base };
 }
 
-it('on resolves an out-of-closure conflict, applies a new import, and preserves real overlay ancestry', async () => {
-  const f = fixture(); const p = await planRebuild(f.args);
-  expect(p.applied).toEqual([expect.objectContaining({ resolvedVia: 'closure-scope', excluded: ['unused.mjs'] })]);
-  expect(f.ok(['show', `${p.finalSha}:new.mjs`])).toBe('export {};');
-  expect(f.ok(['show', `${p.finalSha}:unused.mjs`])).toBe('// main');
-  expect(f.ok(['rev-parse', `${p.finalSha}^2`])).toBe(f.overlay);
-  expect(p.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-conflict-resolved',
-    detail: expect.objectContaining({ via: 'closure-scope', excluded: ['unused.mjs'] }) }));
+// Mint a historical record directly: the locked planner must never create new scoped builds.
+function savedScopedCandidate(f) {
+  const evidence = closureScope.computeClosureScope({ git: f.git, mainSha: f.main,
+    overlays: [{ sha: f.overlay, changedFiles: ['entry.mjs', 'new.mjs', 'unused.mjs'] }],
+    entries: ['entry.mjs'], env: {} });
+  expect(evidence.ok).toBe(true);
+  const resolved = resolveClosureScopedConflict({ git: f.git, cur: f.main, ovSha: f.overlay, scope: evidence.scope });
+  expect(resolved).toMatchObject({ ok: true, excluded: ['unused.mjs'] });
+  const finalSha = f.ok(['commit-tree', resolved.tree, '-p', f.main, '-p', f.overlay, '-m', 'historical scoped build']);
+  return { mainSha: f.main, finalSha, applied: [{ ref: 'lane/a', sha: f.overlay,
+    resolvedVia: 'closure-scope', excluded: resolved.excluded }] };
+}
+
+it('locked on retains the full-merge conflict instead of excluding unused files', async () => {
+  const f = fixture();
+  const p = await planRebuild(f.args);
+  expect(p).toEqual(await planRebuild({ ...f.args, closureScopeMode: 'off' }));
+  expect(p.applied).toEqual([]);
+  expect(p.finalSha).toBe(f.main);
+  expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
 });
 
-it('resets a conflicted out-of-scope addition absent from merge-base by removing it from the scoped input', async () => {
+it('locked on retains a conflicted addition absent from the merge base', async () => {
   const f = fixture();
   f.ok(['checkout', '-q', '--detach', f.overlay]);
   f.commit({ 'added.mjs': '// overlay\n' }, 'lane/a');
   f.ok(['checkout', '-q', '--detach', f.main]);
   const main = f.commit({ 'added.mjs': '// main\n' }, 'main');
-  const p = await planRebuild({ ...f.args, headSha: main });
-  expect(p.applied[0]).toMatchObject({ resolvedVia: 'closure-scope', excluded: ['added.mjs', 'unused.mjs'] });
-  expect(f.ok(['show', `${p.finalSha}:added.mjs`])).toBe('// main');
+  const options = { ...f.args, headSha: main };
+  const p = await planRebuild(options);
+  expect(p).toEqual(await planRebuild({ ...options, closureScopeMode: 'off' }));
+  expect(p.applied).toEqual([]);
+  expect(p.finalSha).toBe(main);
 });
 
 it.each([
@@ -95,12 +109,12 @@ it.each(['#worker', 'closure-test/worker'])('retains conflicts in package-import
     .toMatchObject({ ok: false, reason: 'closure-incomplete' });
 });
 
-it('scoped-noop skips and never removes the overlay as in-main', async () => {
+it('locked on uses the off conflict and inputs key instead of a scoped-noop skip', async () => {
   const f = fixture({ noop: true }); const p = await planRebuild(f.args);
-  expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'skip', reason: 'scoped-noop', excluded: ['unused.mjs'] }));
-  expect(p.decisions.some(d => d.action === 'remove')).toBe(false);
   const off = await planRebuild({ ...f.args, closureScopeMode: 'off' });
-  expect(p.inputsKey).not.toBe(off.inputsKey);
+  expect(p).toEqual(off);
+  expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
+  expect(p.decisions.some(d => d.action === 'remove' || d.reason === 'scoped-noop')).toBe(false);
 });
 
 it('shadow only reports would resolve, excluded N, preserving the off plan', async () => {
@@ -122,7 +136,7 @@ it('shadow preserves off-mode alerts when scope is unproven and edge resolution 
   expect(shadow).toEqual(off);
 });
 
-it('fixpoint replans when dropped B makes A’s excluded file reachable in the final closure', async () => {
+it('shadow reports exclusions while locked on retains both full-merge conflicts', async () => {
   const f = fixture({ entry: "import './worker.mjs';\nimport './protected.mjs';\n",
     files: { 'worker.mjs': "import './unused.mjs';\n", 'protected.mjs': '// base\n' },
     mainFiles: { 'protected.mjs': '// main\n' } });
@@ -138,17 +152,16 @@ it('fixpoint replans when dropped B makes A’s excluded file reachable in the f
   expect(p.decisions.filter(d => d.reason === 'conflict').map(d => d.ref)).toEqual(['lane/a', 'lane/b']);
 });
 
-it('incomplete final evidence refuses scoped adoption with an operator-visible rebase fallback', async () => {
+it('locked on bypasses final closure checks and uses the full-merge fallback', async () => {
   const f = fixture();
-  vi.spyOn(closureScope, 'finalClosureScope').mockReturnValue({ ok: false, reason: 'closure-too-large' });
+  const final = vi.spyOn(closureScope, 'finalClosureScope').mockReturnValue({ ok: false, reason: 'closure-too-large' });
   const p = await planRebuild(f.args);
+  expect(p).toEqual(await planRebuild({ ...f.args, closureScopeMode: 'off' }));
   expect(p.applied).toEqual([]);
-  expect(p.alerts).toContainEqual({ kind: 'overlay-closure-scope-refused', detail: expect.objectContaining({
-    reason: 'closure-too-large', message: expect.stringContaining('rebase'),
-  }) });
+  expect(final).not.toHaveBeenCalled();
 });
 
-it('bounds fixpoint work to three replans and retains conflicts when the bound is exhausted', async () => {
+it('locked on never starts fixpoint work even with multiple conflicting overlays', async () => {
   const paths = ['unused.mjs', ...Array.from({ length: 4 }, (_, i) => `unused${i + 1}.mjs`)];
   const f = fixture({ files: Object.fromEntries(paths.map(p => [p, '// base\n'])),
     mainFiles: Object.fromEntries(paths.map(p => [p, '// main\n'])) });
@@ -158,18 +171,12 @@ it('bounds fixpoint work to three replans and retains conflicts when the bound i
     f.commit({ [paths[i]]: '// overlay\n', [`marker${i}.mjs`]: 'export {};\n' }, `lane/b${i}`);
     overlays.push({ ref: `lane/b${i}` });
   }
-  const readFinal = closureScope.finalClosureScope;
-  let calls = 0;
-  vi.spyOn(closureScope, 'finalClosureScope').mockImplementation(options => {
-    const evidence = readFinal(options);
-    expect(evidence.ok).toBe(true);
-    evidence.closure.files.add(paths[calls++]);
-    return evidence;
-  });
+  const final = vi.spyOn(closureScope, 'finalClosureScope');
   const p = await planRebuild({ ...f.args, overlays });
-  expect(calls).toBe(4); // initial plan plus three replans, then ordinary full-merge fallback
+  expect(p).toEqual(await planRebuild({ ...f.args, overlays, closureScopeMode: 'off' }));
+  expect(final).not.toHaveBeenCalled();
   expect(p.applied).toEqual([]);
-  expect(p.alerts).toContainEqual({ kind: 'overlay-closure-scope-refused', detail: expect.objectContaining({ reason: 'fixpoint-exhausted' }) });
+  expect(p.decisions.filter(d => d.reason === 'conflict')).toHaveLength(overlays.length);
 }, 30000);
 
 it('unreadable clone entries retain the conflict instead of narrowing the scope', async () => {
@@ -182,15 +189,13 @@ it('unreadable clone entries retain the conflict instead of narrowing the scope'
 it.each([
   { label: 'omitted', options: {} },
   { label: 'empty', options: { entries: [] } },
-])('planRebuild in on mode without entries refuses with entries-unreadable and retains the conflict ($label)', async ({ options }) => {
+])('planRebuild in locked on mode without entries uses the off conflict fallback ($label)', async ({ options }) => {
   const f = fixture();
   const { entries, ...args } = f.args;
   const p = await planRebuild({ ...args, ...options });
   expect(p.applied).toEqual([]);
   expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
-  expect(p.alerts).toContainEqual({ kind: 'overlay-closure-scope-refused', detail: expect.objectContaining({
-    reason: 'entries-unreadable', message: expect.stringContaining('rebase'),
-  }) });
+  expect(p).toEqual(await planRebuild({ ...args, ...options, closureScopeMode: 'off' }));
 });
 
 it.each(['on', 'off', 'shadow'].flatMap(mode => [
@@ -200,7 +205,7 @@ it.each(['on', 'off', 'shadow'].flatMap(mode => [
   { mode, label: 'empty provider', options: { entries: () => [] } },
   { mode, label: 'throwing provider', options: { entries() { throw new Error('unreadable'); } } },
 ]))('readyBuildVerified refuses saved scoped candidates without runtime entries in $mode mode ($label)', async ({ mode, options }) => {
-  const f = fixture(); const adopt = await planRebuild(f.args);
+  const f = fixture(); const adopt = savedScopedCandidate(f);
   expect(adopt.applied[0]).toMatchObject({ resolvedVia: 'closure-scope', excluded: ['unused.mjs'] });
   const args = { git: f.git, adopt, mainTip: f.main, prevHead: f.main,
     env: { WE_DAEMON_CLOSURE_SCOPE: mode } };
@@ -209,25 +214,24 @@ it.each(['on', 'off', 'shadow'].flatMap(mode => [
 });
 
 it.each(['on', 'off', 'shadow'])('readyBuildVerified resolves runtime entries once in %s mode', async mode => {
-  const f = fixture(); const adopt = await planRebuild(f.args);
+  const f = fixture(); const adopt = savedScopedCandidate(f);
   const entries = vi.fn().mockReturnValueOnce(['entry.mjs', 'unused.mjs']).mockReturnValue([]);
   expect(readyBuildVerified({ git: f.git, adopt, mainTip: f.main, prevHead: f.main,
     entries, env: { WE_DAEMON_CLOSURE_SCOPE: mode } })).toBe(false);
   expect(entries).toHaveBeenCalledTimes(1);
 });
 
-it('planning retains the conflict if runtime entries disappear before final verification', async () => {
+it('locked planning never reads a runtime entry provider', async () => {
   const f = fixture();
   const entries = vi.fn().mockReturnValueOnce(['entry.mjs']).mockReturnValue([]);
   const plan = await planRebuild({ ...f.args, entries });
   expect(plan.applied).toEqual([]);
-  expect(plan.alerts).toContainEqual({ kind: 'overlay-closure-scope-refused', detail: expect.objectContaining({
-    reason: 'entries-unreadable', message: expect.stringContaining('rebase'),
-  }) });
+  expect(entries).not.toHaveBeenCalled();
+  expect(plan).toEqual(await planRebuild({ ...f.args, closureScopeMode: 'off' }));
 });
 
 it('readyBuildVerified rebuilds exclusions and refuses a reachable or tampered excluded path', async () => {
-  const f = fixture(); const p = await planRebuild(f.args);
+  const f = fixture(); const p = savedScopedCandidate(f);
   expect(p.applied[0]?.resolvedVia).toBe('closure-scope');
   const verify = adopt => readyBuildVerified({ git: f.git, adopt, mainTip: f.main, prevHead: f.main, entries: ['entry.mjs'], env: {} });
   expect(verify(p)).toBe(true);
@@ -238,7 +242,7 @@ it('readyBuildVerified rebuilds exclusions and refuses a reachable or tampered e
 });
 
 it('readyBuildVerified refuses reachable exclusions even when every recorded merge tree reconstructs', async () => {
-  const f = fixture(); const a = await planRebuild(f.args);
+  const f = fixture(); const a = savedScopedCandidate(f);
   expect(a.applied[0]?.resolvedVia).toBe('closure-scope');
   f.ok(['checkout', '-q', '--detach', f.main]);
   const b = f.commit({ 'worker.mjs': "import './unused.mjs';\n" }, 'lane/b');
@@ -277,7 +281,8 @@ it('prepare discovers caller runtime entries lazily and emits the shadow would-r
   // Refresh evidence is injected; all Git commands actually executed remain local.
   vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [], refEvidence: new Map([['lane/a', 'refreshed']]) });
   const discovery = vi.spyOn(cloneEntries, 'cloneRuntimeEntries').mockImplementation(({ entries }) => entries);
-  const result = await prepareRebuild({ root: f.root, env, log: { error() {} },
+  const log = { error: vi.fn() };
+  const result = await prepareRebuild({ root: f.root, env, log,
     run: (args, options) => f.git(args, options), prState: async () => null, now: Date.now,
     entries: ['entry.mjs'], skipCheck: null, prBaseChain: async () => [],
   });
@@ -285,9 +290,10 @@ it('prepare discovers caller runtime entries lazily and emits the shadow would-r
   expect(result.alerts).toContainEqual({ kind: 'overlay-conflict-resolved', detail: expect.objectContaining({
     via: 'closure-scope', mode: 'shadow', excluded: ['unused.mjs'], message: expect.stringContaining('would resolve, excluded 1'),
   }) });
+  expect(log.error).toHaveBeenCalledWith(expect.stringContaining('would resolve, excluded 1'));
 });
 
-it('on adopts the scoped candidate and emits rebuild-adopted with closure-scope provenance', async () => {
+it('locked on rebuild retains the full conflict and leaves HEAD on main', async () => {
   const f = fixture(); f.ok(['checkout', '-q', '-B', 'main', f.main]);
   const state = mkdtempSync(join(tmpdir(), 'closure-adopt-')); temps.push(state);
   const env = { WE_DAEMON_STATE_DIR: join(state, 'state'), WE_DAEMON_OVERLAY_DIR: join(state, 'overlays'),
@@ -303,14 +309,14 @@ it('on adopts the scoped candidate and emits rebuild-adopted with closure-scope 
     runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }),
     dispatchSmoke: { settings: { dispatchSmoke: 'off' } }, emitEvent,
   });
-  expect(result).toMatchObject({ moved: true, adopted: true });
-  expect(f.ok(['rev-parse', 'HEAD^2'])).toBe(f.overlay);
-  expect(readRebuildState(f.root, env).adopted.applied[0]).toMatchObject({ resolvedVia: 'closure-scope', excluded: ['unused.mjs'] });
-  expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'rebuild-adopted',
-    detail: expect.objectContaining({ resolvedVia: 'closure-scope' }) }), expect.anything());
+  expect(result).toMatchObject({ moved: false, reason: 'up-to-date' });
+  expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.main);
+  expect(result.plan.applied).toEqual([]);
+  expect(result.plan.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
+  expect(emitEvent).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'rebuild-adopted' }), expect.anything());
 });
 
-it('smoke failure replans closure scope with all caller entry roots', async () => {
+it('smoke failure replans with the locked full-merge fallback', async () => {
   const f = fixture({ files: { 'other-entry.mjs': 'export {};\n' } });
   f.ok(['checkout', '-q', '--detach', f.main]);
   f.commit({ 'bad.mjs': 'throw new Error("bad overlay");\n' }, 'lane/b');
@@ -333,13 +339,12 @@ it('smoke failure replans closure scope with all caller entry roots', async () =
     entries, skipCheck: null, asJob: false, versions: null, runSmoke,
     dispatchSmoke: { settings: { dispatchSmoke: 'off' } }, emitEvent: vi.fn(),
   });
-  expect(result).toMatchObject({ adopted: true, reason: 'overlay-set-aside' });
+  // With A retained as a full-merge conflict, failed B leaves only the plain-main fallback.
+  expect(result).toMatchObject({ adopted: true, reason: 'fallback-plain-main' });
   expect(runSmoke).toHaveBeenCalledTimes(2);
-  expect(discovery.mock.calls.length).toBeGreaterThan(1);
-  for (const [options] of discovery.mock.calls) expect(options.entries).toEqual(entries);
-  expect(readRebuildState(f.root, env).adopted.applied).toEqual([
-    expect.objectContaining({ ref: 'lane/a', resolvedVia: 'closure-scope', excluded: ['unused.mjs'] }),
-  ]);
+  expect(discovery).not.toHaveBeenCalled();
+  expect(readRebuildState(f.root, env).adopted.applied).toEqual([]);
+  expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.main);
 });
 
 it('closureScope mode cascades standard shadow, file, and environment with provenance', () => {
@@ -347,7 +352,7 @@ it('closureScope mode cascades standard shadow, file, and environment with prove
   const env = { WE_PLATFORM_PREFERENCES_FILE: join(f.root, 'absent.json') };
   expect(resolveClosureScopeMode(env, { settingsPath })).toMatchObject({ mode: 'shadow', source: 'standard' });
   writeFileSync(settingsPath, JSON.stringify({ closureScope: { mode: 'on' } }));
-  expect(resolveClosureScopeMode(env, { settingsPath })).toMatchObject({ mode: 'on', source: 'tool' });
+  expect(resolveClosureScopeMode(env, { settingsPath })).toMatchObject({ mode: 'off', source: 'tool' });
   expect(resolveClosureScopeMode({ ...env, WE_DAEMON_CLOSURE_SCOPE: 'off' }, { settingsPath })).toMatchObject({ mode: 'off', source: 'env' });
   writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ closureScope: { mode: 'off' } }));
   writeFileSync(settingsPath, JSON.stringify({ closureScope: { mode: 'bogus' } }));

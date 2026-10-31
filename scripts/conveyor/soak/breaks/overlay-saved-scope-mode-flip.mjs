@@ -1,10 +1,12 @@
-/** PR #6023: saved scoped candidates keep their runtime-evidence requirement across mode changes. */
+/** Saved scoped candidates keep their evidence checks; new on requests exercise the R284 locked fallback. */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild } from '../../../lib/daemon-rebuild/plan.mjs';
 import { readyBuildVerified } from '../../../lib/daemon-rebuild/adopt.mjs';
+import { computeClosureScope } from '../../../lib/daemon-rebuild/closure-scope.mjs';
+import { resolveClosureScopedConflict } from '../../../lib/daemon-rebuild/overlay-strategies.mjs';
 import { smokeSurfaceEntries } from '../../../lib/daemon-rebuild/skip-unrelated.mjs';
 
 const PATH = 'scripts/lib/daemon-rebuild/adopt.mjs';
@@ -39,14 +41,24 @@ export default {
       ok(['init', '-qb', 'main']);
       const base = commit({ ...Object.fromEntries(smokeSurfaceEntries({}).map(p => [p, 'export {};'])),
         'entry.mjs': 'export {};', 'unused.mjs': '// base' }, 'main');
-      commit({ 'entry.mjs': "import './added.mjs';", 'added.mjs': 'export {};', 'unused.mjs': '// overlay' }, 'lane/saved');
+      const overlay = commit({ 'entry.mjs': "import './added.mjs';", 'added.mjs': 'export {};', 'unused.mjs': '// overlay' }, 'lane/saved');
       ok(['checkout', '-q', '--detach', base]);
       const main = commit({ 'unused.mjs': '// main' }, 'main');
       const plan = await planRebuild({ git, headSha: main, mainRef: 'origin/main',
         overlays: [{ ref: 'lane/saved' }], entries: ['entry.mjs'], env: {},
         closureScopeMode: 'on', stackMode: 'independent', edgeResolve: false });
-      if (plan.applied?.[0]?.resolvedVia !== 'closure-scope') throw new Error('fixture did not create a scoped candidate');
-      const adopt = JSON.parse(JSON.stringify(plan));
+      // New on requests now exercise the locked full-merge fallback.
+      if (plan.applied.length || !plan.decisions.some(d => d.action === 'drop' && d.reason === 'conflict')) {
+        violations.push('locked on created a scoped candidate instead of retaining the full conflict');
+      }
+      // Historical disk records still need verification after the lock. Mint one without enabling a mode.
+      const evidence = computeClosureScope({ git, mainSha: main, entries: ['entry.mjs'], env: {},
+        overlays: [{ sha: overlay, changedFiles: ['entry.mjs', 'added.mjs', 'unused.mjs'] }] });
+      const resolved = evidence.ok && resolveClosureScopedConflict({ git, cur: main, ovSha: overlay, scope: evidence.scope });
+      if (!resolved?.ok) throw new Error('fixture could not reconstruct historical scoped record');
+      const finalSha = ok(['commit-tree', resolved.tree, '-p', main, '-p', overlay, '-m', 'historical scoped build']);
+      const adopt = { mainSha: main, finalSha, applied: [{ ref: 'lane/saved', sha: overlay,
+        resolvedVia: 'closure-scope', excluded: resolved.excluded }] };
       for (const mode of ['on', 'off', 'shadow']) {
         const args = { git, adopt, mainTip: main, prevHead: main, env: { WE_DAEMON_CLOSURE_SCOPE: mode } };
         if (!readyBuildVerified({ ...args, entries: ['entry.mjs'] })) violations.push(`${mode}: valid candidate refused`);

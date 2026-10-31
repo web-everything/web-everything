@@ -3273,31 +3273,31 @@ retains the conflict for full merge/manual rebase. The 66-file spawn-chain comme
 in `closure-scope.test.mjs` pins this independent legacy refusal.
 The fixpoint helper returns additions without mutating scope; the planner owns the three-replan
 limit. `daemon-rebuild-closure-scope.test.mjs` uses local refs (no network) to exercise
-scoped merges, real-overlay ancestry, final-tree verification and the three-replan fallback.
+the locked full-merge fallback, shadow diagnostics, and historical scoped-candidate verification.
 `closureScope.mode` follows the policy cascade with standard `shadow`; shadow reports
-"would resolve, excluded N" while preserving the ordinary plan. Explicit `on` applies scopes;
-`off` disables the strategy. Candidate boot discovery runs only in explicit `on` mode and uses
-`WE_SMOKE_LIVE_CLONE` for clone LaunchAgents; `shadow`, `off` and a generic smoke root alone
-keep the fixed daemon entry list. Planning and boot smoke share `closure-scope-settings.mjs`
-for the policy cascade and provenance. Minimal boot trees
-with none of those entries also keep the fixed list: real child imports fail on missing modules,
-while injected-child fixtures need no host LaunchAgents. In `on` mode an injected `runtimeEntries`
-selects discovery against the supplied root in hermetic boot fixtures. With daemon entries present
-in the boot tree and mode `on`, an unreadable live clone or plist fails smoke before spawning children; checking
-the live root's entries instead could silently bypass discovery for a bad live-root path. Scope
-discovery likewise retains the conflict on unreadable evidence. Final closure checks run before smoke and
-again when reconstructing persisted scoped candidates. Saved scoped candidates require nonempty runtime
-entries even after switching to `off` or `shadow`; adoption evaluates a lazy entry provider once and uses
-that same evidence throughout verification. Final-scope checks also reject empty provider results during
-planning. The tree-reader basename regression uses snapshot workers and checkout-only decoys to pin the
+"would resolve, excluded N" while preserving the ordinary plan. R284 Route B locks every
+`on` request to effective `off` until allowlist card 7540 (xfgw4ro) lands. The shared
+`lockClosureScopeMode` helper applies after cascade resolution and at explicit-mode consumers;
+provenance retains the requesting layer. It logs exactly
+"closure-scope on-mode locked until allowlist card 7540 (xfgw4ro) lands" through `console.error`
+once per process, independently of cascade-log suppression. Logging failures never interrupt
+planning or smoke. `off` and `shadow` retain their behavior. Boot discovery consequently keeps
+the fixed daemon entry list in every mode (the explicit test/soak entry override still applies).
+`daemon-rebuild-closure-scope-lock.test.mjs` pins tool/platform/environment refusal, both explicit
+consumers, boot's early-return paths, once-only diagnostics, throwing loggers and shadow output.
+Saved scoped candidates retain their existing final-closure and runtime-evidence requirements
+in every mode; tests mint historical records directly rather than reopening the locked planner.
+Adoption evaluates a lazy entry provider once and uses the same evidence throughout verification.
+The tree-reader basename regression uses snapshot workers and checkout-only decoys to pin the
 reader's own basename index.
 
 The named boot-smoke tests "keeps boot discovery inert with unreadable LaunchAgents" compare
-the complete default/shadow/off result against the fixed-list result. "keeps the skip surface fixed"
+the complete default/shadow/off/locked-on result against the fixed-list result. "keeps the skip surface fixed"
 checks every mode and the explicit entry override. Scope computation uses supplied runtime entries;
 its smoke surface never discovers host LaunchAgents. The `overlay-shadow-boot-discovery` soak
-exercises both callers with a real missing LaunchAgents directory and confirms explicit `on`
-still refuses boot before spawning children. This preserves the shadow rollout's adoption behavior.
+exercises both callers with a real missing LaunchAgents directory and confirms locked `on`
+also boots the fixed list without discovery. The other closure soak breaks exercise the locked
+fallback while preserving direct scanner and historical-candidate verification coverage.
 
 Markdown and JSON are always retained by closure scoping, including under tests and backlog directories:
 an exported tick can read runtime data after boot with a computed filename, so absence from an import
