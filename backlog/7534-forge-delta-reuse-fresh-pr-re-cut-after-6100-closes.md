@@ -1,19 +1,20 @@
 ---
+bornAs: xzo459u
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
-scope: ["we:scripts/readiness/__tests__/"]
+scope: ["we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Forge remote-exec: pin-creation guard-coverage test
+# Forge delta-reuse: fresh PR re-cut after #6100 closes
 
-Advisory: add a test proving the pin-creation guard is covered. Tests live under we:scripts/readiness/__tests__/.
+After PR #6100 closes and card 7533 lands, re-cut the delta-reuse change on the merged tip. It must read projected memory leaves via sourcePath and pass the 15-row parity matrix in we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/ -t "pin-creation guard" (new test; fails when the guard is removed)`
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs (all 15 rows pass on the re-cut delta-reuse branch, including projected memory leaves read via sourcePath)`
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not change the guard itself.
+- [N1] Does not start before PR 6100 is closed and card 7533 has landed.
 
 ## Edge cases this change must handle
 

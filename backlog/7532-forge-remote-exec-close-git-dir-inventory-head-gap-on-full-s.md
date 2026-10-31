@@ -1,19 +1,20 @@
 ---
+bornAs: xt2krao
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
-scope: ["we:scripts/readiness/forge-exec-manifest.mjs", "we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs"]
+scope: ["we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Forge delta-reuse: fresh PR re-cut after #6100 closes
+# Forge remote-exec: close GIT_DIR inventory/HEAD gap on full ship (PR 6059)
 
-After PR #6100 closes and card xw51scb lands, re-cut the delta-reuse change on the merged tip. It must read projected memory leaves via sourcePath and pass the 15-row parity matrix in we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs.
+PR #6059 full ship still obeys GIT_DIR/GIT_WORK_TREE for the inventory and HEAD reads; closed by card 7533. Core: we:scripts/readiness/remote-exec.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs (all 15 rows pass on the re-cut delta-reuse branch, including projected memory leaves read via sourcePath)`
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs -t "GIT_DIR" (row 3 fails on the PR 6059 head, passes once 7533 lands)`
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not start before PR 6100 is closed and card xw51scb has landed.
+- [N1] Does not change delta-manifest logic.
 
 ## Edge cases this change must handle
 

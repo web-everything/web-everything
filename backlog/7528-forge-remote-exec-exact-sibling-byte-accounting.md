@@ -1,6 +1,7 @@
 ---
+bornAs: x2anmqf
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
 scope: ["we:scripts/readiness/remote-exec.mjs"]
 dateOpened: "2026-10-31"

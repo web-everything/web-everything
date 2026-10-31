@@ -1,19 +1,20 @@
 ---
+bornAs: xjzm75m
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
-scope: ["we:scripts/readiness/forge-exec-bases.mjs"]
+scope: ["we:scripts/readiness/__tests__/"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Forge remote-exec: base-guard wait concurrency
+# Forge remote-exec: pin-creation guard-coverage test
 
-Advisory from the 6100 design review: the base-guard wait is not safe under concurrent runs. Core: we:scripts/readiness/forge-exec-bases.mjs.
+Advisory: add a test proving the pin-creation guard is covered. Tests live under we:scripts/readiness/__tests__/.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/ -t "base-guard wait concurrent" (a new two-waiter test that fails today)`
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/ -t "pin-creation guard" (new test; fails when the guard is removed)`
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not redesign base selection.
+- [N1] Does not change the guard itself.
 
 ## Edge cases this change must handle
 

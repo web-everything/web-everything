@@ -1,4 +1,5 @@
 ---
+bornAs: xw51scb
 kind: story
 size: 5
 parent: "7518"
@@ -51,7 +52,7 @@ Red first on the PR 6059 head (rows 3, 4, 9). Mutations must each turn the named
 
 ## Follow-ups from the design
 
-Cards: xt2krao (GIT_DIR inventory/HEAD gap on PR 6059, closed by this card), x3mwa5p (base-guard wait concurrency), xjzm75m (pin-creation guard-coverage test), x2anmqf (exact sibling byte accounting), x0w2358 (manifestWire tracked default false), xq46oj0 (stale check-ignore stubs), xzo459u (fresh delta-reuse PR re-cut after PR 6100 closes).
+Cards: 7532 (GIT_DIR inventory/HEAD gap on PR 6059, closed by this card), 7529 (base-guard wait concurrency), 7530 (pin-creation guard-coverage test), 7528 (exact sibling byte accounting), 7527 (manifestWire tracked default false), 7531 (stale check-ignore stubs), 7534 (fresh delta-reuse PR re-cut after PR 6100 closes).
 
 ## Ordering
 
@@ -67,7 +68,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not add delta-reuse (that is xzo459u). Does not touch PR 6100 or PR 6059.
+- [N1] Does not add delta-reuse (that is 7534). Does not touch PR 6100 or PR 6059.
 
 ## Edge cases this change must handle
 

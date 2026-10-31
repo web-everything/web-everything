@@ -1,6 +1,7 @@
 ---
+bornAs: x0w2358
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
 scope: ["we:scripts/readiness/forge-exec-manifest.mjs"]
 dateOpened: "2026-10-31"

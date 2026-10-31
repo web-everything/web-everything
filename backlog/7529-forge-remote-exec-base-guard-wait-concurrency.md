@@ -1,19 +1,20 @@
 ---
+bornAs: x3mwa5p
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
-scope: ["we:scripts/readiness/__tests__/"]
+scope: ["we:scripts/readiness/forge-exec-bases.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Forge remote-exec: remove stale check-ignore stubs
+# Forge remote-exec: base-guard wait concurrency
 
-Advisory: test stubs for git check-ignore are stale after the manifest change. Tests live under we:scripts/readiness/__tests__/.
+Advisory from the 6100 design review: the base-guard wait is not safe under concurrent runs. Core: we:scripts/readiness/forge-exec-bases.mjs.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/ (green with the check-ignore stubs deleted)`
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/ -t "base-guard wait concurrent" (a new two-waiter test that fails today)`
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not change real ignore handling.
+- [N1] Does not redesign base selection.
 
 ## Edge cases this change must handle
 

@@ -1,19 +1,20 @@
 ---
+bornAs: xq46oj0
 kind: task
-parent: "xw51scb"
+parent: "7533"
 status: open
-scope: ["we:scripts/readiness/remote-exec.mjs"]
+scope: ["we:scripts/readiness/__tests__/"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Forge remote-exec: close GIT_DIR inventory/HEAD gap on full ship (PR 6059)
+# Forge remote-exec: remove stale check-ignore stubs
 
-PR #6059 full ship still obeys GIT_DIR/GIT_WORK_TREE for the inventory and HEAD reads; closed by card xw51scb. Core: we:scripts/readiness/remote-exec.mjs.
+Advisory: test stubs for git check-ignore are stale after the manifest change. Tests live under we:scripts/readiness/__tests__/.
 
 ## Acceptance
 
-- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/forge-manifest-parity.test.mjs -t "GIT_DIR" (row 3 fails on the PR 6059 head, passes once xw51scb lands)`
+- [A1] **Executable** — `npx vitest run we:scripts/readiness/__tests__/ (green with the check-ignore stubs deleted)`
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not change delta-manifest logic.
+- [N1] Does not change real ignore handling.
 
 ## Edge cases this change must handle
 
