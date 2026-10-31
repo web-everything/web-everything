@@ -21,6 +21,11 @@ import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conve
  * step that needs the network or the lane pool — acquire the lane at the PR's head ref, push, re-arm, release — and
  * the agent only edits files in the lane. A preamble on the brief says so. Antigravity runs Gemini in the existing lane; the launcher owns commits and pushes.
  */
+import { fixPushGate } from '../lib/review-timing.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { markFixPushAwaitingCi } from '../conveyor/fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
@@ -622,6 +627,11 @@ export async function runFixCli(argv = [], {
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
   readCiHeal = readCiHealInputs,
+  timingPolicy = resolveTimingPolicy().fix,
+  readChecks = readReviewChecks,
+  readRequired = getRequiredStatusChecks,
+  sleep = delay,
+  clock = Date.now,
   appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
@@ -735,6 +745,47 @@ export async function runFixCli(argv = [], {
       prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
         : renderPrContext({ ...prHead, comments });
+    }
+    // Wait before the repair so failures from the previous head can join the same agent run and push.
+    // The push boundary below reuses this deadline rather than starting a second wait budget.
+    let firstHeldAt;
+    let previousChecks;
+    let previousRequired;
+    let lastChecksAt;
+    let completedPushReadiness;
+    const awaitPreviousCi = async () => {
+      if (!timingPolicy.pushAfterCi) return { action: 'push', reason: 'off' };
+      if (completedPushReadiness) return completedPushReadiness;
+      firstHeldAt ??= clock();
+      if (previousRequired === undefined) {
+        try { previousRequired = readRequired({ repo: launch.repo })?.checks ?? null; }
+        catch { previousRequired = null; }
+      }
+      for (;;) {
+        const now = clock();
+        // The bound releases even when evidence is unreadable; never reset it after a poll or agent run.
+        const bound = fixPushGate({ previousHeadChecks: null, requiredChecks: previousRequired, firstHeldAt, now, policy: timingPolicy });
+        if (bound.action === 'push') {
+          write('fix-run: previous-head CI wait bound elapsed; pushing available repair after safety checks\n');
+          return bound;
+        }
+        if (lastChecksAt !== undefined && now - lastChecksAt < 30_000) await sleep(30_000 - (now - lastChecksAt));
+        if (clock() >= bound.deadline) continue;
+        lastChecksAt = clock();
+        try { previousChecks = await readChecks({ repo: launch.repo, headSha: prHeadSha }); }
+        catch { previousChecks = null; }
+        const decision = fixPushGate({ previousHeadChecks: previousChecks, requiredChecks: previousRequired,
+          firstHeldAt, now: clock(), policy: timingPolicy });
+        if (decision.action === 'push') {
+          if (decision.reason === 'ci-complete') completedPushReadiness = decision;
+          return decision;
+        }
+        write(`fix-run: waiting for previous-head CI until ${decision.deadline}ms epoch; bound fallback is push\n`);
+      }
+    };
+    const pushReadiness = timingPolicy.pushAfterCi ? await awaitPreviousCi() : null;
+    if (pushReadiness?.ciFailures?.length) {
+      prContext += `\n## Previous-head CI failures (same repair)\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(pushReadiness.ciFailures))}\n`;
     }
     const acquireWait = resolveAcquireWaitPolicy();
     write(`fix-run: lane acquire wait ${acquireWait.ms}ms (${acquireWait.source})\n`);
@@ -1136,6 +1187,7 @@ export async function runFixCli(argv = [], {
       }
       result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
+      if (timingPolicy.pushAfterCi) await awaitPreviousCi();
       // Defense in depth (config was already re-checked right after the agent): this push runs outside the sandbox with
       // our credentials, so refuse again if the repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
       // risky, and run the push with the code-running keys pinned inert (env, so no gap after the check) and no hooks.
