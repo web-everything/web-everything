@@ -90,6 +90,7 @@ describe('runner freshness policy', () => {
         "live-state",
         "live-work",
         "maintenance",
+        "manual-daemon-pass",
         "mutation-check",
         "open-pr",
         "operator-session-bootstrap",
