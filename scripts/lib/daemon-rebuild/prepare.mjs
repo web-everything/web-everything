@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, archiveUncovered, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { makeGit, verifyRev, archiveUncovered, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
@@ -34,6 +34,10 @@ import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
+
+function validTipSha(raw) {
+  return typeof raw?.tipSha === 'string' && FULL_SHA_RE.test(raw.tipSha) ? raw.tipSha : null;
+}
 
 /**
  * Phase 1 (LOCKED, fast — no smoke, no `reset --hard`): recovery, safety, fetch, `planRebuild`, overlay-list
@@ -260,6 +264,13 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
   }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
+  if (fetchResult.malformed?.length) {
+    alert('overlay-state-malformed', { file: overlayFilePath(root, env), malformed: fetchResult.malformed,
+      message: 'Repair the overlay registry before rebuilding with overlays; mainOnly recovery remains available.' });
+    if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-malformed' });
+    // Recovery ignores these entries in memory and leaves the stored registry untouched for repair.
+    overlaysBefore = overlaysBefore.filter((_, index) => !fetchResult.malformed.includes(index));
+  }
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });
     alert('fetch-failed');
@@ -308,15 +319,18 @@ export async function prepareRebuild({
   let unavailablePinned = null;
   if (!mainOnly) {
     for (const raw of unverified) {
-      // Fetch cleanup may have deleted the tracking ref. The last adopted inputs still identify the
-      // mechanism this clone runs; use them only to refuse a loss, never as fresh build/retirement inputs.
+      // Fetch cleanup may have deleted the tracking ref, and rebuild state may have been lost. Adopted
+      // inputs or a recorded full tip identify pins only, never fresh build/retirement inputs. Without
+      // either, pin status is unknown: refuse rather than silently dropping a possible mechanism overlay.
       const adopted = state.adopted?.head === prevHead
         ? state.adopted.applied?.find((o) => o.ref === raw.ref) : null;
-      const pin = pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, adopted?.sha);
+      const tipSha = adopted?.sha ?? validTipSha(raw);
+      const pin = !tipSha && raw.pinned !== true ? { pinned: true, why: 'unknown' }
+        : pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, tipSha);
       if (!pin.pinned) continue;
       unavailablePinned = {
         ok: false, reason: 'pinned-overlay-unavailable',
-        detail: { ref: raw.ref, pr: raw.pr ?? null, sha: adopted?.sha ?? null,
+        detail: { ref: raw.ref, pr: raw.pr ?? null, sha: tipSha ?? null,
           dropReason: 'ref-unavailable', pinnedBy: pin.why, message: PINNED_OVERLAY_GONE_MESSAGE },
       };
       break;
@@ -374,6 +388,11 @@ export async function prepareRebuild({
       }
       const required = new Set([...restored, ...overlaysForPlan.map((o) => o.ref)]);
       const refreshed = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
+      if (refreshed.malformed?.length) {
+        alert('overlay-state-malformed', { file: overlayFilePath(root, env), malformed: refreshed.malformed,
+          message: 'Repair the overlay registry before rebuilding with overlays; mainOnly recovery remains available.' });
+        return terminal({ moved: false, reason: 'overlay-state-malformed' });
+      }
       if (!refreshed.ok || [...required].some((ref) => refreshed.refEvidence.get(ref) !== 'refreshed')) {
         alert('overlay-source-unavailable', { refs: uncovered.map((o) => o.ref), message: 'Restored sources could not be refreshed; retrying next tick.' });
         return terminal({ moved: false, reason: 'overlay-source-unavailable' });

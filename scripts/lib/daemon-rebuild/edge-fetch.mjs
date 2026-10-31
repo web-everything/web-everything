@@ -21,13 +21,18 @@ export function recordedEdgeSha(entry) {
  *  is unreachable). Otherwise each overlay ref is fetched individually; a failure is listed in `goneRefs`
  *  and its stale remote-tracking ref is deleted best-effort. Callers must not infer freshness from a cached
  *  tracking ref. `refEvidence` distinguishes refreshed refs, remotely confirmed missing
- *  branches and unverifiable fetch failures. A failed fetch alone never proves remote absence. */
+ *  branches and unverifiable fetch failures. A failed fetch alone never proves remote absence.
+ *  `malformed` lists invalid registry entry indices, excluded from refspecs and evidence. Main is still fetched
+ *  for recovery; callers using overlays must refuse malformed registries before planning or retirement. */
 export function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
-  // Malformed records are invalid registry evidence, not merely unavailable branch names. Refuse the
-  // whole preparation before fetching or retiring anything; the operator must repair the stored list.
-  if (overlays.some((o) => !o || typeof o !== 'object' || Array.isArray(o)
-    || typeof o.ref !== 'string' || !o.ref)) return { ok: false, reason: 'fetch-failed' };
-  const safeOverlays = overlays.filter((o) => isSafeBranchName(o?.ref));
+  const malformed = [];
+  const safeOverlays = overlays.filter((o, index) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o) || typeof o.ref !== 'string' || !o.ref) {
+      malformed.push(index);
+      return false;
+    }
+    return isSafeBranchName(o.ref);
+  });
   const refEvidence = new Map();
   const attempt = (args) => {
     try {
@@ -86,11 +91,11 @@ export function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
   if (batch.status === 0) {
     for (const { ref } of safeOverlays) refEvidence.set(ref, 'refreshed');
     fetchEdges();
-    return { ok: true, goneRefs: [], refEvidence };
+    return { ok: true, goneRefs: [], refEvidence, malformed };
   }
 
   const mainOnlyFetch = attempt(['fetch', '--quiet', '--prune', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-  if (mainOnlyFetch.status !== 0) return { ok: false, reason: 'fetch-failed' };
+  if (mainOnlyFetch.status !== 0) return { ok: false, reason: 'fetch-failed', malformed };
 
   const goneRefs = [];
   for (const o of safeOverlays) {
@@ -104,7 +109,7 @@ export function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
     }
   }
   fetchEdges();
-  return { ok: true, goneRefs, refEvidence };
+  return { ok: true, goneRefs, refEvidence, malformed };
 }
 
 // ── defaultPrState — the CLI's real PR-state lookup ─────────────────────────────────────────────────────────

@@ -3242,6 +3242,20 @@ the assertions and deadlines remain unchanged.
 The integration-only fallback suite has no `unit` entry in `scripts/ci/test-timings.json`;
 `shard-assign.test.mjs` checks all committed unit timing keys against discovered unit tests.
 
+## Rebuild evidence recovery
+
+An unavailable overlay uses the current adopted tip, falling back to a full 40-hex registry `tipSha`,
+only to classify its pin. Missing evidence refuses with `pinned-overlay-unavailable` and `pinnedBy: unknown`;
+cached tracking refs never authorize building from that tip. Restore the branch or repair/re-register its
+recorded tip before retrying; explicit `mainOnly` recovery remains available. The lost-state regressions
+in `daemon-rebuild.test.mjs` retain a cached ref while injecting failed refresh and ref cleanup so the
+independent local-commits guard cannot mask an unsafe overlay drop.
+
+Malformed registry entries are excluded from fetch refspecs and freshness evidence, and returned as
+`malformed` entry indices even when main fetch fails. Preparation alerts `overlay-state-malformed` and
+refuses before retirement or planning; previews refuse with the same reason. `mainOnly` still fetches
+and adopts main without editing the registry, which remains available for operator repair.
+
 ## Closure-scope foundations
 
 `daemon-clone-entries.test.mjs`, `closure-scope.test.mjs` and
