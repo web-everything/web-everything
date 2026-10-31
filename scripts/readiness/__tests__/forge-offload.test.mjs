@@ -1,4 +1,5 @@
 // @vitest-environment node
+import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 import {describe,it,expect,beforeEach,afterEach,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
@@ -249,24 +250,19 @@ describe('warm base selection and delta proof',()=>{
   it.each([['120000','blob','skills'],['160000','commit','module'],['120000','blob','oauth-source.mjs']])('rejects non-excluded %s tree entry %s %s', (mode,type,path)=>{
     expect(()=>parseGitTree(Buffer.from(`${mode} ${type} ${'a'.repeat(40)}\t${path}\0`))).toThrow('Unsupported git tree mode');
   });
-  it('matches the full-ship digest with excluded symlinks in the base tree',async()=>{
+  it('retains symlinks only as delta tree evidence while refusing gitlinks and default exports',()=>{
+    const oid='a'.repeat(40),link=Buffer.from(`120000 blob ${oid} 9\ttools/alias\0`);
+    expect(parseGitTree(link,{sizes:true,links:true})).toEqual([{path:Buffer.from('tools/alias'),oid,executable:false,symlink:true,size:9}]);
+    expect(()=>parseGitTree(link,{sizes:true})).toThrow('Unsupported git tree mode');
+    expect(()=>parseGitTree(Buffer.from(`160000 commit ${oid} -\ttools/module\0`),{sizes:true,links:true})).toThrow('Unsupported git tree mode');
+  });
+  it('refuses tracked symlinks to files in full and delta manifests even when the base predates them',async()=>{
+    const base=await baseFixture();
     await fs.mkdir(join(repo,'.claude'));
     await fs.symlink('../mode.txt',join(repo,'.claude/skills'));
-    await fs.mkdir(join(repo,'agent-memory-src'));
-    await fs.writeFile(join(repo,'agent-memory-src/MEMORY.md'),'# Memory\n');
-    await fs.symlink('../agent-memory-src',join(repo,'.claude/agent-memory'));
     git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
-    const base=await baseFixture();
-    // Keep the link in the base tree, but untrack it for the delta: indexed
-    // memory bridges intentionally require full shipping.
-    git(['rm','--cached','.claude/agent-memory']);
-    await fs.writeFile(join(repo,'mode.txt'),'changed');
-    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
-    const full=await remote.buildManifest({cwd:repo,exec});
-    expect(delta.excluded.map(path=>path.toString())).toEqual(expect.arrayContaining(['.claude/skills','.claude/agent-memory']));
-    expect(delta.entries.some(entry=>entry.path.toString().startsWith('.claude/'))).toBe(false);
-    expect(delta.manifestDigest).toBe(full.manifestDigest);
-    expect(manifestWire(delta)).toEqual(manifestWire(full));
+    await expect(remote.buildManifest({cwd:repo,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+    await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
   it('prefers the newest local ancestor over a newer nonancestor base',async()=>{
     const base=await baseFixture();
@@ -303,11 +299,11 @@ describe('warm base selection and delta proof',()=>{
   });
   it('prefers fewer changed paths for nonancestors and safely retains newest order on missing distance',async()=>{
     const bases=Array.from({length:3},(_,i)=>({sha:String(i).repeat(40),manifestDigest:'a'.repeat(64)}));
-    const probe=vi.fn(async({args})=>({code:args[0]==='merge-base'?1:0,stdout:args[0]==='diff'?Buffer.from(args.includes(bases[1].sha)?'a\0':'a\0b\0'):Buffer.alloc(0)}));
-    expect(await remote.selectBase({exec:probe,bases})).toEqual(bases[1]);
-    expect(probe.mock.calls.length).toBeLessThanOrEqual(4*bases.length);
-    const broken=async call=>call.args[0]==='diff'?{code:1,stdout:Buffer.alloc(0)}:probe(call);
-    expect(await remote.selectBase({exec:broken,bases})).toEqual(bases[0]);
+    const probe=vi.fn(async call=>bindingEvidence(call)??(({args})=>({code:args[0]==='merge-base'?1:0,stdout:args[0]==='diff'?Buffer.from(args.includes(bases[1].sha)?'a\0':'a\0b\0'):Buffer.alloc(0)}))({args:gitArgs(call)}));
+    expect(await remote.selectBase({cwd:repo,exec:probe,bases})).toEqual(bases[1]);
+    expect(probe.mock.calls.filter(([call])=>!call.args.includes('--show-toplevel')).length).toBeLessThanOrEqual(4*bases.length);
+    const broken=async call=>gitArgs(call)[0]==='diff'?{code:1,stdout:Buffer.alloc(0)}:probe(call);
+    expect(await remote.selectBase({cwd:repo,exec:broken,bases})).toEqual(bases[0]);
   });
   it('uses full shipping when no ready base exists locally',async()=>{
     const base=await baseFixture();
@@ -347,7 +343,7 @@ describe('warm base selection and delta proof',()=>{
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
     await fs.writeFile(join(repo,'untracked.txt'),'new');
     const read=vi.fn(path=>fs.readFile(path));
-    const unavailable=call=>call.args[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
+    const unavailable=call=>gitArgs(call)[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
     const delta=await remote.buildDeltaManifest({cwd:repo,exec:unavailable,base,fs:{...fs,readFile:read}});
     const full=await remote.buildManifest({cwd:repo,exec});
     expect(delta.manifestMode).toBe('full-scan');
@@ -373,7 +369,7 @@ describe('warm base selection and delta proof',()=>{
     const base=await baseFixture();let raced=false;
     const racingExec=async call=>{
       const result=await exec(call);
-      if(!raced&&call.args[0]==='diff'&&call.args.at(-2)==='HEAD') {
+      if(!raced&&gitArgs(call)[0]==='diff'&&call.args.at(-2)==='HEAD') {
         raced=true;
         if(fault==='bytes')await fs.writeFile(join(repo,'mode.txt'),'race');
         else await fs.chmod(join(repo,'mode.txt'),0o755);
@@ -388,7 +384,7 @@ describe('warm base selection and delta proof',()=>{
 });
 
 describe('runner base materialization refuses before install',()=>{
-  async function setup(pool=false,shape) {
+  async function setup(pool=false,shape,linked=false) {
     if(shape==='file to directory')await fs.writeFile(join(repo,'node'),'old leaf');
     if(['directory to file','nested deletion'].includes(shape)) {
       await fs.mkdir(join(repo,'node','nested'),{recursive:true});await fs.writeFile(join(repo,'node','nested','leaf'),'old leaf');
@@ -400,10 +396,16 @@ describe('runner base materialization refuses before install',()=>{
     const bin=join(server,'bin');await fs.mkdir(bin);await fs.symlink(process.execPath,join(bin,'node'));
     await fs.writeFile(join(bin,'npm'),`#!/bin/sh\necho ran >> '${server}/npm.log'\necho \"$*\" >> '${server}/npm-args.log'\nexit 0\n`,{mode:0o755});
     if(pool){await fs.mkdir(join(server,'runs','slot-1'),{recursive:true,mode:0o710});await fs.chmod(join(server,'runs','slot-1'),0o710);}
-    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin',...(pool?{testWorkerExec:async()=>({code:0,stdout:'',stderr:''})}:{})});
+    const workerExec=vi.fn(async()=>({code:0,stdout:'',stderr:''}));
+    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin',...(pool?{testWorkerExec:workerExec}:{})});
     const nonce='e'.repeat(32),prepared=await runner.prepare({nonce});
     expect(prepared.capabilities).toMatchObject({delta:1,bases:[{sha:base.sha,manifestDigest:base.manifestDigest}]});
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    if(linked) {
+      await fs.mkdir(join(repo,'skills-src'));await fs.writeFile(join(repo,'skills-src/leaf.md'),'skill');
+      await fs.mkdir(join(repo,'.claude'));await fs.symlink('../skills-src',join(repo,'.claude/skills'));
+      git(['add','skills-src','.claude/skills']);
+    }
     if(shape)await fs.rm(join(repo,'node'),{recursive:true});
     if(shape==='file to directory'){await fs.mkdir(join(repo,'node'));await fs.writeFile(join(repo,'node','leaf'),'new leaf');}
     if(shape==='directory to file')await fs.writeFile(join(repo,'node'),'new leaf');
@@ -417,7 +419,7 @@ describe('runner base materialization refuses before install',()=>{
     const argv=['npm','run','test:unit','--','a.test.mjs'];
     const request={v:1,nonce,run:prepared.run,argv,env:{},argvDigest:digestArgv(argv),lock:hash('lock'),inputDigest:await digestInput(full),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest,baseSha:base.sha,baseManifestDigest:base.manifestDigest,deletions:Buffer.from('deleted.txt\0').toString('base64')};
     if(shape)request.deletions=Buffer.concat([Buffer.from('deleted.txt\0'),Buffer.from(shape==='file to directory'?'node\0':'node/nested/leaf\0')]).toString('base64');
-    return {base,dir,server,runner,request,work};
+    return {base,dir,server,runner,request,work,workerExec};
   }
   it('uses independent copies, applies deletion and delta, and verifies before install',async()=>{
     const f=await setup();expect((await f.runner.run(f.request)).code).toBe(0);
@@ -482,7 +484,20 @@ describe('runner base materialization refuses before install',()=>{
     await copyLeaves(join(f.dir,'tree'),tree,decodeManifest(f.base.manifest).entries);
     await fs.writeFile(tree+'.json',JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}),{mode:0o600});
     const inode=(await fs.stat(join(tree,'mode.txt'))).ino;
+    f.workerExec.mockImplementation(async({cwd})=>{
+      // Observe exact reconstructed inputs before install/test consumers run.
+      if(cwd===f.work) {
+        expect(await digestInput(cwd)).toBe(f.request.inputDigest);
+        expect(await fs.readFile(join(cwd,'a.test.mjs'),'utf8')).toBe('changed');
+        expect((await fs.stat(join(cwd,'mode.txt'))).ino).toBe(inode);
+        await expect(fs.lstat(join(cwd,'deleted.txt'))).rejects.toMatchObject({code:'ENOENT'});
+        if(shape==='nested deletion')await expect(fs.lstat(join(cwd,'node'))).rejects.toMatchObject({code:'ENOENT'});
+        else expect(await fs.readFile(join(cwd,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
+      }
+      return {code:0,stdout:'',stderr:''};
+    });
     expect((await f.runner.run(f.request)).code).toBe(0);
+    expect(f.workerExec.mock.calls.filter(([call])=>call.cwd===f.work).length).toBeGreaterThanOrEqual(2);
     expect((await fs.stat(join(f.work,'mode.txt'))).ino).toBe(inode);
     if(shape==='nested deletion')await expect(fs.lstat(join(f.work,'node'))).rejects.toMatchObject({code:'ENOENT'});
     else expect(await fs.readFile(join(f.work,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
@@ -504,8 +519,8 @@ describe('runner base materialization refuses before install',()=>{
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
   // These cases run real Git, file copies and the install supervisor; allow for CI contention.
-  it.each(['delta','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
-    const f=await setup(),requests=[],copies=[],log=vi.fn();
+  it.each(['delta','tracked symlink','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+    const f=await setup(false,undefined,mode==='tracked symlink'),requests=[],copies=[],log=vi.fn();
     const sshOptions=['-o','BatchMode=yes','-o','ControlMaster=auto','-o','ControlPersist=60s','-o','ControlPath=private-cm/%C'];
     let baseRetrieved=false,ignoredCalls=0,manifestCalls=0;
     const attempts=[];
@@ -517,7 +532,7 @@ describe('runner base materialization refuses before install',()=>{
         if(ignoredCalls===1&&mode==='ignored listing failure')return {code:1,stdout:Buffer.alloc(0)};
         if(ignoredCalls===1&&mode==='ignored listing rejection')throw new Error('ignore inventory unavailable');
       }
-      if(call.file==='git'){if(mode==='git failure'&&call.args[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='git'){if(mode==='git failure'&&gitArgs(call)[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&gitArgs(call)[0]==='cat-file'&&gitArgs(call)[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
       if(call.file==='ssh')expect(call.sshOptions).toEqual(sshOptions);
       if(call.file==='rsync'){
         expect(call.args[call.args.indexOf('-e')+1]).toBe(`ssh ${sshOptions.map(value=>`'${value}'`).join(' ')}`);
@@ -542,7 +557,7 @@ describe('runner base materialization refuses before install',()=>{
       return {code:0,stdout:JSON.stringify(value)};
     };
     const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions});
-    expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','tracked symlink','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
     if(mode==='retry succeeds')expect(manifestCalls).toBe(2);
     if(mode==='next base'){expect(manifestCalls).toBe(3);expect(attempts[0]).toBe(attempts[1]);expect(attempts[2]).toBe(f.base.sha);}
@@ -555,22 +570,27 @@ describe('runner base materialization refuses before install',()=>{
       expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
-    const deltaMode=['delta','retry succeeds','next base'].includes(mode);
+    const deltaMode=['delta','tracked symlink','retry succeeds','next base'].includes(mode);
     expect(stage.shipMode).toBe(deltaMode?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
     // only in delta mode; the deleted file and private credentials never ship.
-    const payloads=deltaMode?['changed']:['changed','lock','mode','public'];
+    const payloads=mode==='tracked symlink'?['changed','skill','skill']:deltaMode?['changed']:['changed','lock','mode','public'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
-      deltaFileCount:deltaMode?1:0,deltaBytes:deltaMode?Buffer.byteLength('changed'):0});
+      deltaFileCount:deltaMode?payloads.length:0,deltaBytes:deltaMode?bytes:0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
     if(mode==='late delta failure'){
+      expect(log).toHaveBeenCalledWith('manifest: full-scan (Full ship selected)\n');
       expect(copies).toHaveLength(2);
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
     }
     if(mode==='delta'){
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
       expect(requests[0]).toMatchObject({baseSha:f.base.sha,deletions:Buffer.from('deleted.txt\0').toString('base64')});
+    }else if(mode==='tracked symlink') {
+      expect(result.code).toBe(0);
+      expect(copies[0]).toEqual(Buffer.from('./.claude/skills/leaf.md\0./a.test.mjs\0./skills-src/leaf.md\0'));
+      expect(requests[0].baseSha).toBe(f.base.sha);
     }else if(!['retry succeeds','next base'].includes(mode))expect(requests[0].baseSha).toBeUndefined();
   },30_000);
   it('refuses an ignored test created while the SSH base-manifest response is in flight',async()=>{
