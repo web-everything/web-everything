@@ -3239,6 +3239,18 @@ then assert its manifest digest and snapshot bytes. Preserve source mtimes throu
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
 a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
+
+The tracked `.claude/agent-memory` bridge is verified against its index blob and
+projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY.md`
+and the complete target corpus; reject unsafe links or incomplete inputs before
+transfer. These projected inputs require full shipping.
+
+For remote `check:standards`, observe both output streams for skipped gates,
+`no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
+remote result to fall back through local admission; an invalid receipt keeps the
+result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
+compares local and shipped discovery of the base, coverage report, and memory index.
+
 ## CI-heal check evidence (R272)
 
 Check names and required rosters match exactly, including case: a passing `TEST`

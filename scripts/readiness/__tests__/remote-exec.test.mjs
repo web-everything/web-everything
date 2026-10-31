@@ -1206,7 +1206,9 @@ describe('runRemote', () => {
     expect(JSON.parse(callsOf(f.exec).find(isRun).input).manifest.git.head).toBe(head);
     expect(JSON.stringify(callsOf(f.exec))).not.toContain('verify-marker');
     expect(f.local).not.toHaveBeenCalled();
-  });
+    // This integration fixture clones and materializes real Git worktrees, with
+    // individual Git calls bounded at 10s. Use the parity test's aggregate budget.
+  }, 30000);
   it.each(['invalid JSON','array','outside cwd','sibling prefix','Windows absolute','collision'])
   ('falls back before transfer for a non-portable coverage report: %s',async fault=>{
     const f=fixture();
