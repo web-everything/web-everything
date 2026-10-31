@@ -160,6 +160,7 @@ import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-file
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -726,7 +727,6 @@ export async function runWithRemoteDecision({
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
-  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
@@ -759,6 +759,7 @@ export async function runWithRemoteDecision({
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
   let outstanding = false;
   let terminated = false;
+  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
@@ -1199,17 +1200,16 @@ export function slotPath(i) {
 /**
  * Same-machine PID-liveness verdict (mirrors `file-locks-cli.mjs#probePidLiveness` — the layered, NEVER
  * primary, fast path: `kill(pid, 0)` throws ESRCH when no such process exists → provably 'dead'; succeeds →
- * 'alive' (the kernel reuses PIDs, so this does NOT prove it's the same owner — never accelerates a reclaim);
+ * 'alive' unless Linux /proc proves a zombie/dead state (PID reuse never proves the same owner);
  * a null/own/foreign-host pid is 'unknown' (TTL-only). Wired here, not left unwired, because #3461's long
  * `ADMISSION_LEASE_MINUTES` makes the TTL floor alone too slow to recover a genuinely crashed holder.
  * @param {number|null} pid  the CURRENT holder's pid (from its lock entry), or null if unknown
  * @param {number} selfPid   the caller's own pid — never probes/accelerates against itself
+ * @param {(pid:number)=>string|null} [readStat] injectable Linux stat reader (default no-op off Linux)
  * @returns {'dead'|'alive'|'unknown'}
  */
-export function probeSlotHolderLiveness(pid, selfPid) {
-  if (!Number.isInteger(pid) || pid <= 0 || pid === selfPid) return 'unknown';
-  try { process.kill(pid, 0); return 'alive'; }
-  catch (e) { return e && e.code === 'ESRCH' ? 'dead' : 'unknown'; }
+export function probeSlotHolderLiveness(pid, selfPid, readStat) {
+  return probePidLiveness(pid, selfPid, readStat);
 }
 
 /**
