@@ -136,7 +136,8 @@ export function heavyTestReport(stdout, { root, args }) {
       if (!Number.isSafeInteger(frame.plan) || frame.plan > 100_000) invalid();
       continue;
     }
-    const task = /^ok (\d+) - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/.exec(text);
+    // TAP lines are split on LF; titles can still contain CR, U+2028 or U+2029.
+    const task = /^ok (\d+) - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/s.exec(text);
     if (!task || frame.plan === null || Number(task[1]) !== ++frame.seen || frame.seen > frame.plan) invalid();
     const skipped = frame.skipped || task[3] === 'SKIP' || task[3] === 'TODO';
     let result = frame.result;

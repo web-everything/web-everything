@@ -21,8 +21,12 @@ export async function runScratchForgeCase() {
     const { TapReporter } = await import('vitest/reporters');
     const lines = [], reporter = new TapReporter();
     reporter.onInit({ logger: { log: text => lines.push(text) }, getProjectByTaskId: () => ({}) });
+    const titles = ['carriage\rreturn', 'line\u2028separator', 'paragraph\u2029separator', 'line\nbreak', 'line\r\nbreak'];
     await reporter.onFinished([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
       { type: 'test', name: 'assertion', mode: 'run', result: { state: 'pass', duration: 1 } },
+      ...titles.map(name => ({ type: 'suite', name, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
+        { type: 'test', name, mode: 'run', result: { state: 'pass', duration: 1 } },
+      ] })),
     ] }]);
     const tap = lines.join('\n') + '\n';
     let state, remote, runs = 0;
@@ -58,7 +62,8 @@ export async function runScratchForgeCase() {
     const violations = [];
     if (remote.mode !== 'remote' || remote.code !== 0 || runs !== 1) violations.push(`offload failed: ${JSON.stringify(remote)}, runs=${runs}`);
     if (report?.testResults?.[0]?.name !== join(fs.realpathSync(root), file)
-      || report.testResults[0].assertionResults[0]?.status !== 'passed') violations.push('local inventory missing');
+      || report.testResults[0].assertionResults.length !== titles.length + 1
+      || report.testResults[0].assertionResults.some(assertion => assertion.status !== 'passed')) violations.push('local inventory missing');
     return { violations, mode: remote.mode, runs };
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }

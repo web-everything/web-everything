@@ -125,6 +125,33 @@ describe('auto-rebase executed-test inventory', () => {
     expect(transport).toHaveBeenCalled();
   });
 
+  it.each([
+    ['LF', 'line\nbreak'], ['CR', 'carriage\rreturn'], ['CRLF', 'line\r\nbreak'],
+    ['LS', 'line\u2028separator'], ['PS', 'paragraph\u2029separator'],
+    ['punctuation', '`backtick` "quote" # hash'], ['leading option', '--leading'],
+    ['path', '../relative'], ['Unicode', 'café cafe\u0301 \u200b'],
+    ['concatenation', 'carriage\r' + 'return\u2028separator'],
+  ])('preserves execution evidence from real TAP titles containing %s', async (_label, title) => {
+    const root = temp(), lines = [], file = 'worker.test.mjs';
+    const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], testReport: join(root, 'report.json'), env: {} });
+    const reporter = new TapReporter();
+    reporter.onInit({ logger: { log: text => lines.push(text) }, getProjectByTaskId: () => ({}) });
+    await reporter.onFinished([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
+      { type: 'suite', name: title, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
+        { type: 'test', name: title, mode: 'run', result: { state: 'pass', duration: 1 } },
+        { type: 'test', name: title, mode: 'skip' },
+        { type: 'test', name: title, mode: 'todo' },
+      ] },
+    ] }]);
+    const result = { status: 0, stdout: lines.join('\n') + '\n', stderr: '' };
+    const exec = vi.fn(async () => result);
+    expect(await runHeavyTests(invocation, { exec })).toBe(result);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(JSON.parse(fs.readFileSync(invocation.testReport, 'utf8'))).toEqual({ testResults: [
+      { name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }, { status: 'pending' }, { status: 'pending' }] },
+    ] });
+  });
+
   it.each(['', 'TAP version 13\n1..1\n', 'TAP version 13\n1..1\nok 1 - worker.test.mjs {\n    1..1\n',
     'TAP version 13\n1..1\nok 2 - worker.test.mjs\n', 'TAP version 13\n1..0\nnot ok 1 - worker.test.mjs\n',
     'TAP version 13\n1..0\nTAP version 13\n1..0\n', 'x'.repeat(8 * 1024 * 1024 + 1)])(
