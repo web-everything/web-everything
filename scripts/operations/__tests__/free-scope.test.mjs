@@ -254,6 +254,8 @@ describe('heartbeat liveness (live 2026-10-31 dead-owner reap)', () => {
     expect(plain).not.toHaveProperty('lastSeenAt');
     expect(plain).not.toHaveProperty('staleAfterMinutes');
     expect(() => registerScope([], { agent: 'a', files: ['x.mjs'], staleAfterMinutes: 0 }, startedAt)).toThrow(TypeError);
+    // a tokenless heartbeat entry could never be refreshed by a check, so it would expire while alive (Codex audit)
+    expect(() => registerScope([], { agent: 'a', files: ['x.mjs'], staleAfterMinutes: 45 }, startedAt)).toThrow(/needs --owner/);
   });
   it('a different owner may take over a heartbeat-stale name; a live one is still refused', () => {
     const entries = [{ ...beat, agent: 'w', files: ['we:x.mjs'] }];
@@ -271,6 +273,10 @@ describe('heartbeat liveness (live 2026-10-31 dead-owner reap)', () => {
     expect(heartbeatScope([beat], 'build-x', 'B', at).refreshed).toBe(0);
     expect(heartbeatScope([tokenless], 'build-x', undefined, at).refreshed).toBe(0);
     expect(heartbeatScope([beat], 'build-x', 'A', new Date(nowMs + 4 * 3600e3).toISOString()).refreshed).toBe(0);
+    // an out-of-order write (an older snapshot committing late) never moves lastSeenAt backwards (Codex audit)
+    const newer = { ...beat, lastSeenAt: at };
+    expect(heartbeatScope([newer], 'build-x', 'A', startedAt).entries[0].lastSeenAt).toBe(at);
+    expect(registerScope([newer], { agent: 'build-x', files: ['x.mjs'], owner: 'A', staleAfterMinutes: 45 }, startedAt)[0].lastSeenAt).toBe(at);
   });
   it('a heartbeat-stale holder is ignored and reported with its last-seen time', () => {
     const verdict = assess({ agents: [beat], nowMs: nowMs + 46 * 60e3 });

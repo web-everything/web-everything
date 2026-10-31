@@ -80,7 +80,7 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
       check = assess(snapshot.agents);
       // A check naming its own agent AND owner token is that owner's heartbeat; a failed write is an error, never silent.
       if (options['exclude-agent'] && options['exclude-owner']) updateRegistry(registry, (entries) =>
-        heartbeatScope(entries, options['exclude-agent'], options['exclude-owner'], new Date(snapshot.nowMs).toISOString()).entries);
+        heartbeatScope(entries, options['exclude-agent'], options['exclude-owner'], new Date(now()).toISOString()).entries);
     }
     if (options.json) print(JSON.stringify(command === 'register' ? { registered, check } : check, null, 2));
     else if (command !== 'register') print(formatFreeScope(check));

@@ -70,6 +70,8 @@ const ownerOf = (owner) => owner || null;
  * tokenless flow); a LIVE entry held by a different owner is refused, never silently overwritten. An expired entry
  * belongs to no one.
  */
+/** Writes may commit out of order; a heartbeat never moves `lastSeenAt` backwards past a newer valid one. */
+const latestSeen = (nowIso, prior) => (Date.parse(prior) > Date.parse(nowIso) ? prior : nowIso);
 export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAULT_TTL_HOURS, owner, staleAfterMinutes }, nowIso) {
   if (typeof agent !== 'string' || !agent.trim()) throw new TypeError('free-scope: give --agent=<name>');
   const scope = qualified(files || []);
@@ -78,11 +80,13 @@ export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAU
   if (staleAfterMinutes !== undefined && !(typeof staleAfterMinutes === 'number' && Number.isFinite(staleAfterMinutes) && staleAfterMinutes > 0)) {
     throw new TypeError('free-scope: staleAfterMinutes must be a positive number');
   }
+  // Only an owner-tokened check can heartbeat an entry, so a tokenless heartbeat entry would expire while still alive.
+  if (staleAfterMinutes !== undefined && !ownerOf(owner)) throw new TypeError('free-scope: --heartbeat needs --owner=<token>');
   const nowMs = Date.parse(nowIso);
   const held = entries.find((e) => e.agent === agent && ownerOf(e.owner) !== ownerOf(owner) && partitionRegistry([e], nowMs).live.length);
   if (held) throw new TypeError(`free-scope: agent ${agent} is already registered by a different owner (since ${held.startedAt}); release it, wait for its TTL, or use a unique --agent name`);
   return [...entries.filter((e) => e.agent !== agent), { agent, purpose, files: scope, startedAt: nowIso, ttlHours, ...(owner ? { owner } : {}),
-    ...(staleAfterMinutes !== undefined ? { staleAfterMinutes, lastSeenAt: nowIso } : {}) }];
+    ...(staleAfterMinutes !== undefined ? { staleAfterMinutes, lastSeenAt: latestSeen(nowIso, entries.find((e) => e.agent === agent && ownerOf(e.owner) === ownerOf(owner))?.lastSeenAt) } : {}) }];
 }
 /**
  * Refresh `lastSeenAt` on the caller's own entry: same agent AND the same non-empty owner token (a tokenless call
@@ -94,7 +98,7 @@ export function heartbeatScope(entries, agent, owner, nowIso) {
   const next = entries.map((e) => {
     if (!agent || !ownerOf(owner) || e.agent !== agent || ownerOf(e.owner) !== ownerOf(owner) || !(ttlExpiry(e) > nowMs)) return e;
     refreshed++;
-    return { ...e, lastSeenAt: nowIso };
+    return { ...e, lastSeenAt: latestSeen(nowIso, e.lastSeenAt) };
   });
   return { entries: next, refreshed };
 }
