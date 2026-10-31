@@ -3367,17 +3367,6 @@ these guards, check representative mutations for ownership, marker evidence, pri
 failure cleanup and parent-directory removal through the heavy-admission queue. Temporary Vite
 transform configs can substitute mutations without editing the working implementation.
 
-The tracked `.claude/agent-memory` bridge is verified against its index blob and
-projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY.md`
-and the complete target corpus; reject unsafe links or incomplete inputs before
-transfer. These projected inputs require full shipping.
-
-For remote `check:standards`, observe both output streams for skipped gates,
-`no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
-remote result to fall back through local admission; an invalid receipt keeps the
-result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
-compares local and shipped discovery of the base, coverage report, and memory index.
-
 ## CI-heal check evidence (R272)
 
 Check names and required rosters match exactly, including case: a passing `TEST`
