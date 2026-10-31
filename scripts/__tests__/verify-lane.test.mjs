@@ -1477,13 +1477,18 @@ process.exit(${standardsExit});
     for (const name of ['npx', 'npm']) {
       writeFileSync(join(dir, 'bin', name), fake); chmodSync(join(dir, 'bin', name), 0o755);
     }
+    // Pin the local slot layout instead of inheriting host admission preferences.
+    const preferences = join(dir, 'admission-preferences.json');
+    writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
+      cap: 1, fastSlots: 1, fastScale: { maxSlots: 1 }, remote: { enabled: false },
+    } }));
     // Keep fixture infrastructure out of the change's own edited set.
     writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\n*.attempt\n');
     execFileSync('git', ['add', '.'], { cwd: dir });
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
+    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
       expect(result.error, result.stderr).toBeUndefined();
