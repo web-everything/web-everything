@@ -1,4 +1,5 @@
 ---
+bornAs: xkjna3x
 kind: story
 size: 3
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Red-team recovery: second bounded re-dispatch with backoff (follow-up to x533xtg)
+# Red-team recovery: second bounded re-dispatch with backoff (follow-up to 7537)
 
-Follow-up to the x533xtg split of #6056: allow a second bounded red-team re-dispatch with backoff, cut from the MVP. Builds on we:scripts/lib/review-red-team-on-skip.mjs.
+Follow-up to the 7537 split of #6056: allow a second bounded red-team re-dispatch with backoff, cut from the MVP. Builds on we:scripts/lib/review-red-team-on-skip.mjs.
 
 ## Acceptance
 

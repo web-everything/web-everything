@@ -1,4 +1,5 @@
 ---
+bornAs: x8szm3q
 kind: task
 status: open
 scope: ["we:scripts/operations/review-job.mjs"]
@@ -6,9 +7,9 @@ dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Repo-wide gate: every CLI flag has a test naming it (follow-up to x533xtg)
+# Repo-wide gate: every CLI flag has a test naming it (follow-up to 7537)
 
-Follow-up to the x533xtg split of #6056: a gate requiring every flag('x') in a CLI parser to have a test naming --x, so spawn-boundary flags cannot drift. First target we:scripts/operations/review-job.mjs.
+Follow-up to the 7537 split of #6056: a gate requiring every flag('x') in a CLI parser to have a test naming --x, so spawn-boundary flags cannot drift. First target we:scripts/operations/review-job.mjs.
 
 ## Acceptance
 

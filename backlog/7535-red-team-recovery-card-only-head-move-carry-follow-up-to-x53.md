@@ -1,14 +1,15 @@
 ---
+bornAs: x19xrqc
 kind: task
 status: open
-scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/operations/review-extra-seats.mjs"]
+scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
 
-# Red-team recovery: daily-cap refund on deferral (follow-up to x533xtg)
+# Red-team recovery: card-only head-move carry (follow-up to 7537)
 
-Follow-up to the x533xtg split of #6056: refund the daily red-team cap when a run is deferred and restored, cut from the MVP. Touches we:scripts/lib/review-red-team-on-skip.mjs.
+Follow-up to the 7537 split of #6056: carry red-team recovery state across a card-only head move, cut from the MVP. Touches we:scripts/lib/review-red-team-on-skip.mjs.
 
 ## Acceptance
 

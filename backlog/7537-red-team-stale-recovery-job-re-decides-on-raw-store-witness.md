@@ -1,4 +1,5 @@
 ---
+bornAs: x533xtg
 kind: story
 size: 5
 status: open
@@ -76,10 +77,10 @@ Matrix (daemon tick, argv, job, arc; ticks 1-2; never pending after tick 2):
 
 ## Follow-ups
 
-- we:backlog/xkjna3x-red-team-recovery-second-bounded-re-dispatch-with-backoff-fo.md
-- we:backlog/x19xrqc-red-team-recovery-card-only-head-move-carry-follow-up-to-x53.md
-- we:backlog/x3lkept-red-team-recovery-daily-cap-refund-on-deferral-follow-up-to.md
-- we:backlog/x8szm3q-repo-wide-gate-every-cli-flag-has-a-test-naming-it-follow-up.md
+- we:backlog/7539-red-team-recovery-second-bounded-re-dispatch-with-backoff-fo.md
+- we:backlog/7535-red-team-recovery-card-only-head-move-carry-follow-up-to-x53.md
+- we:backlog/7536-red-team-recovery-daily-cap-refund-on-deferral-follow-up-to.md
+- we:backlog/7538-repo-wide-gate-every-cli-flag-has-a-test-naming-it-follow-up.md
 - Close #6056 linking the new PR and this design, once the new PR lands (not done by this card).
 
 Critical files: we:scripts/operations/review-job.mjs (:300, :310, :390-440, :1150-1232, :1363, :1518); we:scripts/lib/review-red-team-on-skip.mjs (:82, :154, :292, :400-590); we:skills-src/conveyor/review-daemon.mjs (:1238); we:scripts/operations/review-extra-seats.mjs; we:scripts/lib/drain-red-team-evidence.mjs.
