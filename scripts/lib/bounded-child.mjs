@@ -183,10 +183,12 @@ export function descendantPids(rootPid, psText) {
  * Kill `rootPid` and its whole process TREE (not its process group). For a child that must stay in its parent's
  * group (so a supervisor's group kill of the parent still reaches it) but must also be killable on its own, e.g.
  * verify-lane's gate phases (`shell → npm exec → node vitest → esbuild`). Best-effort and synchronous.
- * `orphansOfGroup` (a pgid): ALSO kill processes of that group that were reparented to init (ppid 1) — a
- * descendant whose intermediate parent already exited is no longer reachable through the tree, but it keeps the
- * group it was forked into. The caller passes its OWN pgid; an ancestor is never ppid 1 inside that group
- * unless it is the group's launchd-started leader, which is excluded along with the caller.
+ * `orphansOfGroup` (a pgid): ALSO kill processes of that group that were reparented out of it — a descendant whose
+ * intermediate parent already exited is no longer reachable through the tree, but it keeps the group it was forked
+ * into. Its new parent is its reaper: init (ppid 1), or on Linux the nearest PR_SET_CHILD_SUBREAPER ancestor (the
+ * Forge runner supervisor, a systemd user manager), which is never a member of the caller's group. So a member whose
+ * parent is init or outside the group is an orphan. The caller passes its OWN pgid (it leads the group, so every
+ * other member descends from it); the leader and the caller are excluded.
  * @returns {number[]} the pids signalled
  */
 export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = null, selfPid = process.pid, marker = null, outputFds = [],
@@ -200,9 +202,12 @@ export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = 
     const text = listProcesses();
     tree = descendantPids(rootPid, text);
     if (Number.isInteger(orphansOfGroup) && orphansOfGroup > 1) {
-      for (const line of String(text).split('\n')) {
-        const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
-        if (ppid === 1 && pgid === orphansOfGroup && pid !== orphansOfGroup && pid !== selfPid && !tree.includes(pid)) orphans.push(pid);
+      const rows = String(text).split('\n').map(line => line.trim().split(/\s+/).map(Number))
+        .filter(([pid, ppid, pgid]) => Number.isInteger(pid) && Number.isInteger(ppid) && Number.isInteger(pgid));
+      const members = new Set(rows.filter(([, , pgid]) => pgid === orphansOfGroup).map(([pid]) => pid));
+      for (const [pid, ppid, pgid] of rows) {
+        if (pgid === orphansOfGroup && (ppid === 1 || !members.has(ppid)) && pid !== orphansOfGroup && pid !== selfPid && pid !== rootPid
+          && !tree.includes(pid)) orphans.push(pid);
       }
     }
   } catch { /* ps unavailable: still kill the root */ }
