@@ -8,7 +8,7 @@ import { isPrepExempt, logPrepEvent, parsePrep, prepVerdict } from '../lib/prep-
 const prep = 'PREP:\nAcceptance: observable outcome\nPre-mortem: parser may fail\nFiles: scripts/example.mjs\nTests: focused unit tests';
 
 describe('prep block', () => {
-  it.each(['<reason>', '**<reason>**', 'TODO', '........', 'a b c d e f g'])('rejects placeholder/short waiver reason %s', (reason) => {
+  it.each(['<reason>', '**<reason>**', '**blocked**', 'TODO', '........', 'a b c d e f g'])('rejects placeholder/short waiver reason %s', (reason) => {
     expect(prepVerdict(`prep: waived — ${reason}`).ok).toBe(false);
   });
   it.each(['Handle merge conflict markers in parser', 'read-only', 'jury', 'merge conflict', 'card-only workflow'])('does not exempt feature-like titles or bare labels: %s', (title) => {
@@ -86,6 +86,16 @@ describe('prep block', () => {
   });
   it.each(['tbd', 'TODO', 'n/a', 'none', '-', '...', '**TODO**', 'a b c d e f g', '........'])('rejects placeholder/short item %s', (value) => {
     expect(prepVerdict(prep.replace('observable outcome', value)).ok).toBe(false);
+  });
+  it.each(['', '- ', '* ', '+ ', '1. '])('rejects short/placeholder bold continuations after prefix %j', (prefix) => {
+    for (const value of ['**blocked**', '**<reason>**']) {
+      expect(prepVerdict(prep.replace('Acceptance: observable outcome', `Acceptance:\n${prefix}${value}`)).ok).toBe(false);
+    }
+  });
+  it.each(['', '- ', '* ', '+ ', '1. '])('accepts eight-character bold content after prefix %j', (prefix) => {
+    const content = `${prefix}**incident**`;
+    expect(prepVerdict(prep.replace('Acceptance: observable outcome', `Acceptance:\n${content}`)).ok).toBe(true);
+    expect(prepVerdict(`prep: waived — ${content}`)).toEqual({ ok: true, reason: content, waived: true });
   });
   it('requires headings inside PREP and does not borrow content across a new PREP line', () => {
     expect(prepVerdict(prep.replace('PREP:\n', '')).ok).toBe(false);

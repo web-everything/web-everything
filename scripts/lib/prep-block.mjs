@@ -14,7 +14,7 @@ export function isPrepExempt(text) {
 }
 
 function nonTrivial(line) {
-  const item = line.trim().replace(/^(?:[-*+]\s*|\d+[.)]\s*)/, '').replace(/\*\*/g, '').trim();
+  const item = line.trim().replace(/^(?:[-*+]\s+|\d+[.)]\s*)/, '').replace(/\*\*/g, '').trim();
   return item.replace(/\s/g, '').length >= 8
     && !/^(?:<[^<>]*>\s*)+$/.test(item)
     && !/^(?:tbd|todo|n\/a|none|[-.…]+)[.!]?$/i.test(item);
