@@ -217,6 +217,60 @@ describe('overlay main sync', () => {
     expect(tick(f, { spawnFn: spawner() }).started).toEqual([ref]);
   });
 
+  it.each([false, true])('checkout retry clears partial scratch state and syncs without touching root or symlink targets (index lock: %s)', async locked => {
+    const f = fixture(), git = f.deps.git, rootIndex = fs.readFileSync(join(f.root, '.git', 'index'));
+    const outside = join(f.base, 'outside');
+    write(outside, 'keep.md', 'preserve outside scratch\n');
+    f.deps.gitBackoff = vi.fn();
+    f.deps.io.rmSync = vi.fn(fs.rmSync);
+    f.deps.io.readdirSync = vi.fn(fs.readdirSync);
+    let tries = 0, scratch, retryState;
+    f.deps.git = vi.fn((args, opts) => {
+      if (args[0] === 'checkout' && opts.cwd !== f.root) {
+        scratch = opts.cwd;
+        if (++tries === 1) {
+          // Leave a real index plus untracked target files, as an interrupted checkout can.
+          ok(scratch, ['read-tree', '--empty']);
+          write(scratch, 'overlay.test.mjs', 'incomplete checkout\n');
+          write(scratch, '.partial/nested.md', 'partial hidden directory\n');
+          fs.symlinkSync(outside, join(scratch, 'outside-link'), 'dir');
+          if (locked) write(scratch, '.git/index.lock', 'interrupted index write\n');
+          return { status: null, stdout: '', stderr: '',
+            error: Object.assign(new Error('checkout timed out'), { code: 'ETIMEDOUT' }) };
+        }
+        retryState = {
+          entries: fs.readdirSync(scratch),
+          index: fs.existsSync(join(scratch, '.git', 'index')),
+          lock: fs.existsSync(join(scratch, '.git', 'index.lock')),
+        };
+      }
+      return git(args, opts);
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(tries).toBe(2);
+    expect(retryState).toEqual({ entries: ['.git'], index: false, lock: false });
+    expect(f.deps.gitBackoff).toHaveBeenCalledTimes(1);
+    expect(f.deps.gitBackoff).toHaveBeenCalledWith(100);
+    expect(f.deps.io.readdirSync).toHaveBeenCalledWith(scratch);
+    for (const file of ['.git/index', '.git/index.lock']) {
+      expect(f.deps.io.rmSync).toHaveBeenCalledWith(join(scratch, file), { force: true });
+    }
+    const checkouts = f.deps.git.mock.calls.filter(([args]) => args[0] === 'checkout');
+    expect(checkouts).toHaveLength(2);
+    for (const [args, opts] of checkouts) {
+      expect(args).toEqual(['checkout', '--force', '-b', ref, `origin/${ref}`]);
+      expect(opts).toMatchObject({ cwd: scratch, timeout: 300_000 });
+    }
+    expect(f.deps.git.mock.calls.filter(([args]) => args[0] !== 'checkout')
+      .every(([, opts]) => opts.timeout === undefined)).toBe(true);
+    expect(f.deps.git.mock.calls.some(([args]) => gitCommand(args) === 'merge')).toBe(true);
+    expect(synced(f)).toHaveLength(1);
+    expect(alerts(f)).toEqual([]);
+    expect(fs.readFileSync(join(outside, 'keep.md'), 'utf8')).toBe('preserve outside scratch\n');
+    expect(fs.readFileSync(join(f.root, '.git', 'index'))).toEqual(rootIndex);
+    unchanged(f);
+  });
+
   it('kick retries transient fetch and skips quietly without suppressing the next tick', () => {
     const f = fixture(), git = f.deps.git, outcomes = [], backoff = vi.fn(), spawnFn = spawner();
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});

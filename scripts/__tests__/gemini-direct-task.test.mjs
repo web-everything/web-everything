@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative } from 'node:path';
 import { readAgyHold, saveAgyHold } from '../lib/antigravity-run-evidence.mjs';
 import {
   AGY_CLI, AGY_RESUME_PROMPT, AGY_EFFORT_UNSUPPORTED_MODELS, DEFAULT_TIMEOUT_MS, buildAgyDirectTaskArgv, buildAgyPrompt, buildAgyStdinLine,
@@ -292,6 +292,14 @@ describe('runGate — none/standards/full, never commits', () => {
 
 
 describe('buildAgyDirectTaskArgv — observed stdin route, no invented flags or defaults', () => {
+  it.each(['seat with spaces.schema.json', '{"type":"object"}'])('passes a schema string or path unchanged: %s', jsonSchema => {
+    const argv = buildAgyDirectTaskArgv({ jsonSchema });
+    expect(argv.slice(argv.indexOf('--json-schema'), argv.indexOf('--json-schema') + 2)).toEqual(['--json-schema', jsonSchema]);
+    expect(buildAgyDirectTaskArgv()).not.toContain('--json-schema');
+  });
+  it.each(['', ' ', null, 42])('rejects invalid schema value %j', jsonSchema => {
+    expect(() => buildAgyDirectTaskArgv({ jsonSchema })).toThrow(/jsonSchema/);
+  });
   const BASE = ['--input-format', 'stream-json', '--output-format', 'stream-json',
     '--disable-slash-commands', '--dangerously-skip-permissions'];
   it('has exactly the mandatory flags and explicit empty --print value', () => {
@@ -306,6 +314,12 @@ describe('buildAgyDirectTaskArgv — observed stdin route, no invented flags or 
   });
   it.each(['low', 'medium', 'high'])('forwards effort %s with no model pin', (effort) => {
     expect(buildAgyDirectTaskArgv({ effort })).toEqual([...BASE, '--effort', effort, '--print', '']);
+  });
+  it.each(['low', 'medium', 'high'])('omits --effort for the Argon %s model suffix', (suffix) => {
+    const model = `gemini-4-argon-${suffix}`;
+    expect(buildAgyDirectTaskArgv({ model: ` ${model} `, effort: 'medium' }))
+      .toEqual([...BASE, '--model', model, '--print', '']);
+    expect(() => buildAgyDirectTaskArgv({ model, effort: 'bogus' })).toThrow(TypeError);
   });
   it('names only the two known Claude backends as effort exceptions', () => {
     expect(AGY_EFFORT_UNSUPPORTED_MODELS).toEqual(['claude-sonnet-4-6', 'claude-opus-4-6-thinking']);
@@ -544,7 +558,7 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     expect(result.stderr).toBe(`agy quota exhausted: skip-quota-hold until ${quotaResetsAt} (held by google model gemini-3.1-pro)`);
   });
 
-  it('recovers the init UUID after SIGKILL and resumes once with a fresh budget and no task replay', async () => {
+  it('recovers the init UUID after SIGKILL and resumes once with a fresh budget, no task replay and no schema flag', async () => {
     vi.useFakeTimers();
     const dir = tempDir();
     const id = 'afa6b941-eb5d-4652-9471-4bae369c1cbd';
@@ -555,12 +569,15 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     const spawnFn = vi.fn().mockImplementationOnce(first.fn).mockImplementationOnce(second.fn);
     const execFn = fakeExec();
     const pending = geminiDirectTask({ dir, task: 'original task', stream: false, timeoutMs: 20,
-      model: 'chosen', effort: 'high', addDirs: ['/extra'], sandbox: true, gate: 'standards', execFn, spawnFn });
+      model: 'chosen', effort: 'high', jsonSchema: 'seat.schema.json', addDirs: ['/extra'], sandbox: true, gate: 'standards', execFn, spawnFn });
     await vi.advanceTimersByTimeAsync(20);
     expect(first.seen.child.kill).toHaveBeenCalledWith('SIGKILL');
     expect(spawnFn).toHaveBeenCalledTimes(1); // wait for close/output drain before starting the resume
     await vi.advanceTimersByTimeAsync(1);
     expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(first.seen.argv.slice(first.seen.argv.indexOf('--json-schema'), first.seen.argv.indexOf('--json-schema') + 2))
+      .toEqual(['--json-schema', 'seat.schema.json']);
+    expect(second.seen.argv).not.toContain('--json-schema');
     expect(second.seen.argv).toEqual(['--input-format', 'text', '--output-format', 'stream-json',
       '--disable-slash-commands', '--dangerously-skip-permissions', '--add-dir', '/extra',
       '--model', 'chosen', '--effort', 'high', '--sandbox', '--print-timeout', '0.02s',
@@ -713,7 +730,7 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     const logFile = join(dir, 'events.jsonl');
     const stdout = jsonl(REAL_EVENTS);
     const { fn, seen } = fakeSpawn(stdout, { chunks: [stdout.slice(0, 30), stdout.slice(30)] });
-    const opts = { model: 'future-model', effort: 'high', addDirs: ['/other'], sandbox: true, timeoutMs: 5010 };
+    const opts = { model: 'future-model', effort: 'high', jsonSchema: 'seat.schema.json', addDirs: ['/other'], sandbox: true, timeoutMs: 5010 };
     const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const result = await runAgyDirectExec({ dir, task: '/settings\nDo the thing', logFile, stream: false, spawnFn: fn, ...opts });
     expect(seen.cli).toBe(AGY_CLI);
@@ -815,6 +832,20 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
 });
 
 describe('CLI — flag parsing and truthful reports without a real process', () => {
+  it.each(['existing file', 'inline JSON', 'missing path'])('threads the %s schema from CLI through the task and print-mode spawn', async kind => {
+    const dir = tempDir();
+    const jsonSchema = kind === 'inline JSON' ? '{"type":"object"}'
+      : relative(process.cwd(), join(dir, 'seat with spaces.schema.json'));
+    if (kind === 'existing file') writeFileSync(resolve(jsonSchema), '{"type":"object"}');
+    const { fn: spawnFn, seen } = fakeSpawn(jsonl(REAL_EVENTS));
+    const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await main(['--task=review', `--dir=${dir}`, `--json-schema=${jsonSchema}`, '--json', '--review'], {
+      taskFn: opts => geminiDirectTask({ ...opts, execFn: fakeExec(), spawnFn }),
+    });
+    expect(seen.argv.slice(seen.argv.indexOf('--json-schema'), seen.argv.indexOf('--json-schema') + 2))
+      .toEqual(['--json-schema', kind === 'existing file' ? resolve(jsonSchema) : jsonSchema]);
+    expect(output).toHaveBeenCalledOnce();
+  });
   const report = {
     dir: '/d', scratch: { created: false }, startSha: 'abc', argv: [], logFile: '/d/.git/log', exitCode: 0, timedOut: false,
     events: summarizeAgyEvents(REAL_EVENTS), diff: { status: ' M file', diff: '+actual change', diffStat: '1 file', commits: [], hasChanges: true },
