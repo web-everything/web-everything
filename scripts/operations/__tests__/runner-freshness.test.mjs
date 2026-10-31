@@ -118,6 +118,7 @@ describe('runner freshness policy', () => {
         "review-prep",
         "review-seat-caps",
         "route-pr-outcome",
+        "routing-override",
         "runner-activity",
         "scaffold",
         "sessions",
@@ -130,7 +131,7 @@ describe('runner freshness policy', () => {
         "why",
       ]
     `);
-    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load']) {
+    for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load', 'routing-override']) {
       expect(isReadOnlyOperation(resolveOperation(name).declaration), name).toBe(false);
     }
     for (const name of names) {

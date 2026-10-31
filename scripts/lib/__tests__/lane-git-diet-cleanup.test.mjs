@@ -435,6 +435,14 @@ describe('real git: cleanup CLI', () => {
     visit('');
     return files;
   };
+  // Exact byte comparison per file (Buffer.equals); vitest's toEqual on large Buffers cost ~2.5s per compare.
+  const expectSameSnapshot = (actual, expected) => {
+    expect(Object.keys(actual)).toEqual(Object.keys(expected));
+    for (const [rel, want] of Object.entries(expected)) {
+      if (Buffer.isBuffer(want)) expect(Buffer.isBuffer(actual[rel]) && actual[rel].equals(want), `bytes of ${rel}`).toBe(true);
+      else expect(actual[rel], rel).toEqual(want);
+    }
+  };
   const hasOpsRef = (dir) => existsSync(join(dir, '.git', 'refs', 'remotes', 'origin', 'ops', 'review-requests'))
     || readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').includes('refs/remotes/origin/ops/review-requests');
   const hook = (dir, ran) => git(dir, 'config', 'gc.recentObjectsHook', `touch '${ran}'`);
@@ -497,8 +505,8 @@ describe('real git: cleanup CLI', () => {
       for (const mode of [[], ['--prune-expire=now', '--apply']]) {
         const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--lanes=15', '--json', ...mode], { env, encoding: 'utf8' }));
         expect(out.rows[0].skipped).toMatch(reason);
-        expect(snapshot(dir)).toEqual(laneBefore);
-        expect(snapshot(other)).toEqual(otherBefore);
+        expectSameSnapshot(snapshot(dir), laneBefore);
+        expectSameSnapshot(snapshot(other), otherBefore);
         expect(existsSync(ran)).toBe(false);
         expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
       }
@@ -578,7 +586,7 @@ describe('real git: cleanup CLI', () => {
       expect(readFileSync(join(dir, '.git', 'config'), 'utf8')).not.toContain(LANE_OPS_NEGATIVE_FETCH);
       expect(hasOpsRef(dir)).toBe(true);
       expect(existsSync(ran)).toBe(false);
-      expect(snapshot(other)).toEqual(otherBefore);
+      expectSameSnapshot(snapshot(other), otherBefore);
       expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
     } finally {
       for (const path of [dir, other, ran]) rmSync(path, { recursive: true, force: true });
@@ -932,7 +940,7 @@ describe('real git: cleanup CLI', () => {
       expect(out.rows[0]).toMatchObject({ lane: 10, mode: 'apply' });
       expect(git(dir, 'config', '--get-all', 'remote.origin.fetch').split('\n')).toEqual([LANE_DEFAULT_FETCH, LANE_OPS_NEGATIVE_FETCH]);
       expect(git(dir, 'cat-file', '-p', 'HEAD:a.txt')).toBe('a');
-      expect(snapshot(decoy)).toEqual(decoyBefore);
+      expectSameSnapshot(snapshot(decoy), decoyBefore);
     } finally {
       for (const path of [dir, decoy, ...files]) rmSync(path, { recursive: true, force: true });
     }
