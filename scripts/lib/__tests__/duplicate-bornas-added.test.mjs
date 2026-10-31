@@ -42,7 +42,7 @@ describe('open-pr runner surfaces the warning', () => {
     process.stderr.write = (c) => { chunks.push(String(c)); return true; };
     let spawned = false;
     try {
-      createPrLandRunner({
+      createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '',
         prePrReview: () => ({ action: 'pass' }),
         dupBornAs: () => ['backlog/xa.md adds bornAs xa, dup'],
         spawn: () => { spawned = true; return { status: 0, stdout: '{"pr":1}' }; },

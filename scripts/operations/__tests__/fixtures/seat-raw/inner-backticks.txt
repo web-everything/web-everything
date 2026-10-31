@@ -1,0 +1,4 @@
+I checked the finite-input claim.
+```json
+{"lenses": {"red-team": {"verdict": "changes", "findings": [{"summary": "avg overflows for finite inputs", "category": "failing-input", "file": "src/avg.mjs", "line": 3, "impactIfUnfixed": "broken", "failure_scenario": "The input string contains ```json and ```; escaped quotes \" and a backslash \\ must survive, as must braces { }."}]}}}
+```

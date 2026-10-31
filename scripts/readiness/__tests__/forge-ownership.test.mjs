@@ -41,7 +41,12 @@ it.each(['work','container'])('prepare refuses a replaced %s endpoint without to
   const victim=join(root,'unrelated');await fs.mkdir(victim,{mode:0o700});
   await fs.writeFile(join(victim,'keep'),'unchanged');
   const before=await fs.stat(victim);let calls=0;
+  const worker={uid:process.getuid()+1,gid:process.getgid()+1};
   const runner=runnerAPI.createRunner({testRoot:root,
+    testWorkerIdentity:()=>({...worker,groups:[worker.gid]}),
+    // Model the private slot group on unprivileged hosts; retain real modes,
+    // inodes and the descriptor-based handoff that must reject the symlink.
+    testSlotStat:async path=>Object.assign(await fs.lstat(path),{gid:worker.gid}),
     testOwnershipExec:async call=>{
       calls++;
       const cfg=JSON.parse(call.args.at(-1)),path=join(cfg.root,...cfg.parts.slice(0,target==='container'?-1:undefined));
@@ -65,6 +70,56 @@ it.each(['symlink','hardlink','deep tree'])('descriptor handoff rejects an unsaf
   expect(result.code).not.toBe(0);expect(result.stderr).toContain('use local fallback');
   expect(await fs.readFile(victim,'utf8')).toBe('keep');
 });
+
+it.each(['allowed work','flag absent','worker git','symlink git','worker slot','worker run','non-work parent','work at wrong depth'])(
+  'workerParent handoff permits only the immediate work ancestor: %s',async fault=>{
+    const parts=fault==='work at wrong depth'?['slot-1','work','run','.git']:
+      ['slot-1','run',fault==='non-work parent'?'other':'work','.git'];
+    const target=join(root,'runs',...parts),leaf=join(target,'config');
+    await fs.mkdir(target,{recursive:true});await fs.writeFile(leaf,'trusted metadata');
+    const worker={uid:process.getuid()+10000,gid:process.getgid()+10000};
+    const workerPaths=[fault==='work at wrong depth'?join(root,'runs','slot-1','work'):
+      join(root,'runs',...parts.slice(0,-1))];
+    if(fault==='worker git')workerPaths.push(target);
+    if(fault==='worker slot')workerPaths.push(join(root,'runs','slot-1'));
+    if(fault==='worker run')workerPaths.push(join(root,'runs','slot-1','run'));
+    if(fault==='symlink git'){
+      await fs.rename(target,target+'.saved');await fs.symlink(target+'.saved',target);
+    }
+    // Model distinct ownership on unprivileged hosts while exercising the real
+    // Python traversal, descriptors, inode checks and symlink refusal.
+    const preamble=`import os, json
+worker_paths = json.loads(${JSON.stringify(JSON.stringify(workerPaths))})
+worker_inodes = {(os.stat(p).st_dev, os.stat(p).st_ino) for p in worker_paths}
+real_fstat = os.fstat
+transferred = []
+def modeled_fstat(fd):
+    st = real_fstat(fd)
+    if (st.st_dev, st.st_ino) in worker_inodes:
+        fields = list(st)
+        fields[4] = ${worker.uid}
+        return os.stat_result(fields)
+    return st
+def recorded_chown(fd, uid, gid):
+    assert (uid, gid) == (${worker.uid}, ${worker.gid})
+    transferred.append(real_fstat(fd).st_ino)
+os.fstat = modeled_fstat
+os.fchown = recorded_chown
+`;
+    const expected=[(await fs.stat(leaf)).ino,(await fs.stat(target)).ino];
+    const source=preamble+'try:\n'+runnerAPI.ownershipSource.split('\n').map(line=>'    '+line).join('\n')+
+      '\nfinally:\n    print(json.dumps(transferred))\n';
+    const cfg={root:join(root,'runs'),parts,operator:{uid:process.getuid(),gid:process.getgid()},worker,
+      recursive:true,workerParent:fault!=='flag absent'};
+    const result=execute({args:['-I','-c',source,JSON.stringify(cfg)]});
+    if(fault==='allowed work'){
+      expect(result.code,result.stderr).toBe(0);expect(JSON.parse(result.stdout)).toEqual(expected);
+    }else{
+      expect(result.code,result.stderr).not.toBe(0);expect(result.stderr).toContain('Unsafe ownership handoff');
+      expect(JSON.parse(result.stdout)).toEqual([]);
+    }
+    expect(await fs.readFile(leaf,'utf8')).toBe('trusted metadata');
+  });
 
 it('hands over a regular nested tree using verified descriptors in child-before-parent order',async()=>{
   const work=join(root,'runs','slot-1','work');await fs.mkdir(join(work,'nested'),{recursive:true});
@@ -117,7 +172,10 @@ await fs.chown(join(root,'runs','slot-1'),0,gid);
 await fs.mkdir(join(root,'runs','slot-2'),{mode:0o710});
 await fs.chown(join(root,'runs','slot-2'),0,65534);
 const victim=join(root,'runs','slot-2'),before=await fs.stat(victim);let attempted=0;
-const runner=createRunner({testRoot:root,testWorkerIdentity:user=>({uid:user.endsWith('-1')?uid:65534,gid:user.endsWith('-1')?gid:65534}),
+const runner=createRunner({testRoot:root,testWorkerIdentity:user=>{
+  const worker=user.endsWith('-1')?{uid,gid}:{uid:65534,gid:65534};
+  return {...worker,groups:[worker.gid]};
+},
   testOwnershipExec:async call=>{
     const cfg=JSON.parse(call.args.at(-1)),run=cfg.parts[1];
     const actor=spawnSync('python3',['-I','-c',

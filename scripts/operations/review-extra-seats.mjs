@@ -8,7 +8,7 @@ import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
-import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
+import { PROVIDER_CAP_ENV, resolveProviderCap, resolveRoutingProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
 import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '../lib/provider-quota-hold.mjs';
 /**
@@ -56,18 +56,19 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
-  writeFileSync,
+  chmodSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
+  readdirSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS } from './review-dispatch.mjs';
+import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from './review-dispatch.mjs';
 import {
   REVIEW_SEAT_DISPATCH_KIND, REVIEW_SEAT_PROVIDERS, reviewSeatTaskType, selectReviewSeatProvider,
 } from '../lib/provider-routing.mjs';
@@ -101,6 +102,9 @@ export const CAP_TIMEZONE = 'America/New_York';
 
 const MAX_FINDINGS_PER_SEAT = 12;
 const MAX_TEXT = 600;
+const MAX_ANSWER_SCAN_CHARS = 256 * 1024;
+const MAX_RAW_ANSWER_BYTES = 64 * 1024;
+const RAW_ANSWER_CUT = '\n[truncated at 64 KB; remaining evidence requires a new seat call or manual review]\n';
 const QUOTA_RE = /\b(rate[ -]?limit|usage limit|quota|insufficient[_ ]quota|resource[_ ]exhausted|too many requests|429)\b/i;
 
 // ── PURE ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -291,6 +295,12 @@ const capText = (text, max) => {
   return s.length <= max ? s : `${s.slice(0, max)}\n… [truncated: ${s.length - max} more characters not shown]`;
 };
 
+export const SEAT_ANSWER_CONTRACT = [
+  'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
+  'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
+  'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
+].join('\n');
+
 /**
  * The review brief one provider's call receives, covering every seat routed to it. PURE. With `inline`, the brief
  * carries the diff and PR description in its own text and points at no file (a tool-free seat); otherwise it
@@ -332,28 +342,107 @@ export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline
     `Rate each finding's impactIfUnfixed as one of ${Object.values(IMPACT_LEVELS).join(' | ')}.`,
     'If a seat finds nothing, give it verdict "accept" and an empty findings list.',
     '',
-    'END your final message with exactly ONE fenced ```json block holding this object and nothing else after it:',
+    SEAT_ANSWER_CONTRACT,
     JSON.stringify({ lenses: example }),
-    'where each findings entry is {"summary": string, "file": (repo-relative path, e.g. "scripts/x.mjs")|null, "line": number|null, "impactIfUnfixed": string, "failure_scenario": string|null}',
+    'where each findings entry is {"summary": string, "category": string|null, "file": (repo-relative path, e.g. "scripts/x.mjs")|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string|null}',
+    'Every finding must include all six fields above; summary and impactIfUnfixed must be non-empty strings. Include only the requested seat keys under lenses.',
+    keys.includes(RED_TEAM_SEAT.key) ? 'For the red-team seat, category and failure_scenario must be strings, never null.' : null,
     'and verdict is "accept" or "changes".',
   ].filter((l) => l !== null).join('\n');
 }
 
-/** Pull the LAST parseable JSON object carrying `lenses` out of an agent's final message. PURE. */
+/**
+ * Return the last complete root JSON object whose sole key is `lenses` (an object). PURE.
+ * Require a prefix with balanced braces/brackets that does not end in a comma, opening bracket,
+ * or JSON key colon. After the object allow only whitespace, or one closing fence plus whitespace
+ * when the object occupies a single fenced block. Return null for all other or incomplete input,
+ * including oversized text, a later truncated `lenses` answer or exhausted scan budget.
+ */
 export function extractAnswerJson(text) {
   const s = String(text ?? '');
-  const fenced = [...s.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]);
-  const candidates = [...fenced.reverse()];
-  // Unfenced: the object may be spaced or pretty-printed, so match `{ "lenses"` with any whitespace, last first.
-  const starts = [...s.matchAll(/\{\s*"lenses"\s*:/g)].map((m) => m.index).reverse();
-  for (const i of starts) candidates.push(s.slice(i));
-  for (const c of candidates) {
+  // Bound the quoted-key pre-scan too; rejected text is preserved at 64 KB for
+  // a new seat call or manual review by the caller's existing evidence path.
+  if (s.length > MAX_ANSWER_SCAN_CHARS) return null;
+  let lastAnswerKey = -1;
+  // Consume each string and its following whitespace once, including non-key
+  // strings: retrying at escaped quotes can make a regex pre-scan quadratic.
+  for (let cursor = 0; cursor < s.length;) {
+    if (s[cursor] !== '"') { cursor += 1; continue; }
+    const start = cursor++;
+    while (cursor < s.length && s[cursor] !== '"') {
+      cursor += s[cursor] === '\\' ? 2 : 1;
+    }
+    if (cursor >= s.length) break;
+    const end = ++cursor;
+    while (cursor < s.length && /\s/.test(s[cursor])) cursor += 1;
+    if (s[cursor] !== ':') continue;
     try {
-      const obj = JSON.parse(c.trim());
-      if (obj && typeof obj === 'object' && obj.lenses && typeof obj.lenses === 'object') return obj;
-    } catch { /* try the next */ }
+      if (JSON.parse(s.slice(start, end)) === 'lenses') lastAnswerKey = start;
+    } catch { /* An invalid quoted key is not an answer-key token. */ }
   }
-  return null;
+  let last = null;
+  // Malformed candidates can overlap. Bound their combined scan work so unmatched
+  // braces cannot cause quadratic rescanning. Exhaustion stays unparseable; the
+  // caller preserves raw evidence for a new seat call or manual review.
+  let scanBudget = s.length * 4;
+  for (let start = 0; start < s.length; start += 1) {
+    if (s[start] !== '{') continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = start;
+    for (; end < s.length; end += 1) {
+      if (scanBudget-- === 0) return null;
+      const c = s[end];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') inString = false;
+      } else if (c === '"') inString = true;
+      else if (c === '{') depth += 1;
+      else if (c === '}' && --depth === 0) break;
+    }
+    // An unterminated string can contain fake answer objects; never rescan its contents.
+    if (inString) return null;
+    if (depth !== 0) continue;
+    try {
+      const obj = JSON.parse(s.slice(start, end + 1));
+      if (isObject(obj?.lenses)) last = { obj, start, end };
+    } catch { /* A balanced span need not be valid JSON. */ }
+    // Consume the whole balanced span, including any braces inside strings or nested objects.
+    start = end;
+  }
+  if (!last || lastAnswerKey < last.start || lastAnswerKey > last.end) return null;
+  const preceding = s.slice(0, last.start);
+  // Count prose and string braces/brackets too: an unfinished wrapper must fail closed.
+  if ((preceding.match(/{/g)?.length ?? 0) !== (preceding.match(/}/g)?.length ?? 0)) return null;
+  if ((preceding.match(/\[/g)?.length ?? 0) !== (preceding.match(/\]/g)?.length ?? 0)) return null;
+  // A recoverable inner object is not a top-level answer when its outer structure is unfinished.
+  const head = preceding.trimEnd().replace(/```[^\S\r\n]*[a-z]*$/i, '').trimEnd();
+  if (/(?:"\s*:|[,\[])$/.test(head)) return null;
+  if (Object.keys(last.obj).length !== 1) return null;
+  const insideFence = (preceding.match(/```/g)?.length ?? 0) % 2 === 1;
+  const remainder = s.slice(last.end + 1).trim();
+  if (!insideFence) return remainder === '' ? last.obj : null;
+  // Only whitespace may separate the opening fence line from the answer span.
+  if (!/^```[^\r\n]*[\r\n]\s*$/.test(preceding.slice(preceding.lastIndexOf('```')))) return null;
+  return remainder === '```' ? last.obj : null;
+}
+
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/** The strict structured-output dialect: every property required, optional values nullable. PURE. */
+export function seatAnswerJsonSchema(seatKeys) {
+  const object = (properties) => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
+  const finding = (key) => object({
+    summary: { type: 'string', minLength: 1, pattern: '\\S' },
+    category: { type: key === RED_TEAM_SEAT.key ? 'string' : ['string', 'null'] }, file: { type: ['string', 'null'] },
+    line: { type: ['integer', 'null'] }, impactIfUnfixed: { type: 'string', minLength: 1, pattern: '\\S' },
+    failure_scenario: { type: key === RED_TEAM_SEAT.key ? 'string' : ['string', 'null'] },
+  });
+  return object({ lenses: object(Object.fromEntries(seatKeys.map((key) => [key, object({
+    verdict: { type: 'string', enum: ['accept', 'changes'] }, findings: { type: 'array', items: finding(key) },
+  })]))) });
 }
 
 /**
@@ -364,12 +453,27 @@ export function extractAnswerJson(text) {
 export function parseSeatAnswer(text, seats) {
   const obj = extractAnswerJson(text);
   const out = {};
+  const findingKeys = new Set(['summary', 'category', 'file', 'line', 'impactIfUnfixed', 'failure_scenario']);
+  const seatKeys = new Set(seats.flatMap((s) => [s.key, s.lens]).filter((key) => typeof key === 'string'));
+  const unexpectedLens = obj && Object.keys(obj.lenses).some((key) => !seatKeys.has(key));
   for (const s of seats) {
     const entry = obj?.lenses?.[s.key] ?? obj?.lenses?.[s.lens];
-    if (!entry || typeof entry !== 'object') { out[s.key] = { ok: false, verdict: null, findings: [] }; continue; }
-    const findings = (Array.isArray(entry.findings) ? entry.findings : []).map(normalizeFinding).filter(Boolean).slice(0, MAX_FINDINGS_PER_SEAT);
-    const verdict = entry.verdict === 'changes' || entry.verdict === 'accept' ? entry.verdict : (findings.length ? 'changes' : 'accept');
-    out[s.key] = { ok: true, verdict, findings };
+    if (unexpectedLens || !isObject(entry) || Object.keys(entry).length !== 2
+      || !['accept', 'changes'].includes(entry.verdict) || !Array.isArray(entry.findings)) {
+      out[s.key] = { ok: false, verdict: null, findings: [] }; continue;
+    }
+    const findings = entry.findings.map((finding) => isObject(finding)
+      && Object.keys(finding).every((key) => findingKeys.has(key))
+      && [...findingKeys].every((key) => Object.hasOwn(finding, key))
+      && typeof finding.summary === 'string' && finding.summary.trim().length > 0
+      && typeof finding.impactIfUnfixed === 'string' && finding.impactIfUnfixed.trim().length > 0
+      && ['category', 'file', 'failure_scenario'].every((key) => finding[key] === null || typeof finding[key] === 'string')
+      && (s.key !== RED_TEAM_SEAT.key || (typeof finding.category === 'string' && typeof finding.failure_scenario === 'string'))
+      && (finding.line === null || Number.isInteger(finding.line)) ? normalizeFinding(finding) : null);
+    if (findings.some((finding) => finding === null)) {
+      out[s.key] = { ok: false, verdict: null, findings: [] }; continue;
+    }
+    out[s.key] = { ok: true, verdict: entry.verdict, findings: findings.slice(0, MAX_FINDINGS_PER_SEAT) };
   }
   return out;
 }
@@ -395,17 +499,34 @@ export function classifySeatCall(provider, run) {
   if (!run) return { status: 'error', text: '', error: 'no result' };
   const report = run.report ?? null;
   const text = provider === 'codex' ? (report?.lastMessage ?? '') : (report?.events?.finalResponse ?? '');
-  const errText = [run.error, run.stderr, report?.events?.errorMessage, provider === 'codex' && report?.exitCode ? text : '']
+  const errText = [run.error, run.stderr, report?.events?.errorMessage]
     .filter(Boolean).join(' ').slice(0, 2000);
+  // Final-message quota evidence may classify the call, but must never become a scorecard's error text.
+  const quotaText = `${errText} ${provider === 'codex' && report?.exitCode ? text : ''}`;
   if (report?.quotaState === 'exhausted') return { status: 'quota-exhausted', text, error: errText || report.fallbackDecision };
   if (['skip-backend-mismatch', 'skip-model-mismatch'].includes(report?.fallbackDecision)) return { status: 'error', text, error: 'agy model/backend mismatch; verdict skipped' };
   if (run.timedOut || report?.timedOut) return { status: 'timeout', text, error: 'seat call hit its wall' };
-  if (QUOTA_RE.test(errText) && !extractAnswerJson(text)) return { status: 'quota-exhausted', text, error: errText.slice(0, MAX_TEXT) };
+  if (QUOTA_RE.test(quotaText) && !extractAnswerJson(text)) return { status: 'quota-exhausted', text, error: (errText || 'provider reported quota exhaustion').slice(0, MAX_TEXT) };
   if (!report) return { status: 'error', text, error: (errText || `exit ${run.exitCode}`).slice(0, MAX_TEXT) };
   if (!extractAnswerJson(text)) {
     return { status: String(text).trim() ? 'unparseable' : 'error', text, error: (errText || 'no JSON answer in the final message').slice(0, MAX_TEXT) };
   }
   return { status: 'ok', text, error: null };
+}
+
+/** Preserve failed-call evidence before scratch cleanup; raw text never enters a scorecard or publication. */
+export function preserveSeatRawAnswer({ callId, call, parsed, seats }, io) {
+  if (!String(call.text ?? '').trim() || (call.status === 'ok' && seats.every(s => parsed?.[s.key]?.ok))) return;
+  const bytes = Buffer.from(call.text, 'utf8');
+  const text = bytes.length <= MAX_RAW_ANSWER_BYTES ? call.text
+    : bytes.subarray(0, MAX_RAW_ANSWER_BYTES - Buffer.byteLength(RAW_ANSWER_CUT)).toString('utf8').replace(/\uFFFD$/, '') + RAW_ANSWER_CUT;
+  try {
+    call.rawAnswerPath = io.writeRawAnswer({ callId, text });
+    if (!call.rawAnswerPath) throw new Error('missing raw answer path');
+  } catch {
+    call.rawAnswerError = 'Raw answer could not be saved; retry the seat call or review manually.';
+    io.log(call.rawAnswerError);
+  }
 }
 
 /** Codex reports `resets_at` as epoch SECONDS (seen live: 1790430415); store an ISO instant either way. PURE. */
@@ -458,6 +579,8 @@ export function buildSeatRows({
       pr, repo,
       seat: s.seat, lens: s.lens, taskType: reviewSeatTaskType(s.key),
       callId, status, startedAt, finishedAt,
+      ...(call.rawAnswerPath ? { rawAnswerPath: call.rawAnswerPath } : {}),
+      ...(call.rawAnswerError ? { rawAnswerError: call.rawAnswerError } : {}),
       seatVerdict: status === 'ok' ? seatParse.verdict : null,
       claudeVerdict,
       findingsCount: findings.length,
@@ -523,11 +646,18 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`added seats: could not read the scorecard store (${e.message}) — treating it as empty`); }
-    // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveProviderCap`/
+    // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveRoutingProviderCap`/
     // `callsUsedTodayForProvider`): a provider at its own cap is treated exactly like a quota hold or a missing
     // CLI — excluded from `available` — so `reviewSeatRoutes` naturally falls the seat back to whichever OTHER
     // provider still has budget, never to "no seat" while at least one provider does.
-    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
+    const seatCaps = Object.fromEntries([`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]
+      .map(task => [task, Object.fromEntries(REVIEW_SEAT_PROVIDERS.map(p => [p, resolveRoutingProviderCap(p, env,
+        routingPolicy.operations[`review-seat:${task}`] ?? routingPolicy.operations['review-seat'])]))]));
+    // Reservations share a provider ledger, but eligibility is checked against EACH seat's own cap.
+    // An enable on one seat must never make that provider available to another seat.
+    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p,
+      Math.max(...Object.values(seatCaps).map(byProvider => byProvider[p])),
+    ]));
     const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     let available = [];
     const unavailable = [];
@@ -549,7 +679,8 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     }
     for (const u of unavailable) io.log(`added seats: skipping ${u.provider} — ${u.reason}`);
     const remainingCalls = (list) => list.reduce((sum, p) => sum + Math.max(0, caps[p] - usedByProvider[p]), 0);
-    let plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+    const providerAvailable = (provider, seatKey) => usedByProvider[provider] < seatCaps[seatKey][provider];
+    let plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
 
     // RESERVE each distinct provider's ONE call under ITS OWN cap, before launching anything, so concurrent
     // reviews can never together overspend any one provider's budget. A provider that cannot be granted (another
@@ -577,7 +708,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         if (reservation.callIds.length === reservation.models.length) { callIdOf.set(p, new Map(reservation.models.map((model, index) => [model, reservation.callIds[index]]))); } else { anyDenied = true; available = available.filter((x) => x !== p); }
       }
       if (!anyDenied) break;
-      plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+      plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
     }
     const providerUsage = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, { usedToday: usedByProvider[p] + (callIdOf.get(p)?.size ?? 0), cap: caps[p] }]));
     const totalUsedToday = Object.values(providerUsage).reduce((sum, u) => sum + u.usedToday, 0);
@@ -620,17 +751,20 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         io.writeFile(taskFile, buildSeatTask({
           pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], seats: group, openOperatorSendBacks: read.openOperatorSendBacks,
         }));
+        const schemaFile = `${taskFile}.schema.json`;
+        io.writeFile(schemaFile, JSON.stringify(seatAnswerJsonSchema(group.map(s => s.key))));
         const { model, effort } = group[0];
         const t0 = io.now();
         let run;
         try {
-          run = await io.runSeat({ provider, taskFile, dir: scratch, model, effort, timeoutMs });
+          run = await io.runSeat({ provider, taskFile, schemaFile, dir: scratch, model, effort, timeoutMs });
         } catch (e) {
           run = { report: null, error: String(e?.message ?? e) };
         }
         const finishedAt = new Date(io.now()).toISOString();
         const call = classifySeatCall(provider, run);
         const parsed = call.status === 'ok' ? repoRelativeFindings(parseSeatAnswer(call.text, group), scratch) : {};
+        preserveSeatRawAnswer({ callId, call, parsed, seats: group }, io);
         const quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
         const rows = buildSeatRows({
           evidence: run?.report ?? {},
@@ -669,16 +803,18 @@ export function parseDirectTaskJson(stdout) {
 }
 
 /** argv (after `node`) for one seat call through the existing direct-task CLI. PURE. */
-export function seatCallArgv({ provider, taskFile, dir, model, effort, timeoutMs, root = REPO_ROOT }) {
+export function seatCallArgv({ provider, taskFile, schemaFile, dir, model, effort, timeoutMs, root = REPO_ROOT }) {
   if (provider === 'codex') {
     return [join(root, 'scripts', 'codex-direct-task.mjs'), `--task-file=${taskFile}`, `--dir=${dir}`, '--review', '--json',
-      '--no-stream', `--model=${model}`, `--effort=${effort}`, `--timeout-ms=${timeoutMs}`, '--clear-rollout-after-run'];
+      '--no-stream', `--model=${model}`, `--effort=${effort}`, `--timeout-ms=${timeoutMs}`, '--clear-rollout-after-run',
+      ...(schemaFile ? [`--output-schema-file=${schemaFile}`] : [])];
   }
   if (provider === 'agy-claude' || provider === 'agy-gemini') {
     // The script may resume ONCE after a timeout, each attempt with the full budget — so half each. Both
     // antigravity backends run through this SAME script (a generic `agy` passthrough); only `model` differs.
     return [join(root, 'scripts', 'gemini-direct-task.mjs'), `--task-file=${taskFile}`, `--dir=${dir}`, '--review', '--json',
-      `--model=${model}`, `--effort=${effort}`, `--timeout-ms=${Math.floor(timeoutMs / 2)}`];
+      `--model=${model}`, `--effort=${effort}`, `--timeout-ms=${Math.floor(timeoutMs / 2)}`,
+      ...(schemaFile ? [`--json-schema=${schemaFile}`] : [])];
   }
   throw new Error(`review-extra-seats: no seat CLI for provider ${JSON.stringify(provider)}`);
 }
@@ -868,6 +1004,25 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     log: (line) => process.stderr.write(`[${new Date().toISOString()}] ${line}\n`),
     readRecords: () => readStore(storeIo).records,
     append: (row) => appendScorecard(row, storeIo),
+    writeRawAnswer: ({ callId, text }) => {
+      const relative = `seat-raw/${String(callId).replace(/[^A-Za-z0-9._-]/g, '_')}.txt`;
+      const path = join(stateDir, relative);
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      chmodSync(dirname(path), 0o700);
+      writeFileSync(path, text, { mode: 0o600 });
+      chmodSync(path, 0o600);
+      try {
+        const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+        for (const entry of readdirSync(dirname(path), { withFileTypes: true })) {
+          if (!entry.isFile()) continue;
+          try {
+            const candidate = join(dirname(path), entry.name);
+            if (statSync(candidate).mtimeMs < cutoff) unlinkSync(candidate);
+          } catch { /* Retention cleanup must never prevent saving new evidence. */ }
+        }
+      } catch { /* Best-effort retention; the new evidence is already saved. */ }
+      return relative;
+    },
     // Read → reserve → write under a FAIL-CLOSED lock: a lock not taken in time THROWS, and so does an unreadable
     // ledger (rather than being overwritten, which would forget today's outstanding reservations). Either way the
     // run launches nothing.
@@ -916,12 +1071,12 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     },
     removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
-    runSeat: ({ provider, taskFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
+    runSeat: ({ provider, taskFile, schemaFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
       if (stoppingSeats || terminatingSeats) {
         resolvePromise({ report: null, error: 'review seats are stopping', timedOut: false });
         return;
       }
-      const argv = seatCallArgv({ provider, taskFile, dir, model, effort, timeoutMs, root });
+      const argv = seatCallArgv({ provider, taskFile, schemaFile, dir, model, effort, timeoutMs, root });
       let out = '';
       let err = '';
       let timedOut = false;
@@ -1093,9 +1248,10 @@ export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inl
     `Set "category" to one of ${RED_TEAM_CATEGORIES.join(' | ')}, and rate impactIfUnfixed as one of ${Object.values(IMPACT_LEVELS).join(' | ')}.`,
     'If the change holds up, answer verdict "accept" with an empty findings list — an empty list is a real answer, never a failure.',
     '',
-    'END your final message with exactly ONE fenced ```json block holding this object and nothing else after it:',
+    SEAT_ANSWER_CONTRACT,
     JSON.stringify(example),
-    'where each findings entry is {"summary": string, "category": string, "file": (repo-relative path)|null, "line": number|null, "impactIfUnfixed": string, "failure_scenario": string}',
+    'where each findings entry is {"summary": string, "category": string, "file": (repo-relative path)|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string}',
+    'Every finding must include all six fields above; summary and impactIfUnfixed must be non-empty strings. category and failure_scenario must be strings, never null. Include only the requested seat keys under lenses.',
     'and verdict is "accept" (it holds) or "changes" (you broke it).',
   ].filter((l) => l !== null && l !== undefined).join('\n');
 }
@@ -1540,9 +1696,12 @@ export async function speculateRedTeam({
     let available = [];
     const unavailable = [];
     let deferredByCap = false;
-    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
-    const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
-    for (const p of REVIEW_SEAT_PROVIDERS) {
+    const routingPolicy = (io.readRoutingPolicy ?? readRoutingPolicy)();
+    const routingEntry = routingPolicy.operations['review-seat:red-team'];
+    const providers = rosterForKey('review-seat:red-team');
+    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
+    for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) {
@@ -1561,8 +1720,8 @@ export async function speculateRedTeam({
     let callId = null;
     let lastReason = null;
     let configuredRoute = null;
-    for (let attempt = 0; attempt <= REVIEW_SEAT_PROVIDERS.length && available.length && !callId; attempt += 1) {
-      try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available }); }
+    for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
       catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
@@ -1616,16 +1775,19 @@ export async function speculateRedTeam({
       io.writeFile(taskFile, buildRedTeamTask({
         pr, repo, title: read.title, dir: scratch, diffFile, bodyFile, inline, changedFiles: read.netChangedFiles ?? [], claudeFindings, openOperatorSendBacks: read.openOperatorSendBacks,
       }));
+      const schemaFile = `${taskFile}.schema.json`;
+      io.writeFile(schemaFile, JSON.stringify(seatAnswerJsonSchema([RED_TEAM_SEAT.key])));
       const t0 = io.now();
       startedAt = new Date(t0).toISOString();
       const observe = (values) => { try { onTiming({ callId, provider, model, effort, rev, startedAt, ...values }); } catch { /* timing never changes review results */ } };
       observe({ finishedAt: null });
       let run;
-      try { run = await io.runSeat({ provider, taskFile, dir: scratch, model, effort, timeoutMs }); } catch (e) { run = { report: null, error: String(e?.message ?? e) }; }
+      try { run = await io.runSeat({ provider, taskFile, schemaFile, dir: scratch, model, effort, timeoutMs }); } catch (e) { run = { report: null, error: String(e?.message ?? e) }; }
       finishedAt = new Date(io.now()).toISOString();
       durationMs = Date.parse(finishedAt) - t0;
       call = classifySeatCall(provider, run);
       if (call.status === 'ok') parsed = repoRelativeFindings(parseSeatAnswer(call.text, [RED_TEAM_SEAT]), scratch);
+      preserveSeatRawAnswer({ callId, call, parsed, seats: [RED_TEAM_SEAT] }, io);
       observe({ finishedAt, verdict: parsed[RED_TEAM_SEAT.key]?.verdict ?? null,
         findingsCount: parsed[RED_TEAM_SEAT.key]?.findings?.length ?? null });
       evidence = run?.report ?? {};
@@ -1654,6 +1816,7 @@ export async function speculateRedTeam({
     return {
       status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(read), title: read.title ?? '', body: read.body ?? '',
       changedFiles: read.netChangedFiles ?? null, provider, model, effort, callId, call, parsed, evidence, quota, durationMs, startedAt, finishedAt,
+      ...(call.rawAnswerPath ? { rawAnswerPath: call.rawAnswerPath } : {}),
       headMessage, findings, recheckStatus, callsUsedToday: usedByProvider[provider] + 1, dailyCap: caps[provider],
     };
   } catch (e) {
@@ -1664,7 +1827,8 @@ export async function speculateRedTeam({
 /**
  * THE SECOND HALF — given a `speculated` pass and the FINISHED review, write the seat row (corroborated against
  * Claude's own findings now that they exist), fold the verdict and run the effects. Identical to the tail of the
- * pre-split `runRedTeam`. Never throws.
+ * pre-split `runRedTeam`. A non-ok seat returns/stores `failed` with its reason, retaining the evidence row
+ * for quota/cap accounting; only a clean execution claims `ran` or publishes effects. Never throws.
  */
 export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true, record = true } = {}, io = createRedTeamIo()) {
   try {
@@ -1684,6 +1848,8 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       changedFiles: pass.changedFiles ?? null,
     });
     const ran = seatRow.status === 'ok';
+    const status = ran ? 'ran' : 'failed';
+    const reason = ran ? null : (seatRow.reason || seatRow.error || `red-team seat ${seatRow.status}`);
     const confirmed = findings.filter((f) => f.confirmedByRecheck);
     const foldedVerdict = foldRedTeamVerdict({ ran, findings: confirmed.map((f) => ({ summary: f.summary, file: f.file })) });
     const builder = resolveBuilder({ body: pass.body, headMessage: pass.headMessage ?? '' });
@@ -1715,11 +1881,12 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     }
 
     if (record && post) {
-      try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: 'ran' }); }
+      try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: status }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
     }
     return {
-      status: 'ran', provider, model, effort, callId, rev, seat: row, findings, recheckStatus, confirmedMissCount: confirmed.length,
+      status, ...(!ran ? { reason } : {}), provider, model, effort, callId, rev, seat: row, findings, recheckStatus, confirmedMissCount: confirmed.length,
+      ...(call.rawAnswerPath ? { rawAnswerPath: call.rawAnswerPath } : {}),
       foldedVerdict, builder, delegationTrial, comment, rowsWritten, callsUsedToday: pass.callsUsedToday, dailyCap: pass.dailyCap,
     };
   } catch (e) {
@@ -1774,6 +1941,7 @@ export function buildRedTeamDiscardRow({ pr, repo, pass = null, reserved = null,
     dispatchKind: RED_TEAM_DISCARD_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, lens: RED_TEAM_SEAT.lens,
     pr: Number(pr), repo, rev: src.rev ?? null, callId: src.callId, provider: src.provider ?? 'unknown', model: src.model ?? 'unknown',
     effort: src.effort ?? null, completed: pass?.status === 'speculated', callStatus: pass?.call?.status ?? null,
+    ...(pass?.call?.rawAnswerPath ? { rawAnswerPath: pass.call.rawAnswerPath } : {}),
     durationMs: pass?.durationMs ?? null, findingsCount: Array.isArray(pass?.findings) ? pass.findings.length : null,
     reason: String(reason ?? '').slice(0, 300), scoredAt: new Date(now).toISOString(),
   };

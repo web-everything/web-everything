@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // Installed root-owned; only anonymous public Git is accessed on this host.
 import * as filesystem from 'node:fs/promises';
+import {realpathSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {join} from 'node:path';
+import {basename,join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {classifyManifestPath,manifestEntry,manifestWire,digestManifest,parseGitTree,validateTestNames,isTestFile,bytePath,pathParts,decodeManifest} from './forge-exec-manifest.mjs';
-import {baseGuard,baseDirectory,baseFile,readBase,readyBases,pruneBases,PUBLIC_REPOSITORY,anonymousGitEnv} from './forge-exec-bases.mjs';
+import {baseGuard,copyLeaves,createBasePin,prewarmDirectory,prewarmEntry,baseDirectory,baseFile,readBase,readyBases,pruneBases,PUBLIC_REPOSITORY,anonymousGitEnv} from './forge-exec-bases.mjs';
 import {createRunner,verifyManifest,digestLock} from './forge-exec-run.mjs';
 const URL=PUBLIC_REPOSITORY;
 const LIMIT=4*1024*1024;
@@ -72,7 +73,108 @@ async function installWarm(tree,manifest) {
   if(result.code!==0)throw new Error('Warm worker unavailable; full shipping remains available');
   return {code:0};
 }
-export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,fs=filesystem,install=installWarm}={}) {
+// The base tree contains only manifest leaves (including its exact dependency
+// state). Never import caches or links from a worker into the prewarm pool.
+async function prewarmPins(root,fs,ownPin) {
+  const active=new Set();
+  await baseDirectory(join(root,'active'),fs);
+  for(const name of await fs.readdir(join(root,'active'))) {
+    const sha=(await baseFile(join(root,'active',name),fs)).toString();
+    if(!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha))throw new Error('Invalid active pin: prewarm pruning refused');
+    if(name!==ownPin)active.add(sha);
+  }
+  return active;
+}
+const prewarmExists=(path,fs)=>fs.lstat(path).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+async function prewarmSlots(root,runs,receipts,fs,log) {
+  // The timer's flock serializes warmers. Pin the base while copying outside
+  // the runner's guard; keep staging out of the advertised pool entirely.
+  const staging=await fs.mkdtemp(join(root,'.prewarm-')),ownPin=basename(staging);
+  let pinned=false;
+  try {
+    const plan=await baseGuard(root,async()=>{
+      const newest=(await readyBases(root,fs))[0];if(!newest)return;
+      await prewarmPins(root,fs);
+      // With the timer flock held, every previous build is abandoned. Reclaim
+      // its reserved pin even if disposal finished before pin release failed.
+      const abandoned=name=>/^\.prewarm-[A-Za-z0-9]{6}$/.test(name)&&name!==ownPin;
+      for(const name of (await fs.readdir(root)).filter(abandoned)) {
+        await prewarmDirectory(join(root,name),fs);
+        await fs.rename(join(root,name),join(staging,name));
+      }
+      for(const name of (await fs.readdir(join(root,'active'))).filter(abandoned))await fs.rm(join(root,'active',name),{force:true});
+      const active=await prewarmPins(root,fs);
+      const pool=join(root,'prewarm');await fs.mkdir(pool,{recursive:true,mode:0o700});await prewarmDirectory(pool,fs);
+      const shas=await fs.readdir(pool);
+      // Validate the whole pool before pruning any entry.
+      for(const sha of shas) {
+        if(!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha))throw new Error('Unknown prewarm entry: pruning refused');
+        await prewarmDirectory(join(pool,sha),fs);
+      }
+      for(const sha of shas)if(sha!==newest.sha&&!active.has(sha))await fs.rename(join(pool,sha),join(staging,'prune-'+sha));
+      if(!await prewarmExists(runs,fs))return;
+      await prewarmDirectory(runs,fs);
+      const names=(await fs.readdir(runs)).filter(name=>/^slot-[1-9]\d*$/.test(name));
+      if(names.length>128)throw new Error('Prewarm slot bound exceeded: ordinary copying remains available');
+      if(!names.length)return;
+      await prewarmDirectory(receipts,fs);
+      const base=await readBase(root,newest.sha,newest.manifestDigest,fs);
+      const parent=join(pool,newest.sha);await fs.mkdir(parent,{recursive:true,mode:0o700});await prewarmDirectory(parent,fs);
+      await createBasePin(root,ownPin,newest.sha,undefined,fs);pinned=true;
+      return {newest,names,base,parent};
+    },fs);
+    if(!plan)return;
+    const {newest,names,base,parent}=plan;
+    // Re-read busy state and external pins both before building and before
+    // publishing. A runner may claim a tree or reserve a slot during the copy.
+    const needed=async n=>{
+      if((await readyBases(root,fs))[0]?.sha!==newest.sha)return false;
+      const active=await prewarmPins(root,fs,ownPin);
+      for(const path of [runs,join(runs,'slot-'+n),receipts,join(root,'prewarm'),parent])await prewarmDirectory(path,fs);
+      if(await prewarmExists(join(receipts,'worker-active-'+n),fs))return false;
+      const dest=join(parent,n);
+      if(await prewarmExists(dest,fs)) {
+        if(active.has(newest.sha))return false;
+        try{await prewarmEntry(root,newest.sha,n,newest.manifestDigest,fs);return false;}catch{ /* Rebuild untrusted publication evidence only. */ }
+        await prewarmDirectory(dest,fs);
+      }
+      return true;
+    };
+    for(const name of names) {
+      const n=name.slice(5),tree=join(staging,name),dest=join(parent,n),marker=dest+'.json';
+      let built=false;
+      try {
+        if(!await baseGuard(root,()=>needed(n),fs))continue;
+        built=true;
+        await fs.mkdir(tree,{mode:0o700});
+        await copyLeaves(base.tree,tree,decodeManifest(base.manifest).entries,fs);
+        await verifyManifest(tree,base.manifest,newest.manifestDigest,{fs});
+        await fs.writeFile(tree+'.json',JSON.stringify({sha:newest.sha,manifestDigest:newest.manifestDigest}),{flag:'wx',mode:0o600});
+        await baseGuard(root,async()=>{
+          if(!await needed(n))return;
+          if(await prewarmExists(dest,fs))await fs.rename(dest,join(staging,'old-'+n));
+          await fs.rm(marker,{force:true});
+          await fs.rename(tree,dest);
+          try{await fs.rename(tree+'.json',marker);}
+          catch(error){await fs.rename(dest,tree);throw error;}
+        },fs);
+      }catch(error){log('prewarm slot '+n+': '+String(error.message));}
+      finally{
+        // Free partial copies before trying the next slot after ENOSPC.
+        if(built)for(const path of [tree,tree+'.json',join(staging,'old-'+n)]) {
+          try{await fs.rm(path,{recursive:true,force:true});}
+          catch(error){log('prewarm cleanup slot '+n+': '+String(error.message));}
+        }
+      }
+    }
+  }finally{
+    // Recursive disposal can be as slow as copying; it also stays outside the
+    // shared guard. Always attempt pin release even if disposal fails.
+    try{await fs.rm(staging,{recursive:true,force:true});}
+    finally{if(pinned)await baseGuard(root,()=>fs.rm(join(root,'active',ownPin),{force:true}),fs);}
+  }
+}
+export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,fs=filesystem,install=installWarm,runs='/srv/forge-exec',receipts='/srv/forge-receipts',log=message=>process.stderr.write('forge-warm-base: '+String(message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n')}={}) {
   await baseDirectory(root,fs);
   // The timer's flock serializes ticks. The short base guard is also shared
   // with runner pin creation, closing the prune-vs-prepare race.
@@ -151,13 +253,18 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
   // Repair historical candidates too; a healthy current main must not mask a
   // damaged retained base. Failure leaves it unadvertised and full ship available.
   for(const revision of rebuild)if(revision!==sha)await publish(revision);
-  if((await readyBases(root,fs)).some(base=>base.sha===sha))return {sha,reused:true};
-  return publish(sha);
+  const result=(await readyBases(root,fs)).some(base=>base.sha===sha)?{sha,reused:true}:await publish(sha);
+  try{await prewarmSlots(root,runs,receipts,fs,log);}
+  catch(error){log('prewarm unavailable; ordinary copying remains available: '+String(error.message));}
+  return result;
 }
-if(process.argv[1]&&await filesystem.realpath(process.argv[1]).catch(()=> '')===await filesystem.realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1]&&cliPath===realpathSync(fileURLToPath(import.meta.url))) {
   // Bases refuse group/other-writable directories. Imports must not change the
   // host process mask, and worker runtimes may expose an unsupported umask.
   try {if(typeof process.umask==='function')process.umask(0o022);} catch { /* unsupported runtime */ }
-  try{if(process.argv.length!==2)throw new Error('No arguments accepted');await warmTick();}
-  catch(error){process.stderr.write('forge-warm-base: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');process.exitCode=1;}
+  (async()=>{
+    try{if(process.argv.length!==2)throw new Error('No arguments accepted');await warmTick();}
+    catch(error){process.stderr.write('forge-warm-base: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');process.exitCode=1;}
+  })();
 }

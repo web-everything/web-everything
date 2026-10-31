@@ -61,6 +61,93 @@ exit 3
     ...await snapshotBinding(work),inputDigest:await digestInput(work),argvDigest:digestArgv(argv)};
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
+describe('sibling root snapshot acceptance', () => {
+  const siblingRoot = () => join(root,'runs',request.run,'frontierui');
+  async function siblingSnapshot() {
+    const sibling = siblingRoot();
+    await mkdir(join(sibling,'plugs'),{recursive:true});
+    await mkdir(join(sibling,'webtheme'),{recursive:true});
+    await writeFile(join(sibling,'plugs','runtime.js'),'export const plug = true;\n');
+    await writeFile(join(sibling,'webtheme','theme.js'),'export const theme = true;\n');
+    const {manifest} = await snapshotBinding(sibling);
+    request.manifest.siblings = {frontierui:{sha:'a'.repeat(40),...manifest}};
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    request.siblingShas = {frontierui:'a'.repeat(40)};
+    return sibling;
+  }
+  async function expectNoExecutionOrReceipt({siblings = true} = {}) {
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toEqual(siblings
+      ? {v:1,nonce:request.nonce,run:request.run,phase:'rejected',reason:'snapshot-rejected',siblings:true,started:false}
+      : null);
+  }
+
+  it('prepare creates an empty sibling root beside work with mode 0755 when requested', async () => {
+    const prepared = await runner.prepare({nonce:request.nonce,siblings:true});
+    const preparedWork = join(root,'runs',prepared.run,'work');
+    const sibling = join(root,'runs',prepared.run,'frontierui');
+    expect((await stat(sibling)).mode & 0o777).toBe(0o755);
+    expect(await readdir(sibling)).toEqual([]);
+    expect(await realpath(join(preparedWork,'..','frontierui'))).toBe(sibling);
+  });
+
+  it('accepts the matching sibling snapshot and binds its digest in the test receipt', async () => {
+    const sibling = await siblingSnapshot();
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(sibling,'plugs','runtime.js'),'utf8')).toBe('export const plug = true;\n');
+    expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
+      inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
+      manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3,
+      timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
+  });
+
+  it.each([
+    ['changed byte', /snapshot digest/],
+    ['extra file', /snapshot digest/],
+    ['missing file', /Manifest inventory/],
+    ['file symlink', /Manifest symlink/],
+    ['directory symlink', /Manifest symlink/],
+    ['wrong digest', /Manifest digest mismatch/],
+  ])('refuses sibling %s before installation and never certifies a receipt', async (fault, error) => {
+    const sibling = await siblingSnapshot();
+    const plug = join(sibling,'plugs','runtime.js');
+    const outside = join(root,'outside.js');
+    await writeFile(outside,'export const outside = true;');
+    if (fault === 'changed byte') await writeFile(plug,'export const plug = false;\n');
+    if (fault === 'extra file') await writeFile(join(sibling,'plugs','extra.js'),'extra');
+    if (fault === 'missing file') await rm(plug);
+    if (fault === 'file symlink') {
+      await rm(plug);
+      await symlink(outside,plug);
+    }
+    if (fault === 'directory symlink') {
+      await rm(join(sibling,'plugs'),{recursive:true});
+      await symlink(root,join(sibling,'plugs'));
+    }
+    if (fault === 'wrong digest') request.manifestDigest = '0'.repeat(64);
+    await expect(runner.run(request)).rejects.toThrow(error);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it('accepts an empty sibling root without adding a sibling digest to the receipt', async () => {
+    await mkdir(siblingRoot(),{recursive:true});
+    expect((await runner.run(request)).code).toBe(3);
+    const receipt = await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'test',code:3,manifestDigest:request.manifestDigest});
+    expect(receipt).not.toHaveProperty('siblingShas');
+  });
+
+  it('requires an empty sibling root when no sibling manifest was supplied', async () => {
+    await siblingSnapshot();
+    delete request.manifest.siblings;
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    delete request.siblingShas;
+    await expect(runner.run(request)).rejects.toThrow('Extra sibling snapshot');
+    await expectNoExecutionOrReceipt({siblings:false});
+  });
+});
+
 describe('fixed wrapper security boundary', () => {
   it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
     const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
@@ -283,7 +370,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
       argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
+    expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
   it('rejects input and lock changes before install and accepts odd filenames literally', async () => {
     for (const name of ['#file',';file',"quote'`$()",'--option','é\u2028fixture','tab\tfile','trailing ']) await writeFile(join(work,name),name);
@@ -444,7 +531,11 @@ def kill(pid, sig):
 def reap(*args):
     assert set(killed) == {101, 102, 103}, killed
     raise ChildProcessError()
-cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status)
+writer = dict(guard=os.path.join(root, 'supervisor-writer'), reservation=os.path.join(root, 'supervisor-reservation.json'), run='fixture', nonce='fixture')
+fd = os.open(writer['guard'], os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with real_open(writer['reservation'], 'w') as stream: json.dump(dict(run='fixture', nonce='fixture'), stream)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status, writer=writer)
 with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
      patch.object(os, 'listdir', return_value=[*entries, 'self', '105']), \
      patch.object(os, 'getpid', return_value=100), patch.object(builtins, 'open', side_effect=proc_open), \
@@ -540,13 +631,16 @@ with patch.object(os, 'open', side_effect=local_open), \
     const active=join(root,'receipts','worker-active');
     await mkdir(active,{mode:0o700});
     await mkdir(oldRun); await writeFile(oldReceipt,'old'); await mkdir(oldCache); await mkdir(newCache);
-    for(const path of [oldRun,oldReceipt,oldCache,active]) await utimes(path,expired,expired);
+    for(const path of [oldRun,oldReceipt,oldCache]) await utimes(path,expired,expired);
     const local=prune.replaceAll('/srv/forge-exec',join(root,'runs'))
       .replaceAll('/srv/forge-receipts',join(root,'receipts'))
       .replaceAll('/srv/forge-cache',join(root,'cache'));
     const result=spawnSync('bash',['-c',local],{encoding:'utf8'});
     expect(result.status,result.stderr).toBe(0);
-    for(const path of [oldRun,oldReceipt,oldCache])expect((await stat(path)).isDirectory()||(await stat(path)).isFile()).toBe(true);
+    expect((await stat(oldRun)).isDirectory()).toBe(true);
+    expect(await readFile(oldReceipt,'utf8')).toBe('old');
+    expect((await stat(oldCache)).isDirectory()).toBe(true);
+    expect((await stat(active)).isDirectory()).toBe(true);
     await rm(active,{recursive:true});
     const inactive=spawnSync('bash',['-c',local],{encoding:'utf8'});
     expect(inactive.status,inactive.stderr).toBe(0);
@@ -555,6 +649,99 @@ with patch.object(os, 'open', side_effect=local_open), \
     expect((await stat(work)).isDirectory()).toBe(true);
     await expect(stat(active)).rejects.toThrow();
   });
+  it.each(['empty historical reservation','malformed metadata','unreadable metadata','non-object metadata','missing run identity','invalid run identity'])(
+    'preserves expired execution evidence and caches with %s',async fault=>{
+      const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+      const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
+      const active=join(root,'receipts/worker-active'),reservation=join(active,'reservation.json');
+      await mkdir(active,{mode:0o700});
+      if(fault!=='empty historical reservation'){
+        const contents={'malformed metadata':'{broken','unreadable metadata':'{}','non-object metadata':'[]',
+          'missing run identity':'{}','invalid run identity':JSON.stringify({run:'unknown'})};
+        await writeFile(reservation,contents[fault]);
+      }
+      const run='r-'+ 'd'.repeat(32),expired=new Date(Date.now()-16*86400000);
+      const evidence=[];
+      for(const phase of ['prepared','running','receipt','telemetry']){
+        const path=join(root,'receipts',run+'.'+phase),content=JSON.stringify({run,phase,lock:'e'.repeat(64)});
+        await writeFile(path,content);await utimes(path,expired,expired);evidence.push([path,content]);
+      }
+      const cache=join(root,'cache','e'.repeat(64));await mkdir(cache);await writeFile(join(cache,'dependencies.tar'),'dependency contents');
+      await utimes(cache,expired,expired);await utimes(active,expired,expired);
+      const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
+        .replaceAll('/srv/forge-cache',join(root,'cache'));
+      // Inject a real metadata-open failure without depending on the test UID's
+      // permission to bypass chmod. Every other filesystem operation is real.
+      const denied=`import os, errno
+original_open=os.open
+def metadata_open(path, *args, **kwargs):
+    if path == ${JSON.stringify(reservation)}: raise PermissionError(errno.EACCES, 'fixture metadata denied', path)
+    return original_open(path, *args, **kwargs)
+os.open=metadata_open
+`;
+      const harness=(fault==='unreadable metadata'?denied:'')+local;
+      const result=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+      expect(result.status,result.stderr).toBe(0);
+      expect(result.stderr).toContain('preserving expired receipts');expect(result.stderr).toContain('preserving expired cache entries');
+      expect((await stat(active)).isDirectory()).toBe(true);
+      for(const [path,content] of evidence)expect(await readFile(path,'utf8')).toBe(content);
+      expect(await readFile(join(cache,'dependencies.tar'),'utf8')).toBe('dependency contents');
+      // Once the operator removes the uncertain reservation, ordinary age
+      // pruning must make progress on the same artifacts.
+      await rm(active,{recursive:true});
+      const released=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+      expect(released.status,released.stderr).toBe(0);
+      for(const [path] of evidence)await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(cache)).rejects.toMatchObject({code:'ENOENT'});
+    });
+  it.each(['held','old with live UID','abandoned without live UID','abandoned with zombie UID','historical without writer protocol','held without cache evidence'])(
+    'prunes unrelated expired telemetry, receipts and caches with reservation %s',async mode=>{
+      const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+      const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
+      const run='r-'+ 'a'.repeat(32),other='r-'+ 'b'.repeat(32),lock='c'.repeat(64);
+      const slot=join(root,'runs/slot-1'),idle=join(root,'runs/slot-2'),reservation=join(root,'receipts/worker-active-1');
+      const proc=join(root,'proc');await mkdir(proc);
+      if(mode==='old with live UID'||mode==='abandoned with zombie UID'){
+        await mkdir(join(proc,'123'));await writeFile(join(proc,'123/stat'),mode==='old with live UID'?'123 (worker) S 1':'123 (worker) Z 1');
+      }
+      for(const dir of [slot,idle,reservation,join(root,'cache',lock),join(root,'cache/unrelated'),join(root,'cache/recent')])await mkdir(dir);
+      for(const dir of [join(slot,run),join(idle,other)])await mkdir(dir);
+      await writeFile(join(reservation,'reservation.json'),JSON.stringify({run,slot:'forge-exec-1',...(mode==='historical without writer protocol'?{}:{writerGuard:1})}));
+      const running=join(root,'receipts',run+'.running'),telemetry=join(root,'receipts',run+'.telemetry');
+      const unrelatedReceipt=join(root,'receipts',other+'.receipt'),unrelatedTelemetry=join(root,'receipts',other+'.telemetry');
+      await writeFile(running,JSON.stringify({run,...(mode==='held without cache evidence'?{}:{lock})}));await writeFile(telemetry,'active');
+      await writeFile(unrelatedReceipt,'expired');await writeFile(unrelatedTelemetry,'expired');
+      const recent=join(root,'receipts/recent.receipt');await writeFile(recent,'recent');
+      const writer=join(root,'receipts/.worker-active-1.writer');await writeFile(writer,'',{mode:0o600});
+      const writerInode=(await stat(writer)).ino;
+      const expired=new Date(Date.now()-16*86400000);
+      await utimes(writer,expired,expired);
+      for(const path of [join(slot,run),join(idle,other),running,telemetry,unrelatedReceipt,unrelatedTelemetry,join(root,'cache',lock),join(root,'cache/unrelated')])await utimes(path,expired,expired);
+      if(!['held','held without cache evidence'].includes(mode))await utimes(reservation,expired,expired);
+      const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
+        .replaceAll('/srv/forge-cache',join(root,'cache')).replaceAll('/proc',proc);
+      const harness=`import pwd, types, os\npwd.getpwnam=lambda _:types.SimpleNamespace(pw_uid=os.getuid())\n${local}`;
+      const result=spawnSync('python3',['-I','-c',harness],{encoding:'utf8',timeout:10000});
+      expect(result.status,result.stderr).toBe(0);
+      expect((await stat(writer)).ino).toBe(writerInode);
+      for(const path of [join(idle,other),unrelatedReceipt,unrelatedTelemetry])await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+      if(mode==='held without cache evidence')expect((await stat(join(root,'cache/unrelated'))).isDirectory()).toBe(true);
+      else await expect(stat(join(root,'cache/unrelated'))).rejects.toMatchObject({code:'ENOENT'});
+      for(const path of [recent,join(root,'cache/recent')])expect(await stat(path)).toBeDefined();
+      const protectedPaths=[reservation,join(slot,run),running,telemetry,join(root,'cache',lock)];
+      if(mode.startsWith('abandoned')){
+        expect(result.stderr).toContain('abandoned reservation worker-active-1; UID has no live processes');
+        for(const path of protectedPaths){
+          if(path===reservation&&mode==='abandoned with zombie UID')expect(await stat(path)).toBeDefined();
+          else await expect(stat(path)).rejects.toMatchObject({code:'ENOENT'});
+        }
+      }else{
+        if(mode==='held without cache evidence'){
+          expect(result.stderr).toContain('preserving expired cache entries');expect(result.stderr).not.toContain('preserving expired receipts');
+        }else expect(result.stderr).toBe('');
+        for(const path of protectedPaths)expect(await stat(path)).toBeDefined();
+      }
+    });
   it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
     for(const args of [['prepare','extra'],['prepare']]) {
@@ -565,6 +752,35 @@ with patch.object(os, 'open', side_effect=local_open), \
       expect(result.status).toBe(254);
       expect(result.stderr).toContain(args.length===1?'Request limit exceeded':'Invalid subcommand');
     }
+  });
+  it.each(['/root', '../', '/srv/forge-base/../root', `/srv/forge-base/${'a'.repeat(40)}.tmp/other`])
+  ('warm-install rejects out-of-allowlist source %s before any copy', async source => {
+    const probe=join(root,'warm-source-probe.mjs'),attempts=join(root,'warm-source-io.jsonl');
+    await writeFile(probe, `
+import fs from 'node:fs/promises';
+import {appendFileSync} from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
+// Skip host pool discovery and stop every subsequent IO operation before it
+// can read or mutate a host tree, even if the source guard regresses.
+fs.readdir = async () => [];
+for (const method of ['open','mkdir','lstat','writeFile','copyFile','cp']) {
+  fs[method] = async () => {
+    appendFileSync(${JSON.stringify(attempts)},JSON.stringify(method)+'\\n');
+    throw new Error('unexpected warm IO: '+method);
+  };
+}
+syncBuiltinESMExports();
+`);
+    const result=spawnSync(process.execPath,['--import',probe,
+      new URL('../forge-exec-run.mjs',import.meta.url).pathname,'warm-install'],{
+      input:JSON.stringify({source,manifest:request.manifest}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:process.env.PATH},
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status,result.stderr).toBe(254);
+    expect(result.stderr).toBe('forge-exec-run: Invalid warm source\n');
+    expect(result.stdout).toBe('');
+    await expect(stat(attempts)).rejects.toMatchObject({code:'ENOENT'});
   });
   it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
@@ -601,8 +817,10 @@ assert ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b'\xff)\n\xfe)'), 0, 0, 0) ==
 with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))
 time.sleep(30)
 `;
+  const writer={guard:join(root,'supervisor-writer'),reservation:join(root,'supervisor-reservation.json'),run:request.run,nonce:request.nonce};
+  await writeFile(writer.guard,'',{mode:0o600});await writeFile(writer.reservation,JSON.stringify({run:request.run,nonce:request.nonce}));
   const result=spawnSync('python3',['-I','-c',supervisorSource,JSON.stringify({
-    argv:['python3','-I','-c',task,marker],cwd:root,env:{PATH:process.env.PATH},
+    writer,argv:['python3','-I','-c',task,marker],cwd:root,env:{PATH:process.env.PATH},
     uid:process.getuid(),gid:process.getgid(),status,
   })],{encoding:'utf8',timeout:10000});
   const pid=Number(await readFile(marker,'utf8').catch(()=>0));
@@ -631,7 +849,7 @@ describe('privileged finish cleanup', () => {
     expect(await isolated.finish(request)).toMatchObject({phase:'test',code:3});
     expect(cleanup).toHaveBeenCalledTimes(1);
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
+    expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
   it('refuses cleanup failure without consuming state or publishing success', async () => {
     const cleanup=vi.fn(async ()=>({code:1}));
@@ -640,13 +858,13 @@ describe('privileged finish cleanup', () => {
     await expect(isolated.finish(request)).rejects.toThrow('Run cleanup failed');
     expect(cleanup).toHaveBeenCalledTimes(1);
     expect((await stat(work)).isDirectory()).toBe(true);
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.receipt',request.run+'.running',request.run+'.telemetry','telemetry.json']);
+    expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.receipt',request.run+'.running',request.run+'.telemetry','telemetry.json']);
   });
   it('refuses claimed cleanup success when the run directory remains', async () => {
     const cleanup=vi.fn(async ()=>({code:0}));
     const isolated=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testCleanupExec:cleanup});
     await expect(isolated.finish(request)).rejects.toThrow('Run cleanup incomplete');
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.prepared',request.run+'.telemetry','telemetry.json']);
+    expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.prepared',request.run+'.telemetry','telemetry.json']);
     expect((await stat(work)).isDirectory()).toBe(true);
   });
   it('does not delegate invalid or symlink-swapped run containers', async () => {
@@ -696,7 +914,7 @@ exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
   expect(await isolated.finish(request)).toMatchObject({phase:'test',code:0});
   expect(cleanup).toHaveBeenCalledTimes(1);
   await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
-  expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
+  expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
 });
 
 
@@ -798,11 +1016,13 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     if (fault === 'duplicate') {
       manifest.paths = nul([Buffer.from('package-lock.json'),Buffer.from('package-lock.json')]).toString('base64');
       manifest.hashes.push(manifest.hashes[0]); manifest.executable.push(false);
+      manifest.tracked.push(manifest.tracked[0]);
     }
     if (fault === 'unsorted') {
       await writeFile(join(work,'z.txt'),'z');
       manifest.paths = nul([Buffer.from('z.txt'),Buffer.from('package-lock.json')]).toString('base64');
       manifest.hashes = [hash('z'),hash('lock')]; manifest.executable = [false,false];
+      manifest.tracked = [false,false];
     }
     const unsafe = {'newline':'bad\nname.test.mjs', CR:'bad\rname', absolute:'/outside', parent:'../outside', dot:'./file', 'empty component':'a//file'};
     if (fault in unsafe) manifest.paths = nul([Buffer.from(unsafe[fault])]).toString('base64');
@@ -813,7 +1033,13 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     if (fault === 'excluded directory test') manifest.excluded = nul([Buffer.from('__tests__/credentials.js')]).toString('base64');
     request.manifestDigest = hash(JSON.stringify(manifest));
     request.inputDigest = await digestInput(work);
-    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|path|base64|hash|test/i);
+    const ordering = fault === 'duplicate' || fault === 'unsorted';
+    if (ordering) {
+      expect(manifest.hashes).toHaveLength(2);
+      expect(manifest.executable).toEqual([false,false]);
+      expect(manifest.tracked).toEqual([false,false]);
+    }
+    await expect(runner.run(request)).rejects.toThrow(ordering ? 'Manifest paths must be strictly increasing' : /manifest|inventory|snapshot|path|base64|hash|test/i);
     await expectNoExecutionOrReceipt();
   });
 
@@ -939,10 +1165,10 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
       .flatMap(pattern => ['', 'nested/'].map(depth => pattern.replaceAll('**/', depth).replaceAll('*', 'identity'))));
     const names = [...new Set([...positives, 'scripts/__tests__/support.json',
       'scripts/__tests__/credentials.js', 'notes.test.txt', 'support.js'])];
-    for (const name of names) {
+    await Promise.all(names.map(async name => {
       await mkdir(join(work, name, '..'), {recursive:true});
       await writeFile(join(work, name), 'fixture');
-    }
+    }));
     const binding = await snapshot(['package-lock.json', ...names]);
     const verified = await verify(binding.manifest, binding.manifestDigest);
     const selected = new Set(verified.testPaths.map(path => path.toString()));

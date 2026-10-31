@@ -113,7 +113,8 @@ const gcReflogPatterns = (dir) => { try { return git(dir, ['config', '--name-onl
 // `hook.<name>.command` runs on its `hook.<name>.event` (e.g. reference-transaction on update-ref) whatever core.hooksPath says.
 const configHooks = (dir) => { try { return git(dir, ['config', '--name-only', '--get-regexp', '^hook\\.']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 // `extensions.refStorage=<format>://<path>` keeps the refs in another repo: update-ref, gc and prune would act there.
-const refStorage = (dir) => { try { return git(dir, ['config', '--get-all', 'extensions.refstorage']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
+// Read without opening the repository: Git 2.43 refuses an unknown refStorage extension before any repo command.
+const refStorage = (dir) => { try { return git(dir, ['config', '--file', join(dir, '.git', 'config'), '--includes', '--get-all', 'extensions.refstorage']).split('\n').filter(Boolean); } catch (e) { if (e.status === 1) return []; throw e; } };
 // A path git prints, byte-exact: whitespace is a legal path byte, so only the one trailing newline is git's.
 const gitPath = (dir, args) => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(git(dir, args, 120_000, null)).replace(/\n$/, '');
 
@@ -178,16 +179,22 @@ const auditGitDir = (dir) => {
 };
 // Every ref a symbolic ref points at, seen from the lane's own git dir and from each linked worktree's (its HEAD,
 // root refs and per-worktree refs). `%(symref)` resolves a whole chain to its last ref, so each symbolic ref's own
-// next hop is read unresolved too: every ref along a chain (HEAD → ops/a → ops/b → ops/c) is kept. Ref names hold no
-// whitespace, so one per line and a space separator are exact. Any read failure throws: lane error row.
+// next hop is read unresolved too: every ref along a chain (HEAD → ops/a → ops/b → ops/c) is kept. Ref names exclude
+// ASCII spaces/control characters, but may contain Unicode whitespace: strip only Git's output newline.
+// One per line and an ASCII space separator are exact. Any read failure throws: lane error row.
 const symrefTargets = (dir) => {
   let ids = [];
   try { ids = readdirSync(join(dir, '.git', 'worktrees')); } catch (err) { if (!['ENOENT', 'ENOTDIR'].includes(err.code)) throw err; }
   const targets = new Set();
   for (const gitDir of [join(dir, '.git'), ...ids.map((id) => join(dir, '.git', 'worktrees', id))]) {
-    const nextHop = (ref) => { try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', ref]).trim()); } catch (e) { if (e.status !== 1) throw e; } }; // 1: not symbolic (detached HEAD)
+    const nextHop = (ref) => { try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', ref]).replace(/\r?\n$/, '')); } catch (e) { if (e.status !== 1) throw e; } }; // 1: not symbolic (detached HEAD)
+    // Files-format root refs are loose uppercase files. Enumerate them explicitly: --include-root-refs needs 2.46.
+    // Packed refs cannot be symbolic; for-each-ref below still covers both loose and packed refs/ entries.
     nextHop('HEAD');
-    for (const line of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--include-root-refs', '--format=%(if)%(symref)%(then)%(refname) %(symref)%(end)']).split('\n')) {
+    for (const entry of readdirSync(gitDir, { withFileTypes: true })) {
+      if (entry.isFile() && /^[A-Z_]+$/.test(entry.name) && /^ref:\s*(\S+)/.test(readFileSync(join(gitDir, entry.name), 'utf8'))) nextHop(entry.name);
+    }
+    for (const line of git(dir, [`--git-dir=${gitDir}`, 'for-each-ref', '--format=%(if)%(symref)%(then)%(refname) %(symref)%(end)']).split('\n')) {
       if (!line) continue;
       const [ref, resolved] = line.split(' ');
       targets.add(resolved);
@@ -201,17 +208,23 @@ const commonDir = (dir) => { try { return real(gitPath(dir, ['rev-parse', '--pat
 
 const eligible = (dir) => {
   const realGitDir = real(join(dir, '.git'));
+  const storage = realGitDir ? refStorage(dir) : [];
+  if (storage.some(v => v !== 'files')) return cleanupEligibility({ dir, poolRoot: POOL_ROOT, refStorage: storage });
   const objects = realGitDir ? real(join(realGitDir, 'objects')) : null;
   return cleanupEligibility({
     dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir, realCommonDir: realGitDir ? commonDir(dir) : undefined, realObjectsDir: objects ?? undefined, ...auditGitDir(dir),
     lease: readLease(dir), nowMs: Date.now(),
     borrowers: (objects && BORROWERS.get(objects)) || [], gcHooks: realGitDir ? gcHooks(dir) : [], gcRepackFilters: realGitDir ? gcRepackFilters(dir) : [],
     gcReflogPatterns: realGitDir ? gcReflogPatterns(dir) : [], configHooks: realGitDir ? configHooks(dir) : [],
-    refStorage: realGitDir ? refStorage(dir) : [],
+    refStorage: storage,
   });
 };
 // Every eligibility input re-read while we hold the claim, ownership first: the real marker must still be ours.
-const recheckUnderClaim = (dir, holder) => cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: readLease(dir), claimHolder: holder, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: refStorage(dir) });
+const recheckUnderClaim = (dir, holder) => {
+  const storage = refStorage(dir);
+  if (storage.some(v => v !== 'files')) return cleanupEligibility({ dir, poolRoot: POOL_ROOT, refStorage: storage });
+  return cleanupEligibility({ dir, poolRoot: POOL_ROOT, realDir: real(dir), realGitDir: real(join(dir, '.git')), realCommonDir: commonDir(dir), realObjectsDir: real(join(dir, '.git', 'objects')), ...auditGitDir(dir), lease: readLease(dir), claimHolder: holder, nowMs: Date.now(), gcHooks: gcHooks(dir), gcRepackFilters: gcRepackFilters(dir), gcReflogPatterns: gcReflogPatterns(dir), configHooks: configHooks(dir), refStorage: storage });
+};
 
 // O_EXCL claim, same marker shape as `lane-pool` (so `acquire` reads it as a live lease and skips the lane).
 function claim(dir) {
@@ -267,6 +280,8 @@ for (const n of lanes) {
       // Measure and read first, so the ownership check sits right before the writes: a marker rewritten or removed by
       // another holder means the claim is lost.
       const before = duBytes(join(dir, '.git'));
+      const storage = cleanupEligibility({ dir, poolRoot: POOL_ROOT, refStorage: refStorage(dir) });
+      if (!storage.ok) { rows.push({ lane: n, skipped: storage.reason }); continue; }
       const pinned = symrefTargets(dir);
       const recheck = recheckUnderClaim(dir, holder);
       if (!recheck.ok) { rows.push({ lane: n, skipped: recheck.reason }); continue; }

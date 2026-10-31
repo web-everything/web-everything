@@ -63,10 +63,10 @@ export const digestManifest = manifest => sha(JSON.stringify(manifest));
 
 // This exclusion policy is part of the manifest, never an independent rsync
 // filter. Test-shaped names under excluded components refuse remote admission.
-const safeDotDirectory = /^(?:\.github|\.husky|\.vscode|\.storybook|\.changeset)$/;
+const safeDotDirectory = /^(?:\.github|\.githooks|\.husky|\.vscode|\.storybook|\.changeset)$/;
 const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
 const keyComponent = /(?:_rsa|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
-const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key|^id_/;
+const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|api[-_ .]?key|^id_/;
 const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
 function normalizedComponent(part) {
   const utf8 = part.toString('utf8');
@@ -121,16 +121,36 @@ export function decodeManifest(manifest) {
 }
 // Decode Git's byte-safe tree protocol. Only policy-excluded paths may have
 // non-regular modes; retain them so callers record the same exclusions as full ship.
-export function parseGitTree(bytes) {
+export function parseGitTree(bytes, {sizes = false} = {}) {
   if(!Buffer.isBuffer(bytes)||bytes.length>LIMIT||(bytes.length&&bytes.at(-1)!==0))throw new Error('Invalid git tree');
   const entries=[];let start=0;
   for(let i=0;i<bytes.length;i++)if(bytes[i]===0){
     const record=bytes.subarray(start,i),tab=record.indexOf(9),header=record.subarray(0,tab).toString('ascii');
-    if(tab<0||!/^\d{6} (?:blob|tree|commit) [a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(header))throw new Error('Unsupported git tree mode');
+    const pattern=sizes ? /^\d{6} (?:blob|tree|commit) [a-f0-9]{40}(?:[a-f0-9]{24})? +(?:[0-9]+|-)$/ : /^\d{6} (?:blob|tree|commit) [a-f0-9]{40}(?:[a-f0-9]{24})?$/;
+    if(tab<0||!pattern.test(header))throw new Error('Unsupported git tree mode');
     const path=record.subarray(tab+1),policy=classifyManifestPath(path);
     const excluded=(policy.excluded&&!policy.credentialSource)||policy.names.includes('node_modules');
     if(!excluded&&!/^100(?:644|755) blob /.test(header))throw new Error('Unsupported git tree mode');
-    const [mode,,oid]=header.split(' ');entries.push({path,oid,executable:mode==='100755'});start=i+1;
+    const [mode,,oid,size]=header.split(/ +/);
+    if(sizes && size!=='-' && !Number.isSafeInteger(Number(size)))throw new Error('Invalid git blob size');
+    entries.push({path,oid,executable:mode==='100755',...(sizes?{size:size==='-'?null:Number(size)}:{})});start=i+1;
   }
   return entries;
+}
+
+// Porcelain -z emits destination first, then source for rename/copy records.
+// Keep both byte paths: either side may have existed in the warm snapshot.
+export function parseGitStatus(bytes) {
+  const fields=splitPaths(bytes),paths=[];
+  for(let i=0;i<fields.length;i++) {
+    const record=fields[i],status=record.subarray(0,2).toString('latin1');
+    if(record.length<4 || record[2]!==32 || !/^(?:[ MADRCUT?!]{2})$/.test(status) || status==='  ')
+      throw new Error('Invalid git status');
+    const path=record.subarray(3);pathParts(path);paths.push(path);
+    if(/[RC]/.test(status)) {
+      if(!fields[++i])throw new Error('Truncated git rename/copy');
+      paths.push(fields[i]);
+    }
+  }
+  return paths;
 }

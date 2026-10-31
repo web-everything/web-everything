@@ -45,17 +45,21 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
   try{return await transaction(root,async state=>{
     const now=clock();
     if(now<state.backoffUntil)return {ok:false,reason:`backoff-${state.trigger}`};
+    const stale=()=>{
+      const age=clock()-Date.parse(state.telemetry?.sampledAtET);
+      return !Number.isFinite(age)||age < -60000||age>30000;
+    };
     // Cache failed reads as well as successful reads. The mutex covers the SSH
     // read so simultaneous clients cannot each poll Forge once per ten seconds.
-    if(state.lastReadAt===null || now-state.lastReadAt>=10000) {
+    // Stale cached telemetry gets one refresh even inside the ten-second cache.
+    if(state.lastReadAt===null || now-state.lastReadAt>=10000 || (state.telemetry && stale())) {
       state.lastReadAt=now;
       try{state.telemetry=parseTelemetry(JSON.stringify(await readTelemetry({host})));}
       catch{state.telemetry=null;}
     }
     let trigger;
-    const age=clock()-Date.parse(state.telemetry?.sampledAtET);
     if(!state.telemetry)trigger='forge-unreachable';
-    else if(!Number.isFinite(age)||age<0||age>30000)trigger='telemetry-stale';
+    else if(stale())trigger='telemetry-stale';
     else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
     if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}

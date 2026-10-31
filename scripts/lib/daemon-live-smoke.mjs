@@ -929,7 +929,7 @@ export async function runLiveSmoke({
       const trackedRunChild = async (cmd, args, opts) => {
         childCalls++;
         const start = clock();
-        const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < 1_000;
+        const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < (opts?.minChildMs ?? 1_000);
         try {
           const out = await runChild(cmd, args, opts);
           if (check.name === 'daemon-entries-boot') {
@@ -1219,6 +1219,28 @@ const LANE_POOL_DEFAULT_SCAN_TIMEOUT_MS = 120_000;
 /** PURE: did this failed row run out of time (signature AND the gate's own measured elapsed time)? */
 export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS } = {}) {
   if (!row || row.ok) return false;
+  // Boot summaries aggregate several children. Use gate-owned per-entry outcomes rather than a timeout
+  // substring: one import failure/crash or missing outcome, including a retried attempt, must keep
+  // the whole row a code failure.
+  if (row.name === 'daemon-entries-boot') {
+    if (!Array.isArray(row.entries) || !row.entries.length
+      || row.entries.some(r => !r || typeof r.ok !== 'boolean')) return false;
+    const failures = row.entries.filter(r => !r.ok);
+    if (!failures.length) return false;
+    const isFullCapTimeout = r => {
+      if (!r || r.ok !== false) return false;
+      const killed = /^child failed: timed out after (\d+)ms \(process group killed\)$/.exec(r.kind);
+      const cap = Number(killed?.[1]);
+      // A shared-budget slice is not a full-cap timeout. Refuse tiny caps and early/fabricated kills too.
+      return killed && cap >= MIN_OWN_CAP_MS && cap === r.timeoutMs
+        && Number.isFinite(r.elapsedMs) && r.elapsedMs >= cap * 0.9;
+    };
+    return failures.every(r => {
+      const attempts = r.attempts === undefined ? [r] : r.attempts;
+      return isFullCapTimeout(r) && Array.isArray(attempts) && attempts.length > 0
+        && attempts.every(isFullCapTimeout);
+    });
+  }
   const detail = String(row.detail ?? '');
   if (!ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail))) return false;
   // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the

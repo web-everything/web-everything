@@ -89,6 +89,43 @@ function fakeIo(over = {}) {
   return { io, calls, rows, trials };
 }
 
+describe('failed red-team executions (#6096)', () => {
+  it.each(['quota', 'daily cap'])('a failed seat still defers another call under its %s', async limit => {
+    const { io, rows, calls } = fakeIo({ cliAvailable: provider => provider === 'codex',
+      runSeat: async () => limit === 'quota'
+        ? { report: { quotaState: 'exhausted', quotaResetsAt: NOW + 60 * 60_000 }, error: 'quota exhausted' }
+        : { report: null, error: 'provider unavailable' } });
+    io.readRecords = () => rows;
+    const append = io.append;
+    io.append = row => append({ ...row, scoredAt: new Date(NOW).toISOString() });
+    const input = { pr: 5, repo: REPO, loopPayload: payload('accept'),
+      env: { WE_REVIEW_SEAT_CAP_CODEX: limit === 'daily cap' ? '1' : '100' } };
+    expect((await runRedTeam(input, io)).status).toBe('failed');
+    const result = await runRedTeam(input, io);
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain(limit === 'quota' ? 'quota exhausted' : 'daily-cap:');
+    expect(calls.filter(call => call[0] === 'reserve')).toHaveLength(1);
+    expect(rows).toHaveLength(1);
+  });
+
+  it.each([
+    [{ report: null, error: 'provider unavailable' }, 'error', 'provider unavailable'],
+    [{ report: null, timedOut: true }, 'timeout', 'seat call hit its wall'],
+    [{ report: { quotaState: 'exhausted' }, error: 'quota exhausted' }, 'quota-exhausted', 'quota exhausted'],
+  ])('returns failed with the seat reason and retains budget evidence: %s', async (run, status, reason) => {
+    const redTeamStatus = vi.fn();
+    const { io, rows, calls, trials } = fakeIo({ redTeamStatus, runSeat: async () => run });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
+    expect(result).toMatchObject({ status: 'failed', reason, foldedVerdict: 'needs-human', rowsWritten: 1 });
+    expect(redTeamStatus).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'finished', result: 'failed' }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status, error: reason, rev: REV });
+    expect(result.findings).toEqual([]);
+    expect(trials).toEqual([]);
+    expect(calls.some(c => ['post', 'recheck'].includes(c[0]))).toBe(false);
+  });
+});
+
 describe('speculative red-team repository isolation', () => {
   it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
     const { io, calls, rows } = fakeIo();
@@ -874,4 +911,34 @@ describe('red-team scheduling status', () => {
     expect(out).toMatchObject({ status: 'skipped', reason: 'red team skipped: card-only' });
     expect(redTeamStatus).not.toHaveBeenCalled();
   });
+});
+
+
+it('reloads red-team routing each pass, enables unset Gemini, preserves explicit zero, and restores disable on clear', async () => {
+  const { createRoutingPolicyReader } = await import('../../lib/dispatch-routing-policy-io.mjs');
+  const { DEFAULT_ROUTING_POLICY, resolveOperationRoute: pureRoute } = await import('../../lib/dispatch-routing-policy.mjs');
+  let overrides = { 'review-seat:red-team': { provider: 'agy-gemini', model: 'pro', disabledProviders: ['codex', 'agy-claude'] } };
+  const reader = createRoutingPolicyReader({ read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ prefs: { routingOverrides: overrides }, errors: [] }), emit: () => true });
+  resolveOperationRoute.mockImplementation(pureRoute);
+  try {
+    const env = {};
+    const first = fakeIo({ readRoutingPolicy: reader });
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: payload('accept').findings.read, env }, first.io);
+    expect(pass.status).toBe('speculated');
+    expect(first.calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-4-argon-high' });
+    const capped = fakeIo({ readRoutingPolicy: reader });
+    expect((await speculateRedTeam({ pr: 8, repo: REPO, read: payload('accept').findings.read,
+      env: { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' } }, capped.io)).status).toBe('skipped');
+    expect(capped.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
+    overrides = {};
+    const cleared = fakeIo({ readRoutingPolicy: reader, cliAvailable: p => p === 'agy-gemini' });
+    const result = await speculateRedTeam({ pr: 6, repo: REPO, read: payload('accept').findings.read, env }, cleared.io);
+    expect(result.status).toBe('skipped');
+    expect(cleared.calls.filter(c => c[0] === 'seat')).toHaveLength(0);
+    overrides = { 'review-seat:red-team': { enabledProviders: ['agy-gemini'], disabledProviders: ['codex', 'agy-claude'] } };
+    const enabled = fakeIo({ readRoutingPolicy: reader });
+    expect((await speculateRedTeam({ pr: 7, repo: REPO, read: payload('accept').findings.read, env }, enabled.io)).status).toBe('speculated');
+    expect(enabled.calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+  } finally { resolveOperationRoute.mockReturnValue(null); }
 });

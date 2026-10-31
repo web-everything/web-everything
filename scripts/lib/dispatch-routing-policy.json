@@ -1,5 +1,6 @@
 {
   "_howTo": [
+    "Live routingOverrides in the operator-owned ~/.claude/platform-preferences.json (or WE_PLATFORM_PREFERENCES_FILE) deep-merge operation entries over this policy, validated every read; repo platform files cannot supply overrides (ignored with a warning). Example: {\"routingOverrides\":{\"review-seat:red-team\":{\"provider\":\"agy-gemini\",\"model\":\"flash\",\"disabledProviders\":[\"codex\"]}}}. Clear the key to restore repo defaults. Arrays replace; effort maps merge. Selecting a provider enables it for that seat; enabledProviders also enables inherited candidates, disabledProviders excludes them. With its env cap unset, enabling the default-zero agy-gemini provider gives that seat a 300-call daily cap. Codex and agy-claude retain their existing defaults (80 and 300); explicit env caps, including zero, and quota checks remain binding. Applied/cleared changes emit routing-override-applied events with platform provenance. CLI: node scripts/operations/run.mjs routing-override --operation=review-seat --taskType=red-team --provider=agy-gemini, or --clear.",
     "Operation entries select provider, model, effort and fallback together (operations, operations.X:taskType or taskTypes). For fix and ci-heal, codex.modelByTask overlays model, effort and retry through standard policy → platform → settings → env.",
     "An entry with inherit:true preserves the existing evidence/tier router. taskTypes entries override inherited operations; operations may also use operation:taskType keys (review-seat:security, for example).",
     "Aliases below resolve to explicit model IDs. Every policy-routed dispatch requires the critical-work check; criticalWorkGate.kinds also governs inherited routing. A closed gate takes the Claude fallback.",
@@ -26,19 +27,19 @@
       "terra-5.6": "gpt-5.6-terra"
     },
     "antigravity": {
-      "sonnet": "claude-sonnet-4-6",
+      "sonnet": "claude-sonnet-5-5-high",
       "opus": "claude-opus-4-6-thinking",
       "flash": "gemini-3.8-flash",
-      "pro": "gemini-3.1-pro"
+      "pro": "gemini-4-argon-high"
     },
     "agy-claude": {
-      "sonnet": "claude-sonnet-4-6",
+      "sonnet": "claude-sonnet-5-5-high",
       "opus": "claude-opus-4-6-thinking",
       "opus-5-5": "claude-opus-5-5-high"
     },
     "agy-gemini": {
       "flash": "gemini-3.8-flash",
-      "pro": "gemini-3.1-pro"
+      "pro": "gemini-4-argon-high"
     }
   },
   "criticalWorkGate": {

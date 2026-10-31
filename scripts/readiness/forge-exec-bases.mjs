@@ -2,9 +2,10 @@ import * as fs from 'node:fs/promises';
 import {constants} from 'node:fs';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
-import {createHash} from 'node:crypto';
+import {createHash,randomBytes} from 'node:crypto';
 import {pathParts,bytePath,decodeManifest,digestManifest} from './forge-exec-manifest.mjs';
 const revision=sha=>typeof sha==='string'&&/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha);
+export const BASE_RETENTION=12;
 export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
 export const anonymousGitEnv=()=>({PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',
   GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'});
@@ -28,6 +29,7 @@ function gitExec({args,cwd,env,input}) {
 export async function materializeWorktree({work,root,baseSha,head,manifest,manifestDigest,exec=gitExec}) {
   if(!revision(head)||manifest?.git?.head!==head||baseSha!==undefined&&!revision(baseSha)||digestManifest(manifest)!==manifestDigest)throw new Error('Invalid Git evidence');
   const {siblings,git:logical,...primary}=manifest;
+  if(logical.diffCoverageBase!==undefined&&!revision(logical.diffCoverageBase))throw new Error('Invalid coverage base SHA');
   for(const entry of decodeManifest(primary).entries) {
     let leaf=Buffer.from(work);
     for(const part of pathParts(entry.path)){leaf=bytePath(leaf,part);if((await fs.lstat(leaf)).isSymbolicLink())throw new Error('Unsafe Git snapshot');}
@@ -61,6 +63,10 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
       '+refs/heads/main:refs/remotes/origin/main',head],cloned);
     await git(['rev-parse','--verify','refs/remotes/origin/main^{commit}'],cloned);
     await git(['cat-file','-e',head+'^{commit}'],cloned);
+    if(logical.diffCoverageBase!==undefined
+      && await git(['merge-base','--is-ancestor',logical.diffCoverageBase,head],cloned,undefined,true)===null
+      && await git(['merge-base','--is-ancestor',logical.diffCoverageBase,'refs/remotes/origin/main'],cloned,undefined,true)===null)
+      throw Object.assign(new Error('Coverage base unavailable; use local fallback'),{code:'diff-coverage-base-unavailable'});
     // Detach without checking files out over the verified Mac snapshot.
     await git(['update-ref','--no-deref','HEAD',head],cloned);
     if(await git(['rev-parse','--verify','HEAD'],cloned)!==head)throw new Error('Git HEAD mismatch; use local fallback');
@@ -85,6 +91,7 @@ export async function materializeWorktree({work,root,baseSha,head,manifest,manif
     // Publication is the final operation: no privileged Git may follow it.
     await fs.rename(join(cloned,'.git'),join(work,'.git'));
   } catch(error) {
+    if(error.code==='diff-coverage-base-unavailable')throw error;
     throw Object.assign(new Error('Git HEAD unavailable; use local fallback',{cause:error}),{code:'git-head-unavailable'});
   } finally {await fs.rm(pending,{recursive:true,force:true});}
 }
@@ -101,12 +108,51 @@ export async function baseDirectory(path,io=fs) {
   const st=await io.lstat(path);
   if(!st.isDirectory()||st.isSymbolicLink()||(st.mode&0o022))throw new Error('Unsafe base directory');
 }
-export async function baseGuard(root,action,io=fs) {
+export async function baseGuard(root,action,io=fs,{clock=Date.now,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),
+  kill=(pid,signal)=>process.kill(pid,signal),waitMs=5000,retryMs=25,maxAgeMs=86400000}={}) {
   await baseDirectory(root,io);
-  const guard=join(root,'.guard');
-  await io.mkdir(guard,{mode:0o700});
-  try{return await action();}finally{await io.rmdir(guard);}
+  const guard=join(root,'.guard'),deadline=clock()+waitMs,token=randomBytes(16).toString('hex');
+  const ownerName='owner-'+token,pending=join(root,'.guard-pending-'+token);
+  const bounded=()=>new Error('Base guard wait exceeded; use local fallback and inspect the guard owner');
+  await io.mkdir(pending,{mode:0o700});
+  try {
+    // Publish a nonempty owner directory atomically. An initializer delayed
+    // past maxAge may lose its empty mkdir placeholder, but its rename cannot
+    // replace a successor's nonempty lock, so it cannot enter the action.
+    await io.writeFile(join(pending,ownerName),JSON.stringify({pid:process.pid,timestamp:clock()}),{flag:'wx',mode:0o600});
+    for(;;) {
+      if(clock()>deadline)throw bounded();
+      try {await io.mkdir(guard,{mode:0o700});await io.rename(pending,guard);break;}
+      catch(error){if(!['EEXIST','ENOTEMPTY'].includes(error.code))throw error;}
+      try {
+        const st=await io.lstat(guard);
+        if(!st.isDirectory()||st.isSymbolicLink())throw new Error('Unsafe base guard');
+        const names=await io.readdir(guard);
+        if(names.length===1&&/^owner-[a-f0-9]{32}$/.test(names[0])) {
+          const file=join(guard,names[0]),owner=JSON.parse(await baseFile(file,io));
+          let dead=false;
+          if(Number.isSafeInteger(owner.pid)&&owner.pid>0) {
+            try{kill(owner.pid,0);}catch(error){if(error.code==='ESRCH')dead=true;else if(error.code!=='EPERM')throw error;}
+          } else if(clock()-st.mtimeMs>maxAgeMs)dead=true;
+          // Age alone never authorizes stealing from a live holder. Unlink
+          // only this generation's owner; losing reapers cannot remove a
+          // successor's owner. rmdir can only remove an empty placeholder.
+          if(dead){await io.unlink(file);await io.rmdir(guard);continue;}
+        } else if(!names.length&&clock()-st.mtimeMs>maxAgeMs) {
+          await io.rmdir(guard);continue;
+        }
+      }catch(error){
+        // A different identity's private guard is held, never stale evidence.
+        // Keep waiting within the same bound when its owner cannot be read.
+        if(!(error instanceof SyntaxError)&&!['ENOENT','ENOTEMPTY','EEXIST','EACCES','EPERM'].includes(error.code))throw error;
+      }
+      if(clock()>=deadline)throw bounded();
+      await sleep(Math.min(retryMs,deadline-clock()));
+    }
+    try{return await action();}finally{await io.unlink(join(guard,ownerName));await io.rmdir(guard);}
+  }finally{await io.rm(pending,{recursive:true,force:true});}
 }
+
 export async function readyBases(root,io=fs) {
   await baseDirectory(root,io);
   const records=[];
@@ -152,6 +198,31 @@ export async function copyLeaves(source,destination,entries,io=fs) {
     }
   }
 }
+// Root-created pins must be readable by the ops warmer. The privileged caller
+// supplies the operator identity; unprivileged creation needs no transfer.
+export async function createBasePin(root,run,baseSha,operator,io=fs) {
+  const active=join(root,'active'),pin=join(active,run);
+  await io.mkdir(active,{recursive:true,mode:0o700});
+  if(operator){
+    const fd=await io.open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+    try{
+      const st=await fd.stat();
+      if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
+      await fd.chown(operator.uid,operator.gid);
+    }finally{await fd.close();}
+  }
+  try{await io.writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
+  catch(error){if(error.code!=='EEXIST'||(await baseFile(pin,io)).toString()!==baseSha)throw error;}
+  if(operator){
+    const fd=await io.open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try{
+      const st=await fd.stat();
+      if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
+        ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
+      await fd.chown(operator.uid,operator.gid);
+    }finally{await fd.close();}
+  }
+}
 export async function pruneBases(root,io=fs) {
   const ready=await readyBases(root,io),active=new Set();
   await io.mkdir(join(root,'active'),{recursive:true,mode:0o700});await baseDirectory(join(root,'active'),io);
@@ -160,8 +231,44 @@ export async function pruneBases(root,io=fs) {
     if(!revision(sha))throw new Error('Unreadable active base pin: pruning refused');
     active.add(sha);
   }
-  const keep=new Set([...ready.slice(0,4).map(r=>r.sha),...active]);
+  const keep=new Set([...ready.slice(0,BASE_RETENTION).map(r=>r.sha),...active]);
   for(const name of await io.readdir(root)) {
     if((revision(name)&&!keep.has(name))||/^[a-f0-9]{40,64}\.tmp$/.test(name)||name.endsWith('.tmp'))await io.rm(join(root,name),{recursive:true,force:true});
+  }
+}
+
+// Prewarm metadata and trees live exclusively below ops-owned, non-writable
+// parents. Callers hold baseGuard throughout publication, pruning or claim.
+export async function prewarmDirectory(path,io=fs,uid=process.getuid()) {
+  await baseDirectory(path,io);
+  if((await io.lstat(path)).uid!==uid)throw new Error('Untrusted prewarm owner');
+}
+// Cheap publication evidence for reuse. Content is still fully verified after
+// an exclusive claim, before any worker can access the tree.
+export async function prewarmEntry(root,sha,slot,manifestDigest,io=fs,uid=process.getuid()) {
+  if(!revision(sha)||!/^[1-9]\d*$/.test(slot))throw new Error('Invalid prewarm identity');
+  const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
+  for(const path of [join(root,'prewarm'),parent,source])await prewarmDirectory(path,io,uid);
+  if(((await io.lstat(source)).mode&0o077)!==0)throw new Error('Prewarm tree is not private');
+  const st=await io.lstat(marker);
+  if(st.uid!==uid||(st.mode&0o022)||!st.isFile()||st.isSymbolicLink()||st.nlink!==1)throw new Error('Untrusted prewarm marker');
+  if((await baseFile(marker,io)).toString()!==JSON.stringify({sha,manifestDigest}))throw new Error('Invalid prewarm marker');
+}
+export async function claimPrewarm(root,sha,slot,destination,manifest,manifestDigest,verify,io=fs,uid=process.getuid()) {
+  if(!revision(sha)||!/^[1-9]\d*$/.test(slot))return false;
+  const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
+  let claimed=false;
+  try {
+    await prewarmEntry(root,sha,slot,manifestDigest,io,uid);
+    const existing=await io.lstat(destination).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+    if(existing)throw new Error('Prewarm destination already exists');
+    await io.rename(source,destination);claimed=true;
+    await verify(destination,manifest,manifestDigest,{fs:io});
+    await io.chmod(destination,0o755);
+    await io.rm(marker,{force:true});
+    return true;
+  }catch {
+    if(claimed)await io.rm(destination,{recursive:true,force:true});
+    return false; // Uncertain or corrupt optimization: ordinary verified copy.
   }
 }

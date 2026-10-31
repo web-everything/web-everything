@@ -2,7 +2,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner, digestArgv, digestInput, manifestWire, digestManifest, supervisorSource} from '../forge-exec-run.mjs';
+import {createRunner as productionRunner, digestArgv, digestInput, manifestWire, digestManifest, supervisorSource} from '../forge-exec-run.mjs';
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 import * as bases from '../forge-exec-bases.mjs';
@@ -10,17 +10,345 @@ import {buildManifest} from '../remote-exec.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 
+// Simulate only filesystem ownership; retain real directory modes/inodes and
+// run every production identity/ownership check on the supplied evidence.
+const workerIdentity=user=>{
+  const k=Number(user.split('-').at(-1)),uid=process.getuid()+1000+k,gid=process.getgid()+2000+k;
+  return {uid,gid,groups:[gid]};
+};
+const slotStat=async path=>Object.assign(await fs.lstat(path),{uid:process.getuid(),gid:workerIdentity(path).gid});
+const createRunner=options=>productionRunner({testSlotStat:slotStat,
+  testWorkerIdentity:workerIdentity,...options});
 let root, runner;
 const nonce='a'.repeat(32), hash=value=>createHash('sha256').update(value).digest('hex');
 beforeEach(async()=>{
   root=await fs.mkdtemp(join(process.env.TMPDIR,'forge-pool-'));
   for(const k of [1,2])await fs.mkdir(join(root,'runs',`slot-${k}`),{recursive:true,mode:0o710});
-  runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerIdentity:user=>({uid:1000+Number(user.split('-').at(-1)),gid:2000+Number(user.split('-').at(-1))})});
+  runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin'});
 });
 afterEach(async()=>fs.rm(root,{recursive:true,force:true}));
 const work=p=>join(root,'runs',p.slot.replace('forge-exec-','slot-'),p.run,'work');
 const lock=p=>join(root,'receipts','worker-active-'+p.slot.split('-').at(-1));
 describe('per-user worker reservations',()=>{
+  it('legacy fixtures without isolation injections reserve multiple slots as the operator',async()=>{
+    runner=productionRunner({testRoot:root,testPath:'/usr/bin:/bin'});
+    const a=await runner.prepare({nonce}),b=await runner.prepare({nonce});
+    expect([a.slot,b.slot]).toEqual(['forge-exec-1','forge-exec-2']);
+    for(const p of [a,b])expect(p.worker).toMatchObject({uid:process.getuid(),gid:process.getgid()});
+    await runner.finish({...a,nonce});await runner.finish({...b,nonce});
+  });
+  it('an identity injection alone still requires real slot ownership to match',async()=>{
+    runner=productionRunner({testRoot:root,testWorkerIdentity:workerIdentity});
+    await expect(runner.prepare({nonce})).rejects.toThrow('Untrusted slot directory');
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  it('a slot-stat injection alone enforces isolation against resolved system identities',async()=>{
+    const identity=workerIdentity('forge-exec-1');
+    // Supply system id output without requiring forge-exec accounts on the host.
+    const lookup=vi.fn(async(file,args)=>{
+      expect(file).toBe('/usr/bin/id');
+      expect(args[1]).toBe('forge-exec-1');
+      expect(['-u','-g','-G']).toContain(args[0]);
+      return {code:0,stdout:String(args[0]==='-u'?identity.uid:identity.gid)+'\n',stderr:''};
+    });
+    const stat=vi.fn(async path=>Object.assign(await fs.lstat(path),{uid:process.getuid()+1,gid:identity.gid}));
+    runner=productionRunner({testRoot:root,testSlotStat:stat,testIdExec:lookup});
+    await expect(runner.prepare({nonce})).rejects.toThrow('Untrusted slot directory');
+    expect(stat).toHaveBeenCalledOnce();
+    expect(lookup.mock.calls).toEqual(['-u','-g','-G'].map(flag=>['/usr/bin/id',[flag,'forge-exec-1']]));
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  it.each(['symlink','non-private mode'])('legacy fixtures still refuse a %s slot directory',async fault=>{
+    const slot=join(root,'runs/slot-1');
+    if(fault==='symlink'){
+      await fs.rename(slot,slot+'.saved');await fs.symlink(slot+'.saved',slot);
+    }else await fs.chmod(slot,0o777);
+    runner=productionRunner({testRoot:root});
+    await expect(runner.prepare({nonce})).rejects.toThrow('Untrusted slot directory');
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  it('explicit isolation never accepts UID zero',async()=>{
+    const identity=user=>({...workerIdentity(user),uid:0});
+    runner=createRunner({testRoot:root,testWorkerIdentity:identity,testSlotStat:slotStat});
+    await expect(runner.prepare({nonce})).rejects.toThrow(process.getuid()===0?'Worker must not share the operator identity':'Unknown worker identity');
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  async function requestFor(p) {
+    const dir=work(p);await fs.writeFile(join(dir,'package-lock.json'),'lock');
+    const manifest=manifestWire({entries:[{path:Buffer.from('package-lock.json'),sha256:hash('lock'),executable:false}],excluded:[]});
+    const argv=['npm','run','test:unit'];
+    return {...p,nonce,argv,env:{},lock:hash('lock'),manifest,manifestDigest:digestManifest(manifest),inputDigest:await digestInput(dir),argvDigest:digestArgv(argv)};
+  }
+  async function pruneWithoutUidProcesses(before='',after='') {
+    const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    const body=setup.match(/<<'PRUNE_PY'\n([\s\S]*?)\nPRUNE_PY/)[1];
+    const proc=join(root,'proc');await fs.mkdir(proc,{recursive:true});
+    const local=body.replaceAll('/srv/forge-exec',join(root,'runs')).replaceAll('/srv/forge-receipts',join(root,'receipts'))
+      .replaceAll('/srv/forge-cache',join(root,'cache')).replaceAll('/proc',proc);
+    return spawnSync('python3',['-I','-c',`import pwd, types, os\npwd.getpwnam=lambda _:types.SimpleNamespace(pw_uid=os.getuid())\n${before}\n${local}\n${after}`],
+      {encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+  }
+  it.each(['new','persisted'])('root pruning hands %s private writer inodes to the operator before slot acquisition',async mode=>{
+    await runner.telemetry();
+    const names=['worker-active','worker-active-1','worker-active-2'],inodes=[];
+    if(mode==='persisted')for(const name of names){
+      const path=join(root,'receipts','.'+name+'.writer');await fs.writeFile(path,'',{mode:0o600});
+      inodes.push((await fs.stat(path)).ino);
+    }
+    // Model root guards and a distinct operator even when this test runs as
+    // root. Real opens, modes, inodes and flock remain intact; missing fchown
+    // fails the ownership proof on both privileged and unprivileged hosts.
+    const before=String.raw`original_open, original_fstat, original_stat = os.open, os.fstat, os.stat
+operator = (os.getuid() or 1000, os.getgid() or 1000)
+owners = {}
+def operator_stat(path, *args, **kwargs):
+    st = original_stat(path, *args, **kwargs)
+    values = list(st)
+    if path == ${JSON.stringify(join(root,'receipts'))}: values[4:6] = operator
+    return os.stat_result(values)
+def root_open(path, *args, **kwargs):
+    fd = original_open(path, *args, **kwargs)
+    if str(path).endswith('.writer'): owners.setdefault(original_fstat(fd).st_ino, (0, 0))
+    return fd
+def root_stat(fd):
+    st = original_fstat(fd)
+    values = list(st)
+    values[4:6] = owners.get(st.st_ino, (st.st_uid, st.st_gid))
+    return os.stat_result(values)
+def transfer(fd, uid, gid):
+    st = original_fstat(fd)
+    assert owners[st.st_ino] == (0, 0)
+    owners[st.st_ino] = (uid, gid)
+os.open, os.fstat, os.stat, os.fchown = root_open, root_stat, operator_stat, transfer
+`;
+    const after=`assert len(owners) == 3\nassert all(owner == operator for owner in owners.values()), owners`;
+    const result=await pruneWithoutUidProcesses(before,after);expect(result.status,result.stderr).toBe(0);
+    for(const [i,name] of names.entries()){
+      const st=await fs.stat(join(root,'receipts','.'+name+'.writer'));
+      expect(st.mode&0o777).toBe(0o600);if(mode==='persisted')expect(st.ino).toBe(inodes[i]);
+    }
+    for(const k of [1,2]){
+      const p=await runner.prepare({nonce,slot:`forge-exec-${k}`});expect(p.slot).toBe(`forge-exec-${k}`);
+    }
+  });
+  it.skipIf(process.platform!=='linux'||process.getuid()!==0)('root pruning permits real operator acquisition of every slot',async()=>{
+    const uid=65534,gid=65534;
+    await runner.telemetry();
+    for(const path of [root,join(root,'runs'),join(root,'receipts'),join(root,'cache')])await fs.chown(path,uid,gid);
+    for(const k of [1,2])await fs.chown(join(root,'runs',`slot-${k}`),uid,2000+k);
+    const result=await pruneWithoutUidProcesses();expect(result.status,result.stderr).toBe(0);
+    for(const name of ['worker-active','worker-active-1','worker-active-2']){
+      const st=await fs.stat(join(root,'receipts','.'+name+'.writer'));
+      expect(st.uid).toBe(uid);expect(st.gid).toBe(gid);expect(st.mode&0o777).toBe(0o600);
+    }
+    // Load the runner and enter the fixture before dropping privilege. Private
+    // checkout/TMPDIR ancestors need not be traversable by the operator UID.
+    const source=`import {createRunner} from ${JSON.stringify(new URL('../forge-exec-run.mjs',import.meta.url).href)};
+process.chdir(process.argv[1]);
+process.setgroups([]);process.setgid(${gid});process.setuid(${uid});
+const runner=createRunner({testRoot:'.',testWorkerIdentity:user=>{
+  const k=Number(user.split('-').at(-1));return {uid:1000+k,gid:2000+k,groups:[2000+k]};
+}});
+for(const k of [1,2]){
+  const p=await runner.prepare({nonce:${JSON.stringify(nonce)},slot:'forge-exec-'+k});
+  if(p.slot!=='forge-exec-'+k)throw new Error('Wrong reservation');
+}`;
+    const acquired=spawnSync(process.execPath,['--input-type=module','-e',source,root],
+      {encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(acquired.status,acquired.stderr).toBe(0);
+  });
+  it.each(['foreign owner','non-private mode','symlink'])('prune refuses %s before transferring writer ownership',async fault=>{
+    await runner.telemetry();
+    const path=join(root,'receipts/.worker-active.writer');
+    if(fault==='symlink'){
+      const target=join(root,'foreign-writer');await fs.writeFile(target,'untouched',{mode:0o600});await fs.symlink(target,path);
+    }else await fs.writeFile(path,'',{mode:fault==='non-private mode'?0o644:0o600});
+    const before=String.raw`def forbidden_transfer(*args): raise AssertionError('untrusted inode was chowned')
+os.fchown = forbidden_transfer
+`+(fault==='foreign owner'?String.raw`original_fstat = os.fstat
+def foreign_stat(fd):
+    values = list(original_fstat(fd))
+    values[4] = 1048576
+    return os.stat_result(values)
+os.fstat = foreign_stat
+`:'');
+    const result=await pruneWithoutUidProcesses(before);
+    expect(result.status).not.toBe(0);expect(result.stderr).not.toContain('untrusted inode was chowned');
+    expect(result.stderr).toContain(fault==='symlink'?'Too many levels':'unsafe worker writer guard');
+    if(fault==='symlink')expect(await fs.readFile(join(root,'foreign-writer'),'utf8')).toBe('untouched');
+  });
+  it('excludes reclamation while an old reservation holder is paused before worker launch',async()=>{
+    await fs.rm(join(root,'runs/slot-2'),{recursive:true});
+    let reached,resume,paused=false;
+    const ready=new Promise(resolve=>reached=resolve),release=new Promise(resolve=>resume=resolve),launches=[];
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:async({argv,worker})=>{
+      if(!paused){paused=true;reached();await release;}
+      if(argv[0]==='npm')launches.push(worker.uid);
+      return {code:0};
+    }});
+    const a=await runner.prepare({nonce}),request=await requestFor(a),running=runner.run(request);
+    try {
+      await Promise.race([ready,running.then(()=>{throw new Error('Holder exited before the launch barrier');})]);
+      const expired=new Date(Date.now()-16*86400000);
+      const container=join(work(a),'../'),receipt=join(root,'receipts',a.run+'.running');
+      for(const path of [lock(a),container,receipt])await fs.utimes(path,expired,expired);
+      const writer=join(root,'receipts/.worker-active-1.writer'),inode=(await fs.stat(writer)).ino;
+      await fs.utimes(writer,expired,expired);
+      const unrelated=join(root,'receipts/unrelated.telemetry');await fs.writeFile(unrelated,'old');await fs.utimes(unrelated,expired,expired);
+      const result=await pruneWithoutUidProcesses();
+      expect(result.status,result.stderr).toBe(0);expect(result.stderr).not.toContain('abandoned reservation');
+      for(const path of [lock(a),container,receipt])expect(await fs.stat(path)).toBeDefined();
+      expect((await fs.stat(writer)).ino).toBe(inode);
+      await expect(fs.stat(unrelated)).rejects.toMatchObject({code:'ENOENT'});
+      const other=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:vi.fn()});
+      await expect(other.prepare({nonce})).rejects.toMatchObject({code:'forge-busy'});
+      expect(launches).toEqual([]);
+    }finally{resume();await running;}
+    expect(launches).toEqual([a.worker.uid,a.worker.uid]);
+    await runner.finish({...a,nonce});
+    const b=await runner.prepare({nonce});expect(b.worker.uid).toBe(a.worker.uid);
+    expect((await runner.run(await requestFor(b))).code).toBe(0);
+    await runner.finish({...b,nonce});
+  });
+  it('rejects a resumed stale controller after pruning and replacement reservation',async()=>{
+    await fs.rm(join(root,'runs/slot-2'),{recursive:true});
+    const calls=vi.fn(async()=>({code:0}));
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:calls});
+    const a=await runner.prepare({nonce}),request=await requestFor(a),expired=new Date(Date.now()-16*86400000);
+    await fs.utimes(lock(a),expired,expired);
+    // Retain prepared evidence to require the reservation identity recheck,
+    // rather than relying on receipt pruning to reject the stale controller.
+    const result=await pruneWithoutUidProcesses();expect(result.status,result.stderr).toBe(0);
+    expect(result.stderr).toContain('abandoned reservation worker-active-1');
+    const b=await runner.prepare({nonce});expect(b.worker.uid).toBe(a.worker.uid);
+    await expect(runner.run(request)).rejects.toThrow('Reservation mismatch');
+    expect(calls).not.toHaveBeenCalled();
+    expect((await runner.run(await requestFor(b))).code).toBe(0);
+    await runner.finish({...b,nonce});
+  });
+  it.each(['acquire','launch','finish'])('prune exclusion blocks reservation %s until its stable guard is released',async operation=>{
+    await fs.rm(join(root,'runs/slot-2'),{recursive:true});
+    const calls=vi.fn(async()=>({code:0}));
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerExec:calls});
+    const a=await runner.prepare({nonce}),request=await requestFor(a);
+    if(operation==='acquire')await runner.finish({...a,nonce});
+    calls.mockClear();
+    const guard=await fs.open(join(root,'receipts/.worker-active-1.writer'),'r+');
+    try {
+      const held=spawnSync('python3',['-I','-c','import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],{stdio:['ignore','pipe','pipe',guard.fd],timeout:10000});
+      expect(held.status,held.stderr?.toString()).toBe(0);
+      const attempted=operation==='acquire'?runner.prepare({nonce}):operation==='launch'?runner.run(request):runner.finish({...a,nonce});
+      await expect(attempted).rejects.toMatchObject({code:'forge-busy'});expect(calls).not.toHaveBeenCalled();
+      if(operation==='acquire')await expect(fs.stat(lock(a))).rejects.toMatchObject({code:'ENOENT'});
+      else expect((await fs.stat(lock(a))).isDirectory()).toBe(true);
+    }finally{await guard.close();}
+    if(operation==='acquire'){
+      const b=await runner.prepare({nonce});await runner.finish({...b,nonce});
+    }else{
+      if(operation==='launch')expect((await runner.run(request)).code).toBe(0);
+      await runner.finish({...a,nonce});
+    }
+  });
+  function supervisorProbe(config,script='') {
+    const probe=String.raw`import ctypes, json, os, sys, subprocess, fcntl, errno
+from unittest.mock import patch
+source, config = sys.argv[1:]
+cfg = json.loads(config)
+real_popen = subprocess.Popen
+def launch(*args, **kwargs):
+    fd = os.open(cfg['writer']['guard'], os.O_RDWR)
+    try:
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: pass
+        else: raise AssertionError('supervisor lost its writer lease before launch')
+    finally: os.close(fd)
+    inherited = kwargs['pass_fds'][0]
+    drop = kwargs['preexec_fn']
+    def checked_drop():
+        drop()
+        try: os.fstat(inherited)
+        except OSError as error: assert error.errno == errno.EBADF
+        else: raise AssertionError('task inherited the writer guard descriptor')
+    kwargs['preexec_fn'] = checked_drop
+    return real_popen(*args, **kwargs)
+`+script+String.raw`
+with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_value=[]), patch.object(subprocess, 'Popen', side_effect=launch):
+    libc.return_value.prctl.return_value = 0
+    sys.argv = ['supervisor', config]
+    exec(source)
+`;
+    return spawnSync('python3',['-I','-c',probe,supervisorSource,JSON.stringify(config)],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+  }
+  function supervisorConfig(p) {
+    return {uid:process.getuid(),gid:process.getgid(),argv:['/usr/bin/true'],cwd:root,env:{},status:join(root,'supervisor-status'),
+      writer:{run:p.run,nonce,slot:p.slot,guard:join(root,'receipts/.worker-active-1.writer'),reservation:join(lock(p),'reservation.json')}};
+  }
+  it('the root supervisor retains its own writer lease through fork and closes the child copy after UID drop',async()=>{
+    const a=await runner.prepare({nonce}),result=supervisorProbe(supervisorConfig(a));
+    expect(result.status,result.stderr).toBe(0);
+    expect(await fs.readFile(join(root,'supervisor-status'),'utf8')).toBe('0');
+  });
+  it.each(['replacement reservation','exclusive prune lease','oversized reservation','non-private writer guard','missing writer evidence'])('the root supervisor refuses launch after %s',async fault=>{
+    await fs.rm(join(root,'runs/slot-2'),{recursive:true});
+    const a=await runner.prepare({nonce}),config=supervisorConfig(a);
+    let guard;
+    try {
+      if(fault==='replacement reservation'){
+        await runner.finish({...a,nonce});await runner.prepare({nonce});
+      }else if(fault==='missing writer evidence'){
+        delete config.writer;
+      }else if(fault==='oversized reservation'){
+        await fs.writeFile(config.writer.reservation,Buffer.alloc(4*1024*1024+1,'x'));
+      }else if(fault==='non-private writer guard'){
+        await fs.chmod(config.writer.guard,0o644);
+      }else{
+        guard=await fs.open(config.writer.guard,'r+');
+        const held=spawnSync('python3',['-I','-c','import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],{stdio:['ignore','pipe','pipe',guard.fd],timeout:10000});
+        expect(held.status,held.stderr?.toString()).toBe(0);
+      }
+      const result=supervisorProbe(config,"def launch(*args, **kwargs):\n    with open(os.path.join(cfg['cwd'], 'launch-reached'), 'w') as marker: marker.write('launched')\n    raise AssertionError('worker launch was reached')\n");
+      expect(result.status).not.toBe(0);
+      const reasons={'replacement reservation':'Reservation mismatch','exclusive prune lease':'BlockingIOError',
+        'oversized reservation':'unsafe worker reservation','non-private writer guard':'unsafe worker writer guard','missing writer evidence':"KeyError: 'writer'"};
+      expect(result.stderr).toContain(reasons[fault]);
+      await expect(fs.stat(join(root,'launch-reached'))).rejects.toMatchObject({code:'ENOENT'});
+      await expect(fs.stat(config.status)).rejects.toMatchObject({code:'ENOENT'});
+    }finally{await guard?.close();}
+  });
+  it('refuses a symlinked writer guard before reserving or launching a worker',async()=>{
+    const p=await runner.prepare({nonce}),writer=join(root,'receipts/.worker-active-1.writer');
+    await runner.finish({...p,nonce});
+    await fs.rm(writer);const target=join(root,'foreign-guard');await fs.writeFile(target,'untouched');await fs.symlink(target,writer);
+    await expect(runner.prepare({nonce})).rejects.toMatchObject({code:'ELOOP'});
+    expect(await fs.readFile(target,'utf8')).toBe('untouched');
+    await expect(fs.stat(lock(p))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it.each([
+    ['duplicate uid','Duplicate worker identity'],['duplicate gid','Duplicate worker identity'],
+    ['operator uid','Worker must not share the operator identity'],['operator gid','Worker must not share the operator identity'],
+    ['foreign owner','Untrusted slot directory'],['foreign group','Untrusted slot directory'],
+    ['non-private worker group','Worker groups must be private'],
+  ])('refuses production isolation violation: %s',async(fault,message)=>{
+    const identity=user=>{
+      const ids=workerIdentity(user);
+      if(fault==='duplicate uid')ids.uid=workerIdentity('forge-exec-1').uid;
+      if(fault==='duplicate gid')ids.gid=workerIdentity('forge-exec-1').gid;
+      if(fault==='operator uid')ids.uid=process.getuid();
+      if(fault==='operator gid')ids.gid=process.getgid();
+      ids.groups=fault==='non-private worker group'?[ids.gid,ids.gid+1]:[ids.gid];
+      return ids;
+    };
+    const stat=async path=>{
+      const st=await slotStat(path);
+      if(fault==='duplicate gid')st.gid=workerIdentity('forge-exec-1').gid;
+      if(fault==='foreign owner')st.uid=process.getuid()+1;
+      if(fault==='foreign group')st.gid++;
+      return st;
+    };
+    runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerIdentity:identity,testSlotStat:stat});
+    await expect(runner.prepare({nonce})).rejects.toThrow(message);
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
   it('the actual supervisor UID scanner selects only A live processes and excludes B and zombies',()=>{
     const helper=supervisorSource.slice(supervisorSource.indexOf('def uid_processes():'),supervisorSource.indexOf('deadline ='));
     const probe=`import types, io, json\nuid=1001\ncfg={'reapUid':True}\nos=types.SimpleNamespace(listdir=lambda _:['11','22','33','not-a-pid'],getpid=lambda:99,stat=lambda path:types.SimpleNamespace(st_uid=1002 if path.endswith('/22') else 1001))\nopen=lambda path,mode:io.BytesIO(b'33 (zombie) Z 1' if '/33/' in path else b'11 (live) S 1')\n${helper}\nprint(json.dumps(sorted(uid_processes())))`;
@@ -30,7 +358,7 @@ describe('per-user worker reservations',()=>{
   it('runs two commands concurrently under separate UIDs and reaps only the finishing UID',async()=>{
     const calls=[],pending=[];
     runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',
-      testWorkerIdentity:user=>({uid:1000+Number(user.split('-').at(-1)),gid:2000+Number(user.split('-').at(-1))}),
+      testWorkerIdentity:workerIdentity,testSlotStat:slotStat,
       testWorkerExec:async call=>{
         calls.push(call);
         if(call.argv[1]==='run')return new Promise(done=>pending.push(()=>done({code:0})));
@@ -47,7 +375,7 @@ describe('per-user worker reservations',()=>{
     try {
       await vi.waitFor(()=>expect(pending).toHaveLength(2));
       const tasks=calls.filter(c=>c.argv[1]==='run');
-      expect(tasks.map(c=>c.worker.uid).sort()).toEqual([1001,1002]);
+      expect(tasks.map(c=>c.worker.uid).sort()).toEqual([workerIdentity('forge-exec-1').uid,workerIdentity('forge-exec-2').uid]);
       expect(tasks.map(c=>c.cwd).sort()).toEqual([work(a),work(b)].sort());
       expect(tasks.every(c=>[a.slot,b.slot].includes(c.worker.user))).toBe(true);
     }finally{for(const done of pending)done();await Promise.all(running);}
@@ -111,8 +439,49 @@ describe('per-user worker reservations',()=>{
     const body=setup.slice(setup.indexOf("{\n  printf 'ops ALL=('"),setup.indexOf('} > "$sudoers_pending"')+1);
     const result=spawnSync('bash',['-c','FORGE_EXEC_SLOTS=2\n'+body],{encoding:'utf8',timeout:10000});
     expect(result.status,result.stderr).toBe(0);
-    expect(result.stdout.split('\n')[0]).toBe('ops ALL=(forge-exec-1,forge-exec-2) NOPASSWD: /usr/bin/rsync');
+    expect(result.stdout).toBe([
+      'ops ALL=(forge-exec-1,forge-exec-2) NOPASSWD: /usr/bin/rsync',
+      'ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs',
+      'ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs *',
+      '',
+    ].join('\n'));
     expect(result.stdout).not.toContain('(ALL)');expect(result.stdout).not.toContain('(forge-exec-*)');
+    expect(result.stdout).not.toContain('SETENV');
+  });
+  it.each([true,false])('validates sudoers before installing root:root 0440 (visudo accepts: %s)',async valid=>{
+    const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    const install=setup.slice(setup.indexOf('visudo -cf "$sudoers_pending"'),setup.indexOf('trap - EXIT'));
+    const pending=join(root,'sudoers.pending');await fs.writeFile(pending,'fixture',{mode:0o600});
+    const result=spawnSync('bash',['-c',`
+set -euo pipefail
+sudoers_pending=$1
+visudo() { printf 'visudo:%s\\n' "$*"; return ${valid?0:1}; }
+chown() { printf 'chown:%s\\n' "$*"; }
+chmod() { printf 'chmod:%s\\n' "$*"; command chmod "$@"; }
+mv() { printf 'mv:%s\\n' "$*"; }
+${install}
+`,'fixture',pending],{encoding:'utf8',timeout:10000});
+    expect(result.status,result.stderr).toBe(valid?0:1);
+    expect(result.stdout).toBe([
+      `visudo:-cf ${pending}`,
+      ...(valid?[`chown:root:root ${pending}`,`chmod:440 ${pending}`,`mv:-f -- ${pending} /etc/sudoers.d/forge-exec`]:[]),
+      '',
+    ].join('\n'));
+    expect((await fs.stat(pending)).mode&0o777).toBe(valid?0o440:0o600);
+  });
+  it.each([2,3])('refuses shrinking an installed three-slot pool to %s slots',async slots=>{
+    const setup=await fs.readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    // Exercise the shipped guard against a private pool, before user creation
+    // or privileged setup can run. Only the installation path is redirected.
+    const guard=setup.slice(setup.indexOf('set -euo pipefail'),setup.indexOf('if ! id forge-exec'))
+      .replaceAll('/srv/forge-exec',root);
+    await fs.mkdir(join(root,'slot-3'));
+    const result=spawnSync('bash',['-c',guard+'\nprintf "setup-continues\\n"'],{
+      encoding:'utf8',timeout:10000,env:{...process.env,FORGE_EXEC_SLOTS:String(slots)},
+    });
+    expect(result.status,result.stderr).toBe(slots===2?1:0);
+    expect(result.stderr).toBe(slots===2?'forge-setup: cannot shrink an installed pool; retain its slot count and inspect reservations\n':'');
+    expect(result.stdout).toBe(slots===2?'':'setup-continues\n');
   });
   it('rejects client-selected identities outside the discovered pool',async()=>{
     for(const slot of ['root','forge-exec-3','forge-exec-01','../slot-1'])
@@ -207,7 +576,6 @@ describe('anonymous real Git snapshot',()=>{
           expect(git(call.cwd,'rev-parse','HEAD')).toBe(head);
           expect(git(call.cwd,'rev-parse','origin/main')).toBe(main);
           expect(git(call.cwd,'diff','--cached','--name-only')).toBe(tier);
-          await fs.mkdir(join(call.cwd,'coverage'));await fs.writeFile(join(call.cwd,'coverage/coverage-final.json'),coverage);
           expect(scanMaterializedGuards(call.cwd).coverage).toEqual(local);
           return {code:1};
         }
@@ -216,7 +584,7 @@ describe('anonymous real Git snapshot',()=>{
     const evidence={baseSha:main,baseManifestDigest:base.manifestDigest};
     const p=await runner.prepare({nonce,...(delta?evidence:{})}),dir=work(p),argv=['npm','run','check:standards'];
     for(const path of delta?snapshot.deltaPaths:snapshot.entries.map(e=>e.path)){
-      const to=join(dir,path.toString());await fs.mkdir(join(to,'..'),{recursive:true});await fs.copyFile(join(source,path.toString()),to);
+      const to=join(dir,path.toString());await fs.mkdir(join(to,'..'),{recursive:true});await fs.cp(join(source,path.toString()),to,{preserveTimestamps:true});
     }
     // Bind the full tree before transport; the cache merely avoids copying bytes.
     const full=join(root,'full');await fs.mkdir(full);
@@ -230,6 +598,43 @@ describe('anonymous real Git snapshot',()=>{
     expect(git(dir,'rev-parse','HEAD')).toBe(head);
     expect(gitCalls.some(call=>call.args.includes('fetch')&&call.args.at(-1)===head)).toBe(true);
     expect(await runner.finish(request)).toMatchObject({phase:'test',code:1});
+  });
+  it.each(['HEAD ancestor','main ancestor','missing','cached unrelated','mismatch','ref instead of SHA'])
+  ('binds the coverage base SHA and requires public reachability before execution: %s',async scenario=>{
+    const source=join(root,'public'),baseRoot=join(root,'bases');
+    await fs.mkdir(source);await fs.mkdir(baseRoot);
+    git(source,'init','-b','main');git(source,'config','user.name','Fixture');git(source,'config','user.email','f@example.invalid');
+    await fs.writeFile(join(source,'package-lock.json'),'lock');git(source,'add','.');git(source,'commit','-m','initial');
+    const initial=git(source,'rev-parse','HEAD');
+    git(source,'commit','--allow-empty','-m','public main');
+    const main=git(source,'rev-parse','HEAD');
+    git(source,'checkout','--orphan','private-base');git(source,'commit','-m','unrelated cached commit');
+    const unrelated=git(source,'rev-parse','HEAD');git(source,'checkout','main');
+    git(root,'clone','--bare',source,join(baseRoot,'repo.git'));
+    git(join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',scenario==='HEAD ancestor'?initial:main);
+    const head=scenario==='main ancestor'?initial:main;
+    const base=scenario==='missing'?'f'.repeat(40):scenario==='cached unrelated'?unrelated:scenario==='ref instead of SHA'?'main':main;
+    const execute=vi.fn(async()=>({code:0})),gitExec=vi.fn(cachedPublicGitExec);
+    runner=createRunner({testRoot:root,testPath:process.env.PATH,testWorkerExec:execute,testGitExec:gitExec});
+    const p=await runner.prepare({nonce}),dir=work(p),argv=['npm','run','check:standards'];
+    await fs.writeFile(join(dir,'package-lock.json'),'lock');
+    const manifest={...manifestWire({entries:[{path:Buffer.from('package-lock.json'),sha256:hash('lock'),executable:false,tracked:true}],excluded:[]}),git:{head,diffCoverageBase:base}};
+    const request={...p,nonce,argv,env:{DIFF_COVERAGE_BASE:scenario==='mismatch'?initial:base},
+      manifest,manifestDigest:digestManifest(manifest),inputDigest:await digestInput(dir),lock:hash('lock'),argvDigest:digestArgv(argv)};
+    if(scenario.endsWith('ancestor')) {
+      expect(await runner.run(request)).toMatchObject({code:0});
+      expect(git(dir,'rev-parse',base+'^{commit}')).toBe(base);
+      expect(execute.mock.calls.find(([call])=>call.argv[2]==='check:standards')[0].env.DIFF_COVERAGE_BASE).toBe(base);
+      expect(await runner.finish(request)).toMatchObject({phase:'test',code:0});
+    } else {
+      await expect(runner.run(request)).rejects.toThrow(scenario==='mismatch'?'Coverage base mismatch':scenario==='ref instead of SHA'?'Invalid Git evidence':'Coverage base unavailable');
+      expect(execute).not.toHaveBeenCalled();
+      await expect(fs.stat(join(dir,'.git'))).rejects.toMatchObject({code:'ENOENT'});
+      const receipt=await runner.finish(request);
+      if(['missing','cached unrelated'].includes(scenario))expect(receipt).toMatchObject({phase:'rejected',reason:'diff-coverage-base-unavailable',started:false});
+      else expect(receipt).toBeNull(); // Generic snapshot rejection retains the legacy fail-closed contract.
+      if(scenario==='mismatch')expect(gitExec).not.toHaveBeenCalled();
+    }
   });
   it.each([false,true])('certifies an unfetchable Mac HEAD as not-started git-head-unavailable without install or task execution (delta=%s)',async delta=>{
     const source=join(root,'public'),baseRoot=join(root,'bases');await fs.mkdir(source);await fs.mkdir(baseRoot);

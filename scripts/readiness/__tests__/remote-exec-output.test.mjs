@@ -2,13 +2,14 @@
 import { EventEmitter } from 'node:events';
 import {PassThrough} from 'node:stream';
 import * as remote from '../remote-exec.mjs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultExec } from '../remote-exec.mjs';
 
 const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock('node:child_process', () => ({ spawn }));
 
 beforeEach(() => spawn.mockReset());
+afterEach(()=>vi.useRealTimers());
 
 function capturedChild() {
   const child = new EventEmitter();
@@ -90,6 +91,50 @@ describe('bounded persistent Git blob reader',()=>{
     child.stdin.on('finish',()=>{child.stdout.end();queueMicrotask(()=>child.emit('close',0));});
     spawn.mockReturnValue(child);return child;
   }
+  it('rejects overlapping blob requests',async()=>{
+    const child=batchChild(()=>{}),reader=remote.createGitBlobReader({timeoutMs:50});
+    const first=reader.read('a'.repeat(40));
+    await expect(reader.read('b'.repeat(40))).rejects.toThrow('overlapping blob request');
+    child.stdout.write(`${'a'.repeat(40)} blob 1\nx\n`);
+    await expect(first).resolves.toEqual(Buffer.from('x'));
+    await reader.close();expect(child.kill).not.toHaveBeenCalled();
+  });
+  it('rejects a silent blob read at timeoutMs',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild(()=>{}),reader=remote.createGitBlobReader({timeoutMs:50});
+    const rejected=expect(reader.read('a'.repeat(40))).rejects.toThrow('deadline exceeded');
+    await vi.advanceTimersByTimeAsync(49);expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);await rejected;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await expect(reader.close()).rejects.toThrow('deadline exceeded');expect(vi.getTimerCount()).toBe(0);
+  });
+  it('kills a process that never closes',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild(()=>{});child.stdin.removeAllListeners('finish');child.kill=vi.fn(()=>true);
+    const reader=remote.createGitBlobReader({timeoutMs:50});
+    const settled=expect(reader.close()).rejects.toThrow('close deadline exceeded');
+    await vi.advanceTimersByTimeAsync(50);await settled;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');expect(vi.getTimerCount()).toBe(0);
+  });
+  it('rejects a stalled blob request at its deadline',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild((child,oid)=>child.stdout.write(`${oid} blob 5\nx`));child.kill=vi.fn(()=>true);
+    const reader=remote.createGitBlobReader({timeoutMs:50});
+    const settled=expect(reader.read('a'.repeat(40))).rejects.toThrow('deadline exceeded');
+    await vi.advanceTimersByTimeAsync(49);expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);await settled;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await expect(reader.close()).rejects.toThrow('deadline exceeded');expect(vi.getTimerCount()).toBe(0);
+  });
+  it('terminates a stalled close at its deadline',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild(()=>{});child.stdin.removeAllListeners('finish');
+    const reader=remote.createGitBlobReader({timeoutMs:50});
+    const settled=expect(reader.close()).rejects.toThrow('close deadline exceeded');
+    await vi.advanceTimersByTimeAsync(49);expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);await settled;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');expect(vi.getTimerCount()).toBe(0);
+  });
   it('reads multiple exact binary blobs through one process, with chunked protocol framing',async()=>{
     const contents=[Buffer.from('é\0bytes'),Buffer.from([0xff,0,1])];let index=0;
     batchChild((child,oid)=>{const content=contents[index++];const frame=Buffer.concat([Buffer.from(`${oid} blob ${content.length}\n`),content,Buffer.from('\n')]);for(const byte of frame)child.stdout.write(Buffer.from([byte]));});
@@ -110,6 +155,33 @@ describe('bounded persistent Git blob reader',()=>{
     });
     const reader=remote.createGitBlobReader({cwd:'local-checkout'});
     await expect(reader.read('a'.repeat(40))).rejects.toThrow(/full ship/i);
-    await reader.close();expect(child.kill).toHaveBeenCalled();
+    await expect(reader.close()).rejects.toThrow(/full ship/i);expect(child.kill).toHaveBeenCalled();
+  });
+});
+
+
+describe('SSH multiplexing directory boundary',()=>{
+  const directory='private-cm';
+  const safeFs=()=>({mkdirSync:vi.fn(),lstatSync:vi.fn(()=>({
+    isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o700,uid:process.getuid(),
+  }))});
+  it('uses a private directory, short hashed socket name and short persistence',()=>{
+    const fs=safeFs(),options=remote.connectionOptions({directory,fs});
+    expect(fs.mkdirSync).toHaveBeenCalledWith(directory,{mode:0o700});
+    expect(options).toEqual(['-o','BatchMode=yes','-o','ConnectTimeout=10','-o','ControlMaster=auto','-o','ControlPersist=60s','-o',`ControlPath=${directory}/%C`]);
+  });
+  it.each(['unwritable','symlink','permissions','owner','long path'])('disables reuse for %s directory evidence',fault=>{
+    const fs=safeFs();
+    if(fault==='unwritable')fs.mkdirSync.mockImplementation(()=>{throw Object.assign(new Error('denied'),{code:'EACCES'});});
+    if(fault==='symlink')fs.lstatSync.mockReturnValue({isDirectory:()=>true,isSymbolicLink:()=>true});
+    if(fault==='permissions')fs.lstatSync.mockReturnValue({isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o755});
+    if(fault==='owner')fs.lstatSync.mockReturnValue({isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o700,uid:process.getuid()+1});
+    expect(remote.connectionOptions({directory:fault==='long path'?'x'.repeat(101):directory,fs})).toEqual(['-o','BatchMode=yes','-o','ConnectTimeout=10']);
+  });
+  it('passes the selected reuse options to the SSH child',async()=>{
+    const child=capturedChild(),sshOptions=remote.connectionOptions({directory,fs:safeFs()});
+    const result=defaultExec({file:'ssh',args:['forge','true'],sshOptions});
+    expect(spawn.mock.calls[0][1]).toEqual([...sshOptions,'forge','true']);
+    child.emit('close',0);await result;
   });
 });

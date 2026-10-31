@@ -2,14 +2,14 @@
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, existsSync} from 'node:fs';
 import {join} from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
+import {fileURLToPath} from 'node:url';
 import * as runner from '../forge-exec-run.mjs';
 import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
 import {main as telemetryCli, readForgeTelemetry} from '../forge-telemetry.mjs';
 import {checkRemoteHealth} from '../forge-remote-health.mjs';
-import {parseCLI} from 'vitest/node';
 import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const roots = [];
@@ -22,6 +22,20 @@ const policy = remote => resolveAdmissionPolicy({platform:{remote:{enabled:true,
 const command = ['npx','vitest','run','a.test.mjs'];
 const classes = [command,['npx','vitest','related','src/a.ts','--run'],['npm','run','test:integration:vitest'],['npm','run','test:coverage']];
 const withArg = (argv,arg) => argv[0]==='npm' ? [...argv,'--',arg] : [...argv,arg];
+
+describe('Forge synchronous module loading', () => {
+  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs'])
+  ('loads %s synchronously without executing its CLI', module => {
+    // Native require rejects any top-level await in the entire static import graph.
+    const result=spawnSync(process.execPath,['--experimental-require-module','-e',
+      'require(process.env.FORGE_MODULE);'],{
+      env:{...process.env,FORGE_MODULE:fileURLToPath(new URL('../'+module,import.meta.url))},
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.status,result.stderr).toBe(0);
+    expect(result.stdout).toBe('');
+  });
+});
 
 describe('Forge telemetry contracts', () => {
   it('samples on demand on a fresh install without a telemetry file', async () => {
@@ -124,13 +138,20 @@ describe('Forge telemetry contracts', () => {
 
 describe('shared command classes', () => {
   it('proves the installed Vitest parser disables related run mode for --run false, and refuses it on both boundaries',()=>{
-    expect(parseCLI(['vitest','related','src/a.ts','--run','false']).options.run).toBe(false);
+    // Keep the runner's native ESM dependency graph outside the Vitest worker.
+    // The child still exercises the installed public parser, without starting a suite.
+    const parsed = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+      import {parseCLI} from 'vitest/node';
+      console.log(JSON.stringify(parseCLI(['vitest','related','src/a.ts','--run','false']).options.run));
+    `], {cwd:new URL('../../../', import.meta.url), encoding:'utf8', timeout:10000, maxBuffer:65536});
+    expect(parsed.status, parsed.error?.message || parsed.stderr).toBe(0);
+    expect(JSON.parse(parsed.stdout)).toBe(false);
     for(const value of ['false','False','FALSE','false.test.mjs']){
       const argv=['npx','vitest','related','src/a.ts','--run',value];
       expect(isAllowedCommand(argv)).toBe(false);
       expect(runner.allowedCommand(argv)).toBe(false);
     }
-  });
+  }, 15000);
   it.each(['--run','--silent','--no-color'].flatMap(flag=>
     ['false','true','false.test.mjs','true-source.ts'].map(value=>[flag,value])))
   ('rejects boolean-looking positional values immediately after %s: %s', (flag,value) => {
