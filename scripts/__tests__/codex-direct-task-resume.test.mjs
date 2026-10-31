@@ -100,22 +100,33 @@ describe('codexDirectTask resumeThreadId', () => {
     const execFn = vi.fn();
     await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 'a;b', spawnFn, execFn })).rejects.toThrow(/resumeThreadId/);
     await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 't1', ephemeral: true, spawnFn, execFn })).rejects.toThrow(/ephemeral/);
+    await expect(codexDirectTask({ task: 't', resumeThreadId: 't1', repoRoot: '/nowhere', spawnFn, execFn })).rejects.toThrow(/requires --dir/);
+    await expect(codexDirectTask({ task: 't', dir: '/nowhere', resumeThreadId: 't1', outputSchemaFile: 's.json', spawnFn, execFn })).rejects.toThrow(/output-schema/);
     expect(spawnFn).not.toHaveBeenCalled();
     expect(execFn).not.toHaveBeenCalled();
   });
 });
 
 describe('CLI --resume', () => {
-  const run = args => spawnSync(process.execPath, [SCRIPT, '--task=x', ...args], { encoding: 'utf8', timeout: 30000 });
+  // A private jobs dir keeps a regressed --detach from writing a job record into the real one.
+  const run = args => {
+    const jobsDir = mkdtempSync(join(tmpdir(), 'we-resume-jobs-'));
+    try {
+      return spawnSync(process.execPath, [SCRIPT, '--task=x', ...args],
+        { encoding: 'utf8', timeout: 30000, env: { ...process.env, CODEX_JOBS_DIR: jobsDir } });
+    } finally { rmSync(jobsDir, { recursive: true, force: true }); }
+  };
 
   it.each([
     [['--resume=t1'], /requires --dir/],
     [['--resume=t1', '--dir=/nowhere', '--output-schema-file=s.json'], /output-schema/],
     [['--resume', '--dir=/nowhere'], /needs a value/],
+    [['--resume=a;b', '--dir=/nowhere', '--detach'], /resumeThreadId/],
   ])('exits 2 on %j without running Codex', (args, message) => {
     const result = run(args);
     expect(result.status).toBe(2);
     expect(result.stderr).toMatch(message);
+    expect(result.stdout).not.toMatch(/recordPath/);
   });
 
   it('documents the flag in --help', () => {

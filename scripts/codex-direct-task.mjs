@@ -221,14 +221,24 @@ export function parseResumeFlag(flags) {
   if (typeof flags.resume !== 'string' || !flags.resume) {
     throw new TypeError('codex-direct-task: --resume needs a value: --resume=<threadId> from the previous run\'s report (events.threadId)');
   }
-  assertResumeThreadId(flags.resume, { ephemeral: Boolean(flags.ephemeral) });
-  if (flags['output-schema-file'] !== undefined) {
+  assertResumeRequest({ resumeThreadId: flags.resume, ephemeral: Boolean(flags.ephemeral),
+    outputSchemaFile: flags['output-schema-file'], dir: typeof flags.dir === 'string' ? flags.dir : undefined });
+  return flags.resume;
+}
+
+/**
+ * The whole resume contract, shared by `codexDirectTask` and `--resume`: a valid id, not ephemeral, an explicit
+ * checkout, and no output schema (which `codex exec resume` would silently drop).
+ * @param {{resumeThreadId: unknown, ephemeral?: boolean, outputSchemaFile?: unknown, dir?: unknown}} request
+ */
+export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputSchemaFile, dir }) {
+  assertResumeThreadId(resumeThreadId, { ephemeral });
+  if (outputSchemaFile !== undefined) {
     throw new TypeError('codex-direct-task: --resume cannot be combined with --output-schema-file (codex exec resume has no --output-schema)');
   }
-  if (typeof flags.dir !== 'string' || !flags.dir) {
+  if (typeof dir !== 'string' || !dir) {
     throw new TypeError('codex-direct-task: --resume requires --dir=<checkout> (the checkout the resumed thread already edited)');
   }
-  return flags.resume;
 }
 
 export function buildCodexDirectTaskArgv({
@@ -1102,7 +1112,7 @@ export async function codexDirectTask({
   resumeThreadId,
 } = {}) {
   // Fail before any clone, install or spawn work: a bad resume target must not cost a run.
-  if (resumeThreadId !== undefined) assertResumeThreadId(resumeThreadId, { ephemeral });
+  if (resumeThreadId !== undefined) assertResumeRequest({ resumeThreadId, ephemeral, outputSchemaFile, dir });
   if (typeof task !== 'string' || !task.trim()) {
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
   }
@@ -1581,6 +1591,14 @@ async function main() {
     writeLineSync(1, JSON.stringify(result));
     process.exit(code);
   }
+  // Before --detach: a bad resume must never create a job record or spawn a child.
+  let resumeThreadId;
+  try { resumeThreadId = parseResumeFlag(flags); }
+  catch (e) {
+    console.error(e.message);
+    process.exitCode = 2;
+    return;
+  }
   if (flags.detach) {
     const job = await startDetachedJob({ args });
     console.log(JSON.stringify({ id: job.id, recordPath: job.recordPath }));
@@ -1590,13 +1608,6 @@ async function main() {
   const task = flags['task-file'] ? readFileSync(resolve(flags['task-file']), 'utf8') : flags.task;
   if (!task || typeof task !== 'string' || !task.trim()) {
     console.error('codex-direct-task: pass --task=<text> or --task-file=<path>');
-    process.exitCode = 2;
-    return;
-  }
-  let resumeThreadId;
-  try { resumeThreadId = parseResumeFlag(flags); }
-  catch (e) {
-    console.error(e.message);
     process.exitCode = 2;
     return;
   }
