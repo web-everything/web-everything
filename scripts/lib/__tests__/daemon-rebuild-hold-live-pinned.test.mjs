@@ -73,6 +73,7 @@ function fixture() {
 }
 
 describe('a LIVE overlay that cannot be included holds the clone — never a candidate without it', () => {
+  // Runs real git repos (~4s measured); the 5s default is too tight under CI load.
   it('replays ~17:12 ET: the live mechanism-pinned stack top conflicts with the new main → hold, no stack-less candidate', async () => {
     const f = fixture();
     // the review stack top: changes rebuild mechanism files (pinned by derivation) AND review code
@@ -99,8 +100,9 @@ describe('a LIVE overlay that cannot be included holds the clone — never a can
     expect(readRebuildState(f.clone, f.env).building ?? null).toBeNull();
     expect(readRebuildState(f.clone, f.env).held).toMatchObject({ reason: 'established-overlay-conflict', lastGood: live });
     void pin;
-  });
+  }, 30_000);
 
+  // Runs real git repos (~4s measured); the 5s default is too tight under CI load.
   it('a mechanism-pinned overlay that is NOT live yet is still skipped as before (xpinskip keeps the fleet moving)', async () => {
     const f = fixture();
     addOverlay(f.clone, { ref: 'lane/overlay-pin', pr: 5809 }, { env: f.env });
@@ -113,7 +115,7 @@ describe('a LIVE overlay that cannot be included holds the clone — never a can
     expect(r.alerts.map((a) => a.kind)).toContain('pinned-overlay-conflict-skipped');
     expect(r.alerts.map((a) => a.kind)).not.toContain('established-overlay-hold');
     expect(r).toMatchObject({ adopted: true });
-  });
+  }, 30_000);
 });
 
 describe('matchReadyCandidate — superseded never drops a live overlay (fail closed)', () => {
