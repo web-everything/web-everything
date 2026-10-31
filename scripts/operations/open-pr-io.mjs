@@ -15,7 +15,7 @@
  */
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
@@ -77,6 +77,7 @@ function pathWithShimFirst(dir, pathEnv) {
   return [dir, ...pathEnv.split(':').filter((d) => d && d !== dir)].join(':');
 }
 import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan } from '../lib/pre-pr-review.mjs';
+import { isPrepExempt, logPrepEvent, prepVerdict } from '../lib/prep-block.mjs';
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr, prepareBatchIds, verifyPrepareBatchPr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
@@ -130,6 +131,7 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
 export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+  prepGate = prepVerdict, readPrepBody = readFileSync, prepLogPath,
   // Card 6931 — the credential env is resolved per run, inside the runner, so a daemon's guard refusal is a refused
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
@@ -146,6 +148,26 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     let r;
     let cleanupBody = () => {}; // removes the temp PR-body copy a bypass writes; called on every path out
     const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
+    if (!argv.includes('--dry-run')) {
+      let body = '';
+      let readable = true;
+      const bodyFile = arg('body-file');
+      if (bodyFile) {
+        try { body = readPrepBody(resolve(cwd, bodyFile.replace(/^~/, homedir())), 'utf8'); }
+        catch (error) {
+          readable = false;
+          const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+          process.stderr.write(`open-pr: WARNING — prep body unreadable; deferring to existing handling: ${detail}\n`);
+        }
+      }
+      if (readable) {
+        const prep = prepGate(body);
+        if (prep.waived) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
+        else if (!isPrepExempt(`${arg('title') || ''}\n${body}`) && !prep.ok) {
+          return { outcome: 'refused', reason: 'prep-block-missing', detail: prep.reason };
+        }
+      }
+    }
     // Pre-PR review gate (card 2): ADDED before the home's own gates, never instead of them (the post-PR review
     // gate and the verify finish-guard still run inside pr-land). A rehearsal opens nothing, so it is not gated.
     // Any failure of the check is mode-aware (`failedGate`): enforce refuses, it never silently admits.
