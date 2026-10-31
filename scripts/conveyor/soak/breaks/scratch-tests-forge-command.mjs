@@ -7,6 +7,14 @@ import * as worker from '../../../lib/daemon-rebuild/auto-rebase.mjs';
 import { runRemote } from '../../../readiness/remote-exec.mjs';
 import { allowedCommand } from '../../../readiness/forge-exec-run.mjs';
 
+// The injected Git database is virtual. Its directory and worktree must still
+// resolve on disk so the real remote client's binding checks run normally.
+export function scratchGitBinding(call) {
+  if (call.file !== 'git' || !call.args.includes('--show-toplevel')) return;
+  const root = fs.realpathSync(call.cwd);
+  return { code: 0, stdout: Buffer.from(`${root}\n${root}\n`) };
+}
+
 // Exercise both built-in producers: TAP loses the distinction between empty suites
 // and tests, while the basic summary counts only typed test tasks.
 export async function scratchTestOutput(files, { summary = true } = {}) {
@@ -46,6 +54,8 @@ export async function runScratchForgeCase({ emptySuite = false } = {}) {
     let state, remote, runs = 0;
     const exec = async call => {
       if (call.file === 'git') {
+        const binding = scratchGitBinding(call);
+        if (binding) return binding;
         if (call.args.includes('-i')) return { code: 0, stdout: Buffer.alloc(0) };
         const records = call.args.includes('--stage') ? files.map(name => {
           const content = fs.readFileSync(join(root, name));

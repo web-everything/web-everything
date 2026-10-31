@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { buildHeavyTestInvocation, heavyTestReport, runHeavyTests, kickAutoRebase, resolveAutoRebaseSwitch, runAutoRebase, finishPendingSwaps } from '../daemon-rebuild/auto-rebase.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, appendOverlayEvent, persistStackBases } from '../daemon-overlays.mjs';
@@ -13,7 +14,7 @@ import { writeRebuildState, readRebuildState, alertsFilePath } from '../daemon-r
 import { runTestInventoryCase } from '../../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
 import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runRemote } from '../../readiness/remote-exec.mjs';
-import { runScratchForgeCase, scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
+import { runScratchForgeCase, scratchGitBinding, scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
 
 const temps = [];
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-auto-test-')); temps.push(p); return p; };
@@ -136,7 +137,8 @@ describe('auto-rebase executed-test inventory', () => {
     const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], testReport: join(root, 'report.json'), env: {} });
     // Reporters choose colors at import time. Use a fresh process to exercise
     // their CI output even when the parent test runner disables colors.
-    const producer = new URL('../../conveyor/soak/breaks/scratch-tests-forge-command.mjs', import.meta.url).href;
+    const producer = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)),
+      '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs')).href;
     const env = { ...process.env, FORCE_COLOR: '1' };
     delete env.NO_COLOR;
     const emit = tasks => {
@@ -188,10 +190,10 @@ describe('auto-rebase executed-test inventory', () => {
       { name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }] },
     ] });
     expect(exec).toHaveBeenCalledWith(process.execPath, invocation.args, { cwd: root, env: {} });
-    const transport = vi.fn(async () => ({ code: 1 }));
+    const transport = vi.fn(async call => scratchGitBinding(call) ?? { code: 1 });
     const remote = await runRemote({ argv: invocation.args.slice(5), cwd: root, env: {}, exec: transport });
     expect(remote.reason).toBe('forge-unreachable');
-    expect(transport).toHaveBeenCalled();
+    expect(transport.mock.calls.some(([call]) => call.file === 'ssh' && call.args.at(-1) === 'true')).toBe(true);
   });
 
   it.each([
