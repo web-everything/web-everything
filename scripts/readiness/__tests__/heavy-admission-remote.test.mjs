@@ -62,6 +62,51 @@ function expectFallback(log, reason) {
 }
 
 describe('remote admission policy', () => {
+  it.each([
+    'invalid-diff-coverage-base',
+    'diff-coverage-base-unavailable',
+    'coverage-report-not-portable',
+  ])('runs locally after the adapter confirms pre-execution coverage fallback %s', async (reason) => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'coverage-fallback-'));
+    testRoots.push(root);
+    const pool = join(root, 'pool');
+    const lockRoot = join(pool, '.admission', 'heavy');
+    const remoteRoot = join(pool, '.admission', 'remote');
+    mkdirSync(pool);
+    const preferences = join(root, 'preferences.json');
+    writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
+      remote: { enabled: true, mode: 'always' }, fastScale: { maxSlots: 1 },
+    } }));
+    const exited = new Error('test exit');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: preferences,
+      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '',
+      WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '',
+      WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0' })) vi.stubEnv(key, value);
+    const remoteExec = vi.fn(async () => adaptLegacyRemoteResult({ mode: 'fallback', reason }));
+    vi.mocked(execSync).mockImplementation(() => {
+      expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(1);
+      expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toHaveLength(0);
+      expect(existsSync(join(remoteRoot, 'slot-0.unconfirmed'))).toBe(false);
+      throw Object.assign(new Error('local command exit'), { status: 17 });
+    });
+    try {
+      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec, readTelemetry: healthyRead }))
+        .rejects.toBe(exited);
+      expect(remoteExec).toHaveBeenCalledTimes(1);
+      expect(execSync).toHaveBeenCalledTimes(1);
+      expect(execSync).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
+        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+      }));
+      expect(exit).toHaveBeenCalledWith(17);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`fallback: ${reason}`));
+      expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
+    } finally {
+      vi.mocked(execSync).mockReset(); exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs();
+    }
+  });
+
   it('runs unsupported check:standards arguments locally with a reason and no remote staging',async()=>{
     const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
     const preferences=join(root,'preferences.json');
@@ -253,6 +298,9 @@ describe('adaptLegacyRemoteResult', () => {
     'forge-unreachable',
     'copy-failed',
     'ignored-test-file',
+    'invalid-diff-coverage-base',
+    'diff-coverage-base-unavailable',
+    'coverage-report-not-portable',
     'unsupported-sibling-dependency',
   ])('maps %s to a confirmed non-start only at the adapter boundary', async (reason) => {
     const legacy = { mode: 'fallback', reason };
