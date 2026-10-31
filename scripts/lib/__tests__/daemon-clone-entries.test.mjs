@@ -221,3 +221,15 @@ it('permits node paths, absolute scripts, plain flags, pass names and numeric ar
       join(f.root, 'worker.mjs'), join(f.root, 'worker.js'), join(f.root, 'worker.cjs'), '-e', '--no-warnings', '--pass=NAME', '42'] }),
   }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs', 'worker.js', 'worker.cjs']));
 });
+
+it('refuses an extensionless in-clone LaunchAgent script entry instead of silently omitting it', () => {
+  const f = fixture();
+  mkdirSync(join(f.root, 'scripts'));
+  writeFileSync(join(f.root, 'scripts', 'some-daemon'), 'entrypoint');
+  writeFileSync(join(f.launchAgentsDir, 'com.we.ext.plist'), 'plist');
+  for (const arg of [join(realpathSync(f.root), 'scripts/some-daemon'), 'scripts/some-daemon']) {
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/node', arg] }),
+    }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.ext.plist: ${arg}`);
+  }
+});
