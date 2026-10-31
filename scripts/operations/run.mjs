@@ -23,6 +23,8 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
+import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
@@ -190,6 +192,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 
 export const OPERATIONS = Object.freeze({
+  [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
