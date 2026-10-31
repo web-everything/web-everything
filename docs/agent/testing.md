@@ -3624,13 +3624,21 @@ refuses with `manifest-walk-limit` (local fallback) when that budget is exhauste
 ## Forge ignored test discovery
 
 Git ignores do not define Vitest discovery. Full and delta manifest admission omit ignored
-test-shaped build outputs only when every cwd `vitest*.config.*` excludes them from its
-include-minus-exclude set. Missing/unreadable configs, evaluation errors and malformed globs
-retain the existing local fallback. Keep fixture discovery configs explicit; test the native
-Node loader against the repository configs as well as full/delta parity. Warm bases export
-tracked Git entries only; their policy exclusions still refuse test-shaped entries.
-The selector only reproduces relative globs with ordinary wildcards and flat literal
-brace lists. Absolute/negated patterns, traversal and unsupported syntax in either
-include or exclude retain selection and the existing local fallback; never infer
-discovery parity merely because micromatch compiles a pattern. The selector regressions
-cover these refusals alongside the supported repository-config path.
+test-shaped files only when Vitest's own `createVitest('test', options)` and
+`globTestFiles(filters)` prove they are absent from the selected files. A native Node child
+resolves `vitest/node` from the lane, forwards its environment, discovers the actual config
+and workspace, and closes the context without running tests. Mirror the CLI's `TEST=true`,
+`VITEST=true` and default `NODE_ENV=test` prelude (preserving an explicit `NODE_ENV`):
+`createVitest` alone does not set them. Admission forwards the run's
+argv and environment through full and delta paths. Only `npx vitest run` / `vitest run`
+are understood, with `--config/-c`, `--root/-r`, `--dir`, repeated `--project`, and positional
+filters. Reporting accepts `--reporter`, `--silent` and bare/boolean `--coverage` only;
+unknown options, other commands and missing argv retain the existing ignored/unshipped-test
+local fallback. Repeated scalar selection flags also retain fallback.
+
+The listing has a 60-second SIGKILL deadline and a 4 MiB output bound. Child/listing errors,
+timeouts, oversized output, invalid JSON or paths retain local fallback; use local execution
+through heavy admission when evidence is unavailable. Keep native-child regressions for
+config/workspace discovery and no test execution, plus injected full/delta parity and refusal
+cases. Warm bases have no run argv and export tracked Git entries only; policy exclusions
+still refuse test-shaped entries, as do commandless manifest callers.
