@@ -38,21 +38,31 @@ function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
 export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, port) {
   let beat = null;
   let loading = false;
+  let stopRequested = false;
   const cleanup = () => {
     clearTimeout(timer);
     clearInterval(beat);
     // Do not tear down an isolate during ESM evaluation (Node 22 can abort in AsyncModuleExecutionFulfilled).
-    // Closing the port after the import settles lets the worker exit naturally, with no live timers left.
+    // Close the port only after the import settles; cancellation also exits any handles the module left alive.
     if (!loading) port.close();
   };
-  port.on('message', (message) => { if (message === 'stop') cleanup(); });
+  const stop = () => {
+    stopRequested = true;
+    if (loading) return;
+    cleanup();
+    process.exit(0); // Ends only this worker thread, even if the heartbeat module owns live handles.
+  };
+  port.on('message', (message) => { if (message === 'stop') stop(); });
   const timer = setTimeout(() => {
     clearInterval(beat);
     fireTreeKill({ pid, kill, flag, afterTree: () => port.postMessage('fired') });
     if (Atomics.load(flag, 0) === 2) port.postMessage('swept');
     cleanup();
   }, Math.max(0, deadline - Date.now()));
-  if (Atomics.load(flag, 0) !== 0) { cleanup(); return; }
+  if (Atomics.load(flag, 0) !== 0) {
+    if (Atomics.load(flag, 0) === -1) stop(); else cleanup();
+    return;
+  }
   if (heartbeat) {
     // The ceiling above is already armed and must survive a heartbeat module that fails to load.
     let fn = null;
@@ -60,7 +70,9 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
     try { fn = (await import(heartbeat.module))[heartbeat.exportName]; } catch { /* no heartbeat; the ceiling still holds */ }
     loading = false;
     if (typeof fn === 'function' && Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
-    if (Atomics.load(flag, 0) !== 0) cleanup();
+    const state = Atomics.load(flag, 0);
+    if (stopRequested || state === -1) stop();
+    else if (state !== 0) cleanup();
   }
 }
 

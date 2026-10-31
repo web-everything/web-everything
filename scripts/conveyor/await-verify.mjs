@@ -339,6 +339,20 @@ export function main(argv = process.argv.slice(2), {
     if (record.lane && foreignRecord(awaitVerifyStoreKey(record), record.lane)) {
       err(`refusing to overwrite the await record for ${awaitVerifyStoreKey(record)}: it belongs to another lane`); return 2;
     }
+    if (record.kind === 'fix') {
+      const previous = readStore(awaitVerifyStoreKey(record));
+      // The same repair round may re-mark a new commit after a previous-CI handoff.
+      // Carry its pinned evidence, but never inherit it from another PR, branch or session.
+      if (previous?.kind === 'fix' && ['sessionId', 'who', 'repo', 'pr', 'lane', 'ref'].every(key => previous[key] === record[key])
+        && previous.previousCi) {
+        record.previousCi = previous.previousCi;
+        // A mark racing a busy/failed handoff must not turn its intent marker into a delivered inventory.
+        if (previous.pendingResume?.kind === 'previous-ci' && !previous.pendingResume.delivered) {
+          record.pendingResume = previous.pendingResume;
+          record.resumeFailures = previous.resumeFailures ?? 0;
+        }
+      }
+    }
     const result = write({ cwd, record });
     if (!result.ok) { err(result.reason); return 2; }
     if (record.lane) {

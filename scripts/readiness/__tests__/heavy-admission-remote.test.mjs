@@ -21,7 +21,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 }));
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
-const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3,
+const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15 };
 const testRoots=[];
 afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
@@ -92,9 +92,9 @@ describe('remote admission policy', () => {
     }
   });
   it('ignores conflicting tool remote settings on the shared pool', () => {
-    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
+    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = resolveAdmissionPolicy({
-      platform: { remote }, tool: { remote: { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 99 } }, env: {},
+      platform: { remote }, tool: { remote: { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 99, clientPath: 'ignored' } }, env: {},
     });
     expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
     for (const leaf of Object.keys(remote)) {
@@ -190,7 +190,7 @@ describe('remote admission policy', () => {
   });
 
   it('resolves valid platform remote settings and their provenance', () => {
-    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
+    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = policyFor(remote);
     expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
     expect(policy.sources).toMatchObject({
