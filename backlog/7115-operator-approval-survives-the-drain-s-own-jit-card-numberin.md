@@ -3,7 +3,7 @@ bornAs: xxj37pd
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/review-set-label.mjs", "we:scripts/lib/red-team-carry-io.mjs", "we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/__tests__/review-referral-evidence-carry.test.mjs", "we:scripts/lib/__tests__/red-team-carry-machine.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs"]
+scope: ["we:scripts/review-set-label.mjs", "we:scripts/lib/red-team-carry-io.mjs", "we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/queue-branch-numbering.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/__tests__/review-referral-evidence-carry.test.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/lib/__tests__/red-team-carry-machine.test.mjs", "we:scripts/lib/__tests__/queue-branch-numbering.test.mjs"]
 dateOpened: "2026-10-25"
 preparedDate: "2026-10-31"
 preparedAgainstSha: "abbd8c6c1c437208810b23b3be1c915a8368b55b"
