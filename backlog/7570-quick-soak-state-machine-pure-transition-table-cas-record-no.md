@@ -1,4 +1,5 @@
 ---
+bornAs: xb0txug
 kind: story
 size: 5
 status: open
@@ -71,5 +72,5 @@ Run the red-team's two 5b8f9977 probes as table rows (they must fail by refusal 
 
 ## Follow-ups
 
-- Wire the machine into daemon-rebuild (card xis8290, blockedBy this).
+- Wire the machine into daemon-rebuild (card 7571, blockedBy this).
 - Lint that every setting named in a PR body exists in the diff and has a test.

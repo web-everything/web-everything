@@ -1,10 +1,11 @@
 ---
+bornAs: xis8290
 kind: story
 size: 8
 status: open
 scope: ["we:scripts/lib/daemon-rebuild/quick-soak-job.mjs", "we:scripts/lib/daemon-rebuild/quick.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/state.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/lib/daemon-rebuild/__tests__/"]
 scopeRationale: "New quick-soak state and control tests live under we:scripts/lib/daemon-rebuild/__tests__/. The basename-matched we:scripts/__tests__/state.test.mjs tests the unrelated /state CLI, not we:scripts/lib/daemon-rebuild/state.mjs."
-blockedBy: ["xb0txug"]
+blockedBy: ["7570"]
 dateOpened: "2026-10-31"
 preparedDate: "2026-10-31"
 preparedAgainstSha: "06649b999eb6a4ddceadd53808ed09b5d9ee6cf6"
@@ -24,12 +25,12 @@ Drive the daemon-rebuild quick soak through the pure state machine and CAS recor
 ## Non-goals
 
 - [N1] No default-on. The setting ships off; turning it on is a separate operator call.
-- [N2] No change to the state machine tables (owned by card xb0txug).
+- [N2] No change to the state machine tables (owned by card 7570).
 - [N3] No migration: PR 6084 never landed.
 
 ## Design
 
-Drive the quick soak through `step()` and the CAS record from card xb0txug.
+Drive the quick soak through `step()` and the CAS record from card 7570.
 
 - `we:scripts/lib/daemon-rebuild/quick-soak-job.mjs`: tick loop. At tick start read the record, run recovery, then apply events from observations and execute returned `effects[]` (git resets, smoke launch, pages). Each effect is bracketed write-intermediate, git-effect, write-next so a crash is recoverable.
 - `we:scripts/lib/daemon-rebuild/quick.mjs`, `we:scripts/lib/daemon-rebuild/adopt.mjs`, `we:scripts/lib/daemon-rebuild/smoke.mjs`, `we:scripts/lib/daemon-rebuild/state.mjs`, `we:scripts/lib/daemon-live-smoke.mjs`: replace ad-hoc marker comparisons with record events; delete `assertMarkerIdentity` and its callers.
