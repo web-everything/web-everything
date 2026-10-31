@@ -107,9 +107,9 @@ describe('admission import boundary', () => {
     const policy = resolveAdmissionPolicy();
     policy.settings.remote.clientPath = clientPath;
     // The bundled client refuses this command before any external IO. Do not replace its loader with a mock.
+    // Pin the clock to assert the complete result, including the bundled client's stage timings.
     expect(await createRemoteExec({ policy })({
-      argv: ['not-an-allowed-heavy-command'],
-      clock: () => Date.parse('2026-01-01T12:00:00Z'),
+      argv: ['not-an-allowed-heavy-command'], clock: () => Date.parse('2026-01-01T12:00:00Z'),
     })).toEqual({
       mode: 'not-started', terminated: true, reason: 'command-not-allowed',
       timings: [{ stage: 'total', startedAtET: '2026-01-01T07:00:00.000-05:00', ms: 0 }],
