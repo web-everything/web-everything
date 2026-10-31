@@ -59,11 +59,22 @@ const matchedHolderStates = (state, holderStates) => typeof state.baseRefName ==
   (s === 'in-merge-queue' && state.inMergeQueue === true)
   || (state.labels ?? []).some(label => (typeof label === 'string' ? label : label?.name) === s));
 
+const RED_TEAM_BLOCKED = 'red-team:blocked';
+/** Reasons a matched holder can never land as it stands: a draft (operator-parked) or a red-team block.
+ * Missing isDraft (legacy snapshot) is not evidence of a draft, so the hold is retained. */
+const cannotLandReasons = state => [
+  ...(state.isDraft === true ? ['draft'] : []),
+  ...((state.labels ?? []).some(label => (typeof label === 'string' ? label : label?.name) === RED_TEAM_BLOCKED) ? [RED_TEAM_BLOCKED] : []),
+];
+
 /** PURE: only a holder near landing can use a real conflict to serialize fixers. */
 export function landingHolderDecision({ state, setting }) {
   if (setting?.enabled !== true) return { hold: true, why: 'trial merge conflicts' };
   if (state == null) return { hold: true, failedClosed: true, why: 'trial merge conflicts; holder state unreadable, retaining hold' };
   const matched = matchedHolderStates(state, setting.holderStates);
+  const blocked = matched.length ? cannotLandReasons(state) : [];
+  if (blocked.length) return { hold: false,
+    why: `trial merge conflicts; holder cannot land: ${blocked.join(', ')} — not waiting, dispatching in parallel, land-time conflict handling resolves it` };
   if (matched.length) return { hold: true, landing: true,
     why: `trial merge conflicts; holder is landing (${matched.join(', ')}) — waiting until it merges` };
   return { hold: false, why: 'trial merge conflicts; holder not near landing — dispatching in parallel, land-time conflict handling resolves it' };
@@ -78,10 +89,12 @@ export function parseHolderStates(json) {
     const states = new Map();
     for (const node of nodes) {
       if (prNumber(node?.number) === null || typeof node.headRefOid !== 'string'
-        || typeof node.isInMergeQueue !== 'boolean' || !Array.isArray(node.labels?.nodes)
+        || typeof node.isInMergeQueue !== 'boolean' || (node.isDraft !== undefined && typeof node.isDraft !== 'boolean')
+        || !Array.isArray(node.labels?.nodes)
         || !node.labels.nodes.every(label => typeof label?.name === 'string')) return null;
       states.set(Number(node.number), { labels: node.labels.nodes.map(label => label.name),
         inMergeQueue: node.isInMergeQueue, headRefOid: node.headRefOid,
+        ...(typeof node.isDraft === 'boolean' ? { isDraft: node.isDraft } : {}),
         ...(typeof node.baseRefName === 'string' ? { baseRefName: node.baseRefName } : {}) });
     }
     return states;
@@ -106,7 +119,7 @@ export function createHolderStateReader({ repo, // owner/name slug (ghRepoSlug);
         repository(owner: $owner, name: $name) {
           pullRequests(states: OPEN, first: 100, after: $cursor) {
             pageInfo { hasNextPage endCursor }
-            nodes { number headRefOid baseRefName isInMergeQueue labels(first: 50) { nodes { name } } }
+            nodes { number headRefOid baseRefName isDraft isInMergeQueue labels(first: 50) { nodes { name } } }
           }
         }
       }`;
