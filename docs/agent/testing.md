@@ -455,7 +455,7 @@ Only a head with neither status nor row starts fresh. A trusted result comment, 
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
 prevents dispatch, except a finished `skipped` status with `skipCardOnly === true` and a
 stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` matching the status head: that historical gap dispatches fresh to settle the skip. A structured result with an absent policy or any policy other than `card-only` never heals; legacy string `skipped` remains eligible.
-The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
+The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. A dead running owner with `completedRecorded === true` or `cleanRecorded === true` dispatches resume with stale abandonment; production admission requires verified abandonment, re-probes staleness and checks completed-seat evidence before normalizing that prior to finished `ran`. The shared guard independently requires the matching completed row, so missing rows still refuse without a model call. Retry-spent and stale-recovery bounds still apply. Regressions: **dead running owner with %s resumes its recorded pass** and **completed seat resumes through production admission after abandoning a dead running owner (foreign=%s)**. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
 
 Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Budget/guard deferrals (including `deferredByCap` and `deferredByGuard`) also reach non-policy settlement. An accepted head already owes a pass: even plain `not-owed` settles as non-policy needs-you with reason `red team reported not-owed on an accepted head`. Only completed (`ran`/`resumed`) outcomes with a `posted` or `deduped` result comment bypass settlement. Completion also requires no truthy guard/cap deferral flag, successful summary/diagnostic derivations, and a complete live comment read with a trusted result for exactly the settlement head. The production visibility hook shares settlement's `readCompletePrComments` reader and uses `redTeamForHead`; missing readers, unreadable/incomplete threads, other heads and untrusted authors fail closed to needs-you, without posting or clearing. Completed outcomes that fail these checks settle as `unpublished`; those with any other or missing comment status settle as `unpublished`, with reason `red team <status> but its result comment is <comment status or unknown>` through the same sanitized, bounded needs-you path; they never post a result comment or clear.
 The persisted `skipCardOnly` boolean records the writer's resolved setting; consumers must still classify the stored net read, so a `.mjs` code diff remains owed. Settlement exception diagnostics cannot abort the finished status write or gate even if the logger throws.
@@ -550,6 +550,74 @@ The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-o
 Its production admission regression in `review-job-red-team-only.test.mjs` is
 **fresh recovery preserves unknown finished-null history through production admission and launches no call**;
 it verifies that refusal restores the original finished/null status and publishes no comment.
+Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
+with a finite abandonment time and an integer abandonment PID matching the status PID. Production
+planner recovery may re-dispatch an unchanged abandoned row even when its stale redispatch marker
+is spent, provided no retry is spent; it must not abandon the row again. A queued or replaced row
+still blocks this recovery. `review-red-team-on-skip.test.mjs` exercises the real durable marker,
+planner and executor through re-dispatch and the subsequent queued-state refusal.
+Production recovery has two slots per head across three exclusive marker files:
+`.stale-redispatch-1`, `.stale-redispatch-2`, and `.stale-norestart`. Marker 1 consumes slot 1;
+either marker 2 or no-restart consumes slot 2. All three together exceed the cap and fail closed.
+An existing marker 1 spends only the first attempt; `staleRedTeamSpent` means both slots are spent.
+The second abandonment requires a stale running owner with no result, absent/zero `retryCount`,
+and a parseable `pidStart` at or after marker 1's mtime rounded down to the second,
+matching `ps lstart` precision. **recognises a dead same-second replacement and plans attempt 2 with marker %s**
+pins both fractional and whole-second marker mtimes; **refuses a dead previous-second replacement with a millisecond marker without spending attempt 2**
+pins the earlier-second refusal through the planner and abandonment check. It waits at least
+`STALE_REDISPATCH_BACKOFF_MS` (15 minutes) from that mtime, independently of the retry cooldown.
+The abandonment function rechecks these conditions against disk and emits `detail.attempt`.
+Immediately before writing it also refuses changed status bytes or changed claim markers, releasing
+its own claim. The write is not a compare-and-swap: a writer starting between the final re-read and
+the atomic rename can still race it. The durable-marker tests document this residual window and
+simulate new queued/running jobs and changed/unreadable evidence before the final re-read.
+Confirmed non-starts release only the marker they claimed; unknown dispatch outcomes retain it.
+`live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
+that budget refund proves no new start, not that the existing job cannot run. Null/undefined
+dispatch outcomes keep their claims; the budget start is refunded as for any non-live-job skip. The stale planner bypasses
+the in-flight refusal and permits an absent verdict record in a head-matching running payload;
+present non-owed verdicts and all accepted-head publication guards still apply,
+including when the status re-read observes a completed decision after selecting a stale owner.
+Build status-derived fixtures with `recordRedTeamStatus` and read them with the real
+`readDrainRedTeamEvidence`. **dead running owner with truncated verdict recovers the accepting run and dispatches**
+uses the production truncated payload, recovers the accepting run from disk, abandons the dead owner,
+and verifies exactly one dispatch followed by refusal of the live queued handoff.
+Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
+review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
+markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
+Production admission re-runs `staleRedTeamRun` on the prior before clearing it. Admission-level tests
+pin a dead PID (accepted), a live PID (refused), and foreign hosts/namespaces past or within the
+deadline. **production admission handles %s using real foreign-owner evidence** requires verified
+abandonment and the fresh stale-recovery flag before overriding the drain's conservative in-flight
+hold. Unknown age, completed results, spent retries, queued writers, unknown evidence and changed
+status snapshots still refuse. The **fresh recovery launches an expired foreign host/namespace
+through production admission and the shared guard** cases exercise real abandonment and a model
+call through the job and shared seat. Other outcomes (reused PID and probe error) are pinned at the
+`staleRedTeamRun` unit level. **probe exceptions refuse recovery even past the deadline (%s)**
+throws from each of `isAlive` and `readPidStart` and requires refusal despite expired owner age.
+The execution guard
+refuses every still-running prior, including one marked abandoned: direct callers cannot
+use abandonment as proof of death. The regression
+**refuses direct fresh recovery without admission for an abandoned running live writer with zero calls**
+in `review-red-team-resume-only.test.mjs` pins that closed path. The regressions
+**fresh recovery launches an abandoned stale running pass through production admission and the shared guard**,
+**fresh production admission holds a live running writer without stale abandonment**, and
+**fresh production admission and shared guard never rerun a finished ran result with a posted comment**
+pin that boundary; `red-team-run-result.test.mjs` covers malformed abandonment and spent retry evidence.
+The stale-recovery flag is only a hint: production job admission independently reads the head's
+redispatch/spent/no-restart markers and binds the running row's head, PID and abandonment time
+to the latest abandonment claim (allowing 1 second for timestamp precision). A no-restart claim
+uses marker 1's original abandonment; a later process start or more than two claims refuses
+admission. Missing, unreadable or inconsistent claims preserve the row and require operator
+inspection. `stale flag cannot authorize production admission with %s` covers those refusals;
+`verified %s permits production admission at the dispatch boundary` covers both dispatch ordinals
+and the no-restart handoff. The durable-marker tests pin the timestamp boundary at latestClaim minus
+1000 ms (accepted), minus 1001 ms (rejected), and plus 0 ms for both abandonment ordinals.
+**fresh production admission re-probes a live PID despite verified abandonment and the stale flag**
+pins the independent admission probe. The extra-seats CLI forwards the flag to `runRedTeam`, which
+currently has no consumer for it; authorization happens in job admission before that call.
+The CLI recovery-mode plumbing test pins forwarding with and without the flag.
+Direct seat calls still refuse every running prior, regardless of flags.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness
@@ -3472,6 +3540,32 @@ not the handoff CLI with its Git publishing dependencies; the CLI re-exports the
 unset settings, lazy adapter loading in native Node, and real override event/provenance writes.
 Run it alongside the remote-client, daemon closure/staleness, live-smoke and shape wiring regressions
 through the host heavy-run queue; do not weaken their complete-closure assertions.
+
+
+### Red-team recovery plan (PR #6056, R283)
+
+`planRedTeamOnSkip` returns a recovery plan containing the mode, owner verdict, resolved
+`WE_RED_TEAM_STALE_RUN_MS` deadline, accepting payload, completed seat, admission prior,
+abandonment claim and cleanup policy. `planRedTeamRecovery` is the same planning boundary
+for direct jobs and standalone runners. Execution carries this snapshot through the job
+envelope and admission; it may check identity or durable write readback, but must not
+reclassify owner liveness, payload usability or completed seats. Changed evidence refuses
+execution and requires a new plan. Compare recovery timestamps with
+`compareRecoveryTime`, which parses stamps and floors both sides to seconds.
+
+Exercise planner → abandonment → production queued admission → review arc → shared
+runner for first and second attempts. Use production run/status/scorecard writers,
+including the running writer's read-only payload. Completed seats always resume and
+retain their status on daily-cap or guard deferral. Unreadable owners or absent accepting
+payloads produce an explicit skip with an inspection reason. Keep a source-boundary
+regression so executors cannot silently regain their own recovery policy.
+
+A detached plan must also revalidate supersession after fetching the head, before queued
+admission or carry publication. Read current recovery evidence and refuse `carryConflict`
+or unreadable/incomplete evidence with an inspection reason. This validates the snapshot;
+it must not recompute owner staleness, payload eligibility or completed-seat classification.
+Exercise both fresh and resume plans with a conflict introduced after planning (including
+during fetch), and assert no admission write, provider call or publication.
 ## Manual daemon pass (R247)
 
 `node scripts/operations/run.mjs manual-daemon-pass --daemon=review --pr=123 --repo=owner/name --reason="daemon unavailable"`

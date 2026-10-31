@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
+import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, runExtraSeatsCli, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
 import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
+import { pidNamespace } from '../../lib/pid-alive.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -201,14 +202,29 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
       }];
       await refused('resume', fakeIo('resume', { readRedTeamStatus: () => finished(result), readRecords: () => records }), 'no clean prior red-team row');
     });
+  it('standalone fresh recovery cannot bypass abandonment proof for a known-dead local owner', async () => {
+    const io = fakeIo('fresh', { readRedTeamStatus: () => ({ repo, pr, head: rev,
+      status: 'running', result: null, pid: 2147483647, host: hostname(),
+      pidNamespace: pidNamespace(), pidStart: new Date(0).toISOString() }) });
+    await refused('fresh', io, 'prior red-team status; not re-run');
+    noLaunch(io);
+  });
+
   it.each(['ok', 'error', 'quota-exhausted', 'unknown', undefined])('refuses fresh recovery with any prior row status %s and zero model calls', async status => {
     const io = fakeIo('fresh', { readRecords: vi.fn(() => [{ ...prior, status }]) });
-    await refused('fresh', io, 'prior red-team seat row; not re-run');
+    await refused('fresh', io, status === 'ok' ? 'prior red-team result is not resumable' : 'prior red-team seat row; not re-run');
     expect(io.readRecords).toHaveBeenCalledOnce();
     expect(io.readRedTeamStatus).toHaveBeenCalledWith({ pr, repo, head: rev });
   });
   it.each(['finished', 'queued', 'running', 'error', 'unknown'])('refuses fresh recovery with prior %s status and zero model calls', async status => {
     await refused('fresh', fakeIo('fresh', { readRedTeamStatus: () => ({ ...finished({ status: 'ran' }), status }) }), 'prior red-team status; not re-run');
+  });
+  it.each([undefined, true])('refuses direct fresh recovery without admission for an abandoned running live writer with zero calls (stale flag=%s)', async redTeamStaleRecovery => {
+    const status = { repo, pr, head: rev, status: 'running', result: null, pid: process.pid,
+      staleAbandoned: { at: '2026-01-01T00:00:00.000Z', pid: process.pid } };
+    expect(() => process.kill(status.pid, 0)).not.toThrow();
+    const io = fakeIo('fresh', { readRedTeamStatus: () => status });
+    await refused('fresh', io, 'prior red-team status; not re-run', { redTeamStaleRecovery });
   });
   it.each(['ran', 'resumed', { status: 'resumed' }])('a finished placeholder %j without a seat reaches fresh dispatch', async result => {
     const io = fakeIo('fresh', { readRedTeamStatus: () => finished(result) });
@@ -291,6 +307,24 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
 });
 
 describe('red-team CLI recovery mode plumbing', () => {
+  it.each([true, false])('passes stale recovery %s from CLI argv to the red-team entry', async enabled => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-flag-cli-'));
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const payloadPath = join(dir, 'loop.json');
+      writeFileSync(payloadPath, JSON.stringify(loopPayload));
+      const entry = vi.fn(async () => ({ status: 'skipped', reason: 'test entry' }));
+      const redTeamIo = {};
+      await runExtraSeatsCli(['red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${dir}`,
+        `--loop-json=${payloadPath}`, '--json', ...(enabled ? ['--red-team-stale-recovery'] : [])],
+      { redTeamIo, runRedTeam: entry });
+      expect(entry).toHaveBeenCalledOnce();
+      expect(entry).toHaveBeenCalledWith(expect.objectContaining({
+        pr, repo, lanePath: dir, loopPayload, redTeamStaleRecovery: enabled,
+      }), redTeamIo);
+    } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(['fresh', 'resume'])('enforces %s guards through the production child argv with zero model calls', mode => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-recovery-cli-'));
     try {

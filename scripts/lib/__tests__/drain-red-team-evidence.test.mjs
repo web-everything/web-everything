@@ -276,7 +276,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
 
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
-      seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false });
+      seatRecorded: false, completedRecorded: false, completedRow: null, seatRows: [], failedSeatCount: 0, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
@@ -488,7 +488,8 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
       readScorecards: () => hasSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
         pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
     expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
-      seatRecorded: variant === 'live-head seat', completedRecorded: false,
+      seatRecorded: variant === 'live-head seat', completedRecorded: false, completedRow: null,
+      seatRows: variant === 'live-head seat' ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head }] : [],
       failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false });
   });
 

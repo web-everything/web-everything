@@ -212,10 +212,14 @@ describe('failed red-team recovery (#6096)', () => {
     expect(dispatches).toHaveLength(1);
   });
 
+  it('a completed seat selects resume even when a failed seat also exists', () => {
+    const row = planRedTeamOnSkip(recovery({ readEvidence: () => ({ ...evidence, completedRecorded: true }) }))[0];
+    expect(row).toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
+
   it.each([
     { readStatus: () => ({ status: 'finished', result: 'failed', retryCount: 1 }) },
     { readEvidence: () => ({ ...evidence, failedSeatCount: 2 }) },
-    { readEvidence: () => ({ ...evidence, completedRecorded: true }) },
     { setting: { enabled: false, retryCooldownMin: 30 } },
   ])('refuses retries with spent, contradictory, or disabled evidence: %s', overrides => {
     expect(planRedTeamOnSkip(recovery(overrides))[0].action).toBe('skip');

@@ -9,13 +9,21 @@ export function reviewOnlyRedTeamResult(result) {
     && !Array.isArray(result.findings) && !result.provider && !result.model;
 }
 
-/** Null completions require the original queued record from confirmed-dead recovery.
+/** Abandoned stale runs require an explicit opt-in from marker-checked stale recovery. Null completions
+ * require the original queued record from confirmed-dead recovery.
  * Without that provenance, a null result may conceal a run whose seat evidence was lost.
  */
-export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
-  if (row?.status !== 'finished') return false;
+export function redTeamStatusWithoutRun(row, { originalStatus, allowAbandonedRunning = false } = {}) {
   // The durable retry spend survives missing seat rows and legacy placeholder results.
-  if (row.retryCount !== undefined && row.retryCount !== 0) return false;
+  if (row?.retryCount !== undefined && row.retryCount !== 0) return false;
+  if (row?.status === 'running' && row.result == null) {
+    if (allowAbandonedRunning !== true) return false;
+    const abandoned = row.staleAbandoned;
+    return abandoned != null && typeof abandoned === 'object' && !Array.isArray(abandoned)
+      && Number.isFinite(typeof abandoned.at === 'string' ? Date.parse(abandoned.at) : abandoned.at)
+      && Number.isInteger(abandoned.pid) && abandoned.pid === row.pid;
+  }
+  if (row?.status !== 'finished') return false;
   return (row.result === null && originalStatus?.status === 'queued')
     || row.result === 'ran' || row.result === 'resumed'
     || (row.result?.status === 'resumed'

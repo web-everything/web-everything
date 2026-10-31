@@ -322,7 +322,7 @@ describe('review-job red-team skip settlement', () => {
           ? ['queued', 'red-team', 'settle', 'gate']
           : redTeam.deferredByCap ? ['queued', 'red-team', 'settle', 'finished']
             : ['queued', 'red-team', 'settle', 'finished', 'gate']);
-        expect(f.io.clearRedTeamQueued.mock.calls).toEqual(redTeam.deferredByGuard ? [[{ repo, pr, head }]] : []);
+        expect(f.io.clearRedTeamQueued.mock.calls).toEqual(redTeam.deferredByGuard ? [[{ repo, pr, head, ...(redTeamOnly ? { redTeamPlan: expect.any(Object) } : {}) }]] : []);
         expect(f.io.redTeamStatus.mock.calls.filter(([row]) => row.status === 'finished')).toHaveLength(redTeam.deferredByGuard ? 0 : 1);
         expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(redTeam.deferredByCap ? 0 : 1);
       } finally { rmSync(root, { recursive: true, force: true }); }
@@ -342,7 +342,7 @@ describe('review-job red-team skip settlement', () => {
       expect(f.events).toEqual(flag === 'deferredByCap'
         ? ['queued', 'red-team', 'settle', 'finished'] : ['queued', 'red-team', 'settle', 'gate']);
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
-      expect(f.io.clearRedTeamQueued.mock.calls).toEqual(flag === 'deferredByGuard' ? [[{ repo, pr, head }]] : []);
+      expect(f.io.clearRedTeamQueued.mock.calls).toEqual(flag === 'deferredByGuard' ? [[{ repo, pr, head, ...(redTeamOnly ? { redTeamPlan: expect.any(Object) } : {}) }]] : []);
       expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(flag === 'deferredByCap' ? 0 : 1);
       expect(out.redTeam).toMatchObject({ status, [flag]: true, outcome: 'non-policy' });
       if (flag === 'deferredByCap') expect(out).not.toHaveProperty('redTeamGate');
@@ -361,7 +361,7 @@ describe('review-job red-team skip settlement', () => {
       const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
       expect(f.events).toEqual(['queued', 'red-team', 'settle', 'gate']);
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
-      expect(f.io.clearRedTeamQueued).toHaveBeenCalledWith({ repo, pr, head });
+      expect(f.io.clearRedTeamQueued).toHaveBeenCalledWith({ repo, pr, head, ...(redTeamOnly ? { redTeamPlan: expect.any(Object) } : {}) });
       expect(f.io.redTeamStatus.mock.calls.map(([row]) => row.status)).toEqual(['queued']);
       expect(f.io.runRedTeamGate.mock.calls).toEqual([[{ repo, pr }]]);
       expect(out.redTeam).toMatchObject({ status: 'skipped', deferredByCap: true, outcome: 'non-policy' });
@@ -633,7 +633,7 @@ describe('review-job red-team skip settlement', () => {
     const root = mkdtempSync(join(tmpdir(), 'healed-guard-'));
     const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1', WE_RED_TEAM_STATUS_LABELS: '0', WE_REVIEW_RED_TEAM: '1', WE_REVIEW_EXTRA_SEATS: '1' };
     try {
-      const production = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
+      const production = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false, seatRows: [] }) });
       const loopPayload = payload();
       production.redTeamStatus({ repo, pr, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } });
       const { redTeamAdmission } = production.redTeamStatus({ repo, pr, loopPayload, status: 'queued', redTeamMode: 'fresh' });
@@ -645,7 +645,7 @@ describe('review-job red-team skip settlement', () => {
         cliAvailable: vi.fn(() => { throw Error('must not reach provider'); }),
       };
       const result = await runRedTeam({ repo, pr, loopPayload, env, redTeamMode: 'fresh', redTeamAdmission }, io);
-      expect(result).toMatchObject({ status: 'not-owed', reason: expect.stringContaining(guard === 'seat row' ? 'prior red-team seat row' : 'red-team result already on head') });
+      expect(result).toMatchObject({ status: 'not-owed', reason: expect.stringContaining(guard === 'seat row' ? 'planned red-team seat rows changed' : 'red-team result already on head') });
       expect(io.readRecords).toHaveBeenCalledWith({ strict: true });
       expect(io.cliAvailable).not.toHaveBeenCalled();
     } finally { rmSync(root, { recursive: true, force: true }); }

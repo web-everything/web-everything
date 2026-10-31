@@ -31,7 +31,8 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
     expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
     expect(readStatus).toHaveBeenCalledWith({ repo, pr, head });
     expect(dispatch).toHaveBeenCalledOnce();
-    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: mode });
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: mode,
+      redTeamPlan: expect.objectContaining({ action: 'dispatch', mode, prNumber: pr, head }) });
     expect(take).toHaveBeenCalledOnce();
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
