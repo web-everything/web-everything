@@ -4,13 +4,16 @@ import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { kickAutoRebase, resolveAutoRebaseSwitch, runAutoRebase, finishPendingSwaps } from '../daemon-rebuild/auto-rebase.mjs';
+import { buildHeavyTestInvocation, heavyTestReport, runHeavyTests, kickAutoRebase, resolveAutoRebaseSwitch, runAutoRebase, finishPendingSwaps } from '../daemon-rebuild/auto-rebase.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, appendOverlayEvent, persistStackBases } from '../daemon-overlays.mjs';
 import * as overlays from '../daemon-overlays.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { writeRebuildState, readRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { runTestInventoryCase } from '../../conveyor/soak/breaks/auto-rebase-operator-withdrawal.mjs';
+import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
+import { runRemote } from '../../readiness/remote-exec.mjs';
+import { runScratchForgeCase, scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
 
 const temps = [];
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-auto-test-')); temps.push(p); return p; };
@@ -21,11 +24,11 @@ const write = (root, name, text) => { fs.mkdirSync(dirname(join(root, name)), { 
 const ref = 'lane/fix';
 const overlay = { ref, pr: 123 };
 const agentResult = (report = {}) => ({ status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, events: { terminal: 'turn.completed' }, ...report }) });
-const reportPassingTests = ({ root, args }) => {
-  const report = args.find(a => a.startsWith('--outputFile.json='));
-  expect(args.slice(-3, -1)).toEqual(['--reporter=default', '--reporter=json']);
-  fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({
-    testResults: args.slice(7, -3).map(file => ({ name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }] })),
+const reportPassingTests = ({ root, args, testReport }) => {
+  expect(args.slice(-3)).toEqual(['--reporter=basic', '--reporter=tap', '--no-color']);
+  expect(allowedCommand(args.slice(args.indexOf('--') + 1))).toBe(true);
+  fs.writeFileSync(testReport, JSON.stringify({
+    testResults: args.slice(8, -3).map(file => ({ name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }] })),
   }));
   return { status: 0 };
 };
@@ -72,10 +75,10 @@ function fixture({ extraModule = false, workerTest = true, baseFiles = {}, branc
       }
       return agentResult();
     }),
-    testRunner: vi.fn(async ({ root, args }) => {
+    testRunner: vi.fn(async ({ root: scratch, args, testReport }) => {
       calls.push('tests');
-      expect(args.slice(0, -3)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', 'worker.test.mjs']);
-      return reportPassingTests({ root, args });
+      expect(args.slice(0, -3)).toEqual([resolve(root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${fs.realpathSync(scratch)}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run', 'worker.test.mjs']);
+      return reportPassingTests({ root: scratch, args, testReport });
     }),
     auditor: vi.fn(async ({ args }) => { calls.push('audit'); expect(args).toContain('--review'); return agentResult({ lastMessage: 'NOT WEAKENED' }); }),
     addOverlay: (...args) => { calls.push('add'); return addOverlay(...args); },
@@ -98,7 +101,121 @@ const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
   appendOverlayEvent: (...args) => { f.calls.push(args[1].kind); return appendOverlayEvent(...args); } });
 
 describe('auto-rebase executed-test inventory', () => {
-  it.each(['excluded', 'all-excluded', 'missing', 'malformed', 'oversized', 'empty-assertions', 'unknown-status', 'skipped', 'wrong-root', 'failed'])(
+  it.each(['empty', 'nested-empty', 'mixed', 'skipped-empty'])(
+    'refuses ambiguous TAP execution evidence from %s suites', async mode => {
+      const root = temp(), file = 'worker.test.mjs';
+      const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], env: {} });
+      const empty = { type: 'suite', name: 'empty describe', mode: mode === 'skipped-empty' ? 'skip' : 'run',
+        result: { state: 'pass', duration: 0 }, tasks: [] };
+      const tasks = mode === 'nested-empty' ? [{ ...empty, name: 'outer', tasks: [empty] }] : [empty];
+      if (mode === 'mixed') tasks.push({ type: 'test', name: 'real test', mode: 'run', result: { state: 'pass', duration: 0 } });
+      const stdout = await scratchTestOutput([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 0 }, tasks }],
+        { summary: invocation.args.includes('--reporter=basic') });
+      expect(() => heavyTestReport(stdout, invocation)).toThrow(/inventory/);
+    },
+  );
+  it('offloads the real scratch invocation and verifies its Forge receipt and local inventory', async () => {
+    expect(await runScratchForgeCase()).toMatchObject({ violations: [], mode: 'remote', runs: 1 });
+  });
+  it('rejects empty-suite evidence after a successful Forge receipt without a local rerun', async () => {
+    expect(await runScratchForgeCase({ emptySuite: true })).toMatchObject({ violations: [], mode: 'remote', runs: 1 });
+  });
+  it.each(['before', 'after'])('accepts zero-duration tests with the typed summary %s TAP', async order => {
+    const root = temp(), file = 'worker.test.mjs';
+    const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], env: {} });
+    let stdout = await scratchTestOutput([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 0 },
+      tasks: [{ type: 'test', name: 'instant test', mode: 'run', result: { state: 'pass', duration: 0 } }] }]);
+    if (order === 'before') {
+      const boundary = stdout.indexOf(' Test Files  ');
+      stdout = stdout.slice(boundary) + stdout.slice(0, boundary);
+    }
+    expect(heavyTestReport(stdout, invocation).testResults[0].assertionResults).toEqual([{ status: 'passed' }]);
+  });
+  it.each(['', 'no tests', '2 passed (2)', '1 passed (2)', '1 failed (1)', '1 passed | 0 passed (1)',
+    '1 passed (9007199254740992)', '1 passed (1)\n      Tests  1 passed (1)', 'truncated'])(
+    'refuses missing, duplicate or inconsistent typed-test counts %#', summary => {
+      const root = temp(), invocation = buildHeavyTestInvocation({ root, scratch: root, selected: ['worker.test.mjs'], env: {} });
+      const stdout = (summary ? `      Tests  ${summary}\n` : '')
+        + 'TAP version 13\n1..1\nok 1 - worker.test.mjs {\n    1..1\n    ok 1 - real test # time=0ms\n}\n';
+      expect(() => heavyTestReport(stdout, invocation)).toThrow(/inventory/);
+    },
+  );
+  it.each(['worker.test.mjs', 'dir/a # quote`é.test.mjs'])('captures the real TAP producer without remote output-file flags (%s)', async file => {
+    const root = temp();
+    const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], testReport: join(root, 'report.json'), env: {} });
+    const stdout = await scratchTestOutput([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
+      { type: 'test', name: 'assertion', mode: 'run', result: { state: 'pass', duration: 1 } },
+    ] }]);
+    const exec = vi.fn(async () => ({ status: 0, stdout, stderr: '' }));
+    await runHeavyTests(invocation, { exec });
+    expect(JSON.parse(fs.readFileSync(invocation.testReport, 'utf8'))).toEqual({ testResults: [
+      { name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }] },
+    ] });
+    expect(exec).toHaveBeenCalledWith(process.execPath, invocation.args, { cwd: root, env: {} });
+    const transport = vi.fn(async () => ({ code: 1 }));
+    const remote = await runRemote({ argv: invocation.args.slice(5), cwd: root, env: {}, exec: transport });
+    expect(remote.reason).toBe('forge-unreachable');
+    expect(transport).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['LF', 'line\nbreak'], ['CR', 'carriage\rreturn'], ['CRLF', 'line\r\nbreak'],
+    ['LS', 'line\u2028separator'], ['PS', 'paragraph\u2029separator'],
+    ['punctuation', '`backtick` "quote" # hash'], ['leading option', '--leading'],
+    ['path', '../relative'], ['Unicode', 'café cafe\u0301 \u200b'],
+    ['concatenation', 'carriage\r' + 'return\u2028separator'],
+  ])('preserves execution evidence from real TAP titles containing %s', async (_label, title) => {
+    const root = temp(), file = 'worker.test.mjs';
+    const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], testReport: join(root, 'report.json'), env: {} });
+    const stdout = await scratchTestOutput([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
+      { type: 'suite', name: title, mode: 'run', result: { state: 'pass', duration: 1 }, tasks: [
+        { type: 'test', name: title, mode: 'run', result: { state: 'pass', duration: 1 } },
+        { type: 'test', name: title, mode: 'skip' },
+        { type: 'test', name: title, mode: 'todo' },
+      ] },
+    ] }]);
+    const result = { status: 0, stdout, stderr: '' };
+    const exec = vi.fn(async () => result);
+    expect(await runHeavyTests(invocation, { exec })).toBe(result);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(JSON.parse(fs.readFileSync(invocation.testReport, 'utf8'))).toEqual({ testResults: [
+      { name: join(fs.realpathSync(root), file), assertionResults: [{ status: 'passed' }, { status: 'pending' }, { status: 'pending' }] },
+    ] });
+  });
+
+  it.each(['', 'TAP version 13\n1..1\n', 'TAP version 13\n1..1\nok 1 - worker.test.mjs {\n    1..1\n',
+    'TAP version 13\n1..1\nok 2 - worker.test.mjs\n', 'TAP version 13\n1..0\nnot ok 1 - worker.test.mjs\n',
+    'TAP version 13\n1..0\nTAP version 13\n1..0\n', 'x'.repeat(8 * 1024 * 1024 + 1)])(
+    'refuses incomplete, malformed or oversized TAP inventory %#', stdout => {
+      const root = temp(), invocation = buildHeavyTestInvocation({ root, scratch: root, selected: ['worker.test.mjs'], env: {} });
+      expect(() => heavyTestReport(stdout, invocation)).toThrow(/inventory/);
+    },
+  );
+
+  it('preserves skipped suites and empty files as non-execution evidence', () => {
+    const root = temp(), invocation = buildHeavyTestInvocation({ root, scratch: root, selected: ['worker.test.mjs', 'empty.test.mjs'], env: {} });
+    const report = heavyTestReport('      Tests  1 skipped (1)\nTAP version 13\n1..2\nok 1 - worker.test.mjs # SKIP {\n    1..1\n    ok 1 - nested {\n        1..1\n        ok 1 - assertion # time=1ms\n    }\n}\nok 2 - empty.test.mjs\n', invocation);
+    expect(report.testResults.map(r => r.assertionResults)).toEqual([[{ status: 'pending' }], []]);
+  });
+
+  it.each([1, 124])('preserves exit %s without writing inventory or rerunning', async status => {
+    const root = temp(), invocation = buildHeavyTestInvocation({ root, scratch: root, selected: ['worker.test.mjs'], testReport: join(root, 'report.json'), env: {} });
+    const result = { status, stdout: '', stderr: 'remote termination unconfirmed; refusing local rerun (exit 124).' };
+    const exec = vi.fn(async () => result);
+    expect(await runHeavyTests(invocation, { exec })).toBe(result);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(fs.existsSync(invocation.testReport)).toBe(false);
+  });
+
+  it('fails closed on a zero exit with truncated inventory without a local retry', async () => {
+    const root = temp(), invocation = buildHeavyTestInvocation({ root, scratch: root, selected: ['worker.test.mjs'], testReport: join(root, 'report.json'), env: {} });
+    const exec = vi.fn(async () => ({ status: 0, stdout: 'TAP version 13\n1..1\n', stderr: '' }));
+    await expect(runHeavyTests(invocation, { exec })).rejects.toThrow(/inventory/);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(fs.existsSync(invocation.testReport)).toBe(false);
+  });
+
+  it.each(['excluded', 'all-excluded', 'missing', 'malformed', 'oversized', 'empty-assertions', 'empty-suite', 'unknown-status', 'skipped', 'wrong-root', 'failed'])(
     'refuses %s evidence before audit, push and registration', async mode => {
       const result = await runTestInventoryCase({ mode });
       expect(result.failure).toBeTruthy();
@@ -112,19 +229,100 @@ describe('auto-rebase executed-test inventory', () => {
     expect(result).toMatchObject({ pushed: true, registered: true, audited: true, cleaned: true });
     expect(result.remaining).toEqual(['lane%2Ffix.json']);
   });
+  it('rejects a real zero-test Vitest run with passWithNoTests enabled', async () => {
+    const result = await runTestInventoryCase({ realRunner: true, mode: 'empty-suite' });
+    expect(result.runnerResult.status, result.runnerResult.stderr).toBe(0);
+    expect(result.runnerResult.stdout).toContain('empty describe');
+    expect(result.failure).toMatch(/inventory/);
+    expect(result).toMatchObject({ pushed: false, registered: false, audited: false, cleaned: true, remaining: [] });
+  }, 40_000);
   it('rejects the real Vitest zero exit when a failing selected integration file is excluded', async () => {
     const integration = 'scripts/operations/__tests__/dispatch-spawn-live.test.mjs';
     expect(fs.readFileSync('vitest.config.ts', 'utf8')).toContain(integration);
     expect(fs.readFileSync('vitest.integration.config.ts', 'utf8')).toContain(integration);
     const result = await runTestInventoryCase({ realRunner: true });
     expect(result.runnerResult.status, result.runnerResult.stderr).toBe(0);
-    expect(result.runnerResult.stdout).toContain('1 passed');
+    expect(result.runnerResult.stdout).toContain('TAP version 13');
     expect(result.failure).toMatch(/selected tests did not execute/);
     expect(result).toMatchObject({ pushed: false, registered: false, audited: false, cleaned: true, remaining: [] });
   }, 40_000);
 });
 
 describe('established overlay auto rebase', () => {
+
+  it('builds a scratch test command accepted by the Forge executor', () => {
+    const scratch = temp();
+    const invocation = buildHeavyTestInvocation({ root: scratch, scratch,
+      selected: ['worker.test.mjs'], testReport: join(scratch, 'report.json'), env: {} });
+    expect(allowedCommand(invocation.args.slice(invocation.args.indexOf('--') + 1))).toBe(true);
+  });
+
+  it('uses the daemon wrapper, canonical scratch repo and a copied env without LANE_POOL_ROOT', async () => {
+    const f = fixture(); f.moveMain();
+    f.env.LANE_POOL_ROOT = join(f.base, 'must-not-inherit');
+    const alias = join(f.base, 'alias');
+    fs.symlinkSync(f.root, alias, 'dir');
+    const invocation = buildHeavyTestInvocation({ root: f.root, scratch: alias,
+      selected: ['worker.test.mjs'], testReport: 'report.json', env: f.env });
+    expect(invocation.args.slice(0, 8)).toEqual([resolve(f.root, 'scripts/readiness/heavy-admission.mjs'),
+      'run', `--repo=${fs.realpathSync(alias)}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
+    expect(invocation.env).toEqual(Object.fromEntries(Object.entries(f.env).filter(([key]) => key !== 'LANE_POOL_ROOT')));
+    expect(invocation.env).not.toBe(f.env);
+    const passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      expect(options.env).toEqual(invocation.env);
+      return passing(options);
+    });
+    await expect(job(f)).resolves.toMatchObject({ ref: `${ref}-auto-1` });
+    expect(f.env.LANE_POOL_ROOT).toBe(join(f.base, 'must-not-inherit'));
+  });
+
+  it.each(['runner', 'process'])('skips remote-unconfirmed exit 124 without passing, publishing or rerunning (%s)', async mode => {
+    const f = fixture(); f.moveMain();
+    const diagnostic = 'remote termination unconfirmed; refusing local rerun (exit 124).';
+    f.env.LANE_POOL_ROOT = join(f.base, 'must-not-inherit');
+    if (mode === 'runner') f.deps.testRunner = vi.fn(async options => {
+      reportPassingTests(options); // Even a passing inventory cannot authorize publication.
+      return { status: 124, stderr: diagnostic };
+    });
+    else {
+      delete f.deps.testRunner;
+      write(f.root, 'scripts/readiness/heavy-admission.mjs', `
+        import { realpathSync, appendFileSync } from 'node:fs';
+        if (process.env.LANE_POOL_ROOT || !process.argv.includes('--repo=' + realpathSync(process.cwd()))) process.exit(99);
+        appendFileSync(${JSON.stringify(join(f.base, 'runner-calls'))}, 'run\\n');
+        process.stderr.write(${JSON.stringify(diagnostic)});
+        process.exit(124);
+      `);
+    }
+    expect(await job(f)).toEqual({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(f.deps.auditor).not.toHaveBeenCalled();
+    expect(f.calls).not.toContain('add');
+    expect(f.calls).not.toContain('auto-rebase-needs-you');
+    expect(f.calls).toContain('auto-rebase-skipped');
+    expect(ok(f.origin, ['for-each-ref', '--format=%(refname)', `refs/heads/${ref}-auto-*`])).toBe('');
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref]);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(f.scratched.every(p => !fs.existsSync(p))).toBe(true);
+    if (mode === 'runner') expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    else expect(fs.readFileSync(join(f.base, 'runner-calls'), 'utf8')).toBe('run\n');
+  });
+
+  it.each([
+    [124, 'ordinary timeout', ''],
+    [124, 'remote termination unconfirmed', ''],
+    [1, 'remote termination unconfirmed; refusing local rerun (exit 124).', ''],
+    [124, '', 'remote termination unconfirmed; refusing local rerun (exit 124).'],
+  ])('retains normal test failure for other status/stderr combinations (%s, %s)', async (status, stderr, stdout) => {
+    const f = fixture(); f.moveMain();
+    f.deps.testRunner = vi.fn(async () => ({ status, stderr, stdout }));
+    await expect(job(f)).rejects.toThrow('selected test failed or incomplete');
+    expect(needsYouAlert(f).detail.stage).toBe('tests');
+    expect(f.deps.auditor).not.toHaveBeenCalled();
+    expect(f.calls).not.toContain('add');
+    expect(f.calls).not.toContain('auto-rebase-skipped');
+  });
+
   it.each(['success', 'test failure'])('links the sibling Frontier UI checkout for selected tests and unlinks only the link on %s', async outcome => {
     const f = fixture(); f.moveMain();
     const source = resolve(f.root, '..', 'frontierui');
@@ -333,10 +531,10 @@ describe('established overlay auto rebase', () => {
         resolvedFiles: { 'uncovered.txt': 'overlay + main\n' },
       });
       f.moveMain();
-      f.deps.testRunner = vi.fn(async ({ root, args }) => {
-        expect(args.slice(0, 7)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
-        expect(args.slice(7, -3).sort()).toEqual(['branch.test.mjs', 'worker.test.mjs']);
-        return reportPassingTests({ root, args });
+      f.deps.testRunner = vi.fn(async ({ root, args, testReport }) => {
+        expect(args.slice(0, 8)).toEqual([resolve(f.root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${fs.realpathSync(root)}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
+        expect(args.slice(8, -3).sort()).toEqual(['branch.test.mjs', 'worker.test.mjs']);
+        return reportPassingTests({ root, args, testReport });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -357,10 +555,10 @@ describe('established overlay auto rebase', () => {
       f.moveMain();
       // This module is unchanged by the merge; only the overlay's branch diff identifies it.
       expect(ok(f.root, ['diff', '--name-only', f.baseSha, f.oldSha]).split('\n')).not.toContain('feature.test.mjs');
-      f.deps.testRunner = vi.fn(async ({ root, args }) => {
+      f.deps.testRunner = vi.fn(async ({ root, args, testReport }) => {
         expect(ok(root, ['show', 'HEAD:feature.mjs'])).toBe('export const value = 2;');
-        expect(args.slice(7, -3).sort()).toEqual(['feature.test.mjs', 'worker.test.mjs']);
-        return reportPassingTests({ root, args });
+        expect(args.slice(8, -3).sort()).toEqual(['feature.test.mjs', 'worker.test.mjs']);
+        return reportPassingTests({ root, args, testReport });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -378,10 +576,10 @@ describe('established overlay auto rebase', () => {
       });
       f.deps.git = (args, opts) => run(['-c', 'core.quotepath=true', ...args], opts);
       f.moveMain();
-      f.deps.testRunner = vi.fn(async ({ root, args }) => {
-        expect(args.slice(7, -3).sort()).toEqual([test, 'worker.test.mjs']);
+      f.deps.testRunner = vi.fn(async ({ root, args, testReport }) => {
+        expect(args.slice(8, -3).sort()).toEqual([test, 'worker.test.mjs']);
         expect(ok(root, ['show', `HEAD:${file}`])).toBe('export const value = 4;');
-        return reportPassingTests({ root, args });
+        return reportPassingTests({ root, args, testReport });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -400,9 +598,9 @@ describe('established overlay auto rebase', () => {
       });
       f.deps.git = (args, opts) => run(['-c', 'core.quotepath=true', ...args], opts);
       f.moveMain();
-      f.deps.testRunner = vi.fn(async ({ root, args }) => {
-        expect(args.slice(7, -3)).toEqual([test]);
-        return reportPassingTests({ root, args });
+      f.deps.testRunner = vi.fn(async ({ root, args, testReport }) => {
+        expect(args.slice(8, -3)).toEqual([test]);
+        return reportPassingTests({ root, args, testReport });
       });
       const result = await job(f);
       expect(f.deps.testRunner).toHaveBeenCalledOnce();
@@ -861,11 +1059,11 @@ describe('established overlay auto rebase', () => {
       write(options.root, 'extra.mjs', 'fixer also changed this module\n');
       return result; // The worker stages this additional edit through git add -A.
     };
-    f.deps.testRunner = vi.fn(async ({ root, args }) => {
-      expect(args.slice(0, 7)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
-      expect(args.slice(7, -3).sort()).toEqual(['extra.test.mjs', 'worker.test.mjs']);
+    f.deps.testRunner = vi.fn(async ({ root, args, testReport }) => {
+      expect(args.slice(0, 8)).toEqual([resolve(f.root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${fs.realpathSync(root)}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
+      expect(args.slice(8, -3).sort()).toEqual(['extra.test.mjs', 'worker.test.mjs']);
       expect(ok(root, ['show', 'HEAD:extra.mjs'])).toBe('fixer also changed this module');
-      return reportPassingTests({ root, args });
+      return reportPassingTests({ root, args, testReport });
     });
     await job(f);
     expect(f.deps.testRunner).toHaveBeenCalledOnce();

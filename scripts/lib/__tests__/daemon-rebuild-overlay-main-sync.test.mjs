@@ -11,8 +11,13 @@ import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
+import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
+import { runHeavyTests } from '../daemon-rebuild/auto-rebase.mjs';
+import { scratchTestOutput } from '../../conveyor/soak/breaks/scratch-tests-forge-command.mjs';
 
 vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+
+const remoteUnconfirmed = 'heavy-admission: remote failed (transport lost) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-0 retained until its .unconfirmed marker is cleared.\n';
 
 const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
@@ -78,9 +83,9 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     io: { ...fs, mkdtempSync: prefix => { const p = fs.mkdtempSync(prefix); scratched.push(p); temps.push(p); return p; } },
     git: vi.fn((args, opts) => { if (args[0] === 'push') pushes.push([...args]); return run(args, opts); }),
     appendOverlayEvent: (root, event, opts) => { events.push(event); return appendOverlayEvent(root, event, opts); },
-    testRunner: vi.fn(async ({ root: scratch, args }) => {
-      const report = args.find(a => a.startsWith('--outputFile.json='));
-      if (report) fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({
+    testRunner: vi.fn(async ({ root: scratch, args, testReport }) => {
+      expect(allowedCommand(args.slice(args.indexOf('--') + 1))).toBe(true);
+      fs.writeFileSync(testReport, JSON.stringify({
         testResults: args.filter(a => /\.test\.mjs$/.test(a)).map(file => ({
           name: join(fs.realpathSync(scratch), file), assertionResults: [{ status: 'passed' }],
         })),
@@ -109,6 +114,95 @@ const unchanged = f => {
 };
 
 describe('overlay main sync', () => {
+
+  it('refuses a passing empty describe suite before publication', async () => {
+    const f = fixture();
+    f.deps.testRunner = options => runHeavyTests(options, { exec: async () => ({ status: 0,
+      stdout: await scratchTestOutput(options.args.slice(8, -3).map(name => ({ type: 'suite', name, mode: 'run',
+        result: { state: 'pass', duration: 0 }, tasks: [
+          { type: 'suite', name: 'empty describe', mode: 'run', result: { state: 'pass', duration: 0 }, tasks: [] },
+        ] })), { summary: options.args.includes('--reporter=basic') }), stderr: '' }) });
+    await expect(job(f)).rejects.toThrow(/inventory/);
+    expect(f.pushes).toEqual([]);
+    expect(synced(f)).toEqual([]);
+    expect(f.scratched.every(path => !fs.existsSync(path))).toBe(true);
+  });
+
+  it("runs tests through the daemon checkout's wrapper with --repo=scratch", async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    const scratchReal = join(f.base, 'scratch-real'), scratchAlias = join(f.base, 'scratch-alias');
+    fs.mkdirSync(scratchReal);
+    fs.symlinkSync(scratchReal, scratchAlias, 'dir');
+    f.env.TMPDIR = scratchAlias;
+    f.env.LANE_POOL_ROOT = join(f.base, 'must-not-inherit');
+    f.deps.testRunner = vi.fn(async options => {
+      expect(options.root).toBe(join(f.scratched[0], 'repo'));
+      expect(options.root).not.toBe(fs.realpathSync(options.root));
+      expect(options.args.slice(0, 8)).toEqual([join(f.root, 'scripts/readiness/heavy-admission.mjs'),
+        'run', `--repo=${fs.realpathSync(options.root)}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
+      expect(options.env).not.toHaveProperty('LANE_POOL_ROOT');
+      return passing(options);
+    });
+    const result = await job(f);
+    expect(result.pushed).toBe(true);
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.env.LANE_POOL_ROOT).toBe(join(f.base, 'must-not-inherit'));
+  });
+
+  it.each(['runner', 'process'])('exit 124 with remote-unconfirmed is a skip, not an operator-review alert (%s)', async mode => {
+    const f = fixture(), outcomes = [];
+    f.deps.appendDaemonEvent = event => { outcomes.push(event); };
+    if (mode === 'runner') f.deps.testRunner = vi.fn(async () => ({ status: 124, stderr: remoteUnconfirmed }));
+    else {
+      delete f.deps.testRunner;
+      fs.appendFileSync(join(f.root, '.git/info/exclude'), '\n/scripts/readiness/heavy-admission.mjs\n');
+      write(f.root, 'scripts/readiness/heavy-admission.mjs', `
+        import { realpathSync } from 'node:fs';
+        if (process.env.LANE_POOL_ROOT || !process.argv.includes('--repo=' + realpathSync(process.cwd()))) process.exit(99);
+        process.stderr.write(${JSON.stringify(remoteUnconfirmed)});
+        process.exit(124);
+      `);
+    }
+    expect(await job(f)).toEqual({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(alerts(f)).toEqual([]);
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    expect(outcomes.map(e => e.kind)).toEqual(['overlay-main-sync-skipped']);
+    if (fs.existsSync(sidecar(f))) {
+      const state = json(sidecar(f));
+      for (const key of ['lastSyncedMain', 'attemptedMain', 'retryMain', 'retryTries', 'retryAfter', 'firstFailureAt'])
+        expect(state[key]?.[ref]).toBeUndefined();
+    }
+    expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
+    expect(tick(f, { spawnFn: spawner() }).started).toEqual([ref]);
+  });
+
+  it('remote-unconfirmed preserves an exhausted test retry budget and releases both locks for the next tick', async () => {
+    const f = fixture({ exhausted: true }), before = json(sidecar(f));
+    f.deps.testRunner = async () => ({ status: 124, stderr: remoteUnconfirmed });
+    expect(await job(f)).toEqual({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(json(sidecar(f))).toEqual(before);
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(alerts(f)).toEqual([]);
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    expect(fs.existsSync(marker(f))).toBe(false);
+    expect(fs.existsSync(`${sidecar(f)}.clone.lock`)).toBe(false);
+    unchanged(f);
+    expect(tick(f, { spawnFn: spawner() }).started).toEqual([ref]);
+  });
+
+  it.each([
+    [124, 'remote termination unconfirmed'],
+    [124, 'ordinary timeout'],
+    [1, remoteUnconfirmed],
+    [124, '', remoteUnconfirmed],
+  ])('keeps test failure handling for other status/stderr combinations (%s, %s)', async (status, stderr, stdout = '') => {
+    const f = fixture({ exhausted: true });
+    f.deps.testRunner = async () => ({ status, stderr, stdout });
+    await expect(job(f)).rejects.toThrow('operator review required');
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    attempted(f); unchanged(f);
+  });
 
   it.each(['kick', 'worker'])('%s skips a stale registration without attention or failure memory, until one hour or registration changes', async entry => {
     const f = fixture(), git = f.deps.git, events = [], spawnFn = spawner();
@@ -184,7 +278,7 @@ describe('overlay main sync', () => {
       const result = await passing(options);
       if (++calls === 2) {
         if (outcome === 'failed') return { status: 1, stdout: '', stderr: 'chunk failed' };
-        const path = options.args.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length);
+        const path = options.testReport;
         const report = json(path);
         if (outcome === 'missing') report.testResults.pop();
         else report.testResults[0].assertionResults = [];
@@ -264,6 +358,7 @@ describe('overlay main sync', () => {
     expect(f.deps.git.mock.calls.filter(([args]) => args[0] !== 'checkout')
       .every(([, opts]) => opts.timeout === undefined)).toBe(true);
     expect(f.deps.git.mock.calls.some(([args]) => gitCommand(args) === 'merge')).toBe(true);
+    expect(f.deps.git.mock.calls.some(([args]) => args.includes('merge'))).toBe(true);
     expect(synced(f)).toHaveLength(1);
     expect(alerts(f)).toEqual([]);
     expect(fs.readFileSync(join(outside, 'keep.md'), 'utf8')).toBe('preserve outside scratch\n');
@@ -891,14 +986,14 @@ describe('overlay main sync', () => {
     f.deps.testRunner = vi.fn(async options => {
       expect(active).toBe(false); active = true;
       expect(f.pushes).toEqual([]);
-      expect(options.args.slice(0, 2)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run']);
+      expect(options.args.slice(0, 2)).toEqual([join(f.root, 'scripts/readiness/heavy-admission.mjs'), 'run']);
       const result = await passing(options); active = false; return result;
     });
     const result = await job(f);
     expect(result.pushed).toBe(true); expect(result.tests).toHaveLength(102);
     const calls = f.deps.testRunner.mock.calls.map(([o]) => o.args);
     expect(calls.map(args => args.filter(a => a.endsWith('.test.mjs')).length)).toEqual([50, 50, 2]);
-    expect(new Set(calls.map(args => args.find(a => a.startsWith('--outputFile.json=')))).size).toBe(3);
+    expect(new Set(f.deps.testRunner.mock.calls.map(([o]) => o.testReport)).size).toBe(3);
     expect(alerts(f)).toEqual([]); unchanged(f);
   });
 
@@ -1120,7 +1215,7 @@ describe('overlay main sync', () => {
     ageFailure(f);
     f.deps.testRunner = vi.fn(async options => {
       const result = await passing(options);
-      const reportFile = options.args.find(a => a.startsWith('--outputFile.json=')).split('=')[1];
+      const reportFile = options.testReport;
       const report = json(reportFile);
       for (const test of report.testResults) test.assertionResults = outcome === 'failed' ? [{ status: 'failed' }] : [];
       fs.writeFileSync(reportFile, JSON.stringify(report));
@@ -1161,7 +1256,7 @@ describe('overlay main sync', () => {
     ageFailure(f);
     f.deps.testRunner = vi.fn(async options => {
       const result = await passing(options);
-      const reportFile = options.args.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length);
+      const reportFile = options.testReport;
       // Valid passing JSON remains valid after padding, so removing the cap would publish.
       fs.appendFileSync(reportFile, ' '.repeat(8 * 1024 * 1024));
       return result;

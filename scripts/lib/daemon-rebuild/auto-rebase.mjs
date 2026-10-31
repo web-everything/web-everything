@@ -77,7 +77,7 @@ const execute = (bin, args, opts) => spawnSync(bin, args, { encoding: 'utf8', ti
 // Long-running agents and tests must leave the event loop free to heartbeat the lock.
 const executeAsync = (bin, args, opts) => new Promise(resolve => {
   execFile(bin, args, { encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024, ...opts },
-    (error, stdout, stderr) => resolve({ status: error ? 1 : 0, error, stdout, stderr }));
+    (error, stdout, stderr) => resolve({ status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0, error, stdout, stderr }));
 });
 const requireOutput = (r, failure = 'command failed or incomplete') => { if (r?.status !== 0 || r?.error) throw new Error(failure); return String(r.stdout ?? ''); };
 const requireOk = (r, failure) => requireOutput(r, failure).trim();
@@ -98,6 +98,107 @@ const writePending = (io, file, data) => {
     throw error;
   }
 };
+
+// Use the daemon's admission policy while executing against the canonical scratch checkout.
+export function buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io = fs }) {
+  const testEnv = { ...env };
+  delete testEnv.LANE_POOL_ROOT;
+  return { root: scratch, env: testEnv, testReport,
+    args: [resolve(root, 'scripts/readiness/heavy-admission.mjs'), 'run', `--repo=${io.realpathSync(scratch)}`,
+      '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
+      '--reporter=basic', '--reporter=tap', '--no-color'] };
+}
+
+// Forge streams TAP back to the caller; a client-local outputFile cannot be written remotely.
+// Consume Vitest's nested TAP plans completely, including skipped suites and empty files.
+export function heavyTestReport(stdout, { root, args }) {
+  if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > 8 * 1024 * 1024) throw new Error('test inventory unavailable or over 8 MiB');
+  const lines = stdout.replace(/\r\n/g, '\n').split('\n');
+  const header = lines.indexOf('TAP version 13');
+  if (header < 0 || lines.lastIndexOf('TAP version 13') !== header) throw new Error('test inventory unavailable');
+  const selected = new Map(args.slice(8, -3).map(file => [file.replace(/\\/g, '\\\\').replace(/#/g, '\\#').replace(/\n/g, ' '), file]));
+  if (selected.size !== args.length - 11) throw new Error('ambiguous test inventory names');
+  const testResults = [], stack = [{ seen: 0, plan: null, skipped: false }];
+  const invalid = () => { throw new Error('incomplete or malformed test inventory'); };
+  let end = lines.length;
+  for (let index = header + 1; index < lines.length; index++) {
+    const line = lines[index];
+    if (!line.trim()) continue;
+    const frame = stack.at(-1), prefix = '    '.repeat(stack.length - 1);
+    // Reporter hooks may finish in either order. Only leave a complete TAP plan
+    // for the basic reporter's summary, never for an arbitrary trailing TAP line.
+    if (stack.length === 1 && frame.plan !== null && frame.seen === frame.plan
+      && /^(?: Test Files|  Snapshots)  /.test(line)) { end = index; break; }
+    if (stack.length > 1 && line === '    '.repeat(stack.length - 2) + '}') {
+      if (frame.plan === null || frame.plan !== frame.seen) invalid();
+      stack.pop(); continue;
+    }
+    if (!line.startsWith(prefix)) invalid();
+    const text = line.slice(prefix.length);
+    const plan = /^1\.\.(\d+)$/.exec(text);
+    if (plan) {
+      if (frame.plan !== null || frame.seen) invalid();
+      frame.plan = Number(plan[1]);
+      if (!Number.isSafeInteger(frame.plan) || frame.plan > 100_000) invalid();
+      continue;
+    }
+    // TAP lines are split on LF; titles can still contain CR, U+2028 or U+2029.
+    const task = /^ok (\d+) - (.*?)(?: # (SKIP|TODO|time=\d+(?:\.\d+)?ms))?( \{)?$/s.exec(text);
+    if (!task || frame.plan === null || Number(task[1]) !== ++frame.seen || frame.seen > frame.plan) invalid();
+    const skipped = frame.skipped || task[3] === 'SKIP' || task[3] === 'TODO';
+    let result = frame.result;
+    if (stack.length === 1) {
+      const file = selected.get(task[2]);
+      result = { name: file ? join(root, file) : '', assertionResults: [] };
+      testResults.push(result);
+    } else if (!task[4]) result.assertionResults.push({ status: skipped ? 'pending' : 'passed' });
+    if (task[4]) {
+      if (stack.length >= 128) invalid();
+      stack.push({ seen: 0, plan: null, skipped, result });
+    }
+  }
+  if (stack.length !== 1 || stack[0].plan === null || stack[0].seen !== stack[0].plan) invalid();
+  // A passing TAP leaf can be an empty describe suite. Require an independent
+  // typed-test count before trusting any leaf as execution evidence. Ambiguous
+  // mixtures of real tests and empty suites fail closed for both callers.
+  const summaries = [...lines.slice(0, header), ...lines.slice(end)].filter(line => line.startsWith('      Tests  '));
+  if (summaries.length !== 1) invalid();
+  const summary = summaries[0].slice('      Tests  '.length);
+  let total = 0, passed = 0, pending = 0;
+  if (summary !== 'no tests') {
+    const counts = /^(.+) \((\d+)\)$/.exec(summary);
+    if (!counts) invalid();
+    const parts = counts[1].split(' | ');
+    const seen = new Set();
+    for (const part of parts) {
+      const match = /^(\d+) (passed|skipped|todo)$/.exec(part);
+      if (!match || seen.has(match[2]) || !Number.isSafeInteger(Number(match[1]))) invalid();
+      seen.add(match[2]);
+      if (match[2] === 'passed') passed = Number(match[1]);
+      else pending += Number(match[1]);
+    }
+    total = Number(counts[2]);
+    if (!Number.isSafeInteger(total) || total !== passed + pending) invalid();
+  }
+  const assertions = testResults.flatMap(result => result.assertionResults);
+  if (assertions.length !== total || assertions.filter(result => result.status === 'passed').length !== passed)
+    throw new Error('ambiguous test inventory: TAP leaves differ from typed-test counts; empty suites may be present');
+  return { testResults };
+}
+
+export async function runHeavyTests(invocation, { io = fs, exec = executeAsync } = {}) {
+  const result = await exec(process.execPath, invocation.args, { cwd: invocation.root, env: invocation.env });
+  if (result?.status === 0 && !result.error) {
+    const report = heavyTestReport(result.stdout, { ...invocation, root: io.realpathSync(invocation.root) });
+    io.writeFileSync(invocation.testReport, JSON.stringify(report));
+  }
+  return result;
+}
+
+export function isRemoteTerminationUnconfirmed(result) {
+  return result?.status === 124 && typeof result.stderr === 'string'
+    && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).');
+}
 
 export async function runAutoRebase({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, exec = deps.exec ?? execute, now = deps.now ?? (() => new Date().toISOString());
@@ -238,9 +339,13 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
       // A fresh report outside the candidate tree proves every selected file actually executed.
       io.mkdirSync(p.dir, { recursive: true });
       testReport = join(p.dir, `${randomUUID()}.vitest-report`);
-      const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...selected,
-        '--reporter=default', '--reporter=json', `--outputFile.json=${testReport}`];
-      requireOk(await (deps.testRunner ?? ((o) => execAsync(process.execPath, o.args, { cwd: o.root, env })))({ root: scratch, args }), 'selected test failed or incomplete');
+      const invocation = buildHeavyTestInvocation({ root, scratch, selected, testReport, env, io });
+      const result = await (deps.testRunner ?? (o => runHeavyTests(o, { io, exec: execAsync })))(invocation);
+      if (isRemoteTerminationUnconfirmed(result)) {
+        event(root, { kind: 'auto-rebase-skipped', ref, reason: 'remote-termination-unconfirmed' }, { env });
+        return { skipped: true, reason: 'remote-termination-unconfirmed' };
+      }
+      requireOk(result, 'selected test failed or incomplete');
       let reportText;
       try {
         if (io.statSync(testReport).size > 8 * 1024 * 1024) throw new Error('test inventory over 8 MiB');
