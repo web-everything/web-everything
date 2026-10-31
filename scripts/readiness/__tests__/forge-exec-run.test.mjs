@@ -100,6 +100,7 @@ describe('sibling root snapshot acceptance', () => {
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
       inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
       manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3,
+      resources:{memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8},
       timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
   });
 
