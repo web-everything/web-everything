@@ -4,7 +4,8 @@ import { afterAll, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { daemonRebuildSettingsPath, resolveClosureScopeMode, resolveSkipUnrelated } from '../daemon-rebuild/skip-unrelated.mjs';
 import { resolveWrongBranchHealSettings } from '../daemon-rebuild/wrong-branch-heal.mjs';
 
@@ -22,6 +23,16 @@ it('default rebuild settings resolve to the module-relative filesystem path in a
 it('default rebuild settings supply tool provenance without a path override', () => {
   expect(resolveClosureScopeMode(env)).toEqual({ mode: 'shadow', source: 'tool' });
   expect(resolveClosureScopeMode({ ...env, WE_DAEMON_CLOSURE_SCOPE: 'on' })).toEqual({ mode: 'on', source: 'env' });
+});
+
+it('native Node resolves settings relative to the module from an unrelated working directory', () => {
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { daemonRebuildSettingsPath } from ${JSON.stringify(pathToFileURL(join(dirname(expectedPath), 'daemon-rebuild/closure-scope-settings.mjs')).href)};
+    process.stdout.write(daemonRebuildSettingsPath());
+  `], { cwd: root, encoding: 'utf8', timeout: 10_000 });
+  expect(result.error).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toBe(expectedPath);
 });
 
 it('default rebuild settings remain usable through skip and wrong-branch callers', () => {

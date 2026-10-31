@@ -18,11 +18,16 @@ let loadN = 0;
 async function load(args = []) {
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
-  // Re-evaluate the module-scope flags without rebuilding the entire transitive graph.
-  // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
-  // @vite-ignore: under --coverage the variable query is otherwise rewritten into a glob map that
-  // has no `?fresh=N` key ("Unknown variable dynamic import"); the plain specifier resolves normally.
-  return import(/* @vite-ignore */ `../pr-land.mjs?fresh=${++loadN}`);
+  try {
+    // Re-evaluate the CLI's flag defaults while retaining its shared dependency graph.
+    // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
+    // @vite-ignore keeps the query as a module-cache key under coverage, instead of
+    // rewriting the variable import into a glob map with no matching query key.
+    return await import(/* @vite-ignore */ `../pr-land.mjs?delegationCase=${++loadN}`);
+  } finally {
+    process.argv = originalArgv;
+    vi.unstubAllEnvs();
+  }
 }
 
 describe('pr-land --delegation', () => {

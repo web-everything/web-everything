@@ -2,6 +2,16 @@
 
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
 
+## Human-only enqueue approval license (R212)
+
+`human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
+the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
+Admission reads complete comments and live head/labels; missing or unreadable evidence retains
+the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
+exceeding either limit asks the operator to re-approve the current head or queue it.
+`drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
+Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
+
 The real-Git daemon rebuild suites `daemon-rebuild-keep-established.test.mjs` and
 `daemon-rebuild-fallback.test.mjs` run in the blocking integration tier's serial fork.
 Their multi-rebuild cases exceeded the five-second deadline in concurrent unit shards.
@@ -832,6 +842,12 @@ For filesystem settings and plain Node child imports, resolve paths with
 as browser asset URLs, which can become HTTP URLs under Vitest's DOM environment.
 Node's ESM loader refuses those URLs, and a settings read can silently fall back instead.
 Assert tool-layer provenance when testing a real default settings path.
+
+For in-process CLI imports with a variable query used to re-evaluate flag defaults, use
+`import(/* @vite-ignore */ expression)`. Otherwise Vite treats the query expression as a
+dynamic-import glob and can reject it as `Unknown variable dynamic import` before any
+assertions run. Keep distinct query keys while retaining the shared dependency graph;
+`scripts/__tests__/pr-land-delegation.test.mjs` exercises delegated and ordinary defaults.
 
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
