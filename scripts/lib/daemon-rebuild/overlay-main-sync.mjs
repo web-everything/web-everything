@@ -319,7 +319,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
 }
 const runTests = ({ root, args, env }) => new Promise(resolveResult => {
   execFile(process.execPath, args, { cwd: root, env, encoding: 'utf8', timeout: 30 * 60_000, maxBuffer: 8 * 1024 * 1024 },
-    (error, stdout, stderr) => resolveResult({ status: error ? 1 : 0, error, stdout, stderr }));
+    (error, stdout, stderr) => resolveResult({ status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0, error, stdout, stderr }));
 });
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
@@ -432,12 +432,23 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const frontier = resolve(root, '..', 'frontierui');
     if (io.existsSync(frontier)) io.symlinkSync(frontier, join(scratchParent, 'frontierui'), 'dir');
     setStep('tests');
+    const testEnv = { ...env };
+    // The daemon wrapper finds the host pool; scratch tests must not inherit an explicit pool.
+    delete testEnv.LANE_POOL_ROOT;
+    const admission = resolve(root, 'scripts/readiness/heavy-admission.mjs');
+    const testRepo = io.realpathSync(scratch);
     for (let offset = 0; offset < tests.length; offset += 50) {
       const chunk = tests.slice(offset, offset + 50);
       const reportFile = join(scratchParent, `tests-${offset / 50}.json`);
-      const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...chunk,
+      const args = [admission, 'run', `--repo=${testRepo}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...chunk,
         '--reporter=default', '--reporter=json', `--outputFile.json=${reportFile}`];
-      output({ ...await (deps.testRunner ?? runTests)({ root: scratch, args, env }), step });
+      const result = await (deps.testRunner ?? runTests)({ root: scratch, args, env: testEnv });
+      // The remote process may still be running: neither publication nor a local rerun is safe.
+      if (result?.status === 124 && typeof result.stderr === 'string'
+        && result.stderr.includes('remote termination unconfirmed; refusing local rerun (exit 124).')) {
+        return await skip('remote-termination-unconfirmed');
+      }
+      output({ ...result, step });
       if (io.statSync(reportFile).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
       const report = JSON.parse(io.readFileSync(reportFile, 'utf8'));
       const results = report.testResults ?? [];
