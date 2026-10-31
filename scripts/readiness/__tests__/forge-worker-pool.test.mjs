@@ -576,7 +576,6 @@ describe('anonymous real Git snapshot',()=>{
           expect(git(call.cwd,'rev-parse','HEAD')).toBe(head);
           expect(git(call.cwd,'rev-parse','origin/main')).toBe(main);
           expect(git(call.cwd,'diff','--cached','--name-only')).toBe(tier);
-          await fs.mkdir(join(call.cwd,'coverage'));await fs.writeFile(join(call.cwd,'coverage/coverage-final.json'),coverage);
           expect(scanMaterializedGuards(call.cwd).coverage).toEqual(local);
           return {code:1};
         }
@@ -585,7 +584,7 @@ describe('anonymous real Git snapshot',()=>{
     const evidence={baseSha:main,baseManifestDigest:base.manifestDigest};
     const p=await runner.prepare({nonce,...(delta?evidence:{})}),dir=work(p),argv=['npm','run','check:standards'];
     for(const path of delta?snapshot.deltaPaths:snapshot.entries.map(e=>e.path)){
-      const to=join(dir,path.toString());await fs.mkdir(join(to,'..'),{recursive:true});await fs.copyFile(join(source,path.toString()),to);
+      const to=join(dir,path.toString());await fs.mkdir(join(to,'..'),{recursive:true});await fs.cp(join(source,path.toString()),to,{preserveTimestamps:true});
     }
     // Bind the full tree before transport; the cache merely avoids copying bytes.
     const full=join(root,'full');await fs.mkdir(full);
@@ -599,6 +598,43 @@ describe('anonymous real Git snapshot',()=>{
     expect(git(dir,'rev-parse','HEAD')).toBe(head);
     expect(gitCalls.some(call=>call.args.includes('fetch')&&call.args.at(-1)===head)).toBe(true);
     expect(await runner.finish(request)).toMatchObject({phase:'test',code:1});
+  });
+  it.each(['HEAD ancestor','main ancestor','missing','cached unrelated','mismatch','ref instead of SHA'])
+  ('binds the coverage base SHA and requires public reachability before execution: %s',async scenario=>{
+    const source=join(root,'public'),baseRoot=join(root,'bases');
+    await fs.mkdir(source);await fs.mkdir(baseRoot);
+    git(source,'init','-b','main');git(source,'config','user.name','Fixture');git(source,'config','user.email','f@example.invalid');
+    await fs.writeFile(join(source,'package-lock.json'),'lock');git(source,'add','.');git(source,'commit','-m','initial');
+    const initial=git(source,'rev-parse','HEAD');
+    git(source,'commit','--allow-empty','-m','public main');
+    const main=git(source,'rev-parse','HEAD');
+    git(source,'checkout','--orphan','private-base');git(source,'commit','-m','unrelated cached commit');
+    const unrelated=git(source,'rev-parse','HEAD');git(source,'checkout','main');
+    git(root,'clone','--bare',source,join(baseRoot,'repo.git'));
+    git(join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',scenario==='HEAD ancestor'?initial:main);
+    const head=scenario==='main ancestor'?initial:main;
+    const base=scenario==='missing'?'f'.repeat(40):scenario==='cached unrelated'?unrelated:scenario==='ref instead of SHA'?'main':main;
+    const execute=vi.fn(async()=>({code:0})),gitExec=vi.fn(cachedPublicGitExec);
+    runner=createRunner({testRoot:root,testPath:process.env.PATH,testWorkerExec:execute,testGitExec:gitExec});
+    const p=await runner.prepare({nonce}),dir=work(p),argv=['npm','run','check:standards'];
+    await fs.writeFile(join(dir,'package-lock.json'),'lock');
+    const manifest={...manifestWire({entries:[{path:Buffer.from('package-lock.json'),sha256:hash('lock'),executable:false,tracked:true}],excluded:[]}),git:{head,diffCoverageBase:base}};
+    const request={...p,nonce,argv,env:{DIFF_COVERAGE_BASE:scenario==='mismatch'?initial:base},
+      manifest,manifestDigest:digestManifest(manifest),inputDigest:await digestInput(dir),lock:hash('lock'),argvDigest:digestArgv(argv)};
+    if(scenario.endsWith('ancestor')) {
+      expect(await runner.run(request)).toMatchObject({code:0});
+      expect(git(dir,'rev-parse',base+'^{commit}')).toBe(base);
+      expect(execute.mock.calls.find(([call])=>call.argv[2]==='check:standards')[0].env.DIFF_COVERAGE_BASE).toBe(base);
+      expect(await runner.finish(request)).toMatchObject({phase:'test',code:0});
+    } else {
+      await expect(runner.run(request)).rejects.toThrow(scenario==='mismatch'?'Coverage base mismatch':scenario==='ref instead of SHA'?'Invalid Git evidence':'Coverage base unavailable');
+      expect(execute).not.toHaveBeenCalled();
+      await expect(fs.stat(join(dir,'.git'))).rejects.toMatchObject({code:'ENOENT'});
+      const receipt=await runner.finish(request);
+      if(['missing','cached unrelated'].includes(scenario))expect(receipt).toMatchObject({phase:'rejected',reason:'diff-coverage-base-unavailable',started:false});
+      else expect(receipt).toBeNull(); // Generic snapshot rejection retains the legacy fail-closed contract.
+      if(scenario==='mismatch')expect(gitExec).not.toHaveBeenCalled();
+    }
   });
   it.each([false,true])('certifies an unfetchable Mac HEAD as not-started git-head-unavailable without install or task execution (delta=%s)',async delta=>{
     const source=join(root,'public'),baseRoot=join(root,'bases');await fs.mkdir(source);await fs.mkdir(baseRoot);

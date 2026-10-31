@@ -9,7 +9,8 @@
  *     seated inside the review pipeline. That module's argv/parsing pattern is mirrored here where it applies
  *     (the stdin-trap avoidance, JSONL-is-a-stream discipline, parent-imposed timeout wall), but the MODE is
  *     the opposite: this script runs Codex WITH tools, WITH write access, on an OPEN-ENDED prompt, and expects
- *     real file edits as the result — there is no `--output-schema`, no answer to parse out of the stream.
+ *     real file edits as the result. Review callers may optionally constrain the final answer with
+ *     `--output-schema-file=<path>` (forwarded to `codex exec --output-schema <path>`).
  *   - the `xu2pp2m` review/fix-dispatch minimal-context design — that work is about STRIPPING an agent's
  *     context down for a machine-owned production wrapper installed on someone else's box. This script has no
  *     such constraint: it runs on the OPERATOR'S OWN machine, for the OPERATOR'S OWN judgment call about
@@ -198,6 +199,7 @@ export {
 export function buildCodexDirectTaskArgv({
   cwd,
   outputLastMessageFile,
+  outputSchemaFile,
   model, effort, tier, taskKind, size, epic, decision, care, mandatoryLens,
   env = process.env, route,
   ephemeral = false,
@@ -216,6 +218,13 @@ export function buildCodexDirectTaskArgv({
   // #4194 — REVIEW MODE runs Codex under its own `read-only` sandbox: a review seat reads the checkout and reports
   // findings; it must never edit anything. Every other caller keeps `workspace-write`, unchanged.
   const argv = ['exec', '--json', '-s', review ? 'read-only' : 'workspace-write', '--skip-git-repo-check', '-C', cwd];
+  if (outputSchemaFile !== undefined) {
+    if (typeof outputSchemaFile !== 'string' || !outputSchemaFile.trim()) {
+      throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
+    }
+    // `exec resume` does not support --output-schema; validate the option on every path.
+    if (resumeThreadId === undefined) argv.push('--output-schema', outputSchemaFile);
+  }
   if (outputLastMessageFile) {
     if (typeof outputLastMessageFile !== 'string' || !outputLastMessageFile.trim()) {
       throw new TypeError('codex-direct-task: `outputLastMessageFile` must be a non-empty path when given');
@@ -849,6 +858,7 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
 export async function runCodexDirectExec({
   dir,
   task,
+  outputSchemaFile,
   model,
   effort, taskKind, size, epic, decision, care, mandatoryLens, route, log,
   ephemeral = false,
@@ -872,7 +882,7 @@ export async function runCodexDirectExec({
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
+  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
   const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
   // A resumed turn that emits no final file must not reuse an earlier completion report.
@@ -1014,6 +1024,7 @@ export async function runCodexDirectExec({
 export async function codexDirectTask({
   caller = 'codex-direct-task.mjs', repo, pr, card, usageTaskKind,
   task,
+  outputSchemaFile,
   dir,
   repoRoot,
   model,
@@ -1105,7 +1116,7 @@ export async function codexDirectTask({
   const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
   const writableRoots = review ? [] : [gitDir, resolve(admissionLockRoot(resolve(targetDir), env)), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
-    dir: targetDir, task, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
+    dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy,
   }), { env });
   const events = parseJsonlEvents(run.stdout);
@@ -1485,7 +1496,7 @@ async function main() {
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
+      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--output-schema-file=<path>] [--no-self-review] [--json] [--detach]\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
@@ -1539,6 +1550,7 @@ async function main() {
       task,
       dir,
       repoRoot,
+      outputSchemaFile: flags['output-schema-file'] ? resolve(flags['output-schema-file']) : undefined,
       model: flags.model,
       effort: flags.effort,
       tier: flags.tier,
