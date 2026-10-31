@@ -5,7 +5,7 @@ import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { isDeepStrictEqual } from 'node:util';
+import { isDeepStrictEqual, stripVTControlCharacters } from 'node:util';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import * as overlays from '../daemon-overlays.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
@@ -128,7 +128,7 @@ export function heavyTestReport(stdout, { root, args }) {
     // Reporter hooks may finish in either order. Only leave a complete TAP plan
     // for the basic reporter's summary, never for an arbitrary trailing TAP line.
     if (stack.length === 1 && frame.plan !== null && frame.seen === frame.plan
-      && /^(?: Test Files|  Snapshots)  /.test(line)) { end = index; break; }
+      && /^(?: Test Files|  Snapshots)  /.test(stripVTControlCharacters(line))) { end = index; break; }
     if (stack.length > 1 && line === '    '.repeat(stack.length - 2) + '}') {
       if (frame.plan === null || frame.plan !== frame.seen) invalid();
       stack.pop(); continue;
@@ -161,7 +161,10 @@ export function heavyTestReport(stdout, { root, args }) {
   // A passing TAP leaf can be an empty describe suite. Require an independent
   // typed-test count before trusting any leaf as execution evidence. Ambiguous
   // mixtures of real tests and empty suites fail closed for both callers.
-  const summaries = [...lines.slice(0, header), ...lines.slice(end)].filter(line => line.startsWith('      Tests  '));
+  // BasicReporter can enable colors in CI. Normalize only summary text so TAP
+  // titles remain literal and the plan/typed-count checks still fail closed.
+  const summaries = [...lines.slice(0, header), ...lines.slice(end)]
+    .map(line => stripVTControlCharacters(line)).filter(line => line.startsWith('      Tests  '));
   if (summaries.length !== 1) invalid();
   const summary = summaries[0].slice('      Tests  '.length);
   let total = 0, passed = 0, pending = 0;

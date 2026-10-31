@@ -126,10 +126,46 @@ describe('auto-rebase executed-test inventory', () => {
     let stdout = await scratchTestOutput([{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 0 },
       tasks: [{ type: 'test', name: 'instant test', mode: 'run', result: { state: 'pass', duration: 0 } }] }]);
     if (order === 'before') {
-      const boundary = stdout.indexOf(' Test Files  ');
+      const boundary = stdout.indexOf('\n}\n') + 3;
       stdout = stdout.slice(boundary) + stdout.slice(0, boundary);
     }
     expect(heavyTestReport(stdout, invocation).testResults[0].assertionResults).toEqual([{ status: 'passed' }]);
+  });
+  it.each(['before', 'after'])('validates real ANSI-colored reporter summaries %s TAP', async order => {
+    const root = temp(), file = 'worker.test.mjs';
+    const invocation = buildHeavyTestInvocation({ root, scratch: root, selected: [file], testReport: join(root, 'report.json'), env: {} });
+    // Reporters choose colors at import time. Use a fresh process to exercise
+    // their CI output even when the parent test runner disables colors.
+    const producer = new URL('../../conveyor/soak/breaks/scratch-tests-forge-command.mjs', import.meta.url).href;
+    const env = { ...process.env, FORCE_COLOR: '1' };
+    delete env.NO_COLOR;
+    const emit = tasks => {
+      const files = [{ type: 'suite', name: file, mode: 'run', result: { state: 'pass', duration: 0 }, tasks }];
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `import { scratchTestOutput } from ${JSON.stringify(producer)}; process.stdout.write(await scratchTestOutput(JSON.parse(process.argv[1])));`,
+        JSON.stringify(files)], { env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('\x1b[2m Test Files ');
+      const boundary = result.stdout.indexOf('\n}\n') + 3;
+      return order === 'before' ? result.stdout.slice(boundary) + result.stdout.slice(0, boundary) : result.stdout;
+    };
+    const test = { type: 'test', name: 'instant test', mode: 'run', result: { state: 'pass', duration: 0 } };
+    const stdout = emit([test, { ...test, mode: 'skip' }, { ...test, mode: 'todo' }]);
+    const exec = vi.fn(async () => ({ status: 0, stdout, stderr: '' }));
+    await runHeavyTests(invocation, { exec });
+    expect(exec).toHaveBeenCalledOnce();
+    expect(JSON.parse(fs.readFileSync(invocation.testReport, 'utf8')).testResults[0].assertionResults)
+      .toEqual([{ status: 'passed' }, { status: 'pending' }, { status: 'pending' }]);
+    // Color normalization must not excuse duplicate/missing counts, truncated
+    // plans, or the ambiguous TAP leaf emitted for an empty describe suite.
+    const summaryLine = stdout.split('\n').find(line => line.includes('Tests'));
+    expect(summaryLine).toBeDefined();
+    expect(() => heavyTestReport(stdout + summaryLine + '\n', invocation)).toThrow(/inventory/);
+    expect(() => heavyTestReport(stdout.split('\n').filter(line => !line.includes('Tests')).join('\n'), invocation)).toThrow(/inventory/);
+    expect(() => heavyTestReport(stdout.replace('\n}\n', '\n'), invocation)).toThrow(/inventory/);
+    const empty = { type: 'suite', name: 'empty describe', mode: 'run', result: { state: 'pass', duration: 0 }, tasks: [] };
+    expect(() => heavyTestReport(emit([empty]), invocation)).toThrow(/inventory/);
+    expect(() => heavyTestReport(emit([empty, test]), invocation)).toThrow(/inventory/);
   });
   it.each(['', 'no tests', '2 passed (2)', '1 passed (2)', '1 failed (1)', '1 passed | 0 passed (1)',
     '1 passed (9007199254740992)', '1 passed (1)\n      Tests  1 passed (1)', 'truncated'])(
