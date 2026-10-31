@@ -8,7 +8,7 @@
  * open PR in web-everything/web-everything or plateauapp/plateau-app AND (b) the declared target files of every
  * agent still running without a PR. Agents declare (b) in the shared registry
  * `~/workspace/.operations/coordination/agent-scopes.json` via `we:scripts/operations/free-scope-cli.mjs register`;
- * an entry past its TTL is ignored and reported, never silently trusted. Skill: `we:skills-src/free-scope/SKILL.md`.
+ * an entry past its TTL (or past its heartbeat window, when registered with one) is ignored and reported, never silently trusted. Skill: `we:skills-src/free-scope/SKILL.md`.
  */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
@@ -44,7 +44,19 @@ export function parseExcludePr(spec) {
   return { repo, number: Number(digits) };
 }
 const qualified = (files) => [...new Set(files.map((f) => qualifyFile(f)).filter(Boolean))];
-const expiry = (entry) => Date.parse(entry.startedAt) + (entry.ttlHours ?? DEFAULT_TTL_HOURS) * 3600e3;
+const ttlExpiry = (entry) => Date.parse(entry.startedAt) + (entry.ttlHours ?? DEFAULT_TTL_HOURS) * 3600e3;
+/** A heartbeat window counts only when it is a positive number; any other stamp falls back to the TTL alone. */
+const heartbeatWindow = (entry) => typeof entry.staleAfterMinutes === 'number' && Number.isFinite(entry.staleAfterMinutes)
+  && entry.staleAfterMinutes > 0 ? entry.staleAfterMinutes : null;
+const lastSeenMs = (entry) => { const seen = Date.parse(entry.lastSeenAt); return Number.isFinite(seen) ? seen : Date.parse(entry.startedAt); };
+// Live 2026-10-31 18:36 ET: an operator interrupt stopped 4 subagents and their 4h-TTL entries blocked the restarted
+// worker's own files. Subagents share one OS process, so a pid check cannot tell a dead one from a live one. An entry
+// registered with `--heartbeat` carries `staleAfterMinutes`: it expires that long after its owner's last free-scope
+// call (`lastSeenAt`, else `startedAt`), and never later than the TTL. An entry without the stamp keeps the TTL only.
+const expiry = (entry) => {
+  const ttl = ttlExpiry(entry), window = heartbeatWindow(entry);
+  return window === null ? ttl : Math.min(ttl, lastSeenMs(entry) + window * 60e3);
+};
 export function partitionRegistry(entries, nowMs) {
   const live = [], stale = [];
   for (const entry of entries) (Number.isFinite(expiry(entry)) && expiry(entry) > nowMs ? live : stale).push(entry);
@@ -58,15 +70,33 @@ const ownerOf = (owner) => owner || null;
  * tokenless flow); a LIVE entry held by a different owner is refused, never silently overwritten. An expired entry
  * belongs to no one.
  */
-export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAULT_TTL_HOURS, owner }, nowIso) {
+export function registerScope(entries, { agent, purpose, files, ttlHours = DEFAULT_TTL_HOURS, owner, staleAfterMinutes }, nowIso) {
   if (typeof agent !== 'string' || !agent.trim()) throw new TypeError('free-scope: give --agent=<name>');
   const scope = qualified(files || []);
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
   if (!Number.isFinite(ttlHours) || ttlHours <= 0) throw new TypeError('free-scope: ttlHours must be positive');
+  if (staleAfterMinutes !== undefined && !(typeof staleAfterMinutes === 'number' && Number.isFinite(staleAfterMinutes) && staleAfterMinutes > 0)) {
+    throw new TypeError('free-scope: staleAfterMinutes must be a positive number');
+  }
   const nowMs = Date.parse(nowIso);
   const held = entries.find((e) => e.agent === agent && ownerOf(e.owner) !== ownerOf(owner) && partitionRegistry([e], nowMs).live.length);
   if (held) throw new TypeError(`free-scope: agent ${agent} is already registered by a different owner (since ${held.startedAt}); release it, wait for its TTL, or use a unique --agent name`);
-  return [...entries.filter((e) => e.agent !== agent), { agent, purpose, files: scope, startedAt: nowIso, ttlHours, ...(owner ? { owner } : {}) }];
+  return [...entries.filter((e) => e.agent !== agent), { agent, purpose, files: scope, startedAt: nowIso, ttlHours, ...(owner ? { owner } : {}),
+    ...(staleAfterMinutes !== undefined ? { staleAfterMinutes, lastSeenAt: nowIso } : {}) }];
+}
+/**
+ * Refresh `lastSeenAt` on the caller's own entry: same agent AND the same non-empty owner token (a tokenless call
+ * could be anyone, so it proves nothing). A TTL-expired entry is not revived; the TTL stays the hard upper bound.
+ */
+export function heartbeatScope(entries, agent, owner, nowIso) {
+  const nowMs = Date.parse(nowIso);
+  let refreshed = 0;
+  const next = entries.map((e) => {
+    if (!agent || !ownerOf(owner) || e.agent !== agent || ownerOf(e.owner) !== ownerOf(owner) || !(ttlExpiry(e) > nowMs)) return e;
+    refreshed++;
+    return { ...e, lastSeenAt: nowIso };
+  });
+  return { entries: next, refreshed };
 }
 /** Release only entries this caller owns: a different owner's entry under the same name is left in place. */
 export function releaseScope(entries, agent, owner) {
@@ -162,7 +192,8 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   if (status === 'occupied' && unreadable.length) headline += ` — could not read open PRs for ${unreadable.map((r) => r.repo).join(', ')}`;
   if (stale.length) headline += ` — ${stale.length} stale registry entr${stale.length === 1 ? 'y' : 'ies'} ignored`;
   return { observedAt: new Date(nowMs).toISOString(), status, files: rows, freeFiles, occupiedFiles, unknownFiles,
-    staleAgents: stale.map(({ agent, purpose, startedAt, ttlHours = DEFAULT_TTL_HOURS }) => ({ agent, purpose, startedAt, ttlHours })),
+    staleAgents: stale.map(({ agent, purpose, startedAt, ttlHours = DEFAULT_TTL_HOURS, lastSeenAt, staleAfterMinutes }) => ({ agent, purpose, startedAt, ttlHours,
+      ...(staleAfterMinutes !== undefined ? { lastSeenAt: lastSeenAt ?? startedAt, staleAfterMinutes } : {}) })),
     unreadable, headline };
 }
 /** Render an ISO timestamp in the operator's timezone (America/New_York), e.g. `2026-10-05 14:31 ET`. */
@@ -179,7 +210,8 @@ export function formatFreeScope(verdict) {
   for (const row of verdict.files) lines.push(`${label[row.state]}${row.file}${row.holders.map((h) =>
     h.type === 'pr' ? `  ← PR #${h.number} "${h.title}" (${h.repo})`
       : `  ← agent ${h.agent} (${h.purpose}, since ${etTime(h.startedAt)})`).join('')}`);
-  if (verdict.staleAgents.length) lines.push('stale (ignored):', ...verdict.staleAgents.map((e) => `  ${e.agent} (${e.purpose}, since ${etTime(e.startedAt)}, ttl ${e.ttlHours}h)`));
+  if (verdict.staleAgents.length) lines.push('stale (ignored):', ...verdict.staleAgents.map((e) => `  ${e.agent} (${e.purpose}, since ${etTime(e.startedAt)}${
+    e.staleAfterMinutes !== undefined ? `, last seen ${etTime(e.lastSeenAt)}, heartbeat ${e.staleAfterMinutes}m` : ''}, ttl ${e.ttlHours}h)`));
   return lines.join('\n');
 }
 export function freeScopeOperation({ collect } = {}) {
