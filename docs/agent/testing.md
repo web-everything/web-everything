@@ -370,6 +370,16 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Stale abandonment publishes a complete marker before replacing the writer, under the shared status
+claim. Its intent binds the old writer digest, evidence digest, timestamp and the exact JSON bytes
+of the abandoned writer. Recovery may finish that intent only while those inputs still match;
+admission still requires the completed writer binding. Keep the atomic JSON rendering and digest
+in agreement. The persistence-boundary matrix in `review-recovery-witness.test.mjs` interrupts
+before/after each rename for queued/running owners and fresh/resume modes, then attempts admission
+twice. The dead-owner soak also interrupts after marker publication and requires one dispatch.
+The same suite exercises production carry-conflict selection and isolates each admission codec
+field and rollback identity check. Exact-head panel evidence takes precedence over a carry journal.
+
 The status writer may repair truncated JSON, null JSON or a mismatched identity only when no retry
 marker exists; readers still reject that evidence. The writer-contract table in
 `drain-red-team-evidence.test.mjs` covers queued, running, finished, fresh-retry and refund writes,

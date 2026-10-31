@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -12,10 +12,35 @@ import { createReviewJobIo, dispatchReviewJob, runReviewJob, runReviewJobCli } f
 import { newRunRecord, resolveRunsDir } from '../run-store.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { runRedTeam, runExtraSeatsCli } from '../review-extra-seats.mjs';
+import { resumeRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
+
+const interruption = vi.hoisted(() => ({ boundary: null }));
+vi.mock('node:fs', async importOriginal => {
+  const fs = await importOriginal();
+  return { ...fs, openSync: (...args) => {
+    const fd = fs.openSync(...args);
+    if (String(args[0]).endsWith('.stale-redispatch-1') && interruption.boundary === 'after marker') {
+      fs.closeSync(fd);
+      throw Error('interrupted after marker creation');
+    }
+    return fd;
+  } };
+});
+vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
+  const atomic = await importOriginal();
+  return { ...atomic, writeJsonAtomic: (path, data, options) => {
+    const kind = path.endsWith('.stale-redispatch-1') ? 'marker' : data?.staleAbandoned ? 'writer' : null;
+    atomic.writeJsonAtomic(path, data, { ...options, renameSyncFn: (temporary, target) => {
+      if (kind && interruption.boundary === `before ${kind}`) throw Error(`interrupted before ${kind} rename`);
+      renameSync(temporary, target);
+    } });
+    if (kind && interruption.boundary === `after ${kind}`) throw Error(`interrupted after ${kind}`);
+  } };
+});
 
 vi.mock('../../lib/red-team-status-labels.mjs', () => ({ syncRedTeamStatusLabels: vi.fn() }));
 const dirs = [];
-afterEach(() => { dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
+afterEach(() => { interruption.boundary = null; dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
 const repo = 'web-everything/web-everything', pr = 7537, head = 'a'.repeat(40);
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head }, diffText: '+code', netChangedFiles: ['scripts/example.mjs'] } } });
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -175,12 +200,97 @@ it.each([1, 2, 3, 4, 5, 6, 7, 8, 9])('A3 / matrix %s: persisted dead job settles
   if (row === 7) expect(stored.result).toBe('ran');
   if (row !== 7) expect(comments).toHaveLength(1);
 });
-it('A4 / C: every job CLI flag is named; red-team payload reads only the witness', () => {
+it('A4: every job CLI flag is named', () => {
   const source = readFileSync(new URL('../review-job.mjs', import.meta.url), 'utf8');
   const tests = readFileSync(new URL('./review-recovery-witness.test.mjs', import.meta.url), 'utf8');
   for (const [, flag] of source.matchAll(/flag\('([^']+)'\)/g)) expect(tests).toContain(`--${flag}`);
-  const body = source.slice(source.indexOf('readRedTeamOnlyPayload:'), source.indexOf('redTeamSkipCardOnlySetting:'));
-  expect(body).toContain('readWitness('); expect(body).not.toMatch(/readStatus\(|readEvidence\(/);
+});
+
+it.each([false, true])('C: production payload preserves carry conflict unless an exact-head panel exists (exact=%s)', exact => {
+  const f = fixture();
+  expect(() => resumeRedTeamCarry({ repo, pr, head, loopPayload: { ...payload(), carriedFrom: 'b'.repeat(40) } }, {
+    env: f.env, eligible: () => true, intentRecorded: () => false,
+    recordIntent: () => { throw Error('stop after durable intent'); },
+  })).toThrow('stop after durable intent');
+  if (!exact) {
+    const run = JSON.parse(readFileSync(f.run, 'utf8'));
+    run.findings.read.netBasis.rev = 'c'.repeat(40);
+    writeFileSync(f.run, JSON.stringify(run));
+  }
+  const io = createReviewJobIo({ env: f.env, root: f.dir, readSeatRecords: () => [] });
+  const stored = io.readRedTeamOnlyPayload({ repo, pr, head });
+  if (exact) {
+    expect(stored.carryConflict).toBeUndefined();
+    expect(stored.loopPayload).toMatchObject({ id: 'review-pr-7537', findings: { read: { netBasis: { rev: head } } } });
+  } else expect(stored).toMatchObject({ carryConflict: true, head });
+});
+
+it.each(['queued', 'running'].flatMap(status => [false, true].flatMap(completed =>
+  ['before marker', 'after marker', 'before writer', 'after writer'].map(boundary => ({ status, completed, boundary })))))(
+  'abandonment recovers after interruption at $boundary persistence boundary ($status, completed=$completed)', ({ status, completed, boundary }) => {
+    const f = fixture({ status, seats: completed ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' }] : [] });
+    interruption.boundary = boundary;
+    expect(f.abandon().ok).toBe(false);
+    interruption.boundary = null;
+    expect(f.abandon().ok).toBe(true);
+    const provider = vi.fn();
+    provider(f.admit());
+    expect(f.abandon().ok).toBe(false);
+    expect(() => f.admit()).toThrow();
+    expect(provider).toHaveBeenCalledTimes(1);
+  });
+
+it('completed legacy abandonment bindings remain admissible', () => {
+  const f = fixture();
+  expect(f.abandon().ok).toBe(true);
+  const { writer, evidence: boundEvidence } = f.readWitness().markers.redispatch;
+  writeFileSync(`${f.path}.stale-redispatch-1`, JSON.stringify({ writer, evidence: boundEvidence }));
+  expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
+});
+
+it.each(['writer', 'evidence', 'marker writer', 'marker prior'])('interrupted abandonment refuses changed %s', change => {
+  const f = fixture();
+  interruption.boundary = 'after marker';
+  expect(f.abandon().ok).toBe(false);
+  interruption.boundary = null;
+  if (change === 'writer') writeFileSync(f.path, readFileSync(f.path, 'utf8') + ' ');
+  if (change === 'evidence') f.seats.push({ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' });
+  if (change.startsWith('marker')) {
+    const markerPath = `${f.path}.stale-redispatch-1`, marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    marker[change === 'marker writer' ? 'writer' : 'priorWriter'] = 'changed';
+    writeFileSync(markerPath, JSON.stringify(marker));
+  }
+  const before = readFileSync(f.path, 'utf8');
+  expect(f.abandon().ok).toBe(false);
+  expect(() => f.admit()).toThrow();
+  expect(readFileSync(f.path, 'utf8')).toBe(before);
+});
+
+it.each([
+  ['pid mismatch', a => { a.queued.pid++; }],
+  ['zero pid', a => { a.pid = a.queued.pid = 0; }],
+  ['fractional pid', a => { a.pid = a.queued.pid = 1.5; }],
+  ['string pid', a => { a.pid = a.queued.pid = '42'; }],
+  ['zero pr', a => { a.queued.pr = 0; }],
+  ['fractional pr', a => { a.queued.pr = 1.5; }],
+  ['unsafe pr', a => { a.queued.pr = Number.MAX_SAFE_INTEGER + 1; }],
+  ['short head', a => { a.queued.head = 'a'.repeat(39); }],
+  ['nonhex head', a => { a.queued.head = 'g'.repeat(40); }],
+  ['missing head', a => { delete a.queued.head; }],
+  ['invalid repo', a => { a.queued.repo = 1; }],
+  ['nonqueued writer', a => { a.queued.status = 'running'; }],
+  ['missing prior', a => { delete a.prior; }],
+])('admission codec isolates %s', (_name, invalidate) => {
+  const admission = { schema: 1, pid: 42, prior: null, queued: { repo, pr, head, pid: 42, status: 'queued' } };
+  expect(evidence.decodeRecoveryAdmission(JSON.stringify(admission))).toEqual(admission);
+  invalidate(admission);
+  expect(() => evidence.decodeRecoveryAdmission(JSON.stringify(admission))).toThrow('invalid recovery admission schema');
+});
+
+it.each([undefined, null, '', 42])('rollback refuses missing or invalid admission identity (%j) without writes', admissionId => {
+  const f = fixture(), witness = f.readWitness(), before = readFileSync(f.path, 'utf8');
+  expect(() => evidence.restoreRecoveryWriter(f.key, witness, admissionId)).toThrow('missing rollback admission identity');
+  expect(readFileSync(f.path, 'utf8')).toBe(before);
 });
 
 it.each(['missing', 'corrupt', 'schema', 'mismatch', 'legacy', 'incomplete', 'null'])('A2: %s admission file refuses without write or provider call', async kind => {

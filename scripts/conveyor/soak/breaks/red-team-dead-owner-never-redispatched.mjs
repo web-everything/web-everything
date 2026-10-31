@@ -8,7 +8,7 @@ export default {
   id: 'red-team-dead-owner-never-redispatched', title: 'a dead queued red-team owner recovers once and settles',
   card: '#7537', fixedBy: { sha: '7537', where: 'raw-witness recovery' },
   fixPresent: root => readFileSync(join(root, 'scripts/operations/review-job.mjs'), 'utf8').includes('planRedTeamRecovery(witness'),
-  async run({ sourceRoot = ROOT, staleClaim = false, operationRunsOverride = false } = {}) {
+  async run({ sourceRoot = ROOT, staleClaim = false, operationRunsOverride = false, interruptAbandonment = false } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-dead-red-team-'));
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
@@ -31,6 +31,14 @@ export default {
         const old = new Date(Date.now() - 60_000); utimesSync(`${statusPath}.retry-claim`, old, old);
       }
       const readWitness = () => e.readRecoveryWitness({ ...key, readScorecards: () => [] });
+      if (interruptAbandonment) {
+        const { writeJsonAtomic } = await load('scripts/lib/atomic-json-file.mjs');
+        const interrupted = r.abandonStaleRedTeamRun(key, { readWitness, writeJson: (path, data, options) => {
+          writeJsonAtomic(path, data, options);
+          throw Error('power loss after abandonment marker rename');
+        } });
+        if (interrupted.ok) return { violations: ['abandonment fault injection did not interrupt persistence'] };
+      }
       const production = j.createReviewJobIo({ root: dir, env, readWitness, readEvidence: () => ({}) });
       let calls = 0, out;
       const arc = { root: dir, now: Date.now, newActorId: () => 'soak', readPrevCompletion: () => null,

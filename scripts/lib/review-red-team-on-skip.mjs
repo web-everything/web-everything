@@ -1,7 +1,8 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { closeSync, openSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
@@ -25,6 +26,10 @@ import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 
 export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
   && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
+
+const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWriter.sha256
+  && w.markers.redispatch?.evidence === w.evidenceSha256
+  && typeof w.markers.redispatch?.abandonedAt === 'string';
 
 /** Pure decision on a raw witness. Probes and time are supplied by the caller. */
 export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
@@ -62,7 +67,7 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
   const marker = w.markers.redispatch;
   if (marker && !raw) return reject('stale marker without writer; inspect stored evidence');
   if (raw?.staleAbandoned && (!marker || marker.writer !== w.rawWriter.sha256 || marker.evidence !== w.evidenceSha256)) return reject('abandonment witness changed');
-  if (marker && active && !raw?.staleAbandoned) return reject('stale re-dispatch already spent');
+  if (marker && active && !raw?.staleAbandoned && !pendingAbandonment(w)) return reject('stale re-dispatch already spent');
   const completed = w.seats.some(completedRedTeamSeat);
   const resumable = ['ran', 'resumed'].includes(normalizeRedTeamResult(raw?.result).priorResult);
   if (active && dead) executionPrior = completed || resumable ? { ...raw, status: 'finished', result: resumable ? raw.result : 'ran' } : null;
@@ -81,19 +86,23 @@ export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(
 
 /** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
 export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
-  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env) } = {}) {
+  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), writeJson = writeJsonAtomic } = {}) {
   const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
   try {
     return withRedTeamStatusClaim(path, () => {
       const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
       if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
-      if (!p.abandon || p.mode === 'skip' || w.markers.redispatch) return { ok: false };
+      if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w))) return { ok: false };
       const marker = `${path}.stale-redispatch-1`;
-      closeSync(openSync(marker, 'wx', 0o600));
-      writeJsonAtomic(path, { ...w.rawWriter.parsed, staleAbandoned: { at: new Date(now()).toISOString() } });
-      writeJsonAtomic(marker, {});
-      const next = readWitness();
-      writeJsonAtomic(marker, { writer: next.rawWriter.sha256, evidence: next.evidenceSha256 });
+      const abandonedAt = w.markers.redispatch?.abandonedAt ?? new Date(now()).toISOString();
+      const next = { ...w.rawWriter.parsed, staleAbandoned: { at: abandonedAt } };
+      // Bind the exact writeJsonAtomic rendering before publishing either file. A crash
+      // leaves either the old writer plus this complete intent, or the bound new writer.
+      const writer = createHash('sha256').update(`${JSON.stringify(next, null, 2)}\n`).digest('hex');
+      if (w.markers.redispatch && w.markers.redispatch.writer !== writer) return { ok: false };
+      if (!w.markers.redispatch) writeJson(marker, { writer, evidence: w.evidenceSha256,
+        priorWriter: w.rawWriter.sha256, abandonedAt }, { mode: 0o600 });
+      writeJson(path, next);
       return { ok: true };
     });
   } catch { return { ok: false }; }

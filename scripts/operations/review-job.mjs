@@ -459,7 +459,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     readRedTeamOnlyPayload: ({ pr, repo, head }) => {
       const w = readWitness({ pr, repo, head });
       const legacy = w.carryEvidence;
-      return { ...(legacy && (cardOnlyHeadMoveCandidate(legacy, head) || cardOnlySkipSettlementCandidate(legacy, head)) ? legacy : {}),
+      return { ...(legacy && (legacy.carryConflict || cardOnlyHeadMoveCandidate(legacy, head) || cardOnlySkipSettlementCandidate(legacy, head)) ? legacy : {}),
         head, ...(w.newest ? { loopPayload: w.newest } : {}) };
     },
     redTeamSkipCardOnlySetting: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
