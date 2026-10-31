@@ -1,4 +1,4 @@
-import { beforeAll, afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync } from 'node:fs';
@@ -20,7 +20,9 @@ async function load(args = []) {
   process.argv = ['node', 'test-import', ...args];
   try {
     // Re-evaluate the CLI's flag defaults while retaining its shared dependency graph.
-    // The query is a module-cache key, not a path glob for Vite's dynamic-import transform.
+    // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
+    // @vite-ignore keeps the query as a module-cache key under coverage, instead of
+    // rewriting the variable import into a glob map with no matching query key.
     return await import(/* @vite-ignore */ `../pr-land.mjs?delegationCase=${++loadN}`);
   } finally {
     process.argv = originalArgv;
@@ -29,27 +31,20 @@ async function load(args = []) {
 }
 
 describe('pr-land --delegation', () => {
-  let delegated, ordinary;
-  beforeAll(async () => {
-    // Cold CLI imports belong to fixture setup, outside the stamp assertions' 5s budget.
-    delegated = await load(['--delegation=codex:gpt-6-astra:bugfix']);
-    ordinary = await load();
-  }, 30000);
-
-  it('valid flag composes both author and delegation stamps into the PR body', () => {
-    const { composePrBody } = delegated;
+  it('valid flag composes both author and delegation stamps into the PR body', async () => {
+    const { composePrBody } = await load(['--delegation=codex:gpt-6-astra:bugfix']);
     const body = composePrBody('Fix the launch wrapper.');
     expect(parseAuthorActorId(body)).toBe('author-session');
     expect(parseDelegationMarker(body)).toEqual(triple);
   });
-  it('absent flag preserves the author stamp without any delegation marker', () => {
-    const { composePrBody } = ordinary;
+  it('absent flag preserves the author stamp without any delegation marker', async () => {
+    const { composePrBody } = await load();
     const body = composePrBody('Ordinary work.');
     expect(parseAuthorActorId(body)).toBe('author-session');
     expect(body).not.toContain('delegation:');
   });
-  it('stamps idempotently, including malformed/conflicting existing stamps and empty bodies', () => {
-    const { withDelegationStamp } = delegated;
+  it('stamps idempotently, including malformed/conflicting existing stamps and empty bodies', async () => {
+    const { withDelegationStamp } = await load(['--delegation=codex:gpt-6-astra:bugfix']);
     const once = withDelegationStamp('body');
     expect(withDelegationStamp(once)).toBe(once);
     for (const body of ['', '  ', null, undefined, '<!-- delegation: broken -->', `${once}\n${buildDelegationMarker({ ...triple, model: 'other' })}`]) {
