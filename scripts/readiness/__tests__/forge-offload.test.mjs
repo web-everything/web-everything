@@ -19,7 +19,7 @@ beforeEach(async()=>{
   for(const [name,data] of Object.entries({'package-lock.json':'lock','a.test.mjs':'test','deleted.txt':'delete','mode.txt':'mode','oauth-source.mjs':'public','credentials.txt':'private'})) await fs.writeFile(join(repo,name),data);
   git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
 });
-afterEach(async()=>fs.rm(root,{recursive:true,force:true}));
+afterEach(async()=>{vi.restoreAllMocks();await fs.rm(root,{recursive:true,force:true});});
 async function baseFixture() {
   const sha=git(['rev-parse','HEAD']).toString().trim();
   const manifest=await remote.buildManifest({cwd:repo,exec});
@@ -252,9 +252,14 @@ describe('warm base selection and delta proof',()=>{
   it('matches the full-ship digest with excluded symlinks in the base tree',async()=>{
     await fs.mkdir(join(repo,'.claude'));
     await fs.symlink('../mode.txt',join(repo,'.claude/skills'));
-    await fs.symlink('../deleted.txt',join(repo,'.claude/agent-memory'));
+    await fs.mkdir(join(repo,'agent-memory-src'));
+    await fs.writeFile(join(repo,'agent-memory-src/MEMORY.md'),'# Memory\n');
+    await fs.symlink('../agent-memory-src',join(repo,'.claude/agent-memory'));
     git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
     const base=await baseFixture();
+    // Keep the link in the base tree, but untrack it for the delta: indexed
+    // memory bridges intentionally require full shipping.
+    git(['rm','--cached','.claude/agent-memory']);
     await fs.writeFile(join(repo,'mode.txt'),'changed');
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
     const full=await remote.buildManifest({cwd:repo,exec});
@@ -550,10 +555,10 @@ describe('runner base materialization refuses before install',()=>{
       expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
-    expect(stage.shipMode).toBe(['delta','retry succeeds','next base'].includes(mode)?'delta':'full');
+    const deltaMode=['delta','retry succeeds','next base'].includes(mode);
+    expect(stage.shipMode).toBe(deltaMode?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
     // only in delta mode; the deleted file and private credentials never ship.
-    const deltaMode=['delta','retry succeeds','next base'].includes(mode);
     const payloads=deltaMode?['changed']:['changed','lock','mode','public'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
@@ -590,7 +595,7 @@ describe('runner base materialization refuses before install',()=>{
       return {code:0,stdout:JSON.stringify(value)};
     });
     const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log:vi.fn()});
-    expect(result).toMatchObject({mode:'fallback',reason:'ignored-test-file'});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file'});
     expect(transport.mock.calls.some(([call])=>call.file==='ssh'&&call.args.at(-1).endsWith(' base-manifest'))).toBe(true);
     expect(ignoredListings.length).toBeGreaterThan(0);
     for(const listing of ignoredListings)expect(listing.toString().split('\0')).toContain('late.test.mjs');
@@ -832,6 +837,19 @@ describe('warm-base tick',()=>{
     for(let n=1;n<=count;n++)await fs.mkdir(join(f.options.runs,'slot-'+n),{mode:0o700});
     return f;
   }
+  async function interceptPrewarmCopy(beforeMode) {
+    const bases=await import('../forge-exec-bases.mjs'),copy=bases.copyLeaves;
+    // The descriptor-pinned copier runs in Python, outside injected fs.writeFile.
+    // Keep real copies and pause/fault with a partial tree before the mode leaf.
+    return vi.spyOn(bases,'copyLeaves').mockImplementation(async(source,destination,entries)=>{
+      expect(destination).toContain('/.prewarm-');
+      const index=entries.findIndex(entry=>entry.path.equals(Buffer.from('mode.txt')));
+      expect(index).toBeGreaterThan(0);
+      await copy(source,destination,entries.slice(0,index));
+      await beforeMode();
+      await copy(source,destination,entries.slice(index));
+    });
+  }
   it.each([false,true])('retains untouched valid prewarm tree and leaf inodes across ticks (newest pinned: %s)',async pinned=>{
     const f=await slotFixture(1);await f.warm.warmTick(f.options);
     const tree=join(f.target,'prewarm',f.base.sha,'1'),leaf=join(tree,'mode.txt');
@@ -846,11 +864,8 @@ describe('warm-base tick',()=>{
   it('slow prewarm copy does not starve a concurrent baseGuard waiter or expose a partial tree',async()=>{
     const f=await slotFixture(1);let entered,release;
     const copying=new Promise(resolve=>entered=resolve),held=new Promise(resolve=>release=resolve);
-    const io={...fs,writeFile:async(path,...args)=>{
-      if(String(path).endsWith('/mode.txt')&&!String(path).includes(f.base.sha+'.tmp')){entered();await held;}
-      return fs.writeFile(path,...args);
-    }};
-    const tick=f.warm.warmTick({...f.options,fs:io});
+    await interceptPrewarmCopy(async()=>{entered();await held;});
+    const tick=f.warm.warmTick(f.options);
     try {
       await copying;let now=0;
       await expect(baseGuard(f.target,async()=>{
@@ -867,11 +882,10 @@ describe('warm-base tick',()=>{
   });
   it('keeps publication successful and attempts other slots after one copy fails',async()=>{
     const f=await slotFixture(3),log=vi.fn();let failed=false;
-    const io={...fs,writeFile:async(path,...args)=>{
-      if(!failed&&String(path).endsWith('/mode.txt')&&!String(path).includes(f.base.sha+'.tmp')){failed=true;throw Object.assign(new Error('disk full'),{code:'ENOSPC'});}
-      return fs.writeFile(path,...args);
-    }};
-    await expect(f.warm.warmTick({...f.options,fs:io,log})).resolves.toMatchObject({sha:f.base.sha});
+    await interceptPrewarmCopy(async()=>{
+      if(!failed){failed=true;throw Object.assign(new Error('disk full'),{code:'ENOSPC'});}
+    });
+    await expect(f.warm.warmTick({...f.options,log})).resolves.toMatchObject({sha:f.base.sha});
     expect(failed).toBe(true);expect(log).toHaveBeenCalledWith(expect.stringContaining('disk full'));
     const parent=join(f.target,'prewarm',f.base.sha),trees=(await fs.readdir(parent)).filter(name=>/^[1-9]\d*$/.test(name));
     expect(trees).toHaveLength(2);
@@ -884,17 +898,16 @@ describe('warm-base tick',()=>{
     const tree=join(f.target,'prewarm',f.base.sha,'1'),inode=(await fs.lstat(tree)).ino;
     await fs.writeFile(tree+'.json','{}');
     let raced=false;
-    const io={...fs,writeFile:async(path,...args)=>{
-      if(!raced&&String(path).endsWith('/mode.txt')) {
+    await interceptPrewarmCopy(async()=>{
+      if(!raced) {
         raced=true;
         await baseGuard(f.target,async()=>{
           if(fault==='busy')await fs.mkdir(join(f.options.receipts,'worker-active-1'));
           else await createBasePin(f.target,'runner',f.base.sha);
         });
       }
-      return fs.writeFile(path,...args);
-    }};
-    await f.warm.warmTick({...f.options,fs:io});
+    });
+    await f.warm.warmTick(f.options);
     expect(raced).toBe(true);expect((await fs.lstat(tree)).ino).toBe(inode);
     expect(await fs.readFile(tree+'.json','utf8')).toBe('{}');
     expect(await fs.readdir(join(f.target,'active'))).toEqual(fault==='pinned'?['runner']:[]);
