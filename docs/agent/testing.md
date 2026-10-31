@@ -370,6 +370,16 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Stale abandonment publishes a complete marker before replacing the writer, under the shared status
+claim. Its intent binds the old writer digest, evidence digest, timestamp and the exact JSON bytes
+of the abandoned writer. Recovery may finish that intent only while those inputs still match;
+admission still requires the completed writer binding. Keep the atomic JSON rendering and digest
+in agreement. The persistence-boundary matrix in `review-recovery-witness.test.mjs` interrupts
+before/after each rename for queued/running owners and fresh/resume modes, then attempts admission
+twice. The dead-owner soak also interrupts after marker publication and requires one dispatch.
+The same suite exercises production carry-conflict selection and isolates each admission codec
+field and rollback identity check. Exact-head panel evidence takes precedence over a carry journal.
+
 The status writer may repair truncated JSON, null JSON or a mismatched identity only when no retry
 marker exists; readers still reject that evidence. The writer-contract table in
 `drain-red-team-evidence.test.mjs` covers queued, running, finished, fresh-retry and refund writes,
@@ -3530,3 +3540,11 @@ indeterminate run must be inspected before starting a new pass. Focused proof li
 `scripts/operations/__tests__/manual-daemon-pass.test.mjs`; operation enumeration and declaration
 map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
 discovers script modules dynamically and has no hand-maintained operation list.
+
+## Raw red-team recovery witnesses (#7537)
+
+Recovery fixtures persist the panel read as a `review-pr` run and inject the scorecard store;
+`status.loopPayload` is deliberately truncated. Bind abandonment to raw writer bytes and seat/run
+evidence, then test mutations before queued admission. Never normalize the status in a reader.
+Inject raw witness/probe failures directly for liveness refusals; do not infer them from normalized drain flags.
+The dead-owner and skip-settlement breaks are discovered from disk and run with `vitest.soak.config.ts` using the shared repo registry.
