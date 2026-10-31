@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { makeGit, verifyRev, archiveUncovered, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
@@ -355,41 +355,8 @@ export async function prepareRebuild({
       prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
     });
     if (!plan.ok || mainOnly) break;
-    const uncovered = [];
     try {
-      const covered = new Map();
-      const carries = (sha) => {
-        if (!FULL_SHA_RE.test(sha ?? '') || !FULL_SHA_RE.test(plan.finalSha ?? '')) throw new Error('invalid archived commit');
-        if (covered.has(sha)) return covered.get(sha);
-        // A restored source may have advanced beyond its archived SHA. Prove the archive is in the
-        // proposed build by ancestry; requiring equality with the live tip would hold recovery forever.
-        const ancestor = git(['merge-base', '--is-ancestor', sha, plan.finalSha]);
-        if (ancestor.error || ![0, 1].includes(ancestor.status)) throw new Error('archive ancestry unavailable');
-        let present = ancestor.status === 0;
-        if (!present) {
-          // Squash-landed/rebased content is safe only with whole-tree equivalence, as in retirement.
-          const merged = git(['merge-tree', '--write-tree', '--no-messages', plan.finalSha, sha]);
-          if (merged.error || ![0, 1].includes(merged.status)) throw new Error('archive content unavailable');
-          if (merged.status === 0) {
-            const tree = verifyRev(git, `${plan.finalSha}^{tree}`);
-            const mergedTree = String(merged.stdout ?? '').split('\n')[0].trim();
-            if (!FULL_SHA_RE.test(tree ?? '') || !FULL_SHA_RE.test(mergedTree)) throw new Error('archive tree unavailable');
-            present = tree === mergedTree;
-          }
-        }
-        covered.set(sha, present);
-        return present;
-      };
-      for (const carrier of overlaysBefore) {
-        const pending = [...(carrier.retiredSources ?? [])];
-        let missing = false;
-        while (pending.length) {
-          const source = pending.pop();
-          if (!carries(source?.sha)) missing = true;
-          pending.push(...(source.entry?.retiredSources ?? []));
-        }
-        if (missing) uncovered.push(carrier);
-      }
+      const uncovered = archiveUncovered(git, overlaysBefore, plan.finalSha);
       if (!uncovered.length) break;
       const restored = [];
       for (const carrier of uncovered) {
