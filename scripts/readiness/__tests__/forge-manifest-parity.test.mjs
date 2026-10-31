@@ -1,11 +1,12 @@
 // @vitest-environment node
-import {afterEach,beforeEach,expect,it} from 'vitest';
+import {afterEach,beforeEach,expect,it,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {bindGit,buildManifest,buildDeltaManifest,defaultExec,runRemote} from '../remote-exec.mjs';
 import {manifestWire} from '../forge-exec-manifest.mjs';
+import {manifestMutation} from './fixtures/forge-bound-git.mjs';
 let root,cwd,base,env;
 const sha=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,dir=cwd)=>{const r=spawnSync('git',args,{cwd:dir,env,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
@@ -36,6 +37,106 @@ it('refuses a subdirectory or unreadable binding as unbound-worktree before remo
   const result=await runRemote({cwd,env,exec,argv:['npm','run','test:unit'],log:()=>{}});
   expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'unbound-worktree'});
   expect(calls.every(call=>call.file==='git')).toBe(true);
+});
+
+it.each([undefined,null])('bound exec uses its bound directory for cwd=%s without rebinding',async omitted=>{
+  const calls=[],exec=async call=>{
+    calls.push(call);
+    if(calls.length>3)throw new Error('Repeated binding');
+    return defaultExec(call);
+  };
+  const bound=await bindGit({cwd,env,exec});
+  const call={file:'git',args:['rev-parse','--show-toplevel'],cwd:omitted};
+  const result=await bound(call);
+  expect(result.code).toBe(0);
+  expect(result.stdout.toString().trim()).toBe(cwd);
+  expect(calls).toHaveLength(2);
+  expect(calls[1].cwd).toBe(cwd);
+  expect(call.cwd).toBe(omitted);
+});
+
+it('buildDeltaManifest defaults cwd to process.cwd()',async()=>{
+  const current=vi.spyOn(process,'cwd').mockReturnValue(cwd);
+  try {
+    const actual=await buildDeltaManifest({env,base});
+    expect(manifestWire(actual)).toEqual(base.manifest);
+    expect(actual.manifestMode).toBe('git-delta');
+  } finally {current.mockRestore();}
+});
+
+const deletionFaults=[
+  ['failed diff',1,'D\0keep.txt\0'],
+  ['malformed status',0,'invalid\0other.txt\0D\0keep.txt\0'],
+  ['missing record path',0,'D\0keep.txt\0D\0'],
+  ['no deletion',0,''],
+  ['wrong deleted path',0,'D\0other.txt\0'],
+  ['non-deletion status',0,'M\0keep.txt\0'],
+  ['unterminated record',0,'D\0keep.txt'],
+  ['thrown diff',null,''],
+];
+it.each([
+  ['failed diff',deletionFaults[0],"if(result.code!==0)throw manifestRefusal('manifest-worktree-mismatch',missing[0]);"],
+  ['malformed record',deletionFaults[1],"if(!fields[i+1]||!/^[ACDMTUXB]$/.test(fields[i].toString()))throw manifestRefusal('manifest-worktree-mismatch',fields[i+1]??missing[0]);"],
+  ['undeleted leaf',deletionFaults[3],"if(undeleted)throw manifestRefusal('manifest-worktree-mismatch',undeleted);"],
+  ['entire deletion check',deletionFaults[3],'if(missing.length) {','if(false) {'],
+])('deletion-evidence mutation gate kills removal of %s',async(_name,[_fault,code,stdout],find,replacement='')=>{
+  await fs.rm(join(cwd,'keep.txt'));
+  const exec=async call=>{
+    if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
+    if(call.args.includes('--name-status'))return {code,stdout:Buffer.from(stdout)};
+    const result=await defaultExec(call);
+    if(call.args.includes('-co'))return {...result,stdout:Buffer.from(result.stdout.toString().replace('keep.txt\0',''))};
+    return result;
+  };
+  const options={cwd,env,exec};
+  await expect(buildManifest(options)).rejects.toMatchObject({code:'manifest-worktree-mismatch'});
+  const mutant=await manifestMutation(find,replacement);
+  // The identical bad inventory is accepted only when its defending guard is gone.
+  const escaped=await mutant.buildManifest(options);
+  expect(escaped.entries.some(entry=>entry.path.equals(Buffer.from('keep.txt')))).toBe(false);
+});
+it.each(deletionFaults)('refuses missing tracked leaves without explicit deletion evidence: %s',async(_fault,code,stdout)=>{
+  await fs.rm(join(cwd,'keep.txt'));
+  for(const omit of [false,true]) {
+    const calls=[],exec=async call=>{
+      calls.push(call);
+      if(call.file==='ssh'&&call.args.at(-1)==='true')return {code:0,stdout:Buffer.alloc(0)};
+      if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
+      if(call.args.includes('--name-status')){
+        if(code===null)throw new Error('diff spawn failed');
+        return {code,stdout:Buffer.from(stdout)};
+      }
+      const result=await defaultExec(call);
+      // Exercise (d) independently of the earlier inventory missing-leaf check.
+      if(omit&&call.args.includes('-co'))return {...result,stdout:Buffer.from(result.stdout.toString().replace('keep.txt\0',''))};
+      return result;
+    };
+    for(const build of [()=>buildManifest({cwd,env,exec}),()=>buildDeltaManifest({cwd,env,exec,base})])
+      await expect(build()).rejects.toMatchObject({code:'manifest-worktree-mismatch'});
+    const result=await runRemote({cwd,env,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'manifest-worktree-mismatch'});
+    expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+  }
+});
+
+it.each(['node_modules','credentials','.private','ＮＯＤＥ＿ＭＯＤＵＬＥＳ','node_\u200bmodules'])
+('refuses policy-excluded tracked alias %s in full and delta manifests',async name=>{
+  await write('vendor-src/leaf.js','export {};');await fs.mkdir(join(cwd,'tools'));
+  await fs.symlink('../vendor-src',join(cwd,'tools',name));commit();
+  for(const nested of [false,true]) {
+    if(nested){await fs.symlink('tools',join(cwd,'outer'));commit();}
+    const calls=[],exec=async call=>{
+      calls.push(call);
+      if(call.file==='git')return defaultExec(call);
+      if(call.file==='ssh'&&call.args.at(-1)==='true')return {code:0,stdout:Buffer.alloc(0)};
+      throw new Error(`Unexpected transport: ${call.file}`);
+    };
+    for(const build of [()=>buildManifest({cwd,env,exec}),()=>buildDeltaManifest({cwd,env,exec,base})])
+      await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
+    const result=await runRemote({cwd,env,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'unshipped-symlink'});
+    expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+  }
 });
 
 it.each(['unreadable','oversized'])('falls back locally before prepare for an %s filesystem walk',async fault=>{
@@ -229,7 +330,7 @@ it.each(rows)('row %i: %s',async row=>{
     if(row===12){commit();await fs.unlink(join(cwd,'.claude/agent-memory'));await fs.mkdir(join(cwd,'.claude/agent-memory'));}
   }
   if(row===11){await fs.symlink('keep.txt',join(cwd,'extra-link'));await fs.writeFile(join(cwd,'.git/info/exclude'),'extra-link\n');}
-  if(row===13){await fs.writeFile(join(cwd,'.git/hooks/fsmonitor-fixture'),'#!/bin/sh\nexit 1\n',{mode:0o755});git(['config','core.fsmonitor','.git/hooks/fsmonitor-fixture']);}
+  if(row===13){await fs.writeFile(join(cwd,'.git/hooks/fsmonitor-fixture'),'#!/bin/sh\ntouch .git/fsmonitor-ran\nexit 1\n',{mode:0o755});git(['config','core.fsmonitor','.git/hooks/fsmonitor-fixture']);}
   if(row===14){await write('.gitattributes','keep.txt filter=fixture\n');git(['config','filter.fixture.clean','printf keep']);await write('keep.txt','diff');}
   if(row===15)await fs.rm(join(cwd,'keep.txt'));
   if(row>=17&&row<=25||row===31){
@@ -292,6 +393,11 @@ it.each(rows)('row %i: %s',async row=>{
     expect(actual.entries.map(({path,sha256,executable})=>({path:path.toString(),sha256,executable})))
       .toEqual((await oracle()).filter(entry=>!omitted.includes(entry.path)));
     for(const path of omitted)expect(actual.entries.map(entry=>entry.path.toString())).not.toContain(path);
+    if(row===13){
+      await expect(fs.lstat(join(cwd,'.git/fsmonitor-ran'))).rejects.toMatchObject({code:'ENOENT'});
+      expect(calls.filter(call=>call.file==='git'&&!call.args.includes('--show-toplevel'))
+        .every(call=>call.args[2]==='-c'&&call.args[3]==='core.fsmonitor=false')).toBe(true);
+    }
     if(row===31)expect(actual.entries.every(entry=>!entry.path.toString().split('/').includes('node_modules'))).toBe(true);
     if([3,4,5,9].includes(row))expect(calls.filter(c=>c.file==='git').every(c=>!Object.keys(c.env??hostile).some(k=>k.startsWith('GIT_')))).toBe(true);
     if(row===3)expect(calls.filter(c=>c.file==='git'&&!c.args.includes('--show-toplevel')&&!c.args.includes('--absolute-git-dir')).every(c=>c.args[0].startsWith('--git-dir='))).toBe(true);
