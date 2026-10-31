@@ -3111,6 +3111,11 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+The run-scoped temp allocator canonicalizes its base before creating fixtures: macOS's
+`/var` alias must not reach descriptor-relative snapshot copies, which reject symlink
+ancestors. Preserve those production no-follow guards; test the allocator with an explicit
+symlink alias rather than teaching the copy code to follow links.
+
 Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
 `core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
 `full-scan`. Unreadable or incomplete config evidence also requires that fallback.
@@ -3239,6 +3244,18 @@ Every new bypass-widening condition needs one negative test per conjunct. Securi
 checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
 and other system evidence so hermetic tests exercise the production checks.
 
+Security review checklist: for each new `localFallback(` call site under
+`scripts/readiness/`, require a named negative test that reaches that call site,
+asserts no remote dispatch, and checks the fallback reason. For a guard after a
+wait, occupy capacity, change the evidence during the wait, and release capacity;
+pin the expiry boundary and reservation cleanup as well as the refusal.
+
+Standards-conformance review checklist: when remote execution consumes a gate's
+output string to detect incomplete inputs, require a producer-side test that runs
+the gate's emitting code with a skipping checker and asserts the warning. Test
+stdout and stderr, successful non-skipping output, and failed checker output;
+injecting a string only into the remote consumer does not cover the producer.
+
 Writer guards shared by root cron and operator controllers must stay on one
 private inode owned by the operator. Test first-use creation and migration of
 existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
@@ -3252,6 +3269,18 @@ then assert its manifest digest and snapshot bytes. Preserve source mtimes throu
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
 a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
+
+The tracked `.claude/agent-memory` bridge is verified against its index blob and
+projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY.md`
+and the complete target corpus; reject unsafe links or incomplete inputs before
+transfer. These projected inputs require full shipping.
+
+For remote `check:standards`, observe both output streams for skipped gates,
+`no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
+remote result to fall back through local admission; an invalid receipt keeps the
+result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
+compares local and shipped discovery of the base, coverage report, and memory index.
+
 ## Probe worker timeout teardown
 
 Worker timeout promises allow at most one second for `worker.terminate()` before

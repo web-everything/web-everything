@@ -660,7 +660,11 @@ describe('anonymous real Git snapshot',()=>{
     const manifest={...baseManifest,git:{head}};
     const request={...p,nonce,argv,env:{},lock:hash('lock'),manifest,manifestDigest:digestManifest(manifest),inputDigest:await digestInput(dir),argvDigest:digestArgv(argv),
       ...(delta?{...evidence,deletions:''}:{})};
-    await expect(runner.run(request)).rejects.toMatchObject({code:'git-head-unavailable'});
+    const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+    try {
+      await expect(runner.run(request)).rejects.toMatchObject({code:'git-head-unavailable',cause:{message:expect.stringMatching(/^fetch: /)}});
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/^forge-exec-run: git-head-unavailable: fetch: [^\r\n]*\n$/));
+    } finally {stderr.mockRestore();}
     expect(execute).not.toHaveBeenCalled();
     expect(gitCalls.some(call=>call.args.includes('fetch')&&call.args.at(-1)===head)).toBe(true);
     await expect(fs.stat(join(dir,'.git'))).rejects.toMatchObject({code:'ENOENT'});
@@ -692,6 +696,27 @@ describe('anonymous real Git snapshot',()=>{
     await expect(bases.materializeWorktree({work:root,root,head:'b'.repeat(40),manifest,manifestDigest:digestManifest(manifest),exec})).rejects.toThrow('Invalid Git evidence');
     expect(exec).not.toHaveBeenCalled();
   });
+  it.each(['exit','throw'])('trusts only the local mirror and pending clone via global config and preserves bounded clone diagnostics (%s)',async fault=>{
+    const mirror=join(root,'repo.git'),dir=join(root,'snapshot');
+    await fs.mkdir(mirror);await fs.mkdir(dir);
+    const head='a'.repeat(40),manifest={...manifestWire({entries:[],excluded:[]}),git:{head}};
+    const tail='detected dubious ownership '+ 'x'.repeat(400)+'\n\x1b\x00\x7f\x9f';
+    const exec=vi.fn(async call=>{
+      const config=call.env.GIT_CONFIG_GLOBAL,clone=join(call.args.at(-1),'..');
+      expect(config).not.toBe('/dev/null');
+      expect(config).toBe(join(clone,'..','gitconfig'));
+      expect(config.startsWith(join(root,'.git-run-'))).toBe(true);
+      expect(await fs.readFile(config,'utf8')).toBe(`[safe]\n\tdirectory = ${JSON.stringify(mirror)}\n\tdirectory = ${JSON.stringify(clone)}\n`);
+      expect(call.env).toEqual({...bases.anonymousGitEnv(),GIT_CONFIG_GLOBAL:config});
+      if(fault==='throw')throw Object.assign(new Error('transport failed'),{stderr:tail});
+      return {code:128,stdout:'',stderr:tail};
+    });
+    await expect(bases.materializeWorktree({work:dir,root,head,manifest,manifestDigest:digestManifest(manifest),exec}))
+      .rejects.toMatchObject({code:'git-head-unavailable',cause:{message:'clone: '+'x'.repeat(300)}});
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(bases.anonymousGitEnv().GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    expect((await fs.readdir(root)).some(name=>name.startsWith('.git-run-'))).toBe(false);
+  });
   it('keeps exact Mac HEAD, stages tracked bytes and deletions, and leaves Mac untracked files untracked',async()=>{
     const source=join(root,'source'),snapshot=join(root,'snapshot');
     await fs.mkdir(source);await fs.mkdir(snapshot);
@@ -714,11 +739,11 @@ describe('anonymous real Git snapshot',()=>{
       commands.push(call);
       // Only the operator's protected clone and mirror may be trusted, even
       // when Git simulates an ownership mismatch. No Git runs in the snapshot.
-      const env=call.cwd===root?call.env:{...call.env,GIT_TEST_ASSUME_DIFFERENT_OWNER:'1'};
+      const env={...call.env,GIT_TEST_ASSUME_DIFFERENT_OWNER:'1'};
       return cachedPublicGitExec({...call,env});
     }});
     for(const command of commands){
-      expect(command.env).toEqual(bases.anonymousGitEnv());
+      expect(command.env).toEqual({...bases.anonymousGitEnv(),GIT_CONFIG_GLOBAL:join(commands[0].args.at(-1),'../..','gitconfig')});
       expect(Object.keys(command.env).some(key=>/token|secret|password|ssh_auth|proxy/i.test(key))).toBe(false);
       expect(command.args.filter(a=>a.includes('://')).every(url=>url===bases.PUBLIC_REPOSITORY)).toBe(true);
       expect(command.cwd).not.toBe(snapshot);
