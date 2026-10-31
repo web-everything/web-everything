@@ -289,7 +289,7 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
       symlinkSync(join(external,'payload.txt'),join(cwd,file));
     } else symlinkSync(kind === 'dangling parent' ? join(cwd,'absent') : external,join(cwd,'fixtures'));
     f.listFiles.mockResolvedValue(['package-lock.json',file]);
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
   });
@@ -297,13 +297,13 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     const f = fixture();
     if (kind === 'directory') mkdirSync(join(cwd,'fixtures'));
     f.listFiles.mockResolvedValue(['package-lock.json','fixtures']);
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
   });
   it('rejects dual lockfiles at the client even if shrinkwrap is omitted from the inventory', async () => {
     const f = fixture();
     writeFileSync(join(cwd,'npm-shrinkwrap.json'),'shrinkwrap');
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
   });
   it.each(['snapshot', 'stale remote'])('falls back when a %s receipt says 97 and npm ci fails before the command', async (source) => {
@@ -511,7 +511,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
   const discoveryFlags = ['--config','--root','--dir','--project','--workspace','--include','--exclude','--dangerouslyIgnoreUnhandledErrors','-c','-r'];
@@ -521,7 +521,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
   it.each([
@@ -546,7 +546,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -560,7 +560,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -610,7 +610,7 @@ describe('filterEnv', () => {
       }
       return original(call);
     });
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'diff-coverage-base-unavailable'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'diff-coverage-base-unavailable'});
     expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
   });
   it.each(['', '-HEAD', 'HEAD..main', 'main branch', 'HEAD\n', 'HEAD\0', 'HEAD\t', '$(id)', 'HEAD;id', 'HEAD~1', 'main//branch', '.hidden', 'branch.lock', 'main/', 123])
@@ -619,7 +619,7 @@ describe('filterEnv', () => {
     expect(() => filterEnv(env)).toThrow('Invalid DIFF_COVERAGE_BASE: use local fallback');
     expect(forgeManifestAPI.allowedEnv(env)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,env})).toEqual({mode:'fallback',reason:'invalid-diff-coverage-base'});
+    expect(await runRemote({...f,env})).toEqual({mode:'not-started', terminated:true,reason:'invalid-diff-coverage-base'});
     expect(f.exec).not.toHaveBeenCalled();
   });
   it('keeps exactly the allowlist and drops secret names, HOME, PATH, and unknown names', () => {
@@ -652,7 +652,7 @@ describe('runRemote', () => {
     f.argv = ['npm', 'run', 'check:standards', '--', '--unknown'];
     const stage = vi.fn(filesystem.mkdtemp);
     const options = {...f, fs:{...filesystem, mkdtemp:stage}};
-    expect(await runRemote(options)).toEqual({mode:'fallback', reason:'command-not-allowed'});
+    expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed'});
     const log = vi.fn();
     const decision = await runWithRemoteDecision({
       ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
@@ -697,7 +697,7 @@ describe('runRemote', () => {
     f.argv=['npm','run','check:standards'];
     f.exec=vi.fn(async call=>call.file==='git'&&call.args.join(' ')==='rev-parse HEAD'
       ?{code:0,stdout:Buffer.from((++reads===1?'a':'b').repeat(40)+'\n')}:execute(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).some(call=>isPrepare(call)||isRun(call)||call.file==='rsync')).toBe(false);
   });
   it('preserves forge-busy from prepare without transferring bytes or asking an unknown run to finish',async()=>{
@@ -719,7 +719,7 @@ describe('runRemote', () => {
       expect(copies).toHaveLength(1);
       expect(copies[0].args).toContain('--rsync-path=sudo -u forge-exec-2 rsync');
       expect(copies[0].args.at(-1)).toMatch(/^forge:\/srv\/forge-exec\/slot-2\/r-[a-f0-9]{32}\/work\/$/);
-    }else{expect(result).toEqual({mode:'fallback',reason:'copy-failed'});expect(copies).toHaveLength(0);}
+    }else{expect(result).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});expect(copies).toHaveLength(0);}
   });
   it.each(['bound', 'wrong nonce', 'wrong run', 'malformed', 'missing started', 'started', 'unknown reason', 'extra field', 'invalid JSON'])
   ('accepts only bound pre-run protected rejection: %s', async kind => {
@@ -932,7 +932,7 @@ describe('runRemote', () => {
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
       ? remoteManifestAPI.defaultExec(call) : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file'});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it('allows ignored non-tests and dependency/Git internals', async () => {
@@ -955,7 +955,7 @@ describe('runRemote', () => {
     const f = fixture();
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i') ? result : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
   });
 
@@ -1059,7 +1059,7 @@ describe('runRemote', () => {
     mkdirSync(join(cwd,'coverage'));
     writeFileSync(join(cwd,'coverage/coverage-final.json'),reports[fault]);
     f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json','coverage/coverage-final.json']);
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'coverage-report-not-portable'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'coverage-report-not-portable'});
     expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
   });
   it('uses the protected coverage-base rejection as a safe local fallback',async()=>{
@@ -1088,7 +1088,7 @@ describe('runRemote', () => {
   it.each([{code:1,stdout:''},{code:0,stdout:''},{code:0,stdout:'invalid-head'}])('refuses standards before prepare when logical HEAD evidence is unavailable: %j',async evidence=>{
     const f=fixture(),original=f.exec;f.argv=['npm','run','check:standards'];
     f.exec=vi.fn(call=>call.file==='git'&&call.args.join(' ')==='rev-parse HEAD'?evidence:original(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).some(c=>isPrepare(c)||c.file==='rsync'||isRun(c))).toBe(false);
   });
   it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('refuses local rerun for an unbound receipt %j', async (receipt) => {
@@ -1144,19 +1144,19 @@ describe('runRemote', () => {
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'build'] }))
-      .toEqual({ mode: 'fallback', reason: 'command-not-allowed' });
+      .toEqual({ mode: 'not-started', terminated:true, reason: 'command-not-allowed' });
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.local).not.toHaveBeenCalled();
   });
   it('falls back when the forge probe fails, without copying or running', async () => {
     const f = fixture({ probeCode: 255 });
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'forge-unreachable' });
+    expect(await runRemote(f)).toEqual({ mode: 'not-started', terminated:true, reason: 'forge-unreachable' });
     expect(callsOf(f.exec)).toContainEqual(expect.objectContaining({ file: 'ssh', args: ['forge', 'true'] }));
     expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it('reports copy-failed and attempts cleanup after an unsuccessful rsync', async () => {
     const f = fixture({ copyCode: 23 });
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'copy-failed' });
+    expect(await runRemote(f)).toEqual({ mode: 'not-started', terminated:true, reason: 'copy-failed' });
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
     expect(JSON.parse(callsOf(f.exec).find(isCleanup).input).run).toMatch(/^r-/);
@@ -1297,6 +1297,14 @@ describe('explicit remote CLI decision', () => {
     expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
     expect(local).toHaveBeenCalledTimes(1);
     expect(local).toHaveBeenCalledWith(argv);
+  });
+  it('returns the local exit code after an ignored-test-file prelaunch refusal', async () => {
+    const remoteExec = vi.fn(async () => ({mode:'not-started', terminated:true, reason:'ignored-test-file'}));
+    const local = vi.fn(async () => 7), log = vi.fn();
+    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log})).toBe(7);
+    expect(remoteExec).toHaveBeenCalledTimes(1);
+    expect(local).toHaveBeenCalledWith(argv);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored-test-file'));
   });
 });
 
@@ -1823,7 +1831,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toThrow('Input digest mismatch: undecodable test name');
     const f = fixture();
     f.listFiles.mockResolvedValue([path]);
-    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'copy-failed'});
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
@@ -1920,7 +1928,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       return transport(call);
     });
     const result = await runRemote({argv, cwd, runId, exec});
-    if (result.mode === 'fallback') {
+    if (result.mode === 'not-started') {
       expect(['copy-failed','gitlink-unsupported']).toContain(result.reason);
       expect(callsOf(exec).some(isRun)).toBe(false);
     } else {

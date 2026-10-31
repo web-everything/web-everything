@@ -155,6 +155,7 @@ import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-file
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -940,17 +941,16 @@ export function slotPath(i) {
 /**
  * Same-machine PID-liveness verdict (mirrors `file-locks-cli.mjs#probePidLiveness` — the layered, NEVER
  * primary, fast path: `kill(pid, 0)` throws ESRCH when no such process exists → provably 'dead'; succeeds →
- * 'alive' (the kernel reuses PIDs, so this does NOT prove it's the same owner — never accelerates a reclaim);
+ * 'alive' unless Linux /proc proves a zombie/dead state (PID reuse never proves the same owner);
  * a null/own/foreign-host pid is 'unknown' (TTL-only). Wired here, not left unwired, because #3461's long
  * `ADMISSION_LEASE_MINUTES` makes the TTL floor alone too slow to recover a genuinely crashed holder.
  * @param {number|null} pid  the CURRENT holder's pid (from its lock entry), or null if unknown
  * @param {number} selfPid   the caller's own pid — never probes/accelerates against itself
+ * @param {(pid:number)=>string|null} [readStat] injectable Linux stat reader (default no-op off Linux)
  * @returns {'dead'|'alive'|'unknown'}
  */
-export function probeSlotHolderLiveness(pid, selfPid) {
-  if (!Number.isInteger(pid) || pid <= 0 || pid === selfPid) return 'unknown';
-  try { process.kill(pid, 0); return 'alive'; }
-  catch (e) { return e && e.code === 'ESRCH' ? 'dead' : 'unknown'; }
+export function probeSlotHolderLiveness(pid, selfPid, readStat) {
+  return probePidLiveness(pid, selfPid, readStat);
 }
 
 /**
