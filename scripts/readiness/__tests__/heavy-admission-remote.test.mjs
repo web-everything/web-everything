@@ -241,7 +241,6 @@ describe('remote admission policy', () => {
       exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
     }
   });
-
   it('resolves valid platform remote settings and their provenance', () => {
     const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = policyFor(remote);
@@ -303,6 +302,10 @@ describe('adaptLegacyRemoteResult', () => {
     'diff-coverage-base-unavailable',
     'coverage-report-not-portable',
     'unsupported-sibling-dependency',
+    'sibling-missing',
+    'sibling-not-git',
+    'sibling-dirty',
+    'sibling-unsafe',
   ])('maps %s to a confirmed non-start only at the adapter boundary', async (reason) => {
     const legacy = { mode: 'fallback', reason };
     const adapted = adaptLegacyRemoteResult(legacy);
@@ -344,7 +347,6 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 1, 'local');
     expect(f.log.mock.calls[0][0]).toContain('remote.enabled=false (standard)');
   });
-
   it.each([
     ['below threshold -> local', {}, 2.9],
     ['at threshold -> local', {}, 3],
@@ -473,7 +475,6 @@ describe('runWithRemoteDecision', () => {
       } finally { rmSync(cwd, { recursive: true, force: true }); }
     });
   });
-
   it('remoteExec throws -> refuses local rerun with the error reason', async () => {
     const f = fixture();
     f.remoteExec.mockRejectedValue(new Error('injected transport failure'));

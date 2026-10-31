@@ -649,6 +649,7 @@ describe('bounded filesystem adapters', () => {
       return count;
     });
     closeSync.mockClear();
+    openSync.mockClear();
     try {
       expect(() => boundedReadFile(path, io)).toThrow(/1 MiB/);
       expect(total).toBe(maxBytes + 1);
@@ -658,7 +659,10 @@ describe('bounded filesystem adapters', () => {
         expect(range.offset + range.length).toBe(maxBytes + 1);
       }
       expect(closeSync).toHaveBeenCalledTimes(1);
-      expect(() => nativeRead(closeSync.mock.calls[0][0], Buffer.alloc(1), 0, 1, null)).toThrow();
+      // Deterministic: the fd that was closed is exactly the fd that was opened.
+      // (Probing the closed fd with a real read is racy: the kernel may hand the
+      // same fd number to another open in the worker, so the read succeeds.)
+      expect(closeSync.mock.calls[0][0]).toBe(openSync.mock.results[0].value);
     } finally {
       readSync.mockImplementation(nativeRead);
       rmSync(root, { recursive: true, force: true });

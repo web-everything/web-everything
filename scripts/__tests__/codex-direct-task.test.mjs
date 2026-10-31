@@ -897,6 +897,25 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(execFn).not.toHaveBeenCalled();
   });
 
+  it('standards gate goes through heavy-admission when the wrapper exists, direct when absent', () => {
+    const execFn = vi.fn(() => 'ok');
+    const wrapped = runGate({ dir: '/d', mode: 'standards', execFn, env: {}, existsFn: () => true });
+    expect(wrapped.steps[0].cmd).toBe('node scripts/readiness/heavy-admission.mjs run -- npm run check:standards');
+    const direct = runGate({ dir: '/d', mode: 'standards', execFn, env: {}, existsFn: () => false });
+    expect(direct.steps[0].cmd).toBe('npm run check:standards');
+    const held = runGate({ dir: '/d', mode: 'standards', execFn, env: { WE_HEAVY_ADMISSION_HELD: '1' }, existsFn: () => true });
+    expect(held.steps[0].cmd).toBe('npm run check:standards');
+  });
+
+  it('wrapped gate keeps failing, and exit 124 is gate-unconfirmed, never a pass', () => {
+    const fail = (status) => () => { throw Object.assign(new Error('x'), { status }); };
+    const r1 = runGate({ dir: '/d', mode: 'standards', execFn: fail(1), env: {}, existsFn: () => true });
+    expect(r1).toMatchObject({ pass: false });
+    expect(r1.unavailable).toBeUndefined();
+    const r124 = runGate({ dir: '/d', mode: 'standards', execFn: fail(124), env: {}, existsFn: () => true });
+    expect(r124).toMatchObject({ pass: false, unavailable: 'gate-unconfirmed' });
+  });
+
   it('mode "standards" runs only check:standards', () => {
     const execFn = vi.fn(() => 'ok');
     const r = runGate({ dir: '/d', mode: 'standards', execFn });
