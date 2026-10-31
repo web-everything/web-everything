@@ -95,6 +95,8 @@ function fixture({ githubLike = false } = {}) {
     WE_DAEMON_STATE_DIR: mktemp('we-stack-state-'),
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-stack-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-stack-overlay-'),
+    // These fixtures test the planner's retained registrations and stackBases cache, before retirement.
+    WE_DAEMON_OVERLAY_AUTO_RETIRE: 'off',
   };
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
   const fetch = () => gitOk(clone, ['fetch', '-q', '-f', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
@@ -281,6 +283,29 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
       expect(plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved')?.detail.tops).toEqual([LAST]);
     });
   });
+
+  it('rebuildClone retires contained registrations into the adopted top when retirement is on', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
+    for (const o of OVERLAYS.filter((o) => o.ref !== RULING)) {
+      addOverlay(f.clone, { ...o, stackBases: CHAINS[o.pr] }, { env: f.env });
+    }
+    const result = await rebuildClone({
+      root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN', log: { error: () => {} },
+    });
+    expect(result, JSON.stringify(result.alerts)).toMatchObject({ adopted: true });
+    const head = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
+    for (const sha of [f.bOld, f.ladder, f.last]) expect(isAncestor(f.clone, sha, head)).toBe(true);
+    const stored = readOverlays(f.clone, { env: f.env });
+    expect(stored.map((o) => o.ref)).toEqual([LAST]);
+    expect(stored[0].retiredSources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entry: expect.objectContaining({ ref: BASE }), sha: f.bOld }),
+      expect.objectContaining({ entry: expect.objectContaining({ ref: LADDER_REF }), sha: f.ladder }),
+    ]));
+    expect(stored[0].stackBases).toEqual(CHAINS[4792]);
+    expect(result.alerts.filter((a) => a.kind === 'overlay-auto-dropped').map((a) => a.detail.ref))
+      .toEqual([BASE, LADDER_REF]);
+  }, 30_000);
 
   it('rebuildClone adopts the stack tops end to end (base chains recorded on the entries, no gh) and logs the one stack line', async () => {
     const f = fixture();

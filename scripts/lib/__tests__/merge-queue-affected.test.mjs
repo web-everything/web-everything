@@ -137,6 +137,11 @@ describe('resolvedImportsOf (the shared import parser, forward direction)', () =
     expect(resolvedImportsOf('scripts/lib/a.mjs', 'await import(`../pr-land.mjs?fresh=${++n}`);', files)).toEqual(['scripts/pr-land.mjs']);
     expect(resolvedImportsOf('scripts/lib/a.mjs', 'await import(`../pr-land.mjs`);', files)).toEqual(['scripts/pr-land.mjs']);
   });
+  it('still resolves a template-literal dynamic import that carries a leading `/* @vite-ignore */` comment', () => {
+    const files = new Set(['scripts/lib/a.mjs', 'scripts/pr-land.mjs']);
+    expect(resolvedImportsOf('scripts/lib/a.mjs', 'await import(/* @vite-ignore */ `../pr-land.mjs?fresh=${++n}`);', files)).toEqual(['scripts/pr-land.mjs']);
+    expect(relativeSpecifierBases('scripts/lib/a.mjs', 'await import(/* @vite-ignore */ `../pr-land.mjs?fresh=${++n}`);')).toEqual(['scripts/pr-land.mjs']);
+  });
 });
 
 describe('specifier bases (a file the PR adds that a specifier already names)', () => {

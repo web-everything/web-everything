@@ -36,6 +36,9 @@ export const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 export function makeGit({ run, cwd, env, timeoutMs = 60_000, extraEnv = {} }) {
   return (args, opts = {}) => run(args, {
     cwd,
+    ...(Object.hasOwn(opts, 'input') ? { input: opts.input } : {}),
+    ...(Object.hasOwn(opts, 'encoding') ? { encoding: opts.encoding } : {}),
+    ...(Object.hasOwn(opts, 'maxBuffer') ? { maxBuffer: opts.maxBuffer } : {}),
     timeout: timeoutMs,
     killSignal: 'SIGKILL',
     env: { ...env, ...REBUILD_IDENTITY_ENV, ...extraEnv, ...(opts.env || {}) },
