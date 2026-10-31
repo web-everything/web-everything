@@ -3,7 +3,7 @@ kind: story
 status: open
 size: 2
 dateOpened: '2026-10-31'
-scope: ['we:scripts/readiness/forge-exec-run.mjs', 'we:scripts/readiness/__tests__/forge-worker-pool.test.mjs']
+scope: ['we:scripts/readiness/forge-exec-run.mjs', 'we:scripts/readiness/__tests__/forge-exec-run.test.mjs', 'we:scripts/readiness/__tests__/forge-worker-pool.test.mjs']
 tags: [forge, correctness]
 ---
 
