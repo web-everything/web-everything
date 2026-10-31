@@ -201,17 +201,17 @@ export const EXTRA_JUROR_MANDATE = MANDATE_LENSES.CORRECTNESS;
 
 /** The pinned model + effort per provider for an added seat — never left to a CLI's implicit default. Card
  *  xn2wf9t split the old single `gemini` entry into the `agy` CLI's two real backends (see
- *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` keeps the exact model/effort the old
- *  `gemini` entry ran, byte for byte; `agy-claude` is new. */
+ *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` uses the shared Gemini pin;
+ *  `agy-claude` selects the Claude backend. */
 const codexReviewDefault = resolveCodexTaskRoute({ kind: 'review', log: false });
 export const REVIEW_SEAT_MODELS = Object.freeze({
   codex: Object.freeze({ model: codexReviewDefault.model, effort: codexReviewDefault.effort }),
-  // `gemini-3.1-pro` offers only `low`/`high` (agy refused `medium` live, 2026-09-26); `low` is the combination
-  // the review-pr Antigravity seat already runs (`ANTIGRAVITY_REVIEW_EFFORT`).
-  'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'low' }),
+  // Argon high effort is baked into ANTIGRAVITY_MODEL. The launchers omit --effort for suffixed ids,
+  // so a separately requested routing effort cannot override the pinned tier.
+  'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'high' }),
   // The `agy` CLI running a Claude-family model — untried live at this effort for a review seat, so it starts
-  // at the same effort Codex's own seat runs rather than assuming the Gemini backend's `low`/`high`-only quirk
-  // carries over; the first live runs are the proof either way (see the plist/backlog note this card leaves).
+  // at the same effort Codex's own seat runs, independently of the Gemini model's effort suffix.
+  // The first live runs are the proof either way (see the plist/backlog note this card leaves).
   'agy-claude': Object.freeze({ model: AGY_CLAUDE_MODEL_BY_TIER.sonnet, effort: 'medium' }),
 });
 

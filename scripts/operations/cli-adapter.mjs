@@ -578,6 +578,7 @@ export function unwrapJudgeOutcome(returned) {
 /**
  * @typedef {object} JudgeProviderOutcome
  * @property {object} value - the juror's answer, already validated against `shape`.
+ * @property {string} [effort] - effective provider tier, after model suffixes and CLI clamps.
  * @property {string} [sessionId] - which actor judged.
  * @property {number} [costUsd]
  * @property {number} [durationMs]
@@ -742,6 +743,8 @@ function judgeTelemetryFrom(outcome, effective) {
     timedOut: outcome.timedOut,
     // Held item 223 — a seat the provider had to retry (`judgeSpawn`'s unparseable-stdout retry) says so on the record.
     attempts: outcome.attempts,
+    effectiveEffort: outcome.effort,
+    effort: outcome.effort ?? effective.effort,
     model: outcome.servedModel ?? effective.model,
     ...pickAgyEvidence(outcome),
   };
@@ -1071,7 +1074,7 @@ export async function driveRun({
     if (seat.telemetryRecorded) return rec;
     const telemetry = seat.ok ? unwrapJudgeOutcome(seat.value).telemetry : seat.error?.telemetry;
     if (!telemetry) return rec;
-    return { ...rec, telemetry: [...(rec.telemetry ?? []), normalizeJudgeTelemetry({ step: seat.step, stepIndex: seat.stepIndex, telemetry: { ...telemetry, lens: seat.request?.lens, model: telemetry.servedModel || telemetry.model || seat.request?.model, effort: seat.request?.effort } })] };
+    return { ...rec, telemetry: [...(rec.telemetry ?? []), normalizeJudgeTelemetry({ step: seat.step, stepIndex: seat.stepIndex, telemetry: { ...telemetry, lens: seat.request?.lens, model: telemetry.servedModel || telemetry.model || seat.request?.model, effort: telemetry.effort ?? seat.request?.effort } })] };
   };
   // An earlier seat failed: every seat still waiting has its spend recorded (the run's cost is the cost of every spawn
   // that happened), and each one that ANSWERED is saved on the run so a resume can commit it (held item 223). Before
@@ -1121,7 +1124,7 @@ export async function driveRun({
 
     if (status === 'awaiting-judge') {
       // THE SPAWN, in the caller, between two `advance` calls — the declaration declared it and did not act.
-      // Its cost rides back on the resume; `advance` stamps the row with the request's own lens/model/effort.
+      // Its cost rides back on the resume; `advance` keeps the declared lens and the provider's effective tier.
       const stepIndex = current.cursor;
       const stepName = current.pending.step;
       // `review.parallelSeats` — start this seat AND every following independent seat together (`./parallel-judges.mjs`).

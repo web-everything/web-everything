@@ -82,6 +82,7 @@ describe('runner freshness policy', () => {
         "grant-rounds",
         "health-respond",
         "heavy-queue",
+        "host-capacity",
         "item-activity",
         "judge-sweep-facts",
         "land-advance",
