@@ -24,12 +24,29 @@ describe('renderWorkerBrief', () => {
       'nohup', 'setsid', 'SYNCHRONOUS']) expect(codex).toContain(text);
   });
 
+  it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
+    const brief = renderWorkerBrief(params);
+    const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));
+    for (const rule of [
+      'For Forge/remote work, do a real live Forge run in the first 15 minutes.',
+      'Narrow tests while iterating; ONE full verify at the end (re-run only if code changed after it).',
+      'Make small fixes (a few lines, a known finding) yourself; send Codex only larger builds.',
+      'For a Codex follow-up fix, pass `--resume=<threadId>` from its previous run, with the exact file, line range and finding in the task.',
+    ]) expect(speed).toContain(rule);
+    expect(brief).not.toContain('Codex for scoped coding');
+    expect(brief).not.toContain('single-file fix with clear');
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    expect(codex).toContain('Do small fixes (a few lines, a known finding) yourself.');
+    expect(codex).toContain('--resume=<threadId>');
+    expect(brief.slice(brief.indexOf('6. **One PR.**'), brief.indexOf('7. **Pre-push'))).toContain('verify ONCE at the end');
+  });
+
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
     // Pin the standard: the live platform preference deliberately selects related tests.
     const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });
     const brief = renderWorkerBrief({ ...params, policy });
     const sections = ['## Standard worker rules', '**Scope.**', '1. **Free-scope pre-check.**',
-      '2. **Register your scope.**', '3. **Lane.**', '4. **Codex for scoped coding.**',
+      '2. **Register your scope.**', '3. **Lane.**', '4. **Codex for larger builds.**',
       '5. **Red-green tests through the heavy queue.**', '6. **One PR.**',
       '7. **Pre-push recheck.**', '**Proof.**', '**Waiting (rule 23).**',
       '**Processes.**', '**Git.**', '**Trust boundary.**', '**Times**', '**Report**'];

@@ -196,6 +196,41 @@ export {
  * @param {string} [opts.resumeThreadId] - resume this session using the same exec-level configuration.
  * @returns {string[]} argv AFTER the `codex` binary name.
  */
+/**
+ * Validate a thread id to resume. Shared by the argv builder, `codexDirectTask` and the `--resume` CLI flag so all
+ * three refuse the same inputs.
+ * @param {unknown} resumeThreadId
+ * @param {{ephemeral?: boolean}} [opts]
+ */
+export function assertResumeThreadId(resumeThreadId, { ephemeral = false } = {}) {
+  if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
+    throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
+  }
+  if (ephemeral) throw new TypeError('codex-direct-task: cannot resume an ephemeral task');
+}
+
+/**
+ * Parse the CLI's `--resume=<threadId>` flag (R302). Returns undefined when absent. A resumed thread continues the
+ * work in the checkout it already edited, so `--dir` is required (a fresh scratch clone would not hold that work), and
+ * `--output-schema-file` is refused because `codex exec resume` does not support `--output-schema`.
+ * @param {Record<string, string|boolean>} flags - parsed CLI flags.
+ * @returns {string|undefined}
+ */
+export function parseResumeFlag(flags) {
+  if (flags.resume === undefined) return undefined;
+  if (typeof flags.resume !== 'string' || !flags.resume) {
+    throw new TypeError('codex-direct-task: --resume needs a value: --resume=<threadId> from the previous run\'s report (events.threadId)');
+  }
+  assertResumeThreadId(flags.resume, { ephemeral: Boolean(flags.ephemeral) });
+  if (flags['output-schema-file'] !== undefined) {
+    throw new TypeError('codex-direct-task: --resume cannot be combined with --output-schema-file (codex exec resume has no --output-schema)');
+  }
+  if (typeof flags.dir !== 'string' || !flags.dir) {
+    throw new TypeError('codex-direct-task: --resume requires --dir=<checkout> (the checkout the resumed thread already edited)');
+  }
+  return flags.resume;
+}
+
 export function buildCodexDirectTaskArgv({
   cwd,
   outputLastMessageFile,
@@ -265,10 +300,7 @@ export function buildCodexDirectTaskArgv({
   // Exec-level options precede the subcommand: resume itself does not accept -s/-C/--add-dir.
   // Reuse all routed configuration and grants rather than inheriting the user's defaults.
   if (resumeThreadId !== undefined) {
-    if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
-      throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
-    }
-    if (ephemeral) throw new TypeError('codex-direct-task: cannot resume an ephemeral task');
+    assertResumeThreadId(resumeThreadId, { ephemeral });
     argv.push('resume', resumeThreadId, '-');
   }
   // Everything rides stdin, closed via `.end()`.
@@ -1067,7 +1099,10 @@ export async function codexDirectTask({
   readQuotaFn = readRolloutQuota,
   collectQuotaFn = collectAndClearRolloutQuota,
   loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
+  resumeThreadId,
 } = {}) {
+  // Fail before any clone, install or spawn work: a bad resume target must not cost a run.
+  if (resumeThreadId !== undefined) assertResumeThreadId(resumeThreadId, { ephemeral });
   if (typeof task !== 'string' || !task.trim()) {
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
   }
@@ -1133,7 +1168,7 @@ export async function codexDirectTask({
   const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
     dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
-    gitDir, writableRoots, tempRoot, env, policy: briefPolicy,
+    gitDir, writableRoots, tempRoot, env, policy: briefPolicy, resumeThreadId,
   }), { env });
   const events = parseJsonlEvents(run.stdout);
   let summary = summarizeEvents(events);
@@ -1512,7 +1547,9 @@ async function main() {
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
-      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--output-schema-file=<path>] [--no-self-review] [--json] [--detach]\n'
+      + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--output-schema-file=<path>] [--resume=<threadId>] [--no-self-review] [--json] [--detach]\n'
+      + "  --resume=<threadId> (R302): continue a previous run's Codex thread (its report's events.threadId) so a follow-up\n"
+      + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
@@ -1556,6 +1593,13 @@ async function main() {
     process.exitCode = 2;
     return;
   }
+  let resumeThreadId;
+  try { resumeThreadId = parseResumeFlag(flags); }
+  catch (e) {
+    console.error(e.message);
+    process.exitCode = 2;
+    return;
+  }
   const dir = flags.dir ? resolve(flags.dir) : undefined;
   const repoRoot = flags['repo-root'] ? resolve(flags['repo-root']) : (dir ? undefined : repoRootFromCwd());
   const timeoutMs = flags['timeout-ms'] ? Number(flags['timeout-ms']) : DEFAULT_TIMEOUT_MS;
@@ -1588,6 +1632,7 @@ async function main() {
       wireOriginToRemote: Boolean(flags['wire-origin-to-remote']),
       clearRolloutAfterRun: Boolean(flags['clear-rollout-after-run']),
       review: Boolean(flags.review),
+      resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
     });
   } catch (e) {
