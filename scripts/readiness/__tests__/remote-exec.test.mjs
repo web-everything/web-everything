@@ -1124,7 +1124,7 @@ describe('runRemote', () => {
     'dist/output.test.mjs',
     'scripts/quote\' space 雪/build/__tests__/unit/lost.test.mjs',
   ])('falls back before transport for a whole-directory ignored test: %s', async name => {
-    writeFileSync(join(cwd,'vitest.config.mjs'), readFileSync(new URL('./fixtures/forge-vitest.config.mjs',import.meta.url)));
+    writeFileSync(join(cwd,'vitest.config.mjs'), readFileSync(new URL('./fixtures/forge-selection-patterns.mjs',import.meta.url)));
     const f = fixture();
     f.argv = ['npm', 'run', 'test:unit'];
     const exec = f.exec;
