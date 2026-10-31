@@ -20,7 +20,8 @@ async function load(args = []) {
   process.argv = ['node', 'test-import', ...args];
   try {
     // Re-evaluate the CLI's flag defaults while retaining its shared dependency graph.
-    return await import(`../pr-land.mjs?delegationCase=${++loadN}`);
+    // The query is a module-cache key, not a path glob for Vite's dynamic-import transform.
+    return await import(/* @vite-ignore */ `../pr-land.mjs?delegationCase=${++loadN}`);
   } finally {
     process.argv = originalArgv;
     vi.unstubAllEnvs();

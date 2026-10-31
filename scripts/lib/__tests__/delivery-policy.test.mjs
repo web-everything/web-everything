@@ -5,6 +5,7 @@ import { Worker } from 'node:worker_threads';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import ts from 'typescript';
 import { PLATFORM_DELIVERY_POLICY_DEFAULTS as defaults } from '../../../config/deliveryPolicyDefaults';
 import * as gate from '../gate-config.mjs';
@@ -890,6 +891,51 @@ describe('trust, confinement and reach set', () => {
 });
 
 describe('policy journal', () => {
+  it.each(['stale replacement', 'disappearing lock'])('bounds retries by monotonic time under %s churn', kind => {
+    // Patch native ESM bindings only in the child; exercise the real lock checks and
+    // generation-guard removal while recreating contention before every open.
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { performance } from 'node:perf_hooks';
+      import { dirname } from 'node:path';
+      import { appendPolicyJournal } from './scripts/lib/delivery-policy.mjs';
+      const [path, kind] = process.argv.slice(1);
+      const lock = path + '.lock';
+      const originalOpen = fs.openSync;
+      let attempts = 0, elapsed = 0;
+      Object.defineProperty(performance, 'now', { value: () => elapsed });
+      fs.openSync = (file, flags, ...args) => {
+        if (file === lock && (flags & fs.constants.O_EXCL)) {
+          // A safety cutoff makes the pre-fix infinite retry fail deterministically.
+          if (++attempts > 30) throw Error('Lock churn exceeded its monotonic budget');
+          elapsed += 100;
+          if (kind === 'stale replacement') {
+            fs.writeFileSync(lock, '{}');
+            fs.utimesSync(lock, 1, 1);
+          } else {
+            fs.rmSync(lock, { force: true });
+            throw Object.assign(Error('lock disappeared'), { code: 'EEXIST' });
+          }
+        }
+        return originalOpen(file, flags, ...args);
+      };
+      Atomics.wait = () => 'timed-out';
+      syncBuiltinESMExports();
+      let error;
+      try { appendPolicyJournal(path, '{}\\n', { allowedRoots: [dirname(path)] }); }
+      catch (caught) { error = caught.message; }
+      process.stdout.write(JSON.stringify({ error, attempts, elapsed, journalExists: fs.existsSync(path) }));
+    `;
+    const result = JSON.parse(execFileSync(process.execPath,
+      ['--input-type=module', '-e', script, env.WE_POLICY_EVENTS_FILE, kind],
+      { cwd: resolve('.'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 65536 }));
+    expect(result.error).toMatch(/lock timeout; event not recorded/);
+    expect(result.attempts).toBe(10);
+    expect(result.elapsed).toBe(1000);
+    expect(result.journalExists).toBe(false);
+  });
+
   it('does not reclaim an aged lock with a live pid and refuses within a bounded wait', () => {
     const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
     const owner = JSON.stringify({ pid: process.pid, token: 'live-owner' });
@@ -1004,18 +1050,27 @@ describe('policy journal', () => {
     writeFileSync(workerFile, `
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
+      import { performance } from 'node:perf_hooks';
       import { parentPort, workerData } from 'node:worker_threads';
       const { recordPolicyEvent } = await import(workerData.module);
       const { env, role, barrier } = workerData;
       const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
       const control = new Int32Array(barrier);
       const original = { open: fs.openSync, unlink: fs.unlinkSync, write: fs.writeSync };
+      const now = performance.now.bind(performance);
+      let barrierMs = 0;
+      // Worker startup and parent scheduling while deliberately paused are test
+      // orchestration, not lock contention. Keep real time for ordinary retries.
+      Object.defineProperty(performance, 'now', { value: () => now() - barrierMs });
       let paused = false, competing = false, survived;
       const compete = kind => {
         if (!competing) { competing = true; parentPort.postMessage({ phase: 'competing', kind }); }
       };
       const wait = index => {
-        if (Atomics.wait(control, index, 0, 8000) === 'timed-out') throw Error('barrier timed out');
+        const start = now();
+        try {
+          if (Atomics.wait(control, index, 0, 8000) === 'timed-out') throw Error('barrier timed out');
+        } finally { barrierMs += now() - start; }
       };
       fs.unlinkSync = (path, ...args) => {
         if (role === 'first' && path === lock && !paused) {
@@ -1150,6 +1205,55 @@ describe('policy journal', () => {
     expect(lines).toHaveLength(2);
     expect(lines.map(line => JSON.parse(line).subject).sort()).toEqual(['one', 'two']);
     expect(() => statSync(env.WE_POLICY_EVENTS_FILE + '.lock')).toThrow(/ENOENT/);
+  });
+
+  it('waits out a lock holder that is slow under host load instead of dropping the event (main-red 545e68a5b)', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    writeFileSync(lock, 'held');
+    // Deterministic stand-in for a loaded host: the holder releases once the writer has
+    // asked to sleep 600ms in total, which is longer than the old ten-attempt budget (440ms).
+    let requested = 0;
+    const sleep = vi.spyOn(Atomics, 'wait').mockImplementation((_cell, _index, _value, ms) => {
+      requested += ms;
+      if (requested >= 600) rmSync(lock, { force: true });
+      return 'timed-out';
+    });
+    try {
+      recordPolicyEvent({ event: 'after-slow-holder' }, env);
+    } finally { sleep.mockRestore(); }
+    expect(readPolicyEvents({ env })).toMatchObject([{ event: 'after-slow-holder' }]);
+  });
+
+  it.each([-3600000, 3600000])('bounds a live lock wait by monotonic time when wall time steps %ims', step => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    const owner = JSON.stringify({ pid: process.pid, token: 'live-owner' });
+    writeFileSync(lock, owner);
+    const wallStart = Date.now();
+    let elapsed = 0, wallStep = 0;
+    const monotonic = vi.spyOn(performance, 'now').mockImplementation(() => elapsed);
+    const wall = vi.spyOn(Date, 'now').mockImplementation(() => wallStart + elapsed + wallStep);
+    const sleep = vi.spyOn(Atomics, 'wait').mockImplementation((_cell, _index, _value, ms) => {
+      // The first sleep happens after the deadline is computed. Advance monotonic
+      // time by the requested sleep, but step the wall clock independently.
+      wallStep = step;
+      elapsed += ms;
+      if (elapsed >= 2000) throw Error('Lock wait exceeded its monotonic budget');
+      return 'timed-out';
+    });
+    try {
+      expect(() => deliveryPolicy.appendPolicyJournal(env.WE_POLICY_EVENTS_FILE, '{}\n', {
+        allowedRoots: [dir],
+      })).toThrow(/lock timeout; event not recorded/);
+      expect(Date.now() - wallStart).toBe(elapsed + step);
+      expect(elapsed).toBeGreaterThanOrEqual(1000);
+      expect(elapsed).toBeLessThan(1080);
+      expect(readFileSync(lock, 'utf8')).toBe(owner);
+      expect(readPolicyEvents({ env })).toEqual([]);
+    } finally {
+      sleep.mockRestore();
+      wall.mockRestore();
+      monotonic.mockRestore();
+    }
   });
 
   it('refuses a live lock within a bounded wait without stopping the daemon', () => {

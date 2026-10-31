@@ -16,6 +16,7 @@ import {
   buildEntryBootScript, checkDaemonEntriesBoot, DAEMON_BOOT_SMOKE_CHECK, DAEMON_ENTRIES_ENV, DAEMON_ENTRY_MODULES,
   isSafeRelativeEntry, pickSmokeDiagnostics, resolveDaemonEntries, resolveBootSettings, smokeErrorClass, writeStderrTail,
 } from '../daemon-boot-smoke.mjs';
+import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
 import { redactDetail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
 import { smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
 
@@ -184,8 +185,57 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
   let diagnosticsDir;
   beforeEach(() => { diagnosticsDir = mkdtempSync(join(tmpdir(), 'we-boot-diag-')); });
   afterEach(() => rmSync(diagnosticsDir, { recursive: true, force: true }));
+  const sevenEntries = { [DAEMON_ENTRIES_ENV]: Array.from({ length: 7 }, (_, i) => `fixture-${i}.mjs`).join(',') };
   const ctx = (runChild) => ({ root: '/candidate', runtimeEntries: () => DAEMON_ENTRY_MODULES,
     budgets: { daemonBootMs: 1000 }, runChild, env: {}, diagnosticsDir });
+
+  it('refuses all seven boots at 1275ms left instead of starting doomed 45s children', async () => {
+    let calls = 0;
+    const runChild = budgetedRunChild({ deadline: 1275, now: () => 0, runChild: async (_cmd, _args, opts) => {
+      calls++;
+      throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
+    } });
+    const r = await checkDaemonEntriesBoot({ ...ctx(runChild), env: sevenEntries, budgets: { daemonBootMs: 45000 } });
+    expect(r.entries).toHaveLength(7);
+    expect(calls).toBe(0);
+    expect(r.ok).toBe(false);
+    expect(r.entries.every(e => e.kind === 'child failed: skipped: rebuild smoke budget exhausted (1275ms left)')).toBe(true);
+    expect(r.detail).not.toContain('timed out');
+  });
+
+  it('boots healthy entries with ample shared budget', async () => {
+    const seen = [];
+    const runChild = budgetedRunChild({ deadline: 90000, now: () => 0, runChild: async (_cmd, _args, opts) => {
+      seen.push(opts);
+      return '{"ok":true}';
+    } });
+    expect((await checkDaemonEntriesBoot({ ...ctx(runChild), env: sevenEntries, budgets: { daemonBootMs: 45000 } })).ok).toBe(true);
+    expect(seen).toHaveLength(7);
+    expect(seen.every(opts => opts.timeoutMs === 45000 && !('minChildMs' in opts))).toBe(true);
+  });
+
+  it('resolves and logs the boot floor knob and clamps it to the requested cap', async () => {
+    expect(resolveBootSettings({})).toMatchObject({ bootMinChildMs: 10000 });
+    for (const invalid of ['0', '-1', 'abc', '9007199254740992']) {
+      expect(resolveBootSettings({ WE_SMOKE_BOOT_MIN_CHILD_MS: invalid }).bootMinChildMs).toBe(10000);
+    }
+    const lines = [];
+    const floors = [];
+    const env = { WE_SMOKE_BOOT_MIN_CHILD_MS: '20000' };
+    expect(resolveBootSettings(env)).toMatchObject({ bootMinChildMs: 20000, sources: { bootMinChildMs: 'env' } });
+    await checkDaemonEntriesBoot({ ...ctx(async (_cmd, _args, opts) => {
+      floors.push(opts.minChildMs);
+      return '{"ok":true}';
+    }), env, log: { error: line => lines.push(line) } });
+    expect(floors).toEqual(Array(DAEMON_ENTRY_MODULES.length).fill(1000));
+    expect(lines[0]).toContain('"bootMinChildMs":"env"');
+    floors.length = 0;
+    await checkDaemonEntriesBoot({ ...ctx(async (_cmd, _args, opts) => {
+      floors.push(opts.minChildMs);
+      return '{"ok":true}';
+    }), budgets: { daemonBootMs: 45000 }, env });
+    expect(floors).toEqual(Array(DAEMON_ENTRY_MODULES.length).fill(20000));
+  });
 
   it('passes when every entry reports ok', async () => {
     const r = await checkDaemonEntriesBoot(ctx(async () => '{"ok":true}'));
@@ -309,6 +359,31 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
     expect(r.ok).toBe(false);
     expect(calls).toBe(1);
     expect(lines[0]).toContain('"bootSignalRetries":"env"');
+  });
+
+  it('preserves a reported import failure when a pending timer later causes a timeout', async () => {
+    const error = 'SyntaxError: broken module | at /candidate/fixture.mjs:1:1';
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      throw Object.assign(new Error('timed out after 45000ms (process group killed)'), {
+        stdout: JSON.stringify({ ok: false, error }), signal: 'SIGKILL',
+      });
+    }), env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' } });
+    expect(r.entries[0]).toMatchObject({ ok: false, kind: 'import failed',
+      errorClass: 'SyntaxError: broken module', files: ['fixture.mjs'] });
+    expect(readFileSync(r.entries[0].stderrFile, 'utf8')).toContain('SyntaxError: broken module');
+    expect(r.entries[0].attempts).toHaveLength(1);
+  });
+
+  it.each(['success', 'import failure', 'invalid output', 'timeout'])('measures each entry duration for %s', async (outcome) => {
+    let t = 1000;
+    const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
+      t += 1234;
+      if (outcome === 'timeout') throw new Error('timed out after 45000ms (process group killed)');
+      return { success: '{"ok":true}', 'import failure': '{"ok":false,"error":"SyntaxError: broken"}',
+        'invalid output': 'invalid' }[outcome];
+    }), env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, now: () => t });
+    expect(r.entries[0].elapsedMs).toBe(1234);
+    expect(r.entries[0].attempts[0].elapsedMs).toBe(1234);
   });
 
   it('fails when ONE entry\'s own child throws (killed / crashed before it could report) — the other entries still get judged', async () => {
@@ -531,6 +606,7 @@ describe('smoke diagnostics carry an allow-listed summary, never raw child text 
   // V8 copies raw input into a JSON parse message without escaping its quotes, so pairing quotes leaves the text
   // between them raw (self-review, PR 5460): only one cleanly bounded string may be masked in place.
   const v8JsonError = (input) => { try { JSON.parse(input); } catch (e) { return String(e); } throw new Error('parsed'); };
+  const sevenEntries = { [DAEMON_ENTRIES_ENV]: Array.from({ length: 7 }, (_, i) => `fixture-${i}.mjs`).join(',') };
   const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir, runChild });
 
   it('an import failure parsing malformed JSON never carries the copied input in its class', async () => {

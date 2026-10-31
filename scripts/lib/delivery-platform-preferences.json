@@ -8,6 +8,7 @@
   },
   "build": {
     "finalGate": "related",
-    "note": "Operator \"Ok\" (2026-10-22): the normal verify gate runs related tests; CI keeps the full suite."
+    "finalGateStandards": "selected",
+    "note": "Operator \"Ok\" (2026-10-22): the normal verify gate runs related tests; CI keeps the full suite. Operator \"Ok\" (2026-10-29 18:13 ET, Mac offload prototype): local check:standards follows the diff selection instead of always; CI still runs the full check:standards before merge. Revert: delete finalGateStandards (or set \"always\")."
   }
 }

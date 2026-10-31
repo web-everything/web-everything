@@ -828,6 +828,16 @@ describe('rebuild smoke budget and fail-fast', () => {
 });
 
 describe('budgetedRunChild', () => {
+  it('honors a per-call floor, strips it, and keeps the default floor for other children', async () => {
+    const base = vi.fn(async (_cmd, _args, opts) => opts);
+    const run = budgetedRunChild({ runChild: base, deadline: 1275, now: () => 0 });
+    await expect(run('node', [], { timeoutMs: 45000, minChildMs: 10000 }))
+      .rejects.toThrow('skipped: rebuild smoke budget exhausted (1275ms left)');
+    expect(base).not.toHaveBeenCalled();
+    expect(await run('git', [], { timeoutMs: 45000 })).toEqual({ timeoutMs: 1275 });
+    expect(await run('node', [], { timeoutMs: 500, minChildMs: 500 })).toEqual({ timeoutMs: 500 });
+  });
+
   it('caps each child timeout at the time left, and refuses to start one once the budget is spent', async () => {
     let t = 0;
     const base = vi.fn(async (_cmd, _args, opts) => opts.timeoutMs);

@@ -1,5 +1,7 @@
 # Testing — Three-Tier Strategy
 
+> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
 ## Human-only enqueue approval license (R212)
 
 `human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
@@ -477,6 +479,19 @@ secondary copies made to exercise missing Git state or relocated scripts for loc
 the file rather than symlinking it: its relative imports must resolve against the fixture's own
 `scripts/` tree.
 
+## Health tick watchdog deadlines
+
+`scripts/conveyor/__tests__/health-watch.test.mjs` keeps the real child-process kill probe and uses an
+injected child with virtual time to cover production-sized deadlines without waiting minutes. Inject load
+readings through `resolveTickWatchdogLimit.readLoad`; do not depend on the host's current load.
+The deadline is `min(tickKillCeilingMs, tickBudgetMs * 3 * clamp(load1 / cores, 1, tickKillLoadScaleMax))`.
+Defaults are a 60000ms budget, maximum scale 3 and absolute ceiling 540000ms. Policy
+`healthWatchTickWatchdog` resolves standard → platform → flat health-dir `config.json` keys → environment
+(`WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX`, `WE_HEALTH_TICK_KILL_CEILING_MS`). Invalid settings fall back to
+their standard values with provenance logged; invalid/unreadable load uses scale 1. Keep named cases for
+healthy 174s completion under load, the idle 180s deadline, exact scaled-limit SIGKILL, actual-limit
+`overrun.json` persistence, invalid knobs and oversized values capped by the absolute ceiling.
+
 ## Daemon entry boot smoke
 
 Rebuild candidates must also work with the old live daemon's smoke environment: it exports
@@ -496,7 +511,16 @@ Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.b
 Exit failures and `ok:false` never receive this retry. Both settings use the policy cascade via
 `scripts/settings/rebuild-smoke.json`, with env overrides `WE_SMOKE_BOOT_CONCURRENCY` and
 `WE_SMOKE_BOOT_SIGNAL_RETRIES`; log effective values and sources. Env integers are strict
-digits; empty is unset.
+digits; empty is unset. `rebuildSmoke.bootMinChildMs` (default 10000; env
+`WE_SMOKE_BOOT_MIN_CHILD_MS`) uses the same cascade and source log. Each boot asks for a
+per-call floor of `min(daemonBootMs, bootMinChildMs)`; less shared rebuild budget means the
+existing budget refusal, never a doomed short child. Live smoke tracks that same floor when
+marking budget interruptions. Only an all-timeout boot failure set at the full requested caps
+counts as env-timeout (caps at least `MIN_OWN_CAP_MS`, each attempt's measured `elapsedMs`
+at least `min(minElapsedMs, cap * 0.9)`; aggregate row time cannot substitute for entry timing).
+An import failure already reported on child stdout remains `import failed` even when a pending
+timer keeps the child alive until a timeout kills it.
+Mixed import failures, crashes, budget slices and missing entry evidence remain code failures.
 
 Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or
 dispatch smoke failure detail, held state, self-sync alert and PR comment carry only an
@@ -808,6 +832,12 @@ For filesystem settings and plain Node child imports, resolve paths with
 as browser asset URLs, which can become HTTP URLs under Vitest's DOM environment.
 Node's ESM loader refuses those URLs, and a settings read can silently fall back instead.
 Assert tool-layer provenance when testing a real default settings path.
+
+For in-process CLI imports with a variable query used to re-evaluate flag defaults, use
+`import(/* @vite-ignore */ expression)`. Otherwise Vite treats the query expression as a
+dynamic-import glob and can reject it as `Unknown variable dynamic import` before any
+assertions run. Keep distinct query keys while retaining the shared dependency graph;
+`scripts/__tests__/pr-land-delegation.test.mjs` exercises delegated and ordinary defaults.
 
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
@@ -1238,6 +1268,12 @@ holds apply globally. Reads leave legacy files untouched. A skipped run retains
 `servedModel: 'unknown'` and `modelEvidence: 'not-launched'`; `heldBackend` and
 `heldModel` identify the observation responsible for the refusal.
 
+Judge scorecards and run-record telemetry keep the effective agy effort: a model-id
+suffix takes precedence, otherwise apply the CLI map and legacy model override.
+Use `antigravity-model-effort.mjs`'s shared predicate in both launchers. Regression
+coverage lives in `antigravity-judge-spawn.test.mjs`; `parallel-judges.test.mjs` checks
+that both drive modes preserve provider effort while retaining the request fallback.
+
 ## Shadow reviewer agreement evidence
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
@@ -1468,6 +1504,19 @@ temporary git repo to verify gate arguments and green/red handling without recur
 suite. Exercise real subprocesses and git transport. Emit gate chatter in the fixture too: a CLI's
 machine-readable JSON stdout must remain parseable when its child gate prints output.
 
+Keep real-Git fixtures compatible with Forge's Git 2.43. An unsupported repository extension can
+prevent even read-only repository commands: inspect configuration with `git config --file`, and
+prove refusal by comparing filesystem bytes. Git's fetch negotiation may avoid a stale commit-graph,
+so verify an existing graph explicitly when testing corruption admission and repair. An `ls-files`
+exit 1 alone does not prove an untracked path: sparse-tree read failures can share that exit status.
+For a narrowed catch, keep one negative test per independent condition: the expected status with
+an unrelated diagnostic, and the expected diagnostic with another status. Fail-closed hook checks
+also need nonempty stdout and extra or partial stderr cases, in both reporting and repair modes.
+A test promising "only" or "never" must exercise the excluded case as well as the permitted one;
+assert the absence of retries or writes, not just the returned error.
+Send repository-sized path lists through NUL-delimited stdin, not argv; real-Git regressions should
+exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` while stdin succeeds.
+
 ### Passive-wait hook regression probes
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
@@ -1623,6 +1672,11 @@ A large seed commit can launch detached maintenance/repack that outlives `execFi
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
 do not hide the race with sleeps, cleanup retries, or exclusions from the snapshot.
 
+Git path safety tests must preserve raw command-output bytes until UTF-8 round-trip validation;
+include invalid filename bytes as well as a valid U+FFFD name. For generated safety attributes,
+probe the effective value with `git check-attr`, and test encoded line lengths near Git 2.43's
+2048-byte limit. An ignored override must refuse the merge before Git can allocate conflict markers.
+
 1. Test behavior, not implementation.
 2. One concept per test; descriptive names (`should notify listeners on setItem`).
 3. Arrange-Act-Assert. Reset state in `beforeEach`/`afterEach`.
@@ -1679,6 +1733,24 @@ npx vitest run --coverage           # coverage report
 ```
 
 ## Developing & manually testing in a lane
+
+An entry guard placed in the first side-effect import must finish synchronously before
+transferring execution. Awaiting IO in that guard lets sibling entry dependencies evaluate.
+The tools-root subprocess fixture pins this: a later dependency throws if local evaluation
+starts, while the selected tools entry records its actual cwd, argv and exit status.
+Tools-root redirection accepts only the three entries declared in `TOOLS_ROOT_ENTRIES`;
+an ordinary `scripts/` runner importing one of them as a library must stay local, even
+when a counterpart exists in the tools checkout. Pin both the no-spawn seam and the real
+import path. Pin every explicit resolver rejection reason, including a successful Git
+probe that names a different checkout root. The default event-writer fixtures must cover
+both timeout and excessive-output recovery before selected tooling starts.
+
+The synchronous tools-root wrapper cannot forward a signal addressed only to its PID;
+the selected child (or the event writer) can outlive it. Supervisors must terminate the
+whole process group. Moving to async signal forwarding also requires deferring sibling
+entry imports; awaiting the first side-effect import alone does not defer them.
+Oversized-input fixtures must measure requested ranges and cumulative bytes through the
+filesystem seam, including short reads; rejection alone does not prove bounded IO.
 
 Every edit — including an ad-hoc "just fix this one thing" — happens in an **isolated lane clone**, never the main checkout (#2123; the writer model in [platform-decisions.md#pr-flow-rollout-mechanism](platform-decisions.md#pr-flow-rollout-mechanism)). The lane trigger is *making an edit*, not *running a command*. The main checkout stays the human's — its dev server on `:3000`/`:8080` is theirs; don't build or serve into it.
 
@@ -2172,6 +2244,26 @@ Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial compl
 separate from transient infrastructure failures and their retry streak.
 
 ### Direct heavy-run hook probes
+
+Pool maintenance uses health-watch's existing tick and `scheduled-lane-maintenance.mjs`.
+Its per-pool `.maintenance-stamp.json` records attempts before running the trim and gc
+CLIs under a shared stamp lock; the interval is at least 24h, even with a shorter
+`lanes.gc.schedule`. Invalid/oversized/future stamps refuse work: inspect and repair the
+named stamp before retrying. Dry-run ticks do not consume the schedule. The named tests in
+`scripts/lib/__tests__/scheduled-lane-maintenance.test.mjs` cover restart suppression,
+lock contention, subprocess failures, du byte accounting, real trim lease protection,
+and GC refusing lease markers (including a marker appearing during host admission).
+GC conservatively skips even stale or malformed markers; lease reclamation stays with
+lane-pool's existing trim/recovery paths.
+
+Daemon clone GC is serialized by `clone-maintenance.mjs` with the shared WRITE lock;
+keep Git asynchronous so its lock heartbeat can run during packing. The named cases in
+`scripts/lib/__tests__/clone-maintenance.test.mjs` cover lock contention, persisted rate
+limits, idle-hook order and real local packing that preserves recent unreachable objects.
+`cloneMaintenance.intervalMs` resolves through the policy cascade with
+`WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS` as the environment override. A corrupt or
+oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
+and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
@@ -3097,3 +3189,40 @@ the current occupant as ours. Git optional locks are disabled, so status does no
 refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
+
+## Archive-only host retention (R217)
+
+`scripts/lib/archive-retention.mjs` uses the run store's shared directory resolver without triggering
+legacy migration; `OPERATION_RUNS_DIR` wins. Tests use temporary source, Drive and stamp roots.
+Run the archive-retention and archive-retention-tick fixtures through heavy admission. Real `tar`
+creation/listing proves the happy path; injected post-bundle changes prove truncation, size/count
+mismatch and concurrent-source protection. The Drive root must already exist. Never create a local
+fallback archive or remove originals when Drive verification fails. An oversized scan retains all
+sources and asks the operator to split the source or inspect and raise the scan bound. Stale lock
+recovery requires operator inspection, never automatic lock stealing. Archives have no expiry.
+The CLI defaults to both kinds; `--dry-run` creates no archive or stamp. Settings live in
+`scripts/settings/archive-retention.json` and resolve through the shared policy cascade with sources
+included in results and logged by the CLI/health-watch. Host health ticks invoke both kinds; fixture,
+dry-run and redirected ticks skip retention. Each kind serializes with a lock and uses a 24-hour stamp.
+
+A durable per-kind manifest beside the stamp records source-relative paths, size, mtime and
+identity/ctime for verified bundles, scoped to the source and Drive paths. Retained unchanged
+sources are skipped even after stamp expiry; changed sources and session companions remain eligible.
+The manifest is read under the invocation lock and atomically replaced after bundle verification,
+before source removal or stamp publication. Dry-run reads it without writing state. Invalid or
+oversized manifests fail closed and ask the operator to inspect or restore the manifest; the read
+and write limits are 128 MiB and `maxFiles` entries. Regression fixtures cross stamp expiry for both
+kinds, change size/mtime or restore mtime after a same-size edit, and retry failed verification or
+manifest publication. Existing bundles from before manifest tracking cannot be deduplicated by it.
+
+The archiver's invocation lock serializes archivers only; it does **not** exclude run-store or
+Claude writers. A stat/unlink pair cannot safely reclaim a mutable source. Source removal therefore
+requires the injected `withSourceWriterExclusion(path, criticalSection)` provider to exclude **all**
+writers, including already-open file descriptors and atomic replacements, throughout final identity
+verification and unlink. The provider must await the critical section and leave it uncalled when
+exclusion is unavailable. No production provider exists for Claude's external transcript writers;
+the CLI and daily health-watch archive but retain originals, report `filesRetained` and an operator
+fallback, and claim zero reclaimed bytes. Do not enable reclamation with a policy flag or quiet-time
+heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
+Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
+unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
