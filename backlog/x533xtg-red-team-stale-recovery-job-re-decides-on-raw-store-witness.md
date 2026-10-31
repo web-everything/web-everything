@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/operations/review-job.mjs", "we:scripts/lib/review-red-team-on-skip.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/drain-red-team-evidence.mjs"]
+scope: ["we:scripts/operations/review-job.mjs", "we:scripts/lib/review-red-team-on-skip.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/drain-red-team-evidence.mjs", "we:scripts/operations/__tests__/review-job.test.mjs", "we:scripts/lib/__tests__/review-red-team-on-skip.test.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs", "we:scripts/lib/__tests__/drain-red-team-evidence.test.mjs"]
 dateOpened: "2026-10-31"
 tags: []
 ---
