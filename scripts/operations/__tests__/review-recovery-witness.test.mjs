@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -51,7 +51,17 @@ it.each([[1, true], [2, true], [4, false], [5, false], [8, false], [9, false]])(
 });
 it.each([10, 12, 'status rewritten', 'marker removed', 'seat appended'])('B / matrix %s: choke-point mutation refuses without a write or provider', mutation => {
   const f = fixture(); expect(f.abandon().ok).toBe(true);
-  if (mutation === 10) { writeFileSync(f.run, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537', op: 'review-pr', input: { repo, pr } }), ...payload(), verdict: { verdict: 'reject' } })); utimesSync(f.run, new Date(), new Date(Date.now() + 1000)); }
+  if (mutation === 10) {
+    const original = readFileSync(f.run, 'utf8'), at = statSync(f.run).mtimeMs;
+    const older = join(f.env.WE_SHARED_RUNS_DIR, 'review-pr-7537-older-accept.json');
+    const newer = join(f.env.WE_SHARED_RUNS_DIR, 'review-pr-7537-newer-reject.json');
+    writeFileSync(older, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-older-accept', op: 'review-pr', input: { repo, pr } }), ...payload() }));
+    utimesSync(older, new Date(at - 2000), new Date(at - 2000));
+    writeFileSync(newer, JSON.stringify({ ...newRunRecord({ id: 'review-pr-7537-newer-reject', op: 'review-pr', input: { repo, pr } }), ...payload(), verdict: { verdict: 'reject' } }));
+    utimesSync(newer, new Date(at + 2000), new Date(at + 2000));
+    expect(readFileSync(f.run, 'utf8')).toBe(original);
+    expect(f.readWitness().newest).toMatchObject({ id: 'review-pr-7537-newer-reject', verdict: { verdict: 'reject' } });
+  }
   if (mutation === 12) f.probe.isAlive = () => true;
   if (mutation === 'status rewritten') writeFileSync(f.path, readFileSync(f.path, 'utf8') + ' ');
   if (mutation === 'marker removed') rmSync(`${f.path}.stale-redispatch-1`);
