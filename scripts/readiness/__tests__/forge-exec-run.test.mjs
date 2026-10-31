@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -9,6 +9,7 @@ import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
+import {verifiedCopySource} from '../forge-exec-bases.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -61,6 +62,94 @@ exit 3
     ...await snapshotBinding(work),inputDigest:await digestInput(work),argvDigest:digestArgv(argv)};
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
+describe('sibling root snapshot acceptance', () => {
+  const siblingRoot = () => join(root,'runs',request.run,'frontierui');
+  async function siblingSnapshot() {
+    const sibling = siblingRoot();
+    await mkdir(join(sibling,'plugs'),{recursive:true});
+    await mkdir(join(sibling,'webtheme'),{recursive:true});
+    await writeFile(join(sibling,'plugs','runtime.js'),'export const plug = true;\n');
+    await writeFile(join(sibling,'webtheme','theme.js'),'export const theme = true;\n');
+    const {manifest} = await snapshotBinding(sibling);
+    request.manifest.siblings = {frontierui:{sha:'a'.repeat(40),...manifest}};
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    request.siblingShas = {frontierui:'a'.repeat(40)};
+    return sibling;
+  }
+  async function expectNoExecutionOrReceipt({siblings = true} = {}) {
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toEqual(siblings
+      ? {v:1,nonce:request.nonce,run:request.run,phase:'rejected',reason:'snapshot-rejected',siblings:true,started:false}
+      : null);
+  }
+
+  it('prepare creates an empty sibling root beside work with mode 0755 when requested', async () => {
+    const prepared = await runner.prepare({nonce:request.nonce,siblings:true});
+    const preparedWork = join(root,'runs',prepared.run,'work');
+    const sibling = join(root,'runs',prepared.run,'frontierui');
+    expect((await stat(sibling)).mode & 0o777).toBe(0o755);
+    expect(await readdir(sibling)).toEqual([]);
+    expect(await realpath(join(preparedWork,'..','frontierui'))).toBe(sibling);
+  });
+
+  it('accepts the matching sibling snapshot and binds its digest in the test receipt', async () => {
+    const sibling = await siblingSnapshot();
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(sibling,'plugs','runtime.js'),'utf8')).toBe('export const plug = true;\n');
+    expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
+      inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
+      manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3,
+      resources:{memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8},
+      timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
+  });
+
+  it.each([
+    ['changed byte', /snapshot digest/],
+    ['extra file', /snapshot digest/],
+    ['missing file', /Manifest inventory/],
+    ['file symlink', /Manifest symlink/],
+    ['directory symlink', /Manifest symlink/],
+    ['wrong digest', /Manifest digest mismatch/],
+  ])('refuses sibling %s before installation and never certifies a receipt', async (fault, error) => {
+    const sibling = await siblingSnapshot();
+    const plug = join(sibling,'plugs','runtime.js');
+    const outside = join(root,'outside.js');
+    await writeFile(outside,'export const outside = true;');
+    if (fault === 'changed byte') await writeFile(plug,'export const plug = false;\n');
+    if (fault === 'extra file') await writeFile(join(sibling,'plugs','extra.js'),'extra');
+    if (fault === 'missing file') await rm(plug);
+    if (fault === 'file symlink') {
+      await rm(plug);
+      await symlink(outside,plug);
+    }
+    if (fault === 'directory symlink') {
+      await rm(join(sibling,'plugs'),{recursive:true});
+      await symlink(root,join(sibling,'plugs'));
+    }
+    if (fault === 'wrong digest') request.manifestDigest = '0'.repeat(64);
+    await expect(runner.run(request)).rejects.toThrow(error);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it('accepts an empty sibling root without adding a sibling digest to the receipt', async () => {
+    await mkdir(siblingRoot(),{recursive:true});
+    expect((await runner.run(request)).code).toBe(3);
+    const receipt = await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'test',code:3,manifestDigest:request.manifestDigest});
+    expect(receipt).not.toHaveProperty('siblingShas');
+  });
+
+  it('requires an empty sibling root when no sibling manifest was supplied', async () => {
+    await siblingSnapshot();
+    delete request.manifest.siblings;
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    delete request.siblingShas;
+    await expect(runner.run(request)).rejects.toThrow('Extra sibling snapshot');
+    await expectNoExecutionOrReceipt({siblings:false});
+  });
+});
+
 describe('fixed wrapper security boundary', () => {
   it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
     const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
@@ -280,7 +369,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect(log).not.toContain('production');
     expect(log).not.toContain(process.env.HOME);
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,inputDigest:request.inputDigest,
-      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
+      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,resources:{memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8},timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
     expect(await readdir(join(root,'receipts'))).toEqual(['.worker-active.writer',request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
@@ -486,7 +575,7 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 2
+    assert chown.call_count == 3
     assert chown.call_args.args[1:] == (0, 0)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
@@ -495,7 +584,7 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(installed.status,installed.stderr).toBe(0);
     const names=await readdir(join(local,'libexec'));
-    expect(names.sort()).toEqual(['forge-exec-run.mjs','forge-warm-base.mjs']);
+    expect(names.sort()).toEqual(['forge-exec-limits.mjs','forge-exec-run.mjs','forge-warm-base.mjs']);
     const entry=join(local,'libexec','forge-exec-run.mjs');
     expect((await stat(entry)).mode & 0o777).toBe(0o755);
     // Disable newer Node's syntax detection to retain the Node 22.1 default.
@@ -506,6 +595,12 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(result.status,result.stderr).toBe(254);
     expect(result.stderr).toBe('forge-exec-run: Invalid subcommand\n');
+    const limiter=join(local,'libexec','forge-exec-limits.mjs');
+    expect((await stat(limiter)).mode & 0o777).toBe(0o755);
+    const limitsResult=spawnSync(limiter,['unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
+    expect(limitsResult.status,limitsResult.stderr).toBe(1);
+    expect(limitsResult.stderr).toBe('forge-exec-limits: Expected apply\n');
     const warmer=join(local,'libexec','forge-warm-base.mjs');
     expect((await stat(warmer)).mode & 0o777).toBe(0o755);
     const warmResult=spawnSync(warmer,['unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
@@ -694,6 +789,98 @@ syncBuiltinESMExports();
     expect(result.stderr).toBe('forge-exec-run: Invalid warm source\n');
     expect(result.stdout).toBe('');
     await expect(stat(attempts)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it.each(['base', 'temporary parent', 'tree', 'nested directory', 'leaf'])
+  ('warm-install refuses a symlinked %s even when the redirected bytes match the manifest', async component => {
+    const base=join(root,'warm-source'),parent=join(base,'a'.repeat(40)+'.tmp'),tree=join(parent,'tree');
+    await mkdir(join(tree,'nested'),{recursive:true});
+    await writeFile(join(tree,'package-lock.json'),'lock');
+    await writeFile(join(tree,'nested','sentinel'),'fixture bytes');
+    const {manifest}=await snapshotBinding(tree);
+    const replaced={base,'temporary parent':parent,tree,'nested directory':join(tree,'nested'),leaf:join(tree,'nested','sentinel')}[component];
+    await rename(replaced,replaced+'.saved');
+    await symlink(replaced+'.saved',replaced);
+    await expect(runner.warmInstall(tree,manifest)).rejects.toThrow(/warm source|copy/i);
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+    expect(await readFile(join(tree,'nested','sentinel'),'utf8')).toBe('fixture bytes');
+  });
+  it.each(['temporary parent', 'tree', 'nested directory'])
+  ('warm copying stays on the pinned source after replacing its %s pathname', async component => {
+    const parent=join(root,'a'.repeat(40)+'.tmp'),tree=join(parent,'tree'),destination=join(root,'warm-copy');
+    const victim=join(root,'warm-victim'),name=Buffer.from("quote' space 雪.txt");
+    await mkdir(join(tree,'nested'),{recursive:true});await mkdir(destination);
+    await mkdir(join(victim,'tree','nested'),{recursive:true});
+    const original=Buffer.concat([Buffer.from(join(tree,'nested')+'/'),name]);
+    await writeFile(original,'public fixture');
+    await writeFile(join(victim,'tree','nested','sentinel'),'private fixture');
+    const replaced=component==='temporary parent'?parent:component==='tree'?tree:join(tree,'nested');
+    const trigger=component==='temporary parent'?Buffer.from('tree'):component==='tree'?Buffer.from('nested'):name;
+    // Replace the already-open ancestor immediately before the next openat.
+    // A pathname-based copy would resolve into the victim or lose the source.
+    const driver=`import os, sys, json, base64
+attack=json.loads(sys.argv[2])
+original=os.open
+fired=False
+def swapped(name, flags, *args, **kwargs):
+    global fired
+    if not fired and name == base64.b64decode(attack['trigger']) and 'dir_fd' in kwargs:
+        fired=True
+        os.rename(attack['replaced'], attack['replaced']+'.saved')
+        os.symlink(attack['victim'], attack['replaced'])
+    return original(name, flags, *args, **kwargs)
+os.open=swapped
+exec(sys.argv[1])
+assert fired
+`;
+    const entry={path:Buffer.concat([Buffer.from('nested/'),name]).toString('base64'),sha256:hash('public fixture'),executable:false};
+    const result=spawnSync('/usr/bin/python3',['-I','-c',driver,verifiedCopySource,
+      JSON.stringify({trigger:trigger.toString('base64'),replaced,victim})],{
+      input:JSON.stringify({source:tree,destination,entries:[entry]}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(Buffer.concat([Buffer.from(join(destination,'nested')+'/'),name]),'utf8')).toBe('public fixture');
+    expect(await readdir(victim)).toEqual(['tree']);
+  });
+  it.each(['digest mismatch', 'FIFO', 'hardlink'])
+  ('warm copying refuses %s before writing any destination file', async fault => {
+    const source=join(root,'source'),destination=join(root,'destination'),leaf=join(source,'sentinel');
+    await mkdir(source);await mkdir(destination);
+    if(fault==='FIFO') {
+      const fifo=spawnSync('mkfifo',[leaf],{timeout:1000});expect(fifo.status).toBe(0);
+    } else {
+      await writeFile(leaf,'private fixture');
+      if(fault==='hardlink')await link(leaf,join(root,'linked-sentinel'));
+    }
+    const result=spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+      input:JSON.stringify({source,destination,entries:[{path:Buffer.from('sentinel').toString('base64'),sha256:hash(fault==='digest mismatch'?'public fixture':'private fixture'),executable:false}]}),
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Invalid copy source');expect(await readdir(destination)).toEqual([]);
+    expect(result.stdout).toBe('');expect(result.stderr).not.toContain('private fixture');
+  });
+  it('warm-install accepts an ordinary source and completes dependency installation', async () => {
+    const source=join(root,'ordinary-warm-source');await mkdir(source);
+    await writeFile(join(source,'package-lock.json'),'lock');
+    const {manifest}=await snapshotBinding(source);
+    expect(await runner.warmInstall(source,manifest)).toEqual({code:0});
+    expect(await readFile(join(root,'install.log'),'utf8')).toContain('ci --include=dev --ignore-scripts');
+    expect((await readdir(join(root,'runs'))).filter(name=>name.startsWith('warm-'))).toEqual([]);
+  });
+  it.skipIf(process.platform!=='linux'||process.getuid()!==0)
+  ('root warm copying refuses a redirected ancestor before copying a root-only sentinel', async () => {
+    const parent=join(root,'root-source'),tree=join(parent,'tree'),destination=join(root,'root-destination');
+    await mkdir(tree,{recursive:true});await mkdir(destination);
+    await writeFile(join(tree,'sentinel'),'root-only fixture',{mode:0o600});
+    await rename(parent,parent+'.saved');await symlink(parent+'.saved',parent);
+    const result=spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+      input:JSON.stringify({source:tree,destination,entries:[{path:Buffer.from('sentinel').toString('base64'),sha256:hash('root-only fixture'),executable:false}]}),
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
+    expect(await readdir(destination)).toEqual([]);expect(result.stdout).toBe('');
+    expect(result.stderr).not.toContain('root-only fixture');
   });
   it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
@@ -1078,10 +1265,10 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
       .flatMap(pattern => ['', 'nested/'].map(depth => pattern.replaceAll('**/', depth).replaceAll('*', 'identity'))));
     const names = [...new Set([...positives, 'scripts/__tests__/support.json',
       'scripts/__tests__/credentials.js', 'notes.test.txt', 'support.js'])];
-    for (const name of names) {
+    await Promise.all(names.map(async name => {
       await mkdir(join(work, name, '..'), {recursive:true});
       await writeFile(join(work, name), 'fixture');
-    }
+    }));
     const binding = await snapshot(['package-lock.json', ...names]);
     const verified = await verify(binding.manifest, binding.manifestDigest);
     const selected = new Set(verified.testPaths.map(path => path.toString()));
@@ -1132,4 +1319,89 @@ describe('sibling manifest verification', () => {
     expect((await stat(rejected)).mode & 0o777).toBe(0o600);
     expect(await runner.finish(request)).toMatchObject({phase:'rejected',started:false});
   });
+});
+
+
+describe('slot resource environment and receipts',()=>{
+  it.each([undefined,'3'])('defaults worker count while permitting a request override %s',async workers=>{
+    const seen=[];
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async call=>{
+      seen.push(call);
+      return {code:0,stdout:'',stderr:''};
+    }});
+    request.env={CI:'true',...(workers?{WE_VITEST_MAX_WORKERS:workers}:{})};
+    await runner.run(request);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    for(const call of seen) expect(call.env.FORGE_SLOT_CPUS).toBe('8');
+    expect(seen[0].env.WE_VITEST_MAX_WORKERS).toBe('8');
+    expect(seen.at(-1).env.WE_VITEST_MAX_WORKERS).toBe(workers??'8');
+    expect(JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8')).resources)
+      .toEqual({memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8});
+  });
+  it('refuses request overrides of the slot CPU ceiling before execution',async()=>{
+    request.env.FORGE_SLOT_CPUS='100';
+    await expect(runner.run(request)).rejects.toThrow('Invalid execution parameters');
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('accumulates per-command usage in the protected receipt',async()=>{
+    let count=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      count++;
+      return {code:0,stdout:'',stderr:'',usage:{memoryPeakBytes:count===1?200:100,cpuUsec:10,oomKills:1}};
+    }});
+    await runner.run(request);
+    expect(count).toBeGreaterThanOrEqual(2);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(receipt.resources).toEqual({memoryPeakBytes:200,cpuUsec:count*10,oomKills:count,slotCpus:8});
+    expect((await runner.finish(request)).resources).toEqual(receipt.resources);
+  });
+  it.each(['null counters','missing counters','missing usage'].flatMap(kind=>[1,2].map(command=>[kind,command])))
+  ('keeps receipt counters null with %s in command %s',async(kind,command)=>{
+    let count=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      count++;
+      const usage=count!==command ? {memoryPeakBytes:200,cpuUsec:10,oomKills:1}
+        : kind==='null counters' ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null}
+        : kind==='missing counters' ? {} : undefined;
+      return {code:0,stdout:'',stderr:'',usage};
+    }});
+    await runner.run(request);
+    expect(count).toBeGreaterThanOrEqual(2);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(receipt.resources).toEqual({memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8});
+    expect((await runner.finish(request)).resources).toEqual(receipt.resources);
+  });
+});
+
+it.each([false,true])('reads supervisor cgroup counters with missing counters=%s',async missing=>{
+  const usage=join(root,'usage.json');
+  const source=supervisorSource.slice(supervisorSource.indexOf("if 'usage' in cfg:"),supervisorSource.indexOf("fd = os.open(cfg['status']"));
+  const probe=String.raw`import os, sys, json, io, builtins
+from unittest.mock import patch
+source, usage, missing = sys.argv[1:]
+cfg = {'usage': usage}
+files = {'/proc/self/cgroup': '0::/forge-exec.slice/forge-exec-3.slice/scope\n',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.peak': '12345',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.events': 'oom 2\noom_kill 1\n'}
+def counter_open(path, *args, **kwargs):
+    if missing == 'true' and path != '/proc/self/cgroup': raise FileNotFoundError(path)
+    return io.StringIO(files[path])
+with patch.object(builtins, 'open', side_effect=counter_open):
+    exec(source)
+# A second write must refuse to overwrite existing protected evidence.
+try:
+    with patch.object(builtins, 'open', side_effect=counter_open):
+        exec(source)
+except FileExistsError:
+    pass
+else:
+    raise AssertionError('usage write was not exclusive')
+`;
+  const result=spawnSync('python3',['-I','-c',probe,source,usage,String(missing)],{encoding:'utf8',timeout:10000});
+  expect(result.status,result.stderr).toBe(0);
+  expect(JSON.parse(await readFile(usage,'utf8'))).toEqual(missing
+    ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null}
+    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1});
+  expect(supervisorSource.indexOf("if 'usage' in cfg:")).toBeGreaterThan(supervisorSource.indexOf('if not uid_processes(): break'));
 });

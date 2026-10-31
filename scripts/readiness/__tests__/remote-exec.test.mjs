@@ -1,7 +1,8 @@
 // @vitest-environment node
+import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync } from 'node:fs';
+import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -17,6 +18,7 @@ import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision 
 import {materializeWorktree} from '../forge-exec-bases.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
+import {scanDiffBranchCoverage} from '../../lib/diff-branch-coverage.mjs';
 
 vi.mock('../forge-telemetry.mjs', async importOriginal => {
   const actual=await importOriginal();
@@ -46,12 +48,13 @@ const forbiddenEnv = {
   HOME: 'private-home-marker', PATH: 'private-path-marker', OTHER: 'private-other-marker',
 };
 let cwd;
+const auxiliary=[];
 beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
   cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
 });
-afterEach(() => rmSync(cwd, { recursive: true, force: true }));
+afterEach(() => {rmSync(cwd, { recursive: true, force: true });for(const path of auxiliary.splice(0))rmSync(path,{recursive:true,force:true});});
 
 const sshText = (call) => call.args.join(' ');
 const isCleanup = (call) => call.file === 'ssh' && sshText(call).endsWith(' finish');
@@ -65,7 +68,8 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   let state;
   const exec = vi.fn(async (call) => {
     if (call.file === 'git') {
-      if (call.args.join(' ') === 'rev-parse HEAD') return {code:0,stdout:Buffer.from('a'.repeat(40)+'\n')};
+      const binding=bindingEvidence(call);if(binding)return binding;
+      if (gitArgs(call).join(' ') === 'rev-parse HEAD') return {code:0,stdout:Buffer.from('a'.repeat(40)+'\n')};
       if (call.args.includes('-i')) return {code:0, stdout:Buffer.alloc(0)};
       const files = ['package-lock.json', 'a.test.mjs'];
       const records = call.args.includes('--stage') ? files.map(name => {
@@ -125,15 +129,17 @@ function expectNoSecrets(exec) {
 }
 function realRemoteFixture(files) {
   const f = fixture();
+  if(!files.includes('a.test.mjs'))files.push('a.test.mjs');
   f.listFiles.mockResolvedValue(files);
-  const root = join(cwd, 'server');
-  const bin = join(cwd, 'bin');
+  const transportRoot=realpathSync(mkdtempSync(join(process.env.TMPDIR,'remote-transport-')));auxiliary.push(transportRoot);
+  const root = join(transportRoot, 'server');
+  const bin = join(transportRoot, 'bin');
   mkdirSync(bin);
   const npmCli = realpathSync(spawnSync('which', ['npm'], {encoding:'utf8'}).stdout.trim());
   const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
-  for (const name of ['user.npmrc','global.npmrc']) writeFileSync(join(cwd,name),'');
+  for (const name of ['user.npmrc','global.npmrc']) writeFileSync(join(transportRoot,name),'');
   symlinkSync(process.execPath, join(bin,'node'));
-  writeFileSync(join(bin,'npm'), `#!/bin/bash\nexec ${quote(process.execPath)} ${quote(npmCli)} --offline --cache=${quote(join(cwd,'npm-cache'))} --userconfig=${quote(join(cwd,'user.npmrc'))} --globalconfig=${quote(join(cwd,'global.npmrc'))} "$@"\n`, {mode:0o755});
+  writeFileSync(join(bin,'npm'), `#!/bin/bash\nexec ${quote(process.execPath)} ${quote(npmCli)} --offline --cache=${quote(join(transportRoot,'npm-cache'))} --userconfig=${quote(join(transportRoot,'user.npmrc'))} --globalconfig=${quote(join(transportRoot,'global.npmrc'))} "$@"\n`, {mode:0o755});
   const runner = createRunner({testRoot:root, testPath:`${bin}:/usr/bin:/bin`});
   const runs = [];
   let serverRun;
@@ -253,6 +259,8 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
       const work = join(f.root,'runs',prepared.run,'work');
       for (const file of [...files,...(dual ? ['npm-shrinkwrap.json'] : [])]) writeFileSync(join(work,file),readFileSync(join(cwd,file)));
       const manifest = await remoteManifestAPI.buildManifest({cwd:work, exec:f.exec, listFiles:async () => files});
+      // The binding fixture creates client Git metadata; worker snapshots never ship it.
+      rmSync(join(work,'.git'), {recursive:true,force:true});
       const request = {...prepared,nonce,argv,env:{CI:'true'},lock,argvDigest:digestArgv(argv),inputDigest:await digestInput(work),
         manifest:forgeManifestAPI.manifestWire(manifest),manifestDigest:manifest.manifestDigest};
       try {
@@ -288,7 +296,8 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
       symlinkSync(join(external,'payload.txt'),join(cwd,file));
     } else symlinkSync(kind === 'dangling parent' ? join(cwd,'absent') : external,join(cwd,'fixtures'));
     f.listFiles.mockResolvedValue(['package-lock.json',file]);
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    const detail = kind === 'leaf' ? file : kind === 'nested parent' ? 'fixtures/nested' : 'fixtures';
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'unshipped-symlink',detail});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
   });
@@ -296,13 +305,13 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     const f = fixture();
     if (kind === 'directory') mkdirSync(join(cwd,'fixtures'));
     f.listFiles.mockResolvedValue(['package-lock.json','fixtures']);
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
   });
   it('rejects dual lockfiles at the client even if shrinkwrap is omitted from the inventory', async () => {
     const f = fixture();
     writeFileSync(join(cwd,'npm-shrinkwrap.json'),'shrinkwrap');
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
   });
   it.each(['snapshot', 'stale remote'])('falls back when a %s receipt says 97 and npm ci fails before the command', async (source) => {
@@ -398,13 +407,14 @@ console.log('RESOLVED ' + versions.join(','));
       name: 'fixture', version: '1.0.0', lockfileVersion: 3,
       packages: { '': { name: 'fixture', version: '1.0.0' } },
     }));
-    const f = realRemoteFixture(['package.json', 'package-lock.json']);
+    const files = ['package.json', 'package-lock.json', 'a.test.mjs'];
+    const f = realRemoteFixture(files);
     for (const state of ['cold', 'warm']) {
       expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
     }
     const hash = createHash('sha256').update(readFileSync(join(cwd, 'package-lock.json'))).digest('hex');
-    const inputDigest = await digestInput(cwd, ['package.json', 'package-lock.json']);
+    const inputDigest = await digestInput(cwd, files);
     writeFileSync(join(f.root, 'cache', hash, 'dev-v5-'+inputDigest, 'dependencies.tar'), 'corrupt archive');
     const log = vi.fn();
     expect(await runRemoteCli({ ...f, log })).toBe(124);
@@ -510,7 +520,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
   const discoveryFlags = ['--config','--root','--dir','--project','--workspace','--include','--exclude','--dangerouslyIgnoreUnhandledErrors','-c','-r'];
@@ -520,7 +530,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
   it.each([
@@ -545,7 +555,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -559,7 +569,7 @@ describe('isAllowedCommand', () => {
     expect(isAllowedCommand(command)).toBe(false);
     expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
     const f = fixture();
-    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started', terminated:true,reason:'command-not-allowed'});
     expect(f.exec).not.toHaveBeenCalled();
   });
 
@@ -591,7 +601,206 @@ describe('isAllowedCommand', () => {
   });
 });
 
+describe('standards input parity', () => {
+  it('discovers the same base, ignored coverage report, tracked memory index and tracked skills locally and through the real manifest + filterEnv', async () => {
+    for (const scenario of ['coverage base', 'coverage report', 'memory index', 'tracked skills']) {
+      let observed;
+      const f = fixture({receipt:(_nonce,value)=>JSON.stringify({...value,code:observed.exitCode})});
+      const original = f.exec, work = join(cwd, scenario), snapshot = join(cwd, `${scenario}-remote`);
+      mkdirSync(work); mkdirSync(snapshot);
+      const git = (...args) => {
+        const result = spawnSync('git', args, {cwd:work,encoding:'utf8',timeout:10000});
+        expect(result.status,result.stderr).toBe(0); return result.stdout.trim();
+      };
+      git('init','-b','main'); git('config','user.name','Fixture'); git('config','user.email','fixture@example.invalid');
+      const tier = 'scripts/lib/disposition-judge.mjs';
+      mkdirSync(join(work,'scripts/lib'),{recursive:true});
+      for (const file of ['check-memory.mjs','lib/write-all-sync.mjs','lib/secret-scrub.mjs'])
+        cpSync(new URL(`../../${file}`,import.meta.url),join(work,'scripts',file));
+      writeFileSync(join(work,'package-lock.json'),'{}');
+      writeFileSync(join(work,'.gitignore'),'coverage/\n');
+      mkdirSync(join(work,'.claude')); mkdirSync(join(work,'agent-memory-src'));
+      symlinkSync('../agent-memory-src',join(work,'.claude/agent-memory'));
+      writeFileSync(join(work,'agent-memory-src/MEMORY.md'),scenario === 'memory index' ? 'x'.repeat(201) : '# Memory\n');
+      if(scenario==='tracked skills') {
+        mkdirSync(join(work,'skills-src/example'),{recursive:true});
+        writeFileSync(join(work,'skills-src/example/SKILL.md'),'# Skill\n');
+        symlinkSync('../skills-src',join(work,'.claude/skills'));
+      }
+      writeFileSync(join(work,tier),'export const changed = false;\n');
+      git('add','.'); git('commit','-m','base');
+      const base = git('rev-parse','HEAD');
+      git('branch','coverage-base',base);
+      writeFileSync(join(work,tier),'export const changed = true;\n');
+      if (scenario === 'coverage base') { git('add',tier); git('commit','-m','changed tier at clean HEAD'); }
+      git('update-ref','refs/remotes/origin/main','HEAD');
+      const loc = {start:{line:1,column:0},end:{line:1,column:40}};
+      mkdirSync(join(work,'coverage'));
+      // Only the local input exists here; the real builder/stager must ship it.
+      writeFileSync(join(work,'coverage/coverage-final.json'),JSON.stringify({[tier]:{
+        branchMap:{0:{loc,locations:[loc,loc]}},b:{0:scenario === 'memory index' ? [1,1] : [0,0]},
+      }}));
+      const discover = (root, env) => {
+        const coverage = scanDiffBranchCoverage(root,{base:env.DIFF_COVERAGE_BASE ?? 'HEAD'});
+        const memory = spawnSync(process.execPath,[join(root,'scripts/check-memory.mjs'),'--json'],{
+          cwd:root,env:{...env,PATH:process.env.PATH,HOME:join(root,'.fixture-home')},encoding:'utf8',timeout:10000,
+        });
+        expect(memory.error).toBeUndefined();
+        return {coverage:{status:coverage.status,total:coverage.total,exercised:coverage.exercised,ok:coverage.ok},
+          memory:{code:memory.status,output:memory.stdout.replaceAll(root,'<root>')},
+          exitCode:coverage.errors.length || memory.status ? 1 : 0};
+      };
+      const env = {...allowedEnv,...forbiddenEnv,...(scenario === 'coverage base' ? {DIFF_COVERAGE_BASE:'coverage-base'} : {})};
+      const local = discover(work,env);
+      expect(local.exitCode,scenario).toBe(1);
+      f.exec = vi.fn(async call => {
+        if (call.file === 'git') return remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}});
+        if (call.file === 'rsync') {
+          if(scenario==='tracked skills') {
+            expect(readFileSync(join(call.cwd,'.claude/skills/example/SKILL.md'),'utf8')).toBe('# Skill\n');
+            expect((await filesystem.lstat(join(call.cwd,'.claude/skills'))).isDirectory()).toBe(true);
+          }
+          cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
+        }
+        if (isRun(call)) {
+          const request = JSON.parse(call.input);
+          await forgeManifestAPI.verifyManifest(snapshot,request.manifest,request.manifestDigest);
+          expect(await digestInput(snapshot)).toBe(request.inputDigest);
+          // Supply Git evidence only. Do not seed any gate input in the remote tree.
+          cpSync(join(work,'.git'),join(snapshot,'.git'),{recursive:true});
+          expect(request.env).toEqual(filterEnv({...env,...(scenario === 'coverage base' ? {DIFF_COVERAGE_BASE:base} : {})}));
+          observed = discover(snapshot,request.env);
+          const result = await original(call);
+          return {...result,code:observed.exitCode};
+        }
+        return original(call);
+      });
+      expect(await runRemote({...f,cwd:work,listFiles:undefined,env,argv:['npm','run','check:standards']}),scenario)
+        .toEqual({mode:'remote',code:local.exitCode});
+      expect(observed,scenario).toEqual(local);
+    }
+  }, 30000);
+
+  it.each(['untracked', 'wrong target', 'changed index bytes', 'linked parent', 'linked target', 'missing index'])
+  ('refuses an unsafe or incomplete memory bridge: %s', async fault => {
+    mkdirSync(join(cwd,'.claude')); mkdirSync(join(cwd,'agent-memory-src'));
+    writeFileSync(join(cwd,'agent-memory-src/MEMORY.md'),'# Memory\n');
+    const target = fault === 'wrong target' ? '../private' : '../agent-memory-src';
+    symlinkSync(target,join(cwd,'.claude/agent-memory'));
+    let oid = createHash('sha1').update(`blob ${target.length}\0${target}`).digest('hex');
+    if (fault === 'changed index bytes') oid = 'a'.repeat(40);
+    if (fault === 'linked parent') {
+      renameSync(join(cwd,'.claude'),join(cwd,'private'));
+      symlinkSync('private',join(cwd,'.claude'));
+    }
+    if (fault === 'linked target') {
+      renameSync(join(cwd,'agent-memory-src'),join(cwd,'private'));
+      symlinkSync('private',join(cwd,'agent-memory-src'));
+    }
+    if (fault === 'missing index') rmSync(join(cwd,'agent-memory-src/MEMORY.md'));
+    const exec = async call => bindingEvidence(call)??({code:0,stdout:call.args.includes('--stage')
+      ? Buffer.from(`${fault === 'untracked' ? '' : `120000 ${oid} 0\t.claude/agent-memory\0`}100644 ${'b'.repeat(40)} 0\tagent-memory-src/MEMORY.md\0`)
+      : Buffer.alloc(0)});
+    const build = () => remoteManifestAPI.buildManifest({cwd,exec,listFiles:async()=>['.claude/agent-memory','agent-memory-src/MEMORY.md']});
+    if (fault === 'missing index') await expect(build()).rejects.toThrow();
+    else await expect(build()).rejects.toMatchObject({
+      code:'unshipped-symlink',message:'unshipped-symlink: use local fallback',
+      detail:fault === 'linked parent' ? '.claude' : fault === 'linked target' ? 'agent-memory-src' : '.claude/agent-memory',
+    });
+  });
+
+  it.each(['stdout','stderr'])('observes real streamed %s while retaining inherited output', async stream => {
+    const output = vi.spyOn(process[stream],'write').mockImplementation(()=>true);
+    const chunks = [];
+    try {
+      expect(await remoteManifestAPI.defaultExec({file:process.execPath,
+        args:['-e',`process.${stream}.write('skipping input')`],cwd,inherit:true,
+        onOutput:(chunk,source)=>chunks.push({chunk:String(chunk),source}),
+      })).toMatchObject({code:0});
+      expect(chunks.map(item=>item.chunk).join('')).toBe('skipping input');
+      expect(chunks.every(item=>item.source===stream)).toBe(true);
+      expect(output).toHaveBeenCalled();
+    } finally { output.mockRestore(); }
+  });
+
+  it.each(['skipping', 'no-scope', 'ENOENT', 'no changed tier lines; nothing to attribute'])
+  ('falls back through local admission after confirmed standards completion reports %s', async outcome => {
+    const f = fixture(), original = f.exec;
+    f.argv = ['npm','run','check:standards'];
+    f.exec = vi.fn(async call => {
+      const result = await original(call);
+      if (isRun(call)) {
+        // Exercise streaming detection across chunk boundaries, not a seeded result file.
+        call.onOutput?.(outcome.slice(0,3),'stdout');
+        call.onOutput?.(outcome.slice(3),'stdout');
+      }
+      return result;
+    });
+    const log = vi.fn();
+    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async () => {
+        const result = await runRemote(f);
+        expect(result).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
+        expect(callsOf(f.exec).filter(isReceipt)).toHaveLength(1);
+        return result;
+      },
+    })).toEqual({handled:false});
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+  });
+
+  it.each(['skipping', 'no-scope', 'ENOENT'])('refuses captured standards %s on stderr after bounded streaming history', async outcome => {
+    const f = fixture(), original = f.exec;
+    f.argv = ['npm','run','check:standards'];
+    f.exec = vi.fn(async call => {
+      const result = await original(call);
+      if (isRun(call)) {
+        call.onOutput?.('x'.repeat(4*1024*1024),'stdout');
+        return {...result,stderr:outcome};
+      }
+      return result;
+    });
+    expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
+  });
+
+  it('keeps skipped standards unconfirmed when the completion receipt is invalid', async () => {
+    const f = fixture({receipt:'untrusted completion'}), original = f.exec;
+    f.argv = ['npm','run','check:standards'];
+    f.exec = vi.fn(async call => ({...await original(call),...(isRun(call) ? {stdout:'skipping'} : {})}));
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+});
+
 describe('filterEnv', () => {
+  it.each(['HEAD', 'origin/main', 'refs/heads/fix.v1', 'a'.repeat(40)])('accepts safe coverage base %s for local commit resolution', base => {
+    const env = filterEnv({DIFF_COVERAGE_BASE:base});
+    expect(env).toEqual({DIFF_COVERAGE_BASE:base});
+    expect(forgeManifestAPI.allowedEnv(env)).toBe(true);
+  });
+  it.each([{code:128,stdout:''},{code:0,stdout:'main'},{code:0,stdout:'a'.repeat(40)+'\nextra'},new Error('unreadable ref')])
+  ('refuses unresolved or invalid coverage base commit evidence before prepare: %j', async evidence => {
+    const f=fixture(),original=f.exec;
+    f.env.DIFF_COVERAGE_BASE='main';
+    f.exec=vi.fn(async call=>{
+      if(call.file==='git'&&call.args.includes('--end-of-options')) {
+        expect(gitArgs(call)).toEqual(['rev-parse','--verify','--end-of-options','main^{commit}']);
+        if(evidence instanceof Error)throw evidence;
+        return evidence;
+      }
+      return original(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'diff-coverage-base-unavailable'});
+    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
+  });
+  it.each(['', '-HEAD', 'HEAD..main', 'main branch', 'HEAD\n', 'HEAD\0', 'HEAD\t', '$(id)', 'HEAD;id', 'HEAD~1', 'main//branch', '.hidden', 'branch.lock', 'main/', 123])
+  ('refuses invalid coverage base with a local fallback reason before forwarding: %j', async base => {
+    const env = {DIFF_COVERAGE_BASE:base};
+    expect(() => filterEnv(env)).toThrow('Invalid DIFF_COVERAGE_BASE: use local fallback');
+    expect(forgeManifestAPI.allowedEnv(env)).toBe(false);
+    const f = fixture();
+    expect(await runRemote({...f,env})).toEqual({mode:'not-started', terminated:true,reason:'invalid-diff-coverage-base'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
   it('keeps exactly the allowlist and drops secret names, HOME, PATH, and unknown names', () => {
     const env = { ...allowedEnv, ...forbiddenEnv };
     expect(filterEnv(env)).toEqual(allowedEnv);
@@ -622,7 +831,7 @@ describe('runRemote', () => {
     f.argv = ['npm', 'run', 'check:standards', '--', '--unknown'];
     const stage = vi.fn(filesystem.mkdtemp);
     const options = {...f, fs:{...filesystem, mkdtemp:stage}};
-    expect(await runRemote(options)).toEqual({mode:'fallback', reason:'command-not-allowed'});
+    expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed'});
     const log = vi.fn();
     const decision = await runWithRemoteDecision({
       ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
@@ -665,9 +874,9 @@ describe('runRemote', () => {
   it('refuses a Mac HEAD change during snapshot construction before prepare or transport',async()=>{
     const f=fixture(),execute=f.exec;let reads=0;
     f.argv=['npm','run','check:standards'];
-    f.exec=vi.fn(async call=>call.file==='git'&&call.args.join(' ')==='rev-parse HEAD'
+    f.exec=vi.fn(async call=>call.file==='git'&&gitArgs(call).join(' ')==='rev-parse HEAD'
       ?{code:0,stdout:Buffer.from((++reads===1?'a':'b').repeat(40)+'\n')}:execute(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).some(call=>isPrepare(call)||isRun(call)||call.file==='rsync')).toBe(false);
   });
   it('preserves forge-busy from prepare without transferring bytes or asking an unknown run to finish',async()=>{
@@ -689,7 +898,7 @@ describe('runRemote', () => {
       expect(copies).toHaveLength(1);
       expect(copies[0].args).toContain('--rsync-path=sudo -u forge-exec-2 rsync');
       expect(copies[0].args.at(-1)).toMatch(/^forge:\/srv\/forge-exec\/slot-2\/r-[a-f0-9]{32}\/work\/$/);
-    }else{expect(result).toEqual({mode:'fallback',reason:'copy-failed'});expect(copies).toHaveLength(0);}
+    }else{expect(result).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});expect(copies).toHaveLength(0);}
   });
   it.each(['bound', 'wrong nonce', 'wrong run', 'malformed', 'missing started', 'started', 'unknown reason', 'extra field', 'invalid JSON'])
   ('accepts only bound pre-run protected rejection: %s', async kind => {
@@ -712,11 +921,11 @@ describe('runRemote', () => {
   it('aborts not-started before rsync when an ancestor is redirected to different bytes at staging open', async () => {
     const f = fixture();
     const source = join(cwd,'fixtures');
-    const alternate = join(cwd,'alternate');
-    mkdirSync(source); mkdirSync(alternate);
+    const alternate=realpathSync(mkdtempSync(join(process.env.TMPDIR,'alternate-source-')));auxiliary.push(alternate);
+    mkdirSync(source);
     writeFileSync(join(source,'a.test.mjs'),'fixture');
     writeFileSync(join(alternate,'a.test.mjs'),'different private bytes');
-    f.listFiles.mockResolvedValue(['fixtures/a.test.mjs','package-lock.json']);
+    f.listFiles.mockResolvedValue(['fixtures/a.test.mjs','package-lock.json','a.test.mjs']);
     let redirected = false, openedDifferentBytes = false;
     f.fs = {...filesystem, open:async (path, flags) => {
       if (Buffer.from(path).equals(Buffer.from(join(source,'a.test.mjs')))) {
@@ -813,20 +1022,15 @@ describe('runRemote', () => {
     const source = join(cwd, 'a.test.mjs');
     const fs = {...filesystem, mkdtemp:vi.fn(async prefix => {
       staging = await filesystem.mkdtemp(prefix);
+      rmSync(source);
+      if (kind === 'symlink') symlinkSync(join(cwd, 'package-lock.json'), source);
+      else if (kind === 'directory') mkdirSync(source);
+      else if (kind !== 'missing') writeFileSync(source, 'private bytes');
       return staging;
     }), open:vi.fn(async (path, flags) => {
       expect(flags & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
       if (kind === 'unreadable') throw Object.assign(new Error('unreadable'), {code:'EACCES'});
       return filesystem.open(path, flags);
-    }), readFile:vi.fn(async path => {
-      const data = await filesystem.readFile(path);
-      if (Buffer.from(path).equals(Buffer.from(join(cwd, 'package-lock.json')))) {
-        rmSync(source);
-        if (kind === 'symlink') symlinkSync(join(cwd, 'package-lock.json'), source);
-        else if (kind === 'directory') mkdirSync(source);
-        else if (kind !== 'missing') writeFileSync(source, 'private bytes');
-      }
-      return data;
     })};
     expect(await runRemote({...f, fs})).toEqual({mode:'not-started', terminated:true, reason:'snapshot-staging-failed'});
     expect(callsOf(f.exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
@@ -901,8 +1105,8 @@ describe('runRemote', () => {
     const f = fixture();
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
-      ? remoteManifestAPI.defaultExec(call) : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ignored-test-file'});
+      ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file'});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it.each([
@@ -927,13 +1131,13 @@ describe('runRemote', () => {
         return {code:0, stdout:Buffer.from(name+'\0')};
       }
       // Model check-ignore evidence from a whole-directory rule (including info/exclude).
-      if (call.file === 'git' && call.args[0] === 'check-ignore') {
+      if (call.file === 'git' && gitArgs(call)[0] === 'check-ignore') {
         return {code:0, stdout:call.input};
       }
       return exec(call);
     });
     await expect(remoteManifestAPI.buildManifest(f)).rejects.toMatchObject({code:'ignored-test-file'});
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file'});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
@@ -946,7 +1150,7 @@ describe('runRemote', () => {
     const f = fixture();
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
-      ? remoteManifestAPI.defaultExec(call) : fake(call));
+      ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
     expect(await runRemote(f)).toEqual({mode:'remote',code:0});
   });
   it.each([
@@ -957,11 +1161,11 @@ describe('runRemote', () => {
     const f = fixture();
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i') ? result : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
   });
 
-  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('preserves both real standards guards at exact published Mac HEAD ahead of cache base: %j', async (args) => {
+  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].flatMap(args => [[args,true],[args,false]]))('full-ships absolute-path coverage and resolves local main behind HEAD to preserve remote guard parity: %j (dirty: %s)', async (args, dirty) => {
     const f = fixture({runCode:1}),original=f.exec;
     const git=(...args)=>{
       const result=spawnSync('git',args,{cwd,encoding:'utf8',timeout:10000});
@@ -970,12 +1174,14 @@ describe('runRemote', () => {
     git('init','-b','main');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid');
     const tier='scripts/lib/disposition-judge.mjs';
     mkdirSync(join(cwd,'scripts/lib'),{recursive:true});
+    writeFileSync(join(cwd,'.gitignore'),'coverage/\n');
     writeFileSync(join(cwd,tier),'export const changed = false;\n');
     git('add','.');git('commit','-m','public base');
     const base=git('rev-parse','HEAD'),baseRoot=join(cwd,'forge-base'),snapshot=join(cwd,'forge-work');
     mkdirSync(baseRoot);mkdirSync(snapshot);
     git('clone','--bare','.',join(baseRoot,'repo.git'));
     git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',base);
+    git('checkout','--detach',base); // Local main stays behind the published HEAD.
     writeFileSync(join(cwd,tier),'export const changed = true;\n');
     git('add',tier);git('commit','-m','published Mac change');
     const head=git('rev-parse','HEAD');
@@ -983,37 +1189,102 @@ describe('runRemote', () => {
     rmSync(join(baseRoot,'repo.git'),{recursive:true});
     git('clone','--bare','.',join(baseRoot,'repo.git'));
     git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',head);
-    writeFileSync(join(cwd,tier),'export const changed = 2;\n');
-    const localCoverage=scanMaterializedGuards(cwd).coverage;
-    expect(localCoverage.status).toBe('fail');
+    git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/heads/main',head);
+    const warm=forgeManifestAPI.manifestWire(await remoteManifestAPI.buildManifest({cwd,exec:remoteManifestAPI.defaultExec,listFiles:async()=>['a.test.mjs','package-lock.json',tier]}));
+    const warmDigest=forgeManifestAPI.digestManifest(warm);
+    if (dirty) writeFileSync(join(cwd,tier),'export const changed = 2;\n');
+    mkdirSync(join(cwd,'coverage'));
+    const loc={start:{line:1,column:0},end:{line:1,column:40}};
+    const entry={branchMap:{0:{loc,locations:[loc,loc]}},b:{0:[0,0]}};
+    const report=JSON.stringify({[join(cwd,tier)]:entry});
+    const portableReport=JSON.stringify({[tier]:entry});
+    writeFileSync(join(cwd,'coverage/coverage-final.json'),report);
+    // Equal source/report mtimes are fresh. This fractional value loses another
+    // microsecond if the portable rewrite restores the already-staged timestamp.
+    const stamp = 1700000000 + 123406 / 1e6;
+    for (const name of [tier,'coverage/coverage-final.json']) utimesSync(join(cwd,name),stamp,stamp);
+    writeFileSync(join(cwd,'coverage/private.json'),'must not ship');
+    f.env.DIFF_COVERAGE_BASE='main';
+    expect(git('rev-parse','main')).toBe(base);
+    const localCoverage=scanDiffBranchCoverage(cwd,{base});
+    expect(scanDiffBranchCoverage(cwd,{base:'main'})).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    expect(localCoverage).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    if (!dirty) expect(scanMaterializedGuards(cwd).coverage.status).toBe('no-scope');
     const artifacts=['reports/new.md','src/_data/researchTopics/new.json','src/_includes/research-descriptions/new.njk'];
     for(const name of artifacts){mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'new artifact');}
     f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',tier,...artifacts]);
     let observed;
     f.exec=vi.fn(async call=>{
-      if(call.file==='git')return remoteManifestAPI.defaultExec(call);
-      if(call.file==='rsync')cpSync(call.cwd,snapshot,{recursive:true});
+      if(call.file==='git')return remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}});
+      if(call.file==='ssh'&&sshText(call).endsWith(' bases'))return {code:0,stdout:JSON.stringify({delta:1,bases:[{sha:head,manifestDigest:warmDigest}]})};
+      if(call.file==='ssh'&&sshText(call).endsWith(' base-manifest'))return {code:0,stdout:JSON.stringify(warm)};
+      if(call.file==='rsync'){
+        // Check before cpSync's Date-based timestamp preservation loses precision.
+        expect(statSync(join(call.cwd,'coverage/coverage-final.json'),{bigint:true}).mtimeNs)
+          .toBe(statSync(join(call.cwd,tier),{bigint:true}).mtimeNs);
+        cpSync(call.cwd,snapshot,{recursive:true,preserveTimestamps:true});
+      }
       if(isRun(call)){
         const request=JSON.parse(call.input);
+        expect(forgeManifestAPI.allowedEnv(request.env)).toBe(true);
+        expect(request.env.DIFF_COVERAGE_BASE).toBe(base);
+        expect(request.manifest.git.diffCoverageBase).toBe(base);
+        expect(request.manifestDigest).toBe(forgeManifestAPI.digestManifest(request.manifest));
+        expect(request.inputDigest).toBe(await digestInput(snapshot));
+        expect(request.baseSha).toBeUndefined();
+        const entries=forgeManifestAPI.splitPaths(Buffer.from(request.manifest.paths,'base64'));
+        const coverageIndex=entries.findIndex(path=>path.equals(Buffer.from('coverage/coverage-final.json')));
+        expect(coverageIndex).toBeGreaterThanOrEqual(0);
+        expect(request.manifest.hashes[coverageIndex]).toBe(createHash('sha256').update(portableReport).digest('hex'));
+        expect(request.manifest.tracked[coverageIndex]).toBe(false);
+        expect(readFileSync(join(snapshot,'coverage/coverage-final.json'),'utf8')).toBe(portableReport);
+        expect(readFileSync(join(cwd,'coverage/coverage-final.json'),'utf8')).toBe(report);
+        expect(statSync(join(snapshot,'coverage/coverage-final.json')).mtimeMs).toBeCloseTo(statSync(join(cwd,'coverage/coverage-final.json')).mtimeMs,0);
+        expect(existsSync(join(snapshot,'coverage/private.json'))).toBe(false);
         await materializeWorktree({work:snapshot,root:baseRoot,head:request.manifest.git.head,
           manifest:request.manifest,manifestDigest:request.manifestDigest,exec:cachedPublicGitExec});
-        mkdirSync(join(snapshot,'coverage'));
-        const loc={start:{line:1,column:0},end:{line:1,column:40}};
-        writeFileSync(join(snapshot,'coverage/coverage-final.json'),JSON.stringify({[tier]:{branchMap:{0:{loc,locations:[loc,loc]}},b:{0:[0,0]}}}));
         observed=scanMaterializedGuards(snapshot);
+        observed.coverage=scanDiffBranchCoverage(snapshot,{base:request.env.DIFF_COVERAGE_BASE});
       }
       return original(call);
     });
     f.argv = ['npm','run','check:standards',...args];
     expect(await runRemote(f)).toEqual({mode:'remote',code:1});
     expect(observed.coverage).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    expect(observed.coverage).toEqual(localCoverage);
     expect(observed.artifacts.errors.map(e=>e.descriptor.file)).toEqual(['reports','src/_data/researchTopics','src/_includes/research-descriptions']);
     expect(spawnSync('git',['rev-parse','HEAD'],{cwd:snapshot,encoding:'utf8'}).stdout.trim()).toBe(head);
     expect(spawnSync('git',['merge-base','--is-ancestor','HEAD','origin/main'],{cwd:snapshot}).status).toBe(0);
     expect(callsOf(f.exec).some(isPrepare)).toBe(true);
+    expect(callsOf(f.exec).some(call=>call.file==='ssh'&&sshText(call).endsWith(' base-manifest'))).toBe(true);
     expect(JSON.parse(callsOf(f.exec).find(isRun).input).manifest.git.head).toBe(head);
     expect(JSON.stringify(callsOf(f.exec))).not.toContain('verify-marker');
     expect(f.local).not.toHaveBeenCalled();
+    // This integration fixture clones and materializes real Git worktrees, with
+    // individual Git calls bounded at 10s. Use the parity test's aggregate budget.
+  }, 30000);
+  it.each(['invalid JSON','array','outside cwd','sibling prefix','Windows absolute','collision'])
+  ('falls back before transfer for a non-portable coverage report: %s',async fault=>{
+    const f=fixture();
+    const reports={
+      'invalid JSON':'{',array:'[]',
+      'outside cwd':JSON.stringify({[join(cwd,'../elsewhere/file.mjs')]:{}}),
+      'sibling prefix':JSON.stringify({[cwd+'-other/file.mjs']:{}}),
+      'Windows absolute':JSON.stringify({'C:\\other\\file.mjs':{}}),
+      collision:JSON.stringify({[join(cwd,'file.mjs')]:{},'file.mjs':{}}),
+    };
+    mkdirSync(join(cwd,'coverage'));
+    writeFileSync(join(cwd,'coverage/coverage-final.json'),reports[fault]);
+    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json','coverage/coverage-final.json']);
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'coverage-report-not-portable'});
+    expect(callsOf(f.exec).some(call=>isPrepare(call)||call.file==='rsync'||isRun(call))).toBe(false);
+  });
+  it('uses the protected coverage-base rejection as a safe local fallback',async()=>{
+    const f=fixture({receipt:(_nonce,_value,state)=>JSON.stringify({v:1,nonce:state.nonce,run:state.run,
+      phase:'rejected',reason:'diff-coverage-base-unavailable',siblings:false,started:false})});
+    f.argv=['npm','run','check:standards'];
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'diff-coverage-base-unavailable'});
+    expect(callsOf(f.exec).filter(isRun)).toHaveLength(1);
   });
   it.each([undefined,1])('requires exact-HEAD worktree capability before transferring a standards snapshot to an old runner (version=%s)',async version=>{
     const f=fixture(),original=f.exec;
@@ -1033,8 +1304,8 @@ describe('runRemote', () => {
   });
   it.each([{code:1,stdout:''},{code:0,stdout:''},{code:0,stdout:'invalid-head'}])('refuses standards before prepare when logical HEAD evidence is unavailable: %j',async evidence=>{
     const f=fixture(),original=f.exec;f.argv=['npm','run','check:standards'];
-    f.exec=vi.fn(call=>call.file==='git'&&call.args.join(' ')==='rev-parse HEAD'?evidence:original(call));
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    f.exec=vi.fn(call=>call.file==='git'&&gitArgs(call).join(' ')==='rev-parse HEAD'?evidence:original(call));
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'copy-failed'});
     expect(callsOf(f.exec).some(c=>isPrepare(c)||c.file==='rsync'||isRun(c))).toBe(false);
   });
   it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('refuses local rerun for an unbound receipt %j', async (receipt) => {
@@ -1090,19 +1361,19 @@ describe('runRemote', () => {
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'build'] }))
-      .toEqual({ mode: 'fallback', reason: 'command-not-allowed' });
+      .toEqual({ mode: 'not-started', terminated:true, reason: 'command-not-allowed' });
     expect(f.exec).not.toHaveBeenCalled();
     expect(f.local).not.toHaveBeenCalled();
   });
   it('falls back when the forge probe fails, without copying or running', async () => {
     const f = fixture({ probeCode: 255 });
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'forge-unreachable' });
+    expect(await runRemote(f)).toEqual({ mode: 'not-started', terminated:true, reason: 'forge-unreachable' });
     expect(callsOf(f.exec)).toContainEqual(expect.objectContaining({ file: 'ssh', args: ['forge', 'true'] }));
     expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it('reports copy-failed and attempts cleanup after an unsuccessful rsync', async () => {
     const f = fixture({ copyCode: 23 });
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'copy-failed' });
+    expect(await runRemote(f)).toEqual({ mode: 'not-started', terminated:true, reason: 'copy-failed' });
     expect(callsOf(f.exec).some(isRun)).toBe(false);
     expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
     expect(JSON.parse(callsOf(f.exec).find(isCleanup).input).run).toMatch(/^r-/);
@@ -1140,7 +1411,7 @@ describe('runRemote', () => {
     const f = fixture();
     mkdirSync(join(cwd,'src'));
     writeFileSync(join(cwd,'src/a file.mjs'),'fixture');
-    f.listFiles.mockResolvedValue(['package-lock.json', 'src/a file.mjs', 'node_modules/secret.js', 'src/node_modules/nested.js', '.exit-code', 'src/.exit-code', '.exit-code/forged']);
+    f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', 'src/a file.mjs', 'node_modules/secret.js', 'src/node_modules/nested.js', '.exit-code', 'src/.exit-code', '.exit-code/forged']);
     await runRemote({ ...f, host: 'custom-forge' });
     expect(f.listFiles).toHaveBeenCalledWith(cwd);
     const calls = callsOf(f.exec);
@@ -1157,7 +1428,7 @@ describe('runRemote', () => {
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
     expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs prepare');
     const input = copy.input.toString('latin1');
-    expect(input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
+    expect(input.split('\0')).toEqual(['./a.test.mjs', './package-lock.json', './src/a file.mjs', '']);
     expect(copy.args.join(' ')).toMatch(/--rsync-path(?:=|\s)sudo -u forge-exec rsync/);
     expect(copy.args.join(' ')).toMatch(/custom-forge:\/srv\/forge-exec\/r-[a-f0-9]+\/work\//);
     expect(input).toContain('package-lock.json');
@@ -1243,6 +1514,14 @@ describe('explicit remote CLI decision', () => {
     expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
     expect(local).toHaveBeenCalledTimes(1);
     expect(local).toHaveBeenCalledWith(argv);
+  });
+  it('returns the local exit code after an ignored-test-file prelaunch refusal', async () => {
+    const remoteExec = vi.fn(async () => ({mode:'not-started', terminated:true, reason:'ignored-test-file'}));
+    const local = vi.fn(async () => 7), log = vi.fn();
+    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log})).toBe(7);
+    expect(remoteExec).toHaveBeenCalledTimes(1);
+    expect(local).toHaveBeenCalledWith(argv);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ignored-test-file'));
   });
 });
 
@@ -1392,6 +1671,19 @@ original_fstat = os.fstat`);
 });
 
 describe('receipt field binding', () => {
+  it.each([
+    {memoryPeakBytes:200,cpuUsec:30,oomKills:0,slotCpus:8},
+    {memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8},
+  ])('accepts additive resource measurements %j',async resources=>{
+    expect(await runRemote(fixture({receipt:(_n,v)=>JSON.stringify({...v,resources})}))).toEqual({mode:'remote',code:0});
+  });
+  it.each([{},null,{memoryPeakBytes:-1,cpuUsec:0,oomKills:0,slotCpus:8},
+    {memoryPeakBytes:0,cpuUsec:0,oomKills:0,slotCpus:0},
+    {memoryPeakBytes:0,cpuUsec:0,oomKills:0,slotCpus:8,extra:true},
+  ])('rejects malformed additive resource evidence %j',async resources=>{
+    expect(await runRemote(fixture({receipt:(_n,v)=>JSON.stringify({...v,resources})}))).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
   function expectValidReceipt(value) {
     const {phase,code,...expected} = value;
     expect(phase).toBe('test');
@@ -1447,12 +1739,46 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
     return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
   }
+  it.each(['inventory','walk'])('carries a relative, lossy UTF-8, single-line path in an unshipped symlink refusal from %s', async site => {
+    // LF/CR are unsafe manifest bytes; exercise detail sanitization with allowed
+    // controls so inventory reaches the symlink refusal instead of path rejection.
+    const path=Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('\t\x1b\x7fé\u2028.txt')]);
+    expect(forgeManifestAPI.pathParts(path)).toEqual([path]);
+    const fs={
+      lstat:async absolute=>Buffer.from(absolute).equals(Buffer.from(cwd))
+        ? filesystem.lstat(cwd) : {isSymbolicLink:()=>true},
+      readdir:async()=>[path],
+    };
+    await expect(build({cwd,fs,exec:gitInventory(site === 'inventory' ? [path] : [])})).rejects.toMatchObject({
+      code:'unshipped-symlink',message:'unshipped-symlink: use local fallback',detail:'raw-�???é?.txt',
+    });
+  });
+  it.each(['\n','\r'])('rejects %j in a lossy UTF-8 inventory path before filesystem inspection', async control => {
+    const path=Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from(`${control}.txt`)]);
+    const fs={lstat:vi.fn(),readdir:vi.fn()};
+    await expect(build({cwd,fs,exec:gitInventory([path])})).rejects.toThrow('Unsafe manifest path');
+    expect(fs.lstat).not.toHaveBeenCalled();
+    expect(fs.readdir).not.toHaveBeenCalled();
+  });
+  it.each(['parent','leaf'])('rejects an allowlisted ignored coverage input with a %s symlink', async kind => {
+    const outside=join(cwd,'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside,'coverage-final.json'),'private bytes');
+    if(kind==='parent')symlinkSync(outside,join(cwd,'coverage'));
+    else {
+      mkdirSync(join(cwd,'coverage'));
+      symlinkSync(join(outside,'coverage-final.json'),join(cwd,'coverage/coverage-final.json'));
+    }
+    const exec=vi.fn(async call=>bindingEvidence(call)??({code:0,stdout:call.args.includes('-i')?Buffer.from('coverage/coverage-final.json\0'):Buffer.alloc(0)}));
+    await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+  });
   function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
     return vi.fn(async call => {
       expect(call.file).toBe('git');
+      const binding=bindingEvidence(call);if(binding)return binding;
       expect(call.args).toContain('-z');
-      if (call.args[0] === 'ls-tree') {
-        expect(call.args).toEqual(['ls-tree', '-r', '-z', 'origin/main']);
+      if (gitArgs(call)[0] === 'ls-tree') {
+        expect(gitArgs(call)).toEqual(['ls-tree', '-r', '-z', 'origin/main']);
         if (tree instanceof Error) throw tree;
         return tree;
       }
@@ -1464,7 +1790,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   function acceptingTransport(paths, stage = Buffer.alloc(0)) {
     let state;
     return vi.fn(async call => {
-      if (call.file === 'git') return {code:0, stdout:call.args.includes('-i') ? Buffer.alloc(0) : call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
+      if (call.file === 'git') return bindingEvidence(call)??{code:0, stdout:call.args.includes('-i') ? Buffer.alloc(0) : call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
       if (isPrepare(call)) {
         state = JSON.parse(call.input);
         return {code:0, stdout:JSON.stringify({run:'r-'+state.nonce})};
@@ -1563,6 +1889,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     'cert.pem', 'cert.key', 'cert.p12', 'cert.pfx', 'cert.jks', 'cert.keystore',
     'secrets.json', 'tokens.json', 'creds.json', 'credential.json', 'passwd.txt',
     'password.txt', 'oauth.json', 'apikey.json', 'api-key.json', 'ACCESS_TOKEN.json',
+    'api_key.json', 'API_KEY.json', 'api key.json', 'api.key.json',
     'secréts.json', 'tóken.json', 'créds.json', 'íd_backup', 'cert.pém', 'nested/sécrets/hosts.yml',
     '.netrc', '.npmrc', '.env', '.env.production',
   ])('excludes credential class path %s from entries and rsync inventory', async name => {
@@ -1627,7 +1954,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
   it.each([
-    '.claude/skills/x/SKILL.md', '.githooks/pre-commit.js', '.eleventy.js',
+    '.claude/skills/x/SKILL.md', '.eleventy.js',
     '.claude/secrets.md', '.secret.js', 'secret-directory/.hidden.md',
     'private.key/safe.md', 'secret.key/safe.js', '.env.local.js',
     '.netrc/safe.md', '.npmrc/safe.js',
@@ -1640,11 +1967,20 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const manifest = await build({cwd, exec:inventory});
     expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
     expect(manifest.excluded).toEqual([Buffer.from(name)]);
-    expect(callsOf(inventory).some(call => call.args[0] === 'ls-tree')).toBe(false);
+    expect(callsOf(inventory).some(call => gitArgs(call)[0] === 'ls-tree')).toBe(false);
     const exec = acceptingTransport(paths, stage);
     expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it('keeps .githooks in the remote snapshot so remote check:standards sees hook files', async () => {
+    const name = '.githooks/pre-commit';
+    mkdirSync(join(cwd, '.githooks'), {recursive:true});
+    writeFileSync(join(cwd, name), '#!/bin/sh\n');
+    const manifest = await build({cwd, exec:gitInventory(['package-lock.json', name].map(value => Buffer.from(value)))});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain(name);
+    expect(manifest.excluded.map(entry => entry.toString())).not.toContain(name);
   });
 
   it.each(['.claude/skills/x/SKILL.test.md', '.eleventy.test.js', '.claude/secrets.test.js', 'private.key/safe.test.js'])
@@ -1672,6 +2008,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
 
   it('keeps tracked credential JSON excluded from entries', async () => {
+    writeFileSync(join(cwd,'secret-example.json'),'private');
     const paths = [Buffer.from('secret-example.json')];
     const stage = Buffer.from(`100644 ${'a'.repeat(40)} 0\tsecret-example.json\0`);
     const manifest = await build({cwd, exec:gitInventory(paths, stage)});
@@ -1689,7 +2026,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const manifest = await build({cwd, exec});
     expect(manifest.entries.map(entry => entry.path.toString())).toEqual(names);
     expect(manifest.excluded).toEqual([]);
-    expect(callsOf(exec).filter(call => call.args[0] === 'ls-tree')).toHaveLength(1);
+    expect(callsOf(exec).filter(call => gitArgs(call)[0] === 'ls-tree')).toHaveLength(1);
   });
 
   it.each(['modified', 'untracked', 'new', 'staged-different'])
@@ -1715,12 +2052,13 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 
   it.each(['secrets.json', 'credentials.yaml', 'secret.pem', 'credentials', '.secrets/safe.md', 'secret.key/safe.md'])
   ('keeps public tracked non-source or forbidden-component path %s excluded', async name => {
+    mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'public');
     const paths = [Buffer.from(name)];
     const exec = gitInventory(paths, indexRecord(name, 'public'), {code:0, stdout:treeRecord(name, 'public')});
     const manifest = await build({cwd, exec});
     expect(manifest.entries).toEqual([]);
     expect(manifest.excluded).toEqual(paths);
-    expect(callsOf(exec).some(call => call.args[0] === 'ls-tree')).toBe(false);
+    expect(callsOf(exec).some(call => gitArgs(call)[0] === 'ls-tree')).toBe(false);
   });
 
   it.each(['.github/workflows/ci.yml','.husky/pre-commit','.vscode/settings.json','.storybook/main.ts','.changeset/change.md',
@@ -1747,7 +2085,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toThrow('Input digest mismatch: undecodable test name');
     const f = fixture();
     f.listFiles.mockResolvedValue([path]);
-    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'copy-failed'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'copy-failed'});
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
     expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
@@ -1762,6 +2100,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const path = Buffer.concat([Buffer.from('raw-'), Buffer.from([0xff]), Buffer.from('.txt')]);
     const data = Buffer.from('raw test content');
     const fs = {
+      readdir:async()=>[path],
       lstat:vi.fn(async value => ({isDirectory:()=>Buffer.from(value).equals(Buffer.from(cwd)),
         isFile:()=>!Buffer.from(value).equals(Buffer.from(cwd)), isSymbolicLink:()=>false, mode:0o100755})),
       readFile:vi.fn(async value => {
@@ -1844,7 +2183,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       return transport(call);
     });
     const result = await runRemote({argv, cwd, runId, exec});
-    if (result.mode === 'fallback') {
+    if (result.mode === 'not-started') {
       expect(['copy-failed','gitlink-unsupported']).toContain(result.reason);
       expect(callsOf(exec).some(isRun)).toBe(false);
     } else {
@@ -1911,6 +2250,33 @@ describe('allowlisted sibling snapshots', () => {
     return f;
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
+
+  it('ships sibling snapshots for the real repository Vitest shared config', async () => {
+    const f = siblingsFixture();
+    const config = readFileSync(new URL('../../../vitest.shared.ts', import.meta.url), 'utf8');
+    writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles});
+    expect(manifest.siblings.frontierui.sha).toBe(git('rev-parse', 'HEAD'));
+    expect(manifest.siblings.frontierui.entries.map(entry => entry.path.toString())).toEqual([
+      'plugs/index.js', 'webtheme/index.js', 'webtheme/sub/dir/x.md',
+    ]);
+  });
+
+  it('counts exact staged primary and sibling payload bytes, excluding private leaves',async()=>{
+    const f=siblingsFixture();
+    const primary=['a.test.mjs','package-lock.json','vitest.shared.ts'];
+    const siblingFiles=['plugs/index.js','webtheme/index.js','webtheme/sub/dir/x.md'];
+    // Read independently named fixture inputs, never the manifest or timing total.
+    const bytes=[...primary.map(name=>readFileSync(join(f.cwd,name))),
+      ...siblingFiles.map(name=>readFileSync(join(sibling,name)))].reduce((sum,data)=>sum+data.length,0);
+    const result=await timedRunRemote(f);
+    expect(result).toMatchObject({mode:'remote',code:0});
+    expect(result.timings.find(stage=>stage.stage==='rsync')).toMatchObject({
+      shipMode:'full',fileCount:6,bytesSent:bytes,deltaFileCount:0,deltaBytes:0});
+    const copies=callsOf(f.exec).filter(call=>call.file==='rsync');
+    expect(copies).toHaveLength(2);
+    expect(copies[1].input.toString()).not.toContain('credentials.txt');
+  });
 
   it('allows implied directories for both rsync calls and anchors nested inventory paths', async () => {
     const f = siblingsFixture();
@@ -2072,7 +2438,7 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
   });
   it('refuses an oversized sibling inventory before staging or transmission with local fallback', async () => {
     const f=siblingsFixture(), fake=f.exec;
-    f.exec=vi.fn(async call => call.file==='git' && call.cwd===sibling && call.args[0]==='ls-files' && call.args.includes('--')
+    f.exec=vi.fn(async call => call.file==='git' && call.cwd===sibling && gitArgs(call)[0]==='ls-files' && call.args.includes('--')
       ? {code:0,stdout:Buffer.alloc(4*1024*1024+1,97)} : fake(call));
     expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
     expect(callsOf(f.exec).some(call=>call.file==='rsync' || isPrepare(call) || isRun(call))).toBe(false);
@@ -2105,7 +2471,8 @@ describe('offload stage evidence', () => {
     }
     expect(result.timings.find(s=>s.stage==='forge-install').ms).toBe(12);
     expect(result.timings.find(s=>s.stage==='forge-run').ms).toBe(34);
-    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:expect.any(Number)});
+    const bytes=Buffer.byteLength('fixture')+Buffer.byteLength('{"lockfileVersion":3,"packages":{}}\n');
+    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:bytes});
   });
   it('formats winter timestamps with the Eastern standard offset even for early fallback', async () => {
     const result=await timedRunRemote({argv:[],clock:()=>Date.parse('2026-01-01T12:00:00Z')});
@@ -2147,26 +2514,28 @@ it('includes an attempted manifest stage on failure and measures old-runner wall
 describe('overlapped Forge discovery',()=>{
   it('starts reachability, HEAD and bases together before consuming failures',async()=>{
     const f=fixture(),pending=new Map();
-    const exec=vi.fn(call=>new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
-    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec});
+    const exec=vi.fn(call=>bindingEvidence(call)??new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
+    const bound=await remoteManifestAPI.bindGit({cwd,env:f.env,exec});
+    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec:bound});
     await new Promise(resolve=>setImmediate(resolve));
     expect([...pending.keys()].sort()).toEqual(['bases','head','probe']);
     pending.get('probe').resolve({code:0});
     pending.get('head').reject(new Error('HEAD unavailable'));
     pending.get('bases').reject(new Error('bases unavailable'));
-    expect((await result).mode).toBe('fallback');
-    expect(exec).toHaveBeenCalledTimes(3);
+    expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-unreachable'});
+    expect(exec.mock.calls.filter(([call])=>!call.args.includes('--show-toplevel'))).toHaveLength(3);
   });
   it.each(['nonzero','rejection'])('drains in-flight failures before unreachable fallback (%s)',async fault=>{
     const f=fixture(),pending=new Map();let settled=false;
-    const exec=vi.fn(call=>new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
-    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec}).then(value=>{settled=true;return value;});
+    const exec=vi.fn(call=>bindingEvidence(call)??new Promise((resolve,reject)=>pending.set(call.file==='git'?'head':call.args.at(-1)==='true'?'probe':'bases',{resolve,reject})));
+    const bound=await remoteManifestAPI.bindGit({cwd,env:f.env,exec});
+    const result=timedRunRemote({...f,argv:['npm','run','check:standards'],exec:bound}).then(value=>{settled=true;return value;});
     await new Promise(resolve=>setImmediate(resolve));
     if(fault==='rejection')pending.get('probe').reject(new Error('unreachable'));
     else pending.get('probe').resolve({code:255});
     await new Promise(resolve=>setImmediate(resolve));expect(settled).toBe(false);
     pending.get('head').reject(new Error('local failure'));pending.get('bases').reject(new Error('remote failure'));
-    expect(await result).toMatchObject({mode:'fallback',reason:'forge-unreachable'});
-    expect(exec).toHaveBeenCalledTimes(3);
+    expect(await result).toMatchObject({mode:'not-started',terminated:true,reason:'forge-unreachable'});
+    expect(exec.mock.calls.filter(([call])=>!call.args.includes('--show-toplevel'))).toHaveLength(3);
   });
 });

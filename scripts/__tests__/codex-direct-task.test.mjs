@@ -12,8 +12,9 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync }
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
@@ -897,6 +898,25 @@ describe('runGate — none/standards/full, never commits', () => {
     expect(execFn).not.toHaveBeenCalled();
   });
 
+  it('standards gate goes through heavy-admission when the wrapper exists, direct when absent', () => {
+    const execFn = vi.fn(() => 'ok');
+    const wrapped = runGate({ dir: '/d', mode: 'standards', execFn, env: {}, existsFn: () => true });
+    expect(wrapped.steps[0].cmd).toBe('node scripts/readiness/heavy-admission.mjs run -- npm run check:standards');
+    const direct = runGate({ dir: '/d', mode: 'standards', execFn, env: {}, existsFn: () => false });
+    expect(direct.steps[0].cmd).toBe('npm run check:standards');
+    const held = runGate({ dir: '/d', mode: 'standards', execFn, env: { WE_HEAVY_ADMISSION_HELD: '1' }, existsFn: () => true });
+    expect(held.steps[0].cmd).toBe('npm run check:standards');
+  });
+
+  it('wrapped gate keeps failing, and exit 124 is gate-unconfirmed, never a pass', () => {
+    const fail = (status) => () => { throw Object.assign(new Error('x'), { status }); };
+    const r1 = runGate({ dir: '/d', mode: 'standards', execFn: fail(1), env: {}, existsFn: () => true });
+    expect(r1).toMatchObject({ pass: false });
+    expect(r1.unavailable).toBeUndefined();
+    const r124 = runGate({ dir: '/d', mode: 'standards', execFn: fail(124), env: {}, existsFn: () => true });
+    expect(r124).toMatchObject({ pass: false, unavailable: 'gate-unconfirmed' });
+  });
+
   it('mode "standards" runs only check:standards', () => {
     const execFn = vi.fn(() => 'ok');
     const r = runGate({ dir: '/d', mode: 'standards', execFn });
@@ -1048,9 +1068,9 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       expect(flagValue(seen.argv, '-o')).toBe(join(gitDir, 'codex-direct-task-last-message.txt'));
       const roots = JSON.parse(seen.argv.find((v) => v.startsWith('sandbox_workspace_write.writable_roots=')).split('=').slice(1).join('='));
       expect(roots[0]).toBe(gitDir);
-      expect(roots[2]).toBe(seen.opts.env.TMPDIR);
-      expect(statSync(roots[2]).isDirectory()).toBe(true);
-      rmSync(roots[2], { recursive: true, force: true });
+      expect(roots[3]).toBe(seen.opts.env.TMPDIR);
+      expect(statSync(roots[3]).isDirectory()).toBe(true);
+      rmSync(roots[3], { recursive: true, force: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1193,8 +1213,38 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
           expect(statSync(root).isDirectory()).toBe(true);
           expect(seen.opts.env).toMatchObject({ LANE_POOL_ROOT: env.LANE_POOL_ROOT, TMP: root, TEMP: root });
           expect(seen.argv).toContain('sandbox_workspace_write.network_access=true');
-          expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), root])}`);
+          expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), join(env.LANE_POOL_ROOT, '.admission', 'remote'), root])}`);
           expect(seen.argv).toContain(`shell_environment_policy.set.TMPDIR=${JSON.stringify(root)}`);
+        }
+      }
+    } finally {
+      for (const root of allocated) rmSync(root, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('R295 lets edit runs reach the remote admission root heavy-admission derives, never review runs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-codex-remote-admission-test-'));
+    weCheckout(dir);
+    const env = { ...process.env, LANE_POOL_ROOT: join(dir, 'pool') };
+    const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'metadata') : args.includes('rev-parse') ? 'sha' : '';
+    const heavyRoot = admissionLockRoot(dir, env);
+    const remoteRoot = join(dirname(heavyRoot), 'remote');
+    const allocated = [];
+    try {
+      for (const review of [false, true]) {
+        const { fn: spawnFn, seen } = fakeSpawn('{}\n');
+        await codexDirectTask({ dir, task: 't', review, env, execFn, spawnFn, stream: false });
+        const encoded = seen.argv.find((v) => v.startsWith('sandbox_workspace_write.writable_roots='));
+        if (review) {
+          expect(encoded).toBeUndefined();
+          expect(seen.argv.join('\n')).not.toContain(remoteRoot);
+        } else {
+          allocated.push(seen.opts.env.TMPDIR);
+          const roots = JSON.parse(encoded.split('=').slice(1).join('='));
+          expect(roots).toContain(heavyRoot);
+          expect(roots).toContain(remoteRoot);
+          expect(remoteRoot).toBe(join(env.LANE_POOL_ROOT, '.admission', 'remote'));
         }
       }
     } finally {

@@ -8,7 +8,9 @@
 # - /srv/forge-receipts ops:ops 0700, /srv/forge-cache root:ops 0770,
 #   /srv/forge-base ops:ops 0700 and its anonymous public bare repo.git;
 # - /usr/local/libexec root:root 0755 and bundled root:root 0755 wrappers
-#   forge-exec-run.mjs and forge-warm-base.mjs;
+#   forge-exec-run.mjs, forge-warm-base.mjs and forge-exec-limits.mjs;
+# - /etc/forge-exec/limits.json root:root 0644 (created only if absent),
+#   persistent parent/slot systemd slices with live resource ceilings;
 # - /etc/sudoers.d/forge-exec root:root 0440 with these exact forms:
 #   ops ALL=(forge-exec-1,...,forge-exec-N) NOPASSWD: /usr/bin/rsync
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs
@@ -170,7 +172,7 @@ try:
         # installed imports resolve to node builtins, including on Node 22.1.
         import re, json
         source_dir = os.path.dirname(sys.argv[1])
-        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs"}
+        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs"}
         def bundle(filename, nested=False):
             if filename not in allowed:
                 raise RuntimeError("unexpected wrapper dependency")
@@ -202,7 +204,7 @@ try:
             if nested:
                 return "(await (async () => {\n" + code + "\nreturn {" + ",".join(dict.fromkeys(names)) + "};\n})())"
             return "#!/usr/bin/env node\n" + code
-        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs"]:
+        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs", "forge-exec-limits.mjs"]:
             name = ".forge-exec-run-" + secrets.token_hex(16)
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
             try:
@@ -220,6 +222,40 @@ try:
 finally:
     os.close(parent)
 WRAPPER
+# Operator tuning (live, no code deploy):
+# edit /etc/forge-exec/limits.json, then:
+#   sudo /usr/local/libexec/forge-exec-limits.mjs apply
+# Direct persistent tuning is also possible:
+#   sudo systemctl set-property forge-exec-3.slice CPUQuota=1600%
+# A subsequent apply projects limits.json again, replacing direct property edits.
+python3 - <<'LIMITS'
+import os, stat
+try:
+    os.mkdir('/etc/forge-exec', 0o755)
+except FileExistsError:
+    pass
+directory = os.open('/etc/forge-exec', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    st = os.fstat(directory)
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        raise RuntimeError('untrusted limits directory')
+    os.fchown(directory, 0, 0)
+    os.fchmod(directory, 0o755)
+    try:
+        fd = os.open('limits.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    except FileExistsError:
+        pass  # Operator edits are never overwritten.
+    else:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write('{"parent":{"cpuQuota":"2800%","memoryMax":"56G"},"slot":{"cpuQuota":"800%","memoryMax":"12G","tasksMax":2048,"ioWeight":100},"slots":{}}\n')
+            stream.flush()
+            os.fchown(stream.fileno(), 0, 0)
+            os.fchmod(stream.fileno(), 0o644)
+finally:
+    os.close(directory)
+LIMITS
+/usr/local/libexec/forge-exec-limits.mjs apply
+systemctl daemon-reload
 # Ops owns the public bare repository. No remote configuration or credentials
 # are copied from the Mac; each tick supplies the public HTTPS URL explicitly.
 sudo -n -u ops env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c credential.helper= init --bare /srv/forge-base/repo.git

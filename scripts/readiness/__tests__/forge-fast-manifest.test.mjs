@@ -1,4 +1,5 @@
 // @vitest-environment node
+import {gitArgs,bindingEvidence} from './fixtures/forge-bound-git.mjs';
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
@@ -53,7 +54,7 @@ describe('fast Git manifest',()=>{
       finally {active--;captures++;}
     }};
     const observedExec=async call=>{
-      if(['diff','status','check-attr'].includes(call.args[0])||call.args.includes('-v')) {
+      if(['diff','status','check-attr'].includes(gitArgs(call)[0])||call.args.includes('-v')) {
         expect(active).toBe(0);expect(captures).toBe(full.entries.length);evidence=true;
       }
       return exec(call);
@@ -102,7 +103,7 @@ describe('fast Git manifest',()=>{
   });
   it.each(['failed','oversized','truncated','wrong bytes'])('falls back to full scan when blob-content evidence is %s',async fault=>{
     const broken=async call=>{
-      if(call.args[0]==='cat-file'&&call.args[1]==='blob')return {
+      if(gitArgs(call)[0]==='cat-file'&&gitArgs(call)[1]==='blob')return {
         code:fault==='failed'?1:0,
         stdout:Buffer.alloc(fault==='oversized'?4*1024*1024+1:fault==='truncated'?0:4),
       };
@@ -143,8 +144,8 @@ describe('fast Git manifest',()=>{
   it.each(['diff','status','check-attr','ls-files flags','oversized','truncated','throw'])('falls back without partial reuse on %s evidence',async fault=>{
     const broken=async call=>{
       const command=fault==='ls-files flags'?'ls-files':fault;
-      if(call.args[0]===command && (command!=='ls-files'||call.args.includes('-v')))return {code:1,stdout:Buffer.alloc(0)};
-      if(call.args[0]==='status') {
+      if(gitArgs(call)[0]===command && (command!=='ls-files'||call.args.includes('-v')))return {code:1,stdout:Buffer.alloc(0)};
+      if(gitArgs(call)[0]==='status') {
         if(fault==='throw')throw new Error('process failed');
         if(fault==='oversized')return {code:0,stdout:Buffer.alloc(4*1024*1024+1)};
         if(fault==='truncated')return {code:0,stdout:Buffer.from(' M edit.txt')};
@@ -159,8 +160,8 @@ describe('fast Git manifest',()=>{
     if(fault==='size')await write('keep.txt','longer content');
     if(fault==='mode')await fs.chmod(join(cwd,'keep.txt'),0o755);
     if(fault==='symlink'){await fs.rm(join(cwd,'keep.txt'));await fs.symlink('edit.txt',join(cwd,'keep.txt'));}
-    const hidden=call=>call.args[0]==='status'?Promise.resolve({code:0,stdout:Buffer.alloc(0)}):exec(call);
-    if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toThrow('Unsafe inventory component');
+    const hidden=call=>gitArgs(call)[0]==='status'?Promise.resolve({code:0,stdout:Buffer.alloc(0)}):exec(call);
+    if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toMatchObject({code:'unshipped-symlink'});
     else {const spy=readSpy();await compare({exec:hidden,fs:spy.fs});expect(readNames(spy.readFile)).toEqual(['keep.txt']);}
   });
   it.each(['filter','filter named unset','assume-unchanged','skip-worktree','skip-worktree + assume-unchanged'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
@@ -244,8 +245,8 @@ describe('fast Git manifest',()=>{
     // Isolate the flag guard from the separately tested config fallback: keep
     // real fsmonitor flags on index reads and inject its stale clean status.
     const monitored=call=>{
-      if(call.args[0]==='status')return Promise.resolve({code:0,stdout:Buffer.alloc(0)});
-      if(call.args[0]==='ls-files'&&call.args.includes('-v'))return exec({...call,args:[...monitor,...call.args]});
+      if(gitArgs(call)[0]==='status')return Promise.resolve({code:0,stdout:Buffer.alloc(0)});
+      if(gitArgs(call)[0]==='ls-files'&&call.args.includes('-v'))return exec({...call,args:[...call.args.slice(0,4),...monitor,...gitArgs(call)]});
       return exec(call);
     };
     const spy=readSpy(),fast=await compare({fs:spy.fs,exec:monitored});
@@ -255,7 +256,7 @@ describe('fast Git manifest',()=>{
   });
   it.each(['failed','oversized','truncated','invalid key','invalid boolean','missing boolean'])('full-scans when stat config evidence is %s',async fault=>{
     const broken=async call=>{
-      if(call.args[0]==='config') {
+      if(gitArgs(call)[0]==='config') {
         if(fault==='failed')return {code:2,stdout:Buffer.alloc(0)};
         if(fault==='oversized')return {code:0,stdout:Buffer.alloc(4*1024*1024+1)};
         if(call.args.includes('--get-regexp'))return {code:0,stdout:Buffer.from(fault==='truncated'?'core.trustctime\ntrue':fault==='invalid key'?'core.unknown\ntrue\0':'core.trustctime\ntrue\0')};
@@ -272,7 +273,7 @@ describe('fast Git manifest',()=>{
     let raced=false;
     const racing=async call=>{
       const result=await exec(call);
-      if(call.args[0]==='status'&&!raced){raced=true;await write('keep.txt','race');}
+      if(gitArgs(call)[0]==='status'&&!raced){raced=true;await write('keep.txt','race');}
       return result;
     };
     const spy=readSpy();await compare({exec:racing,fs:spy.fs});
@@ -314,7 +315,7 @@ describe('ignored build output test policy',()=>{
   });
   it('refuses ignored tests even when whole-directory ignore evidence is unavailable',async()=>{
     await write('.gitignore','dist/\n');await fs.mkdir(join(cwd,'dist'));await write('dist/a.test.mjs','hidden');
-    const broken=call=>call.args[0]==='check-ignore'?Promise.resolve({code:2,stdout:Buffer.alloc(0)}):exec(call);
+    const broken=call=>gitArgs(call)[0]==='check-ignore'?Promise.resolve({code:2,stdout:Buffer.alloc(0)}):exec(call);
     await expect(buildManifest({cwd,exec:broken})).rejects.toMatchObject({code:'ignored-test-file'});
   });
 });

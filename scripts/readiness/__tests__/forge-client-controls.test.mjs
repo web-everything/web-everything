@@ -24,7 +24,7 @@ const classes = [command,['npx','vitest','related','src/a.ts','--run'],['npm','r
 const withArg = (argv,arg) => argv[0]==='npm' ? [...argv,'--',arg] : [...argv,arg];
 
 describe('Forge synchronous module loading', () => {
-  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs'])
+  it.each(['forge-exec-run.mjs','forge-telemetry.mjs','remote-exec.mjs','forge-warm-base.mjs','forge-exec-limits.mjs'])
   ('loads %s synchronously without executing its CLI', module => {
     // Native require rejects any top-level await in the entire static import graph.
     const result=spawnSync(process.execPath,['--experimental-require-module','-e',
@@ -440,6 +440,55 @@ describe('remote controls', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
     resolve({mode:'remote',code:0});await first;
+  });
+  it.each([
+    ['overloaded',25000,{loadPerCore:0.81},'maxLoadPerCore'],
+    ['low memory',25000,{memFreePct:14},'minFreeRamPct'],
+    ['unreachable',25000,null,'forge-unreachable'],
+    ['stale sample',25000,{age:30001},'telemetry-stale'],
+    ['exact cache expiry',10000,{loadPerCore:0.81},'maxLoadPerCore'],
+    ['healthy refresh',10000,{},null],
+    ['still-cached health',9000,{},null],
+  ])('rechecks health after waiting for a remote slot: %s', async (_name,waitMs,patch,trigger) => {
+    vi.useFakeTimers();vi.setSystemTime(now);
+    const f=fixture({maxConcurrent:1});f.clock=Date.now;
+    const remoteRoot=join(f.cwd,'remote');
+    let release;
+    const first=runWithRemoteDecision({...f,remoteExec:()=>new Promise(done=>{release=done;})});
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(1);
+      const waiting=runWithRemoteDecision(f);
+      await vi.advanceTimersByTimeAsync(waitMs-1000);
+      expect(f.readTelemetry).toHaveBeenCalledTimes(1);
+      expect(f.remoteExec).not.toHaveBeenCalled();
+      // Flip health while all capacity is occupied, then allow the waiting caller
+      // to acquire the slot on its next one-second poll.
+      f.readTelemetry.mockImplementation(async()=>{
+        if(patch===null)throw new Error('offline');
+        const {age=0,...metrics}=patch;
+        return {...sample(Date.now()-age),...metrics};
+      });
+      release({mode:'remote',code:0});await first;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await waiting).toEqual(trigger?{handled:false}:{handled:true,exitCode:0});
+      expect(f.readTelemetry).toHaveBeenCalledTimes(waitMs>=10000?2:1);
+      expect(f.remoteExec).toHaveBeenCalledTimes(trigger?0:1);
+      expect(heldSlots({lockRoot:remoteRoot,cap:1})).toHaveLength(0);
+      expect(existsSync(join(remoteRoot,'slot-0.unconfirmed'))).toBe(false);
+      if(trigger) {
+        expect(f.log).toHaveBeenCalledWith(expect.stringContaining(trigger));
+        const state=JSON.parse(readFileSync(join(remoteRoot,'health.json'),'utf8'));
+        expect(state.trigger).toBe(trigger);
+        expect(state.backoffUntil).toBeGreaterThan(Date.now());
+        // A subsequent caller observes the persisted refusal without another read.
+        expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+        expect(f.readTelemetry).toHaveBeenCalledTimes(2);
+        expect(f.remoteExec).not.toHaveBeenCalled();
+      }
+    } finally {
+      release?.({mode:'remote',code:0});await first;
+    }
   });
   it('fails closed on corrupt persisted evidence and names local fallback', async () => {
     const f=fixture();mkdirSync(join(f.cwd,'remote'));

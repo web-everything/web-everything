@@ -65,9 +65,10 @@ export function classify(paths, map) {
   };
 }
 
-/** Keep index paths still present in the working tree, including dangling symlinks. */
+/** Keep unique index paths still present, including dangling symlinks and unmerged index entries. */
 export function existingTrackedPaths(paths) {
-  return paths.filter(path => {
+  // ls-files repeats a path for each unmerged stage; ownership counts working-tree leaves.
+  return [...new Set(paths)].filter(path => {
     try {
       lstatSync(resolve(root, path));
       return true;

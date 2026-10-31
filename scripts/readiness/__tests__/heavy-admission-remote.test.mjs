@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
 import { runRemote } from '../remote-exec.mjs';
+import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
@@ -62,6 +63,51 @@ function expectFallback(log, reason) {
 }
 
 describe('remote admission policy', () => {
+  it.each([
+    'invalid-diff-coverage-base',
+    'diff-coverage-base-unavailable',
+    'coverage-report-not-portable',
+  ])('runs locally after the adapter confirms pre-execution coverage fallback %s', async (reason) => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'coverage-fallback-'));
+    testRoots.push(root);
+    const pool = join(root, 'pool');
+    const lockRoot = join(pool, '.admission', 'heavy');
+    const remoteRoot = join(pool, '.admission', 'remote');
+    mkdirSync(pool);
+    const preferences = join(root, 'preferences.json');
+    writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
+      remote: { enabled: true, mode: 'always' }, fastScale: { maxSlots: 1 },
+    } }));
+    const exited = new Error('test exit');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: preferences,
+      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '',
+      WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '',
+      WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0' })) vi.stubEnv(key, value);
+    const remoteExec = vi.fn(async () => adaptLegacyRemoteResult({ mode: 'fallback', reason }));
+    vi.mocked(execSync).mockImplementation(() => {
+      expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(1);
+      expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toHaveLength(0);
+      expect(existsSync(join(remoteRoot, 'slot-0.unconfirmed'))).toBe(false);
+      throw Object.assign(new Error('local command exit'), { status: 17 });
+    });
+    try {
+      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec, readTelemetry: healthyRead }))
+        .rejects.toBe(exited);
+      expect(remoteExec).toHaveBeenCalledTimes(1);
+      expect(execSync).toHaveBeenCalledTimes(1);
+      expect(execSync).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
+        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+      }));
+      expect(exit).toHaveBeenCalledWith(17);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`fallback: ${reason}`));
+      expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
+    } finally {
+      vi.mocked(execSync).mockReset(); exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs();
+    }
+  });
+
   it('runs unsupported check:standards arguments locally with a reason and no remote staging',async()=>{
     const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
     const preferences=join(root,'preferences.json');
@@ -107,6 +153,13 @@ describe('remote admission policy', () => {
     {env:{},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['node','scripts/check-standards.mjs','--local','--files=a.mjs'],expected:['npm','run','check:standards','--','--local','--files=a.mjs']},
+    {env:{},command:['vitest','run','--config','vitest.integration.config.ts','a.test.mjs'],expected:['npm','run','test:integration:vitest','--','a.test.mjs']},
+    {env:{},command:['vitest','run','--config','vitest.integration.config.ts'],expected:['npm','run','test:integration:vitest']},
+    {env:{},command:['vitest','run','--coverage','a.test.mjs'],expected:['npm','run','test:coverage','--','a.test.mjs']},
+    {env:{},command:['vitest','run','--coverage'],expected:['npm','run','test:coverage']},
+    {env:{},command:['vitest','run','a.test.mjs'],expected:['npm','run','test:unit','--','a.test.mjs']},
+    {env:{},command:['vitest','run'],expected:['npm','run','test:unit']},
+    {env:{},command:['vitest','list'],expected:['vitest','list']},
   ])('main run dispatches a direct command or explicitly designated Mac verify gate remotely: %j', async ({env:gateEnv,command,expected}) => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-'));
     const pool = join(root, 'pool');
@@ -188,7 +241,6 @@ describe('remote admission policy', () => {
       exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
     }
   });
-
   it('resolves valid platform remote settings and their provenance', () => {
     const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = policyFor(remote);
@@ -246,7 +298,14 @@ describe('adaptLegacyRemoteResult', () => {
     'forge-unreachable',
     'copy-failed',
     'ignored-test-file',
+    'invalid-diff-coverage-base',
+    'diff-coverage-base-unavailable',
+    'coverage-report-not-portable',
     'unsupported-sibling-dependency',
+    'sibling-missing',
+    'sibling-not-git',
+    'sibling-dirty',
+    'sibling-unsafe',
   ])('maps %s to a confirmed non-start only at the adapter boundary', async (reason) => {
     const legacy = { mode: 'fallback', reason };
     const adapted = adaptLegacyRemoteResult(legacy);
@@ -288,7 +347,6 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 1, 'local');
     expect(f.log.mock.calls[0][0]).toContain('remote.enabled=false (standard)');
   });
-
   it.each([
     ['below threshold -> local', {}, 2.9],
     ['at threshold -> local', {}, 3],
@@ -347,6 +405,25 @@ describe('runWithRemoteDecision', () => {
     expectFallback(f.log, reason);
   });
 
+  it.each([
+    ['fixtures/link','fixtures/link'],
+    ['fixtures/unsafe\n\x1b\tlink','fixtures/unsafe???link'],
+    ['x'.repeat(100),'x'.repeat(80)],
+  ])('logs the sanitized and bounded refusal detail %j before local admission', async (detail,display) => {
+    const f=fixture({result:{mode:'not-started',terminated:true,reason:'unshipped-symlink',detail}});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log).toHaveBeenLastCalledWith(`heavy-admission: remote failed (fallback: unshipped-symlink (${display})) - falling back to local admission\n`);
+  });
+
+  it.each(['ignored-test-file', 'future-client-prelaunch-refusal'])('runs locally for confirmed non-start with arbitrary reason %s', async reason => {
+    const f = fixture({result:{mode:'not-started', terminated:true, reason}});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expectFallback(f.log, reason);
+    expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
+  });
+
   describe.each(['not-started', 'cancelled'])('%s', (mode) => {
     it.each([undefined, false, 1, 'true'])('without terminated=true refuses local rerun: %s', async (terminated) => {
       const f = fixture({ result: { mode, terminated } });
@@ -365,6 +442,8 @@ describe('runWithRemoteDecision', () => {
       let request;
       const actions = [];
       const exec = vi.fn(async (call) => {
+        const binding = bindingEvidence(call);
+        if (binding) return binding;
         if (call.file === 'git' && call.args.includes('-i')) return { code: 0, stdout: Buffer.alloc(0) };
         if (call.file === 'git' && call.args.includes('--stage')) return { code: 0, stdout: Buffer.alloc(0) };
         if (call.file === 'rsync') return { code: 0, stdout: '' };
@@ -372,6 +451,7 @@ describe('runWithRemoteDecision', () => {
           const action = call.args.at(-1).split(' ').at(-1);
           actions.push(action);
           if (action === 'true') return { code: 0, stdout: '' };
+          if (action === 'bases') return { code: 254, stdout: '' };
           if (action === 'prepare') return { code: 0, stdout: JSON.stringify({ run: 'r-' + JSON.parse(call.input).nonce }) };
           if (action === 'run') {
             request = JSON.parse(call.input);
@@ -406,7 +486,6 @@ describe('runWithRemoteDecision', () => {
       } finally { rmSync(cwd, { recursive: true, force: true }); }
     });
   });
-
   it('remoteExec throws -> refuses local rerun with the error reason', async () => {
     const f = fixture();
     f.remoteExec.mockRejectedValue(new Error('injected transport failure'));

@@ -149,7 +149,6 @@ import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { checkRemoteHealth, recordRemoteResult } from './forge-remote-health.mjs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -161,6 +160,7 @@ import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-file
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -467,7 +467,14 @@ const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'forge-unreachable',
   'copy-failed',
   'ignored-test-file',
+  'invalid-diff-coverage-base',
+  'diff-coverage-base-unavailable',
+  'coverage-report-not-portable',
   'unsupported-sibling-dependency',
+  'sibling-missing',
+  'sibling-not-git',
+  'sibling-dirty',
+  'sibling-unsafe',
 ]);
 
 /** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
@@ -504,6 +511,28 @@ export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClien
     if (!fs.statSync(real).isFile()) return { reason: 'clientPath must be a regular file' };
     return { clientPath: real };
   } catch (error) { return { reason: `clientPath unreadable: ${oneLine(error?.code ?? error?.message ?? error)}` }; }
+}
+
+/** Per-run client override (`run --remote-client=` / WE_REMOTE_CLIENT_OVERRIDE): only a lane-pool lane's own
+ * scripts/readiness/remote-exec.mjs, or the host clientPath, may be selected. Repo config never feeds this. */
+export function resolveRunClientOverride({ overridePath, hostClientPath = null, laneRoots = [], fs = realClientFs() }) {
+  try {
+    if (typeof overridePath !== 'string' || !isAbsolute(overridePath)) return { reason: 'per-run override must be an absolute path' };
+    const real = fs.realpathSync(overridePath);
+    if (!fs.statSync(real).isFile()) return { reason: 'per-run override must be a regular file' };
+    if (hostClientPath != null) {
+      const host = resolveRemoteClient({ clientPath: hostClientPath, laneRoots, fs });
+      if (host.clientPath && host.clientPath === real) return { clientPath: real };
+    }
+    const tail = sep + join('scripts', 'readiness', 'remote-exec.mjs');
+    for (const root of laneRoots.flatMap((r) => [resolve(r), canonicalPath(r)])) {
+      const prefix = root + sep;
+      if (!real.startsWith(prefix) || !real.endsWith(tail)) continue; // exact compare on realpaths
+      const lane = real.slice(prefix.length, real.length - tail.length);
+      if (/^(?:[^/\\]+[/\\])?lane-\d+$/.test(lane)) return { clientPath: real };
+    }
+    return { reason: 'per-run override is not a lane-pool lane remote-exec.mjs or the host clientPath' };
+  } catch (error) { return { reason: `per-run override unreadable: ${oneLine(error?.code ?? error?.message ?? error)}` }; }
 }
 
 const remoteClientNotice = { logged: false };
@@ -626,10 +655,13 @@ export function createRemoteExec({
       { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096 },
       (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
   }),
-  notice = remoteClientNotice,
+  notice = remoteClientNotice, runOverride = null,
 } = {}) {
   return async (options) => {
-    const client = resolveRemoteClient({ clientPath: policy.settings.remote.clientPath, laneRoots, fs });
+    const scope = runOverride != null ? 'run' : 'host';
+    const client = scope === 'run'
+      ? resolveRunClientOverride({ overridePath: runOverride, hostClientPath: policy.settings.remote.clientPath, laneRoots, fs })
+      : resolveRemoteClient({ clientPath: policy.settings.remote.clientPath, laneRoots, fs });
     if (client.clientPath === null) return adaptLegacyRemoteResult(await (await importClient('./remote-exec.mjs')).runRemote(options));
     const ignored = (reason) => {
       reason = oneLine(reason);
@@ -654,7 +686,12 @@ export function createRemoteExec({
         if (!notice.logged) {
           notice.logged = true;
           const displayPath = clientPathForLog(client.clientPath);
-          await log(`heavy-admission: remote client override ${displayPath} @ ${oneLine(sha)}\n`);
+          await log(`heavy-admission: remote client override${scope === 'run' ? ' (per-run)' : ''} ${displayPath} @ ${oneLine(sha)}\n`);
+        }
+        if (scope === 'run') { // per-run: never touches the shared host provenance state
+          await boundedClientProvenance(() => appendEvent({ kind: 'remote-client-override',
+            detail: { clientPath: clientPathForLog(client.clientPath), sha, scope: 'run' } }), 100);
+          return;
         }
         await boundedClientProvenance(async (signal) => {
           const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
@@ -709,7 +746,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec,
+  remoteExec, remoteClientOverride = null,
   log = (line) => process.stderr.write(line),
 }) {
   let load;
@@ -717,7 +754,9 @@ export async function runWithRemoteDecision({
   const decision = decideRemote({ policy, loadPerCore: load, argv });
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
-  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
+  // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
+  // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
+  const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
@@ -750,11 +789,12 @@ export async function runWithRemoteDecision({
   const executionMarker = join(remoteRoot,`slot-${slot.slot}.unconfirmed`);
   let outstanding = false;
   let terminated = false;
+  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
   };
-  let reason; let timer;
+  let reason; let detail; let timer;
   const controller = new AbortController();
   const timedOut = Symbol('remote-timeout');
   try {
@@ -799,6 +839,7 @@ export async function runWithRemoteDecision({
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
+      detail = result?.detail;
     }
   } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
   finally {
@@ -813,7 +854,7 @@ export async function runWithRemoteDecision({
       if(!outstanding)releaseOwnedSlot({...slotOptions,fastSlots:0});
     }
   }
-  const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}`;
+  const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
 }
@@ -1190,17 +1231,16 @@ export function slotPath(i) {
 /**
  * Same-machine PID-liveness verdict (mirrors `file-locks-cli.mjs#probePidLiveness` — the layered, NEVER
  * primary, fast path: `kill(pid, 0)` throws ESRCH when no such process exists → provably 'dead'; succeeds →
- * 'alive' (the kernel reuses PIDs, so this does NOT prove it's the same owner — never accelerates a reclaim);
+ * 'alive' unless Linux /proc proves a zombie/dead state (PID reuse never proves the same owner);
  * a null/own/foreign-host pid is 'unknown' (TTL-only). Wired here, not left unwired, because #3461's long
  * `ADMISSION_LEASE_MINUTES` makes the TTL floor alone too slow to recover a genuinely crashed holder.
  * @param {number|null} pid  the CURRENT holder's pid (from its lock entry), or null if unknown
  * @param {number} selfPid   the caller's own pid — never probes/accelerates against itself
+ * @param {(pid:number)=>string|null} [readStat] injectable Linux stat reader (default no-op off Linux)
  * @returns {'dead'|'alive'|'unknown'}
  */
-export function probeSlotHolderLiveness(pid, selfPid) {
-  if (!Number.isInteger(pid) || pid <= 0 || pid === selfPid) return 'unknown';
-  try { process.kill(pid, 0); return 'alive'; }
-  catch (e) { return e && e.code === 'ESRCH' ? 'dead' : 'unknown'; }
+export function probeSlotHolderLiveness(pid, selfPid, readStat) {
+  return probePidLiveness(pid, selfPid, readStat);
 }
 
 /**
@@ -2298,7 +2338,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
   }
   if (mode === 'run') {
     if (dashDashIdx === -1 || dashDashIdx === argv.length - 1) {
-      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--container] [--container-node-modules] -- <command…>\n`);
+      process.stderr.write(`usage: heavy-admission.mjs run [--repo=] [--cap=] [--owner=] [--lane=] [--num=] [--kind=] [--ceiling-ms=] [--wait-ms=] [--remote-client=] [--container] [--container-node-modules] -- <command…>\n`);
       process.exit(3);
     }
     const command = argv.slice(dashDashIdx + 1).map(shellQuoteWord).join(' ');
@@ -2325,6 +2365,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // every existing caller (and the bare default here) still runs on the host, byte-identical to before this
     // flag existed. See scripts/lib/container-exec.mjs's own header for exactly what is proven to work this
     // way (check:standards, and — with `--container-node-modules` below — test:unit).
+    // Per-run remote client override: CLI flag or this process's env only; never repo config.
+    const remoteClientOverride = typeof flags['remote-client'] === 'string' ? flags['remote-client']
+      : process.env.WE_REMOTE_CLIENT_OVERRIDE || null;
     const useContainer = !!flags.container || process.env.WE_HEAVY_ADMISSION_CONTAINER === '1';
     // The `test:unit` slice's own opt-in — layered ON TOP of `--container` (meaningless without it, checked
     // below). See this file's own header and container-exec.mjs's "test:unit slice" section for why a plain
@@ -2342,12 +2385,19 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
-      // fixed standards script contract at this client boundary.
-      const remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
+      // fixed standards and Vitest script contracts at this client boundary.
+      let remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
         ? ['npm','run','check:standards',...(requested.length>2?['--',...requested.slice(2)]:[])] : requested;
+      if(requested[0]==='vitest'&&requested[1]==='run') {
+        const integration=requested[2]==='--config'&&requested[3]==='vitest.integration.config.ts';
+        const coverage=requested[2]==='--coverage';
+        const script=integration?'test:integration:vitest':coverage?'test:coverage':'test:unit';
+        const rest=requested.slice(integration?4:coverage?3:2);
+        remoteArgv=['npm','run',script,...(rest.length?['--',...rest]:[])];
+      }
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec, readTelemetry, lockRoot,
+        env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
