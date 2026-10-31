@@ -114,6 +114,36 @@ describe('runFixCli', () => {
     };
     return { calls, envs, run, spawn, owed, pendingRearm, io: { persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    let now = 1000;
+    const sleeps = [];
+    const readChecks = vi.fn(() => now < 31000 ? [{ name: 'test', status: 'in_progress' }] : [{ name: 'test', status: 'completed', conclusion: 'failure' }]);
+    const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: enabled, pushAfterCiMaxMin: 1 },
+      readRequired: () => ({ checks: ['test'] }), readChecks, clock: () => now,
+      sleep: async ms => { sleeps.push(ms); now += ms; } });
+    expect(result.code).toBe(0);
+    expect(sleeps).toEqual(enabled ? [30000] : []);
+    expect(readChecks).toHaveBeenCalledTimes(enabled ? 2 : 0);
+    if (enabled) {
+      expect(readChecks).toHaveBeenCalledWith({ repo: 'o/r', headSha: 'a'.repeat(40) });
+      expect(m.spawn.mock.calls[0][0].prompt).toContain('Previous-head CI failures (same repair)');
+      expect(m.spawn.mock.calls[0][0].prompt).toContain('\"name\":\"test\"');
+    }
+    expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+    expect(m.calls.flat()).not.toContain('--force');
+  });
+  it('pushes at the fixed bound even if CI reads fail', async () => {
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    let now = 0;
+    const sleeps = [];
+    const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: true, pushAfterCiMaxMin: 1 },
+      readRequired: () => ({ checks: ['test'] }), readChecks: () => { throw Error('offline'); }, clock: () => now,
+      sleep: async ms => { sleeps.push(ms); now += ms; } });
+    expect(result.code).toBe(0);
+    expect(sleeps).toEqual([30000, 30000]);
+    expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+  });
   const citedEvidence = '- send-back 1001 item 1: src/fix.mjs:1\n- send-back 1001 item 2: src/fix.mjs:2';
   const withSendBack = ({ evidence = citedEvidence, after = 'b'.repeat(40), failPost = false, fileText = 'one\ntwo\n',
     baseRefName = 'develop', mergeBase = 'd'.repeat(40), diffError = false,
