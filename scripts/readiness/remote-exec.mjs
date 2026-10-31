@@ -345,14 +345,15 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, argv, selectorExec, env=process.env, beginSub=noTiming} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, argv, selectorExec, selectionEnv, env=process.env, beginSub=noTiming} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Git ignore rules alone do not establish runner exclusions. Load discovery
   // evidence lazily, once per snapshot, and retain refusal on any uncertainty.
   let testSelector;
-  // Discovery sees exactly the env Forge execution receives; an invalid env refuses.
-  const selectorEnv=()=>{try{return filterEnv(env);}catch{return undefined;}};
+  // Discovery sees exactly the env Forge execution receives (executeRemote passes its
+  // finalized executionEnv); otherwise filterEnv(env). An invalid env refuses.
+  const selectorEnv=()=>{try{return selectionEnv??filterEnv(env);}catch{return undefined;}};
   const testSelected=async path=>(await (testSelector??=(()=>{const forgeEnv=selectorEnv();
     return forgeEnv?loadTestSelector({cwd,argv,env:forgeEnv,exec:selectorExec}):async()=>true;})()))(path);
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
@@ -617,7 +618,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,argv,selectorExec,env=process.env,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,argv,selectorExec,selectionEnv,env=process.env,beginSub=noTiming}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -716,7 +717,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,argv,selectorExec,env,beginSub});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,argv,selectorExec,selectionEnv,env,beginSub});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -890,14 +891,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           if(selected)break;
         }
         if(!selected)throw lastError;
-        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,argv,selectorExec,env,beginSub});
+        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,argv,selectorExec,selectionEnv:executionEnv,env,beginSub});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,argv,selectorExec,env,beginSub});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,argv,selectorExec,selectionEnv:executionEnv,env,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));

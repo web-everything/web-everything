@@ -3626,8 +3626,8 @@ refuses with `manifest-walk-limit` (local fallback) when that budget is exhauste
 Git ignores do not define Vitest discovery. Full and delta manifest admission omit ignored
 test-shaped files only when Vitest's own `createVitest('test', options)` and
 `globTestFiles(filters)` prove they are absent from the selected files. A native Node child
-resolves `vitest/node` from the lane, receives only the `filterEnv` environment Forge execution
-receives (an invalid env retains fallback), discovers the actual config
+resolves `vitest/node` from the lane, receives only the finalized environment Forge execution
+receives (`filterEnv`, with `DIFF_COVERAGE_BASE` resolved to its SHA; an invalid env retains fallback), discovers the actual config
 and workspace, and closes the context without running tests. Mirror the CLI's `TEST=true`,
 `VITEST=true` and default `NODE_ENV=test` prelude (preserving an explicit `NODE_ENV`):
 `createVitest` alone does not set them. Admission forwards the run's

@@ -1096,6 +1096,28 @@ describe('runRemote', () => {
     expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['a.test.mjs', 'package-lock.json', 'src', 'src/kept.mjs']);
   });
 
+  it('selects ignored tests with the finalized Forge env (DIFF_COVERAGE_BASE resolved to its SHA)', async () => {
+    const f = fixture();
+    const gitIn=(...args)=>{
+      const result=spawnSync('git',['-c','user.name=t','-c','user.email=t@t',...args],{cwd,encoding:'utf8',timeout:10000});
+      expect(result.status,result.stderr).toBe(0);return result.stdout.trim();
+    };
+    gitIn('init','--quiet');
+    writeFileSync(join(cwd,'.gitignore'),'dist/\nheavy/\n');
+    mkdirSync(join(cwd,'dist'),{recursive:true});writeFileSync(join(cwd,'dist/hidden.test.mjs'),'must run');
+    gitIn('add','.');gitIn('commit','-q','-m','base');gitIn('branch','coverage-base');
+    const sha=gitIn('rev-parse','coverage-base');
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git'
+      ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
+    const seen=[];
+    f.selectorExec = vi.fn(async (_file,_args,options) => { seen.push(options.env); return {stdout:JSON.stringify([join(cwd,'dist/hidden.test.mjs')])}; });
+    const result = await runRemote({...f,listFiles:undefined,argv:['npx','vitest','run','a.test.mjs'],env:{...f.env,DIFF_COVERAGE_BASE:'coverage-base'}});
+    expect(seen.length).toBeGreaterThan(0);
+    for (const env of seen) expect(env).toEqual(filterEnv({...f.env,DIFF_COVERAGE_BASE:sha}));
+    expect(result).toMatchObject({mode:'not-started',reason:'ignored-test-file',detail:'dist/hidden.test.mjs'});
+  });
+
   it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
   ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
     writeFileSync(join(cwd,'vitest.config.mjs'), "export default {test:{include:['**/*.{test,spec}.{ts,mjs}', '**/__tests__/**/*.js'],exclude:[]}};");
