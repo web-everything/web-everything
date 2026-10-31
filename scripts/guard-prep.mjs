@@ -11,28 +11,31 @@ function applies(event) {
   return event?.hook_event_name === 'PreToolUse' && ['Agent', 'Task'].includes(event.tool_name)
     && ['', 'codex-runner', 'worker', 'general-purpose'].includes(normalized)
     && typeof prompt === 'string' && /\b(build|implement|add|fix|refactor|write)\b/i.test(prompt)
-    && /\b(open-pr|push|pull request|PR)\b/i.test(prompt) && !isPrepExempt(prompt);
+    && /\b(open-pr|push|pull request|PR)\b/i.test(prompt)
+    && !isPrepExempt(prompt.trim().slice(0, 240).split(/(?:[.!?](?:\s|$)|[\r\n])/, 1)[0]);
+}
+
+function evaluatePrep(event) {
+  if (!applies(event)) return { decision: null, verdict: null };
+  const verdict = prepVerdict(event.tool_input.prompt);
+  const decision = verdict.ok ? null : { hookSpecificOutput: {
+    hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: verdict.reason,
+  } };
+  return { decision, verdict };
 }
 
 export function decide(event) {
-  if (!applies(event)) return null;
-  const verdict = prepVerdict(event.tool_input.prompt);
-  return verdict.ok ? null : { hookSpecificOutput: {
-    hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: verdict.reason,
-  } };
+  return evaluatePrep(event).decision;
 }
 
 /** Injectable boundary also exercises exception handling without an environment bypass switch. */
-export function runHook({ read = () => readFileSync(0, 'utf8'), decide: decision = decide,
+export function runHook({ read = () => readFileSync(0, 'utf8'), evaluate = evaluatePrep,
   stdout = (text) => process.stdout.write(text), stderr = (text) => process.stderr.write(text), logPath } = {}) {
   try {
     const event = JSON.parse(read());
-    const result = decision(event);
-    if (result) stdout(JSON.stringify(result));
-    else if (applies(event)) {
-      const verdict = prepVerdict(event.tool_input.prompt);
-      if (verdict.waived) logPrepEvent({ kind: 'waiver', detail: verdict.reason }, { logPath });
-    }
+    const { decision, verdict } = evaluate(event);
+    if (decision) stdout(JSON.stringify(decision));
+    else if (verdict?.waived) logPrepEvent({ kind: 'waiver', detail: verdict.reason }, { logPath });
   } catch (error) {
     const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
     logPrepEvent({ kind: 'hook-error', detail }, { logPath });

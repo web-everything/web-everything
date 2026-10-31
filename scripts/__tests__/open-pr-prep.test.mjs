@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPrLandRunner } from '../operations/open-pr-io.mjs';
 
@@ -31,16 +31,32 @@ describe('open-pr prep admission', () => {
     expect(runner()({ argv: [...argv.slice(0, 2), '--body-file=body.md'] }).outcome).toBe('opened');
     expect(spawn).toHaveBeenCalledOnce();
   }));
+  it.each([['description without prep', 'refused'], [prep, 'opened']])('expands ~/ in body-file and enforces prep: %s', (body, outcome) => fixture(({ runner, argv, spawn, review }) => {
+    const readPrepBody = vi.fn(() => body);
+    const result = runner({ readPrepBody })({ argv: [...argv.slice(0, 2), '--body-file=~/prep/body.md'] });
+    expect(readPrepBody.mock.calls).toEqual([[join(homedir(), 'prep', 'body.md'), 'utf8']]);
+    expect(result.outcome).toBe(outcome);
+    if (outcome === 'refused') {
+      expect(result.reason).toBe('prep-block-missing');
+      expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
+    } else expect(spawn).toHaveBeenCalledOnce();
+  }));
   it('allows a waiver and records its reason', () => fixture(({ bodyFile, logPath, runner, argv }) => {
     writeFileSync(bodyFile, 'prep: waived — urgent incident');
     expect(runner()({ argv }).outcome).toBe('opened');
     expect(JSON.parse(readFileSync(logPath, 'utf8'))).toMatchObject({ kind: 'waiver', detail: 'urgent incident' });
   }));
-  it.each(['card-only', 'merge conflict', 're-run CI', 'red-team', 'review this PR', 'read-only', 'file a backlog card'])('allows shared exemption in title or body: %s', (text) => fixture(({ bodyFile, runner, argv }) => {
+  it.each(['resolve the conflict', 'resolve conflict', 'merge conflict', 'rebase onto main', 're-run checks', 'rerun CI', 'retrigger', 'red-team', 'redteam', 'review the PR', 'review this PR', 'code review', 'jury', 'read-only', 'do not edit', 'no code changes', 'file a backlog card', 'file the item', 'card-only'])('allows shared exemption in title only: %s', (text) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
     writeFileSync(bodyFile, text);
-    expect(runner()({ argv }).outcome).toBe('opened');
+    expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
+    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
     writeFileSync(bodyFile, 'description');
     expect(runner()({ argv: [...argv.filter((arg) => !arg.startsWith('--title=')), `--title=${text}`] }).outcome).toBe('opened');
+  }));
+  it.each(['The jury discussed this implementation.', 'This implementation needs code review.'])('refuses a build title whose body mentions exempt work: %s', (body) => fixture(({ bodyFile, runner, argv, spawn, review }) => {
+    writeFileSync(bodyFile, body);
+    expect(runner()({ argv })).toMatchObject({ outcome: 'refused', reason: 'prep-block-missing' });
+    expect(spawn).not.toHaveBeenCalled(); expect(review).not.toHaveBeenCalled();
   }));
   it('does not read or gate a dry-run', () => fixture(({ runner, argv, spawn }) => {
     const readPrepBody = vi.fn(() => { throw new Error('must not read'); });

@@ -7,7 +7,9 @@ const FORMAT = 'PREP:\nAcceptance: <criteria>\nPre-mortem: <risks>\nFiles: <path
 const EXEMPT = /\b(?:resolve (?:the )?conflict|merge conflict|rebase onto|re-?run|rerun CI|retrigger|red-?team|review (?:the|this) PR|code review|jury|read-only|do not edit|no code changes|file (?:a |the )?(?:backlog )?(?:card|item)|card-only)\b/i;
 
 export function isPrepExempt(text) {
-  return EXEMPT.test(typeof text === 'string' ? text : '');
+  const statement = typeof text === 'string' ? text : '';
+  const build = /\b(?:implement|build|add\b[^.!?\r\n]*\b(?:feature|code|guard|function))\b/i;
+  return EXEMPT.test(statement) && !build.test(statement);
 }
 
 function nonTrivial(line) {

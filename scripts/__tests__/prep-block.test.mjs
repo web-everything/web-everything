@@ -59,6 +59,13 @@ describe('prep block', () => {
   it.each(['review parser implementation', 'merge feature', 'cards UI', 'team build', 'run tests'])('does not exempt broad words: %s', (text) => {
     expect(isPrepExempt(text)).toBe(false);
   });
+  it.each(['implement X, rerun the tests, then open-pr', 'build X, re-run the tests, then open-pr',
+    'add a jury feature', 'add code for read-only access', 'add a code review guard', 'add a rerun function'])('build instructions override exemption words: %s', (text) => {
+    expect(isPrepExempt(text)).toBe(false);
+  });
+  it.each([undefined, null, 123, {}])('does not exempt non-string input %j', (text) => {
+    expect(isPrepExempt(text)).toBe(false);
+  });
   it('appends timestamped JSON lines and never throws on IO failure', () => {
     const dir = mkdtempSync(join(tmpdir(), 'prep-log-'));
     try {

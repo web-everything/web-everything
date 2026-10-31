@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { decide, runHook } from '../guard-prep.mjs';
+import * as prepBlock from '../lib/prep-block.mjs';
 
 const prompt = 'Build the feature and open-pr';
 const event = (text = prompt, subagent_type = 'worker') => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { prompt: text, subagent_type } });
@@ -34,8 +35,25 @@ describe('guard-prep', () => {
   it.each(['', 'TODO', '........'])('denies empty/placeholder heading %j', (text) => {
     expect(decide(event(prompt + prep.replace('visible outcome', text)))).not.toBeNull();
   });
-  it.each(['resolve the conflict', 're-run CI', 'red-team', 'review this PR', 'read-only', 'file a backlog card', 'card-only'])('allows exemption even without PREP: %s', (text) => {
-    expect(decide(event(`${prompt}; ${text}`))).toBeNull();
+  it.each(['resolve the conflict', 'resolve conflict', 'merge conflict', 'rebase onto main', 're-run checks', 'rerun CI', 'retrigger', 'red-team', 'redteam', 'review the PR', 'review this PR', 'code review', 'jury', 'read-only', 'do not edit', 'no code changes', 'file a backlog card', 'file the item', 'card-only'])('allows exempt task without PREP, but denies a build mentioning it: %s', (text) => {
+    expect(decide(event(`${text}; fix and open-pr`))).toBeNull();
+    expect(decide(event(`${prompt}; ${text}`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it.each(['implement X, rerun the tests, then open-pr', 'implement X, re-run the tests, then open-pr',
+    'build X, rerun the tests, then open-pr', 'add a jury guard, then open-pr'])('denies short mixed build/rerun task: %s', (text) => {
+    expect(decide(event(text))?.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+  it.each(['. ', '! ', '? ', '\n', '\r\n'])('ignores exemption after the first sentence/line (%j)', (separator) => {
+    expect(decide(event(`Fix and open-pr${separator}jury`))?.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(decide(event(`jury${separator}Fix and open-pr`))).toBeNull();
+  });
+  it('uses the first 240 trimmed characters and provides prep/waiver guidance beyond the bound', () => {
+    expect(decide(event(`  \n${'Fix and open-pr '.padEnd(236)}jury`))).toBeNull();
+    for (const length of [240, 20_000]) {
+      expect(decide(event(`${'Fix and open-pr '.padEnd(length)}jury`))).toMatchObject({
+        hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: expect.stringContaining('prep: waived — <reason>') },
+      });
+    }
   });
   it.each(['Explore', 'Plan', 'claude-code-guide', 'statusline-setup'])('allows read-only type %s', (type) => {
     expect(decide(event(prompt, type))).toBeNull();
@@ -52,21 +70,29 @@ describe('guard-prep', () => {
     expect(JSON.parse(output.stdout)).toEqual(decide(event()));
     expect(output.stderr).toBe('');
   });
-  it('allows waiver and writes an audit line through the boundary', () => {
+  it('allows waiver and writes an audit line through the boundary using one verdict and applicability check', () => {
     const dir = mkdtempSync(join(tmpdir(), 'prep-hook-'));
     try {
       const logPath = join(dir, 'events.log'); const output = [];
-      runHook({ read: () => JSON.stringify(event(prompt + '\nprep: waived — urgent incident')), logPath, stdout: (text) => output.push(text) });
-      expect(output).toEqual([]);
-      expect(JSON.parse(readFileSync(logPath, 'utf8'))).toMatchObject({ kind: 'waiver', detail: 'urgent incident' });
+      const originalVerdict = prepBlock.prepVerdict;
+      const verdict = vi.spyOn(prepBlock, 'prepVerdict').mockImplementationOnce(originalVerdict)
+        .mockImplementation(() => { throw new Error('verdict computed twice'); });
+      const exemption = vi.spyOn(prepBlock, 'isPrepExempt');
+      try {
+        runHook({ read: () => JSON.stringify(event(prompt + '\nprep: waived — urgent incident')), logPath, stdout: (text) => output.push(text) });
+        expect(output).toEqual([]);
+        expect(JSON.parse(readFileSync(logPath, 'utf8'))).toMatchObject({ kind: 'waiver', detail: 'urgent incident' });
+        expect(verdict.mock.calls).toEqual([[prompt + '\nprep: waived — urgent incident']]);
+        expect(exemption).toHaveBeenCalledOnce();
+      } finally { verdict.mockRestore(); exemption.mockRestore(); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each(['malformed stdin', 'throwing decide'])('fails OPEN and logs on %s in a Node process', (mode) => {
+  it.each(['malformed stdin', 'throwing evaluator'])('fails OPEN and logs on %s in a Node process', (mode) => {
     const dir = mkdtempSync(join(tmpdir(), 'prep-error-'));
     try {
       const logPath = join(dir, 'events.log');
       const args = mode === 'malformed stdin' ? [guard] : ['--input-type=module', '-e',
-        `import { runHook } from ${JSON.stringify(pathToFileURL(guard).href)}; runHook({ read: () => '{}', decide: () => { throw new Error('injected failure'); }, logPath: process.argv[1] });`, logPath];
+        `import { runHook } from ${JSON.stringify(pathToFileURL(guard).href)}; runHook({ read: () => '{}', evaluate: () => { throw new Error('injected failure'); }, logPath: process.argv[1] });`, logPath];
       const output = spawnSync(process.execPath, args, { input: '{broken', encoding: 'utf8', env: { ...process.env, HOME: dir } });
       expect(output.status).toBe(0); expect(output.stdout).toBe('');
       expect(output.stderr).toMatch(/WARNING.*failing open/);

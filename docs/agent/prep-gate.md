@@ -18,7 +18,14 @@ accept Markdown prefixes. An operator can explicitly waive prep with
 event to `~/workspace/.operations/prep-gate.log`.
 
 The shared exemption matcher covers conflict resolution, reruns, red-team work,
-reviews, read-only work and card filing. Omitted/blank agent types are treated as
+reviews, read-only work and card filing. For Agent/Task prompts, only the first
+sentence or line within the first 240 characters of the trimmed prompt can grant
+an exemption. Put the exempt task there, or supply PREP/a reasoned waiver; later
+mentions never exempt a build. Explicit `implement`/`build` instructions, or `add`
+instructions naming a feature, code, guard or function, take precedence over
+exemption phrases in that statement. Open-pr matches exemptions against the title
+only (including `card-only`), never the body, with the same build precedence.
+Omitted/blank agent types are treated as
 general-purpose; other read-only agent types are allowed. Hook exceptions warn,
 log `hook-error`, and fail open. Open-pr skips prep for dry runs and warns/delegates
 unreadable body files to its existing handling. Missing or incomplete readable prep

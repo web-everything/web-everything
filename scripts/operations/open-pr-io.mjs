@@ -163,7 +163,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       if (readable) {
         const prep = prepGate(body);
         if (prep.waived) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
-        else if (!isPrepExempt(`${arg('title') || ''}\n${body}`) && !prep.ok) {
+        else if (!isPrepExempt(arg('title')) && !prep.ok) {
           return { outcome: 'refused', reason: 'prep-block-missing', detail: prep.reason };
         }
       }
