@@ -52,7 +52,8 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
         // Canonicalize even missing paths: only ENOENT may mean absent evidence.
         const rel = inside(path);
         const file = statSync(path, { throwIfNoEntry: false });
-        if (rel && file?.isFile() && !['.mjs', '.js', '.cjs'].includes(extname(path))) {
+        if (rel && file?.isFile()
+          && [path, rel].some(entry => !['.mjs', '.js', '.cjs'].includes(extname(entry)))) {
           throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
         }
       }

@@ -162,6 +162,20 @@ it.each(['runner', 'daemon.mts', 'daemon.py'])('refuses an existing unsupported 
   }
 });
 
+it.each([
+  ['worker.mjs', 'worker.py'],
+  ['worker.py', 'worker.mjs'],
+])('refuses an absolute clone symlink with an unsupported argument or target extension: %s -> %s', (entry, target) => {
+  const f = fixture();
+  writeFileSync(join(f.root, target), 'entrypoint');
+  const arg = join(f.root, entry);
+  symlinkSync(target, arg);
+  writeFileSync(join(f.launchAgentsDir, 'com.we.symlink.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', arg] }),
+  }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.symlink.plist: ${arg}`);
+});
+
 it('refuses --import=./x even when its target exists in the clone', () => {
   const f = fixture();
   writeFileSync(join(f.root, 'x'), 'export {};');
