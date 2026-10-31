@@ -315,7 +315,8 @@ describe('operator routing overrides', () => {
     for (const provider of ['agy-claude', 'antigravity']) {
       expect(resolvePolicyModel(provider, 'sonnet')).toBe('claude-sonnet-5-5-high');
       const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-      policy.operations['review-seat'] = { provider, model: policy.aliases[provider].sonnet, fallback: [] };
+      // An unrostered operation: this pins the alias catalogue, not a seat launch roster.
+      policy.operations['prepare-item'] = { provider, model: policy.aliases[provider].sonnet, fallback: [] };
       expect(() => validateRoutingPolicy(policy)).not.toThrow();
       policy.aliases[provider].sonnet = 'claude-sonnet-5-5-unknown';
       expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);

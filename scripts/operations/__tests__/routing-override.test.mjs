@@ -61,6 +61,26 @@ function fixture() {
   return { dir, path, env, command };
 }
 
+it.each([
+  ['red-team leaves only zero-cap agy-gemini', key, { disabledProviders: ['codex', 'agy-claude'] }, /no available route/],
+  ['bare review-seat claude', 'review-seat', { provider: 'claude' }, /unsupported seat provider claude/],
+  ['bare review-seat antigravity', 'review-seat', { provider: 'antigravity' }, /unsupported seat provider antigravity/],
+  ['bare review-seat leaves only zero-cap agy-gemini', 'review-seat', { disabledProviders: ['codex', 'agy-claude'] }, /no available route/],
+])('refuses %s and preserves working file bytes', (name, target, patch, error) => {
+  const f = fixture();
+  const original = '{"routingOverrides":{"review-seat:red-team":{"provider":"codex"}},"keep":true}\n';
+  writeFileSync(f.path, original);
+  expect(() => writeRoutingOverride({ key: target, patch }, { env: f.env })).toThrow(error);
+  expect(readFileSync(f.path, 'utf8')).toBe(original);
+});
+
+it.each(['review-seat:red-team', 'review-seat'])('accepts a %s disable that keeps an explicitly capped agy-gemini', target => {
+  const f = fixture();
+  const env = { ...f.env, WE_REVIEW_SEAT_CAP_AGY_GEMINI: '25' };
+  writeRoutingOverride({ key: target, patch: { disabledProviders: ['codex', 'agy-claude'] } }, { env });
+  expect(JSON.parse(readFileSync(f.path, 'utf8')).routingOverrides[target]).toEqual({ disabledProviders: ['codex', 'agy-claude'] });
+});
+
 it('refuses an override that exhausts the effective fallback route and preserves file bytes', () => {
   const f = fixture();
   const original = '{"routingOverrides":{"prepare-item":{"provider":"codex"}},"keep":true}\n';

@@ -3,6 +3,8 @@ export const REVIEW_SEAT_PROVIDERS = Object.freeze(['codex', 'agy-claude', 'agy-
 const SETTINGS_SEAT_PROVIDERS = Object.freeze(['claude', 'agy-claude', 'agy-gemini']);
 
 export const OPERATION_PROVIDER_ROSTERS = Object.freeze({
+  // Extra-juror and advisory-lens seats resolve through the bare key and launch from this same roster.
+  'review-seat': REVIEW_SEAT_PROVIDERS,
   'review-seat:red-team': REVIEW_SEAT_PROVIDERS,
   'review-seat:mandatory:correctness': SETTINGS_SEAT_PROVIDERS,
   'review-seat:mandatory:security': SETTINGS_SEAT_PROVIDERS,

@@ -43,7 +43,7 @@ export function writeRoutingOverride({ key, patch }, { env = process.env } = {})
     if (patch === null) delete overrides[key];
     else overrides[key] = patch;
     const effectivePolicy = applyRoutingOverrides(policy, overrides);
-    resolveRoutingOverrideRoute(key, effectivePolicy);
+    resolveRoutingOverrideRoute(key, effectivePolicy, { env });
     prefs.routingOverrides = overrides;
     const scratch = `${path}.${randomUUID()}.tmp`;
     try {
