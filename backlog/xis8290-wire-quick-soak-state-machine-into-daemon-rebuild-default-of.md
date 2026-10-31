@@ -2,7 +2,8 @@
 kind: story
 size: 8
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/quick-soak-job.mjs", "we:scripts/lib/daemon-rebuild/quick.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/state.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/daemon-rebuild/__tests__/"]
+scope: ["we:scripts/lib/daemon-rebuild/quick-soak-job.mjs", "we:scripts/lib/daemon-rebuild/quick.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/state.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/lib/daemon-rebuild/__tests__/"]
+scopeRationale: "New quick-soak state and control tests live under we:scripts/lib/daemon-rebuild/__tests__/. The basename-matched we:scripts/__tests__/state.test.mjs tests the unrelated /state CLI, not we:scripts/lib/daemon-rebuild/state.mjs."
 blockedBy: ["xb0txug"]
 dateOpened: "2026-10-31"
 preparedDate: "2026-10-31"
