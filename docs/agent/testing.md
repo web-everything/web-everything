@@ -2033,7 +2033,7 @@ earlier phase's rewrite for standards, scanners or guards. Strip only trailing
 `--passWithNoTests`, `--testTimeout=<digits>` (at least 5000) and `--hookTimeout=<digits>`
 (at least 10000) before checking the remaining arguments with Forge's existing `allowedCommand` guard.
 Smaller timeouts stay local so remote defaults cannot loosen them. Remote location evidence
-requires a non-empty receipt ID and an integer exit code; incomplete reports stay local.
+requires a non-empty receipt ID and an integer exit code; a dispatched attempt with an incomplete or missing report is location `unknown` (never local), and any unknown phase makes the overall location unknown.
 Keep allowlisted reporters; unknown options retain the original local command and admission.
 
 The runner's `telemetry` subcommand samples the host on demand, including on fresh installs

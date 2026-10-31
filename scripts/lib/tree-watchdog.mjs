@@ -28,12 +28,14 @@ const WATCHDOG_SOURCE = `import('node:worker_threads').then(({ workerData, paren
   import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort)));`;
 
 // flag[0]: -1 cancelled, 0 armed, 1 fired (escape sweeps running), 2 swept (the kill is complete).
-function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
+// `ownGroup`, `selfPid` and `killTree` are test seams only; production passes none of them.
+export function fireTreeKill({ pid, kill, flag, afterTree = () => {}, ownGroup = ownProcessGroup, selfPid = process.pid,
+  killTree = killProcessTree }) {
   // Cancellation and firing compete on the same word: a stop during worker startup must disarm the ceiling too.
   if (Atomics.compareExchange(flag, 0, 0, 1) !== 0) return;
-  const pgid = kill.orphansOfOwnGroup ? ownProcessGroup() : null;
+  const pgid = kill.orphansOfOwnGroup ? ownGroup() : null;
   // Orphans of this group only when this process LEADS it (every member is then provably ours).
-  killProcessTree(pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null, marker: kill.marker ?? null, outputFds: kill.outputFds ?? [], afterTree });
+  killTree(pid, 'SIGKILL', { orphansOfGroup: pgid === selfPid ? pgid : null, marker: kill.marker ?? null, outputFds: kill.outputFds ?? [], afterTree });
   Atomics.store(flag, 0, 2);
 }
 
