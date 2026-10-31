@@ -651,6 +651,7 @@ describe('bounded filesystem adapters', () => {
       return count;
     });
     closeSync.mockClear();
+    openSync.mockClear();
     try {
       expect(() => boundedReadFile(path, io)).toThrow(/1 MiB/);
       expect(total).toBe(maxBytes + 1);
@@ -660,9 +661,11 @@ describe('bounded filesystem adapters', () => {
         expect(range.offset + range.length).toBe(maxBytes + 1);
       }
       expect(closeSync).toHaveBeenCalledTimes(1);
-      // The reader closes the exact fd it read from. Never re-read that number: the OS may already have recycled it.
+      // The reader closes the exact fd it opened and read from. Never re-read
+      // that number after close: the OS may already have recycled it.
       expect(readFds.size).toBe(1);
       expect(closeSync.mock.calls[0][0]).toBe([...readFds][0]);
+      expect(closeSync.mock.calls[0][0]).toBe(openSync.mock.results[0].value);
     } finally {
       readSync.mockImplementation(nativeRead);
       rmSync(root, { recursive: true, force: true });
