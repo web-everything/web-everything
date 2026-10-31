@@ -315,6 +315,12 @@ describe('buildAgyDirectTaskArgv — observed stdin route, no invented flags or 
   it.each(['low', 'medium', 'high'])('forwards effort %s with no model pin', (effort) => {
     expect(buildAgyDirectTaskArgv({ effort })).toEqual([...BASE, '--effort', effort, '--print', '']);
   });
+  it.each(['low', 'medium', 'high'])('omits --effort for the Argon %s model suffix', (suffix) => {
+    const model = `gemini-4-argon-${suffix}`;
+    expect(buildAgyDirectTaskArgv({ model: ` ${model} `, effort: 'medium' }))
+      .toEqual([...BASE, '--model', model, '--print', '']);
+    expect(() => buildAgyDirectTaskArgv({ model, effort: 'bogus' })).toThrow(TypeError);
+  });
   it('names only the two known Claude backends as effort exceptions', () => {
     expect(AGY_EFFORT_UNSUPPORTED_MODELS).toEqual(['claude-sonnet-4-6', 'claude-opus-4-6-thinking']);
   });

@@ -178,7 +178,7 @@ export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = 
     if (!Array.isArray(scorecards)) throw new Error('quota scorecards unreadable');
     const availability = {
       'antigravity-claude': readHolds('claude-sonnet-4-6', { now }),
-      'antigravity-gemini': readHolds('gemini-3.1-pro', { now }),
+      'antigravity-gemini': readHolds('gemini-4-argon-high', { now }),
       codex: providerQuotaHold(scorecards, 'codex', now),
     };
     const route = decideDispatchRoute({ kind: 'ci-heal', scopePaths: p.scope ?? [], reason: p.reason ?? 'red-ci' }, { scorecards, ciHealAvailability: availability });

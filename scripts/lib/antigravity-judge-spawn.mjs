@@ -134,6 +134,7 @@
  */
 
 import { agyRunEvidence, readAgyHold, saveAgyHold, agyEvidenceError } from './antigravity-run-evidence.mjs';
+import { hasAntigravityEffortSuffix } from './antigravity-model-effort.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync,
@@ -157,13 +158,9 @@ export const ANTIGRAVITY_CLI = 'agy';
  * resolves implicitly (#3633 probe 9 — the CLI's own undocumented default self-reports as "Gemini 3.8 Flash"
  * with NO exposed effort tier, so a run record could not even stamp what it actually asked for).
  *
- * `gemini-3.1-pro` — a BARE model id from `agy`'s own roster (#3633 probe 9's "ten models" enumeration) —
- * deliberately NOT one of the effort-SUFFIXED ids (`gemini-3.8-flash-medium` and friends). Probe 9 also found
- * effort is "either a model-id suffix or the flag, never both": a suffixed id conflicts with a separately
- * passed `--effort`, while a bare id like this one REQUIRES `--effort` as its own flag (available `low|high`
- * for this specific model). This module's seat always supplies one explicitly (see `ANTIGRAVITY_REVIEW_EFFORT`
- * in `review-pr.mjs`), so pinning a bare id here is what keeps the two flags from ever landing on the same
- * argv in a way `agy` refuses.
+ * `gemini-4-argon-high` is an effort-suffixed id from the current `agy models` roster; no bare
+ * `gemini-4-argon` id is available. High effort is baked into the model id. agy accepts effort as a
+ * model-id suffix OR the `--effort` flag, never both, so the argv builder omits the flag for suffixed ids.
  *
  * NO LIVE COST/QUALITY COMPARISON HAS BEEN RUN across `agy`'s ten models for this role, unlike the Codex fourth
  * seat's measured medium-vs-max comparison (`CORRECTNESS_ADVISORY_EFFORT`'s own docblock) — stated honestly:
@@ -171,7 +168,7 @@ export const ANTIGRAVITY_CLI = 'agy';
  * `model-probation.json`'s own entry for this identity), not a benchmarked choice. Revisit once probation data
  * (#3649's run-quality recorder) accumulates.
  */
-export const ANTIGRAVITY_MODEL = 'gemini-3.1-pro';
+export const ANTIGRAVITY_MODEL = 'gemini-4-argon-high';
 
 /**
  * The shared care→rigor dial's effort enum (`judge-spawn.mjs#EFFORT_LEVELS`) does not match `agy`'s own
@@ -189,26 +186,12 @@ export const ANTIGRAVITY_EFFORT_MAP = Object.freeze({
 });
 
 /**
- * #x5s8b47 — PER-MODEL `--effort` RESTRICTIONS, layered UNDER {@link ANTIGRAVITY_EFFORT_MAP}'s already
- * CLI-LEVEL clamp (xhigh/max -> high). That map normalizes across every model `agy` can run — the CLI's
- * `--effort` flag itself accepts low/medium/high universally — but a SPECIFIC model can still refuse a value
- * the flag otherwise accepts: a live run seating the pinned seat model ({@link ANTIGRAVITY_MODEL},
- * `gemini-3.1-pro`) at `medium` hit `status: "ERROR"` before any API call, `invalid model selection (--model
- * "gemini-3.1-pro" --effort "medium"): gemini-3.1-pro has no "medium" effort (available: low, high)` — this
- * seat's fallback path (`judgeAdvisory`/`judgeCorrectnessAdvisory` degrading onto `antigravity` when Codex is
- * quota-held) crashed on EVERY run as a result, exactly as `ANTIGRAVITY_MODEL`'s own docblock already
- * predicted ("REQUIRES `--effort`... available `low|high` for this specific model") but nothing enforced.
- *
- * A SEPARATE table from `ANTIGRAVITY_EFFORT_MAP` rather than folding model-awareness into it: most models on
- * `agy`'s own roster accept the full low/medium/high range (#3633 probe 9's "ten models" enumeration), so a
- * per-model entry here is the EXCEPTION, keyed only for a model actually known to restrict it — an unlisted
- * model falls through to the CLI-level map untouched. Each entry maps an UNSUPPORTED value to the NEAREST
- * supported one — a degrade, never a refusal, mirroring `ANTIGRAVITY_EFFORT_MAP`'s own xhigh/max -> high
- * clamp reasoning exactly: an unsupported request should still run, at the closest level the model actually
- * offers, rather than crash the seat outright.
+ * Legacy bare-model restrictions, layered under the CLI-level effort map. Historical callers of
+ * `gemini-3.1-pro` still need medium clamped to high (agy only accepted low/high for that model).
+ * The current Argon pin carries effort in its suffix and needs no override or separate effort flag.
  */
 export const ANTIGRAVITY_MODEL_EFFORT_OVERRIDES = Object.freeze({
-  [ANTIGRAVITY_MODEL]: Object.freeze({ medium: 'high' }),
+  'gemini-3.1-pro': Object.freeze({ medium: 'high' }),
 });
 
 /**
@@ -316,9 +299,10 @@ export function buildAntigravityJudgeArgv({ schemaFile, model, effort } = {}) {
     if (!mapped) {
       throw new TypeError(`antigravity-judge-spawn: \`effort\` must be one of ${Object.keys(ANTIGRAVITY_EFFORT_MAP).join('|')}, got ${JSON.stringify(effort)}`);
     }
-    // #x5s8b47 — a SECOND, model-specific clamp on top of the CLI-level one above (see
-    // `ANTIGRAVITY_MODEL_EFFORT_OVERRIDES`'s own header for the live crash this fixes).
-    argv.push('--effort', resolveAntigravityModelEffort(model, mapped));
+    // Effort-suffixed ids already select effort; agy rejects combining them with --effort.
+    if (!hasAntigravityEffortSuffix(model)) {
+      argv.push('--effort', resolveAntigravityModelEffort(model, mapped));
+    }
   }
   // `--print ''` — the prompt rides stdin as a stream-json `user` event instead (see
   // `buildAntigravityStreamInput`); an EMPTY value is required in this mode (#3633 probe 5b), never omitted
@@ -677,10 +661,15 @@ export async function antigravityJudgeSpawn({
   }
   assertNoAntigravityToolAllowlist(allowedTools);
 
+  // Record the tier agy will use, including suffixes that supersede the requested effort.
+  const effectiveEffort = hasAntigravityEffortSuffix(model)
+    ? model.trim().split('-').at(-1)
+    : resolveAntigravityModelEffort(model, ANTIGRAVITY_EFFORT_MAP[effort]);
   const hold = readHold(model);
   if (hold) {
-    recordScorecard({ provider: 'antigravity', model: 'unknown', ...hold, dispatchKind: role, kind: 'review', role });
-    throw agyEvidenceError(hold);
+    const evidence = { ...hold, effort: effectiveEffort };
+    recordScorecard({ provider: 'antigravity', model: 'unknown', ...evidence, dispatchKind: role, kind: 'review', role });
+    throw agyEvidenceError(evidence);
   }
   const workDir = mkTempDir(join(tmpdir(), 'antigravity-judge-'));
   const spawnCwd = cwd || workDir;
@@ -742,7 +731,7 @@ export async function antigravityJudgeSpawn({
       child.stdin?.end(streamInput);
     });
   } catch (error) {
-    const evidence = agyRunEvidence({ requestedModel: model });
+    const evidence = { ...agyRunEvidence({ requestedModel: model }), effort: effectiveEffort };
     error.telemetry = evidence;
     recordScorecard({ ...evidence, model: 'unknown', provider: 'antigravity', dispatchKind: role, kind: 'review', role });
     throw error;
@@ -766,13 +755,13 @@ export async function antigravityJudgeSpawn({
   // unparseable run is recorded too — exactly the run most worth capturing. Best-effort, never throws
   // (`recordAntigravityRunScorecard`'s own header) — a recording failure can never turn an otherwise-completed
   // judge call into a failed one.
-  const evidence = agyRunEvidence({ ...result, requestedModel: model });
+  const evidence = { ...agyRunEvidence({ ...result, requestedModel: model }), effort: effectiveEffort };
   let holdError;
   try { saveHold(evidence); } catch (error) { holdError = error; }
   recordScorecard({
     ...evidence,
     transcriptFile, dispatchKind: role, kind: 'review', role,
-    provider: 'antigravity', model: evidence.servedModel, effort,
+    provider: 'antigravity', model: evidence.servedModel,
   });
 
   try {
