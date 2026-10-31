@@ -67,7 +67,7 @@ const safeDotDirectory = /^(?:\.github|\.githooks|\.husky|\.vscode|\.storybook|\
 const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
 const keyComponent = /(?:_rsa|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
 const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|api[-_ .]?key|^id_/;
-const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
+export const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
 function normalizedComponent(part) {
   const utf8 = part.toString('utf8');
   // Non-test opaque byte names retain their existing byte-path contract. Only

@@ -199,7 +199,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -211,19 +211,19 @@ async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
   for(const part of [null,...parts.slice(0,-1)]) {
     if(part)absolute=bytePath(absolute,part);
     const parent=await fs.lstat(absolute);
-    if(parent.isSymbolicLink()||!parent.isDirectory())throw manifestRefusal('unshipped-symlink');
+    if(parent.isSymbolicLink()||!parent.isDirectory())throw manifestRefusal('unshipped-symlink',absolute.subarray(Buffer.byteLength(cwd)+1));
   }
   const link=bytePath(cwd,linkPath);
-  if(!(await fs.lstat(link)).isSymbolicLink())throw manifestRefusal('unshipped-symlink');
+  if(!(await fs.lstat(link)).isSymbolicLink())throw manifestRefusal('unshipped-symlink',linkPath);
   const target = await fs.readlink(link, {encoding:'buffer'});
   if (!oid || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(oid)
     || createHash(oid.length === 64 ? 'sha256' : 'sha1').update(`blob ${target.length}\0`).update(target).digest('hex') !== oid)
-    throw manifestRefusal('unshipped-symlink');
+    throw manifestRefusal('unshipped-symlink',linkPath);
   // Resolve POSIX link bytes without decoding opaque Git filenames or following
   // another link. Any step outside the repository refuses the whole snapshot.
-  if(!target.length||target.some(b=>b===0||b===10||b===13))throw manifestRefusal('unshipped-symlink');
+  if(!target.length||target.some(b=>b===0||b===10||b===13))throw manifestRefusal('unshipped-symlink',linkPath);
   const rootPrefix=directoryPrefix(Buffer.from(cwd));
-  if(target[0]===47&&!underPath(target,rootPrefix))throw manifestRefusal('unshipped-symlink');
+  if(target[0]===47&&!underPath(target,rootPrefix))throw manifestRefusal('unshipped-symlink',linkPath);
   const relativeTarget=target[0]===47?target.subarray(rootPrefix.length):target;
   const resolved=target[0]===47?[]:parts.slice(0,-1);
   let start=0;
@@ -231,28 +231,30 @@ async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
     const part=relativeTarget.subarray(start,i);start=i+1;
     if(!part.length||part.equals(Buffer.from('.')))continue;
     if(part.equals(Buffer.from('..'))) {
-      if(!resolved.length)throw manifestRefusal('unshipped-symlink');
+      if(!resolved.length)throw manifestRefusal('unshipped-symlink',linkPath);
       resolved.pop();
     } else {
       resolved.push(part);
       const path=Buffer.concat(resolved.flatMap((part,i)=>i?[Buffer.from('/'),part]:[part]));
       const st=await fs.lstat(bytePath(cwd,path));
-      if(st.isSymbolicLink()||!st.isDirectory())throw manifestRefusal('unshipped-symlink');
+      if(st.isSymbolicLink()||!st.isDirectory())throw manifestRefusal('unshipped-symlink',path);
     }
   }
   const source=Buffer.concat(resolved.flatMap((part,i)=>i?[Buffer.from('/'),part]:[part]));
   if(!source.length||underPath(linkPath,directoryPrefix(source))||(targetPath&&!source.equals(targetPath)))
-    throw manifestRefusal('unshipped-symlink');
+    throw manifestRefusal('unshipped-symlink',linkPath);
   absolute=Buffer.from(cwd);
   for(const part of pathParts(source)) {
     absolute=bytePath(absolute,part);
     const st=await fs.lstat(absolute);
-    if(st.isSymbolicLink()||!st.isDirectory())throw manifestRefusal('unshipped-symlink');
+    if(st.isSymbolicLink()||!st.isDirectory())throw manifestRefusal('unshipped-symlink',absolute.subarray(Buffer.byteLength(cwd)+1));
   }
   return source;
 }
 
-const manifestRefusal=code=>Object.assign(new Error(`${code}: use local fallback`),{code});
+const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local fallback`),{
+  code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
+});
 // Walk independently of Git's inventory. Never follow a directory link.
 async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
@@ -260,26 +262,26 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   let count=0,bytes=0;
   async function walk(directory,prefix=Buffer.alloc(0)) {
     const before=await fs.lstat(directory);
-    if(!before.isDirectory()||before.isSymbolicLink())throw manifestRefusal('manifest-worktree-mismatch');
+    if(!before.isDirectory()||before.isSymbolicLink())throw manifestRefusal('manifest-worktree-mismatch',prefix);
     const names=await fs.readdir(directory,{encoding:'buffer'});
-    if(names.length>100000-count)throw manifestRefusal('manifest-walk-limit');
+    if(names.length>100000-count)throw manifestRefusal('manifest-walk-limit',prefix);
     for(const name of names) {
       if(name.equals(Buffer.from('.git'))||name.equals(Buffer.from('node_modules')))continue;
       const path=prefix.length?bytePath(prefix,name):name;
-      if(++count>100000||(bytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
+      if(++count>100000||(bytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       const absolute=bytePath(cwd,path),st=await inventoryStat(fs,absolute),key=path.toString('hex');
       walked.set(key,st);
       // (b) Only verified index links may project regular source leaves.
       const link=trackedLinks.get(key);
       if(st.isSymbolicLink()||link) {
-        if(!link)throw manifestRefusal('unshipped-symlink');
-        try {await verifyTrackedLink(cwd,link,fs);}catch {throw manifestRefusal('unshipped-symlink');}
+        if(!link)throw manifestRefusal('unshipped-symlink',path);
+        try {await verifyTrackedLink(cwd,link,fs);}catch(error) {throw manifestRefusal('unshipped-symlink',error.detail??link.linkPath);}
         continue;
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
         // (a) Ignored tests still belong to the runner's discovery universe.
-        if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file');
+        if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
         if(!shipped.has(key)&&ignoredPaths.has(key)&&!classifyManifestPath(path).excluded) {
@@ -288,8 +290,11 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
             const projected=Buffer.concat([directoryPrefix(link.linkPath),alias.subarray(link.sourcePrefix.length)]);
             const projectedKey=projected.toString('hex');
             if(seen.has(projectedKey))continue;
-            if(++count>100000||(bytes+=projected.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
-            if(isTestFile(projected)||classifyManifestPath(projected).excluded)throw manifestRefusal('unshipped-symlink');
+            if(++count>100000||(bytes+=projected.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',projected);
+            const policy=classifyManifestPath(projected);
+            // Ignored runtime data may be excluded solely by the tracked link's prefix.
+            if(isTestFile(projected)||policy.excluded&&(sourceExtension.test(policy.names.at(-1))
+              ||classifyManifestPath(projected.subarray(directoryPrefix(link.linkPath).length)).excluded))throw manifestRefusal('unshipped-symlink',link.linkPath);
             seen.add(projectedKey);aliases.push(projected);
           }
           continue;
@@ -298,13 +303,13 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
           const projection=shipped.get(Buffer.concat([directoryPrefix(link.linkPath),path.subarray(link.sourcePrefix.length)]).toString('hex'));
           const source=shipped.get(key);
           if(!source||!projection||projection.sha256!==source.sha256
-            ||!projection.sourcePath?.equals(path))throw manifestRefusal('unshipped-symlink');
+            ||!projection.sourcePath?.equals(path))throw manifestRefusal('unshipped-symlink',link.linkPath);
         }
-      } else throw manifestRefusal('manifest-worktree-mismatch');
+      } else throw manifestRefusal('manifest-worktree-mismatch',path);
     }
     const after=await fs.lstat(directory);
     if(!after.isDirectory()||after.isSymbolicLink()||before.dev!==after.dev||before.ino!==after.ino)
-      throw manifestRefusal('manifest-worktree-mismatch');
+      throw manifestRefusal('manifest-worktree-mismatch',prefix);
   }
   // Sibling manifests deliberately cover only these contract roots.
   if(scoped) {
@@ -316,24 +321,25 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
     const path=entry.sourcePath??entry.path,key=path.toString('hex');
     const actual=walked.get(key),expected=identities.get(key);
     if(!actual?.isFile()||!expected||actual.dev!==expected.dev||actual.ino!==expected.ino)
-      throw manifestRefusal('manifest-worktree-mismatch');
+      throw manifestRefusal('manifest-worktree-mismatch',entry.path);
   }
   const rootAfter=await fs.lstat(Buffer.from(cwd));
   if(!rootAfter.isDirectory()||rootAfter.isSymbolicLink()||rootInfo.dev!==rootAfter.dev||rootInfo.ino!==rootAfter.ino)
-    throw manifestRefusal('manifest-worktree-mismatch');
+    throw manifestRefusal('manifest-worktree-mismatch','.');
   // (d) Missing tracked leaves require explicit deletion evidence.
   const missing=[...indexBlobs.keys()].map(key=>Buffer.from(key,'base64')).filter(path=>
     !walked.has(path.toString('hex'))&&!pathParts(path).some(p=>p.equals(Buffer.from('.git'))||p.equals(Buffer.from('node_modules')))
     &&(!scoped||Object.values(SIBLING_PATHS).some(root=>path.toString().startsWith(root.slice('../frontierui/'.length)+'/'))));
   if(missing.length) {
     const result=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});
-    if(result.code!==0)throw manifestRefusal('manifest-worktree-mismatch');
+    if(result.code!==0)throw manifestRefusal('manifest-worktree-mismatch',missing[0]);
     const fields=splitPaths(result.stdout),deleted=new Set();
     for(let i=0;i<fields.length;i+=2) {
-      if(!fields[i+1]||!/^[ACDMTUXB]$/.test(fields[i].toString()))throw manifestRefusal('manifest-worktree-mismatch');
+      if(!fields[i+1]||!/^[ACDMTUXB]$/.test(fields[i].toString()))throw manifestRefusal('manifest-worktree-mismatch',fields[i+1]??missing[0]);
       if(fields[i].equals(Buffer.from('D')))deleted.add(fields[i+1].toString('hex'));
     }
-    if(missing.some(path=>!deleted.has(path.toString('hex'))))throw manifestRefusal('manifest-worktree-mismatch');
+    const undeleted=missing.find(path=>!deleted.has(path.toString('hex')));
+    if(undeleted)throw manifestRefusal('manifest-worktree-mismatch',undeleted);
   }
 }
 
@@ -385,10 +391,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
     const link={linkPath:Buffer.from(key,'base64'),linkOid:indexBlobs.get(key)};
-    try {link.targetPath=await verifyTrackedLink(cwd,link,fs);}catch {throw manifestRefusal('unshipped-symlink');}
+    try {link.targetPath=await verifyTrackedLink(cwd,link,fs);}catch(error) {throw manifestRefusal('unshipped-symlink',error.detail??link.linkPath);}
     link.sourcePrefix=directoryPrefix(link.targetPath);
     const targets=[...indexBlobs.keys()].filter(key=>underPath(Buffer.from(key,'base64'),link.sourcePrefix));
-    if(!targets.some(key=>indexBlobs.get(key)))throw manifestRefusal('unshipped-symlink');
+    if(!targets.some(key=>indexBlobs.get(key)))throw manifestRefusal('unshipped-symlink',link.linkPath);
     trackedLinks.set(link.linkPath.toString('hex'),link);
     // An injected inventory cannot omit a tracked link or its target corpus.
     files.push(link.linkPath,...targets.map(key=>Buffer.from(key,'base64')));
@@ -467,7 +473,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     for (const [i,part] of parts.entries()) {
       absolute = bytePath(absolute,part);
       st = await inventoryStat(fs,absolute);
-      if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink');
+      if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink',absolute.subarray(Buffer.byteLength(cwd)+1));
       if (i === parts.length-1 ? !st.isFile() : !st.isDirectory()) throw new Error('Unsafe inventory component');
     }
     identities.set(path.toString('hex'),st);
@@ -496,17 +502,17 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   function project(link) {
     const key=link.linkPath.toString('hex');
     if(projected.has(key))return projected.get(key);
-    if(projecting.has(key))throw manifestRefusal('unshipped-symlink');
+    if(projecting.has(key))throw manifestRefusal('unshipped-symlink',link.linkPath);
     projecting.add(key);
     if (excluded.some(path=>underPath(path,link.sourcePrefix)))
-      throw manifestRefusal('unshipped-symlink');
+      throw manifestRefusal('unshipped-symlink',link.linkPath);
     const targets = sourceEntries.filter(entry=>underPath(entry.path,link.sourcePrefix));
     for(const nested of trackedLinks.values())if(underPath(nested.linkPath,link.sourcePrefix))targets.push(...project(nested));
-    if (!targets.length) throw manifestRefusal('unshipped-symlink');
+    if (!targets.length) throw manifestRefusal('unshipped-symlink',link.linkPath);
     const leaves=[];
     for (const entry of targets) {
       const path=Buffer.concat([directoryPrefix(link.linkPath),entry.path.subarray(link.sourcePrefix.length)]);
-      if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit');
+      if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }
     projecting.delete(key);projected.set(key,leaves);
@@ -548,7 +554,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
     ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
-    ? error : manifestRefusal('manifest-worktree-mismatch');}
+    ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
   const wire = manifestWire(manifest);
   if (Buffer.byteLength(JSON.stringify(wire)) > LIMIT - 16384) throw new Error('Manifest wire limit exceeded; use local fallback');
@@ -774,7 +780,7 @@ export async function runRemote(options={}) {
 }
 
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
-  const fallback = (reason) => ({ mode: 'not-started', terminated: true, reason });
+  const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
@@ -1015,7 +1021,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed');
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');

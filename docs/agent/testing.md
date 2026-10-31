@@ -3541,6 +3541,11 @@ escaping or incomplete links refuse with `unshipped-symlink`. Cyclic projections
 also refuse; expanding links share the walk's count/byte limits and report
 `manifest-walk-limit` when those limits are exceeded.
 
+Manifest refusals keep the reason code separate from `detail`: the offending path
+relative to the checkout, decoded as lossy UTF-8 and kept on one line. Preserve
+this detail through verification wrappers and remote fallback; heavy admission
+logs it with the shared `oneLine` sanitizer and bound.
+
 Projected entries retain their regular `sourcePath` and link evidence for staging
 reverification. Delta manifests always transfer projected leaves, including unchanged
 ones: their alias paths have no corresponding regular Git blob for digest assembly.
@@ -3557,8 +3562,9 @@ ignored byte inventory; it still refuses untracked symlinks, missing projections
 for non-ignored regular files, and policy-excluded source leaves, even when ignored.
 `forge-manifest-parity.test.mjs` rows 20–25 and 31 cover those boundaries for full and
 delta manifests, including ignored runtime JSON beside a `node_modules/.bin` symlink
-and the earlier `ignored-test-file` refusal. Row 20 refuses the excluded
-`.claude/skills` alias; row 31 retains omission parity through an allowed alias.
+and the earlier `ignored-test-file` refusal. Row 20 omits ignored runtime data at the
+excluded `.claude/skills` alias only when the leaf is not source code and the remainder
+after the link prefix is not policy-excluded; row 31 retains omission parity through an allowed alias.
 Check every projected alias before skipping an ignored leaf, including nested link
 projections: a non-test source can become a test under `tests/`, or acquire an
 excluded component. Rows 26–30 pin those refusals and benign nested omissions for

@@ -197,7 +197,7 @@ const rows=[
   [17,'tracked directory symlink projects skills'],
   [18,'tracked directory symlink has no special path name'],
   [19,'tracked directory symlink with an absolute in-repo target'],
-  [20,'tracked directory symlink refuses ignored runtime files projected into excluded .claude/skills'],
+  [20,'tracked directory symlink omits ignored runtime data files projected into excluded .claude/skills'],
   [21,'tracked directory symlink still refuses an ignored untracked source symlink'],
   [22,'tracked directory symlink still requires an omitted non-ignored source file'],
   [23,'tracked directory symlink still refuses an ignored policy-excluded source file'],
@@ -211,7 +211,7 @@ const rows=[
   [31,'allowed tracked directory alias omits ignored runtime files beside a node_modules/.bin symlink'],
 ];
 it.each(rows)('row %i: %s',async row=>{
-  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,20,21,22,23,24,25,26,27,28,29].includes(row);
+  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29].includes(row);
   const omitted=[];
   if(row===2){const st=await fs.stat(join(cwd,'keep.txt'));await write('keep.txt','diff');await fs.utimes(join(cwd,'keep.txt'),st.atimeMs/1000,st.mtimeMs/1000);}
   if(row===3){const twin=join(root,'twin');await fs.cp(cwd,twin,{recursive:true});await fs.writeFile(join(twin,'keep.txt'),'twin');hostile.GIT_DIR=join(twin,'.git');hostile.GIT_WORK_TREE=twin;}

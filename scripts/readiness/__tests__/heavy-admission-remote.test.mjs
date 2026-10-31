@@ -405,6 +405,17 @@ describe('runWithRemoteDecision', () => {
     expectFallback(f.log, reason);
   });
 
+  it.each([
+    ['fixtures/link','fixtures/link'],
+    ['fixtures/unsafe\n\x1b\tlink','fixtures/unsafe???link'],
+    ['x'.repeat(100),'x'.repeat(80)],
+  ])('logs the sanitized and bounded refusal detail %j before local admission', async (detail,display) => {
+    const f=fixture({result:{mode:'not-started',terminated:true,reason:'unshipped-symlink',detail}});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log).toHaveBeenLastCalledWith(`heavy-admission: remote failed (fallback: unshipped-symlink (${display})) - falling back to local admission\n`);
+  });
+
   it.each(['ignored-test-file', 'future-client-prelaunch-refusal'])('runs locally for confirmed non-start with arbitrary reason %s', async reason => {
     const f = fixture({result:{mode:'not-started', terminated:true, reason}});
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});

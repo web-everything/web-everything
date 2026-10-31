@@ -296,7 +296,8 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
       symlinkSync(join(external,'payload.txt'),join(cwd,file));
     } else symlinkSync(kind === 'dangling parent' ? join(cwd,'absent') : external,join(cwd,'fixtures'));
     f.listFiles.mockResolvedValue(['package-lock.json',file]);
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'unshipped-symlink'});
+    const detail = kind === 'leaf' ? file : kind === 'nested parent' ? 'fixtures/nested' : 'fixtures';
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'unshipped-symlink',detail});
     expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
     expect(callsOf(f.exec).some(isRun)).toBe(false);
   });
@@ -701,8 +702,11 @@ describe('standards input parity', () => {
       ? Buffer.from(`${fault === 'untracked' ? '' : `120000 ${oid} 0\t.claude/agent-memory\0`}100644 ${'b'.repeat(40)} 0\tagent-memory-src/MEMORY.md\0`)
       : Buffer.alloc(0)});
     const build = () => remoteManifestAPI.buildManifest({cwd,exec,listFiles:async()=>['.claude/agent-memory','agent-memory-src/MEMORY.md']});
-    if (fault === 'untracked') await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
-    else await expect(build()).rejects.toThrow();
+    if (fault === 'missing index') await expect(build()).rejects.toThrow();
+    else await expect(build()).rejects.toMatchObject({
+      code:'unshipped-symlink',message:'unshipped-symlink: use local fallback',
+      detail:fault === 'linked parent' ? '.claude' : fault === 'linked target' ? 'agent-memory-src' : '.claude/agent-memory',
+    });
   });
 
   it.each(['stdout','stderr'])('observes real streamed %s while retaining inherited output', async stream => {
@@ -1722,6 +1726,17 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
     return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
   }
+  it.each(['inventory','walk'])('carries a relative, lossy UTF-8, single-line path in an unshipped symlink refusal from %s', async site => {
+    const path=Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('\n\t\ré\u2028.txt')]);
+    const fs={
+      lstat:async absolute=>Buffer.from(absolute).equals(Buffer.from(cwd))
+        ? filesystem.lstat(cwd) : {isSymbolicLink:()=>true},
+      readdir:async()=>[path],
+    };
+    await expect(build({cwd,fs,exec:gitInventory(site === 'inventory' ? [path] : [])})).rejects.toMatchObject({
+      code:'unshipped-symlink',message:'unshipped-symlink: use local fallback',detail:'raw-�???é?.txt',
+    });
+  });
   it.each(['parent','leaf'])('rejects an allowlisted ignored coverage input with a %s symlink', async kind => {
     const outside=join(cwd,'outside');
     mkdirSync(outside);
