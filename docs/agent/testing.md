@@ -3106,6 +3106,11 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+The run-scoped temp allocator canonicalizes its base before creating fixtures: macOS's
+`/var` alias must not reach descriptor-relative snapshot copies, which reject symlink
+ancestors. Preserve those production no-follow guards; test the allocator with an explicit
+symlink alias rather than teaching the copy code to follow links.
+
 Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
 `core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
 `full-scan`. Unreadable or incomplete config evidence also requires that fallback.
@@ -3259,6 +3264,18 @@ then assert its manifest digest and snapshot bytes. Preserve source mtimes throu
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
 a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
+
+The tracked `.claude/agent-memory` bridge is verified against its index blob and
+projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY.md`
+and the complete target corpus; reject unsafe links or incomplete inputs before
+transfer. These projected inputs require full shipping.
+
+For remote `check:standards`, observe both output streams for skipped gates,
+`no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
+remote result to fall back through local admission; an invalid receipt keeps the
+result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
+compares local and shipped discovery of the base, coverage report, and memory index.
+
 ## Probe worker timeout teardown
 
 Worker timeout promises allow at most one second for `worker.terminate()` before
@@ -3283,8 +3300,12 @@ or concurrent writes: hash those leaves normally, and use fresh stat/mode and ba
 checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
 warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
 read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
-Ignored test-shaped build output is exempt only when `check-ignore`
-confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
+Outside dependency/Git internals, ignored test-shaped files force local fallback, including
+files under wholly ignored build directories: Git ignore evidence does not prove exclusion
+from the test runner. The named
+`refuses runnable scripts/build tests ignored by …` cases cover `.gitignore` and
+`.git/info/exclude` for full and delta manifests; `remote-exec.test.mjs`'s
+`falls back before transport for a whole-directory ignored test` table pins remote refusal.
 Run this fixture and the affected Forge tests through heavy admission.
 
 Remote discovery may overlap reachability, HEAD and base discovery, but drain every
@@ -3311,6 +3332,9 @@ starting but does not forcibly interrupt the loader. Do not use this readiness p
 that dynamically imports additional modules after announcing readiness.
 `bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
 imports to exercise cancellation without taking down the test runner on a native loader regression.
+Eval worker bootstraps must support inherited `--input-type=commonjs` and `--input-type=module`;
+use dynamic imports for dependencies shared by both modes. Keep both caller modes in the watchdog's
+heartbeat shutdown matrix, including live handles, in-flight imports and fired deadlines.
 The named `hashes Git-clean … leaves` table covers every sensitive attribute:
 `filter`, `working-tree-encoding`, `ident`, `text`, and `eol`, asserting actual leaf
 reads and equality with full hashing. Include an identity encoding as well as a

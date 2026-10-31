@@ -19,7 +19,7 @@ beforeEach(async()=>{
   for(const [name,data] of Object.entries({'package-lock.json':'lock','a.test.mjs':'test','deleted.txt':'delete','mode.txt':'mode','oauth-source.mjs':'public','credentials.txt':'private'})) await fs.writeFile(join(repo,name),data);
   git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
 });
-afterEach(async()=>fs.rm(root,{recursive:true,force:true}));
+afterEach(async()=>{vi.restoreAllMocks();await fs.rm(root,{recursive:true,force:true});});
 async function baseFixture() {
   const sha=git(['rev-parse','HEAD']).toString().trim();
   const manifest=await remote.buildManifest({cwd:repo,exec});
@@ -428,7 +428,7 @@ describe('runner base materialization refuses before install',()=>{
     expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(false);
     const receipt=await f.runner.finish(f.request);expect(receipt.timings).toMatchObject({installMs:expect.any(Number),runMs:expect.any(Number)});
   });
-  it.each(['valid','tampered','absent','symlink','bad marker','not private'])('prewarm %s claims exclusively or falls back to the ordinary copy, applying only delta',async kind=>{
+  it.each(['valid','tampered','absent','symlink','bad marker','not private','writable pool','writable parent','writable marker','linked marker','symlink marker'])('prewarm %s claims exclusively or falls back to the ordinary copy, applying only delta',async kind=>{
     const f=await setup(true),parent=join(f.server,'bases','prewarm',f.base.sha),tree=join(parent,'1');
     if(kind!=='absent') {
       await fs.mkdir(parent,{recursive:true,mode:0o700});await fs.mkdir(tree,{mode:0o700});
@@ -439,6 +439,11 @@ describe('runner base materialization refuses before install',()=>{
       if(kind==='symlink'){await fs.rm(join(tree,'mode.txt'));await fs.symlink(join(repo,'mode.txt'),join(tree,'mode.txt'));}
       if(kind==='not private')await fs.chmod(tree,0o755);
       if(kind==='bad marker')await fs.writeFile(tree+'.json','{}');
+      if(kind==='writable pool')await fs.chmod(dirname(parent),0o720);
+      if(kind==='writable parent')await fs.chmod(parent,0o702);
+      if(kind==='writable marker')await fs.chmod(tree+'.json',0o620);
+      if(kind==='linked marker')await fs.link(tree+'.json',join(root,'marker-link'));
+      if(kind==='symlink marker'){await fs.rename(tree+'.json',join(root,'marker-target'));await fs.symlink(join(root,'marker-target'),tree+'.json');}
     }
     const inode=kind==='valid'?(await fs.stat(join(tree,'mode.txt'))).ino:null;
     expect((await f.runner.run(f.request)).code).toBe(0);
@@ -451,7 +456,25 @@ describe('runner base materialization refuses before install',()=>{
       expect(await claimPrewarm(join(f.server,'bases'),f.base.sha,'1',join(parent,'second'),f.base.manifest,f.base.manifestDigest,()=>{})).toBe(false);
     }
     expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(kind==='valid');
+    if(['writable pool','writable parent','writable marker','linked marker','symlink marker'].includes(kind))expect(await fs.lstat(tree)).toBeDefined();
     await f.runner.finish(f.request);
+  });
+  it.each(['uid argument','pool owner','parent owner','tree owner','marker owner'])('rejects untrusted prewarm %s before claim and leaves ordinary copying available',async kind=>{
+    const f=await setup(true),bases=join(f.server,'bases'),pool=join(bases,'prewarm'),parent=join(pool,f.base.sha),tree=join(parent,'1');
+    const {decodeManifest}=await import('../forge-exec-manifest.mjs');
+    await fs.mkdir(tree,{recursive:true,mode:0o700});
+    await copyLeaves(join(f.dir,'tree'),tree,decodeManifest(f.base.manifest).entries);
+    await fs.writeFile(tree+'.json',JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}),{mode:0o600});
+    const suspect={'pool owner':pool,'parent owner':parent,'tree owner':tree,'marker owner':tree+'.json'}[kind];
+    const io={...fs,lstat:async path=>{
+      const st=await fs.lstat(path);if(String(path)===suspect)st.uid=process.getuid()+1;return st;
+    }};
+    const dest=join(root,'claimed'),verify=vi.fn(),inode=(await fs.lstat(tree)).ino;
+    expect(await claimPrewarm(bases,f.base.sha,'1',dest,f.base.manifest,f.base.manifestDigest,verify,io,process.getuid()+(kind==='uid argument'?1:0))).toBe(false);
+    expect(verify).not.toHaveBeenCalled();expect((await fs.lstat(tree)).ino).toBe(inode);
+    await expect(fs.lstat(dest)).rejects.toMatchObject({code:'ENOENT'});
+    await fs.mkdir(dest);await copyLeaves(join(f.dir,'tree'),dest,decodeManifest(f.base.manifest).entries);
+    expect(await fs.readFile(join(dest,'mode.txt'),'utf8')).toBe('mode');
   });
   it.each(['file to directory','directory to file','nested deletion'])('prewarm applies %s without stale parent directories',async shape=>{
     const f=await setup(true,shape),tree=join(f.server,'bases','prewarm',f.base.sha,'1');
@@ -546,14 +569,14 @@ describe('runner base materialization refuses before install',()=>{
       expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
-    expect(stage.shipMode).toBe(['delta','retry succeeds','next base'].includes(mode)?'delta':'full');
-    const deltaShipped=['delta','retry succeeds','next base'].includes(mode);
+    const deltaMode=['delta','retry succeeds','next base'].includes(mode);
+    expect(stage.shipMode).toBe(deltaMode?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
-    // only when delta shipping succeeds; the deleted file and private credentials never ship.
-    const payloads=deltaShipped?['changed']:['changed','lock','mode','public'];
+    // only in delta mode; the deleted file and private credentials never ship.
+    const payloads=deltaMode?['changed']:['changed','lock','mode','public'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
-      deltaFileCount:deltaShipped?1:0,deltaBytes:deltaShipped?Buffer.byteLength('changed'):0});
+      deltaFileCount:deltaMode?1:0,deltaBytes:deltaMode?Buffer.byteLength('changed'):0});
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
     if(mode==='late delta failure'){
       expect(log).toHaveBeenCalledWith('manifest: full-scan (Full ship selected)\n');
@@ -811,6 +834,7 @@ describe('warm-base tick',()=>{
     await f.warm.warmTick(f.options);
     const pool=join(f.target,'prewarm'),tree=join(pool,f.base.sha,'1');
     expect(await fs.readFile(join(tree,'mode.txt'),'utf8')).toBe('mode');
+    expect((await fs.lstat(tree)).mode&0o777).toBe(0o700);
     await expect(fs.lstat(join(pool,f.base.sha,'2'))).rejects.toMatchObject({code:'ENOENT'});
     await fs.rm(tree,{recursive:true});await f.warm.warmTick(f.options);
     expect(await fs.readFile(join(tree,'mode.txt'),'utf8')).toBe('mode');expect(f.install).toHaveBeenCalledOnce();
@@ -821,6 +845,140 @@ describe('warm-base tick',()=>{
     await fs.rm(join(f.target,'active','run'));await f.warm.warmTick(f.options);
     await expect(fs.lstat(tree)).rejects.toMatchObject({code:'ENOENT'});
     expect(await fs.readdir(pool)).toEqual([git(['rev-parse','HEAD']).toString().trim()]);
+  });
+  async function slotFixture(count=2) {
+    const f=await tickFixture();
+    await fs.mkdir(f.options.runs,{mode:0o700});await fs.mkdir(f.options.receipts,{mode:0o700});
+    for(let n=1;n<=count;n++)await fs.mkdir(join(f.options.runs,'slot-'+n),{mode:0o700});
+    return f;
+  }
+  async function interceptPrewarmCopy(beforeMode) {
+    const bases=await import('../forge-exec-bases.mjs'),copy=bases.copyLeaves;
+    // The descriptor-pinned copier runs in Python, outside injected fs.writeFile.
+    // Keep real copies and pause/fault with a partial tree before the mode leaf.
+    return vi.spyOn(bases,'copyLeaves').mockImplementation(async(source,destination,entries)=>{
+      expect(destination).toContain('/.prewarm-');
+      const index=entries.findIndex(entry=>entry.path.equals(Buffer.from('mode.txt')));
+      expect(index).toBeGreaterThan(0);
+      await copy(source,destination,entries.slice(0,index));
+      await beforeMode();
+      await copy(source,destination,entries.slice(index));
+    });
+  }
+  it.each([false,true])('retains untouched valid prewarm tree and leaf inodes across ticks (newest pinned: %s)',async pinned=>{
+    const f=await slotFixture(1);await f.warm.warmTick(f.options);
+    const tree=join(f.target,'prewarm',f.base.sha,'1'),leaf=join(tree,'mode.txt');
+    const before=await Promise.all([fs.lstat(tree),fs.lstat(leaf)]);
+    if(pinned)await fs.writeFile(join(f.target,'active','run'),f.base.sha);
+    const write=vi.fn(fs.writeFile),read=vi.fn(fs.readFile);
+    await f.warm.warmTick({...f.options,fs:{...fs,writeFile:write,readFile:read}});
+    expect((await fs.lstat(tree)).ino).toBe(before[0].ino);expect((await fs.lstat(leaf)).ino).toBe(before[1].ino);
+    expect(write.mock.calls.some(([path])=>String(path).endsWith('/mode.txt'))).toBe(false);
+    expect(read.mock.calls.some(([path])=>String(path).includes('/tree/'))).toBe(false);
+  });
+  it('slow prewarm copy does not starve a concurrent baseGuard waiter or expose a partial tree',async()=>{
+    const f=await slotFixture(1);let entered,release;
+    const copying=new Promise(resolve=>entered=resolve),held=new Promise(resolve=>release=resolve);
+    await interceptPrewarmCopy(async()=>{entered();await held;});
+    const tick=f.warm.warmTick(f.options);
+    try {
+      await copying;let now=0;
+      await expect(baseGuard(f.target,async()=>{
+        expect(await fs.readdir(join(f.target,'active'))).not.toEqual([]);
+        const dest=join(root,'partial-claim'),verify=vi.fn();
+        expect(await claimPrewarm(f.target,f.base.sha,'1',dest,f.base.manifest,f.base.manifestDigest,verify)).toBe(false);
+        expect(verify).not.toHaveBeenCalled();
+        return 42;
+      },fs,{waitMs:50,retryMs:25,clock:()=>now,sleep:async ms=>{now+=ms;}})).resolves.toBe(42);
+    }finally{release();await tick;}
+    expect(await fs.readFile(join(f.target,'prewarm',f.base.sha,'1','mode.txt'),'utf8')).toBe('mode');
+    expect(await fs.readdir(join(f.target,'active'))).toEqual([]);
+    expect((await fs.readdir(f.target)).filter(name=>name.startsWith('.prewarm-'))).toEqual([]);
+  });
+  it('keeps publication successful and attempts other slots after one copy fails',async()=>{
+    const f=await slotFixture(3),log=vi.fn();let failed=false;
+    await interceptPrewarmCopy(async()=>{
+      if(!failed){failed=true;throw Object.assign(new Error('disk full'),{code:'ENOSPC'});}
+    });
+    await expect(f.warm.warmTick({...f.options,log})).resolves.toMatchObject({sha:f.base.sha});
+    expect(failed).toBe(true);expect(log).toHaveBeenCalledWith(expect.stringContaining('disk full'));
+    const parent=join(f.target,'prewarm',f.base.sha),trees=(await fs.readdir(parent)).filter(name=>/^[1-9]\d*$/.test(name));
+    expect(trees).toHaveLength(2);
+    for(const name of trees)expect(await fs.readFile(join(parent,name,'mode.txt'),'utf8')).toBe('mode');
+    expect(await fs.readdir(join(f.target,'active'))).toEqual([]);
+    expect((await fs.readdir(f.target)).filter(name=>name.startsWith('.prewarm-'))).toEqual([]);
+  });
+  it.each(['busy','pinned'])('rechecks a slot that becomes %s while its replacement is copied',async fault=>{
+    const f=await slotFixture(1);await f.warm.warmTick(f.options);
+    const tree=join(f.target,'prewarm',f.base.sha,'1'),inode=(await fs.lstat(tree)).ino;
+    await fs.writeFile(tree+'.json','{}');
+    let raced=false;
+    await interceptPrewarmCopy(async()=>{
+      if(!raced) {
+        raced=true;
+        await baseGuard(f.target,async()=>{
+          if(fault==='busy')await fs.mkdir(join(f.options.receipts,'worker-active-1'));
+          else await createBasePin(f.target,'runner',f.base.sha);
+        });
+      }
+    });
+    await f.warm.warmTick(f.options);
+    expect(raced).toBe(true);expect((await fs.lstat(tree)).ino).toBe(inode);
+    expect(await fs.readFile(tree+'.json','utf8')).toBe('{}');
+    expect(await fs.readdir(join(f.target,'active'))).toEqual(fault==='pinned'?['runner']:[]);
+  });
+  it('preserves an existing pinned newest entry even when its marker needs repair',async()=>{
+    const f=await slotFixture(1);await f.warm.warmTick(f.options);
+    const tree=join(f.target,'prewarm',f.base.sha,'1'),inode=(await fs.lstat(tree)).ino;
+    await fs.writeFile(tree+'.json','{}');await createBasePin(f.target,'runner',f.base.sha);
+    await f.warm.warmTick(f.options);
+    expect((await fs.lstat(tree)).ino).toBe(inode);expect(await fs.readFile(tree+'.json','utf8')).toBe('{}');
+  });
+  it('rolls back a failed marker publication and continues warming other slots',async()=>{
+    const f=await slotFixture(2),log=vi.fn(),parent=join(f.target,'prewarm',f.base.sha);let failed=false;
+    const io={...fs,rename:async(from,to)=>{
+      if(!failed&&to===join(parent,'1.json')){failed=true;throw new Error('marker rename failed');}
+      return fs.rename(from,to);
+    }};
+    await expect(f.warm.warmTick({...f.options,fs:io,log})).resolves.toMatchObject({sha:f.base.sha});
+    expect(failed).toBe(true);expect(log).toHaveBeenCalledWith(expect.stringContaining('marker rename failed'));
+    await expect(fs.lstat(join(parent,'1'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await fs.readFile(join(parent,'2','mode.txt'),'utf8')).toBe('mode');
+    expect(await fs.readdir(join(f.target,'active'))).toEqual([]);
+  });
+  it('reclaims abandoned build trees and orphan source pins without deleting under the guard',async()=>{
+    const f=await slotFixture(1);await f.warm.warmTick(f.options);
+    const abandoned=join(f.target,'.prewarm-ABC123'),active=join(f.target,'active');
+    await fs.mkdir(abandoned,{mode:0o700});await fs.writeFile(join(abandoned,'partial'),'partial');
+    await fs.mkdir(join(f.target,'.prewarm-NOP456'),{mode:0o700});
+    await fs.writeFile(join(active,'.prewarm-ABC123'),f.base.sha);
+    await fs.writeFile(join(active,'.prewarm-XYZ789'),f.base.sha);
+    await createBasePin(f.target,'runner',f.base.sha);
+    const io={...fs,rm:async(path,...args)=>{
+      if(args[0]?.recursive&&String(path).includes('.prewarm-')) {
+        let now=0;
+        expect(await baseGuard(f.target,()=>42,fs,{clock:()=>now,sleep:async ms=>{now+=ms;},waitMs:50})).toBe(42);
+      }
+      return fs.rm(path,...args);
+    }};
+    await f.warm.warmTick({...f.options,fs:io});
+    expect(await fs.readdir(active)).toEqual(['runner']);
+    expect((await fs.readdir(f.target)).filter(name=>name.startsWith('.prewarm-'))).toEqual([]);
+  });
+  it.each(['unknown pool entry','slot cap','invalid active pin'])('treats prewarm %s as non-fatal while refusing unsafe work',async fault=>{
+    const f=await slotFixture(1);await f.warm.warmTick(f.options);
+    const tree=join(f.target,'prewarm',f.base.sha,'1'),inode=(await fs.lstat(tree)).ino,log=vi.fn();
+    if(fault==='unknown pool entry')await fs.writeFile(join(f.target,'prewarm','unexpected'),'keep');
+    const io={...fs,readdir:async(path,...args)=>String(path)===f.options.runs&&fault==='slot cap'?Array.from({length:129},(_,i)=>'slot-'+(i+1)):fs.readdir(path,...args)};
+    const gitExec=async call=>{
+      const result=await f.gitExec(call);
+      if(fault==='invalid active pin'&&call.args.includes('fetch'))await fs.writeFile(join(f.target,'active','bad'),'invalid');
+      return result;
+    };
+    await expect(f.warm.warmTick({...f.options,fs:io,exec:gitExec,log})).resolves.toMatchObject({reused:true});
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(fault==='unknown pool entry'?'Unknown prewarm entry':fault==='slot cap'?'slot bound':'Invalid active pin'));
+    expect((await fs.lstat(tree)).ino).toBe(inode);
+    expect(f.install).toHaveBeenCalledOnce();
   });
   it('warm tick tolerates a transient shared guard EEXIST',async()=>{
     const f=await tickFixture();let collisions=0;

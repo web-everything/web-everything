@@ -38,6 +38,7 @@ function fixture(source = success) {
   const seams = { policy, lockRoot, laneRoots: [], readSha: vi.fn(() => 'abc123'),
     log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false } };
   // Keep admission health/slot state separate from the provenance IO under test.
+  // The default-executor wiring test below exercises their shared production root.
   const admission = { lockRoot: join(root, 'admission', 'heavy'), readTelemetry: healthyRead };
   const run = (extra = {}) => runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: root, env: {},
     ...admission, policy, loadPerCore: () => 0, log: seams.log, remoteExec: createRemoteExec({ ...seams, ...extra }) });
@@ -346,7 +347,8 @@ describe('remote client override', () => {
     vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(null, 'production-sha\n'));
     // main() supplies lockRoot to this entry point; leave remoteExec unset to exercise its wiring.
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env,
-      ...f.admission, policy: f.policy, lockRoot, log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
+      policy: f.policy, lockRoot, readTelemetry: healthyRead,
+      log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'production-sha' };
     await vi.waitFor(() => expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8')))
       .toEqual({ ...pair, pathKey: pathKeyFor(pair.clientPath) }));
@@ -647,7 +649,9 @@ describe('remote client override', () => {
       return handle;
     });
     try {
-      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      // Probe the bounded reader directly; admission health IO has its own deadline and state.
+      expect(await createRemoteExec(f.seams)({ argv: ['npm', 'run', 'build'] }))
+        .toEqual({ mode: 'remote', code: 0 });
       await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
       expect(open.mock.calls.filter(([file]) => file === f.state)).toEqual([
         [f.state, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0)],

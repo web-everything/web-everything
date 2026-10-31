@@ -21,8 +21,10 @@ try {
     .replace("from './bounded-child.mjs'", `from '${helperUrl}'`);
   OWN_SOURCE_URL = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 } catch { /* the fallback timer covers it */ }
-const WATCHDOG_SOURCE = `const { workerData, parentPort } = require('node:worker_threads');
-import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort));`;
+// Eval workers inherit the caller's --input-type on newer Node releases. Dynamic imports work in both
+// CommonJS and ESM, so a module-mode caller must not downgrade the ceiling to the main-thread fallback.
+const WATCHDOG_SOURCE = `import('node:worker_threads').then(({ workerData, parentPort }) =>
+  import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort)));`;
 
 // flag[0]: -1 cancelled, 0 armed, 1 fired (escape sweeps running), 2 swept (the kill is complete).
 function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
@@ -38,21 +40,31 @@ function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
 export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, port) {
   let beat = null;
   let loading = false;
+  let stopRequested = false;
   const cleanup = () => {
     clearTimeout(timer);
     clearInterval(beat);
     // Do not tear down an isolate during ESM evaluation (Node 22 can abort in AsyncModuleExecutionFulfilled).
-    // Closing the port after the import settles lets the worker exit naturally, with no live timers left.
-    if (!loading) port.close();
+    // Exit only after imports and any escape sweeps finish. Closing the port alone leaves heartbeat-owned
+    // handles alive, so stop() would hang after the deadline fired just as it would during cancellation.
+    if (!loading) process.exit(0); // Ends only this worker thread, including the module's live handles.
   };
-  port.on('message', (message) => { if (message === 'stop') cleanup(); });
+  const stop = () => {
+    stopRequested = true;
+    if (loading) return;
+    cleanup();
+  };
+  port.on('message', (message) => { if (message === 'stop') stop(); });
   const timer = setTimeout(() => {
     clearInterval(beat);
     fireTreeKill({ pid, kill, flag, afterTree: () => port.postMessage('fired') });
     if (Atomics.load(flag, 0) === 2) port.postMessage('swept');
     cleanup();
   }, Math.max(0, deadline - Date.now()));
-  if (Atomics.load(flag, 0) !== 0) { cleanup(); return; }
+  if (Atomics.load(flag, 0) !== 0) {
+    if (Atomics.load(flag, 0) === -1) stop(); else cleanup();
+    return;
+  }
   if (heartbeat) {
     // The ceiling above is already armed and must survive a heartbeat module that fails to load.
     let fn = null;
@@ -60,7 +72,9 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
     try { fn = (await import(heartbeat.module))[heartbeat.exportName]; } catch { /* no heartbeat; the ceiling still holds */ }
     loading = false;
     if (typeof fn === 'function' && Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
-    if (Atomics.load(flag, 0) !== 0) cleanup();
+    const state = Atomics.load(flag, 0);
+    if (stopRequested || state === -1) stop();
+    else if (state !== 0) cleanup();
   }
 }
 

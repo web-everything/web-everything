@@ -34,10 +34,14 @@ function cliFixture(source) {
     import { main, loadAdmissionPolicy, createRemoteExec } from ${JSON.stringify(admissionUrl.href)};
     import { easternTimestamp } from ${JSON.stringify(new URL('../forge-exec-run.mjs', import.meta.url).href)};
     const policy = loadAdmissionPolicy({ home: ${JSON.stringify(root)}, env: { ...process.env, WE_PLATFORM_PREFERENCES: '' } });
-    await main(process.argv.slice(1), { remoteExec: createRemoteExec({
-      policy, lockRoot: ${JSON.stringify(join(pool, '.admission', 'heavy'))},
-    }), readTelemetry: async () => ({ sampledAtET: easternTimestamp(Date.now()),
-      cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] }) });
+    await main(process.argv.slice(1), {
+      readTelemetry: async () => ({ sampledAtET: easternTimestamp(Date.now()),
+        cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] }),
+      remoteExec: createRemoteExec({
+        policy, lockRoot: ${JSON.stringify(join(pool, '.admission', 'heavy'))},
+        readSha: () => 'unknown',
+      }),
+    });
   `;
   return { clientPath, eventPath, state: join(pool, '.admission', 'remote', 'client-override.json'),
     run: () => spawnSync(process.execPath, ['--input-type=module', '-e', runner, 'run', '--', 'npm', 'run', 'build'], {
@@ -106,13 +110,12 @@ describe('admission import boundary', () => {
   it.each([undefined, null])('unset %s still executes the real bundled client', async (clientPath) => {
     const policy = resolveAdmissionPolicy();
     policy.settings.remote.clientPath = clientPath;
+    // Pin the bundled client's total timing without replacing its native import boundary.
+    let now = Date.parse('2026-01-01T12:00:00.000Z');
     // The bundled client refuses this command before any external IO. Do not replace its loader with a mock.
-    // Pin the clock to assert the complete result, including the bundled client's stage timings.
-    expect(await createRemoteExec({ policy })({
-      argv: ['not-an-allowed-heavy-command'], clock: () => Date.parse('2026-01-01T12:00:00Z'),
-    })).toEqual({
+    expect(await createRemoteExec({ policy })({ argv: ['not-an-allowed-heavy-command'], clock: () => now++ })).toEqual({
       mode: 'not-started', terminated: true, reason: 'command-not-allowed',
-      timings: [{ stage: 'total', startedAtET: '2026-01-01T07:00:00.000-05:00', ms: 0 }],
+      timings: [{ stage: 'total', startedAtET: '2026-01-01T07:00:00.000-05:00', ms: 1 }],
     });
   });
 

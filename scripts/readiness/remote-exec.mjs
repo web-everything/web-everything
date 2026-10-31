@@ -78,7 +78,7 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, sshOptions, onOutput }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
       cwd, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
@@ -180,31 +180,14 @@ async function verifyMemoryLink(cwd, oid, fs) {
 
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, beginSub=noTiming} = {}) {
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Build names are exempt only with evidence that Git ignores the whole directory.
+  // Git ignore rules do not establish test-runner exclusions. Even a whole
+  // ignored build directory can contain runnable tests (scripts/build/__tests__).
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredPaths = splitPaths(ignored.stdout);
-  const ignoredTests=ignoredPaths.filter(path=>isTestFile(path)
-    && !pathParts(path).slice(0,-1).some(part=>['node_modules','.git'].includes(part.toString('latin1'))));
-  const buildNames=new Set(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static']);
-  const candidates=new Map();
-  for(const path of ignoredTests) {
-    const parts=pathParts(path);
-    for(let i=0;i<parts.length-1;i++)if(buildNames.has(parts[i].toString('latin1'))) {
-      const dir=path.subarray(0,parts.slice(0,i+1).reduce((length,part)=>length+part.length+1,0)-1);
-      candidates.set(dir.toString('hex'),dir);
-    }
-  }
-  let ignoredDirs=[];
-  if(candidates.size) {
-    const result=await exec({file:'git',args:['check-ignore','--no-index','-z','--stdin'],cwd,input:nulPaths([...candidates.values()])});
-    if(![0,1].includes(result.code))throw new Error('Ignored directory evidence unavailable');
-    ignoredDirs=splitPaths(result.stdout);
-    if(ignoredDirs.some(dir=>!candidates.has(dir.toString('hex'))))throw new Error('Invalid ignored directory evidence');
-  }
-  for(const path of ignoredTests) {
-    if(ignoredDirs.some(dir=>path[dir.length]===47 && path.subarray(0,dir.length).equals(dir)))continue;
-    throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
+  for (const path of ignoredPaths) {
+    if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
+    if (isTestFile(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
   }
   const walkDone=beginSub('inventory-walk');
   let files;
@@ -615,7 +598,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     start(()=>disableDelta?undefined:exec({file:'ssh',args:[host,'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs bases'],input:'{}',cwd,sshOptions})),
   ]);
   // All speculative children are drained and all rejections observed before fallback.
-  if(initial[0].status==='rejected'||initial[0].value.code!==0)return fallback('forge-unreachable');
+  if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
   const unwrap=result=>{if(result.status==='rejected')throw result.reason;return result.value;};
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};

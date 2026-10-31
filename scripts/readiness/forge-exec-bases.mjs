@@ -10,9 +10,9 @@ export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
 export const anonymousGitEnv=()=>({PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',
   GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'});
 const stderrTail=value=>String(value??'').replace(/[\x00-\x1f\x7f-\x9f]/g,'').slice(-300);
-function gitExec({args,cwd,env,input}) {
+function gitExec({file='git',args,cwd,env,input}) {
   return new Promise((resolve,reject)=>{
-    const child=spawn('git',args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']});
+    const child=spawn(file,args,{cwd,env,stdio:[input===undefined?'ignore':'pipe','pipe','pipe']});
     const chunks=[];let size=0,overflow=false,stderr='';
     const timer=setTimeout(()=>{overflow=true;child.kill('SIGKILL');},120000);
     for(const stream of [child.stdout,child.stderr])stream.on('data',chunk=>{
@@ -191,26 +191,69 @@ export async function readBase(root,sha,expected,io=fs) {
   decodeManifest(manifest);
   return {ready,manifest,tree:join(root,sha,'tree')};
 }
-// Copy regular, verified leaves only; no reflinks or hardlinks and no inherited
-// writable metadata. Each destination is new inside an ops-owned tree.
-export async function copyLeaves(source,destination,entries,io=fs) {
-  const root=await io.lstat(source);if(root.isSymbolicLink()||!root.isDirectory())throw new Error('Unsafe copy root');
-  for(const entry of entries) {
-    let from=Buffer.from(source),to=Buffer.from(destination);
-    const parts=pathParts(entry.path);
-    for(const [i,part] of parts.entries()) {
-      from=bytePath(from,part);to=bytePath(to,part);
-      const st=await io.lstat(from);
-      if(st.isSymbolicLink()||(i===parts.length-1?!st.isFile():!st.isDirectory()))throw new Error('Unsafe copy component');
-      if(i<parts.length-1)await io.mkdir(to,{recursive:true,mode:0o755});
-      else {
-        const handle=await io.open(from,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-        let content;try{const pinned=await handle.stat();if(!pinned.isFile()||pinned.ino!==st.ino||pinned.dev!==st.dev||pinned.mode!==st.mode)throw new Error('Copy source swapped');content=await handle.readFile();}finally{await handle.close();}
-        await io.writeFile(to,content,{flag:'wx',mode:entry.executable?0o755:0o644});
-        await io.chmod(to,entry.executable?0o755:0o644);
-      }
-    }
-  }
+// Privileged snapshot copies must never resolve a source through a mutable ancestor.
+// Keep directory descriptors through every open, including the absolute source
+// ancestors, and verify pinned file bytes before creating a destination leaf.
+export const verifiedCopySource = String.raw`
+import os, sys, json, stat, base64, hashlib
+cfg = json.load(sys.stdin)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+def unsafe():
+    raise RuntimeError('Invalid copy source; use full shipping and inspect the source tree')
+def parts(path):
+    values = path.split(b'/')
+    if not values or len(values) > 128 or any(p in (b'', b'.', b'..') or b'\x00' in p for p in values): unsafe()
+    return values
+def descend(parent, values, create=False):
+    fd = os.dup(parent)
+    try:
+        for name in values:
+            if create:
+                try: os.mkdir(name, 0o755, dir_fd=fd)
+                except FileExistsError: pass
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+def absolute(path):
+    if not isinstance(path, str) or not path.startswith('/'): unsafe()
+    root = os.open('/', flags)
+    try: return descend(root, parts(os.fsencode(path)[1:]))
+    finally: os.close(root)
+source = absolute(cfg['source'])
+try:
+    destination = absolute(cfg['destination'])
+    try:
+        for entry in cfg['entries']:
+            names = parts(base64.b64decode(entry['path'], validate=True))
+            parent = descend(source, names[:-1])
+            try: leaf = os.open(names[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            finally: os.close(parent)
+            with os.fdopen(leaf, 'rb') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or bool(info.st_mode & 0o111) != entry['executable']: unsafe()
+                content = stream.read(info.st_size + 1)
+                if len(content) != info.st_size or hashlib.sha256(content).hexdigest() != entry['sha256']: unsafe()
+            parent = descend(destination, names[:-1], create=True)
+            try:
+                mode = 0o755 if entry['executable'] else 0o644
+                leaf = os.open(names[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+                with os.fdopen(leaf, 'wb') as stream:
+                    os.fchmod(stream.fileno(), mode)
+                    stream.write(content)
+            finally: os.close(parent)
+    finally: os.close(destination)
+finally: os.close(source)
+`;
+export async function copyLeaves(source,destination,entries) {
+  const result=await gitExec({file:'/usr/bin/python3',args:['-I','-c',verifiedCopySource],
+    env:{PATH:'/usr/bin:/bin',LANG:'C'},
+    input:JSON.stringify({source,destination,entries:entries.map(entry=>({...entry,path:entry.path.toString('base64')}))}),
+  });
+  if(result.code!==0)throw new Error('Invalid copy source; use full shipping and inspect the source tree');
 }
 // Root-created pins must be readable by the ops warmer. The privileged caller
 // supplies the operator identity; unprivileged creation needs no transfer.
@@ -257,19 +300,25 @@ export async function prewarmDirectory(path,io=fs,uid=process.getuid()) {
   await baseDirectory(path,io);
   if((await io.lstat(path)).uid!==uid)throw new Error('Untrusted prewarm owner');
 }
+// Cheap publication evidence for reuse. Content is still fully verified after
+// an exclusive claim, before any worker can access the tree.
+export async function prewarmEntry(root,sha,slot,manifestDigest,io=fs,uid=process.getuid()) {
+  if(!revision(sha)||!/^[1-9]\d*$/.test(slot))throw new Error('Invalid prewarm identity');
+  const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
+  for(const path of [join(root,'prewarm'),parent,source])await prewarmDirectory(path,io,uid);
+  if(((await io.lstat(source)).mode&0o077)!==0)throw new Error('Prewarm tree is not private');
+  const st=await io.lstat(marker);
+  if(st.uid!==uid||(st.mode&0o022)||!st.isFile()||st.isSymbolicLink()||st.nlink!==1)throw new Error('Untrusted prewarm marker');
+  if((await baseFile(marker,io)).toString()!==JSON.stringify({sha,manifestDigest}))throw new Error('Invalid prewarm marker');
+}
 export async function claimPrewarm(root,sha,slot,destination,manifest,manifestDigest,verify,io=fs,uid=process.getuid()) {
   if(!revision(sha)||!/^[1-9]\d*$/.test(slot))return false;
   const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
   let claimed=false;
   try {
-    for(const path of [join(root,'prewarm'),parent,source])await prewarmDirectory(path,io,uid);
-    // The tree root must be private until verified: the worker UID may traverse the run container.
-    if(((await io.lstat(source)).mode&0o077)!==0)throw new Error('Prewarm tree is not private');
-    const st=await io.lstat(marker);
-    if(st.uid!==uid||(st.mode&0o022)||!st.isFile()||st.isSymbolicLink()||st.nlink!==1)throw new Error('Untrusted prewarm marker');
+    await prewarmEntry(root,sha,slot,manifestDigest,io,uid);
     const existing=await io.lstat(destination).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
     if(existing)throw new Error('Prewarm destination already exists');
-    if((await baseFile(marker,io)).toString()!==JSON.stringify({sha,manifestDigest}))throw new Error('Invalid prewarm marker');
     await io.rename(source,destination);claimed=true;
     await verify(destination,manifest,manifestDigest,{fs:io});
     await io.chmod(destination,0o755);
