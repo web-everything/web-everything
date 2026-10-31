@@ -2992,6 +2992,12 @@ early and green-verdict pushes. Persist its previous head and first-held time in
 verify retries, retain the waiter on read/write failures, and log the timing policy's source.
 `await-verify-pass-push-after-ci.test.mjs` and the `claude-fix-push-after-ci` soak scenario cover
 this path with injected CI reads, including the bounded fallback when evidence is unavailable.
+Completed previous-head failures must reach the fixer in a shared untrusted-data fence before
+either push path runs. Persist the handoff and pending delivery together; retain the inventory
+across busy/failed resumes and same-session re-marks until the repair push succeeds. A delivered
+resume waits for a new mark; exhausted delivery retains the record for operator recovery.
+Exercise busy, paused and failed delivery across multiple ticks with both push policies:
+zero pushes until delivery and a subsequent re-mark, then a push of the follow-up commit.
 
 ## Archive-only host retention (R217)
 

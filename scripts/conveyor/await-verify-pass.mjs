@@ -43,6 +43,7 @@ import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs'
 import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { fixPushGate } from '../lib/review-timing.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
@@ -162,6 +163,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
     : '';
   if (isNoPushRecord(record) && ['green', 'red', 'escalate', 'infra', 'void'].includes(kind)) return buildNoPushResumePrompt({ kind, record, marker, detail, head, next });
   switch (kind) {
+    case 'previous-ci':
+      return `${head}\n\nThe previous PR head's CI completed with failures. The harness has withheld this push. Repair these failures in the same lane, commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} Do not push ${record.ref} yourself.\n\nPrevious-head CI failures:\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(record.previousCi.ready.ciFailures))}`;
     case 'green': {
       const pushed = `Verify is GREEN for exactly this sha and the harness has PUSHED it to ${record.ref}${detail ? ` (${detail})` : ''}. Do not push ${record.ref} again.`;
       // The two briefs end differently: a CI-heal's only PR write is the restart-surviving tally comment (no evidence comment, no hand-back).
@@ -379,21 +382,34 @@ export async function runAwaitVerifyPass({
   resumedUnclearable = UNCLEARABLE_DONE, pushPolicy = null, retryPolicy = null, loggedPolicyLine = LOGGED_POLICY_LINE,
 } = {}) {
   const rows = [];
+  const timing = io.fixTimingPolicy?.();
+  const previousCiFailurePending = record => timing?.pushAfterCi && record?.kind === 'fix'
+    && record.previousCi?.ready?.ciFailures?.length > 0
+    && !(record.previousCi.failuresHandedOff && (record.pendingResume?.kind === 'green'
+      || (record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha))));
   /** Clear a finished record. One that cannot be removed would stay actionable (another push / resume next tick), so it is
    *  remembered for this daemon's lifetime and never acted on again. Returns whether the record is really gone. */
   const clearOrNote = (key, record) => {
+    if (previousCiFailurePending(record)) return false;
     const cleared = io.clearRecord(key, record)?.cleared !== false;
     if (!cleared) resumedUnclearable.add(`${key}|${record.requestedAt}`);
     return cleared;
   };
   // fix.pushBeforeGate (we:scripts/lib/fix-push-policy.mjs): an injected policy wins; else the IO's own; else OFF (today's flow).
   const policy = pushPolicy ?? (typeof io.pushPolicy === 'function' ? io.pushPolicy() : null);
-  const timing = io.fixTimingPolicy?.();
   const recovery = retryPolicy ?? io.retryPolicy?.() ?? loadVerifyRecoverySettings();
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
     try {
+      if (previousCiFailurePending(record) && record.pendingResume?.delivered) {
+        rows.push({ ...row, action: 'wait', reason: 'previous-head CI repair must be verified and re-marked' });
+        continue;
+      }
+      if (previousCiFailurePending(record) && (record.resumeFailures ?? 0) >= limits.maxResumeFailures) {
+        rows.push({ ...row, action: 'wait', result: 'resume-exhausted; previous-head CI failures retained; operator recovery required' });
+        continue;
+      }
       // Adopt an infra resume left by an older daemon before it can spend another model turn.
       if (record?.kind === 'fix' && record.pendingResume?.kind === 'infra') {
         record = { ...record }; delete record.pendingResume;
@@ -438,8 +454,20 @@ export async function runAwaitVerifyPass({
         Object.assign(row, { action: 'wait', reason: `previous-head CI: ${ciReadiness.reason}` });
         rows.push(row); continue;
       }
+      if (timing?.pushAfterCi && record.kind === 'fix' && ciReadiness?.ciFailures?.length
+        && !record.previousCi?.failuresHandedOff && (earlyOwed || d.action === 'push')) {
+        // Save both the inventory and the pending delivery before waking the fixer. A busy/failed
+        // resume must retry this message, rather than bypassing it because the handoff is marked.
+        if (!persist({ ...record, previousCi: { ...record.previousCi, failuresHandedOff: true },
+          pendingResume: { kind: 'previous-ci' } })) { rows.push(row); continue; }
+        d = { action: 'resume', reason: 'previous-head CI failures', resume: 'previous-ci' };
+        earlyOwed = false;
+        Object.assign(row, { action: d.action, reason: d.reason });
+      }
       // Keep processing local verify recovery while an early push is held by CI.
-      if (earlyOwed && ciReadiness?.action !== 'wait') {
+      // A handoff marker records intent. Its pending resume blocks early pushes until delivery
+      // completes and the fixer re-marks, including on ticks after a busy/paused/failed resume.
+      if (earlyOwed && ciReadiness?.action !== 'wait' && !record.pendingResume) {
         const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
         // `record` now carries `earlyPush`; the rest of this record's handling keeps it.
         if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
@@ -564,6 +592,14 @@ export async function runAwaitVerifyPass({
       if (!persist({ ...record, resumeFailures: failures })) { rows.push(row); continue; }
       const resumed = io.resume({ session, prompt });
       if (resumed?.resumed) {
+        if (previousCiFailurePending(record)) {
+          // Retain the inventory until the fixer re-marks and the follow-up push succeeds.
+          // A delivered message must not wake the session again on every daemon tick.
+          if (persist({ ...record, pendingResume: { ...record.pendingResume, delivered: true } })) {
+            row.result = `resumed:${record.pendingResume.kind}; previous-head CI failures retained`;
+          }
+          rows.push(row); continue;
+        }
         const cleared = clearOrNote(key, record);
         row.result = `${row.result ? `${row.result}; ` : ''}resumed:${record.pendingResume.kind}${cleared ? '' : '; record-clear-failed'}`;
       } else if (failures >= limits.maxResumeFailures) {
