@@ -5,6 +5,7 @@ import {spawn} from 'node:child_process';
 import {createHash,randomBytes} from 'node:crypto';
 import {pathParts,bytePath,decodeManifest,digestManifest} from './forge-exec-manifest.mjs';
 const revision=sha=>typeof sha==='string'&&/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha);
+export const BASE_RETENTION=12;
 export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
 export const anonymousGitEnv=()=>({PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent',LANG:'C',
   GIT_TERMINAL_PROMPT:'0',GIT_ASKPASS:'/bin/false',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_COUNT:'0'});
@@ -224,8 +225,44 @@ export async function pruneBases(root,io=fs) {
     if(!revision(sha))throw new Error('Unreadable active base pin: pruning refused');
     active.add(sha);
   }
-  const keep=new Set([...ready.slice(0,4).map(r=>r.sha),...active]);
+  const keep=new Set([...ready.slice(0,BASE_RETENTION).map(r=>r.sha),...active]);
   for(const name of await io.readdir(root)) {
     if((revision(name)&&!keep.has(name))||/^[a-f0-9]{40,64}\.tmp$/.test(name)||name.endsWith('.tmp'))await io.rm(join(root,name),{recursive:true,force:true});
+  }
+}
+
+// Prewarm metadata and trees live exclusively below ops-owned, non-writable
+// parents. Callers hold baseGuard throughout publication, pruning or claim.
+export async function prewarmDirectory(path,io=fs,uid=process.getuid()) {
+  await baseDirectory(path,io);
+  if((await io.lstat(path)).uid!==uid)throw new Error('Untrusted prewarm owner');
+}
+// Cheap publication evidence for reuse. Content is still fully verified after
+// an exclusive claim, before any worker can access the tree.
+export async function prewarmEntry(root,sha,slot,manifestDigest,io=fs,uid=process.getuid()) {
+  if(!revision(sha)||!/^[1-9]\d*$/.test(slot))throw new Error('Invalid prewarm identity');
+  const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
+  for(const path of [join(root,'prewarm'),parent,source])await prewarmDirectory(path,io,uid);
+  if(((await io.lstat(source)).mode&0o077)!==0)throw new Error('Prewarm tree is not private');
+  const st=await io.lstat(marker);
+  if(st.uid!==uid||(st.mode&0o022)||!st.isFile()||st.isSymbolicLink()||st.nlink!==1)throw new Error('Untrusted prewarm marker');
+  if((await baseFile(marker,io)).toString()!==JSON.stringify({sha,manifestDigest}))throw new Error('Invalid prewarm marker');
+}
+export async function claimPrewarm(root,sha,slot,destination,manifest,manifestDigest,verify,io=fs,uid=process.getuid()) {
+  if(!revision(sha)||!/^[1-9]\d*$/.test(slot))return false;
+  const parent=join(root,'prewarm',sha),source=join(parent,slot),marker=source+'.json';
+  let claimed=false;
+  try {
+    await prewarmEntry(root,sha,slot,manifestDigest,io,uid);
+    const existing=await io.lstat(destination).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+    if(existing)throw new Error('Prewarm destination already exists');
+    await io.rename(source,destination);claimed=true;
+    await verify(destination,manifest,manifestDigest,{fs:io});
+    await io.chmod(destination,0o755);
+    await io.rm(marker,{force:true});
+    return true;
+  }catch {
+    if(claimed)await io.rm(destination,{recursive:true,force:true});
+    return false; // Uncertain or corrupt optimization: ordinary verified copy.
   }
 }

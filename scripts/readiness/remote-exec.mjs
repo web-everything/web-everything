@@ -9,6 +9,8 @@ import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
+import {BASE_RETENTION} from './forge-exec-bases.mjs';
+
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
@@ -303,20 +305,34 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   return {...manifest,manifestDigest:digestManifest(wire)};
 }
 
-// Forge advertises ready bases newest-first. Prefer an ancestor, then the
-// newest local commit: integrity comes from the byte-level base manifest and
-// verified worktree bytes, not Git ancestry. No local base means full shipping.
-export async function selectBase({cwd,exec=defaultExec,bases}={}) {
-  if(!Array.isArray(bases)||bases.length>4)return null;
-  let newestLocal=null;
-  for(const base of bases) {
-    if(!base || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha)||!/^[a-f0-9]{64}$/.test(base.manifestDigest))return null;
-    if((await exec({file:'git',args:['cat-file','-e',base.sha+'^{commit}'],cwd})).code!==0)continue;
-    newestLocal ??= base;
-    if((await exec({file:'git',args:['merge-base','--is-ancestor',base.sha,'HEAD'],cwd})).code===0)return base;
+// Bound discovery work to at most four Git calls per advertised base. Missing
+// ranking evidence retains advertised (newest-first) order as the safe tie-break.
+export async function rankBases({cwd,exec=defaultExec,bases}={}) {
+  if(!Array.isArray(bases)||bases.length>BASE_RETENTION)return [];
+  if(bases.some(base=>!base||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha)||!/^[a-f0-9]{64}$/.test(base.manifestDigest)))return [];
+  const ranked=[];
+  for(const [index,base] of bases.entries()) {
+    try {
+      if((await exec({file:'git',args:['cat-file','-e',base.sha+'^{commit}'],cwd})).code!==0)continue;
+      const ancestor=(await exec({file:'git',args:['merge-base','--is-ancestor',base.sha,'HEAD'],cwd})).code===0;
+      let distance=Infinity;
+      try {
+        const result=await exec({file:'git',args:ancestor?['rev-list','--count',base.sha+'..HEAD']:['diff','--name-only','-z',base.sha,'HEAD','--'],cwd});
+        const bytes=ancestor?protocolText(result.stdout,128):result.stdout;
+        if(!ancestor&&(!Buffer.isBuffer(bytes)||bytes.length>LIMIT))throw new Error('Base diff bound exceeded');
+        if(result.code===0) {
+          if(ancestor&&/^\d+\s*$/.test(bytes)&&Number.isSafeInteger(Number(bytes)))distance=Number(bytes);
+          else if(!ancestor&&(bytes.length===0||bytes.at(-1)===0))distance=bytes.reduce((n,b)=>n+Number(b===0),0);
+        }
+      }catch { /* Unknown distance retains newest local order. */ }
+      ranked.push({base,index,ancestor,distance});
+    }catch { /* Unavailable local commit: try the remaining advertised bases. */ }
   }
-  return newestLocal;
+  return ranked.sort((a,b)=>Number(b.ancestor)-Number(a.ancestor)||a.distance-b.distance||a.index-b.index).map(r=>r.base);
 }
+export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
+const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head,beginSub=noTiming}={}) {
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -546,21 +562,33 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         if(disableDelta)throw new Error('Full ship selected');
         const discovery=unwrap(initial[2]);
         if(discovery.code!==0)throw new Error('No base capabilities');
-        const caps=JSON.parse(protocolText(discovery.stdout,4096));
+        const caps=JSON.parse(protocolText(discovery.stdout,8192));
         if(caps.delta!==1)throw new Error('Delta unavailable');
-        const base=await selectBase({cwd,exec,bases:caps.bases});
-        if(!base)throw new Error('No local ready base');
-        const response=await ssh('base-manifest',{sha:base.sha});
-        if(response.code!==0)throw new Error('Base manifest unavailable');
-        const wire=JSON.parse(protocolText(response.stdout,LIMIT));
-        delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire},head:logicalHead,beginSub});
+        const candidates=await rankBases({cwd,exec,bases:caps.bases});
+        if(!candidates.length)throw new Error('No local ready base');
+        let selected,lastError;
+        for(const base of candidates) {
+          for(let attempt=0;attempt<2;attempt++) {
+            try {
+              const response=await ssh('base-manifest',{sha:base.sha});
+              if(response.code!==0)throw new Error('Base manifest unavailable');
+              const wire=JSON.parse(protocolText(response.stdout,LIMIT));
+              if(digestManifest(wire)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
+              decodeManifest(wire);
+              selected={...base,manifest:wire};break;
+            }catch(error){lastError=error;if(attempt===0)await delay(300);}
+          }
+          if(selected)break;
+        }
+        if(!selected)throw lastError;
+        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,beginSub});
         manifest=delta;
-        if(delta.manifestMode==='full-scan'){manifestReason=delta.manifestReason;delta=undefined;}
-      } catch {delta=undefined;}
+        if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
+      } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
       manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
-      manifestDone({substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
+      manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
       const selectedKeys=new Set(selected.map(path=>path.toString('hex')));
       const stageDone=begin('mac-stage-and-rehash');
