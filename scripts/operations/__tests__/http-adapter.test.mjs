@@ -327,6 +327,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
    * that can act"); it is applied here to a strictly narrower claim.
    */
   const DECLARING_MODULE = Object.freeze({
+    'manual-daemon-pass': 'manual-daemon-pass.mjs',
     'health-respond': 'health-respond.mjs',
     [REVIEW_PR_OP]: 'review-pr.mjs',
     [SUGGEST_NEXT_OP]: 'suggest-next.mjs',
