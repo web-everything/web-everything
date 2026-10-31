@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -168,6 +169,84 @@ function liveFixture() {
 }
 
 describe('carry production IO guards and marker postconditions', () => {
+  const restampHeadline = '📌 review — acceptance re-stamped after a rebase (no new review)';
+  const reviewComment = sha => ({ body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->`,
+    author: { login: 'web-everything' } });
+  const restampComment = sha => ({ ...reviewComment(sha),
+    body: `${restampHeadline}\n\n<!-- reviewed-sha: ${sha} -->` });
+  const anchoredFixture = () => {
+    const f = liveFixture();
+    f.live.comments.push(reviewComment(f.input.loopPayload.carriedFrom));
+    return f;
+  };
+
+  it('allows a trusted current-head restamp after the anchor and preserves its witness', () => {
+    const f = anchoredFixture();
+    f.live.comments.push(restampComment(f.input.head));
+    const io = createRedTeamCarryIo(f.options);
+    expect(io.eligible(f.input)).toBe(true);
+    const witness = createHash('sha256').update(JSON.stringify(f.live.comments.map(c => c.body))).digest('hex');
+    expect(io.witness()).toBe(witness);
+    expect(io.eligible({ ...f.input, reviewWitness: witness })).toBe(true);
+    expect(f.run().outcome).toBe('policy-clear');
+    expect(f.state().reviewWitness).toBe(witness);
+  });
+  it('allows repeated current-head markers in a trusted restamp', () => {
+    const f = anchoredFixture(), comment = restampComment(f.input.head);
+    comment.body += `\n<!-- reviewed-sha: ${f.input.head} -->`;
+    f.live.comments.push(comment);
+    expect(createRedTeamCarryIo(f.options).eligible(f.input)).toBe(true);
+  });
+  it('refuses a trusted current-head restamp containing a drain park marker', () => {
+    const f = anchoredFixture(), comment = restampComment(f.input.head);
+    comment.body += '\n<!-- drain-park-reason -->';
+    f.live.comments.push(comment);
+    expect(createRedTeamCarryIo(f.options).eligible(f.input)).toBe(false);
+  });
+  it.each(['different head', 'abbreviated head', 'mixed markers'])(
+    'refuses a trusted restamp with %s after the anchor', kind => {
+      const f = anchoredFixture(), comment = restampComment('c'.repeat(40));
+      if (kind === 'abbreviated head') comment.body = restampComment(f.input.head.slice(0, 7)).body;
+      if (kind === 'mixed markers') comment.body += `\n<!-- reviewed-sha: ${f.input.head} -->`;
+      f.live.comments.push(comment);
+      expect(createRedTeamCarryIo(f.options).eligible(f.input)).toBe(false);
+    });
+  it.each(['leading whitespace', 'quoted headline', 'different headline'])(
+    'refuses a current-head marker with %s', kind => {
+      const f = anchoredFixture(), comment = restampComment(f.input.head);
+      if (kind === 'leading whitespace') comment.body = ` ${comment.body}`;
+      if (kind === 'quoted headline') comment.body = `> ${comment.body}`;
+      if (kind === 'different headline') comment.body = comment.body.replace('no new review', 'new review');
+      f.live.comments.push(comment);
+      expect(createRedTeamCarryIo(f.options).eligible(f.input)).toBe(false);
+    });
+  it.each([{ login: 'attacker' }, undefined])('keeps existing trust semantics for restamps by %j', author => {
+    const f = anchoredFixture(), comment = { ...restampComment(f.input.head), author };
+    const io = createRedTeamCarryIo(f.options);
+    expect(io.eligible(f.input)).toBe(true);
+    const witness = io.witness();
+    f.live.comments.push(comment);
+    expect(io.eligible({ ...f.input, reviewWitness: witness })).toBe(true);
+    expect(io.witness()).toBe(witness);
+    f.live.comments.push(reviewComment(f.input.head));
+    expect(io.eligible(f.input)).toBe(false);
+  });
+  it.each(['SHA marker', 'verdict heading'])('refuses a real later review (%s) after a current-head restamp', kind => {
+    const f = anchoredFixture();
+    f.live.comments.push(restampComment(f.input.head), kind === 'SHA marker' ? reviewComment(f.input.head)
+      : { body: '🔁 review — changes requested', author: { login: 'web-everything' } });
+    expect(createRedTeamCarryIo(f.options).eligible(f.input)).toBe(false);
+  });
+  it('refuses a changed restamp body against a pinned witness', () => {
+    const f = anchoredFixture(), comment = restampComment(f.input.head);
+    f.live.comments.push(comment);
+    const io = createRedTeamCarryIo(f.options);
+    expect(io.eligible(f.input)).toBe(true);
+    const reviewWitness = io.witness();
+    comment.body += '\nEdited restamp explanation.';
+    expect(createRedTeamCarryIo(f.options).eligible({ ...f.input, reviewWitness })).toBe(false);
+  });
+
   it.each(boundaries.flatMap(boundary => ['review:human', 'review:changes', 'review:held-mechanical', 'review:pending',
     'red-team:blocked', 'policy-off', 'unknown-policy', 'head-moved', 'panel', 'different-verdict', 'same-source-panel',
     'labels-unreadable', 'comments-unreadable', 'evidence-unreadable', 'proof-failed'].map(guard => [boundary, guard])))(
