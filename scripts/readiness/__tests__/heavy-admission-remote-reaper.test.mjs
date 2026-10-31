@@ -2,10 +2,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync,
-  renameSync, statSync, unlinkSync } from 'node:fs';
+  renameSync, statSync, unlinkSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { main, reapRemoteSlots, runWithRemoteDecision, resolveAdmissionPolicy, tryAcquireSlot,
-  heldSlots, DEFAULT_ADMISSION_CEILING_MS } from '../heavy-admission.mjs';
+  heldSlots, releaseOwnedSlot, DEFAULT_ADMISSION_CEILING_MS } from '../heavy-admission.mjs';
 import { readForgeTelemetry } from '../forge-telemetry.mjs';
 import { validateRunId } from '../remote-exec.mjs';
 import { writeAllSync } from '../../lib/write-all-sync.mjs';
@@ -50,6 +50,84 @@ describe('remote slot reaper', () => {
     const f = fixture();
     expect(await reapRemoteSlots(f)).toEqual([]);
     expect(f.readForgeStatus).not.toHaveBeenCalled();
+  });
+  it('keeps a marker untouched when its slot lease has a live owner, even with another slot free', async () => {
+    const f = fixture(); const file = marker(f, { slot: 1 });
+    const original = readFileSync(file);
+    const info = statSync(file);
+    const options = { lockRoot: f.remoteRoot, cap: 2, slots: [1], owner: 'live-dispatcher',
+      pid: process.pid, nowMs: now, nowIso: new Date(now).toISOString() };
+    expect(tryAcquireSlot(options)).toMatchObject({ ok: true, slot: 1 });
+    const lease = heldSlots(options);
+    const beforeMarkerUnlink = vi.fn();
+    expect(await reapRemoteSlots({ ...f, cap: 2, beforeMarkerUnlink })).toEqual([]);
+    expect(statSync(file)).toMatchObject({ ino: info.ino, mtimeMs: info.mtimeMs, atimeMs: info.atimeMs });
+    expect(readFileSync(file)).toEqual(original);
+    expect(heldSlots(options)).toEqual(lease);
+    expect(f.readForgeStatus).not.toHaveBeenCalled();
+    expect(f.pidAlive).not.toHaveBeenCalled();
+    expect(beforeMarkerUnlink).not.toHaveBeenCalled();
+    expect(f.appendEvent).not.toHaveBeenCalled();
+  });
+  it('retains out-of-capacity markers for operator cleanup without scanning unbounded lease indices', async () => {
+    const f = fixture(); const file = marker(f, { slot: Number.MAX_SAFE_INTEGER });
+    expect(await reapRemoteSlots({ ...f, cap: 2 })).toEqual([]);
+    expect(existsSync(file)).toBe(true);
+    expect(f.readForgeStatus).not.toHaveBeenCalled();
+    expect(f.log).toHaveBeenCalledWith(expect.stringContaining('outside configured capacity; inspect with reap-remote'));
+    expect(heldSlots({ lockRoot: f.remoteRoot, cap: 2 })).toEqual([]);
+  });
+  it.each(['success', 'kept', 'seam throws', 'fresh status throws', 'event throws'])(
+    'releases its slot lease after %s', async outcome => {
+      const f = fixture(); const file = marker(f, { slot: 1 });
+      const options = { lockRoot: f.remoteRoot, cap: 2, slots: [1], owner: 'next-dispatcher',
+        pid: process.pid, nowMs: now, nowIso: new Date(now).toISOString() };
+      const observedLeases = [];
+      const beforeMarkerUnlink = vi.fn(() => {
+        observedLeases.push(heldSlots(options));
+        if (outcome === 'kept') writeFileSync(file, 'replacement evidence');
+        if (outcome === 'seam throws') throw new Error('injected seam failure');
+      });
+      if (outcome === 'fresh status throws') f.readForgeStatus.mockResolvedValueOnce(idle)
+        .mockRejectedValueOnce(new Error('injected status failure'));
+      if (outcome === 'event throws') f.appendEvent.mockRejectedValueOnce(new Error('injected event failure'));
+      const cleared = ['success', 'event throws'].includes(outcome);
+      expect(await reapRemoteSlots({ ...f, cap: 2, beforeMarkerUnlink })).toHaveLength(cleared ? 1 : 0);
+      expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
+      expect(observedLeases).toEqual([[expect.objectContaining({ slot: 1,
+        owner: expect.stringMatching(new RegExp(`^reaper-${process.pid}-[a-f0-9]+$`)), pid: process.pid })]]);
+      expect(existsSync(file)).toBe(!cleared);
+      expect(heldSlots(options)).toEqual([]);
+      expect(tryAcquireSlot(options)).toMatchObject({ ok: true, slot: 1 });
+      expect(releaseOwnedSlot({ ...options, fastSlots: 0 })).toEqual({ released: true, slot: 1 });
+    },
+  );
+  it('blocks dispatcher acquisition between marker checks and unlink and through event emission', async () => {
+    const f = fixture(); const file = marker(f, { slot: 1 });
+    const options = { lockRoot: f.remoteRoot, cap: 2, slots: [1], owner: 'racing-dispatcher',
+      pid: process.pid, nowMs: now, nowIso: new Date(now).toISOString() };
+    const attempts = [];
+    const contend = () => { attempts.push(tryAcquireSlot(options)); };
+    const beforeMarkerUnlink = vi.fn(async () => { contend(); });
+    f.readForgeStatus.mockResolvedValueOnce(idle).mockImplementationOnce(async () => {
+      // This await is after the identity check and before the final pathname unlink.
+      contend();
+      return idle;
+    });
+    f.appendEvent.mockImplementationOnce(async () => {
+      expect(existsSync(file)).toBe(false);
+      contend();
+    });
+    expect(await reapRemoteSlots({ ...f, cap: 2, beforeMarkerUnlink })).toEqual([
+      { slot: 1, runId, evidence: expect.any(String), cleared: true },
+    ]);
+    expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
+    expect(attempts).toHaveLength(3);
+    expect(attempts).toEqual(Array.from({ length: 3 }, () => expect.objectContaining({ ok: false, slot: null,
+      heldBy: [{ slot: 1, owner: expect.stringMatching(/^reaper-/) }] })));
+    expect(heldSlots(options)).toEqual([]);
+    expect(tryAcquireSlot(options)).toMatchObject({ ok: true, slot: 1 });
+    releaseOwnedSlot({ ...options, fastSlots: 0 });
   });
   it('clears legacy-old and new-dead-pid markers with idle Forge evidence and emits events', async () => {
     const f = fixture();
@@ -231,7 +309,7 @@ describe('remote slot reaper', () => {
     expect(f.readForgeStatus).toHaveBeenCalledTimes(1);
     if (change === 'vanished') expect(existsSync(file)).toBe(false);
     else expect(readFileSync(file, 'utf8')).toBe(change === 'content' ? replacement : original);
-    expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(1);
+    expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(0);
     expect(f.appendEvent).not.toHaveBeenCalled();
     expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('reaped ('));
   });
@@ -257,7 +335,7 @@ describe('remote slot reaper', () => {
       ['unparseable', { ...idle, procCount: '0' }],
       ['negative count', { ...idle, activeRuns: -1 }],
       ['reader throws', null],
-    ])('retains the marker and lease when status turns %s between first sample and unlink', async (_, status) => {
+    ])('retains the marker and releases the reaper lease when status turns %s between first sample and unlink', async (_, status) => {
       const f = fixture();
       const host = legacy ? 'forge' : 'other';
       const file = marker(f, { age: oldAge, legacy, overrides: { host } });
@@ -275,7 +353,7 @@ describe('remote slot reaper', () => {
       expect(beforeMarkerUnlink).toHaveBeenCalledTimes(1);
       expect(f.readForgeStatus.mock.calls).toEqual([[{ host }], [{ host }]]);
       expect(readFileSync(file, 'utf8')).toBe(original);
-      expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(1);
+      expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(0);
       expect(f.appendEvent).not.toHaveBeenCalled();
       expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('reaped ('));
     });
@@ -342,21 +420,45 @@ describe('remote slot reaper', () => {
     const f = fixture(); const file = marker(f);
     tryAcquireSlot({ lockRoot: f.remoteRoot, cap: 1, owner: 'old', nowMs: now - oldAge,
       nowIso: new Date(now - oldAge).toISOString(), pid: process.pid });
+    const leases = heldSlots({ lockRoot: f.remoteRoot, cap: 1 });
     expect(await reapRemoteSlots({ ...f, dryRun: true })).toEqual([
       { slot: 0, runId, evidence: expect.any(String), cleared: false },
     ]);
     expect(existsSync(file)).toBe(true);
-    expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(1);
+    expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toEqual(leases);
     expect(f.appendEvent).not.toHaveBeenCalled();
     expect(f.log).not.toHaveBeenCalled();
   });
-  it.each([true, false])('removes only an expired matching slot lease (expired=%s)', async expired => {
+  it('dry-run never creates a slot lease', async () => {
     const f = fixture(); marker(f);
+    f.readForgeStatus.mockImplementation(async () => {
+      expect(readdirSync(f.remoteRoot)).toEqual(['slot-0.unconfirmed']);
+      return idle;
+    });
+    expect(await reapRemoteSlots({ ...f, dryRun: true })).toHaveLength(1);
+    expect(readdirSync(f.remoteRoot)).toEqual(['slot-0.unconfirmed']);
+  });
+  it.each([true, false])('reclaims an expired lease and skips a held live lease (expired=%s)', async expired => {
+    const f = fixture(); const file = marker(f);
     const at = expired ? now - oldAge : now;
     tryAcquireSlot({ lockRoot: f.remoteRoot, cap: 1, owner: 'lease-owner', nowMs: at,
       nowIso: new Date(at).toISOString(), pid: process.pid });
-    expect(await reapRemoteSlots(f)).toHaveLength(1);
+    expect(await reapRemoteSlots(f)).toHaveLength(expired ? 1 : 0);
+    expect(existsSync(file)).toBe(!expired);
     expect(heldSlots({ lockRoot: f.remoteRoot, cap: 1 })).toHaveLength(expired ? 0 : 1);
+  });
+  it('reclaims and releases an unexpired lease held by a provably dead dispatcher', async () => {
+    const f = fixture(); const file = marker(f);
+    const options = { lockRoot: f.remoteRoot, cap: 1, owner: 'dead-dispatcher', pid: 12345,
+      nowMs: now, nowIso: new Date(now).toISOString() };
+    expect(tryAcquireSlot(options)).toMatchObject({ ok: true, slot: 0 });
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('dead dispatcher'), { code: 'ESRCH' });
+    });
+    expect(await reapRemoteSlots({ ...f, cap: 1 })).toHaveLength(1);
+    expect(kill).toHaveBeenCalledWith(12345, 0);
+    expect(existsSync(file)).toBe(false);
+    expect(heldSlots(options)).toEqual([]);
   });
   it.each([
     ['', 0, true],
@@ -451,15 +553,15 @@ describe('remote admission markers', () => {
     expect(heldSlots({ lockRoot: f.remoteRoot, cap: 8 })).toHaveLength(1);
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('refusing local rerun (exit 124)'));
   });
-  it('clears the exit-124 ambiguous-result marker once its local pid is dead and Forge is idle', async () => {
+  it('clears the exit-124 ambiguous-result marker once its local pid is dead, its lease expired and Forge is idle', async () => {
     const f = fixture();
     expect(await admission(f, async () => ({ mode: 'unconfirmed' }))).toEqual({ handled: true, exitCode: 124 });
     const file = join(f.remoteRoot, 'slot-0.unconfirmed');
     const persisted = JSON.parse(readFileSync(file, 'utf8'));
     expect(persisted).toMatchObject({ v: 1, pid: process.pid });
     f.pidAlive.mockReturnValue(false);
-    const detail = { slot: 0, runId: persisted.runId, evidence: 'forge-idle activeRuns=0 procs=0 age=120000ms' };
-    expect(await reapRemoteSlots({ ...f, clock: () => now + 120000 })).toEqual([{ ...detail, cleared: true }]);
+    const detail = { slot: 0, runId: persisted.runId, evidence: `forge-idle activeRuns=0 procs=0 age=${oldAge}ms` };
+    expect(await reapRemoteSlots({ ...f, clock: () => now + oldAge })).toEqual([{ ...detail, cleared: true }]);
     expect(f.pidAlive).toHaveBeenCalledWith(persisted.pid);
     expect(existsSync(file)).toBe(false);
     expect(f.appendEvent.mock.calls).toEqual([[{ kind: 'remote-slot-reaped', detail }]]);

@@ -441,14 +441,19 @@ describe('remote controls', () => {
     let resolve;
     const first=runWithRemoteDecision({...f,remoteExec:()=>new Promise(done=>{resolve=done;})});
     await vi.advanceTimersByTimeAsync(0);
+    const liveLease=heldSlots({lockRoot:join(f.cwd,'remote'),cap:1});
+    expect(liveLease).toHaveLength(1);
     const second=runWithRemoteDecision(f);
     await vi.advanceTimersByTimeAsync(30000);
     expect(await second).toEqual({handled:false});
-    expect(f.readForgeStatus).toHaveBeenCalledTimes(1);
+    // A live dispatcher's lease prevents the reaper from inspecting its marker or host.
+    expect(f.readForgeStatus).not.toHaveBeenCalled();
+    expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:1})).toEqual(liveLease);
     expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(true);
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith(expect.stringContaining('remote-full'));
     resolve({mode:'remote',code:0});await first;
+    expect(heldSlots({lockRoot:join(f.cwd,'remote'),cap:1})).toEqual([]);
   });
   it.each([
     ['overloaded',25000,{loadPerCore:0.81},'maxLoadPerCore'],

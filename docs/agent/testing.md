@@ -3421,7 +3421,15 @@ prepare/run/finish processes. A valid v1 marker requires a provably dead owner p
 `graceMs`; a live owner is never reaped, regardless of age. Legacy markers require mtime age at
 least `maxRunMs + marginMs`. Only the exact trimmed legacy text
 `remote termination unconfirmed` or a valid v1 JSON marker is eligible. Unknown markers remain
-operator cleanup holds. Before unlinking, re-read and match the marker's bytes, inode and mtime;
+operator cleanup holds. Before inspecting a candidate, the reaper must acquire that slot's lease
+with `tryAcquireSlot`, using a unique reaper owner and its own pid. A held lease skips all marker
+and host IO. Keep the lease through identity/eligibility checks, fresh host evidence, unlink and
+event emission, and always release it with `releaseOwnedSlot` in `finally`, including kept and
+throw paths. Dry-run never acquires a lease. The reaper tests must also attempt dispatcher
+acquisition during the final check-to-unlink window and prove it cannot acquire the same slot.
+Markers outside the configured remote capacity remain operator cleanup holds; do not expand
+the lease-release scan to arbitrary marker indices.
+Before unlinking, re-read and match the marker's bytes, inode and mtime;
 then freshly check the dispatch host is still reachable and idle, retaining the marker if that
 read fails or is incomplete. Recheck marker identity after this asynchronous status read;
 replacement or disappearance must skip deletion and emit no reap event. The injected

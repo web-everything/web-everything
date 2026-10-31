@@ -162,7 +162,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, releaseLockDirIf, isLeaseExpired, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -750,6 +750,7 @@ function remoteMarkerPidAlive(pid) {
  * Returns candidates only; dryRun reports them without changing markers, leases or events. */
 export async function reapRemoteSlots({
   remoteRoot, clock = Date.now, readForgeStatus = readRemoteForgeStatus,
+  cap = ADMISSION_POLICY_STANDARD.remote.maxConcurrent,
   log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   dryRun = false, maxRunMs = DEFAULT_ADMISSION_CEILING_MS, marginMs = 600000,
   graceMs = 120000, pidAlive = remoteMarkerPidAlive, beforeMarkerUnlink = () => {},
@@ -765,9 +766,25 @@ export async function reapRemoteSlots({
     const nowMs = clock();
     if (![nowMs, maxRunMs, marginMs, graceMs].every(n => Number.isFinite(n) && n >= 0)) return results;
     for (const name of names) {
+      let slotOptions;
+      let acquired = false;
       try {
         const slot = Number(name.slice(5, -12));
         if (!Number.isSafeInteger(slot) || name !== `slot-${slot}.unconfirmed`) continue;
+        if (slot >= cap) {
+          notice(`heavy-admission: remote slot-${slot} outside configured capacity; inspect with reap-remote before operator cleanup\n`);
+          continue;
+        }
+        if (!dryRun) {
+          // Dispatchers persist markers only while holding this same lease. Own it before
+          // reading the marker and retain it across every await through unlink and event IO.
+          slotOptions = { lockRoot: remoteRoot, cap,
+            owner: `reaper-${process.pid}-${randomBytes(12).toString('hex')}`, pid: process.pid };
+          const leaseNow = clock();
+          acquired = tryAcquireSlot({ ...slotOptions, slots: [slot], nowMs: leaseNow,
+            nowIso: new Date(leaseNow).toISOString() }).ok;
+          if (!acquired) continue;
+        }
         const file = join(remoteRoot, name);
         const info = lstatSync(file);
         if (!info.isFile() || info.size > 4096) {
@@ -813,7 +830,7 @@ export async function reapRemoteSlots({
         const evidence = `${host}-idle activeRuns=0 procs=0 age=${Math.floor(age)}ms`;
         if (!dryRun) {
           await beforeMarkerUnlink({ file, slot });
-          // Re-read immediately before unlinking: a new owner may have replaced this marker.
+          // Fail closed on external marker changes even while we own the dispatch lease.
           const markerUnchanged = () => {
             const current = lstatSync(file);
             return current.isFile() && current.dev === info.dev && current.ino === info.ino
@@ -826,19 +843,18 @@ export async function reapRemoteSlots({
           // The fresh status read is asynchronous; preserve identity across that wait too.
           if (!markerUnchanged()) continue;
           unlinkSync(file);
-          // Guard lease removal against a replacement or heartbeat since the stale read.
-          try {
-            const entry = readLockEntry(remoteRoot, slotPath(slot));
-            if (entry && isLeaseExpired(entry, nowMs, ADMISSION_LEASE_MINUTES)) {
-              releaseLockDirIf(remoteRoot, slotPath(slot), entry);
-            }
-          } catch { notice(`heavy-admission: remote slot-${slot} lease cleanup failed; leaving to lease expiry\n`); }
           results.push({ slot, runId, evidence, cleared: true });
           notice(`heavy-admission: remote slot-${slot} reaped (${evidence})\n`);
           try { await appendEvent({ kind: 'remote-slot-reaped', detail: { slot, runId, evidence } }); }
           catch { notice(`heavy-admission: remote slot-${slot} reap event failed\n`); }
         } else results.push({ slot, runId, evidence, cleared: false });
       } catch { notice('heavy-admission: remote slot reap failed; marker retained if not already cleared\n'); }
+      finally {
+        if (acquired) {
+          try { releaseOwnedSlot({ ...slotOptions, fastSlots: 0 }); }
+          catch { notice('heavy-admission: remote slot reap lease release failed; inspect with reap-remote before operator cleanup\n'); }
+        }
+      }
     }
   } catch { notice('heavy-admission: remote slot reap unavailable; retaining unconfirmed markers\n'); }
   return results;
@@ -869,7 +885,8 @@ export async function runWithRemoteDecision({
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
-  await reapRemoteSlots({ remoteRoot, clock, readForgeStatus, log });
+  const cap = policy.settings.remote.maxConcurrent;
+  await reapRemoteSlots({ remoteRoot, cap, clock, readForgeStatus, log });
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
@@ -878,7 +895,6 @@ export async function runWithRemoteDecision({
   const healthy = await health();
   if (!healthy.ok) return localFallback(healthy.reason);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
-  const cap = policy.settings.remote.maxConcurrent;
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   const waitAt = clock();
   let slot;
@@ -2418,7 +2434,8 @@ export async function main(argv, { remoteExec, readTelemetry, readForgeStatus } 
     return;
   }
   if (mode === 'reap-remote') {
-    const results = await reapRemoteSlots({ remoteRoot: join(dirname(lockRoot), 'remote'), readForgeStatus, dryRun: !!flags['dry-run'] });
+    const results = await reapRemoteSlots({ remoteRoot: join(dirname(lockRoot), 'remote'), cap: policy.settings.remote.maxConcurrent,
+      readForgeStatus, dryRun: !!flags['dry-run'] });
     emit(results);
     return;
   }
