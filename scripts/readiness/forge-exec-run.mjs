@@ -853,12 +853,16 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
       return await exclusiveWorker(async (executeCommand,selected) => {
       const resources={memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8};
+      const unmeasured=new Set();
       const command=async(...args)=>{
         const value=await executeCommand(...args);
         resources.slotCpus=value.slotCpus??resources.slotCpus;
         for(const key of ['memoryPeakBytes','cpuUsec','oomKills']) {
           const n=value.usage?.[key];
-          if(Number.isSafeInteger(n)&&n>=0) resources[key]=key==='memoryPeakBytes'?Math.max(resources[key]??0,n):(resources[key]??0)+n;
+          if(!Number.isSafeInteger(n)||n<0) {
+            unmeasured.add(key);
+            resources[key]=null;
+          } else if(!unmeasured.has(key)) resources[key]=key==='memoryPeakBytes'?Math.max(resources[key]??0,n):(resources[key]??0)+n;
         }
         return value;
       };

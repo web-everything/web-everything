@@ -1174,6 +1174,22 @@ describe('slot resource environment and receipts',()=>{
     expect(receipt.resources).toEqual({memoryPeakBytes:200,cpuUsec:count*10,oomKills:count,slotCpus:8});
     expect((await runner.finish(request)).resources).toEqual(receipt.resources);
   });
+  it.each(['null counters','missing counters','missing usage'].flatMap(kind=>[1,2].map(command=>[kind,command])))
+  ('keeps receipt counters null with %s in command %s',async(kind,command)=>{
+    let count=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      count++;
+      const usage=count!==command ? {memoryPeakBytes:200,cpuUsec:10,oomKills:1}
+        : kind==='null counters' ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null}
+        : kind==='missing counters' ? {} : undefined;
+      return {code:0,stdout:'',stderr:'',usage};
+    }});
+    await runner.run(request);
+    expect(count).toBeGreaterThanOrEqual(2);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(receipt.resources).toEqual({memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8});
+    expect((await runner.finish(request)).resources).toEqual(receipt.resources);
+  });
 });
 
 it.each([false,true])('reads supervisor cgroup counters with missing counters=%s',async missing=>{
