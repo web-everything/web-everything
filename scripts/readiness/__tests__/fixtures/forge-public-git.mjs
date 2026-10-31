@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
+import {dirname,join} from 'node:path';
 import {PUBLIC_REPOSITORY,anonymousGitEnv} from '../../forge-exec-bases.mjs';
 
 // Replace only public transport with the fixture mirror's objects. Never fetch
@@ -11,8 +12,10 @@ export async function cachedPublicGitExec(call) {
     assert.deepEqual(args.slice(fetch, -1),['fetch','--no-tags','--no-write-fetch-head','origin',
       '+refs/heads/main:refs/remotes/origin/main']);
     assert.match(args.at(-1),/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/);
+    const global=call.env.GIT_CONFIG_GLOBAL;
+    if(global!=='/dev/null')assert.equal(global,join(dirname(call.cwd),'gitconfig'));
     assert.deepEqual({...call.env,GIT_TEST_ASSUME_DIFFERENT_OWNER:undefined},
-      {...anonymousGitEnv(),GIT_TEST_ASSUME_DIFFERENT_OWNER:undefined});
+      {...anonymousGitEnv(),GIT_CONFIG_GLOBAL:global,GIT_TEST_ASSUME_DIFFERENT_OWNER:undefined});
     const origin=spawnSync('git',[...args.slice(0,fetch),'remote','get-url','origin'],{cwd:call.cwd,env:call.env,encoding:'utf8',timeout:10000});
     assert.equal(origin.status,0,origin.stderr);
     assert.equal(origin.stdout.trim(),PUBLIC_REPOSITORY);
@@ -20,5 +23,5 @@ export async function cachedPublicGitExec(call) {
   }
   const result=spawnSync(call.file,args,{cwd:call.cwd,env:call.env,input:call.input,timeout:15000,maxBuffer:4*1024*1024});
   if(result.error)throw result.error;
-  return {code:result.status,stdout:result.stdout};
+  return {code:result.status,stdout:result.stdout,stderr:result.stderr};
 }

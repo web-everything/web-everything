@@ -14,6 +14,8 @@ import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 
 vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
 
+const remoteUnconfirmed = 'heavy-admission: remote failed (transport lost) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-0 retained until its .unconfirmed marker is cleared.\n';
+
 const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
@@ -109,6 +111,82 @@ const unchanged = f => {
 };
 
 describe('overlay main sync', () => {
+
+  it("runs tests through the daemon checkout's wrapper with --repo=scratch", async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    const scratchReal = join(f.base, 'scratch-real'), scratchAlias = join(f.base, 'scratch-alias');
+    fs.mkdirSync(scratchReal);
+    fs.symlinkSync(scratchReal, scratchAlias, 'dir');
+    f.env.TMPDIR = scratchAlias;
+    f.env.LANE_POOL_ROOT = join(f.base, 'must-not-inherit');
+    f.deps.testRunner = vi.fn(async options => {
+      expect(options.root).toBe(join(f.scratched[0], 'repo'));
+      expect(options.root).not.toBe(fs.realpathSync(options.root));
+      expect(options.args.slice(0, 8)).toEqual([join(f.root, 'scripts/readiness/heavy-admission.mjs'),
+        'run', `--repo=${fs.realpathSync(options.root)}`, '--wait-ms=540000', '--', 'npx', 'vitest', 'run']);
+      expect(options.env).not.toHaveProperty('LANE_POOL_ROOT');
+      return passing(options);
+    });
+    const result = await job(f);
+    expect(result.pushed).toBe(true);
+    expect(f.deps.testRunner).toHaveBeenCalledOnce();
+    expect(f.env.LANE_POOL_ROOT).toBe(join(f.base, 'must-not-inherit'));
+  });
+
+  it.each(['runner', 'process'])('exit 124 with remote-unconfirmed is a skip, not an operator-review alert (%s)', async mode => {
+    const f = fixture(), outcomes = [];
+    f.deps.appendDaemonEvent = event => { outcomes.push(event); };
+    if (mode === 'runner') f.deps.testRunner = vi.fn(async () => ({ status: 124, stderr: remoteUnconfirmed }));
+    else {
+      delete f.deps.testRunner;
+      fs.appendFileSync(join(f.root, '.git/info/exclude'), '\n/scripts/readiness/heavy-admission.mjs\n');
+      write(f.root, 'scripts/readiness/heavy-admission.mjs', `
+        import { realpathSync } from 'node:fs';
+        if (process.env.LANE_POOL_ROOT || !process.argv.includes('--repo=' + realpathSync(process.cwd()))) process.exit(99);
+        process.stderr.write(${JSON.stringify(remoteUnconfirmed)});
+        process.exit(124);
+      `);
+    }
+    expect(await job(f)).toEqual({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(alerts(f)).toEqual([]);
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    expect(outcomes.map(e => e.kind)).toEqual(['overlay-main-sync-skipped']);
+    if (fs.existsSync(sidecar(f))) {
+      const state = json(sidecar(f));
+      for (const key of ['lastSyncedMain', 'attemptedMain', 'retryMain', 'retryTries', 'retryAfter', 'firstFailureAt'])
+        expect(state[key]?.[ref]).toBeUndefined();
+    }
+    expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
+    expect(tick(f, { spawnFn: spawner() }).started).toEqual([ref]);
+  });
+
+  it('remote-unconfirmed preserves an exhausted test retry budget and releases both locks for the next tick', async () => {
+    const f = fixture({ exhausted: true }), before = json(sidecar(f));
+    f.deps.testRunner = async () => ({ status: 124, stderr: remoteUnconfirmed });
+    expect(await job(f)).toEqual({ skipped: true, reason: 'remote-termination-unconfirmed' });
+    expect(json(sidecar(f))).toEqual(before);
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(alerts(f)).toEqual([]);
+    expect(fs.existsSync(f.env.WE_NEEDS_YOU_FEED)).toBe(false);
+    expect(fs.existsSync(marker(f))).toBe(false);
+    expect(fs.existsSync(`${sidecar(f)}.clone.lock`)).toBe(false);
+    unchanged(f);
+    expect(tick(f, { spawnFn: spawner() }).started).toEqual([ref]);
+  });
+
+  it.each([
+    [124, 'remote termination unconfirmed'],
+    [124, 'ordinary timeout'],
+    [1, remoteUnconfirmed],
+    [124, '', remoteUnconfirmed],
+  ])('keeps test failure handling for other status/stderr combinations (%s, %s)', async (status, stderr, stdout = '') => {
+    const f = fixture({ exhausted: true });
+    f.deps.testRunner = async () => ({ status, stderr, stdout });
+    await expect(job(f)).rejects.toThrow('operator review required');
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    attempted(f); unchanged(f);
+  });
 
   it.each(['kick', 'worker'])('%s skips a stale registration without attention or failure memory, until one hour or registration changes', async entry => {
     const f = fixture(), git = f.deps.git, events = [], spawnFn = spawner();
@@ -264,6 +342,7 @@ describe('overlay main sync', () => {
     expect(f.deps.git.mock.calls.filter(([args]) => args[0] !== 'checkout')
       .every(([, opts]) => opts.timeout === undefined)).toBe(true);
     expect(f.deps.git.mock.calls.some(([args]) => gitCommand(args) === 'merge')).toBe(true);
+    expect(f.deps.git.mock.calls.some(([args]) => args.includes('merge'))).toBe(true);
     expect(synced(f)).toHaveLength(1);
     expect(alerts(f)).toEqual([]);
     expect(fs.readFileSync(join(outside, 'keep.md'), 'utf8')).toBe('preserve outside scratch\n');
@@ -891,7 +970,7 @@ describe('overlay main sync', () => {
     f.deps.testRunner = vi.fn(async options => {
       expect(active).toBe(false); active = true;
       expect(f.pushes).toEqual([]);
-      expect(options.args.slice(0, 2)).toEqual(['scripts/readiness/heavy-admission.mjs', 'run']);
+      expect(options.args.slice(0, 2)).toEqual([join(f.root, 'scripts/readiness/heavy-admission.mjs'), 'run']);
       const result = await passing(options); active = false; return result;
     });
     const result = await job(f);

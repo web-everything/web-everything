@@ -404,6 +404,14 @@ describe('runWithRemoteDecision', () => {
     expectFallback(f.log, reason);
   });
 
+  it.each(['ignored-test-file', 'future-client-prelaunch-refusal'])('runs locally for confirmed non-start with arbitrary reason %s', async reason => {
+    const f = fixture({result:{mode:'not-started', terminated:true, reason}});
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expectFallback(f.log, reason);
+    expect(f.log.mock.calls.some(([line]) => line.includes('exit 124'))).toBe(false);
+  });
+
   describe.each(['not-started', 'cancelled'])('%s', (mode) => {
     it.each([undefined, false, 1, 'true'])('without terminated=true refuses local rerun: %s', async (terminated) => {
       const f = fixture({ result: { mode, terminated } });
