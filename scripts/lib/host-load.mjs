@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
+import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 
 // GC has no reason to reclaim even a stale lease. Unknown markers/IO refuse work too.
@@ -123,17 +124,24 @@ export function readHostMemoryHeadroomMb(options = {}) {
   return readMemoryReading(options).mb ?? NaN;
 }
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
+  capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
   try {
     policy ??= loadHostOverloadSettings({ env, log });
+    if (policy.settings.host.capacitySignal === 'cpu-mem') {
+      const reading = capacity({ policy, env, log, includeQueue: false, includeForge: false });
+      loadVerdict = { admitted: reading.admitNewWorkers === true && ['high', 'medium'].includes(reading.headroom?.mac),
+        reason: `host capacity: ${reading.reason ?? 'unknown'}; host.capacitySignal=cpu-mem (${policy.sources?.['host.capacitySignal'] ?? 'standard'})` };
+    } else {
     const limit = policy.settings.host.maxLoadPerCore;
     const l = load()[0]; const c = cores();
     if (!Number.isFinite(l) || l < 0 || !Number.isFinite(c) || c <= 0 || !Number.isFinite(limit) || limit <= 0) throw Error('unknown host load');
     const ratio = l / c;
     loadVerdict = { admitted: ratio <= limit, reason: `host load ${l.toFixed(2)}/${c}=${ratio.toFixed(2)}; host.maxLoadPerCore=${limit} (${policy.sources['host.maxLoadPerCore']})` };
+    }
   } catch (e) { return { admitted: false, reason: `host load unknown: ${e.message}` }; }
   if (!loadVerdict.admitted) return loadVerdict;
   // Memory is checked only once load admits; unavailable readings fail closed.

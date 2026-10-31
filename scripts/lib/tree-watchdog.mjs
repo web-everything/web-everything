@@ -21,14 +21,16 @@ try {
     .replace("from './bounded-child.mjs'", `from '${helperUrl}'`);
   OWN_SOURCE_URL = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 } catch { /* the fallback timer covers it */ }
-// Eval workers can inherit the caller's module mode. Dynamic import works in both CommonJS and ESM;
-// keep startup promise-based so stop() can terminate a heartbeat import without top-level await.
+// Eval workers inherit the caller's --input-type on newer Node releases. Dynamic imports work in both
+// CommonJS and ESM, so a module-mode caller must not downgrade the ceiling to the main-thread fallback.
+// Keep startup promise-based so stop() can drain a heartbeat import without top-level await.
 const WATCHDOG_SOURCE = `import('node:worker_threads').then(({ workerData, parentPort }) =>
   import(workerData.module).then((m) => m.runTreeWatchdog(workerData, parentPort)));`;
 
-// flag[0]: 0 armed, 1 fired (the tree is killed, the escape sweeps are running), 2 swept (the kill is complete).
+// flag[0]: -1 cancelled, 0 armed, 1 fired (escape sweeps running), 2 swept (the kill is complete).
 function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
-  Atomics.store(flag, 0, 1);
+  // Cancellation and firing compete on the same word: a stop during worker startup must disarm the ceiling too.
+  if (Atomics.compareExchange(flag, 0, 0, 1) !== 0) return;
   const pgid = kill.orphansOfOwnGroup ? ownProcessGroup() : null;
   // Orphans of this group only when this process LEADS it (every member is then provably ours).
   killProcessTree(pid, 'SIGKILL', { orphansOfGroup: pgid === process.pid ? pgid : null, marker: kill.marker ?? null, outputFds: kill.outputFds ?? [], afterTree });
@@ -38,16 +40,42 @@ function fireTreeKill({ pid, kill, flag, afterTree = () => {} }) {
 /** Worker entry of {@link startTreeWatchdog}. Not for direct use. */
 export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, port) {
   let beat = null;
-  setTimeout(() => {
+  let loading = false;
+  let stopRequested = false;
+  const cleanup = () => {
+    clearTimeout(timer);
+    clearInterval(beat);
+    // Do not tear down an isolate during ESM evaluation (Node 22 can abort in AsyncModuleExecutionFulfilled).
+    // Exit only after imports and any escape sweeps finish. Closing the port alone leaves heartbeat-owned
+    // handles alive, so stop() would hang after the deadline fired just as it would during cancellation.
+    if (!loading) process.exit(0); // Ends only this worker thread, including the module's live handles.
+  };
+  const stop = () => {
+    stopRequested = true;
+    if (loading) return;
+    cleanup();
+  };
+  port.on('message', (message) => { if (message === 'stop') stop(); });
+  const timer = setTimeout(() => {
     clearInterval(beat);
     fireTreeKill({ pid, kill, flag, afterTree: () => port.postMessage('fired') });
-    port.postMessage('swept');
+    if (Atomics.load(flag, 0) === 2) port.postMessage('swept');
+    cleanup();
   }, Math.max(0, deadline - Date.now()));
+  if (Atomics.load(flag, 0) !== 0) {
+    if (Atomics.load(flag, 0) === -1) stop(); else cleanup();
+    return;
+  }
   if (heartbeat) {
     // The ceiling above is already armed and must survive a heartbeat module that fails to load.
     let fn = null;
+    loading = true;
     try { fn = (await import(heartbeat.module))[heartbeat.exportName]; } catch { /* no heartbeat; the ceiling still holds */ }
+    loading = false;
     if (typeof fn === 'function' && Atomics.load(flag, 0) === 0) beat = setInterval(() => { try { fn(heartbeat.args); } catch { /* best-effort */ } }, heartbeat.everyMs);
+    const state = Atomics.load(flag, 0);
+    if (stopRequested || state === -1) stop();
+    else if (state !== 0) cleanup();
   }
 }
 
@@ -59,8 +87,8 @@ export async function runTreeWatchdog({ pid, deadline, kill, heartbeat, flag }, 
  * is free). `heartbeat` (`{ module, exportName, args, everyMs }`) is called on that thread until the ceiling, then
  * stops, so a caller still stuck after the kill no longer keeps its slot. If the worker cannot run, the same ceiling
  * falls back to a main-thread timer, which a blocked main thread defeats — so that downgrade is logged through `warn`.
- * Unref'd; `stop()` ends it.
- * @returns {{ fired: () => boolean, settled: (maxWaitMs?: number) => Promise<void>, stop: () => void }}
+ * Unref'd while armed; await `stop()` to drain a cancelled worker before exiting the caller.
+ * @returns {{ fired: () => boolean, settled: (maxWaitMs?: number) => Promise<void>, stop: () => Promise<void> }}
  */
 export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null, onFire = () => {},
   warn = (m) => { try { process.stderr.write(m); } catch { /* logging only */ } }, moduleUrl = OWN_SOURCE_URL }) {
@@ -79,9 +107,11 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
     fallback.unref();
   };
   let worker = null;
+  let workerExited = Promise.resolve();
   try {
     if (!moduleUrl) throw new Error('own module source unavailable');
     worker = new Worker(WATCHDOG_SOURCE, { eval: true, workerData: { module: moduleUrl, pid, deadline, kill, heartbeat, flag } });
+    workerExited = new Promise((r) => worker.once('exit', () => r()));
     worker.on('message', (m) => { if (m === 'fired' && !stopped) onFire(); if (m === 'swept') markSwept(); });
     worker.on('error', fallBack);
     worker.on('exit', () => markSwept());
@@ -96,11 +126,21 @@ export function startTreeWatchdog({ pid, timeoutMs, kill = {}, heartbeat = null,
     // The wait timer is REF'd on purpose: the child has closed and the worker is unref'd, so without it nothing keeps
     // the caller's event loop alive and Node would exit mid-await, before the caller records its result.
     settled: (maxWaitMs = 60_000) => {
-      if (Atomics.load(flag, 0) === 0) return Promise.resolve();
+      if (Atomics.load(flag, 0) <= 0) return Promise.resolve();
       let hold = null;
       return Promise.race([swept, new Promise((r) => { hold = setTimeout(r, maxWaitMs); })]).finally(() => clearTimeout(hold));
     },
-    // Disarms an unfired ceiling. A fired worker is left to finish its sweeps and exit on its own.
-    stop: () => { stopped = true; clearTimeout(fallback); if (Atomics.load(flag, 0) === 0) worker?.terminate().catch(() => {}); },
+    // Disarm synchronously even if the worker is still loading. Let pending ESM imports settle instead of
+    // Worker.terminate(), which can crash the entire host process. A fired worker keeps its escape sweeps.
+    stop: () => {
+      stopped = true;
+      clearTimeout(fallback);
+      Atomics.compareExchange(flag, 0, 0, -1);
+      if (worker) {
+        worker.ref();
+        if (Atomics.load(flag, 0) === -1) worker.postMessage('stop');
+      }
+      return workerExited;
+    },
   };
 }

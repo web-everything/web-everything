@@ -32,7 +32,7 @@ describe('createPrLandRunner — daemon gh guard refusal (card 6931)', () => {
     for (const [, marker] of DAEMONS) {
       const fb = fallbacks();
       const gh = { spawn: 0, review: 0, dup: 0 };
-      const run = createPrLandRunner({
+      const run = createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '',
         resolveEnv: () => resolveGhCredentialEnv({ env: { PATH: '/usr/bin', ...marker }, build: writeFailed, exists: fb.exists, orgShimDir: fb.orgShimDir }),
         prePrReview: () => { gh.review++; return { action: 'pass' }; },
         dupBornAs: () => { gh.dup++; return []; },
@@ -53,7 +53,7 @@ describe('createPrLandRunner — daemon gh guard refusal (card 6931)', () => {
         vi.stubEnv('XPC_SERVICE_NAME', marker.XPC_SERVICE_NAME ?? '');
         vi.stubEnv('PATH', empty);
         let spawned = 0;
-        const run = createPrLandRunner({ resolveEnv: () => resolveGhCredentialEnv(), prePrReview: () => ({ action: 'pass' }), spawn: () => { spawned++; return { status: 0, stdout: '{"pr":1}' }; } });
+        const run = createPrLandRunner({ prepGate: () => ({ ok: true }), readPrepBody: () => '', resolveEnv: () => resolveGhCredentialEnv(), prePrReview: () => ({ action: 'pass' }), spawn: () => { spawned++; return { status: 0, stdout: '{"pr":1}' }; } });
         expect(run({ argv: ['--ref=lane/x'] })).toMatchObject({ outcome: 'refused', reason: 'gh-auth-guard-unavailable', detail: expect.stringMatching(/without a real gh binary/) });
         expect(spawned).toBe(0);
       }
