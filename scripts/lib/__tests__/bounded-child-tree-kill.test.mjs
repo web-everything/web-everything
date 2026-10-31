@@ -42,6 +42,47 @@ describe('escaped-descendant listings (PR #5768)', () => {
 });
 
 describe('startTreeWatchdog (PR #5768)', () => {
+  it.each([
+    { liveHandle: false, loading: false },
+    { liveHandle: true, loading: false },
+    { liveHandle: false, loading: true },
+    { liveHandle: true, loading: true },
+  ])('stop() resolves with a heartbeat module (live handle: $liveHandle, import in flight: $loading)', ({ liveHandle, loading }) => {
+    // Isolate the probe so a regression cannot leave a ref'd watchdog hanging the test runner.
+    const liveInterval = liveHandle ? 'setInterval(() => {}, 1000);' : ''; // keepalive-helper-ok: deliberate worker handle leak; bounded subprocess exits after the stop race.
+    const module = `import { workerData } from 'node:worker_threads';
+const state = workerData.heartbeat.args;
+export const heartbeat = () => {};
+${liveInterval}
+${loading ? `Atomics.store(state, 0, 1);
+Atomics.notify(state, 0);
+await new Promise((r) => setTimeout(r, 450));` : ''}
+Atomics.store(state, 1, 1);
+export const ready = () => { heartbeat(); Atomics.store(state, 0, 1); Atomics.notify(state, 0); };
+`;
+    const probe = `import { spawn } from 'node:child_process';
+import { startTreeWatchdog } from ${JSON.stringify(pathToFileURL(resolve(process.cwd(), 'scripts/lib/tree-watchdog.mjs')).href)};
+const victim = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { stdio: 'ignore' });
+const exited = new Promise((r) => victim.once('exit', r));
+const state = new Int32Array(new SharedArrayBuffer(8));
+const warned = [];
+const watchdog = startTreeWatchdog({ pid: victim.pid, timeoutMs: 60_000, warn: (m) => warned.push(m),
+  heartbeat: { module: ${JSON.stringify(`data:text/javascript;base64,${Buffer.from(module).toString('base64')}`)}, exportName: 'ready', args: state, everyMs: 10 } });
+let timer;
+try {
+  await Atomics.waitAsync(state, 0, 0, 5_000).value;
+  const entered = Atomics.load(state, 0);
+  const completedBeforeStop = Atomics.load(state, 1);
+  const result = await Promise.race([watchdog.stop().then(() => 'stopped'), new Promise((r) => { timer = setTimeout(() => r('timeout'), 5_000); })]);
+  console.log(JSON.stringify({ entered, completedBeforeStop, completed: Atomics.load(state, 1), result, fired: watchdog.fired(), alive: victim.exitCode === null && victim.signalCode === null, warned }));
+} finally { clearTimeout(timer); victim.kill('SIGKILL'); await exited; }
+process.exit(0);
+`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', probe], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({ entered: 1, completedBeforeStop: loading ? 0 : 1, completed: 1, result: 'stopped', fired: false, alive: true, warned: [] });
+  }, 20_000);
+
   it.each([false, true])('stop() drains an in-flight heartbeat import without terminating its isolate (fired: %s)', async (fire) => {
     // A real subprocess keeps a native worker-loader crash from taking down Vitest itself.
     const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-stop-import-'));
