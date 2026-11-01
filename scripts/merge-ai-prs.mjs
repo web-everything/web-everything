@@ -4599,8 +4599,19 @@ async function runCli() {
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
   const repoFlag = (repo) => (repo ? ['--repo', repo] : []);      // a slug → scope the gh call; null → cwd repo
-  // The persisted memo is shared across repos: key an implicit (cwd) repo by its real slug, never a bare "cwd".
-  const memoRepo = (repo) => repo || localSlug || `cwd:${process.cwd()}`;
+  // Provisioning receives the memo identity as --repo. Match implicit PR edits: honour GH_REPO, then
+  // let gh resolve its default remote (which may differ from origin). Resolve once, only when needed;
+  // use the URL so a remote on another GitHub host keeps its identity too. Never guess on a failed read.
+  let implicitLabelRepo;
+  const memoRepo = (repo) => {
+    if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
+    if (!implicitLabelRepo) {
+      implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
+      if (!implicitLabelRepo) throw new Error('Cannot resolve implicit label repository');
+    }
+    return implicitLabelRepo;
+  };
   const KNOWN_LABEL_META = { ...REVIEW_LABEL_META, ...CI_LIFECYCLE_LABEL_META };
   // Not-found on a label write: drop the stale memo entries, re-mint, report whether a retry is worthwhile.
   const healLabelNotFoundIn = (repo) => (name) => {

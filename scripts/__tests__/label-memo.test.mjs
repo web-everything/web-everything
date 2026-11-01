@@ -8,10 +8,104 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { createLabelEnsurer, isLabelNotFoundError, parseLabelMemo, LABEL_MEMO_TTL_MS } from '../lib/label-memo.mjs';
 import { applyDrainParkLabel, applyCiLifecycleLabelPlan } from '../merge-ai-prs.mjs';
 
 const META = { color: 'aabbcc', description: 'd' };
+
+// Exercise the CLI's actual provisioning/retry closures, with only the gh transport replaced.
+// This also covers addPrLabel, which is private to the CLI rather than an exported helper.
+describe('implicit repository label wiring', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-label-repo-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const wire = (path, effectiveRepo, { localSlug = 'alice/fork', env = { GH_REPO: effectiveRepo }, repoReadError = null } = {}) => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    const setup = src.slice(src.indexOf('  const repoFlag ='), src.indexOf('  // #gh-graphql-budget'));
+    const provision = src.slice(src.indexOf('  const ensuredLabels ='), src.indexOf('  // #2263'));
+    const calls = [];
+    const labels = new Set();
+    const exec = (cmd, args) => {
+      expect(cmd).toBe('gh');
+      const target = args.includes('--repo') ? args[args.indexOf('--repo') + 1] : effectiveRepo;
+      calls.push({ args, target });
+      if (args[0] === 'repo') {
+        if (repoReadError) throw repoReadError;
+        return effectiveRepo + '\n';
+      }
+      if (args[0] === 'label') labels.add(`${target}::${args[2]}`);
+      if (args.includes('--add-label') && !labels.has(`${target}::${args.at(-1)}`)) {
+        throw Object.assign(new Error('missing label'), { stderr: "'review:human' not found" });
+      }
+    };
+    const api = runInNewContext(`${setup}\n${provision}\n({ memoRepo, labelEnsurer, healLabelNotFoundIn, addPrLabel })`, {
+      localSlug, process: { env: { ...env, WE_DRAIN_LABEL_MEMO_PATH: path }, cwd: () => '/checkout' },
+      REVIEW_LABEL_META: { 'review:human': META }, CI_LIFECYCLE_LABEL_META: { 'ci:failed': META },
+      execFileSync: exec, createLabelEnsurer, isLabelNotFoundError,
+    });
+    return { ...api, calls, labels, exec };
+  };
+
+  it.each(['upstream/project', 'https://github.example.com/upstream/project'])(
+    'provisions, memoises and heals in gh\'s effective repository %s instead of origin', (effectiveRepo) => {
+      const path = join(dir, 'memo.json');
+      const api = wire(path, effectiveRepo);
+      const repo = api.memoRepo(null);
+      api.labelEnsurer.ensure(repo, 'review:human', META);
+      expect(api.calls.find(c => c.args[0] === 'label').target).toBe(effectiveRepo);
+      expect(parseLabelMemo(readFileSync(path, 'utf8'))[`${effectiveRepo}::review:human`]).toBeTypeOf('number');
+      const restarted = wire(path, effectiveRepo);
+      restarted.labelEnsurer.ensure(restarted.memoRepo(null), 'review:human', META);
+      expect(restarted.calls).toEqual([]);
+      api.labels.clear(); // Deleted after provisioning: all three production add-label paths must recover.
+      expect(() => api.addPrLabel(null, 7, 'review:human')).not.toThrow();
+      api.labels.clear();
+      expect(applyDrainParkLabel({ gate: { applyLabel: 'review:human' }, labels: [], dryRun: false, pr: 7,
+        repo: null, onLabelNotFound: api.healLabelNotFoundIn(null) }, { exec: api.exec }).added).toBe(true);
+      api.labels.clear();
+      expect(applyCiLifecycleLabelPlan({ plan: { toAdd: ['ci:failed'], toRemove: [] }, pr: 7,
+        repo: null, exec: api.exec, signal: () => {}, onLabelNotFound: api.healLabelNotFoundIn(null) })).toBe(true);
+      expect(api.calls.filter(c => c.args[0] === 'label').map(c => c.target)).toEqual(Array(4).fill(effectiveRepo));
+      expect(api.calls.filter(c => c.args.includes('--add-label'))).toHaveLength(6);
+    });
+
+  it('explicit repository takes precedence over GH_REPO for provisioning, memo and retry', () => {
+    const api = wire(join(dir, 'memo.json'), 'upstream/project');
+    const repo = 'other/project';
+    expect(api.memoRepo(repo)).toBe(repo);
+    api.labelEnsurer.ensure(api.memoRepo(repo), 'review:human', META);
+    api.labels.clear();
+    expect(() => api.addPrLabel(repo, 7, 'review:human')).not.toThrow();
+    expect(api.calls.every(c => c.target === repo)).toBe(true);
+  });
+
+  it.each(['alice/fork', null])('resolves gh\'s default repository once instead of guessing from origin %s', (localSlug) => {
+    const effectiveRepo = 'https://github.example.com/upstream/project';
+    const api = wire(join(dir, 'memo.json'), effectiveRepo, { env: {}, localSlug });
+    expect(api.memoRepo(null)).toBe(effectiveRepo);
+    api.labelEnsurer.ensure(api.memoRepo(null), 'review:human', META);
+    api.labels.clear();
+    expect(() => api.addPrLabel(null, 7, 'review:human')).not.toThrow();
+    expect(api.calls.filter(c => c.args[0] === 'repo')).toHaveLength(1);
+    expect(api.calls.filter(c => c.args[0] === 'label').every(c => c.target === effectiveRepo)).toBe(true);
+  });
+
+  it('refuses an empty default repository read before provisioning or memoising', () => {
+    const api = wire(join(dir, 'memo.json'), '', { env: { GH_REPO: '' } });
+    expect(() => api.labelEnsurer.ensure(api.memoRepo(null), 'review:human', META)).toThrow('Cannot resolve implicit label repository');
+    expect(api.calls.map(c => c.args[0])).toEqual(['repo']);
+    expect(api.labelEnsurer.memo).toEqual({});
+  });
+
+  it('propagates a failed repository read without provisioning in origin', () => {
+    const api = wire(join(dir, 'memo.json'), 'unused', { env: {}, repoReadError: new Error('HTTP 502') });
+    expect(() => api.labelEnsurer.ensure(api.memoRepo(null), 'review:human', META)).toThrow('HTTP 502');
+    expect(api.calls.map(c => c.args[0])).toEqual(['repo']);
+    expect(api.labelEnsurer.memo).toEqual({});
+  });
+});
 
 describe('label memo — persisted ensure', () => {
   let dir, path, clock, calls;
