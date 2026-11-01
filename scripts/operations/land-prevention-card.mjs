@@ -754,6 +754,7 @@ export async function landPreventionCard(input, {
         const saved = salvageCards({ dir: laneDir, lane: laneNum ?? 0, reason: `land-prevention-card ${input.session}: card files left after ${durable ? 'a landed' : 'an unlanded'} filing` });
         if (saved.status === 'salvaged') write(`land-prevention-card: saved ${saved.removed.length} card file(s) to ${saved.outDir}, lane cleaned — ${saved.removed.join(', ')}\n`);
         else if (saved.status === 'failed') write(`land-prevention-card: lane card salvage FAILED (lane-pool release retries it) — ${saved.reason}\n`);
+        else if (saved.status === 'unknown') write(`land-prevention-card: lane card salvage skipped (status unreadable; lane-pool release retries it) — ${saved.reason}\n`);
         else if (saved.status === 'mixed') write(`land-prevention-card: lane holds non-card changes too; card files left for release to judge — ${saved.other.join(', ')}\n`);
       } catch (e) { write(`land-prevention-card: lane cleanup failed (non-fatal; lane-pool release retries it) — ${errorReason(e)}\n`); }
     }

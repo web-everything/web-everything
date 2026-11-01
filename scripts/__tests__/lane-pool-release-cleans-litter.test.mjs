@@ -13,6 +13,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { refreshSalvageIndex } from '../lib/salvage-index.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -22,11 +23,11 @@ function git(args, cwd) {
 
 let base, originDir, referenceDir, poolRoot;
 
-function runPool(args) {
+function runPool(args, preload = null) {
   const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_SALVAGE_DIR: join(base, 'salvage') };
   delete env.LANE_SESSION;
   delete env.CLAUDE_CODE_SESSION_ID;
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env });
+  const r = spawnSync('node', [...(preload ? ['--import', preload] : []), SCRIPT, ...args], { encoding: 'utf8', env });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -182,6 +183,22 @@ describe('lane-pool release reaps known-safe litter (#3568)', () => {
 
 // R310 — 2026-11-01: 75 of 90 lanes were released DIRTY with only leftover card files and the pool read 0 acquirable.
 describe('lane-pool release saves, then cleans, a lane dirty only with backlog card files (R310)', () => {
+  // Patch the child's process boundary only: the real release, Git operations and lease IO still run.
+  function gitHook(dir, body) {
+    const path = join(base, 'git-hook.mjs');
+    writeFileSync(path, `import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { writeFileSync } from 'node:fs';
+const original = cp.execFileSync;
+const lane = ${JSON.stringify(dir)};
+let statusReads = 0;
+cp.execFileSync = function(cmd, args, opts) {
+  ${body}
+  return original.call(this, cmd, args, opts);
+};
+syncBuiltinESMExports();\n`);
+    return path;
+  }
   function leaveCards(dir) {
     mkdirSync(join(dir, 'backlog', 'raised-by', '5360'), { recursive: true });
     writeFileSync(join(dir, 'backlog', 'xfmkody-prevention-guard.md'), 'card\n');
@@ -203,6 +220,74 @@ describe('lane-pool release saves, then cleans, a lane dirty only with backlog c
     const [stamp] = readdirSync(out);
     expect(readFileSync(join(out, stamp, 'backlog/xfmkody-prevention-guard.md'), 'utf8')).toBe('card\n');
     expect(readFileSync(join(out, stamp, 'backlog/raised-by/5360/5771-abc.md'), 'utf8')).toBe('raise\n');
+    const events = readFileSync(join(poolRoot, 'litterpool', '.lane-journal.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events.filter(e => e.action === 'card-salvage')).toEqual([expect.objectContaining({
+      removed: expect.arrayContaining(['backlog/xfmkody-prevention-guard.md', 'backlog/raised-by/5360/5771-abc.md']),
+      salvagedTo: join(out, stamp),
+    })]);
+  });
+
+  it('a status-read failure with no known cards does not block release', () => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    const hook = gitHook(dir, `if (cmd === 'git' && opts?.cwd === lane && args.includes('status')) throw new Error('forced unreadable status');`);
+    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json'], hook);
+    expect(release.code).toBe(0);
+    expect(JSON.parse(release.out).released).toBe(1);
+    expect(release.out + release.err).toContain('card salvage skipped');
+    expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(false);
+    expect(existsSync(join(base, 'salvage'))).toBe(false);
+  });
+
+  it.each(['litter cleanup', 'salvage recheck'])('lease changed during %s prevents card retirement', stage => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    leaveCards(dir);
+    writeFileSync(join(dir, '.pr-body.md'), 'litter\n');
+    const leasePath = join(dir, '.git', '.lane-lease');
+    const replacement = { ...JSON.parse(readFileSync(leasePath, 'utf8')), session: 'replacement-owner', holder: 'replacement-holder' };
+    const replacementBytes = JSON.stringify(replacement);
+    // -uall distinguishes card salvage reads from the earlier snapshot/litter reads.
+    const hook = gitHook(dir, `if (cmd === 'git' && opts?.cwd === lane && (
+      ${JSON.stringify(stage)} === 'litter cleanup' ? args.includes('clean')
+        : args.includes('status') && args.includes('--untracked-files=all') && ++statusReads === 2
+    )) {
+      const out = original.call(this, cmd, args, opts);
+      writeFileSync(${JSON.stringify(leasePath)}, ${JSON.stringify(replacementBytes)});
+      return out;
+    }`);
+    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json'], hook);
+    expect(release.code).toBe(0);
+    expect(JSON.parse(release.out).released).toBe(0);
+    expect(release.out + release.err).toMatch(/lease changed/);
+    expect(readFileSync(leasePath, 'utf8')).toBe(replacementBytes);
+    expect(readFileSync(join(dir, 'backlog/xfmkody-prevention-guard.md'), 'utf8')).toBe('card\n');
+    expect(readFileSync(join(dir, 'backlog/raised-by/5360/5771-abc.md'), 'utf8')).toBe('raise\n');
+    expect(existsSync(join(dir, '.pr-body.md'))).toBe(false); // the hook really ran during cleanup
+    if (stage === 'litter cleanup') expect(existsSync(join(base, 'salvage'))).toBe(false);
+    else {
+      const root = join(base, 'salvage');
+      const entry = JSON.parse(readFileSync(join(root, 'index.jsonl'), 'utf8').trim());
+      expect(readFileSync(join(entry.outDir, 'backlog/xfmkody-prevention-guard.md'), 'utf8')).toBe('card\n');
+      expect(existsSync(join(entry.outDir, 'retired'))).toBe(false);
+    }
+  });
+
+  it('retired cards survive real lane trim and salvage expiry', () => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    leaveCards(dir);
+    expect(JSON.parse(runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']).out).released).toBe(1);
+    const root = join(base, 'salvage');
+    const entry = JSON.parse(readFileSync(join(root, 'index.jsonl'), 'utf8').trim());
+    const retiredDir = join(entry.outDir, 'retired');
+    const retained = readdirSync(retiredDir).map(name => join(retiredDir, name));
+    expect(retained).toHaveLength(2);
+    const trim = runPool(['trim', '--max=0', ...poolArgs(), '--json']);
+    expect(trim.code).toBe(0);
+    expect(existsSync(dir)).toBe(false);
+    expect(refreshSalvageIndex({ root, nowMs: Date.parse(entry.ts) + 30 * 86400_000, isLanded: () => false }).expired).toHaveLength(1);
+    expect(retained.map(path => readFileSync(path, 'utf8')).sort()).toEqual(['card\n', 'raise\n']);
   });
 
   it('cards plus other real work: nothing is touched (the existing release behavior)', () => {
@@ -223,9 +308,12 @@ describe('lane-pool release saves, then cleans, a lane dirty only with backlog c
     leaveCards(dir);
     writeFileSync(join(base, 'salvage'), 'not a directory'); // forced error
     const before = git(['status', '--porcelain', '--untracked-files=all'], dir);
+    const leasePath = join(dir, '.git', '.lane-lease');
+    const leaseBefore = readFileSync(leasePath, 'utf8');
     const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
     expect(JSON.parse(release.out).released).toBe(0);
     expect(release.err + release.out).toMatch(/KEPT — card files could not be saved/);
     expect(git(['status', '--porcelain', '--untracked-files=all'], dir)).toBe(before);
+    expect(readFileSync(leasePath, 'utf8')).toBe(leaseBefore);
   });
 });

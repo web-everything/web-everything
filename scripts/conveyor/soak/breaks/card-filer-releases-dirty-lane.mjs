@@ -8,7 +8,8 @@
  * only with card files (`we:scripts/lib/lane-card-salvage.mjs`).
  *
  * Scenario: the REAL filer against a scratch pool through the REAL `lane-pool.mjs` CLI. `file-item` writes the card
- * and then times out (the forced error path). RED = the released lane is still dirty; GREEN = clean, card saved.
+ * and then times out (the forced error path). Also releases a clean lane whose status read fails: unknown dirt
+ * must not become a known card-save failure that strands its lease. GREEN = clean, card saved, unknown released.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -64,6 +65,43 @@ export default {
       if (left) violations.push({ invariant: 'released-lane-clean', detail: left });
       const index = join(base, 'salvage', 'index.jsonl');
       if (!left && !(existsSync(index) && readFileSync(index, 'utf8').includes(CARD))) violations.push({ invariant: 'card-saved', detail: 'card removed without a salvage record' });
+      const unknown = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-unknown', '--json']));
+      const hook = join(base, 'unreadable-status.mjs');
+      writeFileSync(hook, `import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const original = cp.execFileSync;
+cp.execFileSync = function(cmd, args, opts) {
+  if (cmd === 'git' && opts?.cwd === ${JSON.stringify(unknown.path)} && args.includes('status')) throw new Error('forced unreadable status');
+  return original.call(this, cmd, args, opts);
+};
+syncBuiltinESMExports();\n`);
+      const release = JSON.parse(execRead('node', ['--import', hook, join(ROOT, 'scripts/lane-pool.mjs'),
+        'release', `--lane=${unknown.lane}`, '--session=soak-unknown', '--json', ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] }));
+      if (release.released !== 1 || existsSync(join(unknown.path, '.git', '.lane-lease'))) {
+        violations.push({ invariant: 'unknown-status-release', detail: 'a failed status read with no known cards stranded the lease' });
+      }
+      const raced = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-old-owner', '--json']));
+      writeFileSync(join(raced.path, CARD), 'replacement holder card\n');
+      const leasePath = join(raced.path, '.git', '.lane-lease');
+      const replacement = { ...JSON.parse(readFileSync(leasePath, 'utf8')), session: 'soak-new-owner' };
+      writeFileSync(hook, `import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { writeFileSync } from 'node:fs';
+const original = cp.execFileSync;
+let reads = 0;
+cp.execFileSync = function(cmd, args, opts) {
+  const out = original.call(this, cmd, args, opts);
+  if (cmd === 'git' && opts?.cwd === ${JSON.stringify(raced.path)} && args.includes('status') && args.includes('--untracked-files=all') && ++reads === 2)
+    writeFileSync(${JSON.stringify(leasePath)}, ${JSON.stringify(JSON.stringify(replacement))});
+  return out;
+};
+syncBuiltinESMExports();\n`);
+      const raceRelease = JSON.parse(execRead('node', ['--import', hook, join(ROOT, 'scripts/lane-pool.mjs'),
+        'release', `--lane=${raced.lane}`, '--session=soak-old-owner', '--json', ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] }));
+      if (raceRelease.released !== 0 || readFileSync(leasePath, 'utf8') !== JSON.stringify(replacement)
+        || !existsSync(join(raced.path, CARD)) || readFileSync(join(raced.path, CARD), 'utf8') !== 'replacement holder card\n') {
+        violations.push({ invariant: 'ownership-during-salvage', detail: 'a lease swap during the status recheck must preserve the replacement lease and card' });
+      }
       return { violations };
     } finally {
       if (savedSalvage === undefined) delete process.env.WE_LANE_SALVAGE_DIR; else process.env.WE_LANE_SALVAGE_DIR = savedSalvage;

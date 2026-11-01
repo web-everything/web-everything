@@ -593,17 +593,59 @@ describe('landPreventionCard — the lane is clean before release, on every exit
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('a batched card (durable in the collector) has its lane copy removed before release', async () => {
+  it.each(['batched', 'held'])('%s filing preserves exact handoff bytes and releases a clean lane', async step => {
     const { root, lane, salvageRoot } = realLane();
     try {
       const seen = [];
+      const pendingDir = join(root, 'pending');
+      const handedOff = [];
       const { exec } = scriptedExec([acquire(lane), fileItem(lane, JSON.stringify({ verdict: { num: null, rel: REL } })), releaseSeesStatus(lane, seen)]);
       const result = await landPreventionCard(INPUT, {
-        exec, ...deps(salvageRoot), batch: async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }),
+        exec, ...deps(salvageRoot), pendingDir, batch: async entry => {
+          handedOff.push(readFileSync(join(entry.laneDir, entry.cardPath), 'utf8'));
+          return step === 'batched' ? { batched: true, batchRef: 'lane/card-batch-prevention-1' }
+            : { batched: false, retryable: true, reason: 'lease-held' };
+        },
       });
-      expect(result).toMatchObject({ ok: true, step: 'batched' });
+      expect(result).toMatchObject({ ok: true, step });
       expect(seen).toEqual(['']);
+      expect(handedOff).toEqual(['card\n']);
+      if (step === 'held') {
+        const [spool] = readdirSync(pendingDir);
+        expect(JSON.parse(readFileSync(join(pendingDir, spool), 'utf8'))).toMatchObject({ rel: REL, content: 'card\n' });
+      }
       expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false); // durable elsewhere: nothing to salvage
+      const retired = join(salvageRoot, 'web-everything', 'retired-cards');
+      const [name] = readdirSync(retired);
+      expect(readFileSync(join(retired, name), 'utf8')).toBe('card\n');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['verify', 'refused'], ['verify', 'throw'], ['open-pr', 'refused'], ['open-pr', 'throw'],
+  ])('%s failure (%s) preserves committed card bytes and releases a clean lane', async (step, failure) => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      const seen = [];
+      let committedHead;
+      const refused = step === 'verify'
+        ? JSON.stringify({ verdict: { ok: false, blocking: ['forced verify failure'] } })
+        : JSON.stringify({ findings: { submit: { effects: [{ result: { outcome: 'refused', reason: 'forced open-pr failure' } }] } } });
+      const { exec } = scriptedExec([
+        acquire(lane), fileItem(lane, JSON.stringify({ verdict: { num: null, rel: REL } })),
+        () => { gitIn(lane, ['add', '--', REL]); return ''; },
+        () => { gitIn(lane, ['commit', '--quiet', '-m', 'card']); committedHead = gitIn(lane, ['rev-parse', 'HEAD']); return ''; },
+        ...(step === 'open-pr' ? [VERIFY_GREEN] : []),
+        failure === 'throw' ? new Error(`forced ${step} failure`) : refused,
+        releaseSeesStatus(lane, seen),
+      ]);
+      const result = await landPreventionCard(INPUT, { exec, ...deps(salvageRoot), pendingDir: join(root, 'pending') });
+      expect(result).toMatchObject({ ok: false, step });
+      expect(seen).toEqual(['']);
+      expect(gitIn(lane, ['rev-parse', 'HEAD'])).toBe(committedHead);
+      expect(execFileSync('git', ['show', `HEAD:${REL}`], { cwd: lane, encoding: 'utf8' })).toBe('card\n');
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe('card\n');
+      expect(existsSync(salvageRoot)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
