@@ -1,9 +1,9 @@
 // @vitest-environment node
 import {describe, it, expect, afterEach} from 'vitest';
-import {mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
+import {readdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createMarkerReaper, markerContent, blockedSlots} from '../forge-slot-markers.mjs';
+import {createMarkerReaper, markerContent, blockedSlots, heldTombstone} from '../forge-slot-markers.mjs';
 
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, {recursive: true, force: true}); });
@@ -52,6 +52,14 @@ describe('stale remote slot markers (perf10)', () => {
     writeFileSync(join(root, 'slot-1.unconfirmed.held-0123456789abcdef'), 'x');
     writeFileSync(join(root, 'slot-3.unconfirmed.dead'), '{}');
     expect([...blockedSlots(root, 8)].sort()).toEqual([0, 1, 2]);
+  });
+  it('retakes the listing when a listed marker is renamed away mid-scan, never missing its tombstone', () => {
+    const root = setup({0: {pid: 1}});
+    let lists = 0;
+    const readdir = dir => { const out = readdirSync(dir); if (lists++ === 0) renameSync(join(dir, 'slot-0.unconfirmed'), join(dir, 'slot-0.unconfirmed.held-0123456789abcdef')); return out; };
+    expect([...blockedSlots(root, 8, readdir)]).toEqual([0]);
+    expect(heldTombstone(root, 0)).toBe(true);
+    expect(heldTombstone(root, 1)).toBe(false);
   });
   it('fails closed when the marker directory cannot be listed', () => {
     expect(() => blockedSlots('/x', 8, () => { throw Object.assign(new Error('boom'), {code: 'EIO'}); })).toThrow('boom');

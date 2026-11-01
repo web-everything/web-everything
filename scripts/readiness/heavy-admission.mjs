@@ -173,7 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { stripGateOnlyOptions } from './forge-gate-options.mjs';
-import { createMarkerReaper, markerContent, blockedSlots } from './forge-slot-markers.mjs';
+import { createMarkerReaper, markerContent, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -870,6 +870,9 @@ export async function runWithRemoteDecision({
       // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
       if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
       writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}),{flag:'wx',mode:0o600});
+      // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
+      // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
+      if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {

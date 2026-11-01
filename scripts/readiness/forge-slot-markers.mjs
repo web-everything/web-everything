@@ -3,7 +3,7 @@
 // forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
 // A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
 // telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
-import {existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
+import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
 import {readLockEntry} from './file-locks.mjs';
@@ -21,18 +21,34 @@ export function markerContent({owner, pid, nowMs}) {
   return JSON.stringify({v: 1, note: 'remote termination unconfirmed', owner, pid, at: nowMs}) + '\n';
 }
 
-/** Slot indices whose marker (or a held tombstone) is present: those slots are never handed out. */
-export function blockedSlots(root, cap, readdir = readdirSync, exists = existsSync) {
-  const blocked = new Set();
-  let names = [];
-  // Fail closed: only a missing directory means "nothing held"; any other error must stop admission.
-  try { names = readdir(root); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
-  for (const name of names) {
-    const m = HELD_NAME.exec(name);
-    // A canonical marker counts only when it resolves (a dangling link is refused later by exclusive creation); a held tombstone always counts.
-    if (m && Number(m[1]) < cap && (name.includes('.held-') || exists(join(root, name)))) blocked.add(Number(m[1]));
+/**
+ * Slot indices whose marker (or a held tombstone) is present: those slots are never handed out. A canonical marker
+ * that is listed but gone by the time it is examined was renamed by a reaper: the listing is retaken until stable,
+ * and an unstable listing fails closed. A canonical marker counts only if it resolves (a dangling link is refused
+ * later by exclusive creation); a held tombstone always counts; any listing error other than ENOENT throws.
+ */
+export function blockedSlots(root, cap, readdir = readdirSync, stat = statSync, lstat = lstatSync) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const blocked = new Set();
+    let names = [], raced = false;
+    try { names = readdir(root); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    for (const name of names) {
+      const m = HELD_NAME.exec(name);
+      if (!m || Number(m[1]) >= cap) continue;
+      if (name.includes('.held-')) { blocked.add(Number(m[1])); continue; }
+      try { lstat(join(root, name)); } catch (error) { if (error?.code === 'ENOENT') { raced = true; continue; } throw error; }
+      try { stat(join(root, name)); blocked.add(Number(m[1])); }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; } // dangling link: not a resolvable marker
+    }
+    if (!raced) return blocked;
   }
-  return blocked;
+  throw new Error('remote-marker-listing-unstable');
+}
+
+/** True when a held tombstone exists for this slot (fails closed: an unreadable directory counts as held). */
+export function heldTombstone(root, index, readdir = readdirSync) {
+  try { return readdir(root).some(name => { const m = HELD_NAME.exec(name); return m && name.includes('.held-') && Number(m[1]) === index; }); }
+  catch { return true; }
 }
 
 function ownerPid(root, index, file) {
