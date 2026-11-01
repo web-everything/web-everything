@@ -18,7 +18,7 @@ const GIT_TIMEOUT_MS = 5 * 60 * 1000;
 export const defaultPoolDir = (env = process.env) => env.WE_REVIEW_SEAT_POOL_DIR || join(tmpdir(), 'we-seat-pool');
 
 function git(args, { allowFail = false } = {}) {
-  const r = spawnSync('git', args, { encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
+  const r = spawnSync('git', args, { encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
   if (r.status !== 0 && !allowFail) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
   return r;
 }
