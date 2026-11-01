@@ -377,6 +377,9 @@ admission still requires the completed writer binding. Keep the atomic JSON rend
 in agreement. The persistence-boundary matrix in `review-recovery-witness.test.mjs` interrupts
 before/after each rename for queued/running owners and fresh/resume modes, then attempts admission
 twice. The dead-owner soak also interrupts after marker publication and requires one dispatch.
+Keep a named mutation row for each intent binding: old writer, evidence, expected writer and
+abandonment timestamp. Change the timestamp alone to exercise its digest binding; for a non-string
+timestamp, recompute the expected writer digest so the type guard is tested independently.
 The same suite exercises production carry-conflict selection and isolates each admission codec
 field and rollback identity check. Exact-head panel evidence takes precedence over a carry journal.
 

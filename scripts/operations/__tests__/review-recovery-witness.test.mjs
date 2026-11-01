@@ -300,7 +300,7 @@ it('completed legacy abandonment bindings remain admissible', () => {
   expect(f.admit().redTeamAdmission.queued.status).toBe('queued');
 });
 
-it.each(['writer', 'evidence', 'marker writer', 'marker prior'])('interrupted abandonment refuses changed %s', change => {
+it.each(['writer', 'evidence', 'marker writer', 'marker prior', 'marker abandonedAt', 'marker abandonedAt non-string'])('interrupted abandonment refuses changed %s', change => {
   const f = fixture();
   interruption.boundary = 'after marker';
   expect(f.abandon().ok).toBe(false);
@@ -309,7 +309,15 @@ it.each(['writer', 'evidence', 'marker writer', 'marker prior'])('interrupted ab
   if (change === 'evidence') f.seats.push({ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' });
   if (change.startsWith('marker')) {
     const markerPath = `${f.path}.stale-redispatch-1`, marker = JSON.parse(readFileSync(markerPath, 'utf8'));
-    marker[change === 'marker writer' ? 'writer' : 'priorWriter'] = 'changed';
+    if (change === 'marker writer') marker.writer = 'changed';
+    if (change === 'marker prior') marker.priorWriter = 'changed';
+    if (change === 'marker abandonedAt') marker.abandonedAt = '2001-01-01T00:00:00.000Z';
+    if (change === 'marker abandonedAt non-string') {
+      marker.abandonedAt = 42;
+      // Keep the digest consistent so only the timestamp type guard can refuse this intent.
+      const next = { ...f.readWitness().rawWriter.parsed, staleAbandoned: { at: marker.abandonedAt } };
+      marker.writer = hash(`${JSON.stringify(next, null, 2)}\n`);
+    }
     writeFileSync(markerPath, JSON.stringify(marker));
   }
   const before = readFileSync(f.path, 'utf8');
