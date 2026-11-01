@@ -115,6 +115,22 @@ const unchanged = f => {
 
 describe('overlay main sync', () => {
 
+  it('gives the scratch tests a real, clean frontierui sibling (never a link the Forge manifest would refuse)', async () => {
+    const f = fixture(), sibling = join(f.base, 'frontierui');
+    fs.mkdirSync(sibling); ok(sibling, ['init', '-q', '-b', 'main']); write(sibling, 'plugs/a.txt', 'a\n');
+    ok(sibling, ['add', 'plugs']); ok(sibling, ['commit', '-qm', 'fui']);
+    write(sibling, 'dirty-untracked.txt', 'left uncommitted in the real checkout\n');
+    const seen = [], passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      const copy = join(options.root, '..', 'frontierui');
+      seen.push({ link: fs.lstatSync(copy).isSymbolicLink(), dir: fs.lstatSync(copy).isDirectory(),
+        status: ok(copy, ['status', '--porcelain']), file: fs.existsSync(join(copy, 'plugs/a.txt')) });
+      return passing(options);
+    });
+    await job(f);
+    expect(seen).toEqual([{ link: false, dir: true, status: '', file: true }]);
+  });
+
   it('refuses a passing empty describe suite before publication', async () => {
     const f = fixture();
     f.deps.testRunner = options => runHeavyTests(options, { exec: async () => ({ status: 0,
