@@ -565,7 +565,7 @@ The abandonment function rechecks these conditions against disk and emits `detai
 Confirmed non-starts release only the marker they claimed; unknown dispatch outcomes retain it.
 `live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
 that budget refund proves no new start, not that the existing job cannot run. Null/undefined
-dispatch outcomes keep their claims; the budget start is refunded as for any non-live-job skip. The stale planner bypasses
+dispatch outcomes also keep claims and their budget reservation. The stale planner bypasses
 only the in-flight refusal: non-owed verdicts and all accepted-head publication guards still apply,
 including when the status re-read observes a completed decision after selecting a stale owner.
 Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
