@@ -790,7 +790,7 @@ export async function runWithRemoteDecision({
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
+  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
@@ -819,7 +819,7 @@ export async function runWithRemoteDecision({
       // Dead clients' markers must not wall off the cap while Forge is idle: reap by owner liveness plus Forge's own state.
       if(nowMs-reapedAt>=2000){
         reapedAt=nowMs;
-        const reaped=await markerReaper.step(async()=>{const state=await health();return state.ok?state.telemetry:null;},nowMs);
+        const reaped=await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs);
         if(reaped.length)continue;
       }
       const waited = nowMs - waitAt;

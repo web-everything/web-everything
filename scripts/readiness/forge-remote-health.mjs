@@ -63,7 +63,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
     if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}
-    return {ok:true,telemetry:state.telemetry};
+    return {ok:true};
   },host);}catch(error){return {ok:false,reason:error.message==='remote-health-busy'?error.message:'remote-health-unreadable'};}
 }
 export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
@@ -78,4 +78,10 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
       if(state.failures>=settings.backoffFailures){state.backoffUntil=clock()+settings.backoffMs;state.trigger=reason;}
     } else state.failures=0;
   },host);
+}
+
+/** Latest persisted Forge telemetry sample (read-only; null when absent or unreadable). */
+export function peekRemoteTelemetry({root,host='forge'}) {
+  const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
+  try{return readState(join(root,key+'.json')).telemetry;}catch{return null;}
 }

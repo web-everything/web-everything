@@ -3,7 +3,7 @@
 // forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
 // A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
 // telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
-import {readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
+import {existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
 import {readLockEntry} from './file-locks.mjs';
@@ -18,18 +18,19 @@ const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
 
 /** New markers carry their owner pid so a later client can prove the owner is dead. */
 export function markerContent({owner, pid, nowMs}) {
-  return JSON.stringify({v: 1, owner, pid, at: nowMs}) + '\n';
+  return JSON.stringify({v: 1, note: 'remote termination unconfirmed', owner, pid, at: nowMs}) + '\n';
 }
 
 /** Slot indices whose marker (or a held tombstone) is present: those slots are never handed out. */
-export function blockedSlots(root, cap, readdir = readdirSync) {
+export function blockedSlots(root, cap, readdir = readdirSync, exists = existsSync) {
   const blocked = new Set();
   let names = [];
   // Fail closed: only a missing directory means "nothing held"; any other error must stop admission.
   try { names = readdir(root); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
   for (const name of names) {
     const m = HELD_NAME.exec(name);
-    if (m && Number(m[1]) < cap) blocked.add(Number(m[1]));
+    // A canonical marker counts only when it resolves (a dangling link is refused later by exclusive creation); a held tombstone always counts.
+    if (m && Number(m[1]) < cap && (name.includes('.held-') || exists(join(root, name)))) blocked.add(Number(m[1]));
   }
   return blocked;
 }
