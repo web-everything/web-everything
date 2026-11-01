@@ -2,9 +2,9 @@
 import { readSettings } from '../lib/settings-files.mjs';
 import { cascadePolicy, resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 
-const standard = Object.freeze({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, lightRevalidate: true, lightRevalidateMaxDiffLines: 400, retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128 });
+const standard = Object.freeze({ batchParallel: true, batchMaxParallel: 3, batchSize: 6, aheadCount: 20, lightRevalidate: true, lightRevalidateMaxDiffLines: 400, retryUnstampedOnce: true, autoSize: true, runner: 'codex', mergedGuardHours: 24, maxPrListingCallsPerTick: 128, launchPrListingReserve: 32, parkedPrListingCacheMinutes: 15 });
 const bool = v => typeof v === 'boolean';
-const valid = { batchParallel: bool, batchMaxParallel: v => Number.isSafeInteger(v) && v >= 1 && v <= 100, batchSize: v => Number.isSafeInteger(v) && v >= 1 && v <= 100, aheadCount: v => Number.isSafeInteger(v) && v >= 0 && v <= 10000, lightRevalidate: bool, lightRevalidateMaxDiffLines: v => Number.isInteger(v) && v >= 0, maxPrListingCallsPerTick: v => Number.isInteger(v) && v >= 0 && v <= 1000, retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v),
+const valid = { batchParallel: bool, batchMaxParallel: v => Number.isSafeInteger(v) && v >= 1 && v <= 100, batchSize: v => Number.isSafeInteger(v) && v >= 1 && v <= 100, aheadCount: v => Number.isSafeInteger(v) && v >= 0 && v <= 10000, lightRevalidate: bool, lightRevalidateMaxDiffLines: v => Number.isInteger(v) && v >= 0, maxPrListingCallsPerTick: v => Number.isInteger(v) && v >= 0 && v <= 1000, launchPrListingReserve: v => Number.isInteger(v) && v >= 0 && v <= 1000, parkedPrListingCacheMinutes: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1440, retryUnstampedOnce: bool, autoSize: bool, runner: v => ['codex', 'claude', 'scope'].includes(v),
   mergedGuardHours: v => typeof v === 'number' && Number.isFinite(v) && v >= 0 };
 const parseBool = v => {
   if (bool(v)) return v;
@@ -26,6 +26,8 @@ const envValues = env => ({
   autoSize: parseBool(env?.WE_PREPARE_AUTO_SIZE),
   runner: env?.WE_PREPARE_RUNNER,
   maxPrListingCallsPerTick: env?.WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK?.trim() ? Number(env.WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK) : undefined,
+  launchPrListingReserve: env?.WE_PREPARE_LAUNCH_PR_LISTING_RESERVE?.trim() ? Number(env.WE_PREPARE_LAUNCH_PR_LISTING_RESERVE) : undefined,
+  parkedPrListingCacheMinutes: env?.WE_PREPARE_PARKED_PR_LISTING_CACHE_MINUTES?.trim() ? Number(env.WE_PREPARE_PARKED_PR_LISTING_CACHE_MINUTES) : undefined,
   mergedGuardHours: typeof env?.WE_PREPARE_MERGED_GUARD_HOURS === 'string'
     && env.WE_PREPARE_MERGED_GUARD_HOURS.trim() !== '' ? Number(env.WE_PREPARE_MERGED_GUARD_HOURS) : undefined,
 });
@@ -40,6 +42,8 @@ const result = resolved => ({
   autoSize: resolved.value.autoSize,
   runner: resolved.value.runner,
   maxPrListingCallsPerTick: resolved.value.maxPrListingCallsPerTick,
+  launchPrListingReserve: resolved.value.launchPrListingReserve,
+  parkedPrListingCacheMinutes: resolved.value.parkedPrListingCacheMinutes,
   mergedGuardHours: resolved.value.mergedGuardHours,
   sources: {
     batchParallel: resolved.sources.batchParallel,
@@ -52,6 +56,8 @@ const result = resolved => ({
     autoSize: resolved.sources.autoSize,
     runner: resolved.sources.runner,
     maxPrListingCallsPerTick: resolved.sources.maxPrListingCallsPerTick,
+    launchPrListingReserve: resolved.sources.launchPrListingReserve,
+    parkedPrListingCacheMinutes: resolved.sources.parkedPrListingCacheMinutes,
     mergedGuardHours: resolved.sources.mergedGuardHours,
   },
 });
