@@ -310,7 +310,8 @@ describe('per-dispatch owner token', () => {
     expect(brief).toContain('every 1.5 minutes');
   });
 
-  it.each(['0', '-1', '', 'nope', 'Infinity', '5e-324'])('refuses to print a cadence for unusable stale window %j', async value => {
+  it.each(['0', '-1', '', 'nope', 'Infinity', '5e-324', '1e-12', '0.000000000001',
+    String(1 / 60e3), String((2 / 60e3) * (1 - Number.EPSILON))])('refuses to print a cadence for unusable stale window %j', async value => {
     vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', value);
     try {
       const deps = io();
@@ -318,6 +319,39 @@ describe('per-dispatch owner token', () => {
       expect(deps.stdout.write).not.toHaveBeenCalled();
       expect(deps.stderr.write.mock.calls.flat().join('')).toMatch(/invalid staleAfterMinutes/i);
     } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([1e-12, 1 / 60e3, (2 / 60e3) * (1 - Number.EPSILON)])(
+    'rejects a sub-millisecond cadence from injected settings (%s minutes)', staleAfterMinutes => {
+      expect(() => renderWorkerBrief({ ...params, freeScope: { staleAfterMinutes } }))
+        .toThrow(/invalid staleAfterMinutes/i);
+    });
+
+  it('refuses --out without writing a brief when the stale window is too small', async () => {
+    vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', '1e-12');
+    try {
+      const deps = io();
+      expect(await main(['--purpose=tiny', '--files=scripts/x.mjs', '--owner=token123', '--out=brief.md'], deps)).toBe(2);
+      expect(deps.writeFile).not.toHaveBeenCalled();
+      expect(deps.stdout.write).not.toHaveBeenCalled();
+      expect(deps.stderr.write.mock.calls.flat().join('')).toContain('at least 1 millisecond');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('keeps the minimum supported window live at registration and through printed-cadence renewals', () => {
+    withRegistry(2 / 60e3, ({ brief, run, register, heartbeat, entries, start }) => {
+      const cadence = Number(/every (\S+) minutes/.exec(brief)[1]);
+      expect(cadence * 60e3).toBe(1);
+      expect(run(register, 0)).toMatchObject({ code: 0, err: '' });
+      expect(partitionRegistry(entries(), start).live).toHaveLength(1);
+      for (let tick = 1; tick <= 3; tick++) {
+        const minute = tick * cadence;
+        expect(partitionRegistry(entries(), start + minute * 60e3).live).toHaveLength(1);
+        expect(run(heartbeat, minute)).toMatchObject({ code: 0, err: '' });
+        expect(run(register, minute)).toMatchObject({ code: 0, err: '' });
+        expect(run(['check', `--files=${files}`], minute).code).toBe(1);
+      }
+    });
   });
 });
 

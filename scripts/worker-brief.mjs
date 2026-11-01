@@ -59,8 +59,10 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
   const commaList = qualified.join(',');
   const { staleAfterMinutes } = freeScope;
   const heartbeatMinutes = Math.min(20, staleAfterMinutes / 2);
-  if (!Number.isFinite(staleAfterMinutes) || !(heartbeatMinutes > 0)) {
-    throw new Error('Invalid staleAfterMinutes: cannot derive a positive heartbeat cadence; correct the free-scope setting and regenerate the brief.');
+  // Registry ISO timestamps have millisecond precision: reserve at least two ticks
+  // so the half-window heartbeat can advance lastSeenAt before the entry expires.
+  if (!Number.isFinite(staleAfterMinutes) || !(heartbeatMinutes >= 1 / 60e3)) {
+    throw new Error('Invalid staleAfterMinutes: the stale window must be at least 2 milliseconds for a heartbeat cadence of at least 1 millisecond; correct the free-scope setting and regenerate the brief.');
   }
   const laneRepo = repo === 'plateau-app' ? ' --repo=<plateau-app checkout>' : '';
   // Codex's full and related gates need WE's scripts/verify-lane.mjs; a plateau-app lane has only its own standards.
