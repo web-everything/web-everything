@@ -3061,11 +3061,9 @@ function printStatus(repo) {
   // consumes leased rows, e.g. conveyor-state.mjs / scope-lease-collect.mjs). A leased lane's row is byte-for-
   // byte identical to a full `status` call; an unleased lane's row just omits the git-derived fields.
   const leasedOnly = !!flags['leased-only'];
-  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 0 = always probe
-  // fresh, today's behaviour) lets a display-only reader reuse a recent, signature-matched probe.
+  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 45000; 0 = always probe fresh) lets a display-only reader reuse a recent, signature-matched probe.
   const maxAgeMs = resolveStatusMaxAgeMs(flags['max-age-ms']);
-  // Only an opted-in call reads OR writes the cache: a default `status` stays strictly read-only (stale-state and
-  // other readers pin "writes no state"), so the cache is shared among the opted-in display readers only.
+  // perf #3 — shared by every status reader (wip, health-watch, review); `--max-age-ms=0` neither reads nor writes it.
   const statusCache = maxAgeMs > 0 ? { maxAgeMs, cache: readStatusCache(repo.poolDir), updates: {} } : null;
   // Filter before probing: a single-lane reader must never spawn git in another lane.
   const lanes = existingLanes(repo).filter((n) => flags.lane === undefined || n === Number(flags.lane));
