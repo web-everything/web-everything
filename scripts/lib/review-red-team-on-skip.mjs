@@ -26,8 +26,6 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 
 export const STALE_RUN_DEADLINE_MS = 2 * 60 * 60 * 1000;
-export const STALE_REDISPATCH_BACKOFF_MS = 15 * 60 * 1000;
-const MAX_STALE_REDISPATCHES = 2;
 
 export function staleRunDeadlineMs(env = process.env) {
   const value = env.WE_RED_TEAM_STALE_RUN_MS;
@@ -62,39 +60,17 @@ export function staleRedTeamRun({ status, now = Date.now(), deadlineMs = STALE_R
 const staleStatusPath = ({ repo, pr, head, env = process.env }) =>
   join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
-/** Legacy marker 1 remains a spent first attempt. Unreadable or inconsistent marker evidence stays closed. */
-export function staleRedTeamRedispatch(key) {
-  const path = staleStatusPath(key), markers = [];
-  for (let attempt = 1; attempt <= MAX_STALE_REDISPATCHES; attempt++) {
-    try {
-      const marker = statSync(`${path}.stale-redispatch-${attempt}`);
-      if (!marker.isFile() || !Number.isFinite(marker.mtimeMs)) throw new Error('invalid stale redispatch marker');
-      markers.push(marker);
-    } catch (error) { if (error.code === 'ENOENT') markers.push(null); else throw error; }
-  }
-  if (markers[1] && !markers[0]) throw new Error('stale redispatch marker 2 without marker 1');
-  const count = markers.filter(Boolean).length;
-  return { count, nextOrdinal: count < MAX_STALE_REDISPATCHES ? count + 1 : null,
-    firstMarkerMtimeMs: markers[0]?.mtimeMs ?? null };
-}
-
 export function staleRedTeamSpent(key) {
-  return staleRedTeamRedispatch(key).count === MAX_STALE_REDISPATCHES;
-}
-
-function isRedispatchedRun(status, firstMarkerMtimeMs) {
-  const started = Date.parse(status?.pidStart);
-  return status?.status === 'running' && status.result == null
-    && (status.retryCount === undefined || status.retryCount === 0)
-    && Number.isFinite(started) && Number.isFinite(firstMarkerMtimeMs) && started > firstMarkerMtimeMs;
+  try { statSync(`${staleStatusPath(key)}.stale-redispatch-1`); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
 /** The exclusive-create marker spends recovery; the re-read is a best-effort recheck, not an atomic lock.
  * Only a confirmed non-start may release the recovery spend.
  */
 export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(), probe = {} }) {
-  const key = { repo, pr, head, env }, path = staleStatusPath(key);
-  let claimed = false, marker;
+  const path = staleStatusPath({ repo, pr, head, env }), marker = `${path}.stale-redispatch-1`;
+  let claimed = false;
   const release = () => { try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
   try {
     const current = JSON.parse(readFileSync(path, 'utf8'));
@@ -103,10 +79,6 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
       || current.pid !== status?.pid || current.pidStart !== status?.pidStart
       || current.host !== status?.host || current.pidNamespace !== status?.pidNamespace) return { ok: false };
     if (staleRedTeamRun({ status: current, now, probe }).stale !== true) return { ok: false };
-    const { nextOrdinal: attempt, firstMarkerMtimeMs } = staleRedTeamRedispatch(key);
-    if (attempt == null || (attempt === 2 && (!isRedispatchedRun(current, firstMarkerMtimeMs)
-      || !Number.isFinite(now) || now - firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS))) return { ok: false };
-    marker = `${path}.stale-redispatch-${attempt}`;
     closeSync(openSync(marker, 'wx')); claimed = true;
     const reason = 'running red team owner is dead or exceeded stale deadline';
     const at = new Date(now).toISOString();
@@ -114,7 +86,7 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
     const events = daemonEventsPath({ env });
     mkdirSync(dirname(events), { recursive: true });
     appendFileSync(events, `${JSON.stringify({ at, kind: 'red-team-stale-run-abandoned', repo, pr,
-      daemon: 'review', detail: { head, pid: status.pid, reason, attempt } })}\n`);
+      daemon: 'review', detail: { head, pid: status.pid, reason } })}\n`);
     return { ok: true, release };
   } catch { if (claimed) { try { release(); } catch { /* keep closed */ } } return { ok: false }; }
 }
@@ -230,7 +202,7 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
   setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, probe, staleSpent = staleRedTeamSpent,
-  staleRedispatch = staleRedTeamRedispatch, deadlineMs = STALE_RUN_DEADLINE_MS }) {
+  deadlineMs = STALE_RUN_DEADLINE_MS }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -341,17 +313,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if ((!staleOwed && evidence.inFlight) || evidence.queued) return skip('red-team pass in flight');
       if (staleOwed) {
         if (status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
-        const key = { repo, pr, head }, spent = staleSpent(key), redispatch = staleRedispatch(key);
-        if (spent || redispatch.count > 0) {
+        if (staleSpent({ repo, pr, head })) {
           // Admission replaces the abandoned row with queued before a run starts.
           // An unchanged abandoned row means the prior job never launched a call.
           if (redTeamStatusWithoutRun(status)) return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: false,
             why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
-          if (spent || redispatch.nextOrdinal !== 2 || !isRedispatchedRun(status, redispatch.firstMarkerMtimeMs)) {
-            return skip('stale red team already re-dispatched; inspect review run');
-          }
-          if (!Number.isFinite(now)) return skip('red-team evidence unreadable; inspect stored evidence before retrying');
-          if (now - redispatch.firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS) return skip('stale red team re-dispatch backoff');
+          return skip('stale red team already re-dispatched; inspect review run');
         }
         return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: true,
           why: 'running red team owner is dead; abandon and re-dispatch' });
@@ -393,7 +360,6 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, probe,
   staleSpent = key => staleRedTeamSpent({ ...key, env }),
-  staleRedispatch = key => staleRedTeamRedispatch({ ...key, env }),
   recoverPayload = recoverStaleRunPayload, abandonStale = abandonStaleRedTeamRun,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
@@ -428,7 +394,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
-      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, probe, staleSpent, staleRedispatch,
+      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, probe, staleSpent,
       deadlineMs: staleRunDeadlineMs(env) }));
     for (const row of rows) {
       let started = false;

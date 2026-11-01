@@ -9,7 +9,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -1513,7 +1513,6 @@ const staleProbe = (alive = false, start = deadRunningStatus().pidStart) => ({
 function staleFixture(over = {}) {
   const status = deadRunningStatus();
   return fixture({ now: staleNow, probe: staleProbe(), staleSpent: () => false,
-    staleRedispatch: () => ({ count: 0, nextOrdinal: 1, firstMarkerMtimeMs: null }),
     rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'red-team:pending'], reviews: [],
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
     readEvidence: () => ({ loopPayload: { findings: { read: { netBasis: { rev: head } } } },
@@ -1669,7 +1668,6 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       const o = staleRunFixture({ env,
         readStatus: key => readRedTeamStatus({ ...key, env }),
         staleSpent: key => staleRecovery.staleRedTeamSpent({ ...key, env }),
-        staleRedispatch: key => staleRecovery.staleRedTeamRedispatch({ ...key, env }),
         dispatch: vi.fn(() => {
           expect(readFileSync(statusPath, 'utf8')).toBe(abandoned);
           recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued' }, { env });
@@ -1682,8 +1680,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(o.abandonStale).not.toHaveBeenCalled();
       expect(o.dispatch).toHaveBeenCalledOnce();
       expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
-      expect(staleRecovery.staleRedTeamRedispatch({ repo, pr, head, env })).toMatchObject({ count: 1, nextOrdinal: 2 });
-      expect(staleRecovery.staleRedTeamSpent({ repo, pr, head, env })).toBe(false);
+      expect(staleRecovery.staleRedTeamSpent({ repo, pr, head, env })).toBe(true);
       // Remove cooldown and capacity effects so the queued row itself must block another start.
       o.lastDispatch.clear();
       o.capacity = { lanes: 1, budget: { left: 1 } };
@@ -1747,7 +1744,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
   });
 });
 
-describe('abandonStaleRedTeamRun — durable ordinal markers', () => {
+describe('abandonStaleRedTeamRun — durable one-shot marker', () => {
   it('preserves status, records one event, refuses a second spend, and releases the marker', () => {
     const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-marker-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'daemon-events.jsonl') };
@@ -1762,22 +1759,20 @@ describe('abandonStaleRedTeamRun — durable ordinal markers', () => {
       const result = staleRecovery.abandonStaleRedTeamRun(input);
       expect(result).toEqual({ ok: true, release: expect.any(Function) });
       expect(existsSync(marker)).toBe(true);
-      expect(staleRecovery.staleRedTeamRedispatch(input)).toMatchObject({ count: 1, nextOrdinal: 2 });
-      expect(staleRecovery.staleRedTeamSpent(input)).toBe(false);
+      expect(staleRecovery.staleRedTeamSpent(input)).toBe(true);
       expect(staleRecovery.staleRedTeamSpent({ ...input, head: 'b'.repeat(40) })).toBe(false);
       const rewritten = JSON.parse(readFileSync(statusPath, 'utf8'));
       expect(rewritten).toEqual({ ...status, staleAbandoned: { at: expect.anything(), pid: status.pid, reason: expect.any(String) } });
       expect(new Date(rewritten.staleAbandoned.at).getTime()).toBe(staleNow);
       const events = () => readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(line => JSON.parse(line));
       expect(events()).toHaveLength(1);
-      expect(events()[0]).toMatchObject({ kind: 'red-team-stale-run-abandoned', repo, pr, detail: { attempt: 1 } });
+      expect(events()[0]).toMatchObject({ kind: 'red-team-stale-run-abandoned', repo, pr });
       expect(JSON.stringify(events()[0].detail)).toContain(head);
       expect(JSON.stringify(events()[0].detail)).toContain(String(status.pid));
       expect(staleRecovery.abandonStaleRedTeamRun(input)).toMatchObject({ ok: false });
       expect(events()).toHaveLength(1);
       result.release();
       expect(existsSync(marker)).toBe(false);
-      expect(staleRecovery.staleRedTeamRedispatch(input)).toEqual({ count: 0, nextOrdinal: 1, firstMarkerMtimeMs: null });
       expect(staleRecovery.staleRedTeamSpent(input)).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1802,152 +1797,6 @@ describe('abandonStaleRedTeamRun — durable ordinal markers', () => {
         expect(readFileSync(statusPath, 'utf8')).toBe(original);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
-});
-
-describe('stale red-team recovery — bounded second re-dispatch', () => {
-  const backoff = 15 * 60_000;
-  function withRedispatch(check, { age = backoff, status: over = {}, probe = staleProbe() } = {}) {
-    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-second-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
-    try {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-      const marker1 = `${statusPath}.stale-redispatch-1`, marker2 = `${statusPath}.stale-redispatch-2`;
-      const original = deadRunningStatus({ pidStart: new Date(staleNow - staleDeadline * 2).toISOString() });
-      writeFileSync(statusPath, JSON.stringify(original));
-      expect(staleRecovery.abandonStaleRedTeamRun({ repo, pr, head, env, status: original,
-        now: staleNow - age, probe: staleProbe() }).ok).toBe(true);
-      const markerAt = staleNow - age;
-      utimesSync(marker1, new Date(markerAt), new Date(markerAt));
-      // A new job overwrites the abandoned status; quota and crash deaths have the same evidence.
-      const status = deadRunningStatus({ pid: 60284, ...over });
-      writeFileSync(statusPath, JSON.stringify(status));
-      const key = { repo, pr, head, env };
-      const input = { ...key, status, now: staleNow, probe };
-      const options = staleRunFixture({ env, probe,
-        readStatus: key => readRedTeamStatus({ ...key, env }),
-        staleSpent: undefined, staleRedispatch: undefined,
-        abandonStale: vi.fn(staleRecovery.abandonStaleRedTeamRun) });
-      const events = () => readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse);
-      check({ key, input, options, statusPath, marker1, marker2, markerAt, events });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  }
-  it('exports the fifteen-minute backoff', () => {
-    expect(staleRecovery.STALE_REDISPATCH_BACKOFF_MS).toBe(backoff);
-  });
-  it.each([null, undefined].flatMap(result => [0, undefined].map(retryCount => ({ result, retryCount }))))(
-    'dead replacement after marker 1 abandons and dispatches attempt 2 after backoff: %j', status => {
-      withRedispatch(({ key, options, statusPath, marker1, marker2, markerAt, events }) => {
-        expect(staleRecovery.staleRedTeamSpent(key)).toBe(false);
-        expect(staleRecovery.staleRedTeamRedispatch(key)).toEqual({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: markerAt });
-        expect(runRedTeamOnSkip(options)).toMatchObject({ rows: [{ action: 'dispatch', abandonStale: true }],
-          dispatched: [{ prNumber: pr, jobPid: 42 }] });
-        expect(options.abandonStale).toHaveBeenCalledOnce();
-        expect(options.dispatch).toHaveBeenCalledOnce();
-        expect(existsSync(marker1)).toBe(true);
-        expect(existsSync(marker2)).toBe(true);
-        expect(staleRecovery.staleRedTeamSpent(key)).toBe(true);
-        expect(staleRecovery.staleRedTeamRedispatch(key)).toEqual({ count: 2, nextOrdinal: null, firstMarkerMtimeMs: markerAt });
-        expect(JSON.parse(readFileSync(statusPath, 'utf8'))).toMatchObject({ staleAbandoned: { pid: 60284 } });
-        expect(events()).toHaveLength(2);
-        expect(events()[1]).toMatchObject({ kind: 'red-team-stale-run-abandoned', detail: { attempt: 2, head, pid: 60284 } });
-        // A third job death cannot consume a third attempt, even with a new owner and no result.
-        const third = deadRunningStatus({ pid: 60285, pidStart: new Date(staleNow + 1).toISOString() });
-        writeFileSync(statusPath, JSON.stringify(third));
-        options.lastDispatch.clear();
-        options.capacity = { lanes: 1, budget: { left: 1 } };
-        options.now = () => staleNow + backoff;
-        expect(runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'skip',
-          why: 'stale red team already re-dispatched; inspect review run' });
-        expect(staleRecovery.abandonStaleRedTeamRun({ ...key, status: third,
-          now: staleNow + backoff, probe: options.probe })).toEqual({ ok: false });
-        expect(options.dispatch).toHaveBeenCalledOnce();
-        expect(existsSync(`${statusPath}.stale-redispatch-3`)).toBe(false);
-        expect(events()).toHaveLength(2);
-      }, { status });
-    });
-  it.each([
-    ['backoff', {}, backoff - 1, 'stale red team re-dispatch backoff'],
-    ['row before marker 1', { pidStart: new Date(staleNow - backoff - 1).toISOString() }, backoff],
-    ['row at marker 1', { pidStart: new Date(staleNow - backoff).toISOString() }, backoff],
-    ['unknown start', { pidStart: undefined }, backoff],
-    ['invalid start', { pidStart: 'unparseable' }, backoff],
-    ['spent retry', { retryCount: 1 }, backoff],
-    ['oversized retry', { retryCount: Number.MAX_SAFE_INTEGER }, backoff],
-    ['unknown retry', { retryCount: 'unknown' }, backoff],
-    ['null retry', { retryCount: null }, backoff],
-    ['completed result', { result: { status: 'ran' } }, backoff],
-  ])('%s refuses planner dispatch and real abandonment without spending marker 2', (_name, status, age, why) => {
-    withRedispatch(({ options, input, statusPath, marker2, events }) => {
-      const before = readFileSync(statusPath, 'utf8');
-      expect(runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'skip', ...(why ? { why } : {}) });
-      expect(options.dispatch).not.toHaveBeenCalled();
-      expect(options.abandonStale).not.toHaveBeenCalled();
-      expect(staleRecovery.abandonStaleRedTeamRun(input)).toEqual({ ok: false });
-      expect(existsSync(marker2)).toBe(false);
-      expect(events()).toHaveLength(1);
-      expect(readFileSync(statusPath, 'utf8')).toBe(before);
-    }, { status, age });
-  });
-  it('live replacement refuses planner dispatch and real abandonment after backoff', () => {
-    withRedispatch(({ options, input, marker2 }) => {
-      expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
-      expect(options.dispatch).not.toHaveBeenCalled();
-      expect(staleRecovery.abandonStaleRedTeamRun(input)).toEqual({ ok: false });
-      expect(existsSync(marker2)).toBe(false);
-    }, { probe: staleProbe(true) });
-  });
-  it.each([
-    ['reused pid', {}, staleProbe(true, 'different start')],
-    ['past deadline', { host: 'remote', pidStart: new Date(staleNow - staleDeadline - 1).toISOString() }, staleProbe()],
-  ])('%s replacement can spend attempt 2', (_name, status, probe) => {
-    withRedispatch(({ options, marker2 }) => {
-      expect(runRedTeamOnSkip(options).dispatched).toHaveLength(1);
-      expect(existsSync(marker2)).toBe(true);
-    }, { status, probe, age: staleDeadline * 2 });
-  });
-  it('both markers cap a third dead run with an operator-visible inspection reason', () => {
-    withRedispatch(({ options, input, statusPath, marker2, events }) => {
-      writeFileSync(marker2, '');
-      expect(runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'skip',
-        why: 'stale red team already re-dispatched; inspect review run' });
-      expect(options.dispatch).not.toHaveBeenCalled();
-      expect(staleRecovery.abandonStaleRedTeamRun(input)).toEqual({ ok: false });
-      expect(existsSync(`${statusPath}.stale-redispatch-3`)).toBe(false);
-      expect(events()).toHaveLength(1);
-    });
-  });
-  it('a confirmed second non-start releases only marker 2 and leaves marker 1 unchanged', () => {
-    withRedispatch(({ key, options, marker1, marker2, markerAt }) => {
-      options.dispatch = vi.fn(() => ({ skipped: 'no capacity' }));
-      expect(runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'skip', why: 'no capacity' });
-      expect(options.abandonStale).toHaveBeenCalledOnce();
-      expect(existsSync(marker2)).toBe(false);
-      expect(statSync(marker1).mtimeMs).toBe(markerAt);
-      expect(staleRecovery.staleRedTeamSpent(key)).toBe(false);
-    });
-  });
-  it('an unknown second dispatch outcome retains marker 2', () => {
-    withRedispatch(({ key, options, marker2 }) => {
-      options.dispatch = vi.fn(() => { throw new Error('unknown spawn outcome'); });
-      runRedTeamOnSkip(options);
-      expect(options.abandonStale).toHaveBeenCalledOnce();
-      expect(existsSync(marker2)).toBe(true);
-      expect(staleRecovery.staleRedTeamSpent(key)).toBe(true);
-    });
-  });
-  it.each(['invalid metadata', 'orphan marker 2'])('%s fails closed without dispatch or abandonment', kind => {
-    withRedispatch(({ options, input, marker1, marker2 }) => {
-      rmSync(marker1);
-      if (kind === 'invalid metadata') mkdirSync(marker1);
-      else writeFileSync(marker2, '');
-      expect(runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'skip',
-        why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
-      expect(options.dispatch).not.toHaveBeenCalled();
-      expect(staleRecovery.abandonStaleRedTeamRun(input)).toEqual({ ok: false });
-      expect(existsSync(marker2)).toBe(kind === 'orphan marker 2');
-    });
-  });
 });
 
 describe('recoverStaleRunPayload — head-bound accepting review run', () => {
