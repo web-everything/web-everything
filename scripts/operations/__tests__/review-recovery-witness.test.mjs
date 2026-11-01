@@ -70,6 +70,19 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
 }
 
 it.each([null, undefined].flatMap(result => [undefined, 0].map(retryCount => ({ result, retryCount }))))(
+  'dead queued writer with one failed seat cannot infer a retry (result=$result, retryCount=$retryCount)', ({ result, retryCount }) => {
+    const f = fixture({ status: 'queued', seats: [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }] });
+    writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, result, retryCount }));
+    const before = readFileSync(f.path, 'utf8');
+    expect(f.decide()).toMatchObject({ mode: 'skip', why: 'prior pass cannot restart' });
+    expect(f.abandon().ok).toBe(false);
+    expect(() => f.admit()).toThrow('prior pass cannot restart');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+    expect(f.readWitness().markers).toEqual({ redispatch: null, retry: false });
+  },
+);
+
+it.each([null, undefined].flatMap(result => [undefined, 0].map(retryCount => ({ result, retryCount }))))(
   'dead running writer with one failed seat recovers its one retry (result=$result, retryCount=$retryCount)', ({ result, retryCount }) => {
     const f = fixture({ seats: [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }] });
     const raw = { ...f.readWitness().rawWriter.parsed, result, retryCount };

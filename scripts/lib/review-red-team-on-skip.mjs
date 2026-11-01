@@ -72,8 +72,9 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
   const resumable = ['ran', 'resumed'].includes(normalizeRedTeamResult(raw?.result).priorResult);
   const failedSeatCount = w.seats.filter(r => !completedRedTeamSeat(r)).length;
   if (active && dead) {
-    // A crash after the failed seat append can precede the finished/failed status write.
-    const interruptedFailure = failedSeatCount === 1 && raw.result == null
+    // A running writer can crash after appending its failed seat, before finishing.
+    // Queued state cannot establish that an existing seat belongs to this writer.
+    const interruptedFailure = raw.status === 'running' && failedSeatCount === 1 && raw.result == null
       && (raw.retryCount === undefined || raw.retryCount === 0);
     executionPrior = completed || resumable ? { ...raw, status: 'finished', result: resumable ? raw.result : 'ran' }
       : interruptedFailure ? { ...raw, status: 'finished', result: 'failed' } : null;

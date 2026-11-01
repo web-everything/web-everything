@@ -3571,6 +3571,9 @@ Recovery fixtures persist the panel read as a `review-pr` run and inject the sco
 `status.loopPayload` is deliberately truncated. Bind abandonment to raw writer bytes and seat/run
 evidence, then test mutations before queued admission. Never normalize the status in a reader.
 Inject raw witness/probe failures directly for liveness refusals; do not infer them from normalized drain flags.
+Only a raw `running` writer can infer an interrupted failure from a single failed seat and no result.
+A dead `queued` writer with an existing failed seat and no result must refuse planning, abandonment and admission
+without spending either marker; test null/missing results and zero/missing retry counts alongside running recovery.
 The dead-owner and skip-settlement breaks are discovered from disk and run with `vitest.soak.config.ts` using the shared repo registry.
 Status-write claims record the holder's PID, birth time, host and PID namespace. The recovery-witness
 fixtures cover reused PIDs in abandonment and every ordinary status write, live and unreadable
