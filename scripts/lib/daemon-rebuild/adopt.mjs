@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { readOverlayState, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
-import { verifyRev, makeGit } from './shared.mjs';
+import { verifyRev, makeGit, archiveUncovered } from './shared.mjs';
 import { finalClosureScope, isExcludable } from './closure-scope.mjs';
 import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -234,7 +234,7 @@ export function staleAlertDetail(result, state) {
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
 export async function finalizeRebuild({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, archiveGuard = true,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -314,6 +314,28 @@ export async function finalizeRebuild({
     if (colliding.length > 0) {
       alert('untracked-collision', { paths: colliding });
       return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
+    }
+  }
+
+  // PR #6033 red team — a sibling tick may have archived a source into a carrier while this build smoked
+  // unlocked. Re-read the registry under this lock and refuse a target that drops archived content; unreadable
+  // evidence refuses too. A mainOnly rebuild never edits the overlay list, so it skips this (as its planning does).
+  if (archiveGuard) {
+    const registry = readOverlayState(root, { env });
+    let uncovered = [];
+    let error = null;
+    if (registry.corrupt) error = 'overlay registry unreadable';
+    else {
+      try { uncovered = archiveUncovered(git, registry.overlays, plan.finalSha); }
+      catch (e) { error = String(e?.message ?? e); }
+    }
+    if (error) uncovered = (registry.overlays ?? []).filter((o) => o?.retiredSources?.length);
+    if (error || uncovered.length) {
+      const refs = uncovered.map((o) => o.ref);
+      alert('overlay-source-unavailable', { refs, failed: `archive-source-uncovered: ${refs.join(', ')}`, target: plan.finalSha,
+        ...(error ? { error } : {}),
+        message: 'Finalize cannot prove archived content is preserved; keeping the running build and overlay registrations.' });
+      return terminal({ moved: false, reason: error ? 'overlay-source-unverifiable' : 'overlay-source-unavailable', plan });
     }
   }
 

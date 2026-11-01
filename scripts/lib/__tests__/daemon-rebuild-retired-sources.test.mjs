@@ -7,6 +7,7 @@ import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import { addOverlay, migrateRegistrationIds, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity,
   reinstateOverlaySources, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { readReadyCandidate, writeReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 
 // Exercise preparation and real registry storage without network or .git writes.
 vi.mock('../lane-repair.mjs', () => ({ repairCloneRefs: () => ({ ok: true, pruned: [], reportedNew: [] }), holdsCloneWriteLock: () => true }));
@@ -426,10 +427,66 @@ describe('a saved ready candidate is held to the archived-source rule (PR #6033 
     expect(readReadyCandidate(root, f.env)).toBeNull();
   });
 
+  it('a mainOnly rebuild skips the archive rule for a saved candidate, as its planning does', async () => {
+    const f = fixture();
+    await f.retire();
+    model.upToDate = false;
+    writeReadyCandidate(root, { kind: 'candidate', prevHead: '1'.repeat(40), passedAt: new Date().toISOString(),
+      adopt: { finalSha: '5'.repeat(40), mainSha: '1'.repeat(40), applied: [] } }, f.env);
+    model.readyMatch = ({ ready }) => ({ adopt: ready.adopt, failed: '', match: 'exact', dropRefs: [] });
+    model.finalize = vi.fn(async (args) => ({ moved: true, adopted: true, head: args.plan.finalSha }));
+    const next = await f.prepare({ mainOnly: true });
+    expect(next.alerts.filter((a) => a.kind === 'ready-candidate-discarded')).toEqual([]);
+    expect(model.finalize).toHaveBeenCalledWith(expect.objectContaining({ archiveGuard: false }));
+  });
+
   it('still adopts a saved candidate whose target carries the archived source', async () => {
     const { next, discarded } = await readyTick({ target: '4'.repeat(40) });
     expect(discarded).toEqual([]);
     expect(model.finalize).toHaveBeenCalledTimes(1);
     expect(next.result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'fallback-main-moved' });
+    expect(model.finalize).toHaveBeenCalledWith(expect.objectContaining({ archiveGuard: true }));
+  });
+});
+
+describe('finalize re-reads the registry and refuses a target that drops archived content (PR #6033 red team)', () => {
+  // The build smoked unlocked; a sibling tick archived lower into top meanwhile. Finalize runs under the write lock.
+  async function finalizeAfterSiblingRetired({ target, gitError = false, archiveGuard }) {
+    const f = fixture();
+    await f.retire();
+    model.gitErrorTarget = gitError ? target : null;
+    const resets = [];
+    const run = (args) => {
+      if (args[0] === 'reset') { resets.push(args.at(-1)); return { stdout: '', status: 0 }; }
+      return f.git(args);
+    };
+    const fin = await finalizeRebuild({ root, env: f.env, run, now: Date.now, prevHead: '1'.repeat(40), lease: { token: null },
+      plan: { finalSha: target, mainSha: '1'.repeat(40), applied: [], inputsKey: 'test' },
+      ...(archiveGuard === undefined ? {} : { archiveGuard }) });
+    return { f, fin, resets };
+  }
+
+  it('refuses a plain-main target that lacks the sibling\'s new archive, before any reset', async () => {
+    const { f, fin, resets } = await finalizeAfterSiblingRetired({ target: '5'.repeat(40) });
+    expect(fin).toMatchObject({ moved: false, reason: 'overlay-source-unavailable' });
+    expect(fin.adopted).not.toBe(true);
+    expect(resets).toEqual([]);
+    expect(fin.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-source-unavailable',
+      detail: expect.objectContaining({ refs: ['top'], failed: 'archive-source-uncovered: top' }) }));
+    expect(readOverlayState(root, { env: f.env }).overlays.find((o) => o.ref === 'top').retiredSources).toHaveLength(1);
+  });
+
+  it('refuses when archive containment cannot be read (fails closed)', async () => {
+    const { fin, resets } = await finalizeAfterSiblingRetired({ target: '5'.repeat(40), gitError: true });
+    expect(fin).toMatchObject({ moved: false, reason: 'overlay-source-unverifiable' });
+    expect(resets).toEqual([]);
+  });
+
+  it('adopts a target that carries the archive, and a mainOnly finalize (archiveGuard false) skips the rule', async () => {
+    const carried = await finalizeAfterSiblingRetired({ target: '4'.repeat(40) });
+    expect(carried.resets).toEqual(['4'.repeat(40)]);
+    expect(carried.fin.alerts.map((a) => a.kind)).not.toContain('overlay-source-unavailable');
+    const mainOnly = await finalizeAfterSiblingRetired({ target: '5'.repeat(40), archiveGuard: false });
+    expect(mainOnly.resets).toEqual(['5'.repeat(40)]);
   });
 });

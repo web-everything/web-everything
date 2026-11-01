@@ -604,7 +604,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, archiveGuard: !mainOnly,
     }), finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {

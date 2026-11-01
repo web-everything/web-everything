@@ -716,8 +716,9 @@ export async function prepareRebuild({
       // A saved candidate predates this tick's archives (auto-retirement may have run since it passed).
       // Hold it to the same rule as a fresh plan: every registered carrier's archived sources must be in
       // the target. Unreadable evidence discards it too; the fresh plan below then re-checks and smokes.
+      // A mainOnly rebuild skips archives everywhere (its planning and smoke fallbacks never edit the list).
       let archiveRefusal = null;
-      if (m.adopt) {
+      if (m.adopt && !mainOnly) {
         try {
           const uncovered = archiveUncovered(git, overlaysBefore || [], m.adopt.finalSha);
           if (uncovered.length) archiveRefusal = { refs: uncovered.map((o) => o.ref) };
@@ -752,6 +753,7 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          archiveGuard: !mainOnly,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -820,7 +822,7 @@ export async function prepareRebuild({
     if (d?.skip) {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
-        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null }, archiveGuard: !mainOnly,
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
       return {
