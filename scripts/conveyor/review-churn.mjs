@@ -6,8 +6,9 @@
  *   fix-push -> re-review ping-pong. Two guards, each a policy-cascade leaf, both SHADOW by default:
  *   - `sameTree`: a head whose git tree equals the tree of an already ACCEPTED reviewed head owes no review (a new
  *     commit id over identical content). A changed tree is always reviewed.
- *   - `maxLoopsPerPr` (+ `capMode`): once a PR has accumulated that many reviews of distinct heads, another review is
- *     not dispatched; the PR is parked with the existing cap-exhausted needs-you row so a person decides.
+ *   - `maxLoopsPerPr` (+ `capMode`): once a PR has accumulated that many reviews of distinct heads, a needs-you note
+ *     (`review-churn`) tells a person the loop is not converging. The review itself STILL runs: changed code is never
+ *     left unreviewed.
  *   Modes: `off` (today), `shadow` (compute and record `churnShadow` on the dispatch row, change nothing), `on`.
  *   Cascade: standard -> platform preference `reviewChurn` -> `scripts/settings/review.json#reviewChurn` -> env
  *   WE_REVIEW_CHURN_SAME_TREE / WE_REVIEW_CHURN_CAP_MODE / WE_REVIEW_CHURN_MAX_LOOPS.
@@ -69,7 +70,9 @@ export function decideReviewChurn(pr) {
   const verdicts = reviewedHeadVerdicts(pr.comments);
   const found = [];
   if (sameTree !== 'off' && head && f.headTree) {
-    const twin = verdicts.find((v) => v.accept && !head.startsWith(v.head) && !v.head.startsWith(head)
+    // Only a head whose LATEST verdict is an accept counts: a later changes verdict on it supersedes the accept.
+    const latest = new Map(verdicts.map((v) => [v.head, v.accept]));
+    const twin = verdicts.find((v) => latest.get(v.head) === true && !head.startsWith(v.head) && !v.head.startsWith(head)
       && f.trees?.[v.head] && f.trees[v.head] === f.headTree);
     if (twin) found.push({ kind: 'same-tree', mode: sameTree, head, reviewedHead: twin.head, tree: f.headTree });
   }

@@ -1717,12 +1717,9 @@ function dispatchReviewRow({
       why: `head \`${churn.head}\` has the identical tree (\`${churn.tree}\`) of already-accepted reviewed head \`${churn.reviewedHead}\` — nothing new to review (review.reviewChurn.sameTree)` });
     return;
   }
-  if (churn?.mode === 'on' && churn.kind === 'loop-cap') {
-    refuseCapExhausted({ ...withPhase, attempts: churn.loops, cap: churn.cap, capKind: 'review-churn', ...extra,
-      why: `this PR has had ${churn.loops} reviews of distinct heads against review.reviewChurn.maxLoopsPerPr=${churn.cap} — the fix/review ping-pong is not converging and a person must take it` },
-    { allowTakeover: false });
-    return;
-  }
+  // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
+  // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
+  if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
   // count exceeds the cap: the last allowed fix is always owed its final review.
   const finalReview = attempts >= roundCap;
@@ -3936,6 +3933,11 @@ export function planReconcile({
         attempts: entry.reviewFixAttempts ?? entry.attempts,
         joinedInputs: { head: pr.headRefOid, ciFailures: facts.ciFailures, reviewFindings: facts.findings.map(c => c.body) } });
     } else timedDispatch.push(entry);
+  }
+  for (const d of timedDispatch) {
+    if (d.kind !== 'review' || !d.churnCap || notes.some(n => n.kind === 'review-churn' && n.prNumber === d.prNumber)) continue;
+    notes.push({ kind: 'review-churn', prNumber: d.prNumber, loops: d.churnCap.loops, cap: d.churnCap.cap,
+      text: `PR #${d.prNumber}: ${d.churnCap.loops} reviews of distinct heads (review.reviewChurn.maxLoopsPerPr=${d.churnCap.cap}) — the fix/review loop is not converging; the new head is still reviewed, and a person should look at the PR` });
   }
   return { dispatch: timedDispatch, refusals, notes };
 }

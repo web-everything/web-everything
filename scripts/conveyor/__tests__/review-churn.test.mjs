@@ -58,11 +58,11 @@ describe('per-PR loop cap', () => {
     expect(countReviewLoops(comments)).toBe(3);
     expect(countReviewLoops([accept(heads[0], 1), accept(heads[0], 2)])).toBe(1);
   });
-  it('on: a new head past the cap is parked, not reviewed', () => {
+  it('on: a new head past the cap is STILL reviewed, and a needs-you note is raised', () => {
     const r = plan(mkPr(comments, sha('d'), { settings: SET({ sameTree: 'off' }) }));
-    expect(row(r)?.kind).not.toBe('review');
-    const cap = r.refusals.find((x) => x.prNumber === 7 && x.kind === 'cap-exhausted');
-    expect(cap?.capKind).toBe('review-churn');
+    expect(row(r)?.kind).toBe('review');
+    expect(row(r)?.churnCap).toMatchObject({ kind: 'loop-cap', loops: 3, cap: 3 });
+    expect(r.notes.find((n) => n.kind === 'review-churn' && n.prNumber === 7)).toBeTruthy();
   });
   it('under the cap: reviewed', () => {
     const r = plan(mkPr(comments, sha('d'), { settings: SET({ sameTree: 'off', maxLoopsPerPr: 4 }) }));
@@ -72,6 +72,14 @@ describe('per-PR loop cap', () => {
     const r = plan(mkPr(comments, sha('d'), { settings: SET({ sameTree: 'off', capMode: 'shadow' }) }));
     expect(row(r)?.kind).toBe('review');
     expect(row(r)?.churnShadow?.kind).toBe('loop-cap');
+  });
+});
+
+describe('stale accept', () => {
+  it('a later changes verdict on the same head voids its accept for the same-tree skip', () => {
+    const A = sha('a'); const TREE = sha('1');
+    const bounce = { author: BOT, createdAt: at(2), body: `🔁 review — changes requested\n\n<!-- reviewed-sha: ${A} -->` };
+    expect(decideReviewChurn(mkPr([accept(A, 1), bounce], sha('b'), { settings: SET(), headTree: TREE, trees: { [A]: TREE } }))).toBeNull();
   });
 });
 
