@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cardIdOf, decideBatchFiling, fileIntoBatch, launchSealJob, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
+import { cardIdOf, decideBatchFiling, fileIntoBatch, freshMainBase, launchSealJob, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
 import { AI_TRAILER } from '../card-batch-io.mjs';
 import { sealDueBatches } from '../card-batch-seal-io.mjs';
 import { effectiveCardBatchPolicy, resolvePreventionBatchSettings, resolveCardBatchSettings } from '../../lib/card-batch-settings.mjs';
@@ -103,6 +103,63 @@ describe('fileIntoBatch against a real origin', () => {
       expect(tree.sort()).toEqual([a, b].sort());
     });
   }, 60_000);
+
+  it('a run of admissions in one lane fetches origin/main once per freshness window, not once per card', async () => {
+    await withNarrowClone(async (ctx) => {
+      const trace = join(tempDir(), 'trace2.jsonl');
+      const prior = process.env.GIT_TRACE2_EVENT;
+      process.env.GIT_TRACE2_EVENT = trace;
+      const fetchesOfMain = () => {
+        let text = '';
+        try { text = readFileSync(trace, 'utf8'); } catch { return 0; }
+        return text.split('\n').filter((l) => l.includes('"event":"start"'))
+          .filter((l) => JSON.parse(l).argv.slice(1).join(' ') === 'fetch --no-tags -q origin main').length;
+      };
+      const bases = [];
+      const admit = async (input) => { bases.push(input.baseSha); return { action: 'refuse', reason: 'head-mismatch' }; };
+      const deps = { admit, launch: () => {}, stateDir: tempDir(), log: () => {}, settings: settingsWith() };
+      try {
+        for (const id of ['xfffff1', 'xfffff2', 'xfffff3', 'xfffff4']) {
+          await fileIntoBatch({ laneDir: ctx.clone, cardPath: writeCard(ctx.clone, id), source: { repo: 'org/repo' } }, deps);
+        }
+      } finally {
+        if (prior === undefined) delete process.env.GIT_TRACE2_EVENT; else process.env.GIT_TRACE2_EVENT = prior;
+      }
+      expect(bases).toHaveLength(4);
+      expect(new Set(bases)).toEqual(new Set([ctx.git(['rev-parse', 'origin/main']).trim()]));
+      expect(fetchesOfMain()).toBe(1);
+    });
+  }, 60_000);
+
+  it('freshMainBase refetches once the window passes, and never caches a failed fetch', () => {
+    let t = 0;
+    const calls = [];
+    let failFetch = false;
+    let sha = 'a'.repeat(40);
+    const run = (cwd, args) => {
+      calls.push(`${cwd}:${args[0]}`);
+      if (args[0] === 'fetch' && failFetch) throw new Error('offline');
+      return args[0] === 'rev-parse' ? sha : '';
+    };
+    const opts = { run, now: () => t, cache: new Map(), maxAgeMs: 1000 };
+    const fetches = () => calls.filter((c) => c.endsWith(':fetch')).length;
+    expect(freshMainBase('/lane-a', opts)).toBe(sha);
+    t = 999; sha = 'b'.repeat(40);
+    expect(freshMainBase('/lane-a', opts)).toBe('a'.repeat(40));
+    expect(fetches()).toBe(1);
+    t = 1000;
+    expect(freshMainBase('/lane-a', opts)).toBe('b'.repeat(40));
+    expect(fetches()).toBe(2);
+    expect(freshMainBase('/lane-b', opts)).toBe('b'.repeat(40));
+    expect(fetches()).toBe(3);
+    failFetch = true; t = 5000;
+    expect(freshMainBase('/lane-a', opts)).toBe('b'.repeat(40));
+    expect(freshMainBase('/lane-a', opts)).toBe('b'.repeat(40));
+    expect(fetches()).toBe(5);
+    failFetch = false;
+    freshMainBase('/lane-a', opts); freshMainBase('/lane-a', opts);
+    expect(fetches()).toBe(6);
+  });
 
   it('opt-out, interactive actor and a disabled setting never touch the coordinator', async () => {
     const admit = vi.fn();
