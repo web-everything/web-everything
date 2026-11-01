@@ -209,8 +209,36 @@ describe('identity and harness hash', () => {
   it('no harness hash means no identity (nothing is reused)', () => {
     expect(smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: null })).toBeNull();
   });
-  it('the real harness hash is a content hash of the smoke import closure, not of one file', () => {
-    expect(smokeHarnessHash()).toMatch(/^[0-9a-f]{64}$/);
+  it('changing an imported harness dependency changes the computed harness hash', () => {
+    const root = mk();
+    put(root, 'scripts/lib/daemon-live-smoke.mjs', "import './harness-dependency.mjs';\n");
+    put(root, 'scripts/lib/daemon-rebuild/smoke.mjs', 'export const smoke = true;\n');
+    put(root, 'scripts/lib/harness-dependency.mjs', 'export const value = 1;\n');
+    const before = smokeHarnessHash({ root });
+    expect(before).toMatch(/^[0-9a-f]{64}$/);
+    put(root, 'scripts/lib/harness-dependency.mjs', 'export const value = 2;\n');
+    const after = smokeHarnessHash({ root });
+    expect(after).toMatch(/^[0-9a-f]{64}$/);
+    expect(after).not.toBe(before);
+    put(root, 'scripts/lib/harness-dependency.mjs', 'export const value = 1;\n');
+    expect(smokeHarnessHash({ root })).toBe(before);
+  });
+  it('an unreadable or incomplete harness closure returns null', () => {
+    const root = mk();
+    expect(smokeHarnessHash({ root })).toBeNull();
+    put(root, 'scripts/lib/daemon-live-smoke.mjs', "import './harness-dependency.mjs';\n");
+    put(root, 'scripts/lib/daemon-rebuild/smoke.mjs', 'export const smoke = true;\n');
+    put(root, 'scripts/lib/harness-dependency.mjs', 'export const value = 1;\n');
+    expect(smokeHarnessHash({ root, readFile: (path) => {
+      if (path.endsWith('harness-dependency.mjs')) throw new Error('unreadable dependency');
+      return readFileSync(path);
+    } })).toBeNull();
+    put(root, 'scripts/lib/harness-dependency.mjs', 'export const load = (path) => import(path);\n');
+    expect(smokeHarnessHash({ root })).toBeNull();
+    for (const closure of [null, { complete: false, files: new Set(['x.mjs']) },
+      { files: new Set(['x.mjs']) }, { complete: true, files: new Set() }]) {
+      expect(smokeHarnessHash({ root, closureOf: () => closure })).toBeNull();
+    }
   });
 });
 

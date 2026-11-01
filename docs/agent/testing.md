@@ -3742,3 +3742,10 @@ The projection's index, source-classification and source-entry checks repeat sou
 invariants: a credential source must pass the public-blob checks before entering the projection
 corpus. Do not claim independent mutation coverage for those redundant checks from a test
 that already refuses at source admission.
+
+## Rebuild smoke relevance proof identity
+
+Relevance proofs bind the exercised import closure to the running smoke harness, Node version,
+and candidate lockfile identity. Legacy or missing execution identity forces a live check.
+`daemon-rebuild-smoke-relevance-share.test.mjs` varies each identity component independently
+and asserts that an irrelevant daemon executes the check after invalidation.

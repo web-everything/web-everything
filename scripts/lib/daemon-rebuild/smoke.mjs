@@ -152,18 +152,24 @@ export function writeClosureProofs(rows, { identity = null, env = process.env, n
 }
 
 /** Harness hash over EVERY module the smoke imports (not only the live-smoke file), memoized per process.
- *  An unreadable or incomplete closure yields null: no identity, so nothing is reused. */
+ *  An unreadable or incomplete closure yields null: no identity, so nothing is reused.
+ *  Explicit fixture IO bypasses the process memo without changing the production snapshot. */
 let harnessHashMemo;
-export function smokeHarnessHash() {
-  if (harnessHashMemo !== undefined) return harnessHashMemo;
+export function smokeHarnessHash(options) {
+  if (options === undefined && harnessHashMemo !== undefined) return harnessHashMemo;
+  const remember = (value) => {
+    if (options === undefined) harnessHashMemo = value;
+    return value;
+  };
   try {
-    const root = resolvePath(dirname(fileURLToPath(import.meta.url)), '../../..');
-    const closure = collectImportClosure({ root, entries: ['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs'] });
-    if (!closure || closure.complete === false || !(closure.files instanceof Set)) return (harnessHashMemo = null);
+    const { root = resolvePath(dirname(fileURLToPath(import.meta.url)), '../../..'),
+      closureOf = collectImportClosure, readFile = readFileSync } = options ?? {};
+    const closure = closureOf({ root, entries: ['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs'] });
+    if (!closure || closure.complete !== true || !(closure.files instanceof Set) || !closure.files.size) return remember(null);
     const h = createHash('sha256');
-    for (const f of [...closure.files].sort()) { h.update(f); h.update('\0'); h.update(readFileSync(join(root, f))); h.update('\0'); }
-    return (harnessHashMemo = h.digest('hex'));
-  } catch { return (harnessHashMemo = null); }
+    for (const f of [...closure.files].sort()) { h.update(f); h.update('\0'); h.update(readFile(join(root, f))); h.update('\0'); }
+    return remember(h.digest('hex'));
+  } catch { return remember(null); }
 }
 
 /** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree.
