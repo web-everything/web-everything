@@ -7,6 +7,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
+import { acquireSeatSlot, pruneSeatPool } from '../lib/review-seat-pool.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap, resolveRoutingProviderCap } from './review-seat-policy.mjs';
@@ -62,7 +63,7 @@ import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  chmodSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
+  chmodSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, readlinkSync, renameSync, rmSync, statSync, unlinkSync,
   readdirSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -485,12 +486,20 @@ export function parseSeatAnswer(text, seats) {
  * repo-relative path Claude's seats use — corroboration matches exact paths only. PURE.
  */
 export function repoRelativeFindings(parsed, scratchDir) {
-  const marker = scratchDir ? `/${basename(scratchDir)}/` : null;
-  if (!marker) return parsed;
+  if (!scratchDir) return parsed;
+  // A pooled checkout is a symlink view: a seat may cite the view's path or the physical slot it resolves to.
+  const targets = [];
+  for (const resolve of [realpathSync, readlinkSync]) {
+    try { targets.push(resolve(scratchDir)); } catch { /* not a symlink, or already gone */ }
+  }
+  const markers = [`/${basename(scratchDir)}/`, ...[...new Set(targets)].filter((t) => t !== scratchDir).map((t) => `${t}/`)];
   const rel = (file) => {
     if (typeof file !== 'string') return file;
-    const i = file.indexOf(marker);
-    return i === -1 ? file : file.slice(i + marker.length);
+    for (const marker of markers) {
+      const i = file.indexOf(marker);
+      if (i !== -1) return file.slice(i + marker.length);
+    }
+    return file;
   };
   return Object.fromEntries(Object.entries(parsed ?? {}).map(([k, v]) => [k, { ...v, findings: v.findings.map((f) => ({ ...f, file: rel(f.file) })) }]));
 }
@@ -733,7 +742,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     let rowsWritten = 0;
     try {
       scratch = io.makeScratch({ lanePath, rev, pr });
-      const inputDir = join(scratch, '.git', 'we-review-seat');
+      const inputDir = seatInputDir(scratch);
       const diffFile = join(inputDir, 'net.diff');
       const bodyFile = join(inputDir, 'pr-body.md');
       io.writeFile(diffFile, read.diffText);
@@ -994,6 +1003,13 @@ export function killActiveSeats(signal = 'SIGTERM') {
   return stoppingAllSeats;
 }
 
+/** Where a seat's inputs (net diff, body, task) live: inside `.git` for a self-contained copy; for a pooled worktree (its `.git` is a file) in a sibling dir OUTSIDE the PR's tree, so tracked content or a symlink in the PR can neither overwrite nor redirect them. The pool clears it on slot reuse. */
+export function seatInputDir(scratch) {
+  let pooled = false;
+  try { pooled = statSync(join(scratch, '.git')).isFile(); } catch { /* no .git yet: legacy layout */ }
+  return pooled ? `${scratch}.input` : join(scratch, '.git', 'we-review-seat');
+}
+
 export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storePath, lockTimeoutMs = LEDGER_LOCK_TIMEOUT_MS } = {}) {
   const storeIo = storePath ? { path: storePath } : {};
   const stateDir = dirname(storePath ?? resolveScorecardStorePath());
@@ -1052,8 +1068,21 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     // dir may reach the lane's objects either. Shallow on purpose: every
     // seat gets the net diff (Codex as a file, Gemini inline), so one commit's tree is all they read. Only a PINNED commit is ever
     // fetched: the lane's HEAD (or any ref) may already be another PR's by now.
-    makeScratch: ({ lanePath, rev }) => {
+    //
+    // Perf item 8: unless `private` (the re-check renames its dir, so it needs its own copy), a seat gets a pooled,
+    // exclusive worktree slot at exactly `rev` (see review-seat-pool.mjs) instead of a 15k-file checkout it then
+    // deletes. Any pool failure falls back to the self-contained copy below.
+    makeScratch: ({ lanePath, rev, private: wantPrivate = false }) => {
       if (!isPinnedRev(rev)) throw new Error(`makeScratch: refusing an unpinned rev ${JSON.stringify(rev ?? null)} — only a commit id is safe on a released lane`);
+      if (!wantPrivate && env.WE_REVIEW_SEAT_POOL !== '0') {
+        try {
+          const slot = acquireSeatSlot({ lanePath, rev });
+          ownReviewScratch(slot.dir, shutdownActiveSeats, { release: () => { slot.release(); pruneSeatPool(); } });
+          return slot.dir;
+        } catch (error) {
+          process.stderr.write(`[${new Date().toISOString()}] review seat pool unavailable (${String(error.message).slice(0, 200)}); using a full copy\n`);
+        }
+      }
       const dir = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.seat));
       const git = (args) => {
         const r = spawnSync('git', args, { encoding: 'utf8', timeout: 5 * 60 * 1000 });
@@ -1769,7 +1798,7 @@ export async function speculateRedTeam({
     try {
       scratch = io.makeScratch({ lanePath, rev, pr });
       try { headMessage = io.readHeadMessage(scratch) ?? ''; } catch { headMessage = ''; }
-      const inputDir = join(scratch, '.git', 'we-review-seat');
+      const inputDir = seatInputDir(scratch);
       const diffFile = join(inputDir, 'net.diff');
       const bodyFile = join(inputDir, 'pr-body.md');
       io.writeFile(diffFile, read.diffText);
@@ -2007,7 +2036,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       try {
         let cwd;
         if (readsRepo) {
-          scratch = base.makeScratch({ lanePath, rev });
+          scratch = base.makeScratch({ lanePath, rev, private: true });
           // Keep the independent pinned clone under the lane shape assertLaneCwd enforces.
           parent = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.recheck));
           ownReviewScratch(parent, shutdownActiveSeats);

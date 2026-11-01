@@ -1,0 +1,135 @@
+import { it, expect, afterEach, beforeEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { acquireSeatSlot, pruneSeatPool } from '../../lib/review-seat-pool.mjs';
+
+const roots = [];
+let lane; let pool; let rev1; let rev2;
+const git = (cwd, ...args) => {
+  const r = spawnSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(r.stderr);
+  return r.stdout.trim();
+};
+beforeEach(() => {
+  const base = mkdtempSync(join(tmpdir(), 'we-pool-test-')); roots.push(base);
+  lane = join(base, 'lane'); pool = join(base, 'pool');
+  spawnSync('git', ['init', '--quiet', lane]);
+  writeFileSync(join(lane, 'stable.txt'), 'same\n'); writeFileSync(join(lane, 'moves.txt'), 'one\n');
+  git(lane, 'add', '-A'); git(lane, 'commit', '-qm', 'one'); rev1 = git(lane, 'rev-parse', 'HEAD');
+  writeFileSync(join(lane, 'moves.txt'), 'two\n'); git(lane, 'commit', '-qam', 'two'); rev2 = git(lane, 'rev-parse', 'HEAD');
+});
+afterEach(() => { for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); });
+
+it('gives two concurrent seats on one commit separate slots, then reuses a released one without rewriting files', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(a.slotDir).not.toBe(b.slotDir);
+  for (const s of [a, b]) { expect(readFileSync(join(s.dir, 'moves.txt'), 'utf8')).toBe('one\n'); expect(git(s.dir, 'rev-parse', 'HEAD')).toBe(rev1); }
+  writeFileSync(join(a.dir, 'junk.txt'), 'seat wrote this'); // a seat must not leak into another seat
+  expect(existsSync(join(b.dir, 'junk.txt'))).toBe(false);
+  const inode = statSync(join(a.dir, 'stable.txt')).ino; const mtime = statSync(join(a.dir, 'stable.txt')).mtimeMs;
+  a.release();
+  const c = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(c.slotDir).toBe(a.slotDir); expect(c.reused).toBe(true);
+  expect(existsSync(join(c.dir, 'junk.txt'))).toBe(false);
+  expect(statSync(join(c.dir, 'stable.txt')).ino).toBe(inode); expect(statSync(join(c.dir, 'stable.txt')).mtimeMs).toBe(mtime);
+  b.release(); c.release();
+});
+
+it('keeps seat inputs outside the pinned tree and clears them on reuse; a live or fresh lock is never reclaimed', async () => {
+  const { seatInputDir } = await import('../review-extra-seats.mjs');
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  const input = seatInputDir(a.dir);
+  expect(input.startsWith(a.slotDir + '/')).toBe(false);
+  mkdirSync(input, { recursive: true }); writeFileSync(join(input, 'net.diff'), 'x');
+  // lock held by a live pid, even if backdated: not reclaimable
+  const lock = join(pool, 'locks', 'slot-1');
+  utimesSync(lock, new Date(0), new Date(0));
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(b.slotDir).not.toBe(a.slotDir);
+  a.release(); b.release();
+  const c = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(existsSync(input)).toBe(false);
+  c.release();
+  // dead owner: a young lock is kept; an old one is reclaimed unless a reclaim of that exact token is in flight
+  const dead = () => { mkdirSync(lock, { recursive: true }); writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2 ** 22 + 12345, token: 't0' })); };
+  rmSync(lock, { recursive: true, force: true }); dead();
+  expect(acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }).slotDir).not.toBe(c.slotDir); // young
+  utimesSync(lock, new Date(0), new Date(0));
+  mkdirSync(`${lock}.reclaim-t0`);
+  expect(acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }).slotDir).not.toBe(c.slotDir); // reclaim in flight
+  rmSync(`${lock}.reclaim-t0`, { recursive: true });
+  const d = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(d.slotDir).toBe(c.slotDir);
+  expect(existsSync(`${lock}.reclaim-t0`)).toBe(false);
+});
+
+it('a repeated release or cleanup never frees or deletes a slot another seat now holds', async () => {
+  const { ownReviewScratch, removeReviewScratch } = await import('../../lib/review-scratch.mjs');
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  ownReviewScratch(a.dir, undefined, { release: a.release });
+  removeReviewScratch(a.dir);
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  ownReviewScratch(b.dir, undefined, { release: b.release });
+  expect(b.slotDir).toBe(a.slotDir); expect(b.dir).not.toBe(a.dir);
+  removeReviewScratch(a.dir); a.release(); // stale handle of seat A, repeated
+  const c = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(c.slotDir).not.toBe(b.slotDir); // B still holds its slot
+  expect(existsSync(join(b.dir, 'moves.txt'))).toBe(true);
+  removeReviewScratch(b.dir); removeReviewScratch(b.dir);
+  expect(existsSync(join(b.slotDir, 'moves.txt'))).toBe(true); // slot stays warm
+  c.release();
+  expect(readdirSync(join(pool, 'views'))).toEqual([]);
+});
+
+it('normalizes findings cited by the view path or by the physical slot path to repo-relative', async () => {
+  const { repoRelativeFindings } = await import('../review-extra-seats.mjs');
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  const mk = (file) => ({ s: { findings: [{ file }] } });
+  for (const file of [join(a.dir, 'src/x.mjs'), join(a.slotDir, 'src/x.mjs'), join(realpathSync(a.slotDir), 'src/x.mjs'), join(readlinkSync(a.dir), 'src/x.mjs')]) {
+    expect(repoRelativeFindings(mk(file), a.dir).s.findings[0].file).toBe('src/x.mjs');
+  }
+  a.release();
+});
+
+it('moves a warm slot to a new commit rewriting only the changed file', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  const stable = statSync(join(a.dir, 'stable.txt')).ino; a.release();
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool });
+  expect(b.slotDir).toBe(a.slotDir); expect(b.reused).toBe(false);
+  expect(git(b.dir, 'rev-parse', 'HEAD')).toBe(rev2);
+  expect(readFileSync(join(b.dir, 'moves.txt'), 'utf8')).toBe('two\n');
+  expect(statSync(join(b.dir, 'stable.txt')).ino).toBe(stable);
+  expect(git(b.dir, 'status', '--porcelain')).toBe('');
+  b.release();
+});
+
+it('releases locks, prunes idle slots with their worktrees, and never touches the lane', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool });
+  expect(pruneSeatPool({ poolDir: pool, keep: 0 })).toEqual([]); // both held: nothing pruned
+  a.release(); b.release();
+  expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+  expect(pruneSeatPool({ poolDir: pool, keep: 1 }).length).toBe(1);
+  expect(readdirSync(join(pool, 'slots')).length).toBe(1);
+  expect(pruneSeatPool({ poolDir: pool, keep: 0 }).length).toBe(1);
+  expect(readdirSync(join(pool, 'slots'))).toEqual([]);
+  expect(git(pool + '/repo.git', 'worktree', 'list').split('\n').length).toBe(1);
+  expect(git(lane, 'worktree', 'list').split('\n').length).toBe(1);
+  expect(git(lane, 'status', '--porcelain')).toBe('');
+});
+
+it('makeScratch hands out a pooled checkout at the pinned rev and removeScratch frees the slot, not deletes it', () => {
+  const url = pathToFileURL(resolve('scripts/operations/review-extra-seats.mjs')).href;
+  const code = `import { createExtraSeatsIo } from ${JSON.stringify(url)}; import { readFileSync, existsSync } from 'node:fs';
+    const io = createExtraSeatsIo(); const d = io.makeScratch({ lanePath: ${JSON.stringify(lane)}, rev: ${JSON.stringify(rev1)} });
+    if (readFileSync(d + '/moves.txt', 'utf8') !== 'one\\n') throw new Error('wrong tree');
+    io.removeScratch(d); if (existsSync(d)) throw new Error('view should be gone');
+    if (!existsSync(process.env.WE_REVIEW_SEAT_POOL_DIR + '/slots/slot-1/moves.txt')) throw new Error('slot should stay warm');`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, WE_REVIEW_SEAT_POOL_DIR: pool, TMPDIR: join(pool, 'tmp') }, encoding: 'utf8', timeout: 30000 });
+  expect(r.status, r.stderr).toBe(0);
+  expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+});
