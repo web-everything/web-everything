@@ -27,7 +27,7 @@ export function tick(){
 export default {
   id: 'overlay-runtime-closure',
   title: 'runtime JSON, Markdown and commented dynamic imports retain overlay conflicts',
-  card: 'PR #6023 / x1b8hlo',
+  card: 'PR #6023 / 5726',
   fixedBy: { sha: 'HEAD', where: 'lane/r171-closure-scope', paths: PATHS },
   fixPresent(root) {
     return readFileSync(join(root, PATHS[0]), 'utf8').includes('md|json')
