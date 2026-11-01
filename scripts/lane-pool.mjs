@@ -287,9 +287,8 @@ const git = (args, cwd, opts = {}) => {
 };
 const gitQuiet = (args, cwd, opts = {}) => {
   const options = { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: LANE_GIT_ENV, ...opts };
-  if (!BOUNDED_NETWORK_GIT.has(args[0])) return execFileSync('git', args, options);
-  const bounded = boundedGitCommand(args, options.timeout);
-  return execFileSync(bounded.file, bounded.args, { ...options, timeout: options.timeout + BOUNDED_GIT_GRACE_MS });
+  const bounded = BOUNDED_NETWORK_GIT.has(args[0]) ? boundedGitCommand(args, options.timeout) : null;
+  return execFileSync(bounded ? bounded.file : 'git', bounded ? bounded.args : args, bounded ? { ...options, timeout: options.timeout + BOUNDED_GIT_GRACE_MS } : options);
 };
 const tryGit = (args, cwd, opts = {}) => {
   try {
