@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
+import { resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
+import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
@@ -180,13 +182,17 @@ describe('per-dispatch owner token', () => {
     expect(brief.match(/--(?:exclude-)?owner=abc123/g)).toHaveLength(4);
   });
 
-  it('registers with --heartbeat and tells the worker to heartbeat with the same token every ~20 minutes', () => {
-    const brief = renderWorkerBrief(params);
+  it('registers with --heartbeat and tells the worker to heartbeat with the same token every 20 minutes by default', () => {
+    const freeScope = resolveFreeScopeSettings({ env: {}, platform: {} });
+    const brief = renderWorkerBrief({ ...params, freeScope });
     const step2 = brief.slice(brief.indexOf('2. **Register'), brief.indexOf('3. **Lane'));
     expect(step2).toMatch(/register --agent=fix-widget --owner=tok12345 [^`]*--heartbeat`/);
     expect(step2).toContain('reuse exactly this token');
     expect(step2).toContain('keep the reservation alive');
-    expect(step2).toContain('every ~20 minutes');
+    expect(step2).toContain('every 20 minutes');
+    expect(step2).toContain('half the configured stale window, capped at 20 minutes');
+    expect(step2).toContain('Keep this cadence during long commands too');
+    expect(step2).toContain('if you cannot, stop work and release the scope');
     for (const moment of ['after each Codex round', 'after each narrow-test round', 'before verify']) expect(step2).toContain(moment);
     expect(step2).toContain(`check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`);
     expect(step2).toContain('lastSeenAt');
@@ -194,6 +200,52 @@ describe('per-dispatch owner token', () => {
     // the pre-push recheck and the release stay
     expect(brief).toContain('7. **Pre-push recheck.**');
     expect(step2).toContain('free-scope-cli.mjs release --agent=fix-widget --owner=tok12345');
+  });
+
+  it.each([[10, 5], [0.5, 0.25], [45, 20], [120, 20]])(
+    'CLI cadence for a %s-minute window keeps the owner live at minute 11', async (window, cadence) => {
+      vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', String(window));
+      try {
+        const deps = io();
+        expect(await main(['--purpose=fix-widget', `--files=${files}`], deps)).toBe(0);
+        const brief = deps.stdout.write.mock.calls.flat().join('');
+        expect(brief).toContain(`stale about ${window} minutes`);
+        const match = /every ([\d.]+) minutes/.exec(brief);
+        expect(match).not.toBeNull();
+        const minutes = Number(match[1]);
+        expect(minutes).toBe(cadence);
+        expect(minutes).toBeLessThan(window);
+        const start = Date.parse('2026-11-01T00:00:00Z');
+        const at = minute => new Date(start + minute * 60e3).toISOString();
+        let entries = registerScope([], { agent: params.purpose, owner: params.owner,
+          files: params.files, staleAfterMinutes: window }, at(0));
+        for (let minute = minutes; minute <= 11; minute += minutes) {
+          expect(partitionRegistry(entries, start + minute * 60e3).live).toHaveLength(1);
+          const beat = heartbeatScope(entries, params.purpose, params.owner, at(minute));
+          expect(beat.refreshed).toBe(1);
+          entries = beat.entries;
+        }
+        expect(partitionRegistry(entries, start + 11 * 60e3).live).toHaveLength(1);
+        expect(() => registerScope(entries, { agent: params.purpose, owner: 'competitor',
+          files: params.files, staleAfterMinutes: window }, at(11))).toThrow('different owner');
+      } finally { vi.unstubAllEnvs(); }
+    });
+
+  it('uses the shared platform stale window for in-process briefs', () => {
+    const freeScope = resolveFreeScopeSettings({ env: {}, platform: { staleAfterMinutes: 3 } });
+    const brief = renderWorkerBrief({ ...params, freeScope });
+    expect(brief).toContain('stale about 3 minutes');
+    expect(brief).toContain('every 1.5 minutes');
+  });
+
+  it.each(['0', '-1', '', 'nope', 'Infinity', '5e-324'])('refuses to print a cadence for unusable stale window %j', async value => {
+    vi.stubEnv('WE_FREE_SCOPE_STALE_AFTER_MINUTES', value);
+    try {
+      const deps = io();
+      expect(await main(['--purpose=fix-widget', `--files=${files}`], deps)).toBe(2);
+      expect(deps.stdout.write).not.toHaveBeenCalled();
+      expect(deps.stderr.write.mock.calls.flat().join('')).toMatch(/invalid staleAfterMinutes/i);
+    } finally { vi.unstubAllEnvs(); }
   });
 });
 

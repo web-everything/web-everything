@@ -1,5 +1,6 @@
 import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
 import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
+import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
@@ -37,9 +38,10 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  * @param {number} [params.reportLines]
  * @param {string} [params.owner] Registry owner token; the default is minted per call (per dispatch), which is what
  *   keeps a re-dispatch or a generic slug from colliding with another live worker's registration.
+ * @param {object} [params.freeScope] Resolved shared free-scope settings; defaults to the registry's platform/env cascade.
  * @returns {string} Markdown with a trailing newline.
  */
-export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }) } = {}) {
+export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }), freeScope = resolveFreeScopeSettings({ log: line => console.error(line) }) } = {}) {
   if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) throw new Error('--owner must be an alphanumeric token.');
   if (typeof purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(purpose)) {
     throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
@@ -55,6 +57,11 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
   if (edgeClone !== undefined && (typeof edgeClone !== 'string' || !SAFE.test(edgeClone))) throw new Error('--edge-clone has unsafe characters.');
   const qualified = paths.map(path => path.trim()).map(path => path.includes(':') ? path : `${repo}:${path}`);
   const commaList = qualified.join(',');
+  const { staleAfterMinutes } = freeScope;
+  const heartbeatMinutes = Math.min(20, staleAfterMinutes / 2);
+  if (!Number.isFinite(staleAfterMinutes) || !(heartbeatMinutes > 0)) {
+    throw new Error('Invalid staleAfterMinutes: cannot derive a positive heartbeat cadence; correct the free-scope setting and regenerate the brief.');
+  }
   const laneRepo = repo === 'plateau-app' ? ' --repo=<plateau-app checkout>' : '';
   // Codex's full and related gates need WE's scripts/verify-lane.mjs; a plateau-app lane has only its own standards.
   const codexGate = repo === 'plateau-app' && policy.finalGate !== 'none' ? 'standards' : policy.finalGate;
@@ -85,10 +92,12 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    The \`--owner\` token \`${owner}\` was generated once for you: reuse exactly this token in every register, heartbeat, recheck
    and release below; never mint a new one. If register refuses because the name is held by a different owner, another live worker
    shares your slug. Stop and report; never release or overwrite their entry.
-   **Heartbeat.** \`--heartbeat\` makes the reservation go stale about 45 minutes after the owner was last seen, so a killed worker
-   does not block its own restart. To keep the reservation alive, re-run this owner-tokened check at least every ~20 minutes of
+   **Heartbeat.** \`--heartbeat\` makes the reservation go stale about ${staleAfterMinutes} minutes after the owner was last seen, so a killed worker
+   does not block its own restart. To keep the reservation alive, re-run this owner-tokened check at least every ${heartbeatMinutes} minutes of
    work (for example after each Codex round, after each narrow-test round, and before verify):
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
+   This cadence is half the configured stale window, capped at 20 minutes. Use the same free-scope settings when registering;
+   if they change, regenerate the brief. Keep this cadence during long commands too; if you cannot, stop work and release the scope.
    Each run refreshes your \`lastSeenAt\`. If it reports OCCUPIED or UNKNOWN (exit 2), stop and report.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
