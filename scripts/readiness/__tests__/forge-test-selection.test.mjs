@@ -5,6 +5,7 @@ import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {join} from 'node:path';
 import {loadTestSelector} from '../forge-test-selection.mjs';
+import {buildManifest} from '../remote-exec.mjs';
 import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const argv=['npx','vitest','run'];
@@ -37,6 +38,25 @@ it('selects with a symlinked cwd using real Vitest discovery',async()=>{
   expect(await selected('selected.test.mjs')).toBe(true);
   expect(await selected('omitted.test.mjs')).toBe(false);
 });
+
+it('retains manifest fallback for an ignored dependency executed by real Vitest despite discovery filters',async()=>{
+  const root=await fixture("export default {test:{include:['**/*.test.mjs'],exclude:[],poolOptions:{threads:{singleThread:true}}}};");
+  await fs.writeFile(join(root,'.gitignore'),'node_modules/\nb.test.mjs\n');
+  await fs.writeFile(join(root,'package-lock.json'),'{}');
+  await fs.writeFile(join(root,'b.test.mjs'),'export const value = 42;');
+  await fs.writeFile(join(root,'a.test.mjs'),"import {it,expect} from 'vitest'; import {value} from './b.test.mjs'; it('imports ignored dependency',()=>expect(value).toBe(42));");
+  const env=Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('GIT_')));
+  const git=async args=>execute('git',args,{cwd:root,env,timeout:10000,maxBuffer:1024*1024});
+  await git(['init','-q']);await git(['add','.']);
+  await git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
+  const command=[...argv,'a.test.mjs'];
+  const selected=await loadTestSelector({cwd:root,env,argv:command,timeoutMs:10000});
+  expect(await selected('a.test.mjs')).toBe(true);expect(await selected('b.test.mjs')).toBe(false);
+  const result=await execute(process.execPath,[new URL('../../../node_modules/vitest/vitest.mjs',import.meta.url).pathname,'run','a.test.mjs'],
+    {cwd:root,env,timeout:20000,maxBuffer:1024*1024});
+  expect(result.stdout).toContain('1 passed');
+  await expect(buildManifest({cwd:root,env,argv:command})).rejects.toMatchObject({code:'ignored-test-file',detail:'b.test.mjs'});
+},45000);
 
 it.each(['empty','outside only','mixed outside','cwd itself'])('retains refusal for invalid discovery boundaries: %s',async fault=>{
   const root=await fixture('export default {};');

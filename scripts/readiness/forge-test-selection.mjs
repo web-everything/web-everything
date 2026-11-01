@@ -42,6 +42,9 @@ function selectionArgs(argv) {
   return {options, filters};
 }
 
+// This describes test entry points only, not the dependency closure. A false
+// result must never authorize omitting a file from a remote manifest: selected
+// tests can still import it. Manifest admission independently retains fallback.
 // exec has the promisified execFile signature, independent of Git/SSH exec.
 // A killed/oversized/unreadable listing always retains ignored-test refusal.
 export async function loadTestSelector({cwd, argv, env = process.env, exec = execute, timeoutMs = 60000} = {}) {

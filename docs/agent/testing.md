@@ -3623,33 +3623,29 @@ refuses with `manifest-walk-limit` (local fallback) when that budget is exhauste
 
 ## Forge ignored test discovery
 
-Git ignores do not define Vitest discovery. Full and delta manifest admission omit ignored
-test-shaped files only when Vitest's own `createVitest('test', options)` and
-`globTestFiles(filters)` prove they are absent from the selected files. A native Node child
-resolves `vitest/node` from the lane, receives only the finalized environment Forge execution
-receives (`filterEnv`, with `DIFF_COVERAGE_BASE` resolved to its SHA; an invalid env retains fallback), discovers the actual config
-and workspace, and closes the context without running tests. Mirror the CLI's `TEST=true`,
-`VITEST=true` and default `NODE_ENV=test` prelude (preserving an explicit `NODE_ENV`):
-`createVitest` alone does not set them. Admission forwards the run's
-argv and environment through full and delta paths. Only `npx vitest run` / `vitest run`
-are understood, with `--config/-c`, `--root/-r`, `--dir`, repeated `--project`, and positional
-filters. Reporting accepts `--reporter`, `--silent` and bare/boolean `--coverage` only;
-unknown options, other commands and missing argv retain the existing ignored/unshipped-test
-local fallback. Repeated scalar selection flags also retain fallback.
+Git ignores and Vitest discovery do not establish that a file is unused. A selected
+`a.test.mjs` can import an ignored `b.test.mjs` even when filename filters, config excludes,
+workspace selection or include patterns omit `b.test.mjs` from `globTestFiles(filters)`.
+Static imports, re-exports, dynamic imports and imports through helpers all need the
+dependency bytes at execution time. Discovery alone is insufficient evidence for omission.
 
-Discovery resolves the lane cwd with `realpath` before spawning and comparing Vitest's
-absolute paths, including when the caller reaches the lane through a symlink. An empty
-listing, the cwd itself, or any selected path outside that physical cwd retains local fallback.
-The selector's native-child symlink regression and the full/delta symlink manifest regressions
-pin this boundary. Invalid selection environments retain ignored-test refusal in both manifest
-modes without launching discovery.
+Full and delta manifest admission therefore retain `ignored-test-file` local fallback for
+every ignored test-shaped file outside dependency/Git internals. The independent filesystem
+walk also refuses unshipped tests (`unshipped-test-file`) and ignored leaves projected into
+test paths by tracked directory aliases (`unshipped-symlink`), including nested aliases.
+No discovery result, argv, environment, warm base or retry exempts those checks. Until
+dependency inclusion can be established, use local execution through heavy admission.
+The refusal names the path; no remote prepare, transfer or execution follows it.
 
-The listing has a 60-second SIGKILL deadline and a 4 MiB output bound. Child/listing errors,
-timeouts, oversized output, invalid JSON or paths retain local fallback; use local execution
-through heavy admission when evidence is unavailable. Keep native-child regressions for
-config/workspace discovery and no test execution, plus injected full/delta parity and refusal
-cases. Warm bases have no run argv and export tracked Git entries only; policy exclusions
-still refuse test-shaped entries, as do commandless manifest callers. The refusal names the path.
+`forge-test-selection.mjs` remains a bounded diagnostic of test entry points, separate from
+manifest admission. Its native child resolves the lane's Vitest and physical cwd, mirrors the
+CLI environment prelude and closes discovery without running tests. Its 60-second SIGKILL
+deadline, 4 MiB output bound and conservative error handling do not prove dependency closure.
+Keep the real-Vitest regression showing that an ignored dependency executes despite being
+absent from discovery, along with full/delta and pre-transport refusal tests for all import
+shapes and the filesystem/alias checks. Invalid environments continue to retain manifest
+refusal without launching discovery. Warm bases export tracked Git entries only, and policy
+exclusions still refuse test-shaped entries.
 
 A credential-named alias is refused like any excluded path. The one exemption is the
 `.claude/agent-memory/` bridge's exact image of a tracked `agent-memory-src/` source-extension

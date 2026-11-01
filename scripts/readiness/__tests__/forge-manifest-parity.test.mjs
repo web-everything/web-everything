@@ -55,19 +55,61 @@ it.each(['selected','timeout','invalid JSON','non-vitest argv','unknown flag','m
   if(['non-vitest argv','unknown flag','missing argv'].includes(fault))expect(selectorExec).not.toHaveBeenCalled();
 });
 
-it('omits a Vitest-excluded ignored test from full and delta entries with the same argv and env',async()=>{
+it.each(['static import','re-export','dynamic import','transitive import'])(
+'refuses a discovery-excluded ignored dependency before full/delta admission and transport: %s',async kind=>{
+  const path='b.test.mjs';
+  await write(path,'export const value = 42;');await write('.gitignore',path+'\n');
+  const imports={
+    'static import':"import {value} from './b.test.mjs'; export {value};",
+    're-export':"export {value} from './b.test.mjs';",
+    'dynamic import':"export const value = (await import('./b.test.mjs')).value;",
+    'transitive import':"export {value} from './helper.mjs';",
+  };
+  await write('a.test.mjs',imports[kind]);
+  if(kind==='transitive import')await write('helper.mjs',imports['re-export']);
+  const argv=['npx','vitest','run','a.test.mjs'];
+  const selectorExec=vi.fn(async()=>({stdout:JSON.stringify([join(cwd,'a.test.mjs')])}));
+  const options={cwd,env,argv,selectorExec};
+  await expect(buildManifest(options)).rejects.toMatchObject({code:'ignored-test-file',detail:path});
+  await expect(buildDeltaManifest({...options,base})).rejects.toMatchObject({code:'ignored-test-file',detail:path});
+  const calls=[],exec=async call=>{
+    calls.push(call);
+    if(call.file==='git')return defaultExec(call);
+    if(call.file==='ssh'&&call.args.length===2&&call.args[1]==='true')return {code:0,stdout:Buffer.alloc(0)};
+    throw new Error(`Unexpected transport: ${call.file}`);
+  };
+  expect(await runRemote({...options,exec,disableDelta:true,log:()=>{}}))
+    .toMatchObject({mode:'not-started',terminated:true,reason:'ignored-test-file'});
+  expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
+});
+
+it('retains full/delta fallback for a discovery-excluded ignored test without loading discovery',async()=>{
   const path='scripts/build/lost.test.mjs';
   await write(path,'export {};');await write('.gitignore','scripts/build/\n');
-  const argv=['npx','vitest','run','a.test.mjs'],selectorExec=vi.fn(async(file,args,options)=>{
-    expect(JSON.parse(args[1]).filters).toEqual(['a.test.mjs']);
-    expect(options.env).toEqual(filterEnv(env));expect(options.cwd).toBe(cwd);
-    return {stdout:JSON.stringify([join(cwd,'a.test.mjs')])};
-  });
-  for(const actual of [await buildManifest({cwd,env,argv,selectorExec}),await buildDeltaManifest({cwd,env,base,argv,selectorExec})]){
-    expect(actual.entries.map(entry=>entry.path.toString())).not.toContain(path);
-    expect(actual.excluded.map(entry=>entry.toString())).not.toContain(path);
+  const argv=['npx','vitest','run','a.test.mjs'],selectorExec=vi.fn(async()=>({stdout:JSON.stringify([join(cwd,'a.test.mjs')])}));
+  await expect(buildManifest({cwd,env,argv,selectorExec})).rejects.toMatchObject({code:'ignored-test-file',detail:path});
+  await expect(buildDeltaManifest({cwd,env,base,argv,selectorExec})).rejects.toMatchObject({code:'ignored-test-file',detail:path});
+  expect(selectorExec).not.toHaveBeenCalled();
+});
+
+it.each(['missing ignored inventory','directory alias','nested directory alias'])(
+'retains dependency fallback in filesystem cross-checks despite non-selection: %s',async kind=>{
+  const alias=kind!=='missing ignored inventory',path=alias?'runtime-src/hidden.js':'b.test.mjs';
+  if(alias){
+    await write('runtime-src/keep.txt','keep');
+    if(kind==='nested directory alias'){
+      await fs.mkdir(join(cwd,'bridge'));await fs.symlink('../runtime-src',join(cwd,'bridge/inner'));
+    }
+    await fs.symlink(kind==='nested directory alias'?'bridge':'runtime-src',join(cwd,'tests'));commit();
   }
-  expect(selectorExec).toHaveBeenCalledTimes(2);
+  await write(path,'export const value = 42;');await write('.gitignore',path+'\n');
+  const exec=async call=>kind==='missing ignored inventory'&&call.args.includes('-i')
+    ?{code:0,stdout:Buffer.alloc(0)}:defaultExec(call);
+  const options={cwd,env,exec,argv:['npx','vitest','run','a.test.mjs'],
+    selectorExec:async()=>({stdout:JSON.stringify([join(cwd,'a.test.mjs')])})};
+  const code=alias?'unshipped-symlink':'unshipped-test-file';
+  await expect(buildManifest(options)).rejects.toMatchObject({code});
+  await expect(buildDeltaManifest({...options,base})).rejects.toMatchObject({code});
 });
 
 it.each(['full','delta'])('refuses a selected ignored test through a symlinked cwd in %s manifests',async mode=>{
@@ -434,12 +476,12 @@ const rows=[
   [29,'nested tracked directory links refuse an ignored leaf projected into an excluded path'],
   [30,'nested tracked directory links omit an ignored non-test leaf at every alias'],
   [31,'allowed tracked directory alias omits ignored runtime files beside a node_modules/.bin symlink'],
-  [32,'ignored _site test outside all Vitest includes is omitted'],
+  [32,'ignored _site test outside all Vitest includes still refuses'],
   [33,'ignored _site test selected by the explicit integration config still refuses'],
   [34,'selection sees the Forge env: a local-only env var cannot deselect an ignored test'],
 ];
 it.each(rows)('row %i: %s',async row=>{
-  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29,33,34].includes(row);
+  let hostile={...env},omit=false,refuse=[6,7,8,10,11,12,21,22,23,24,25,26,27,28,29,32,33,34].includes(row);
   const omitted=[];
   if(row===32||row===33||row===34){
     await fs.symlink(new URL('../../../node_modules',import.meta.url).pathname,join(cwd,'node_modules'),'dir');
@@ -521,7 +563,7 @@ it.each(rows)('row %i: %s',async row=>{
     const argv=row===32?['npx','vitest','run']:row===33||row===34?['npx','vitest','run','--config','vitest.integration.config.mjs']:undefined;
     const build=()=>delta?buildDeltaManifest({cwd,env:hostile,exec,base,argv}):buildManifest({cwd,env:hostile,exec,argv});
     if(refuse){
-      if(row>=20)await expect(build()).rejects.toMatchObject({code:[25,33,34].includes(row)?'ignored-test-file':'unshipped-symlink'});
+      if(row>=20)await expect(build()).rejects.toMatchObject({code:[25,32,33,34].includes(row)?'ignored-test-file':'unshipped-symlink'});
       if(row===33||row===34)await expect(build()).rejects.toMatchObject({detail:'_site/assets/js/__tests__/x.test.ts',
         message:'Ignored test _site/assets/js/__tests__/x.test.ts: use local fallback'});
       else await expect(build()).rejects.toThrow();

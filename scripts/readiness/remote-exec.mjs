@@ -10,7 +10,6 @@ import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
-import {loadTestSelector} from './forge-test-selection.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -258,7 +257,7 @@ const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local f
   code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
 });
 // Walk independently of Git's inventory. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,testSelected,exec,head,rootInfo,scoped}) {
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -282,8 +281,9 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
-        // (a) Only proven ignored, undiscovered tests may be omitted.
-        if(isTestFile(path)&&!shipped.has(key)&&(!ignoredPaths.has(key)||await testSelected(path)))throw manifestRefusal('unshipped-test-file',path);
+        // (a) Discovery excludes entry points, not imports. Every test-shaped
+        // leaf must ship, even when Git ignores it or Vitest does not list it.
+        if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
         if(!shipped.has(key)&&ignoredPaths.has(key)&&!classifyManifestPath(path).excluded) {
@@ -295,7 +295,7 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
             if(++count>100000||(bytes+=projected.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',projected);
             const policy=classifyManifestPath(projected);
             // Ignored runtime data may be excluded solely by the tracked link's prefix.
-            if(isTestFile(projected)&&await testSelected(projected)||policy.excluded&&(sourceExtension.test(policy.names.at(-1))
+            if(isTestFile(projected)||policy.excluded&&(sourceExtension.test(policy.names.at(-1))
               ||classifyManifestPath(projected.subarray(directoryPrefix(link.linkPath).length)).excluded))throw manifestRefusal('unshipped-symlink',link.linkPath);
             seen.add(projectedKey);aliases.push(projected);
           }
@@ -345,23 +345,18 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, argv, selectorExec, selectionEnv, env=process.env, beginSub=noTiming} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Git ignore rules alone do not establish runner exclusions. Load discovery
-  // evidence lazily, once per snapshot, and retain refusal on any uncertainty.
-  let testSelector;
-  // Discovery sees exactly the env Forge execution receives (executeRemote passes its
-  // finalized executionEnv); otherwise filterEnv(env). An invalid env refuses.
-  const selectorEnv=()=>{try{return selectionEnv??filterEnv(env);}catch{return undefined;}};
-  const testSelected=async path=>(await (testSelector??=(()=>{const forgeEnv=selectorEnv();
-    return forgeEnv?loadTestSelector({cwd,argv,env:forgeEnv,exec:selectorExec}):async()=>true;})()))(path);
+  // Neither Git ignores nor Vitest discovery prove that a file is unused:
+  // selected tests can import excluded tests, directly or through helpers.
+  // Until dependency inclusion is established, retain local fallback.
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredPaths = splitPaths(ignored.stdout);
   for (const path of ignoredPaths) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
-    if (isTestFile(path) && await testSelected(path)) {
+    if (isTestFile(path)) {
       const refusal=manifestRefusal('ignored-test-file',path);
       throw Object.assign(refusal,{message:`Ignored test ${refusal.detail}: use local fallback`});
     }
@@ -580,7 +575,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     }
   }
   try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
-    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),testSelected,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
+    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
@@ -618,7 +613,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,argv,selectorExec,selectionEnv,env=process.env,beginSub=noTiming}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -717,7 +712,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,argv,selectorExec,selectionEnv,env,beginSub});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -807,7 +802,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, selectorExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -891,14 +886,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           if(selected)break;
         }
         if(!selected)throw lastError;
-        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,argv,selectorExec,selectionEnv:executionEnv,env,beginSub});
+        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,env,beginSub});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,argv,selectorExec,selectionEnv:executionEnv,env,beginSub});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
@@ -1043,7 +1038,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,selectorExec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1076,7 +1071,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,selectorExec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
