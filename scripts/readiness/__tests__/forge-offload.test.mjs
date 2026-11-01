@@ -314,7 +314,7 @@ describe('warm base selection and delta proof',()=>{
     const base=await baseFixture();
     await fs.writeFile(join(repo,'a.test.mjs'),'changed '+seed);await fs.rm(join(repo,'deleted.txt'));await fs.chmod(join(repo,'mode.txt'),0o755);
     await fs.writeFile(join(repo,'added.txt'),'added '+seed);git(['add','.']);commit();
-    await fs.writeFile(join(repo,'untracked.txt'),'untracked '+seed);await fs.writeFile(join(repo,'credentials.txt'),'still private');
+    await fs.writeFile(join(repo,'untracked.txt'),'untracked '+seed);await fs.writeFile(join(repo,'local-credentials.txt'),'still private');
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
     const full=await remote.buildManifest({cwd:repo,exec});
     expect(delta.manifestDigest).toBe(full.manifestDigest);
@@ -322,7 +322,7 @@ describe('warm base selection and delta proof',()=>{
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs','added.txt','mode.txt','untracked.txt']);
     expect(delta.deletions.map(p=>p.toString())).toEqual(['deleted.txt']);
     expect(delta.entries.some(e=>e.path.toString()==='oauth-source.mjs')).toBe(true);
-    expect(delta.excluded.map(p=>p.toString())).toContain('credentials.txt');
+    expect(delta.excluded.map(p=>p.toString())).toContain('local-credentials.txt');
   });
   it('refuses a credential source changed from public evidence and ignored tests in delta mode',async()=>{
     const base=await baseFixture();await fs.writeFile(join(repo,'oauth-source.mjs'),'private bytes');
@@ -336,7 +336,7 @@ describe('warm base selection and delta proof',()=>{
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base,fs:{...fs,readFile:read}});
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs']);
     expect(delta.manifestMode).toBe('git-delta');
-    expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','oauth-source.mjs']);
+    expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','credentials.txt','oauth-source.mjs']);
   });
   it('reads and hashes every final leaf when the fast path is unavailable',async()=>{
     const base=await baseFixture();
@@ -573,8 +573,8 @@ describe('runner base materialization refuses before install',()=>{
     const deltaMode=['delta','tracked symlink','retry succeeds','next base'].includes(mode);
     expect(stage.shipMode).toBe(deltaMode?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
-    // only in delta mode; the deleted file and private credentials never ship.
-    const payloads=mode==='tracked symlink'?['changed','skill','skill']:deltaMode?['changed']:['changed','lock','mode','public'];
+    // only in delta mode; the deleted file never ships; the tracked, identical, clean credentials.txt ships in full mode (R321).
+    const payloads=mode==='tracked symlink'?['changed','skill','skill']:deltaMode?['changed']:['changed','lock','mode','public','private'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
       deltaFileCount:deltaMode?payloads.length:0,deltaBytes:deltaMode?bytes:0});
