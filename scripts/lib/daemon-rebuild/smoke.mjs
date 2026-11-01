@@ -711,8 +711,9 @@ export async function smokeAndAdopt({
     const ids = new Map(retained.map((ap) => [ap.ref, ap.registrationId]));
     const replanned = await planRebuild({
       entries: runtimeEntries, env, closureScopeMode,
+      adopted: adoptedState,
       git, headSha: prevHead, mainRef: 'origin/main',
-      overlays: retained.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
+      overlays: retained.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr, registrationId: ap.registrationId })),
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
     // The planner produces content rows. Bind fallback evidence to the original candidate's

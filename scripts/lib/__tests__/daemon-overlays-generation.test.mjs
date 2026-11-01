@@ -8,6 +8,7 @@ import * as overlays from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { finalizeRebuild, dropSuspectOverlays } from '../daemon-rebuild/adopt.mjs';
 import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 
 // Spy after initialization: a partial importOriginal mock loads prepare through the
 // overlays → self-sync → rebuild cycle before that mock exists, bypassing its read seam.
@@ -38,7 +39,7 @@ afterEach(() => {
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function fixture() {
+function fixture(ref = REF) {
   const root = mkdtempSync(join(tmpdir(), 'overlay-generation-'));
   temps.push(root);
   const env = {
@@ -57,7 +58,7 @@ function fixture() {
   };
   const file = overlays.overlayFilePath(root, env);
   const list = () => overlays.readOverlays(root, { env });
-  const add = () => overlays.addOverlay(root, { ref: REF, pr: 17, now: NOW }, { env })[0];
+  const add = () => overlays.addOverlay(root, { ref, pr: 17, now: NOW }, { env })[0];
   const seed = (entries) => {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify({ clone: root, overlays: entries }));
@@ -66,8 +67,8 @@ function fixture() {
   return { root, env, file, list, add, seed, bytes };
 }
 
-function gitFixture() {
-  const f = fixture();
+function gitFixture(ref = REF) {
+  const f = fixture(ref);
   const git = (args, options = {}) => spawnSync('git', args, {
     cwd: f.root, env: f.env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     ...options,
@@ -88,9 +89,9 @@ function gitFixture() {
   ok(['add', 'scripts']);
   ok(['commit', '-qm', 'overlay mechanism']);
   const head = ok(['rev-parse', 'HEAD']);
-  ok(['update-ref', `refs/remotes/origin/${REF}`, head]);
+  ok(['update-ref', `refs/remotes/origin/${ref}`, head]);
   const old = f.add();
-  const adopted = { head, mainSha, applied: [{ ref: REF, pr: 17, sha: head, registrationId: old.registrationId }], at: NOW };
+  const adopted = { head, mainSha, applied: [{ ref, pr: 17, sha: head, registrationId: old.registrationId }], at: NOW };
   const save = (value = adopted) => writeRebuildState(f.root, { adopted: value }, f.env);
   save();
   const prepare = async ({ available = false, now = Date.parse(NOW), visit = () => {} } = {}) => {
@@ -103,7 +104,7 @@ function gitFixture() {
           // All remote IO is injected; no fetch, push, or network subprocess is launched.
           let result;
           if (args[0] === 'fetch') {
-            result = { status: available || !args.some(a => a.includes(`heads/${REF}:`)) ? 0 : 1, stdout: '', stderr: '' };
+            result = { status: available || !args.some(a => a.includes(`heads/${ref}:`)) ? 0 : 1, stdout: '', stderr: '' };
           } else if (args[0] === 'ls-remote') result = { status: 2, stdout: '', stderr: '' };
           else result = git(args, options);
           visit(`git:${args[0]}:after`);
@@ -124,7 +125,7 @@ function gitFixture() {
       });
     } finally { seams.visit = null; }
   };
-  return { ...f, old, adopted, save, prepare };
+  return { ...f, old, adopted, save, prepare, git, ok };
 }
 
 function expectNoBorrowedPin(result) {
@@ -134,6 +135,67 @@ function expectNoBorrowedPin(result) {
 }
 
 describe('overlay registration generations', () => {
+  it.each([false, true])('T12 historical pin belongs only to its registration (replaced=%s)', async (replaced) => {
+    const ref = 'lane/reused';
+    const f = gitFixture(ref);
+    const b = f.adopted.head;
+    // Main and rewritten C conflict, while the already adopted B still merges cleanly.
+    f.ok(['reset', '--hard', f.adopted.mainSha]);
+    writeFileSync(join(f.root, 'README.md'), 'main change\n');
+    f.ok(['add', 'README.md']);
+    f.ok(['commit', '-qm', 'main advances']);
+    const mainSha = f.ok(['rev-parse', 'HEAD']);
+    f.ok(['update-ref', 'refs/remotes/origin/main', mainSha]);
+    const merged = f.git(['merge', '--no-ff', b, '-m', `daemon-rebuild: merge overlay ${ref} (PR #17) onto ${mainSha}`],
+      { env: { ...f.env, ...REBUILD_IDENTITY_ENV } });
+    expect(merged.status).toBe(0);
+    const running = f.ok(['rev-parse', 'HEAD']);
+    const adopted = { ...f.adopted, head: running, mainSha };
+    f.save(adopted);
+    f.ok(['reset', '--hard', b]);
+    writeFileSync(join(f.root, 'README.md'), 'rewritten conflicting C\n');
+    f.ok(['add', 'README.md']);
+    f.ok(['commit', '-qm', 'rewrite reused branch']);
+    const c = f.ok(['rev-parse', 'HEAD']);
+    f.ok(['update-ref', `refs/remotes/origin/${ref}`, c]);
+    f.ok(['reset', '--hard', running]);
+    const registration = replaced ? f.add() : f.old;
+    expect(registration.registrationId === f.old.registrationId).toBe(!replaced);
+
+    const result = await f.prepare({ available: true });
+    const persisted = readRebuildState(f.root, f.env).adopted.applied;
+    if (replaced) {
+      expect(persisted).not.toContainEqual(expect.objectContaining({ sha: b, registrationId: registration.registrationId }));
+      expect(result.plan?.applied ?? result.result?.plan?.applied ?? []).not.toContainEqual(
+        expect.objectContaining({ sha: b, registrationId: registration.registrationId }));
+      expect(result.alerts.map(a => a.kind)).not.toContain('overlay-pinned');
+      expect(persisted).toEqual(adopted.applied);
+    } else {
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-pinned');
+      expect(persisted).toContainEqual(expect.objectContaining({ ref, sha: b, registrationId: f.old.registrationId }));
+    }
+    expect(f.list()).toEqual([expect.objectContaining({ ref, registrationId: registration.registrationId })]);
+  });
+
+  it.each(['distinct-ids', 'same-id', 'legacy'])('T13 duplicate refs refuse deterministically across ticks: %s', async (kind) => {
+    const f = gitFixture();
+    const first = kind === 'legacy' ? { ref: REF, pr: 17 } : f.old;
+    const second = kind === 'legacy' ? { ref: REF, pr: 18 }
+      : { ...first, registrationId: kind === 'same-id' ? first.registrationId : 'another-registration' };
+    f.seed([first, second]);
+    const before = f.bytes();
+    for (let tick = 0; tick < 2; tick++) {
+      const visits = [];
+      const result = await f.prepare({ available: true, visit: point => visits.push(point) });
+      expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'overlay-registration-duplicate' } });
+      expect(result.alerts).toContainEqual({ kind: 'overlay-registration-duplicate', detail: { refs: [REF] } });
+      expect(result.alerts.map(a => a.kind)).not.toContain('overlay-registration-changed');
+      expect(visits).not.toContain('git:fetch:before');
+      expect(f.bytes()).toBe(before);
+      expect(readRebuildState(f.root, f.env).adopted).toEqual(f.adopted);
+    }
+  });
+
   it('T1 property: inject addOverlay(root,{ref}) at each point prepareRebuild reads the list or awaits', async () => {
     // Discover every read/run/await boundary on both the unavailable-pin and refreshed-plan paths.
     // Each replay starts from the same old evidence; never reuse a mutated fixture between points.
@@ -281,12 +343,18 @@ describe('overlay registration generations', () => {
     expect(migrated.adopted.applied[0].registrationId).toBeUndefined();
     expect(new Set(migrated.list.map(o => o.registrationId)).size).toBe(entries.length);
     for (const entry of migrated.list) expect(entry.registrationId).toMatch(UUID);
-    // Replay the legacy input through preparation itself, so migration alerts cannot be bypassed.
+    // Preparation refuses ambiguous registries before migration; unique entries still report
+    // unprovable legacy adopted evidence through the migration path.
     f.seed(entries);
     f.save(adopted);
     const result = await f.prepare();
     expectNoBorrowedPin(result);
-    expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-unprovable');
+    if (kind === 'duplicate-ref') {
+      expect(result).toMatchObject({ terminal: true, result: { reason: 'overlay-registration-duplicate' } });
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-duplicate');
+      expect(f.list()).toEqual(entries);
+      expect(readRebuildState(f.root, f.env).adopted).toEqual(adopted);
+    } else expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-unprovable');
     expect(f.list()).toHaveLength(entries.length);
   });
 

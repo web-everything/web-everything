@@ -92,6 +92,7 @@ export async function dryRunRebuild({
             ? { ok: false, reason: 'overlay-state-malformed', detail: { malformed: fetched.malformed } }
             : await planRebuild({
               entries: runtimeEntries, env, closureScopeMode,
+              adopted: state.adopted,
               git: scratchGit,
               headSha: head,
               mainRef: 'origin/main',
@@ -201,6 +202,7 @@ export async function previewOverlayConflict({
   const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
   const head = verifyRev(rootGit, 'HEAD');
   if (!head) return { ok: false, reason: 'head-unresolved' };
+  const adopted = readRebuildState(root, env).adopted;
 
   let url = originUrl;
   if (!url) {
@@ -250,6 +252,7 @@ export async function previewOverlayConflict({
     for (;;) {
       planExisting = await planRebuild({
         entries: runtimeEntries, env, closureScopeMode,
+        adopted,
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -283,6 +286,7 @@ export async function previewOverlayConflict({
     if (mt.status === 1) {
       const planCandidate = await planRebuild({
         entries: runtimeEntries, env, closureScopeMode,
+        adopted,
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',

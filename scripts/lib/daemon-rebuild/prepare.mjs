@@ -241,6 +241,21 @@ export async function prepareRebuild({
   let overlaysBefore = overlayState.overlays;
   let snapshotGeneration = overlayState.generation;
   if (!mainOnly && !overlayState.corrupt) {
+    // A ref-keyed snapshot cannot represent duplicate registrations, even with identical ids.
+    // Refuse before migration so legacy duplicates and their adopted evidence remain untouched
+    // for operator repair. Repeated ticks report the same registry defect, not a writer race.
+    const seenRefs = new Set();
+    const duplicateRefs = new Set();
+    for (const entry of overlaysBefore) {
+      if (typeof entry?.ref !== 'string' || !entry.ref) continue;
+      if (seenRefs.has(entry.ref)) duplicateRefs.add(entry.ref);
+      seenRefs.add(entry.ref);
+    }
+    if (duplicateRefs.size) {
+      const detail = { refs: [...duplicateRefs].sort() };
+      alert('overlay-registration-duplicate', detail);
+      return terminal({ moved: false, reason: 'overlay-registration-duplicate', detail });
+    }
     const migrated = migrateRegistrationIds(root, { env, adopted: state.adopted });
     if (migrated.adopted !== state.adopted) { state.adopted = migrated.adopted; writeState(); }
     for (const detail of migrated.unprovable) alert('overlay-registration-unprovable', detail);
@@ -449,6 +464,7 @@ export async function prepareRebuild({
     plan = unavailablePinned ?? await planRebuild({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
       entries: runtimeEntries, env, closureScopeMode,
+      adopted: state.adopted,
       stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
       prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
     });
