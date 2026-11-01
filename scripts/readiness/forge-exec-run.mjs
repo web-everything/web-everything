@@ -503,15 +503,21 @@ async function procStart(pid) {
   catch(error) {if(error.code!=='ENOENT')return undefined; return filesystem.access('/proc/self/stat').then(()=>null,()=>undefined);}
 }
 async function uidBusy(uid) {
-  for(const entry of await readdir('/proc')) {
-    if(!/^\d+$/.test(entry))continue;
-    try {
-      if((await filesystem.stat('/proc/'+entry)).uid!==uid)continue;
-      const data=(await filesystem.readFile('/proc/'+entry+'/stat')).toString('latin1');
-      if(data.slice(data.lastIndexOf(')')+2,data.lastIndexOf(')')+3)!=='Z')return true;
-    } catch(error) {if(error.code!=='ENOENT')return true;}
+  // A process can fork and exit between listing /proc and reading its entry. Any vanished entry
+  // makes the scan unstable; repeat, and treat a scan that never settles as busy (fail closed).
+  for(let attempt=0;attempt<4;attempt++) {
+    let vanished=false;
+    for(const entry of await readdir('/proc')) {
+      if(!/^\d+$/.test(entry))continue;
+      try {
+        if((await filesystem.stat('/proc/'+entry)).uid!==uid)continue;
+        const data=(await filesystem.readFile('/proc/'+entry+'/stat')).toString('latin1');
+        if(data.slice(data.lastIndexOf(')')+2,data.lastIndexOf(')')+3)!=='Z')return true;
+      } catch(error) {if(error.code!=='ENOENT')return true; vanished=true;}
+    }
+    if(!vanished)return false;
   }
-  return false;
+  return true;
 }
 async function unitActive(unit) {
   const result=await execute('/usr/bin/systemctl',['is-active',unit]);
@@ -643,7 +649,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     await rm(tomb,{recursive:true,force:true});
   }
   // True only on proof the owner is gone: dead pid, reused pid (other start time), or inactive
-  // unit when the pid cannot be read. Without an owner record only age counts (never for slotless).
+  // unit when the pid cannot be read. Without an owner record only age counts.
   async function ownerGone(record,file,{allowAge}) {
     const owner=record.owner;
     if(owner&&Number.isSafeInteger(owner.pid)&&typeof owner.start==='string') {
@@ -663,7 +669,8 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       return await action();
     }finally{await guard.close();}
   }
-  async function readRecord(file) {try{return JSON.parse(await readPinned(file));}catch{return null;}}
+  // null = provably absent (ENOENT); undefined = unreadable or malformed, which is unprovable: keep.
+  async function readRecord(file) {try{return JSON.parse(await readPinned(file));}catch(error){return error.code==='ENOENT'?null:undefined;}}
   async function reapLeaked() {
     const names=await readdir(receipts);
     const found=names.map(n=>/^(r-[a-f0-9]{32})\.(prepared|running)$/.exec(n)).filter(Boolean).map(m=>({run:m[1],phase:m[2],file:join(receipts,m[0])}));
@@ -674,15 +681,16 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     };
     for(const lock of names.filter(n=>/^worker-active(?:-[1-9]\d*)?$/.test(n))) {
       const slotNumber=/^worker-active-([1-9]\d*)$/.exec(lock)?.[1];
-      if(!slotNumber&&!testRoot)continue; // slotless lock exists only in the legacy harness
+      if(!slotNumber)continue; // a slotless lock has no UID to prove its descendants gone: never reaped
       const lockPath=join(receipts,lock);
       const reservation=await readRecord(join(lockPath,'reservation.json'));
+      if(reservation===undefined)continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
       const decide=async()=>{
         if(entries.length>1)return false;
-        if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:!!slotNumber});}
+        if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:true});}
         const age=await lstat(reservation?join(lockPath,'reservation.json'):lockPath).then(st=>clock()-st.mtimeMs,()=>0);
-        return !!slotNumber&&age>=REAP_GRACE_MS;
+        return age>=REAP_GRACE_MS;
       };
       if(!await decide())continue;
       await withWorkerExclusive(lock,async()=>{
@@ -700,11 +708,19 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(taken.has(entry.run))continue;
       const record=await readRecord(entry.file);
       if(!record?.slot)continue;
-      const reservation=await readRecord(join(receipts,writerName(record),'reservation.json'));
-      if(reservation?.run===entry.run)continue;
+      if(!/^forge-exec-[1-9]\d*$/.test(record.slot))continue;
+      const reservationFile=join(receipts,writerName(record),'reservation.json');
+      const reservation=await readRecord(reservationFile);
+      if(reservation===undefined||reservation?.run===entry.run)continue;
       if(!await ownerGone(record,entry.file,{allowAge:true}))continue;
-      await dropRecords(entry.run);
-      await reapLog(`${entry.run}.${entry.phase} slot=${record.slot} reason=no-reservation`);
+      await withWorkerExclusive(writerName(record),async()=>{
+        const again=await readRecord(reservationFile);
+        if(again===undefined||again?.run===entry.run)return;
+        if(await reapProbe.uidBusy((await identity(record.slot)).uid))return;
+        if(!await ownerGone(record,entry.file,{allowAge:true}))return;
+        await dropRecords(entry.run);
+        await reapLog(`${entry.run}.${entry.phase} slot=${record.slot} reason=no-reservation`);
+      }).catch(error=>process.stderr.write('forge-exec-run: reap skipped '+entry.run+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'));
     }
   }
   async function reap() {
