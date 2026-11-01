@@ -14,20 +14,22 @@ import ts from 'typescript';
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 let root; let lane; let salvageRoot;
-beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'lane-card-salvage-'));
-  lane = join(root, 'lane-7');
-  salvageRoot = join(root, 'salvage');
-  mkdirSync(lane);
-  git(['init', '--quiet', '--initial-branch=main'], lane);
-  git(['config', 'user.email', 't@t.com'], lane);
-  git(['config', 'user.name', 't'], lane);
-  mkdirSync(join(lane, 'backlog'));
-  writeFileSync(join(lane, 'backlog', '100-old.md'), 'old\n');
-  git(['add', '.'], lane);
-  git(['commit', '--quiet', '-m', 'seed'], lane);
-});
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+function realGitFixtures() {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'lane-card-salvage-'));
+    lane = join(root, 'lane-7');
+    salvageRoot = join(root, 'salvage');
+    mkdirSync(lane);
+    git(['init', '--quiet', '--initial-branch=main'], lane);
+    git(['config', 'user.email', 't@t.com'], lane);
+    git(['config', 'user.name', 't'], lane);
+    mkdirSync(join(lane, 'backlog'));
+    writeFileSync(join(lane, 'backlog', '100-old.md'), 'old\n');
+    git(['add', '.'], lane);
+    git(['commit', '--quiet', '-m', 'seed'], lane);
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+}
 
 /** The live 2026-11-01 lane-82 shape: a staged raised-by file plus an untracked prevention card. */
 function leaveCards() {
@@ -56,7 +58,67 @@ describe('planLaneCardDirt — PURE', () => {
   });
 });
 
+describe('unstaging failures — injected Git, real file retirement', () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'lane-card-unstage-'));
+    lane = join(root, 'lane');
+    salvageRoot = join(root, 'salvage');
+    mkdirSync(join(lane, 'backlog', 'raised-by', '5360'), { recursive: true });
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it.each(['filed', 'salvage'])('failed unstaging remains a release-blocking failure on every retry (%s)', mode => {
+    const rel = 'backlog/raised-by/5360/5771-abc.md';
+    writeFileSync(join(lane, rel), 'admitted bytes\n');
+    const gitRun = (_dir, args) => {
+      if (args[0] === 'status') return `${existsSync(join(lane, rel)) ? 'A ' : 'AD'} ${rel}\n`;
+      if (args[0] === 'rev-parse') return 'main';
+      if (args[0] === 'rm') throw new Error('index.lock exists');
+      throw new Error(`unexpected git command: ${args[0]}`);
+    };
+    const options = { dir: lane, lane: 7, salvageRoot, gitRun, isLeaseCurrent: () => true };
+    let cleanupError; let result;
+    try {
+      result = mode === 'filed'
+        ? removeFiledCards({ ...options, expected: new Map([[rel, 'admitted bytes\n']]) })
+        : salvageLaneCards(options);
+    } catch (error) { cleanupError = error; }
+    expect(existsSync(join(lane, rel))).toBe(false);
+    const retiredDir = mode === 'filed' ? join(salvageRoot, 'web-everything', 'retired-cards') : join(result.outDir, 'retired');
+    const [retired] = readdirSync(retiredDir);
+    expect(readFileSync(join(retiredDir, retired), 'utf8')).toBe('admitted bytes\n');
+    // Both the filer's subsequent salvage and the release backstop must retain the lease.
+    for (let retry = 0; retry < 2; retry++) {
+      expect(salvageLaneCards(options)).toMatchObject({ status: 'failed', reason: expect.stringContaining('staged card deletion') });
+    }
+    if (mode === 'filed') expect(cleanupError?.message).toContain('index.lock exists');
+    else expect(result.status).toBe('failed');
+  });
+
+  it.each(['', '?? backlog/xother-card.md\n', ' M scripts/other.mjs\n'])('an existing AD card blocks release even with other dirt (%j)', other => {
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true,
+      gitRun: (_dir, args) => {
+        expect(args[0]).toBe('status');
+        return `AD backlog/raised-by/5360/5771-abc.md\n${other}`;
+      },
+    });
+    expect(result).toMatchObject({ status: 'failed', reason: expect.stringContaining('staged card deletion'), removed: [] });
+    expect(existsSync(salvageRoot)).toBe(false);
+  });
+
+  it('a quoted AD card also blocks release without attempting any mutation', () => {
+    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true,
+      gitRun: (_dir, args) => {
+        expect(args[0]).toBe('status');
+        return 'AD "backlog/raised-by/5360/quoted\\tcard.md"\n';
+      },
+    }).status).toBe('failed');
+    expect(existsSync(salvageRoot)).toBe(false);
+  });
+});
+
 describe('salvageLaneCards — real git', () => {
+  realGitFixtures();
   it.each([salvageLaneCards, removeFiledCards])('requires an explicit ownership predicate before any git IO (%s)', cleanup => {
     let calls = 0;
     expect(() => cleanup({ dir: lane, lane: 7, salvageRoot, gitRun: () => { calls++; return ''; } })).toThrow('requires isLeaseCurrent');
@@ -285,21 +347,22 @@ describe('salvageLaneCards — real git', () => {
 });
 
 describe('removeFiledCards', () => {
+  realGitFixtures();
   it.each(['before-retirement', 'after-retirement'])('lost ownership %s preserves the staged index', boundary => {
     const rel = 'backlog/xlease3-filed.md';
     writeFileSync(join(lane, rel), 'card\n');
     git(['add', '--', rel], lane);
     const beforeIndex = readFileSync(join(lane, '.git', 'index'));
     const retiredDir = join(salvageRoot, 'web-everything', 'retired-cards');
-    const removed = removeFiledCards({ dir: lane, salvageRoot, expected: new Map([[rel, 'card\n']]),
+    const cleanup = () => removeFiledCards({ dir: lane, salvageRoot, expected: new Map([[rel, 'card\n']]),
       isLeaseCurrent: () => boundary === 'before-retirement' ? !existsSync(retiredDir) : existsSync(join(lane, rel)),
     });
+    if (boundary === 'before-retirement') expect(cleanup()).toEqual([]);
+    else expect(cleanup).toThrow('lease changed before unstaging cards');
     expect(readFileSync(join(lane, '.git', 'index'))).toEqual(beforeIndex);
     if (boundary === 'before-retirement') {
-      expect(removed).toEqual([]);
       expect(readFileSync(join(lane, rel), 'utf8')).toBe('card\n');
     } else {
-      expect(removed).toEqual([rel]);
       const [name] = readdirSync(retiredDir);
       expect(readFileSync(join(retiredDir, name), 'utf8')).toBe('card\n');
     }

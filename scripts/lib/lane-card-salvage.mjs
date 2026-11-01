@@ -37,6 +37,7 @@ export function isCardFilePath(path) {
 }
 
 // `AM` (staged, then edited) is NOT a card here: its index bytes differ from the file, so it is left for a human.
+// `AD` is an incomplete cleanup (or a manually deleted staged addition), never an absent/clean card.
 const CARD_STATUSES = new Set(['??', 'A ']);
 
 /** Allowlisted litter, or a file inside an allowlisted litter directory (`-uall` lists `tmp/x`, not `tmp/`). */
@@ -54,7 +55,9 @@ export function planLaneCardDirt(porcelain) {
   for (const line of String(porcelain || '').split('\n').filter(Boolean)) {
     const status = line.slice(0, 2);
     const path = line.slice(3);
-    if (CARD_STATUSES.has(status) && !path.startsWith('"') && isCardFilePath(path)) cards.push({ status, path });
+    // Quoted AD paths only need classification: they are never passed to filesystem or index mutations.
+    if (status === 'AD' && isCardFilePath(path.startsWith('"') ? path.slice(1, -1) : path)) cards.push({ status, path });
+    else if (CARD_STATUSES.has(status) && !path.startsWith('"') && isCardFilePath(path)) cards.push({ status, path });
     else if (status === '??' && isLitter(path)) litter.push(path);
     else other.push(path);
   }
@@ -95,6 +98,10 @@ export function salvageLaneCards({
   catch { return { status: 'failed', reason: 'lease ownership unreadable; lane untouched', removed: [] }; }
   try { porcelain = gitRun(dir, ['status', '--porcelain', '--untracked-files=all']); plan = planLaneCardDirt(porcelain); }
   catch (e) { return { status: 'unknown', reason: `status read failed: ${String(e?.message || e).split('\n')[0]}`, removed: [] }; }
+  const pending = plan.cards.filter(({ status }) => status === 'AD');
+  // A previous retirement may have succeeded while unstaging failed or the process died. Keep the lease even
+  // with mixed dirt; neither missing working files nor a later retry prove the index cleanup completed.
+  if (pending.length) return { status: 'failed', reason: `staged card deletion needs recovery: ${pending.map(({ path }) => path).join(', ')}; inspect the saved copies and index, resolve the staged deletion, then retry release`, removed: [] };
   if (!plan.cards.length) return { status: 'none', removed: [] };
   if (!plan.cardOnly) return { status: 'mixed', other: plan.other, removed: [] };
   const stamp = `${salvageStamp(now)}-cards-lane-${lane}`;
@@ -175,7 +182,8 @@ function unstage(dir, cards, removed, gitRun, isLeaseCurrent) {
  * Remove ONE filing's own card files from a lane after the cards are durable elsewhere (pushed in a PR, admitted
  * to a batch, or spooled for the next batch window). `expected` maps each path to the exact text the filer handed
  * on; a file whose bytes differ now is left for the salvage pass. Requires an explicit ownership predicate
- * (missing predicates throw before IO); otherwise returns the removed paths without throwing.
+ * (missing predicates throw before IO). Returns removed paths only after unstaging succeeds; an unstaging
+ * failure throws so the caller reports incomplete cleanup. The AD entries also block the release backstop.
  */
 export function removeFiledCards({ dir, expected, pool = 'web-everything', salvageRoot = resolveSalvageRoot(), gitRun = git, isLeaseCurrent }) {
   if (typeof isLeaseCurrent !== 'function') throw new TypeError('removeFiledCards requires isLeaseCurrent');
@@ -191,6 +199,6 @@ export function removeFiledCards({ dir, expected, pool = 'web-everything', salva
   try {
     for (const { path } of mine) if (retireIfUnchanged(dir, path, Buffer.from(wanted.get(path), 'utf8'), join(salvageRoot, pool, 'retired-cards'), isLeaseCurrent)) removed.push(path);
   } catch { /* the salvage pass that follows saves whatever is left */ }
-  try { unstage(dir, mine, removed, gitRun, isLeaseCurrent); } catch { /* ditto */ }
+  unstage(dir, mine, removed, gitRun, isLeaseCurrent);
   return removed;
 }

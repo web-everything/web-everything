@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSyn
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { refreshSalvageIndex } from '../lib/salvage-index.mjs';
+import { removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
 
@@ -205,6 +206,49 @@ syncBuiltinESMExports();\n`);
     writeFileSync(join(dir, 'backlog', 'raised-by', '5360', '5771-abc.md'), 'raise\n');
     git(['add', '--', 'backlog/raised-by/5360/5771-abc.md'], dir);
   }
+
+  it.each(['filed', 'salvage'])('failed unstaging keeps the exact lease on release and retry (%s)', mode => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    const rel = 'backlog/raised-by/5360/5771-abc.md';
+    mkdirSync(join(dir, 'backlog', 'raised-by', '5360'), { recursive: true });
+    writeFileSync(join(dir, rel), 'admitted card\n');
+    git(['add', '--', rel], dir);
+    const leasePath = join(dir, '.git', '.lane-lease');
+    const leaseBytes = readFileSync(leasePath);
+    const indexBytes = readFileSync(join(dir, '.git', 'index'));
+    const lock = join(dir, '.git', 'index.lock');
+    writeFileSync(lock, 'busy');
+    const options = { dir, lane, salvageRoot: join(base, 'salvage'), pool: 'litterpool', isLeaseCurrent: () => true };
+    let retiredDir;
+    if (mode === 'filed') {
+      expect(() => removeFiledCards({ ...options, expected: new Map([[rel, 'admitted card\n']]) })).toThrow();
+      retiredDir = join(base, 'salvage', 'litterpool', 'retired-cards');
+    } else {
+      const result = salvageLaneCards(options);
+      expect(result.status).toBe('failed');
+      retiredDir = join(result.outDir, 'retired');
+    }
+    const [retired] = readdirSync(retiredDir);
+    expect(readFileSync(join(retiredDir, retired), 'utf8')).toBe('admitted card\n');
+    for (const locked of [true, false]) {
+      if (!locked) rmSync(lock);
+      const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+      expect(release.code).toBe(0);
+      expect(JSON.parse(release.out).released).toBe(0);
+      expect(release.out + release.err).toContain('staged card deletion needs recovery');
+      expect(readFileSync(leasePath)).toEqual(leaseBytes);
+      expect(readFileSync(join(dir, '.git', 'index'))).toEqual(indexBytes);
+      expect(git(['status', '--porcelain'], dir)).toBe(`AD ${rel}`);
+    }
+    // Operator recovery after checking saved bytes: resolve the pending deletion, then retry release.
+    git(['rm', '--cached', '--quiet', '--', rel], dir);
+    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    expect(JSON.parse(release.out).released).toBe(1);
+    expect(existsSync(leasePath)).toBe(false);
+    expect(git(['status', '--porcelain'], dir)).toBe('');
+    expect(readFileSync(join(retiredDir, retired), 'utf8')).toBe('admitted card\n');
+  });
 
   it('card-only dirt: the cards are saved byte for byte and the released lane reads clean', () => {
     const { lane } = acquireOneLane();

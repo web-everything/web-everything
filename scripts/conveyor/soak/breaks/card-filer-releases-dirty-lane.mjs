@@ -11,7 +11,8 @@
  * and then times out (the forced error path). Also releases a clean lane whose status read fails: unknown dirt
  * must not become a known card-save failure that strands its lease. A replaced lease during filing must keep
  * the replacement holder's untracked cards, staged index and lease, including a same-session reacquisition.
- * GREEN = clean, card saved, unknown released, replacement holder untouched.
+ * An index lock after batch admission must retain the lease when retirement leaves a staged deletion.
+ * GREEN = clean, card saved, unknown released, replacement holder untouched, incomplete unstaging held.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -123,6 +124,42 @@ export default {
         rmSync(join(replacementLane, otherCard), { force: true });
         cli(['release', `--lane=${replacementNumber}`, `--session=${session}-replacement`]);
       }
+      let lockedLane; let lockedNumber; let lockedLease; let lockedIndex;
+      const lockedExec = (cmd, args) => {
+        if (cmd === 'node' && /lane-pool\.mjs$/.test(args[0])) {
+          const out = cli(args[1] === 'acquire' ? [...args.slice(1), '--no-reset'] : args.slice(1));
+          if (args[1] === 'acquire') {
+            const acquired = JSON.parse(out);
+            lockedLane = acquired.path;
+            lockedNumber = acquired.lane;
+            lockedLease = readFileSync(join(lockedLane, '.git', '.lane-lease'));
+          }
+          return out;
+        }
+        if (cmd === 'node' && args.includes('file-item')) {
+          writeFileSync(join(lockedLane, CARD), 'admitted before index lock\n');
+          git(['add', '--', CARD], lockedLane);
+          lockedIndex = readFileSync(join(lockedLane, '.git', 'index'));
+          return JSON.stringify({ verdict: { rel: CARD } });
+        }
+        throw new Error(`unexpected exec ${cmd} ${args.join(' ')}`);
+      };
+      const lockedResult = await landPreventionCard({ title: 't', kind: 'story', size: '1', digest: '1. x', scope: 'we:a.mjs', parent: '', queue: 'false', session: 'soak-index-lock' },
+        { exec: lockedExec, write: () => {}, dedupe: () => null, pendingDir: join(base, 'pending'),
+          batch: async () => {
+            writeFileSync(join(lockedLane, '.git', 'index.lock'), 'busy');
+            return { batched: true, batchRef: 'lane/soak-card-batch' };
+          } });
+      if (lockedResult.step !== 'batched' || git(['status', '--porcelain'], lockedLane) !== `AD ${CARD}`
+        || !readFileSync(join(lockedLane, '.git', 'index')).equals(lockedIndex)
+        || !existsSync(join(lockedLane, '.git', '.lane-lease'))
+        || !readFileSync(join(lockedLane, '.git', '.lane-lease')).equals(lockedLease)) {
+        violations.push({ invariant: 'unstaging-failure-keeps-lease', detail: 'batch cleanup with index.lock must preserve the lease and staged index' });
+      }
+      // Resolve this fixture's pending deletion only after checking the retained state.
+      rmSync(join(lockedLane, '.git', 'index.lock'));
+      git(['rm', '--cached', '--quiet', '--', CARD], lockedLane);
+      cli(['release', `--lane=${lockedNumber}`, '--session=soak-index-lock']);
       const unknown = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-unknown', '--json']));
       const hook = join(base, 'unreadable-status.mjs');
       writeFileSync(hook, `import cp from 'node:child_process';
