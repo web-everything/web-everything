@@ -72,7 +72,7 @@ Screen: clear - gate key is a merit call (replayable vs gameable), no WE<->FUI b
 | Option | Description | Verdict |
 |---|---|---|
 | (a) | Per PR number only. | Excluded: a split or re-open resets the evidence. |
-| **(b) default** | Per lineage, detected mechanically and also by a declared link (split from, supersedes, shared parent card). Successors inherit the families already counted. | Closes the reset loophole without trusting the author to declare it. A false overlap could merge two unrelated PRs, which the visible hold makes cheap to undo. |
+| **(b) default** | Per lineage: the count follows the work across a split or resubmission, and successors inherit the families already counted. | Closes the reset loophole without trusting the author to declare it. A false overlap could merge two unrelated PRs, which the visible hold makes cheap to undo. |
 | (c) | Per linked card only. | Excluded: PRs with no card (the #6033 shape) would never be counted; the sibling card on prepared-card gating closes that gap separately. |
 
 **Default: (b).** The replay does not prove this fork. The lineage rule is justified by the split mechanism (#5964 became #6033), not by the replay.
@@ -85,8 +85,8 @@ Screen: clear - a split resetting the evidence is a merit difference visible in 
 
 | Option | Description | Verdict |
 |---|---|---|
-| (a) | An operator round grant clears it. | Excluded: the status quo. |
-| **(b) default** | A design card linked to the PR, whose scope covers the PR's changed files and meets the same width limit as the sibling prepared-card card (`x9syioh`, Fork 2), prepared through the normal `/prepare` flow (so its skeptic and screen are separate agents, not the PR author's builder), and stamped after the stop, opens a new window and resets the count. A second stop in the same lineage stays held until another such card exists. There is no override. | Forces the missing design step, keeps independent validation, and blocks a thin card from buying unlimited windows. Slower for a PR whose families share one cause; acceptable, the hold is a ticket not a rejection. |
+| (a) | An operator round grant clears it. | Excluded: a grant closes no design gap, so the stop would collapse into the existing cap and #6033 would repeat. |
+| **(b) default** | An independently prepared design card that covers the PR's changed files opens a new window and resets the count. A second stop in the same lineage stays held until another such card exists. There is no override. | Forces the missing design step and keeps independent validation (the card's skeptic and screen are separate agents, not the PR author's builder). A thin card cannot buy unlimited windows. |
 | (c) | Auto-clear after N days. | Excluded: turns a design stop into a timer. |
 
 **Default: (b).**

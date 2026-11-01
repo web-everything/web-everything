@@ -38,7 +38,8 @@ Build child of xtv879w. Policy, forks and defaults live there; this card holds m
 
 - Add a pure family counter beside `parseRedTeamComment` in we:scripts/lib/red-team-gate.mjs: key = category normalized to a closed vocabulary plus file path without line, over confirmed `broken`/`degraded` findings, lineage-wide, per the parent defaults.
 - Setting `redTeam.breakFamilyStop.threshold` (default 3) and `mode` of `report-only | enforce` (start `report-only`, flip after one clean week).
-- At the threshold in enforce mode the round-grant step refuses further fix rounds and routes the PR to the `/prepare` hold ("needs-design") through the existing hold-routing path. An `extend-rounds` grant does not lift it. A linked, scope-covering card stamped after the stop (commit order) opens a new window; a second stop goes to the operator.
+- At the threshold in enforce mode the round-grant step refuses further fix rounds and routes the PR to the `/prepare` hold ("needs-design") through the existing hold-routing path. An `extend-rounds` grant does not lift it. A linked, scope-covering card stamped after the stop (commit order), meeting the same width limit as `xnzadym` (scope depth and entry count), opens a new window; a second stop goes to the operator.
 - Freeze the #5964/#6033 advisory results as a scrubbed fixture with each PR's own round labels; exclude C10 to C12 (not advisory-sourced). Record actual per-round counts in the PR; if they disagree with #7582, report it and do not tune the key.
+- Lineage is detected mechanically and also by a declared link (split from, supersedes, shared parent card).
 - Report an advisory when a lineage keeps producing unconfirmed or unverifiable findings.
 - Prototype-first: register the branch through the overlay loader; the daemon rebuild smoke is the gate. Codex read-only audit must say NOT WEAKENED.

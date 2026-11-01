@@ -36,7 +36,7 @@ Build child of x9syioh. Policy, forks and defaults live there; this card holds m
 
 ## Mechanics
 
-- New pure module we:scripts/lib/prepared-card-gate.mjs: `(careBand, card, files, now) -> allow | refuse(reason)`, reusing the existing freshness rule (`preparedMaxAgeDays`, `preparedAgainstSha`) and a prefix-covering scope check; reject card scopes that are a whole top-level directory or the repo.
+- New pure module we:scripts/lib/prepared-card-gate.mjs: `(careBand, card, files, now) -> allow | refuse(reason)`, reusing the existing freshness rule (`preparedMaxAgeDays`, `preparedAgainstSha`) and a prefix-covering scope check; reject card scopes that are too wide: no entry shallower than a third-level directory (`scripts/` and `scripts/lib/` too wide, a leaf like `scripts/lib/daemon-rebuild/` allowed) and at most 10 entries (rationale: #6033 touched 83 files across a few directories; constants tunable here without a new ruling).
 - Care estimator from declared files: daemon, gate, guard, statute or human-required paths are elevated or higher; no files declared is elevated and refuses with a request for files.
 - `worker-brief` gains `--card=<id>` and refuses when the rule refuses. `build-dispatch` calls the same rule and does not count `operatorTask` stamps as prepared at elevated or high.
 - Rulings and design notes are recorded as a card's origin field, never accepted as the link.

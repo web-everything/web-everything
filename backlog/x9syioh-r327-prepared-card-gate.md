@@ -54,7 +54,7 @@ Builds at elevated or high care (daemons, gates, guards) need a linked card with
 | Option | Description | Verdict |
 |---|---|---|
 | (a) | Yes, a filing-time stamp is enough everywhere. | Excluded at elevated and high. |
-| **(b) default** | No at elevated and high: they need a full `/prepare`. At low and none the existing stamp still works. | Keeps the fast path for small work. Slows small elevated tasks by one prepare. |
+| **(b) default** | No at elevated and high: they need a full `/prepare`. At low and none the existing stamp still works. | Keeps the fast path for small work. None on merit. |
 
 **Default: (b).**
 Skeptic: SURVIVES-WITH-AMENDMENT - 'briefed is not prepared' beat the stamp-is-enough attack; amended to cite the sections the stamp does and does not require and that the flag is author-writable front matter.
@@ -67,7 +67,7 @@ Screen: clear - rigor of preparation vs speed is a merit/correctness call.
 | Option | Description | Verdict |
 |---|---|---|
 | (a) | Any prepared card id on the brief. | Excluded. |
-| **(b) default** | The card's scope must cover every file the work touches, and must be narrow: no entry shallower than a third-level directory (so `scripts/` and `scripts/lib/` are too wide, a leaf directory like `scripts/lib/daemon-rebuild/` is allowed), and at most 10 entries. Why these numbers: #6033 touched 83 files across a few directories, and a leaf directory is the smallest unit a design can plausibly own; the exact constants are tunable by the child without a new ruling. A ruling or design note is recorded as the card's origin, never accepted as the link itself. | Ties permission to the actual files. A legitimately broad refactor must be sliced into narrower cards, which is the point. |
+| **(b) default** | The card's scope must cover every file the work touches and must be bounded and narrow, so no broad scope can unlock unrelated work. A ruling or design note is recorded as the card's origin, never accepted as the link itself. | Ties permission to the actual files, and a design owns a bounded surface. |
 
 **Default: (b).**
 Skeptic: SURVIVES-WITH-AMENDMENT - file-covering links beat the name-only attack; amended with a depth and entry-count width limit and normalized paths.
