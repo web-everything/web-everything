@@ -80,10 +80,16 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
    If the verdict is UNKNOWN (exit 2: a PR list was cut off or unreadable), the scope is NOT proven free: stop and report it. Do not start.
-2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList}\`.
+2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList} --heartbeat\`.
    If register exits non-zero (the scope is occupied or the registry refused), stop and report; do not edit anything.
-   The \`--owner\` token is yours alone: if register refuses because the name is held by a different owner, another live worker
+   The \`--owner\` token \`${owner}\` was generated once for you: reuse exactly this token in every register, heartbeat, recheck
+   and release below; never mint a new one. If register refuses because the name is held by a different owner, another live worker
    shares your slug. Stop and report; never release or overwrite their entry.
+   **Heartbeat.** \`--heartbeat\` makes the reservation go stale about 45 minutes after the owner was last seen, so a killed worker
+   does not block its own restart. To keep the reservation alive, re-run this owner-tokened check at least every ~20 minutes of
+   work (for example after each Codex round, after each narrow-test round, and before verify):
+   \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
+   Each run refreshes your \`lastSeenAt\`. If it reports OCCUPIED or UNKNOWN (exit 2), stop and report.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
    Base the lane on origin/main (what acquire gives you). Do not base it on another open PR.

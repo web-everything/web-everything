@@ -59,7 +59,7 @@ describe('renderWorkerBrief', () => {
     for (const text of [
       '- we:scripts/x.mjs', '- plateau-app:src/y.ts',
       `free-scope-cli.mjs check --files=${files}`,
-      `register --agent=fix-widget --owner=tok12345 --purpose="fix-widget" --files=${files}`,
+      `register --agent=fix-widget --owner=tok12345 --purpose="fix-widget" --files=${files} --heartbeat`,
       'free-scope-cli.mjs release --agent=fix-widget --owner=tok12345',
       'lane-pool.mjs acquire --purpose=fix-widget --adopt',
       'lane-pool.mjs release --lane=<N> --session=<holder slug it printed>',
@@ -175,9 +175,25 @@ describe('per-dispatch owner token', () => {
     const token = (brief) => /--owner=(\S+) --purpose/.exec(brief)[1];
     expect(token(renderWorkerBrief(rest))).not.toBe(token(renderWorkerBrief(rest)));
     expect(() => renderWorkerBrief({ ...rest, owner: 'bad token' })).toThrow('--owner');
-    // the same token is used to register, release and exclude yourself at the pre-push recheck
+    // the same token is used to register, heartbeat, release and exclude yourself at the pre-push recheck
     const brief = renderWorkerBrief({ ...rest, owner: 'abc123' });
-    expect(brief.match(/--(?:exclude-)?owner=abc123/g)).toHaveLength(3);
+    expect(brief.match(/--(?:exclude-)?owner=abc123/g)).toHaveLength(4);
+  });
+
+  it('registers with --heartbeat and tells the worker to heartbeat with the same token every ~20 minutes', () => {
+    const brief = renderWorkerBrief(params);
+    const step2 = brief.slice(brief.indexOf('2. **Register'), brief.indexOf('3. **Lane'));
+    expect(step2).toMatch(/register --agent=fix-widget --owner=tok12345 [^`]*--heartbeat`/);
+    expect(step2).toContain('reuse exactly this token');
+    expect(step2).toContain('keep the reservation alive');
+    expect(step2).toContain('every ~20 minutes');
+    for (const moment of ['after each Codex round', 'after each narrow-test round', 'before verify']) expect(step2).toContain(moment);
+    expect(step2).toContain(`check --files=${files} --exclude-agent=fix-widget --exclude-owner=tok12345`);
+    expect(step2).toContain('lastSeenAt');
+    expect(step2).toMatch(/OCCUPIED or UNKNOWN \(exit 2\), stop and report/);
+    // the pre-push recheck and the release stay
+    expect(brief).toContain('7. **Pre-push recheck.**');
+    expect(step2).toContain('free-scope-cli.mjs release --agent=fix-widget --owner=tok12345');
   });
 });
 
