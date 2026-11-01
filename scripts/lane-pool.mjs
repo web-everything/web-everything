@@ -2349,6 +2349,9 @@ async function cmdAcquire(repo) {
       }
       fail(`lane-${n} is ${describeLease(lease) || 'held'} — pick another lane`);
     }
+    // The lane is claimed. Repair missing alternates NOW, before any dirty/ahead refusal below: it only adds a file, so it is
+    // safe on a dirty lane, and a lane that is refused for its work still stops re-downloading the repository.
+    ensureAlternatesFor(repo, n);
     // #3390 — the explicit-lane path is the ONLY claim route that reaches the destructive reset below with no
     // #2267 dirty/ahead check at all: auto-pick's own candidate source (`isLaneAcquirable`, via the cached
     // scan) never selects a dirty/ahead candidate to begin with, and `refreshLane` calls `laneDirtyOrAhead`
