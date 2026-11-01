@@ -246,30 +246,30 @@ describe('identity and harness hash', () => {
 
 describe('Fork 3: Forge routing with Mac fallback', () => {
   const tree = 'a'.repeat(40);
-  const line = (body) => `noise\n${FORGE_SMOKE_MARKER}${JSON.stringify(body)}\n`;
+  const line = (body) => `noise\n${FORGE_SMOKE_MARKER}${JSON.stringify({ node: 'v1', harness: 'h', ...body })}\n`;
   const rows = [{ name: 'dispatch-dry-run', ok: true, ms: 5, detail: 'ok', closureHash: 'd'.repeat(64) }];
   const allowedChecks = SHAREABLE_CHECK_NAMES;
   it('accepts a passing row for the exact tree', () => {
-    const r = parseForgeSmokeOutput(line({ tree, rows }), { expectedTree: tree, allowedChecks });
+    const r = parseForgeSmokeOutput(line({ tree, rows }), { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' });
     expect(r.ran).toBe(true);
     expect(Object.keys(r.rows)).toEqual(['dispatch-dry-run']);
   });
   it('rejects a tree mismatch, missing/duplicate markers, oversize, non-JSON, failing and unexpected rows', () => {
-    expect(parseForgeSmokeOutput(line({ tree: 'b'.repeat(40), rows }), { expectedTree: tree, allowedChecks })).toEqual({ ran: false, reason: 'tree-mismatch' });
-    expect(parseForgeSmokeOutput('nothing', { expectedTree: tree, allowedChecks }).ran).toBe(false);
-    expect(parseForgeSmokeOutput(line({ tree, rows }) + line({ tree, rows }), { expectedTree: tree, allowedChecks }).ran).toBe(false);
-    expect(parseForgeSmokeOutput('x'.repeat(70_000), { expectedTree: tree, allowedChecks }).ran).toBe(false);
-    expect(parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}{nope`, { expectedTree: tree, allowedChecks }).ran).toBe(false);
-    const bad = parseForgeSmokeOutput(line({ tree, rows: [{ name: 'dispatch-dry-run', ok: false }, { name: 'gh-pr-list', ok: true }, { name: '../x', ok: true }] }), { expectedTree: tree, allowedChecks });
+    expect(parseForgeSmokeOutput(line({ tree: 'b'.repeat(40), rows }), { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' })).toEqual({ ran: false, reason: 'tree-mismatch' });
+    expect(parseForgeSmokeOutput('nothing', { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' }).ran).toBe(false);
+    expect(parseForgeSmokeOutput(line({ tree, rows }) + line({ tree, rows }), { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' }).ran).toBe(false);
+    expect(parseForgeSmokeOutput('x'.repeat(70_000), { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' }).ran).toBe(false);
+    expect(parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}{nope`, { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' }).ran).toBe(false);
+    const bad = parseForgeSmokeOutput(line({ tree, rows: [{ name: 'dispatch-dry-run', ok: false }, { name: 'gh-pr-list', ok: true }, { name: '../x', ok: true }] }), { expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h' });
     expect(bad.ran).toBe(false);
   });
   it('falls back (ran:false) when Forge is not ready, unconfigured, errors, or returns a wrong tree', async () => {
     const decide = (remote, reason) => async () => ({ remote, reason });
-    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, exec: async () => '', decide: decide(false, 'forge-busy') }))).toEqual({ ran: false, reason: 'forge-busy' });
-    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, decide: decide(true) }))).toEqual({ ran: false, reason: 'forge-smoke-executor-unconfigured' });
-    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, exec: async () => { throw new Error('transport'); }, decide: decide(true) })).ran).toBe(false);
-    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, exec: async () => line({ tree: 'c'.repeat(40), rows }), decide: decide(true) })).reason).toBe('tree-mismatch');
-    const ok = await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, exec: async () => line({ tree, rows }), decide: decide(true) });
+    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h', exec: async () => '', decide: decide(false, 'forge-busy') }))).toEqual({ ran: false, reason: 'forge-busy' });
+    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h', decide: decide(true) }))).toEqual({ ran: false, reason: 'forge-smoke-executor-unconfigured' });
+    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h', exec: async () => { throw new Error('transport'); }, decide: decide(true) })).ran).toBe(false);
+    expect((await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h', exec: async () => line({ tree: 'c'.repeat(40), rows }), decide: decide(true) })).reason).toBe('tree-mismatch');
+    const ok = await runSmokeCodeChecksOnForge({ cwd: '.', expectedTree: tree, allowedChecks, expectedNode: 'v1', expectedHarness: 'h', exec: async () => line({ tree, rows }), decide: decide(true) });
     expect(ok.ran).toBe(true);
   });
   it('runLiveSmoke takes a verified passing Forge row instead of running the check, and never takes a failing one', async () => {
@@ -296,7 +296,7 @@ describe('audit findings (xfwf4zc)', () => {
   it('Forge output with any failing, skipped, duplicate or unexpected row is void as a whole', () => {
     const tree = 'a'.repeat(40);
     const good = { name: 'dispatch-dry-run', ok: true, ms: 1, detail: 'ok' };
-    const parse = (rows) => parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}${JSON.stringify({ tree, rows })}`, { expectedTree: tree, allowedChecks: SHAREABLE_CHECK_NAMES });
+    const parse = (rows) => parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}${JSON.stringify({ tree, node: 'v1', harness: 'h', rows })}`, { expectedTree: tree, allowedChecks: SHAREABLE_CHECK_NAMES, expectedNode: 'v1', expectedHarness: 'h' });
     expect(parse([good]).ran).toBe(true);
     for (const extra of [{ name: 'reconcile-dry-run', ok: false }, { ...good, skipped: true }, good, { name: 'gh-pr-list', ok: true }]) {
       expect(parse([good, extra]).ran, JSON.stringify(extra)).toBe(false);
@@ -344,6 +344,25 @@ describe('audit findings (xfwf4zc)', () => {
     expect(none.sharedKey).toBeNull();
     expect(none.relevanceKey).toBeNull();
     expect(none.key).toBe(base.key); // the local per-clone key is unchanged by the environment
+  });
+  it('Forge output must match the Mac runtime and harness; Forge rows and unlisted env knobs are never durable', () => {
+    const tree = 'a'.repeat(40);
+    const rows = [{ name: 'dispatch-dry-run', ok: true }];
+    const parse = (extra, o = {}) => parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}${JSON.stringify({ tree, node: 'v1', harness: 'h', rows, ...extra })}`,
+      { expectedTree: tree, allowedChecks: SHAREABLE_CHECK_NAMES, expectedNode: 'v1', expectedHarness: 'h', ...o });
+    expect(parse({}).ran).toBe(true);
+    expect(parse({ node: 'v2' })).toEqual({ ran: false, reason: 'runtime-mismatch' });
+    expect(parse({ harness: 'x' })).toEqual({ ran: false, reason: 'runtime-mismatch' });
+    expect(parse({}, { expectedHarness: undefined })).toEqual({ ran: false, reason: 'runtime-mismatch' });
+    const all = SMOKE_CHECKS.map((c) => ({ name: c.name, ok: true, ...(c.name === 'dispatch-dry-run' ? { ranOn: 'forge' } : {}) }));
+    expect(completeSmokePass({ verdict: 'pass', smoke: { results: all } })).toBe(false);
+    const env = { WE_DAEMON_STATE_DIR: mk() };
+    writeClosureProofs([{ name: 'dispatch-dry-run', ok: true, ranOn: 'forge', closureHash: 'a'.repeat(64) }], { identity: { tree, relevanceKey: 'e'.repeat(64) }, env });
+    expect(makeRelevanceProof({ identity: { tree, relevanceKey: 'e'.repeat(64) }, git: () => ({ status: 0, stdout: '' }), env })('dispatch-dry-run', 'a'.repeat(64))).toBe(false);
+    const g = (args) => (args[0] === 'rev-parse' ? { status: 0, stdout: `${tree}\n` } : args[0] === 'show' ? { status: 0, stdout: 'L' } : { status: 1, stdout: '' });
+    const id = (e) => smokePassIdentity(g, 'sha', 'drain', { harnessHash: 'h1', smokeEnv: { ...SENV, ...e } });
+    expect(id({ WE_SMOKE_DISPATCH_PASSES: '1' }).relevanceKey).not.toBe(id({ WE_SMOKE_DISPATCH_PASSES: '0' }).relevanceKey);
+    expect(id({ UNRELATED_VAR: '1' }).relevanceKey).toBe(id({}).relevanceKey);
   });
 });
 

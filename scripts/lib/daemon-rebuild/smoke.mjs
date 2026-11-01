@@ -91,6 +91,7 @@ export function completeSmokePass(result, { relevanceProof = null } = {}) {
       const own = rows.filter(row => row?.name === check.name);
       if (own.length !== 1 || own[0].ok !== true) return false;
       const row = own[0];
+      if (row.ranOn === 'forge') return false; // Forge evidence passes this build's gate but is never durable
       if (!row.skipped && !row.skipReason) return true;
       return check.shareable === true && row.skipped === true && row.skipReason === 'relevance'
         && typeof relevanceProof === 'function' && relevanceProof(check.name, row.closureHash) === true;
@@ -152,7 +153,7 @@ export function writeSharedVerdict(identity, { env = process.env, now = Date.now
 export function writeClosureProofs(rows, { identity = null, env = process.env, now = Date.now } = {}) {
   if (!validRelevanceIdentity(identity)) return;
   for (const row of rows || []) {
-    if (!row || row.ok !== true || row.skipped || row.skipReason || !SHAREABLE_CHECK_NAMES.includes(row.name)
+    if (!row || row.ok !== true || row.skipped || row.skipReason || row.ranOn || !SHAREABLE_CHECK_NAMES.includes(row.name)
       || !/^[0-9a-f]{64}$/.test(String(row.closureHash))) continue;
     writeStoreRecord(closureProofPath(row.name, row.closureHash, identity.relevanceKey, env), { v: 3, kind: 'closure-pass', name: row.name,
       relevanceKey: identity.relevanceKey, tree: identity.tree,
@@ -198,8 +199,10 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon', { harnessHash 
     // The dry-runs consume the live clone's pool root / dispatch root / origin (candidateSmokeEnv): a verdict or proof
     // from another clone environment, or another daemon kind, is not evidence for this one. No env -> no binding
     // possible -> no shared identity (the local `key` is per clone already).
-    const envBinding = smokeEnv ? sha256(JSON.stringify(['LANE_POOL_ROOT', 'LANE_POOL_CANONICAL_ORIGIN', 'WE_DISPATCH_CWD_ROOT', 'WE_SMOKE_LIVE_CLONE']
-      .map((k) => [k, String(smokeEnv[k] ?? '')]))) : null;
+    // Every smoke-shaping knob counts, not a fixed short list: pool/dispatch roots, origin, live clone, and any
+    // WE_SMOKE_* / WE_REBUILD_SMOKE* / WE_DISPATCH_* / LANE_POOL_* setting (e.g. WE_SMOKE_DISPATCH_PASSES).
+    const envBinding = smokeEnv ? sha256(JSON.stringify(Object.keys(smokeEnv).filter((k) => /^(WE_SMOKE_|WE_REBUILD_SMOKE|WE_DISPATCH_|LANE_POOL_)/.test(k))
+      .sort().map((k) => [k, String(smokeEnv[k] ?? '')]))) : null;
     if (!envBinding) return { tree, key: smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind }), sharedKey: null, relevanceKey: null };
     const execution = { lockHash, nodeVersion, harnessHash, cloneKind, envBinding };
     const base = { tree, lockHash, nodeVersion, harnessHash, envBinding };
@@ -599,6 +602,7 @@ export async function smokeAndAdopt({
       let forgeRows = null;
       if (!proven && !freshComparison && identity && typeof forgeExec === 'function') {
         const f = await runSmokeCodeChecksOnForge({ cwd: candidate.path, env, expectedTree: identity.tree,
+          expectedNode: process.version, expectedHarness: smokeHarnessHash(),
           allowedChecks: SHAREABLE_CHECK_NAMES, exec: forgeExec });
         log.error?.(`daemon-rebuild: smoke-forge ${JSON.stringify(f.ran ? { ran: true, checks: Object.keys(f.rows) } : { ran: false, reason: f.reason })}`);
         if (f.ran) forgeRows = f.rows;

@@ -166,7 +166,7 @@ const FORGE_SMOKE_NAME = /^[a-z][a-z0-9-]{0,63}$/;
 
 /** PURE: parse Forge output as untrusted text (never executed). Exactly one marker line carrying JSON
  *  `{tree, rows:[{name, ok, ms, detail, closureHash?}]}`. Only a row naming an expected check, with `ok === true`, is kept. */
-export function parseForgeSmokeOutput(text, { expectedTree, allowedChecks = [] } = {}) {
+export function parseForgeSmokeOutput(text, { expectedTree, allowedChecks = [], expectedNode, expectedHarness } = {}) {
   try {
     if (typeof text !== 'string' || Buffer.byteLength(text) > FORGE_SMOKE_MAX_BYTES) return { ran: false, reason: 'forge-output-invalid' };
     const lines = text.split('\n').filter((l) => l.startsWith(FORGE_SMOKE_MARKER));
@@ -174,6 +174,8 @@ export function parseForgeSmokeOutput(text, { expectedTree, allowedChecks = [] }
     const body = JSON.parse(lines[0].slice(FORGE_SMOKE_MARKER.length));
     if (typeof body?.tree !== 'string' || !/^[0-9a-f]{40,64}$/.test(body.tree) || !Array.isArray(body.rows)) return { ran: false, reason: 'forge-output-invalid' };
     if (!expectedTree || body.tree !== expectedTree) return { ran: false, reason: 'tree-mismatch' };
+    // Same runtime and harness as the Mac that will rely on the result; Forge must report both, exactly.
+    if (!expectedNode || !expectedHarness || body.node !== expectedNode || body.harness !== expectedHarness) return { ran: false, reason: 'runtime-mismatch' };
     const rows = {};
     // Any anomalous row (failing, skipped, duplicate, unexpected name, bad shape) voids the WHOLE result: partial or
     // contradictory evidence never replaces a local adopt-gate check.
@@ -193,7 +195,7 @@ export function parseForgeSmokeOutput(text, { expectedTree, allowedChecks = [] }
  * `exec({argv, cwd, env})` is the injected executor (default: none -> Mac fallback, `forge-smoke-executor-unconfigured`).
  * @returns {Promise<{ran:true, tree:string, rows:object}|{ran:false, reason:string}>}
  */
-export async function runSmokeCodeChecksOnForge({ cwd, env = process.env, expectedTree, allowedChecks, exec, decide = decidePhaseRemote } = {}) {
+export async function runSmokeCodeChecksOnForge({ cwd, env = process.env, expectedTree, expectedNode, expectedHarness, allowedChecks, exec, decide = decidePhaseRemote } = {}) {
   try {
     const argv = ['npm', 'run', 'test:unit', '--', 'scripts/lib/__tests__/smoke-forge-code-checks.forge.test.mjs'];
     if (!allowedCommand(argv)) return { ran: false, reason: 'forge-argv-not-allowlisted' };
@@ -201,6 +203,6 @@ export async function runSmokeCodeChecksOnForge({ cwd, env = process.env, expect
     if (!decision?.remote) return { ran: false, reason: decision?.reason ?? 'forge-not-ready' };
     if (typeof exec !== 'function') return { ran: false, reason: 'forge-smoke-executor-unconfigured' };
     const out = await exec({ argv, cwd, env });
-    return parseForgeSmokeOutput(out, { expectedTree, allowedChecks });
+    return parseForgeSmokeOutput(out, { expectedTree, allowedChecks, expectedNode, expectedHarness });
   } catch { return { ran: false, reason: 'forge-transport-error' }; }
 }
