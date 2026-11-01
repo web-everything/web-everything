@@ -271,6 +271,14 @@ export async function registrationEvidenceReplay() {
       { reused, retired: reusedRetired.retired, entries: entries() });
       removeOverlay(root, 'lane/reused', { env });
     }
+    // The same class for an operator's edge approval: it vouched for PR 11's resolution, not PR 12's.
+    writeOverlays(root, [{ ref: 'lane/reused', pr: 11, registrationId: 'pr-11',
+      edgeResolution: { sha: needed, by: 'operator', at: '2026-10-31T00:00:00Z' } }], { env });
+    addOverlay(root, { ref: 'lane/reused', pr: 12 }, { env });
+    const reapproved = entries().find((o) => o.ref === 'lane/reused');
+    check('reregistration-drops-inherited-edge-approval', reapproved?.registrationId !== 'pr-11'
+      && !('edgeResolution' in reapproved), reapproved);
+    removeOverlay(root, 'lane/reused', { env });
 
     const input = { ref: 'same', now: '2026-10-27T12:00:00Z' };
     const first = addOverlay(root, input, { env }).find((o) => o.ref === 'same');
