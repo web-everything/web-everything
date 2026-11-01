@@ -83,6 +83,21 @@ describe('stale accept', () => {
   });
 });
 
+describe('same-tree edge cases', () => {
+  it('an abbreviated changes verdict voids a full-sha accept', () => {
+    const A = sha('a'); const TREE = sha('1');
+    const bounce = { author: BOT, createdAt: at(2), body: `🔁 review — changes requested\n\n<!-- reviewed-sha: ${A.slice(0, 7)} -->` };
+    expect(decideReviewChurn(mkPr([accept(A, 1), bounce], sha('b'), { settings: SET(), headTree: TREE, trees: { [A]: TREE } }))).toBeNull();
+  });
+  it('a needs-human PR owed its advisory review keeps it despite an identical tree', () => {
+    const A = sha('a'); const B = sha('b'); const TREE = sha('1');
+    const p = mkPr([accept(A, 1)], B, { settings: SET(), headTree: TREE, trees: { [A]: TREE } });
+    p.labels = [{ name: 'review:human' }];
+    const r = plan(p);
+    expect(refusal(r, 'review-same-tree')).toBeUndefined();
+  });
+});
+
 describe('guard interplay', () => {
   it('a shadow same-tree decision never hides an enforcing loop cap', () => {
     const heads = ['a', 'b', 'c'].map(sha); const TREE = sha('1');

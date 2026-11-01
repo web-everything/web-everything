@@ -1710,7 +1710,9 @@ function dispatchReviewRow({
   // ── R365 fix 4 (`review-churn.mjs`): a head whose tree equals an already-ACCEPTED reviewed head's owes no review, and a
   // PR that has had `maxLoopsPerPr` reviews of distinct heads is parked for a person instead of another round. Shadow
   // by default: the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
-  const churn = decideReviewChurn(pr);
+  // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
+  const churnRaw = decideReviewChurn(pr);
+  const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
   if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
   if (churn?.mode === 'on' && churn.kind === 'same-tree') {
     refuse('review-same-tree', { ...withPhase, ...extra, churn,

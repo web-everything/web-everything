@@ -71,8 +71,9 @@ export function decideReviewChurn(pr) {
   const found = [];
   if (sameTree !== 'off' && head && f.headTree) {
     // Only a head whose LATEST verdict is an accept counts: a later changes verdict on it supersedes the accept.
-    const latest = new Map(verdicts.map((v) => [v.head, v.accept]));
-    const twin = verdicts.find((v) => latest.get(v.head) === true && !head.startsWith(v.head) && !v.head.startsWith(head)
+    // An accept is voided by ANY later non-accept verdict naming a compatible (prefix-equal) head.
+    const live = (v, i) => v.accept && !verdicts.slice(i + 1).some((w) => !w.accept && (v.head.startsWith(w.head) || w.head.startsWith(v.head)));
+    const twin = verdicts.find((v, i) => live(v, i) && !head.startsWith(v.head) && !v.head.startsWith(head)
       && f.trees?.[v.head] && f.trees[v.head] === f.headTree);
     if (twin) found.push({ kind: 'same-tree', mode: sameTree, head, reviewedHead: twin.head, tree: f.headTree });
   }
