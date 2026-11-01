@@ -419,10 +419,34 @@ describe('overlay registration generations', () => {
     expect(f.list()).toContainEqual(replacement);
   });
 
-  it('T10 adopt CAS: unreadable registry cannot establish registration evidence', async () => {
+  it.each(['already-adopted', 'moved'])('T10 archive guard: unreadable registry refuses %s without changing adopted evidence', async (branch) => {
+    const f = gitFixture();
+    const before = readRebuildState(f.root, f.env).adopted;
+    writeFileSync(f.file, '{broken');
+    const onAdopted = vi.fn();
+    const run = vi.fn((args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }));
+    const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      lease: { token: 'cas-test' }, prevHead: f.adopted.head,
+      plan: { finalSha: branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha,
+        mainSha: f.adopted.mainSha, inputsKey: 'unreadable', applied: f.adopted.applied },
+      run, onAdopted,
+    });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-source-unverifiable' });
+    expect(result.adopted).not.toBe(true);
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-source-unavailable',
+      detail: expect.objectContaining({ error: 'overlay registry unreadable' }) }));
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(onAdopted).not.toHaveBeenCalled();
+    expect(readRebuildState(f.root, f.env).adopted).toEqual(before);
+    expect(f.bytes()).toBe('{broken');
+  });
+
+  it('T10 adopt CAS: mainOnly unreadable registry cannot establish registration evidence', async () => {
     const f = gitFixture();
     writeFileSync(f.file, '{broken');
+    // mainOnly deliberately skips archive checks; its adoption CAS must still strip unprovable ids.
     const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      archiveGuard: false,
       lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha: f.adopted.head, mainSha: f.adopted.mainSha,
         inputsKey: 'unreadable', applied: f.adopted.applied },
       run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),

@@ -249,6 +249,7 @@ describe('rebuildClone coordination events', () => {
     // nested planning/diagnostic reasons, which must not imply a failed rebuild.
     const idle = new Set([
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
+      'archive-source-uncovered', // Discards a saved candidate; preparation can still build a fresh one.
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
       'deps-job-started', 'detached-off-main', 'detached-or-unreadable-head', 'detached-with-changes',
