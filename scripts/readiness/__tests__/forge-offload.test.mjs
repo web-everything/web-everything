@@ -566,7 +566,7 @@ describe('runner base materialization refuses before install',()=>{
     if(mode==='delta') {
       expect(ignoredCalls).toBe(1);
       const substages=result.timings.find(stage=>stage.stage==='manifest-build').substages;
-      expect(substages.map(stage=>stage.stage).sort()).toEqual(['base-blob-verification','git-evidence','hashing','ignored-file-listing','inventory-walk','lstat-pass']);
+      expect(substages.map(stage=>stage.stage).sort()).toEqual(['base-blob-verification','cross-check','git-evidence','hashing','ignored-file-listing','inventory-walk','lstat-pass']);
       expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);

@@ -29,12 +29,37 @@ export function connectionOptions({directory=join(homedir(),'.forge-cm'),fs={mkd
   } catch {return [...SSH_OPTIONS];}
 }
 const noTiming=()=>()=>{};
+// Leaf checks are independent, so they run in a bounded pool. Results keep input
+// order; after a failure no new leaf starts and the lowest failing index is
+// thrown. Every earlier leaf has already started, so this is the error a serial
+// loop would have thrown first.
+const MANIFEST_CONCURRENCY=16;
+async function orderedPool(items,limit,work) {
+  const results=new Array(items.length),failures=[];
+  let next=0;
+  const worker=async()=>{
+    while(!failures.length&&next<items.length) {
+      const index=next++;
+      try {results[index]=await work(items[index],index);}catch(error) {failures.push([index,error]);}
+    }
+  };
+  await Promise.all(Array.from({length:Math.min(limit,items.length)},worker));
+  if(failures.length)throw failures.sort((a,b)=>a[0]-b[0])[0][1];
+  return results;
+}
 // Substages accumulate repeated hashing calls without one timing record per file.
+// Overlapping (concurrent) intervals of one stage count once, as wall time.
 function substageTimer(clock) {
-  const values=new Map();
+  const values=new Map(),active=new Map();
   return {values,begin(stage) {
-    const at=clock();
-    return ()=>values.set(stage,(values.get(stage)??0)+Math.max(0,clock()-at));
+    const open=active.get(stage)??{count:0,at:0};
+    if(!open.count++)open.at=clock();
+    active.set(stage,open);
+    let closed=false;
+    return ()=>{
+      if(closed)return;closed=true;
+      if(!--open.count)values.set(stage,(values.get(stage)??0)+Math.max(0,clock()-open.at));
+    };
   }};
 }
 async function timed(begin,stage,work) {
@@ -408,9 +433,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   }
   // Read public evidence once, only when a credential-named source needs it.
   // Missing, oversized, truncated or malformed evidence leaves the local fallback.
-  let publicBlobs;
+  // Parallel leaves share one load: no caller may observe a partially loaded map.
+  let publicBlobs, publicLoad;
   async function publicBlob(key) {
-    if (publicBlobs === undefined) {
+    publicLoad ??= (async () => {
       publicBlobs = new Map();
       try {
         const tree = await exec({file:'git',args:['ls-tree','-r','-z','origin/main'],cwd});
@@ -430,7 +456,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
           offset = i + 1;
         }
       } catch { publicBlobs.clear(); }
-    }
+    })();
+    await publicLoad;
     return publicBlobs.get(key);
   }
   const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
@@ -441,9 +468,22 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const rootInfo = await fs.lstat(Buffer.from(cwd));
   if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Invalid inventory root');
   const entries = [], excluded = [], identities = new Map();
-  let deletedWorktreePaths;
-  for (const path of files) {
-    if (trackedLinks.has(path.toString('hex'))) continue;
+  // Deletion evidence is loaded once; each caller reports its own path.
+  let deletedLoad;
+  const deletedWorktreePaths=()=>deletedLoad ??= (async()=>{
+    const deleted=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});
+    if(deleted.code!==0)throw new Error('deletion evidence unavailable');
+    const fields=splitPaths(deleted.stdout),paths=new Set();
+    for(let i=0;i<fields.length;i+=2) {
+      if(!/^[ACDMTUXB]$/.test(fields[i].toString())||!fields[i+1])throw new Error('invalid deletion evidence');
+      if(fields[i].equals(Buffer.from('D')))paths.add(fields[i+1].toString('hex'));
+    }
+    return paths;
+  })();
+  // Each leaf runs the same per-leaf checks; leaves run concurrently and their
+  // results are reassembled in inventory order (see orderedPool).
+  const leaves = await orderedPool(files, MANIFEST_CONCURRENCY, async path => {
+    if (trackedLinks.has(path.toString('hex'))) return;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
     let publicOid;
     if (credentialSource && !names.includes('node_modules')) {
@@ -458,26 +498,15 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
         throw excludedSource();
       }
       if (excludedTest) throw new Error('Excluded test: use local fallback');
-      excluded.push(path); continue;
+      return {excluded:path};
     }
     if(!listFiles && !trackedOnly && indexBlobs.has(path.toString('base64'))) {
       const missing=await fs.lstat(bytePath(cwd,path)).then(()=>false,error=>{if(error.code==='ENOENT')return true;throw error;});
       if(missing) {
-        if(!deletedWorktreePaths) {
-          let deleted;
-          try {deleted=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});}
-          catch {throw manifestRefusal('manifest-worktree-mismatch',path);}
-          if(deleted.code!==0)throw manifestRefusal('manifest-worktree-mismatch',path);
-          let fields;
-          try {fields=splitPaths(deleted.stdout);}catch {throw manifestRefusal('manifest-worktree-mismatch',path);}
-          deletedWorktreePaths=new Set();
-          for(let i=0;i<fields.length;i+=2) {
-            if(!/^[ACDMTUXB]$/.test(fields[i].toString())||!fields[i+1])throw manifestRefusal('manifest-worktree-mismatch',path);
-            if(fields[i].equals(Buffer.from('D')))deletedWorktreePaths.add(fields[i+1].toString('hex'));
-          }
-        }
-        if(!deletedWorktreePaths.has(path.toString('hex')))throw manifestRefusal('manifest-worktree-mismatch',path);
-        continue;
+        let deleted;
+        try {deleted=await deletedWorktreePaths();}catch {throw manifestRefusal('manifest-worktree-mismatch',path);}
+        if(!deleted.has(path.toString('hex')))throw manifestRefusal('manifest-worktree-mismatch',path);
+        return;
       }
     }
     let absolute = Buffer.from(cwd), st;
@@ -491,10 +520,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const previous=!trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
     const executable=!!(st.mode & 0o111), tracked=indexBlobs.has(path.toString('base64'));
     const stable=previous?.stat && ['dev','ino','size','mode','mtimeNs','ctimeNs','mtimeMs','ctimeMs'].every(key=>st[key]===previous.stat[key]);
-    if(previous && stable && st.size===previous.size && executable===previous.executable) {
-      entries.push({path,sha256:previous.sha256,executable,tracked});
-      continue;
-    }
+    if(previous && stable && st.size===previous.size && executable===previous.executable)
+      return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
     const content = await readManifestFile(absolute,st,fs);
     if (publicOid || trackedOnly) {
@@ -505,8 +532,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
         .update(`blob ${content.length}\0`).update(content).digest('hex');
       if (oid !== publicOid) throw excludedSource();
     }
-    entries.push(manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64'))));
     hashDone();
+    return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
+  });
+  for (const leaf of leaves) {
+    if (leaf?.entry) entries.push(leaf.entry);
+    else if (leaf?.excluded) excluded.push(leaf.excluded);
   }
   const sourceEntries=[...entries],projected=new Map(),projecting=new Set();
   let projectionCount=entries.length,projectionBytes=entries.reduce((size,entry)=>size+entry.path.length+1,0);
@@ -567,7 +598,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const files = splitPaths(result.stdout);
       const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
       if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
+      const siblingDone=beginSub('sibling-inventory');
       const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true});
+      siblingDone();
       if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
       siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
     } catch (error) {
@@ -575,8 +608,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       throw error;
     }
   }
-  try {await crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
-    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles});}
+  try {await timed(beginSub,'cross-check',()=>crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
+    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),exec,head,rootInfo,scoped:trackedOnly&&!!listFiles}));}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
