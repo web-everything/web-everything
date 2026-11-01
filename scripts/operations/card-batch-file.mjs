@@ -83,20 +83,23 @@ const MAIN_BASE_CACHE = new Map();
  */
 export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS, deadline } = {}) {
   const key = resolve(laneDir);
-  const identity = fetchFreshRemoteIdentity(laneDir, 'origin', (args, cwd) => run(cwd, args));
-  const hit = cache.get(key);
-  if (identity !== null && hit?.identity === identity && now() - hit.at < Math.min(maxAgeMs, fetchFreshWindowMs())) return hit.sha; // never outlive the shared window
   const cap = (max) => {
     if (!deadline) return undefined;
     const left = deadline.left();
     if (left < 1_000) throw budgetError('git');
     return Math.min(max, left);
   };
+  // Every git call (identity reads, fetch, ref reads) is capped at the time left; a budget error propagates.
+  const capped = (args, cwd) => run(cwd, args, cap(args[0] === 'fetch' ? 30_000 : 10_000));
+  let identity;
+  try { identity = fetchFreshRemoteIdentity(laneDir, 'origin', capped); } catch (error) { if (isBudgetError(error)) throw error; identity = null; }
+  const hit = cache.get(key);
+  if (identity !== null && hit?.identity === identity && now() - hit.at < Math.min(maxAgeMs, fetchFreshWindowMs())) return hit.sha; // never outlive the shared window
   let fetched = true;
   const at = now();
   let ageMs = 0;
   // Only the fetch itself is capped at the time left; a budget error propagates, any other failure falls back to the lane's last fetch.
-  try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, maxAgeMs, run: (args, cwd) => run(cwd, args, args[0] === 'fetch' ? cap(30_000) : undefined) })); } catch (error) {
+  try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, maxAgeMs, run: capped })); } catch (error) {
     cache.delete(key);
     if (isBudgetError(error)) throw error;
     fetched = false; /* fall back to the lane's last fetch */

@@ -113,7 +113,7 @@ import {
 import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline } from '../lib/tick-deadline.mjs';
 import { cursorSeed, readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
-import { removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
+import { cappedLaneGit, removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
@@ -895,9 +895,11 @@ async function landPreventionCardImpl(input, {
   } finally {
     if (laneDir) {
       try {
-        const removed = durable ? removeCards({ dir: laneDir, expected: handedOn, isLeaseCurrent }) : [];
+        // In a tick every cleanup git call is capped at the time left (5-30 s), so cleanup cannot outlast the tick before the release below.
+        const gitRun = inTick ? cappedLaneGit(() => Math.min(30_000, Math.max(5_000, deadline.left()))) : undefined;
+        const removed = durable ? removeCards({ dir: laneDir, expected: handedOn, isLeaseCurrent, ...(gitRun ? { gitRun } : {}) }) : [];
         if (removed.length) write(`land-prevention-card: removed ${removed.length} filed card copy(ies) from the lane — ${removed.join(', ')}\n`);
-        const saved = salvageCards({ dir: laneDir, lane: laneNum ?? 0, isLeaseCurrent, reason: `land-prevention-card ${input.session}: card files left after ${durable ? 'a landed' : 'an unlanded'} filing` });
+        const saved = salvageCards({ dir: laneDir, lane: laneNum ?? 0, isLeaseCurrent, ...(gitRun ? { gitRun } : {}), reason: `land-prevention-card ${input.session}: card files left after ${durable ? 'a landed' : 'an unlanded'} filing` });
         if (saved.status === 'salvaged') write(`land-prevention-card: saved ${saved.removed.length} card file(s) to ${saved.outDir}, lane cleaned — ${saved.removed.join(', ')}\n`);
         else if (saved.status === 'failed') write(`land-prevention-card: lane card salvage FAILED (lane-pool release retries it) — ${saved.reason}\n`);
         else if (saved.status === 'unknown') write(`land-prevention-card: lane card salvage skipped (status unreadable; lane-pool release retries it) — ${saved.reason}\n`);

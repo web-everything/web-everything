@@ -241,8 +241,11 @@ describe('fileIntoBatch against a real origin', () => {
       const opts = { run, cache: new Map(), now: () => 0 };
       freshMainBase(lane, opts);
       run.mockClear();
-      expect(freshMainBase(lane, { ...opts, deadline: { left: () => 0 } })).toBe('sha');
+      // With no budget left even the identity reads refuse (budget error); with budget, a hit makes no fetch or rev-parse.
+      expect(freshMainBase(lane, { ...opts, deadline: { left: () => 20_000 } })).toBe('sha');
       expect(run.mock.calls.filter(call => call[1][0] === 'fetch' || call[1][0] === 'rev-parse')).toEqual([]);
+      expect(run.mock.calls.every(call => call[2] > 0 && call[2] <= 10_000)).toBe(true);
+      expect(() => freshMainBase(lane, { ...opts, deadline: { left: () => 0 } })).toThrow(/tick budget/);
     } finally { rmSync(lane, { recursive: true, force: true }); }
   });
 
