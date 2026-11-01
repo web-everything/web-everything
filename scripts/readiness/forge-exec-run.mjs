@@ -502,7 +502,7 @@ async function procStart(pid) {
   try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
   catch(error) {if(error.code!=='ENOENT')return undefined; return filesystem.access('/proc/self/stat').then(()=>null,()=>undefined);}
 }
-async function uidBusy(uid) {
+export async function uidBusy(uid) {
   // A process can fork and exit between listing /proc and reading its entry. Any vanished entry
   // makes the scan unstable; repeat, and treat a scan that never settles as busy (fail closed).
   for(let attempt=0;attempt<4;attempt++) {
@@ -510,9 +510,13 @@ async function uidBusy(uid) {
     for(const entry of await readdir('/proc')) {
       if(!/^\d+$/.test(entry))continue;
       try {
-        if((await filesystem.stat('/proc/'+entry)).uid!==uid)continue;
-        const data=(await filesystem.readFile('/proc/'+entry+'/stat')).toString('latin1');
-        if(data.slice(data.lastIndexOf(')')+2,data.lastIndexOf(')')+3)!=='Z')return true;
+        // Credentials come from status (world-readable even for non-dumpable processes), never from
+        // the /proc/<pid> owner, which flips to root when a worker clears its dumpable flag.
+        const status=(await filesystem.readFile('/proc/'+entry+'/status')).toString('latin1');
+        const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status),state=/^State:\s+(\S)/m.exec(status);
+        if(!ids||!state)return true; // credentials undeterminable: keep the reservation
+        if(!ids.slice(1).some(id=>Number(id)===uid))continue;
+        if(state[1]!=='Z')return true;
       } catch(error) {if(error.code!=='ENOENT')return true; vanished=true;}
     }
     if(!vanished)return false;
