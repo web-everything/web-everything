@@ -466,6 +466,11 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        contentInBuild: (sha, build) => {
+          const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+          const t = String(m.stdout ?? '').split('\n')[0].trim();
+          return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
+        },
         leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       if (!m.adopt) {
@@ -481,6 +486,7 @@ export async function prepareRebuild({
         alert('ready-candidate-adopted', {
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({
