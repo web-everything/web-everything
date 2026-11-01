@@ -1612,37 +1612,6 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
     expect(planRedTeamOnSkip(staleFixture({ staleSpent: () => true }))[0])
       .toMatchObject({ action: 'skip', why: expect.stringContaining('already re-dispatched') });
   });
-  it.each([null, undefined].flatMap(result => [0, undefined].map(retryCount => ({ result, retryCount }))))(
-    'spent stale marker with unchanged abandonment dispatches without abandon: %j', ({ result, retryCount }) => {
-      const f = staleFixture({ staleSpent: () => true });
-      Object.assign(f.readStatus(), { result, retryCount, staleAbandoned: { at: staleNow, pid: f.readStatus().pid } });
-      expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: false,
-        why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
-    });
-  it.each([
-    ['queued', { status: 'queued' }],
-    ['finished', { status: 'finished', result: 'ran' }],
-    ['missing abandonment', { staleAbandoned: undefined }],
-    ['replaced owner', { pid: 6040 }],
-    ['invalid abandonment time', { staleAbandoned: { at: 'invalid', pid: 6039 } }],
-    ['missing abandonment PID', { staleAbandoned: { at: staleNow } }],
-    ['completed result', { result: 'ran' }],
-    ['spent retry', { retryCount: 1 }],
-  ])('spent stale marker still skips with %s', (_name, over) => {
-    const f = staleFixture({ staleSpent: () => true });
-    Object.assign(f.readStatus(), { staleAbandoned: { at: staleNow, pid: f.readStatus().pid } }, over);
-    expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
-    const o = staleRunFixture({ ...f, now: () => staleNow });
-    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
-    expect(o.abandonStale).not.toHaveBeenCalled();
-    expect(o.dispatch).not.toHaveBeenCalled();
-  });
-  it('unchanged abandonment with a spent marker still respects retry cooldown', () => {
-    const f = staleFixture({ staleSpent: () => true,
-      lastDispatch: new Map([[`${repo}#${pr}@${head}`, staleNow - 1]]) });
-    f.readStatus().staleAbandoned = { at: staleNow, pid: f.readStatus().pid };
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
-  });
   it('dead owner respects retry cooldown', () => {
     expect(planRedTeamOnSkip(staleFixture({ lastDispatch: new Map([[`${repo}#${pr}@${head}`, staleNow - 1]]) }))[0])
       .toMatchObject({ action: 'skip', why: 'retry cooldown active' });
@@ -1655,40 +1624,6 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
 });
 
 describe('runRedTeamOnSkip — stale recovery effects', () => {
-  it('re-dispatches an unchanged abandoned row with a real spent marker without abandoning again, then stops at queued', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-restart-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'daemon-events.jsonl') };
-    try {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-      const status = deadRunningStatus();
-      writeFileSync(statusPath, JSON.stringify(status));
-      expect(staleRecovery.abandonStaleRedTeamRun({ repo, pr, head, status, env, now: staleNow, probe: staleProbe() }).ok).toBe(true);
-      const abandoned = readFileSync(statusPath, 'utf8');
-      const o = staleRunFixture({ env,
-        readStatus: key => readRedTeamStatus({ ...key, env }),
-        staleSpent: key => staleRecovery.staleRedTeamSpent({ ...key, env }),
-        dispatch: vi.fn(() => {
-          expect(readFileSync(statusPath, 'utf8')).toBe(abandoned);
-          recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued' }, { env });
-          return { jobPid: 42 };
-        }) });
-      expect(runRedTeamOnSkip(o)).toMatchObject({
-        rows: [{ action: 'dispatch', mode: 'fresh', abandonStale: false }],
-        dispatched: [{ prNumber: pr, jobPid: 42, mode: 'fresh' }],
-      });
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(o.dispatch).toHaveBeenCalledOnce();
-      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
-      expect(staleRecovery.staleRedTeamSpent({ repo, pr, head, env })).toBe(true);
-      // Remove cooldown and capacity effects so the queued row itself must block another start.
-      o.lastDispatch.clear();
-      o.capacity = { lanes: 1, budget: { left: 1 } };
-      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(o.dispatch).toHaveBeenCalledOnce();
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
   it.each([
     ['shorter override', '60000', 60 * 60 * 1000, true],
     ['longer override', '14400000', 3 * 60 * 60 * 1000, false],

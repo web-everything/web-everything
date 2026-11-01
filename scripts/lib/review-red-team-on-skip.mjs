@@ -313,13 +313,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if ((!staleOwed && evidence.inFlight) || evidence.queued) return skip('red-team pass in flight');
       if (staleOwed) {
         if (status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
-        if (staleSpent({ repo, pr, head })) {
-          // Admission replaces the abandoned row with queued before a run starts.
-          // An unchanged abandoned row means the prior job never launched a call.
-          if (redTeamStatusWithoutRun(status)) return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: false,
-            why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
-          return skip('stale red team already re-dispatched; inspect review run');
-        }
+        if (staleSpent({ repo, pr, head })) return skip('stale red team already re-dispatched; inspect review run');
         return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: true,
           why: 'running red team owner is dead; abandon and re-dispatch' });
       }

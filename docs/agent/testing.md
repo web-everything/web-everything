@@ -552,10 +552,6 @@ Its production admission regression in `review-job-red-team-only.test.mjs` is
 it verifies that refusal restores the original finished/null status and publishes no comment.
 Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
 with a finite abandonment time and an integer abandonment PID matching the status PID. Production
-planner recovery may re-dispatch an unchanged abandoned row even when its stale redispatch marker
-is spent, provided no retry is spent; it must not abandon the row again. A queued or replaced row
-still blocks this recovery. `review-red-team-on-skip.test.mjs` exercises the real durable marker,
-planner and executor through re-dispatch and the subsequent queued-state refusal. Production
 admission must still prove the writer dead before clearing that prior. The execution guard
 refuses every still-running prior, including one marked abandoned: direct callers cannot
 use abandonment as proof of death. The regression
