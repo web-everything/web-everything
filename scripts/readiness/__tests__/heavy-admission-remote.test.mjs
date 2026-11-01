@@ -196,18 +196,19 @@ describe('remote admission policy', () => {
   });
 
   it.each([
-    ['CI with Forge gate handoff', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false],
-    ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false],
-    ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false],
-    ['--container', {}, ['--container'], true, true],
-    ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false],
-    ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true],
-    ['remote disabled by default', {}, [], false, true],
+    ['CI with Forge gate handoff', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true],
+    ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false, true],
+    ['CI bypass without Forge gate handoff', { CI: 'true' }, [], true, false, false],
+    ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false, false],
+    ['--container', {}, ['--container'], true, true, false],
+    ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false, false],
+    ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true, false],
+    ['remote disabled by default', {}, [], false, true, false],
     ['remote.* env vars cannot enable remote', {
       'remote.enabled': 'true', 'remote.mode': 'always',
       WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true', WE_HEAVY_ADMISSION_REMOTE_MODE: 'always',
-    }, [], false, true],
-  ])('main run keeps %s local and proceeds with local admission', async (_name, env, flags, enableRemote, acquiresSlot) => {
+    }, [], false, true, false],
+  ])('main run keeps %s local with the expected slot and execution report', async (_name, env, flags, enableRemote, acquiresSlot, reportsLocalCompletion) => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-local-'));
     const pool = join(root, 'pool');
     const lockRoot = join(pool, '.admission', 'heavy');
@@ -221,7 +222,7 @@ describe('remote admission policy', () => {
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
-      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '',
+      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_CONTAINER: '',
       WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl'), ...env })) vi.stubEnv(key, value);
     const localExec = flags.includes('--container') ? execContainerized : execSync;
     vi.mocked(localExec).mockImplementation(() => {
@@ -238,7 +239,13 @@ describe('remote admission policy', () => {
       }));
       expect(localExec.mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(exit).toHaveBeenCalledWith(17);
-      expect(existsSync(join(root, 'verify-report.jsonl'))).toBe(false);
+      // A consumed Forge handoff must preserve the first local verdict even on a bypass.
+      if (reportsLocalCompletion) {
+        expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8')))
+          .toEqual({ location: 'local-fallback', exitCode: 17 });
+      } else {
+        expect(existsSync(join(root, 'verify-report.jsonl'))).toBe(false);
+      }
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
       if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
     } finally {
