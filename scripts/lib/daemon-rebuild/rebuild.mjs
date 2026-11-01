@@ -191,7 +191,7 @@ async function rebuildCloneInternal({
   try {
     return await smokeAndAdopt({
       root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly, entries,
     });
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.

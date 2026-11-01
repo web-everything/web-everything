@@ -8,20 +8,22 @@ import {
 } from './smoke-classify/index.mjs';
 import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
-import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
+import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, stateDir } from './state.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
+import { runSmokeCodeChecksOnForge } from '../verify-remote-routing.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
-import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, renameSync, openSync, fstatSync, readSync, closeSync, constants as fsConstants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, posix } from 'node:path';
+import { dirname, join, posix, resolve as resolvePath } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SHAREABLE_CHECK_NAMES } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -59,17 +61,116 @@ export function smokePassTtlMs(env = process.env) {
   return resolveSmokeReuse(env).reuseHours * 60 * 60_000;
 }
 
-/** Only a full, successful, unskipped table is durable evidence. */
-export function completeSmokePass(result) {
-  const rows = result?.smoke?.results;
-  return result?.verdict === 'pass' && !result.disabled && !result.cached && Array.isArray(rows)
-    && rows.length === SMOKE_CHECKS.length && SMOKE_CHECKS.every(check =>
-      rows.filter(row => row?.name === check.name && row.ok === true && !row.skipped && !row.skipReason).length === 1);
+/** The relevance proof a `skipped:relevance` row needs: a recorded prior LIVE pass of that check on an identical
+ *  closure, harness, Node version and lockfile. Missing identity or legacy records mean "no proof" (the check runs). */
+export function makeRelevanceProof({ identity = null, env = process.env, now = Date.now, ttlMs = smokePassTtlMs(env) } = {}) {
+  return (name, closureHash) => {
+    if (!validRelevanceIdentity(identity)) return false;
+    if (!SHAREABLE_CHECK_NAMES.includes(name) || !/^[0-9a-f]{64}$/.test(String(closureHash))) return false;
+    const rec = readStoreRecord(closureProofPath(name, closureHash, identity.relevanceKey, env));
+    const age = now() - Date.parse(rec?.passedAt);
+    return rec?.v === 2 && rec.kind === 'closure-pass' && rec.relevanceKey === identity.relevanceKey
+      && rec.name === name && rec.closureHash === closureHash && age >= 0 && age < ttlMs;
+  };
 }
 
-/** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree. */
-export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
+/** Only a full, successful table is durable evidence. A relevance skip counts only with its recorded live proof. */
+export function completeSmokePass(result, { relevanceProof = null } = {}) {
+  const rows = result?.smoke?.results;
+  return result?.verdict === 'pass' && !result.disabled && !result.cached && Array.isArray(rows)
+    && rows.length === SMOKE_CHECKS.length && SMOKE_CHECKS.every(check => {
+      const own = rows.filter(row => row?.name === check.name);
+      if (own.length !== 1 || own[0].ok !== true) return false;
+      const row = own[0];
+      if (!row.skipped && !row.skipReason) return true;
+      return check.shareable === true && row.skipped === true && row.skipReason === 'relevance'
+        && typeof relevanceProof === 'function' && relevanceProof(check.name, row.closureHash) === true;
+    });
+}
+
+// ── shared host-level verdict store (x1bppc5 Fork 2) ──────────────────────────────────────────────────────────
+// One directory under the host-wide daemon state dir, read by every clone. A record is trusted only when it parses,
+// is small, names the exact key, is inside the window and was written by a completed smoke; anything else is absent.
+
+const STORE_MAX_BYTES = 65536;
+const storeDir = (env = process.env) => join(stateDir(env), 'smoke-verdicts');
+const verdictPath = (key, env) => join(storeDir(env), `verdict-${key}.json`);
+const closureProofPath = (name, hash, relevanceKey, env) => join(storeDir(env), `closure-${name}-${hash}-${relevanceKey}.json`);
+const validRelevanceIdentity = (identity) => typeof identity?.relevanceKey === 'string'
+  && /^[0-9a-f]{64}$/.test(identity.relevanceKey);
+
+function readStoreRecord(path) {
+  let fd;
   try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > STORE_MAX_BYTES) return null;
+    const buf = Buffer.alloc(st.size);
+    if (readSync(fd, buf, 0, st.size, 0) !== st.size) return null;
+    const rec = JSON.parse(buf.toString('utf8'));
+    return rec && typeof rec === 'object' && !Array.isArray(rec) ? rec : null;
+  } catch { return null; } finally { if (fd !== undefined) try { closeSync(fd); } catch { /* best effort */ } }
+}
+
+function writeStoreRecord(path, rec) {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
+    renameSync(tmp, path); // atomic: a reader sees the old record or the whole new one
+    return true;
+  } catch { return false; }
+}
+
+/** The shared verdict for `identity.sharedKey`, or null: exact key, inside the window, names every shareable check. */
+export function readSharedVerdict(identity, { env = process.env, now = Date.now, ttlMs = smokePassTtlMs(env) } = {}) {
+  if (!identity?.sharedKey) return null;
+  const rec = readStoreRecord(verdictPath(identity.sharedKey, env));
+  const age = now() - Date.parse(rec?.passedAt);
+  const ok = rec?.kind === 'smoke-verdict' && rec.key === identity.sharedKey && rec.tree === identity.tree
+    && age >= 0 && age < ttlMs && Array.isArray(rec.checks) && SHAREABLE_CHECK_NAMES.every(n => rec.checks.includes(n));
+  return ok ? rec : null;
+}
+
+/** Called only after a completed, unskipped smoke (never from partial rows). */
+export function writeSharedVerdict(identity, { env = process.env, now = Date.now, checks = SHAREABLE_CHECK_NAMES } = {}) {
+  if (!identity?.sharedKey) return false;
+  return writeStoreRecord(verdictPath(identity.sharedKey, env), { v: 1, kind: 'smoke-verdict', key: identity.sharedKey,
+    tree: identity.tree, checks: [...checks], passedAt: new Date(now()).toISOString(), writer: { host: hostname(), pid: process.pid } });
+}
+
+/** One file per (check, closure hash, execution identity): no read-modify-write or cross-runtime proof reuse. */
+export function writeClosureProofs(rows, { identity = null, env = process.env, now = Date.now } = {}) {
+  if (!validRelevanceIdentity(identity)) return;
+  for (const row of rows || []) {
+    if (!row || row.ok !== true || row.skipped || row.skipReason || !SHAREABLE_CHECK_NAMES.includes(row.name)
+      || !/^[0-9a-f]{64}$/.test(String(row.closureHash))) continue;
+    writeStoreRecord(closureProofPath(row.name, row.closureHash, identity.relevanceKey, env), { v: 2, kind: 'closure-pass', name: row.name,
+      relevanceKey: identity.relevanceKey,
+      closureHash: row.closureHash, passedAt: new Date(now()).toISOString(), writer: { host: hostname(), pid: process.pid } });
+  }
+}
+
+/** Harness hash over EVERY module the smoke imports (not only the live-smoke file), memoized per process.
+ *  An unreadable or incomplete closure yields null: no identity, so nothing is reused. */
+let harnessHashMemo;
+export function smokeHarnessHash() {
+  if (harnessHashMemo !== undefined) return harnessHashMemo;
+  try {
+    const root = resolvePath(dirname(fileURLToPath(import.meta.url)), '../../..');
+    const closure = collectImportClosure({ root, entries: ['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs'] });
+    if (!closure || closure.complete === false || !(closure.files instanceof Set)) return (harnessHashMemo = null);
+    const h = createHash('sha256');
+    for (const f of [...closure.files].sort()) { h.update(f); h.update('\0'); h.update(readFileSync(join(root, f))); h.update('\0'); }
+    return (harnessHashMemo = h.digest('hex'));
+  } catch { return (harnessHashMemo = null); }
+}
+
+/** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree.
+ *  `sharedKey` drops `cloneKind` (the shareable checks are `cloneIndependent`); `key` keeps it. */
+export function smokePassIdentity(git, sha, cloneKind = 'daemon', { harnessHash = smokeHarnessHash(), nodeVersion = process.version } = {}) {
+  try {
+    if (typeof harnessHash !== 'string' || !harnessHash || typeof nodeVersion !== 'string' || !nodeVersion) return null;
     const tree = verifyRev(git, `${sha}^{tree}`);
     if (!tree) return null;
     const lock = git(['show', `${sha}:package-lock.json`]);
@@ -79,8 +180,10 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon') {
       if (listed.status !== 0 || String(listed.stdout ?? '').trim()) return null;
     }
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
-    const harnessHash = sha256(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs')));
-    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion: process.version, harnessHash, cloneKind }) };
+    const execution = { lockHash, nodeVersion, harnessHash };
+    const base = { tree, ...execution };
+    return { tree, key: smokePassKey({ ...base, cloneKind }), sharedKey: smokePassKey({ ...base, cloneKind: '*' }),
+      relevanceKey: sha256(JSON.stringify(execution)) };
   } catch {
     return null;
   }
@@ -335,6 +438,7 @@ async function resolveDispatchSmoke(opt, env) {
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
   finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  entries: daemonEntries = null, forgeExec = undefined,
 }) {
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
@@ -445,11 +549,17 @@ export async function smokeAndAdopt({
     if (freshComparison) changedFiles = null;
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
-    const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+    const localProof = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
       return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
     });
+    // Fork 2: a verdict any clone on this host recorded for the exact (tree, lockfile, node, harness) identity.
+    const sharedProof = !freshComparison && !localProof && reuse.reuseEnabled && identity
+      ? readSharedVerdict(identity, { env: stEnv, now, ttlMs: reuse.reuseHours * 3_600_000 }) : null;
+    const proven = localProof || sharedProof;
     if (proven) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
+    if (proven) log.error?.(`daemon-rebuild: smoke-reuse-hit ${JSON.stringify({ source: localProof ? 'clone' : 'shared', passedAt: proven.passedAt, tree: identity.tree })}`);
+    else if (!freshComparison && reuse.reuseEnabled) log.error?.('daemon-rebuild: smoke-reuse-miss');
     // Every smoke of this build (A, then B / C) reuses the lease's own unique path, one after another.
     const candidate = materializeCandidate({
       root, sha, run, env, path: lease.path, log,
@@ -459,9 +569,20 @@ export async function smokeAndAdopt({
     let threw = null;
     let dispatch = null;
     const t0 = now();
+    const relevanceProof = makeRelevanceProof({ identity, env: stEnv, now, ttlMs: reuse.reuseHours * 3_600_000 });
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
-      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild });
+      // Fork 3: shareable code checks on Forge when an executor is wired and Forge is ready; a Forge result is
+      // accepted only for this exact tree. Any doubt -> the Mac runs the same checks (never a silent pass).
+      let forgeRows = null;
+      if (!proven && !freshComparison && identity && typeof forgeExec === 'function') {
+        const f = await runSmokeCodeChecksOnForge({ cwd: candidate.path, env, expectedTree: identity.tree,
+          allowedChecks: SHAREABLE_CHECK_NAMES, exec: forgeExec });
+        log.error?.(`daemon-rebuild: smoke-forge ${JSON.stringify(f.ran ? { ran: true, checks: Object.keys(f.rows) } : { ran: false, reason: f.reason })}`);
+        if (f.ran) forgeRows = f.rows;
+      }
+      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven,
+        runChild, daemonEntries, relevanceProof, forgeRows });
     } catch (e) {
       threw = e;
     }
@@ -474,7 +595,7 @@ export async function smokeAndAdopt({
     // x5059uu — per-step timings on EVERY smoke (live 2026-10-09: smokes took 421 s and 1,002 s), so a slow step is
     // visible in the log before it crosses the smoke-slow line; the dispatch smoke counts as its own step.
     const checks = [
-      ...(smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`),
+      ...(smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? (r.skipReason ? `skipped:${r.skipReason}` : 'skipped') : `${r.ms}ms${r.ranOn ? `@${r.ranOn}` : ''}`}`),
       ...(dispatch?.result?.ms != null ? [`dispatch-smoke:${dispatch.result.ms}ms`] : []),
     ].join(' ');
     const passTimings = smokePassTimings(smokeResult?.smoke?.results);
@@ -487,12 +608,19 @@ export async function smokeAndAdopt({
         ...passTimings,
       });
     }
-    if (!threw && !proven && completeSmokePass(smokeResult) && changedFiles === null && (!dispatch || dispatch.result.ok)
+    // Closure proofs: a passing, uncached smoke's own LIVE shareable rows prove those checks on their closure hash.
+    if (!threw && smokeResult?.verdict === 'pass' && !smokeResult.disabled && !smokeResult.cached && (!dispatch || dispatch.result.ok)) {
+      writeClosureProofs(smokeResult?.smoke?.results, { identity, env: stEnv, now });
+    }
+    if (!threw && !proven && completeSmokePass(smokeResult, { relevanceProof }) && changedFiles === null && (!dispatch || dispatch.result.ok)
       && !smokeResult.cached && !busyPoolSkippedChecks(smokeResult).length && label !== 'confirm') {
-      if (identity) await locked((st) => {
-        const prior = Array.isArray(st.smokePassed) ? st.smokePassed : [];
-        st.smokePassed = [{ ...identity, passedAt: nowIso() }, ...prior.filter((entry) => entry?.key !== identity.key)].slice(0, 5);
-      });
+      if (identity) {
+        writeSharedVerdict(identity, { env: stEnv, now });
+        await locked((st) => {
+          const prior = Array.isArray(st.smokePassed) ? st.smokePassed : [];
+          st.smokePassed = [{ ...identity, passedAt: nowIso() }, ...prior.filter((entry) => entry?.key !== identity.key)].slice(0, 5);
+        });
+      }
     }
     return {
       smokeResult, threw, ms, dispatch, reused: !!proven,

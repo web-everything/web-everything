@@ -824,9 +824,12 @@ export const SMOKE_CHECKS = Object.freeze([
   { name: 'lane-acquire-release', kind: 'env', run: checkLaneAcquireRelease, mayBeTransient: false, codeEntries: ['scripts/lane-pool.mjs'] },
   { name: 'gh-api-repo', kind: 'env', run: checkGhApiRepo, mayBeTransient: true },
   { name: 'gh-pr-list', kind: 'env', run: checkGhPrList, mayBeTransient: true },
-  { name: 'reconcile-dry-run', kind: 'code', run: checkReconcileDryRun, mayBeTransient: false, codeEntries: ['scripts/conveyor/reconcile-pass.mjs'] },
+  // x1bppc5/xfwf4zc: `shareable` = relevance-skippable and reusable through the shared per-commit verdict (only these
+  // two dry-runs; the floor in Fork 4 never is); `cloneIndependent` = their verdict is a function of the tree, so the
+  // shared key drops `cloneKind`. A test asserts exactly this set carries each flag.
+  { name: 'reconcile-dry-run', kind: 'code', run: checkReconcileDryRun, mayBeTransient: false, codeEntries: ['scripts/conveyor/reconcile-pass.mjs'], shareable: true, cloneIndependent: true },
   // xp4lw2v (epic #4075/#3383) — see the two functions' own docblocks just above for what each covers.
-  { name: 'dispatch-dry-run', kind: 'code', run: checkDispatchDryRun, mayBeTransient: false, codeEntries: DISPATCH_DRY_RUN_CODE_ENTRIES },
+  { name: 'dispatch-dry-run', kind: 'code', run: checkDispatchDryRun, mayBeTransient: false, codeEntries: DISPATCH_DRY_RUN_CODE_ENTRIES, shareable: true, cloneIndependent: true },
   // #4468 — actually BOOTS (imports) every standalone daemon entry module on the candidate tree; see
   // `daemon-boot-smoke.mjs`'s own header for the live incident this closes (#2921: a smoke-passing candidate
   // that then crash-looped every daemon at startup, because nothing before this row ever imported an entry file).
@@ -853,6 +856,38 @@ export function checkCodeUnchanged({ check, changedFiles, root, closureOf = coll
   return Array.isArray(hits) && hits.length === 0;
 }
 
+/** The checks that may be relevance-skipped and shared (Fork 4: everything else always runs or keeps its closure skip). */
+export const SHAREABLE_CHECK_NAMES = Object.freeze(SMOKE_CHECKS.filter((c) => c.shareable).map((c) => c.name));
+
+/**
+ * Content hash of a check's own import closure (path + file bytes, sorted), or `null` when the closure is unknown or
+ * incomplete (fail closed: no proof can be built on it). Two trees with the same hash run byte-identical check code.
+ */
+export function checkClosureHash({ check, root, closureOf = collectImportClosure, readFile = (p) => readFileSync(p) }) {
+  try {
+    const closure = closureOf({ root, entries: check.codeEntries || [] });
+    if (!closure || closure.complete === false || !(closure.files instanceof Set) || !closure.files.size) return null;
+    const h = createHash('sha256');
+    for (const f of [...closure.files].sort()) { h.update(f); h.update('\0'); h.update(readFile(join(root, f))); h.update('\0'); }
+    return h.digest('hex');
+  } catch { return null; }
+}
+
+/**
+ * Fork 1: is `check` relevant to the daemon whose entry modules are `daemonEntries`? A daemon is relevant when its
+ * import closure contains one of the check's own `codeEntries` (it actually imports that machinery). Unknown daemon
+ * entries, an unreadable or incomplete closure, or a non-shareable check all mean RELEVANT (run it), as today.
+ */
+export function checkRelevantToDaemon({ check, daemonEntries, root, closureOf = collectImportClosure }) {
+  if (!check?.shareable || !Array.isArray(daemonEntries) || !daemonEntries.length) return true;
+  try {
+    const closure = closureOf({ root, entries: daemonEntries });
+    if (!closure || closure.complete === false || !(closure.files instanceof Set)) return true;
+    const mine = new Set([...closure.files].map((f) => String(f)));
+    return (check.codeEntries || []).some((e) => mine.has(e));
+  } catch { return true; }
+}
+
 /** PURE: does a completed set of check results pass the gate? Every single check must have passed. */
 export function decideSmokeVerdict(results) {
   return results.length > 0 && results.every((r) => r.ok);
@@ -870,6 +905,10 @@ export async function runLiveSmoke({
   clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
+  // xfwf4zc: per-daemon relevance (`daemonEntries` = the rebuilding daemon's entry modules; null = unknown, run all),
+  // `relevanceProof(name, closureHash)` = is there a recorded prior LIVE pass of that check on an identical closure,
+  // `forgeRows` = already-verified passing rows a Forge run produced for shareable checks (tree checked by the caller).
+  daemonEntries = null, relevanceProof = null, forgeRows = null,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -925,10 +964,28 @@ export async function runLiveSmoke({
     for (const check of SMOKE_CHECKS) {
       const startedAt = clock();
       let result;
-      if (check.kind === 'code' && (reuseCode || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
+      // Fork 1: a shareable dry-run the daemon never imports is `skipped:relevance` — only when a prior live pass of
+      // the same check on a closure-identical tree is on record; otherwise it runs (fail closed).
+      if (check.shareable && !reuseCode && !checkRelevantToDaemon({ check, daemonEntries, root, closureOf })) {
+        const closureHash = checkClosureHash({ check, root, closureOf });
+        if (closureHash && typeof relevanceProof === 'function' && relevanceProof(check.name, closureHash) === true) {
+          results.push({ name: check.name, ms: 0, ok: true, skipped: true, skipReason: 'relevance', closureHash,
+            mayBeTransient: false, detail: 'skipped:relevance — this daemon does not import the check and an identical-closure live pass is on record' });
+          continue;
+        }
+      }
+      const forgeRow = check.shareable && !reuseCode ? forgeRows?.[check.name] : null;
+      if (forgeRow && forgeRow.ok === true) {
+        results.push({ name: check.name, ms: Number.isFinite(forgeRow.ms) ? forgeRow.ms : 0, ok: true, ranOn: 'forge',
+          mayBeTransient: false, ...(forgeRow.closureHash ? { closureHash: forgeRow.closureHash } : {}),
+          detail: `forge: ${String(forgeRow.detail ?? '').slice(0, 500)}` });
+        continue;
+      }
+      // Fork 2: only the shareable dry-runs are reused through a proven (same-key) pass; the floor always runs.
+      if (check.kind === 'code' && ((reuseCode && check.shareable) || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
         results.push({
           name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
-          detail: reuseCode ? 'reused passing tree smoke (code check)' : 'code unchanged since the last live-verified build — not re-run (#4044)',
+          detail: (reuseCode && check.shareable) ? 'reused passing tree smoke (code check)' : 'code unchanged since the last live-verified build — not re-run (#4044)',
         });
         continue;
       }
@@ -969,7 +1026,10 @@ export async function runLiveSmoke({
           || (check.name === 'daemon-entries-boot' && bootOutputsOk))
         && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
           || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
+      // A live, passing shareable row names the content hash of the code it ran: it is the closure proof (Fork 1).
+      const liveClosureHash = result.ok && check.shareable ? checkClosureHash({ check, root, closureOf }) : null;
       results.push({ name: check.name, ms: clock() - startedAt, ...result,
+        ...(liveClosureHash ? { closureHash: liveClosureHash } : {}),
         ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
     }
     return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
@@ -1093,7 +1153,7 @@ export async function runLiveSmokeWithRetry({
   root, env = process.env, runChild = runBounded, sleep = defaultSleep,
   retries = envNonNegInt(env, SMOKE_TRANSIENT_RETRIES_ENV, 2),
   backoffMs = envMs(env, SMOKE_RETRY_BACKOFF_MS_ENV, 15_000),
-  changedFiles = null, reuseCode = false,
+  changedFiles = null, reuseCode = false, daemonEntries = null, relevanceProof = null, forgeRows = null,
   refreshAuth = refreshSmokeGithubEnv,
   clock = Date.now,
   loadAvg = () => loadavg(),
@@ -1117,7 +1177,7 @@ export async function runLiveSmokeWithRetry({
     // Fresh token for EVERY attempt, the same way the daemon's own tick gets one (see refreshSmokeGithubEnv).
     const { env: runEnv, refresh } = await refreshAuth({ env: attemptEnv, force: forceRefresh });
     forceRefresh = false;
-    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock });
+    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock, daemonEntries, relevanceProof, forgeRows });
     verdict = classifySmokeFailure(smoke.results);
     // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
     // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.

@@ -10,7 +10,7 @@ import { rebuildClone, readRebuildState, readyCandidatePath } from '../daemon-re
 import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
-import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
+import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse, smokeHarnessHash } from '../daemon-rebuild/smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 
@@ -301,7 +301,7 @@ describe('durable smoke pass cache', () => {
     gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
     const tree = identity(f, target).tree;
     const parts = { tree, cloneKind: 'clone', lockHash: '', nodeVersion: process.version,
-      harnessHash: createHash('sha256').update(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../daemon-live-smoke.mjs'))).digest('hex') };
+      harnessHash: smokeHarnessHash() };
     expect(smokePassKey(parts)).toBe(identity(f, target).key);
     writeRebuildState(f.cloneDir, { smokePassed: [{ tree, key: smokePassKey({ ...parts, [field]: 'different' }), passedAt: new Date().toISOString() }] }, f.env);
     const smoke = vi.fn(async () => PASS);

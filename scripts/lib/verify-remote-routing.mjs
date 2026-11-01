@@ -154,3 +154,50 @@ export const REMOTE_TERMINATION_UNCONFIRMED = Object.freeze({ reason: 'remote-te
 export function remoteInfrastructureFailure({ exitCode, remoteAttempt, ranOn } = {}) {
   return exitCode === 124 && remoteAttempt === true && ranOn?.localExitCode !== 124 ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
 }
+
+// ── xfwf4zc / x1bppc5 Fork 3: rebuild-smoke code checks on Forge ─────────────────────────────────────────────
+// The ONLY transport is the heavy-admission remote wrapper this file already preflights; Forge-routed smokes are
+// admitted through the heavy-command queue by that wrapper. This helper decides, runs through an injected
+// executor, and validates; it never throws and never turns doubt into a pass (any non-`ran` result means the Mac
+// runs the same checks with the same verdict rules).
+export const FORGE_SMOKE_MARKER = 'FORGE_SMOKE_RESULT ';
+const FORGE_SMOKE_MAX_BYTES = 65536;
+const FORGE_SMOKE_NAME = /^[a-z][a-z0-9-]{0,63}$/;
+
+/** PURE: parse Forge output as untrusted text (never executed). Exactly one marker line carrying JSON
+ *  `{tree, rows:[{name, ok, ms, detail, closureHash?}]}`. Only a row naming an expected check, with `ok === true`, is kept. */
+export function parseForgeSmokeOutput(text, { expectedTree, allowedChecks = [] } = {}) {
+  try {
+    if (typeof text !== 'string' || Buffer.byteLength(text) > FORGE_SMOKE_MAX_BYTES) return { ran: false, reason: 'forge-output-invalid' };
+    const lines = text.split('\n').filter((l) => l.startsWith(FORGE_SMOKE_MARKER));
+    if (lines.length !== 1) return { ran: false, reason: 'forge-output-invalid' };
+    const body = JSON.parse(lines[0].slice(FORGE_SMOKE_MARKER.length));
+    if (typeof body?.tree !== 'string' || !/^[0-9a-f]{40,64}$/.test(body.tree) || !Array.isArray(body.rows)) return { ran: false, reason: 'forge-output-invalid' };
+    if (!expectedTree || body.tree !== expectedTree) return { ran: false, reason: 'tree-mismatch' };
+    const rows = {};
+    for (const r of body.rows) {
+      if (!r || typeof r.name !== 'string' || !FORGE_SMOKE_NAME.test(r.name) || !allowedChecks.includes(r.name) || r.ok !== true || r.name in rows) continue;
+      rows[r.name] = { name: r.name, ok: true, ms: Number.isFinite(r.ms) && r.ms >= 0 ? r.ms : 0,
+        detail: typeof r.detail === 'string' ? r.detail.slice(0, 500) : '',
+        ...(typeof r.closureHash === 'string' && /^[0-9a-f]{64}$/.test(r.closureHash) ? { closureHash: r.closureHash } : {}) };
+    }
+    return { ran: true, tree: body.tree, rows };
+  } catch { return { ran: false, reason: 'forge-output-invalid' }; }
+}
+
+/**
+ * Run the shareable code checks of the candidate tree on Forge when its health says ready.
+ * `exec({argv, cwd, env})` is the injected executor (default: none -> Mac fallback, `forge-smoke-executor-unconfigured`).
+ * @returns {Promise<{ran:true, tree:string, rows:object}|{ran:false, reason:string}>}
+ */
+export async function runSmokeCodeChecksOnForge({ cwd, env = process.env, expectedTree, allowedChecks, exec, decide = decidePhaseRemote } = {}) {
+  try {
+    const argv = ['npm', 'run', 'test:unit', '--', 'scripts/lib/__tests__/smoke-forge-code-checks.forge.test.mjs'];
+    if (!allowedCommand(argv)) return { ran: false, reason: 'forge-argv-not-allowlisted' };
+    const decision = await decide({ cwd, env, argv });
+    if (!decision?.remote) return { ran: false, reason: decision?.reason ?? 'forge-not-ready' };
+    if (typeof exec !== 'function') return { ran: false, reason: 'forge-smoke-executor-unconfigured' };
+    const out = await exec({ argv, cwd, env });
+    return parseForgeSmokeOutput(out, { expectedTree, allowedChecks });
+  } catch { return { ran: false, reason: 'forge-transport-error' }; }
+}
