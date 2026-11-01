@@ -64,10 +64,6 @@ exit 3
     ...await snapshotBinding(work),inputDigest:await digestInput(work),argvDigest:digestArgv(argv)};
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
-// The production CLI re-execs through `sudo -n`; without passwordless sudo these tests cannot run, so skip them
-// with a clear name instead of failing (or ever waiting for a password).
-const sudoNonInteractive = (() => { try { return spawnSync('/usr/bin/sudo', ['-n', 'true'], {stdio: 'ignore', timeout: 5000}).status === 0; } catch { return false; } })();
-const itNeedsSudo = (name, fn) => (sudoNonInteractive ? it : it.skip)(`${name} [needs passwordless sudo: sudo -n unavailable]`, fn);
 describe('sibling root snapshot acceptance', () => {
   const siblingRoot = () => join(root,'runs',request.run,'frontierui');
   async function siblingSnapshot() {
@@ -816,7 +812,7 @@ os.open=metadata_open
         for(const path of protectedPaths)expect(await stat(path)).toBeDefined();
       }
     });
-  itNeedsSudo('the production CLI rejects extra argv and oversized requests', () => {
+  it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
     for(const args of [['prepare','extra'],['prepare']]) {
       const result=spawnSync(process.execPath,[source.pathname,...args],{
@@ -948,7 +944,7 @@ assert fired
     expect(await readdir(destination)).toEqual([]);expect(result.stdout).toBe('');
     expect(result.stderr).not.toContain('root-only fixture');
   });
-  itNeedsSudo('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
+  it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
     // Observe the real CLI's first filesystem operation after createRunner().
     // Stop before any host mutation, even if a regression enables testRoot.
@@ -1048,7 +1044,7 @@ describe('privileged finish cleanup', () => {
 // Required on Linux: execute this suite as a non-root ops test user with
 // passwordless sudo for python3 and rm. It uses numeric worker IDs, no accounts
 // are created and every mutation is confined to this test's TMPDIR fixture.
-it.skipIf(process.platform !== 'linux' || !sudoNonInteractive)('cross-identity cleanup finishes a nonempty 0755 worker-owned run after prepare and execution', async () => {
+it.skipIf(process.platform !== 'linux')('cross-identity cleanup finishes a nonempty 0755 worker-owned run after prepare and execution', async () => {
   expect(process.getuid(),'Linux cross-identity fixture requires a non-root ops user with passwordless sudo').not.toBe(0);
   const workerUid=65534, workerGid=65534;
   const task=String.raw`import os
