@@ -17,6 +17,9 @@ function simpleShellWords(command) {
 const unquote = arg => arg.replaceAll("'", '');
 
 const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+// Keys that change neither the nested wrapper's admission (CI bypasses it) nor its routing. Each must
+// also pass Forge's env allowlist, so the remote run sees the same value.
+const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR']);
 const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*npx vitest(?=\s|$)/;
 
 function wrappedVitestCommand(command) {
@@ -24,12 +27,12 @@ function wrappedVitestCommand(command) {
   const words = simpleShellWords(command);
   if (!words) return null;
   // Leading assignments run with the nested wrapper, so they apply locally and reach Forge only
-  // through its env allowlist. A key Forge would drop keeps the segment local.
+  // through its env allowlist. Any other key keeps the segment local.
   let start = 0;
   for (; start < words.length; start++) {
     const assignment = ENV_ASSIGNMENT.exec(words[start]);
     if (!assignment) break;
-    if (!allowedEnv({ [assignment[1]]: unquote(assignment[2]) })) return null;
+    if (!SEGMENT_ENV_KEYS.includes(assignment[1]) || !allowedEnv({ [assignment[1]]: unquote(assignment[2]) })) return null;
   }
   if (words[start] !== 'npx' || words[start + 1] !== 'vitest' || words[start + 2] !== 'run') return null;
   const args = words.slice(start + 3);

@@ -266,6 +266,12 @@ describe('verify remote routing', () => {
     'npx vitest run a.test.mjs && VERIFY_SCAN_FILES=x.mjs npx vitest run scan.test.mjs',
     'VERIFY_SCAN_FILES=x.mjs npx vitest run scan.test.mjs',
     'WE_VITEST_MAX_WORKERS=0 npx vitest run a.test.mjs',
+    // CI bypasses the nested wrapper's admission; with no outer slot it would run unslotted.
+    'CI=true npx vitest run a.test.mjs --testTimeout=15000',
+    'npx vitest run a.test.mjs && CI=1 npx vitest run b.test.mjs',
+    'NODE_ENV=test npx vitest run a.test.mjs',
+    'WE_VITEST_MAX_WORKERS=2 npx vitest run a.test.mjs',
+    'DIFF_COVERAGE_BASE=origin/main npx vitest run a.test.mjs',
     "'TZ'=UTC npx vitest run a.test.mjs",
     'TZ=UTC npx vitest related a.mjs --run',
     'npx vitest run a.test.mjs && npx vitest related b.mjs --run --passWithNoTests',
