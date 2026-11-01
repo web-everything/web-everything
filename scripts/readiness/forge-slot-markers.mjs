@@ -22,9 +22,10 @@ const LOCK_KEY = 'marker-mutation';
 async function withMarkerLock(root, work, {clock = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms))} = {}) {
   const owner = 'marker-' + randomBytes(12).toString('hex'), start = clock();
   for (;;) {
-    const now = clock(), entry = readLockEntry(root, LOCK_KEY);
-    const liveness = Number.isInteger(entry?.pid) && entry.pid !== process.pid ? probePidLiveness(entry.pid, process.pid) : 'unknown';
-    if (reserve(root, LOCK_KEY, owner, now, new Date(now).toISOString(), process.pid, liveness, 1, null, true).ok) break;
+    // Never hand `reserve` a liveness verdict read earlier: it rereads the holder itself, so a stale `dead` could
+    // reclaim a live holder's lock. A crashed holder is reclaimed by its 1-minute lease instead.
+    const now = clock();
+    if (reserve(root, LOCK_KEY, owner, now, new Date(now).toISOString(), process.pid, 'unknown', 1, null, true).ok) break;
     if (clock() - start >= 3000) throw new Error('remote-marker-busy');
     await sleep(25);
   }
@@ -67,7 +68,7 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const pid = ownerPid(root, Number(m[1]), file);
         if (liveness(pid, selfPid) !== 'dead') { firstDead.delete(name); continue; }
-        if (!firstDead.has(name)) firstDead.set(name, now);
+        if (!firstDead.has(name)) firstDead.set(name, clock()); // stamped after the death probe
         dead.push({name, file, mtimeMs, ino, index: Number(m[1])});
       }
       if (!dead.length) return [];
