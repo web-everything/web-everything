@@ -28,9 +28,9 @@ function ownerPid(root, index, file) {
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
  * A dead owner is reaped only when (1) it was first observed dead no later than the telemetry sample, so any Forge
- * receipt it created is already counted, (2) the marker is past the grace window, and (3) the number of dead-owner
- * markers exceeds Forge's reported active runs, so at most that many (the newest) may still be running.
- * Leaked Forge receipts only inflate activeRuns, which makes this stricter, never looser.
+ * receipt it created is already counted, (2) the marker is past the grace window, and (3) Forge reports ZERO active
+ * runs. Telemetry is only a count and cannot say WHICH marker's run is still going, so any active run keeps every
+ * dead-owner marker (never guess by age). Leaked Forge receipts therefore keep markers, never the other way round.
  */
 export function createMarkerReaper({root, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
@@ -56,15 +56,13 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
       const sampledAt = Date.parse(telemetry?.sampledAtET), active = telemetry?.activeRuns;
       if (!Number.isFinite(sampledAt) || !Number.isSafeInteger(active) || active < 0) return [];
       dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
-      let budget = dead.length - Math.min(dead.length, active);
+      if (active !== 0) return [];
       const reaped = [];
       for (const entry of dead) {
-        if (budget <= 0) break;
         if (now - entry.mtimeMs < graceMs || firstDead.get(entry.name) > sampledAt) continue;
         try { fs.unlinkSync(entry.file); } catch { continue; }
         firstDead.delete(entry.name);
         reaped.push(entry.name);
-        budget -= 1;
       }
       if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; Forge reports ${active} active run(s))\n`);
       return reaped;

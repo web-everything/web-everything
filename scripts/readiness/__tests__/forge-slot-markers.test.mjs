@@ -41,11 +41,13 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(tel(1))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
-  it('reaps only as many dead markers as Forge cannot account for, oldest first', async () => {
+  it('keeps every dead marker while Forge reports any active run (telemetry cannot say whose it is)', async () => {
     const root = setup({0: {pid: 111, ageMs: 900_000}, 1: {pid: 112, ageMs: 600_000}, 2: {pid: 113, ageMs: 300_000}});
     const reaper = createMarkerReaper({root, clock: () => NOW, liveness: liveness([111, 112, 113])});
-    expect(await reaper.step(tel(2))).toEqual(['slot-0.unconfirmed']);
-    expect(names(root)).toEqual(['1', '2']);
+    expect(await reaper.step(tel(2))).toEqual([]);
+    expect(await reaper.step(tel(1))).toEqual([]);
+    expect(names(root)).toEqual(['0', '1', '2']);
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed', 'slot-2.unconfirmed']);
   });
   it('keeps a young marker inside the grace window', async () => {
     const root = setup({0: {pid: 111, ageMs: 30_000}});
