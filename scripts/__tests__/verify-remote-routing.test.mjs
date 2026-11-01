@@ -161,6 +161,12 @@ describe('proven local fallback verdict', () => {
 });
 
 describe('verify remote routing', () => {
+  it('pins heavy-admission wrappers for the npm scripts accepted by wrappedNpmScript', () => {
+    const { scripts } = JSON.parse(readFileSync(resolve(repo, 'package.json'), 'utf8'));
+    for (const name of ['test:unit', 'check:standards']) {
+      expect(scripts[name]).toMatch(/^node scripts\/readiness\/heavy-admission\.mjs run --/);
+    }
+  });
   it.each([
     ['remote green never reruns', false, 0, false],
     ['remote red confirms locally', false, 1, true],
@@ -770,6 +776,10 @@ describe('R332: scan phases and whole-gate chains route to Forge', () => {
     const command = 'npx vitest run scripts/a.test.mjs && npm run check:standards';
     expect(phaseAdmissionPlan({ command, decision: remote }))
       .toEqual({ command: 'npm run test:unit -- scripts/a.test.mjs && npm run check:standards', takeLocalSlot: false, setHeld: false });
+  });
+  it('a quoted vitest file in a mixed chain is wrapped like an unquoted one (formerly a keep-local case)', () => {
+    expect(phaseAdmissionPlan({ command: "npx vitest run 'one.test.mjs' && npm run check:standards", decision: { remote: true } }))
+      .toEqual({ command: "npm run test:unit -- 'one.test.mjs' && npm run check:standards", takeLocalSlot: false, setHeld: false });
   });
   it.each([
     'npm run test:unit && node scripts/x.mjs',
