@@ -9,7 +9,9 @@ import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, mkdirSync,
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
 
 const CLEAN = {
   WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined,
@@ -49,6 +51,14 @@ for (let i = 0; i < ${CALLS}; i++) { const r = spawnSync(${JSON.stringify(shimPa
 }
 
 describe('gh shim process fan-out (R320 #1)', () => {
+  it('keeps the generator closure complete with its throttle dependency', () => {
+    const root = fileURLToPath(new URL('../../../', import.meta.url));
+    const closure = collectImportClosure({ root, entries: ['scripts/lib/gh-app-shim.mjs'] });
+    expect(closure?.complete).toBe(true);
+    expect(closure.files.has('scripts/lib/gh-throttle.mjs')).toBe(true);
+    expect(closure.files.has('scripts/lib/__tests__/gh-app-shim.perf.test.mjs')).toBe(false);
+  });
+
   it(`spawns no second (throttle) node over ${CALLS} calls: ps + git + gh only`, () => {
     const f = fixture();
     try {
@@ -68,6 +78,21 @@ describe('gh shim process fan-out (R320 #1)', () => {
 });
 
 describe('in-process throttle load failures', () => {
+  it('loads the baked module URL with quotes, spaces, hash and percent characters in its path', () => {
+    const f = fixture();
+    try {
+      const cli = join(f.dir, 'throttle "quoted" \'single\' # %.mjs');
+      writeFileSync(cli, 'export function runGhCliPassthrough() { return { status: 0, stdout: Buffer.from("literal target\\n"), stderr: Buffer.alloc(0) }; }\n');
+      const shim = join(f.dir, 'gh-literal-target');
+      writeFileSync(shim, renderGhShimScript({ realGhPath: f.real, cachePath: f.cachePath, ghThrottleCliPath: cli }));
+      const env = { ...process.env, ...CLEAN, WE_GH_THROTTLE_LOCK_ROOT: join(f.dir, 'locks'), LANE_POOL_ROOT: undefined };
+      const result = spawnSync(process.execPath, [shim, 'api', 'ping'], { cwd: f.repo, env, encoding: 'utf8', timeout: 10000 });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('literal target\n');
+      expect(result.stderr).toBe('');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
   it('a throttle module that throws on load fails like the old child (status 1, loader diagnostics), never an unthrottled bypass; a missing one still falls back', () => {
     const f = fixture();
     try {
