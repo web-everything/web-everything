@@ -143,3 +143,11 @@ describe('git-bounded survives a SIGKILL of its supervisor', () => {
     expect(alive).toBe(false);
   });
 });
+
+it('only network URLs have a slug: file:// and bare paths never read as GitHub', () => {
+  expect(canonicalRepoSlug('file://github.com/chalbert/web-everything.git')).toBeNull();
+  expect(canonicalRepoSlug('github.com/chalbert/web-everything.git')).toBeNull();
+  expect(canonicalRepoSlug('/local/chalbert/web-everything')).toBeNull();
+  expect(canonicalRepoSlug('https://github.com/chalbert/web-everything')).toBe('github.com/web-everything/web-everything');
+  expect(canonicalRepoSlug('ssh://git@github.com/chalbert/web-everything.git')).toBe('github.com/web-everything/web-everything');
+});

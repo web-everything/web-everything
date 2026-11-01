@@ -16,7 +16,10 @@ const REPO_ALIASES = new Map([['chalbert/web-everything', 'web-everything/web-ev
 /** `host/owner/repo` for ssh/https/scp URLs, lowercased, `.git` stripped, the known redirect folded. PURE. */
 export function canonicalRepoSlug(url) {
   if (typeof url !== 'string') return null;
-  const m = /^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?([^/:]+)[/:]([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(url.trim());
+  // Network forms only: scheme://host/owner/repo (ssh/https/git) or scp-like host:owner/repo. file:// and bare paths never match.
+  const u = url.trim();
+  const m = /^(?:ssh|https?|git|git\+ssh|ssh\+git):\/\/(?:[^@/]+@)?([^/:@]+)(?::\d+)?\/([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(u)
+    || /^(?:[^@/:]+@)?([^/:@]+):([^/]+)\/([^/]+?)(?:\.git)?\/*$/.exec(u);
   if (!m) return null;
   const ownerRepo = `${m[2].toLowerCase()}/${m[3].toLowerCase()}`;
   return `${m[1].toLowerCase()}/${REPO_ALIASES.get(ownerRepo) ?? ownerRepo}`;
