@@ -550,13 +550,6 @@ The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-o
 Its production admission regression in `review-job-red-team-only.test.mjs` is
 **fresh recovery preserves unknown finished-null history through production admission and launches no call**;
 it verifies that refusal restores the original finished/null status and publishes no comment.
-Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
-with a finite abandonment time and an integer abandonment PID matching the status PID. Production
-admission must still prove the writer dead before clearing that prior. The regressions
-**fresh recovery launches an abandoned stale running pass through production admission and the shared guard**,
-**fresh production admission holds a live running writer without stale abandonment**, and
-**fresh production admission and shared guard never rerun a finished ran result with a posted comment**
-pin that boundary; `red-team-run-result.test.mjs` covers malformed abandonment and spent retry evidence.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness
