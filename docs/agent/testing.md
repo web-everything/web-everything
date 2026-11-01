@@ -121,6 +121,13 @@ Opaque loaders follow one strict rule: a closure reference to `module`/`node:mod
 `process.loadEnvFile`, `process.execArgv`, `process.env.NODE_OPTIONS` or preload/loader flags,
 or a `data:`, `file:` or HTTP(S) import, returns `closure-incomplete`. This retains the entire
 conflict for full merge/manual rebase, including percent-escaped file URLs and encoded data URLs.
+Function-constructor aliases also refuse strict exclusion evidence: `constructor` references
+(including decoded escaped keys), computed property reads/bindings with unproven keys,
+and reflective descriptor access cannot establish a complete closure. Numeric indices remain
+modeled. The constructor-alias cases in `closure-scope-failclosed.test.mjs` cover ordinary,
+async and generator functions, a real Node runtime import, and saved-candidate verification
+in off/shadow/on modes. This conservatively refuses ordinary constructor metadata too;
+the existing full-merge/manual-rebase fallback applies. Non-strict import walks are unchanged.
 Tracked bare packages (including nested `node_modules`) and `.`/`..` package loads union
 all extension/index candidates and manifest targets in the extended strict walk only.
 The compact opaque-loader/package table checks protection through an imported closure file;
