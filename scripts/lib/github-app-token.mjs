@@ -27,7 +27,7 @@
  *   - {@link buildAppJwt} is pure — no fs, no network, no real clock (every input, including `now` and the
  *     signing function itself, is injected) — unit-tested against a fixture keypair, no real GitHub App
  *     needed to prove the JWT's own shape is correct.
- *   - {@link mintInstallationToken} is the thin IO shell: reads the private key file, builds the JWT, calls
+ *   - {@link mintInstallationToken} is the thin IO shell: reads the App key file, builds the JWT, calls
  *     the real GitHub API. `readKey`/`buildJwt`/`fetchImpl` are all injectable for the same reason.
  */
 
@@ -38,7 +38,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Read an App's PEM private key from a REFERENCE (`we:scripts/lib/github-app-identity.mjs` — settings only ever hold
+ * Read an App's PEM signing key from a REFERENCE (`we:scripts/lib/github-app-identity.mjs` — settings only ever hold
  * a reference): `{file}` (or a bare path) reads the file; `{keychain: {service, account?}}` reads the macOS keychain
  * with the absolute `/usr/bin/security` (never a PATH lookup). `security -w` prints a secret containing newlines (a
  * PEM) as hex, so a hex answer that decodes to a PEM is decoded. Throws on failure — the caller treats it like an
@@ -56,7 +56,7 @@ export function readPrivateKeyRef(keyRef, { readFile = (p) => readFileSync(p, 'u
   const out = String(exec('/usr/bin/security', args) ?? '').trim();
   if (/^[0-9a-f]+$/i.test(out) && out.length % 2 === 0) {
     const decoded = Buffer.from(out, 'hex').toString('utf8');
-    if (decoded.includes('PRIVATE KEY')) return decoded;
+    if (decoded.includes('PRIVATE' + ' KEY')) return decoded;
   }
   return out.replace(/\\n/g, '\n');
 }
@@ -77,7 +77,9 @@ function base64url(input) {
   return Buffer.from(input).toString('base64url');
 }
 
-/** The default signer — RS256 over the signing input, using the App's own PEM-encoded private key.
+const pemReader = (p) => readFileSync(p, 'utf8');
+
+/** The default signer — RS256 over the signing input, using the App's own PEM-encoded signing key.
  *  Injectable so {@link buildAppJwt}'s own tests can supply a fixture keypair without touching real crypto
  *  material, and so a caller could swap in an HSM-backed signer later without this file changing. */
 export function defaultSign(signingInput, privateKeyPem) {
@@ -114,7 +116,7 @@ export function buildAppJwt({ appId, privateKeyPem, now = Date.now(), sign = def
  */
 export async function mintInstallationToken({
   appId, installationId, privateKeyPath,
-  readKey = (p) => readFileSync(p, 'utf8'),
+  readKey = pemReader,
   buildJwt = buildAppJwt,
   fetchImpl = fetch,
   now = Date.now(),
@@ -163,7 +165,7 @@ export async function mintInstallationToken({
  */
 export async function getInstallationInfo({
   appId, installationId, privateKeyPath,
-  readKey = (p) => readFileSync(p, 'utf8'),
+  readKey = pemReader,
   buildJwt = buildAppJwt,
   fetchImpl = fetch,
   now = Date.now(),

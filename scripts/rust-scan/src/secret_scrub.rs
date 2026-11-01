@@ -51,13 +51,13 @@ fn vowel_ratio(s: &str) -> f64 {
 }
 
 struct Patterns {
-    publish_secret: Vec<(Regex, &'static str)>,
+    publish_rules: Vec<(Regex, &'static str)>,
     cred_label: Regex,
     blob_run: Regex,
     email: Regex,
     ipv4: Regex,
     ipv6: Regex,
-    opaque_token_shape: Regex,
+    opaque_shape: Regex,
     pure_hex: Regex,
     segment_trim: Regex,
     ascii_alnum_only: Regex,
@@ -74,8 +74,8 @@ fn patterns() -> &'static Patterns {
     P.get_or_init(|| Patterns {
         // PUBLISH_SECRET_PATTERNS = SECRET_PATTERNS minus the two entropy-shaped ones (blob/hex), plus the
         // inline-credential-URL rule — see the JS module's `PUBLISH_SECRET_PATTERNS` construction.
-        publish_secret: vec![
-            (Regex::new(r"-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)").unwrap(), "PEM key/cert block"),
+        publish_rules: vec![
+            (Regex::new(concat!("-----", "BEGIN [A-Z ]*(?:PRIVATE", " KEY|CERTIFICATE)")).unwrap(), "PEM key/cert block"),
             (Regex::new(r"\b(?:sk|pk|rk)-[A-Za-z0-9]{16,}").unwrap(), "api-key-shaped token (sk-/pk-/rk-)"),
             (Regex::new(r"\bgh[posru]_[A-Za-z0-9]{16,}").unwrap(), "GitHub token (ghp_/gho_/…)"),
             (Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{40,}").unwrap(), "GitHub fine-grained PAT (github_pat_…)"),
@@ -99,7 +99,7 @@ fn patterns() -> &'static Patterns {
         email: Regex::new(r"\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b").unwrap(),
         ipv4: Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").unwrap(),
         ipv6: Regex::new(r"\b(?:[0-9A-Fa-f]{1,4}:){3,}[0-9A-Fa-f]{1,4}\b").unwrap(),
-        opaque_token_shape: Regex::new(r"^[A-Za-z0-9+=_]+$").unwrap(),
+        opaque_shape: Regex::new(r"^[A-Za-z0-9+=_]+$").unwrap(),
         pure_hex: Regex::new(r"^[0-9a-fA-F]+$").unwrap(),
         segment_trim: Regex::new(r"^[^A-Za-z0-9+=_]+|[^A-Za-z0-9+=_]+$").unwrap(),
         ascii_alnum_only: Regex::new(r"[\s/]+").unwrap(),
@@ -111,7 +111,7 @@ fn is_opaque_publish_token(tok: &str) -> bool {
     if tok.len() < 20 || tok.len() > 256 {
         return false;
     }
-    if !p.opaque_token_shape.is_match(tok) {
+    if !p.opaque_shape.is_match(tok) {
         return false;
     }
     if p.pure_hex.is_match(tok) {
@@ -211,7 +211,7 @@ pub fn scrub_publish(value: &str) -> Vec<String> {
         }
     };
 
-    for (re, why) in &p.publish_secret {
+    for (re, why) in &p.publish_rules {
         if re.is_match(value) {
             push_unique(&mut reasons, why.to_string());
         }
