@@ -3,6 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { basename } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -80,6 +81,11 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
     }
+    // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
+    await checkPendingAdoptions({
+      root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
+      emit: (event) => emitEvent(event, eventOptions),
+    });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   return result;
 }
