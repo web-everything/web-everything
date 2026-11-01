@@ -39,6 +39,8 @@ function wrappedVitestCommand(command) {
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
   if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
+  // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
+  if (args.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(unquote(arg)))) return null;
   if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
   return [...words.slice(0, start), 'npm run test:unit --', ...args].join(' ');
 }
