@@ -9,15 +9,14 @@ export function reviewOnlyRedTeamResult(result) {
     && !Array.isArray(result.findings) && !result.provider && !result.model;
 }
 
-/** Abandoned stale runs require an explicit opt-in from marker-checked stale recovery. Null completions
+/** Abandoned stale runs carry explicit no-result provenance. Null completions
  * require the original queued record from confirmed-dead recovery.
  * Without that provenance, a null result may conceal a run whose seat evidence was lost.
  */
-export function redTeamStatusWithoutRun(row, { originalStatus, allowAbandonedRunning = false } = {}) {
+export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
   // The durable retry spend survives missing seat rows and legacy placeholder results.
   if (row?.retryCount !== undefined && row.retryCount !== 0) return false;
   if (row?.status === 'running' && row.result == null) {
-    if (allowAbandonedRunning !== true) return false;
     const abandoned = row.staleAbandoned;
     return abandoned != null && typeof abandoned === 'object' && !Array.isArray(abandoned)
       && Number.isFinite(typeof abandoned.at === 'string' ? Date.parse(abandoned.at) : abandoned.at)

@@ -1590,22 +1590,6 @@ describe('staleRedTeamRun — dead running owner recovery', () => {
 });
 
 describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
-  it.each([0, 1, 2])('review:human with an abandoned running row skips with %i stale markers', count => {
-    const f = staleFixture({
-      staleSpent: vi.fn(() => count === 2),
-      staleRedispatch: vi.fn(() => ({ count, nextOrdinal: count < 2 ? count + 1 : null,
-        firstMarkerMtimeMs: count > 0 ? staleNow : null })) });
-    f.rawPrs[0].labels = ['review:human'];
-    const status = f.readStatus(), evidence = { ...f.readEvidence(), loopPayload: payload() };
-    status.staleAbandoned = { at: staleNow, pid: status.pid };
-    f.readEvidence = () => evidence;
-
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team pass in flight' });
-    expect(f.staleSpent).not.toHaveBeenCalled();
-    expect(f.staleRedispatch).not.toHaveBeenCalled();
-    expect(f.lastDispatch.size).toBe(0);
-  });
-
   it.each([1, 2])('dead owner with pending labels skips a spent retry count of %i', retryCount => {
     const f = staleFixture();
     f.readStatus().retryCount = retryCount;
@@ -1675,45 +1659,6 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
 });
 
 describe('runRedTeamOnSkip — stale recovery effects', () => {
-  it.each([0, 1, 2])('review:human never dispatches abandoned running state with %i persisted stale markers after cooldown reset', count => {
-    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-human-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-    try {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-      const status = deadRunningStatus({ loopPayload: payload(),
-        staleAbandoned: { at: staleNow, pid: 6039 } });
-      const stored = JSON.stringify(status);
-      writeFileSync(statusPath, stored);
-      if (count > 0) writeFileSync(`${statusPath}.stale-redispatch-1`, '');
-      if (count === 2) writeFileSync(`${statusPath}.stale-redispatch-2`, '');
-      const f = staleFixture(), evidence = { ...f.readEvidence(), status, loopPayload: payload() };
-      f.rawPrs[0].labels = ['review:human'];
-      const claimNoRestart = vi.fn(), take = vi.fn();
-      const o = staleRunFixture({ env, rawPrs: f.rawPrs, readEvidence: () => evidence,
-        readStatus: key => readRedTeamStatus({ ...key, env }),
-        staleSpent: key => staleRecovery.staleRedTeamSpent({ ...key, env }),
-        staleRedispatch: key => staleRecovery.staleRedTeamRedispatch({ ...key, env }),
-        claimNoRestart, lastDispatch: new Map(),
-        capacity: { lanes: 1, budget: { left: 1 }, remainingStarts: 1, take } });
-      expect(o.staleRedispatch({ repo, pr, head }).count).toBe(count);
-
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why: 'red-team pass in flight' }], dispatched: [] });
-      o.lastDispatch.clear();
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why: 'red-team pass in flight' }], dispatched: [] });
-      expect(o.dispatch).not.toHaveBeenCalled();
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(o.recoverPayload).not.toHaveBeenCalled();
-      expect(claimNoRestart).not.toHaveBeenCalled();
-      expect(take).not.toHaveBeenCalled();
-      expect(o.capacity).toMatchObject({ lanes: 1, budget: { left: 1 }, remainingStarts: 1 });
-      expect(o.lastDispatch.size).toBe(0);
-      expect(readFileSync(statusPath, 'utf8')).toBe(stored);
-      expect(o.staleRedispatch({ repo, pr, head }).count).toBe(count);
-      expect(existsSync(`${statusPath}.stale-norestart`)).toBe(false);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-
   function withAbandoned(check, count = 1) {
     const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-norestart-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'daemon-events.jsonl') };

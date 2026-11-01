@@ -1608,7 +1608,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     // The status reader folds a surviving retry marker into retryCount. Check the admitted record too:
     // admission may have replaced a restored placeholder prior with null while the marker still stands.
     if (!retry && [status, admittedStatus].some(row => row?.retryCount !== undefined && row.retryCount !== 0)) return refuse('red-team retry already spent');
-    if (!retry && status != null && !redTeamStatusWithoutRun(status, { allowAbandonedRunning: true })) return refuse('prior red-team status; not re-run');
+    if (!retry && status != null && !redTeamStatusWithoutRun(status)) return refuse('prior red-team status; not re-run');
     if (!retry && rows.length > 0) return refuse('prior red-team seat row; not re-run');
     if (retry) {
       // Spend before any provider work. A missing seat row can never restore this allowance.

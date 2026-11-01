@@ -406,7 +406,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
             && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
             && !retry
             && (redTeamSkipNeedsSettlement(admissionPrior)
-            || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior, allowAbandonedRunning: true }))) admissionPrior = null;
+            || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }

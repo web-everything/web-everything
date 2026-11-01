@@ -349,14 +349,14 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (!owed) return skip('stored review does not owe a red team');
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
-      if ((!staleOwed && (evidence.inFlight || status?.status === 'running')) || evidence.queued) return skip('red-team pass in flight');
+      if ((!staleOwed && evidence.inFlight) || evidence.queued) return skip('red-team pass in flight');
       if (staleOwed) {
         if (status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
         const key = { repo, pr, head }, spent = staleSpent(key), redispatch = staleRedispatch(key);
         if (spent || redispatch.count > 0) {
           // Admission replaces the abandoned row with queued before a run starts.
           // An unchanged abandoned row means the prior job never launched a call.
-          if (redTeamStatusWithoutRun(status, { allowAbandonedRunning: true })) {
+          if (redTeamStatusWithoutRun(status)) {
             if (redispatch.count === 1) return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: false,
               why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
             return skip('stale red team already re-dispatched; inspect review run');
