@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { stripGateOnlyOptions, GATE_TIMEOUT_FLOORS } from '../readiness/forge-gate-options.mjs';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { phaseAdmissionPlan, laneConfigMaySetTimeouts, laneWrapperStripsGateOptions, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
 
@@ -33,18 +33,10 @@ describe('timeout preservation', () => {
     '--hookTimeout=30000 --testTimeout=15000 --passWithNoTests',
     '--testTimeout=5000 --hookTimeout=10000',
     '--passWithNoTests',
-  ])('hands the nested wrapper a Forge-compatible command stripped daemon-side: %s', flags => {
-    // The lane's own heavy-admission may predate stripGateOnlyOptions; the daemon's snapshot strips here.
+  ])('hands the nested wrapper every gate option under remote policy: %s', flags => {
     const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
-      .toEqual({ command: "npm run test:unit -- 'scripts/changed test.test.mjs'", takeLocalSlot: false, setHeld: false, stripped: true });
-    expect(phaseAdmissionPlan({ command, decision: { remote: false } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
-  });
-  it.each([
-    'npx vitest run --passWithNoTests',
-    'npx vitest run --testTimeout=15000 --hookTimeout=30000',
-  ])('fails closed when stripping would leave no test filter: %s', command => {
-    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+      .toEqual({ command: `npm run test:unit -- 'scripts/changed test.test.mjs' ${flags}`, takeLocalSlot: false, setHeld: false });
   });
   it.each([
     "'--testTimeout=15000' --hookTimeout='30000'",
@@ -73,7 +65,7 @@ describe('timeout preservation', () => {
     const decidePhaseRemote = vi.fn(async () => ({ remote: true }));
     // Simulate Forge becoming unavailable: the child runs locally and needs the requested
     // timeout for a six-second edited test. A stripped command produces the original red.
-    const runGate = vi.fn(async (childCommand, _args, { forgeDispatch = false } = {}) => ({
+    const runGate = vi.fn(async (childCommand, _args, { forgeDispatch }) => ({
       exitCode: childCommand.includes('--testTimeout=15000') && childCommand.includes('--hookTimeout=30000') ? 0 : 1,
       remoteAttempt: forgeDispatch, ranOn: { location: 'local' },
     }));
@@ -98,25 +90,93 @@ describe('timeout preservation', () => {
     const timedRunGate = runInNewContext(`${source.slice(runStart, runEnd)}; timedRunGate`, context);
     const result = await timedRunGate('vitestMs', command);
     expect(result.exitCode).toBe(0);
-    // The stripped handoff fell back inside an old lane's wrapper and went red; the original command,
-    // with every flag, then runs locally under a local slot and owns the verdict.
-    expect(runGate).toHaveBeenCalledTimes(2);
-    expect(runGate).toHaveBeenNthCalledWith(1, 'npm run test:unit -- scripts/changed.test.mjs', undefined, { forgeDispatch: true });
-    expect(runGate).toHaveBeenNthCalledWith(2, command, undefined);
-    expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
-    expect(acquireSlotBlocking).toHaveBeenCalledTimes(1);
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(runGate).toHaveBeenCalledWith('npm run test:unit -- scripts/changed.test.mjs --testTimeout=15000 --hookTimeout=30000',
+      undefined, { forgeDispatch: true });
+    expect(acquireSlotBlocking).not.toHaveBeenCalled();
     expect(decidePhaseRemote).toHaveBeenCalledTimes(1);
     expect(context.vitestAdmittedLocally).toBe(true);
   });
 });
 
-describe('proven local fallback verdict', () => {
-  it.each(['local', 'mixed'])('confirms a stripped plan\'s %s red: it ran the stricter command, not the original', location => {
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, stripped: true }, exitCode: 1, ranOn: { location } })).toBe(true);
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, stripped: true }, exitCode: 124, ranOn: { location } })).toBe(false);
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, stripped: true }, exitCode: 0, ranOn: { location } })).toBe(false);
+// A lane checkout that predates #6154: its wrapper forwards every option to Forge, which rejects them.
+function oldLane({ config = "export default { test: {} };\n", files = {} } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'verify-old-lane-'));
+  mkdirSync(join(root, 'scripts/readiness'), { recursive: true });
+  writeFileSync(join(root, 'scripts/readiness/heavy-admission.mjs'), 'export const remoteArgv = requested => requested;\n');
+  if (config !== null) writeFileSync(join(root, 'vitest.config.ts'), config);
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(root, name), text);
+  return root;
+}
+
+describe('daemon-side gate option stripping (lanes without #6154)', () => {
+  const gate = "npx vitest run 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000"
+    + " && TZ=UTC npx vitest run 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000";
+
+  it('detects which wrapper the lane carries, and this repo (the daemon snapshot) sets no config timeout', () => {
+    expect(laneWrapperStripsGateOptions(repo)).toBe(true);
+    expect(laneConfigMaySetTimeouts(repo)).toBe(false);
+    const root = oldLane();
+    try { expect(laneWrapperStripsGateOptions(root)).toBe(false); } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('hands an old lane the Forge-compatible command; a #6154+ lane keeps every option for its own fallback', () => {
+    const root = oldLane();
+    try {
+      expect(phaseAdmissionPlan({ command: gate, cwd: root, decision: { remote: true } })).toEqual({
+        command: "npm run test:unit -- 'a.test.mjs' && TZ=UTC npm run test:unit -- 'b.test.mjs'",
+        takeLocalSlot: false, setHeld: false, stripped: true,
+      });
+      // The daemon-local plan never changes.
+      expect(phaseAdmissionPlan({ command: gate, cwd: root, decision: { remote: false } })).toEqual({ command: gate, takeLocalSlot: true, setHeld: true });
+      expect(phaseAdmissionPlan({ command: 'npx vitest run a.test.mjs', cwd: root, decision: { remote: true } }))
+        .toEqual({ command: 'npm run test:unit -- a.test.mjs', takeLocalSlot: false, setHeld: false });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+    expect(phaseAdmissionPlan({ command: gate, cwd: repo, decision: { remote: true } })).toEqual({
+      command: "npm run test:unit -- 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000"
+        + " && TZ=UTC npm run test:unit -- 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000",
+      takeLocalSlot: false, setHeld: false,
+    });
+  });
+
+  it.each([
+    ['config sets testTimeout', { config: 'export default { test: { testTimeout: 60000 } };\n' }],
+    ['imported shared config sets hookTimeout', { config: "import s from './shared';\nexport default s;\n", files: { 'shared.ts': 'export default { test: { hookTimeout: 60000 } };\n' } }],
+    ['config imports a file that cannot be resolved', { config: "import s from './missing';\nexport default s;\n" }],
+    ['no config file at all', { config: null }],
+    ['a workspace file exists', { files: { 'vitest.workspace.ts': 'export default [];\n' } }],
+  ])('a stripped timeout would let the lane config win, so the command stays local and intact: %s', (_label, shape) => {
+    const root = oldLane(shape);
+    try {
+      expect(laneConfigMaySetTimeouts(root)).toBe(true);
+      expect(phaseAdmissionPlan({ command: gate, cwd: root, decision: { remote: true } })).toEqual({ command: gate, takeLocalSlot: true, setHeld: true });
+      // Dropping only --passWithNoTests never depends on the config.
+      expect(phaseAdmissionPlan({ command: 'npx vitest run a.test.mjs --passWithNoTests', cwd: root, decision: { remote: true } }))
+        .toEqual({ command: 'npm run test:unit -- a.test.mjs', takeLocalSlot: false, setHeld: false, stripped: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    'npx vitest run --passWithNoTests',
+    'npx vitest run --testTimeout=15000 --hookTimeout=30000',
+    'npx vitest run a.test.mjs --testTimeout=4999',
+    'npx vitest run a.test.mjs --passWithNoTests --passWithNoTests',
+    "npx vitest run a.test.mjs '--testTimeout=15000'",
+  ])('fails closed on an old lane when the strip is empty, partial or unrecognized: %s', command => {
+    const root = oldLane();
+    try {
+      expect(phaseAdmissionPlan({ command, cwd: root, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a stripped red that already ran locally stands; a remote one is confirmed with the original command', () => {
+    const plan = { takeLocalSlot: false, stripped: true };
+    for (const location of ['local', 'mixed']) expect(shouldConfirmRemoteRed({ plan, exitCode: 1, ranOn: { location } })).toBe(false);
+    expect(shouldConfirmRemoteRed({ plan, exitCode: 1, ranOn: { location: 'remote' } })).toBe(true);
+  });
+});
+
+describe('proven local fallback verdict', () => {
   it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
     const ranOn = phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode })));
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode, ranOn })).toBe(false);
@@ -144,7 +204,7 @@ describe('proven local fallback verdict', () => {
   it.each([false, true].flatMap(phaseAdmission => [
     ['vitestMs', 'npx vitest run scripts/changed.test.mjs', ['local-fallback']],
     ['standardsMs', 'npm run check:standards', ['local-fallback']],
-    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run scripts/changed.test.mjs', ['remote', 'local-fallback']],
+    ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npx vitest run scripts/changed.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ['remote', 'local-fallback']],
     ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run scripts/changed.test.mjs', ['local-fallback', 'remote']],
   ].map(([phase, command, locations]) => ({ phaseAdmission, phase, command, locations }))))(
     'retains the failed child and its evidence: $phase, $locations, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command, locations }) => {
@@ -277,19 +337,19 @@ describe('verify remote routing', () => {
     '--hookTimeout=30000',
     '--testTimeout=5000 --hookTimeout=10000',
     '--reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
-  ])('selected Vitest run with trailing gate flags goes to the wrapper stripped daemon-side: %s', flags => {
+  ])('selected Vitest run with trailing gate flags goes to the wrapper with every flag intact: %s', flags => {
     const files = "'scripts/path with spaces.test.mjs' 'scripts/two.test.mjs'";
-    const kept = flags.startsWith('--reporter=dot') ? ' --reporter=dot' : '';
     expect(phaseAdmissionPlan({ command: `npx vitest run ${files} ${flags}`, decision: { remote: true } })).toEqual({
-      command: `npm run test:unit -- ${files}${kept}`, takeLocalSlot: false, setHeld: false, stripped: true,
+      command: `npm run test:unit -- ${files} ${flags}`, takeLocalSlot: false, setHeld: false,
     });
   });
   it('the daemon selected-tests gate chain is remote-eligible segment by segment', () => {
     const one = "npx vitest run 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000";
     const two = "TZ=UTC npx vitest run 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000";
     expect(phaseAdmissionPlan({ command: `${one} && ${two}`, decision: { remote: true } })).toEqual({
-      command: "npm run test:unit -- 'a.test.mjs' && TZ=UTC npm run test:unit -- 'b.test.mjs'",
-      takeLocalSlot: false, setHeld: false, stripped: true,
+      command: "npm run test:unit -- 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000"
+        + " && TZ=UTC npm run test:unit -- 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000",
+      takeLocalSlot: false, setHeld: false,
     });
     expect(phaseAdmissionPlan({ command: `${one} && ${two}`, decision: { remote: false } }))
       .toEqual({ command: `${one} && ${two}`, takeLocalSlot: true, setHeld: true });
@@ -484,6 +544,7 @@ describe('verify-lane remote phase spawn', () => {
     ['unreadable', 0, 'unknown', false],
     ['raw', 0, 'local', true],
     ['raw', 0, 'local', true, 'npm run test:unit && node raw.cjs'],
+    // Stripped by the daemon: the fixture lane's own wrapper would forward the options to Forge.
     ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
       ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot']],
     ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot",
@@ -514,6 +575,8 @@ describe('verify-lane remote phase spawn', () => {
     try {
       execFileSync('git', ['init', '-q'], { cwd: root });
       execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'fixture'], { cwd: root });
+      // The fixture lane carries no heavy-admission of its own (a pre-#6154 lane) and a config without timeouts.
+      writeFileSync(join(root, 'vitest.config.ts'), 'export default { test: {} };\n');
       const events = join(root, 'events.jsonl');
       const heavy = pathToFileURL(resolve(repo, 'scripts/readiness/heavy-admission.mjs')).href;
       const routing = pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href;
