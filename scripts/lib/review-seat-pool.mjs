@@ -5,13 +5,13 @@
 // The user's primary checkout and the lane are never touched: objects arrive by `fetch` into the pool's own store.
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 export const SEAT_POOL_KEEP = 4;
 export const SEAT_POOL_MAX_IDLE_MS = 24 * 60 * 60 * 1000;
-export const SEAT_LOCK_STALE_MS = 6 * 60 * 60 * 1000;
+export const SEAT_LEASE_DEFAULT_MS = 6 * 60 * 60 * 1000;
 const SLOT = /^slot-(\d+)$/;
 const GIT_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -22,6 +22,14 @@ function git(args, { allowFail = false } = {}) {
   if (r.status !== 0 && !allowFail) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
   return r;
 }
+/** The pool lives at a predictable temp path: use a directory only if it is a real one, ours, and not group/world writable. */
+function ownPrivateDir(dir) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  if (!st.isDirectory() || st.isSymbolicLink() || (typeof process.getuid === 'function' && st.uid !== process.getuid()) || (st.mode & 0o022) !== 0) {
+    throw new Error(`seat pool path is not a private directory owned by this user: ${dir}`);
+  }
+}
 const lstatOrNull = (p) => { try { return lstatSync(p); } catch { return null; } };
 const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 const paths = (poolDir) => ({
@@ -30,17 +38,18 @@ const paths = (poolDir) => ({
 
 /**
  * Claim `lockDir` for this process. A held lock is reclaimed only when its owner is dead AND it is older than
- * SEAT_LOCK_STALE_MS (far beyond any seat's wall clock, since a seat can outlive its parent). Reclaiming is keyed to
+ * its own recorded lease (`expiresAt`, the seat's wall clock plus margin) has passed, since a seat can outlive its
+ * parent; a lock with no lease is never reclaimed. Reclaiming is keyed to
  * the stale lock's own token: a marker `<lock>.reclaim-<staleToken>` is taken exclusively (mkdir), the lock is
  * re-read and must STILL carry that token, and the replacement lock exists before the marker is dropped. So of
  * several reclaimers of one stale lock exactly one wins, and none can remove a lock a later seat has taken. A
  * process killed inside that few-millisecond window leaks the one slot (it is skipped, never shared).
  */
-function tryLock(lockDir, now, poolDir, token = randomUUID()) {
+function tryLock(lockDir, now, token = randomUUID(), leaseMs = SEAT_LEASE_DEFAULT_MS) {
   const take = () => {
     try {
       mkdirSync(lockDir);
-      writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token }));
+      writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token, expiresAt: now() + leaseMs }));
       return true;
     } catch (e) {
       if (e.code === 'EEXIST') return false;
@@ -51,9 +60,7 @@ function tryLock(lockDir, now, poolDir, token = randomUUID()) {
   let owner = {};
   try { owner = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')); } catch { /* half-written lock */ }
   if (!owner.token || (owner.pid && pidAlive(owner.pid))) return false;
-  let age;
-  try { age = now() - statSync(lockDir).mtimeMs; } catch { return take(); } // released meanwhile
-  if (age < SEAT_LOCK_STALE_MS) return false;
+  if (!Number.isFinite(owner.expiresAt) || now() < owner.expiresAt) return false;
   const marker = `${lockDir}.reclaim-${owner.token}`;
   try { mkdirSync(marker); } catch (e) { if (e.code === 'EEXIST') return false; throw e; }
   try {
@@ -78,10 +85,11 @@ const readRev = (p, n) => { try { return readFileSync(join(p.state, `slot-${n}.r
  * name, release or delete a later seat's checkout; `slotDir` is the shared slot behind it.
  * @returns {{dir:string, slotDir:string, reused:boolean, release:()=>void}}
  */
-export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP } = {}) {
+export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP, leaseMs = SEAT_LEASE_DEFAULT_MS } = {}) {
   const p = paths(poolDir);
-  for (const d of [p.slots, p.locks, p.state, p.views]) mkdirSync(d, { recursive: true });
+  for (const d of [poolDir, p.slots, p.locks, p.state, p.views]) ownPrivateDir(d);
   if (!existsSync(join(p.repo, 'HEAD'))) git(['init', '--quiet', '--bare', p.repo]);
+  ownPrivateDir(p.repo);
   if (git(['-C', p.repo, 'cat-file', '-e', `${rev}^{commit}`], { allowFail: true }).status !== 0) {
     git(['-C', p.repo, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, `+${rev}:refs/seat/${rev}`]);
   }
@@ -90,7 +98,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   for (const n of order) {
     const lockDir = join(p.locks, `slot-${n}`);
     const token = randomUUID();
-    if (!tryLock(lockDir, now, poolDir, token)) continue;
+    if (!tryLock(lockDir, now, token, leaseMs)) continue;
     const dir = join(p.slots, `slot-${n}`);
     // Idempotent and token-checked: a repeated release can never free a lock that a later seat now holds.
     const view = join(p.views, token);
@@ -106,7 +114,11 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
     try {
       const reused = existsSync(join(dir, '.git')) && readRev(p, n) === rev;
       rmSync(join(p.state, `slot-${n}.rev`), { force: true }); // unknown while the tree is being brought to `rev`
-      if (existsSync(join(dir, '.git'))) {
+      if (existsSync(dir)) {
+        // Only ever reset a slot that is a real directory of ours registered in THIS pool's store, never a planted link.
+        ownPrivateDir(dir);
+        const link = readFileSync(join(dir, '.git'), 'utf8').trim().replace(/^gitdir: /, '');
+        if (realpathSync(link) !== realpathSync(join(p.repo, 'worktrees', basename(dir)))) throw new Error(`seat slot is not a worktree of this pool: ${dir}`);
         git(['-C', dir, 'reset', '--quiet', '--hard', rev]);
         git(['-C', dir, 'clean', '--quiet', '-ffdx']); // drop anything a previous seat left, ignored files included
       } else {
@@ -140,7 +152,7 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
     slots.forEach(({ n, mtime }, i) => {
       if (i < keep && now() - mtime < maxIdleMs) return;
       const lockDir = join(p.locks, `slot-${n}`);
-      if (!tryLock(lockDir, now, poolDir)) return;
+      if (!tryLock(lockDir, now)) return;
       try {
         git(['-C', p.repo, 'worktree', 'remove', '--force', join(p.slots, `slot-${n}`)], { allowFail: true });
         rmSync(join(p.slots, `slot-${n}`), { recursive: true, force: true });

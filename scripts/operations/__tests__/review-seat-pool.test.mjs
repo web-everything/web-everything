@@ -1,6 +1,6 @@
 import { it, expect, afterEach, beforeEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -55,13 +55,13 @@ it('keeps seat inputs outside the pinned tree and clears them on reuse; a live o
   expect(existsSync(input)).toBe(false);
   c.release();
   // dead owner: a young lock is kept; an old one is reclaimed unless a reclaim of that exact token is in flight
-  const dead = () => { mkdirSync(lock, { recursive: true }); writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2 ** 22 + 12345, token: 't0' })); };
+  const dead = () => { mkdirSync(lock, { recursive: true }); writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2 ** 22 + 12345, token: 't0', expiresAt: Date.now() + 3600e3 })); };
   rmSync(lock, { recursive: true, force: true }); dead();
   expect(acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }).slotDir).not.toBe(c.slotDir); // young
-  utimesSync(lock, new Date(0), new Date(0));
   mkdirSync(`${lock}.reclaim-t0`);
   expect(acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }).slotDir).not.toBe(c.slotDir); // reclaim in flight
   rmSync(`${lock}.reclaim-t0`, { recursive: true });
+  writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2 ** 22 + 12345, token: 't0', expiresAt: Date.now() - 1 }));
   const d = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   expect(d.slotDir).toBe(c.slotDir);
   expect(existsSync(`${lock}.reclaim-t0`)).toBe(false);
@@ -93,6 +93,17 @@ it('normalizes findings cited by the view path or by the physical slot path to r
     expect(repoRelativeFindings(mk(file), a.dir).s.findings[0].file).toBe('src/x.mjs');
   }
   a.release();
+});
+
+it('refuses a planted slot link: never resets a directory it did not create', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  rmSync(a.slotDir, { recursive: true, force: true });
+  symlinkSync(lane, a.slotDir); // attacker/mistake: slot-1 -> the lane
+  writeFileSync(join(lane, 'precious.txt'), 'keep');
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool })).toThrow(/not a private directory/); // caller falls back to a full copy
+  expect(readFileSync(join(lane, 'precious.txt'), 'utf8')).toBe('keep');
+  expect(git(lane, 'rev-parse', 'HEAD')).toBe(rev2);
+  expect(readdirSync(join(pool, 'locks'))).toEqual([]);
 });
 
 it('moves a warm slot to a new commit rewriting only the changed file', () => {

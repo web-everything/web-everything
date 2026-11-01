@@ -1076,7 +1076,8 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       if (!isPinnedRev(rev)) throw new Error(`makeScratch: refusing an unpinned rev ${JSON.stringify(rev ?? null)} — only a commit id is safe on a released lane`);
       if (!wantPrivate && env.WE_REVIEW_SEAT_POOL !== '0') {
         try {
-          const slot = acquireSeatSlot({ lanePath, rev });
+          // The lease outlasts the seat's own wall clock (two half-budget attempts + the outer 90s wall) with a wide margin.
+          const slot = acquireSeatSlot({ lanePath, rev, leaseMs: resolveSeatTimeoutMs(env) + 90_000 + 30 * 60_000 });
           ownReviewScratch(slot.dir, shutdownActiveSeats, { release: () => { slot.release(); pruneSeatPool(); } });
           return slot.dir;
         } catch (error) {
