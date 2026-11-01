@@ -600,10 +600,13 @@ export async function smokeAndAdopt({
       // Fork 3: shareable code checks on Forge when an executor is wired and Forge is ready; a Forge result is
       // accepted only for this exact tree. Any doubt -> the Mac runs the same checks (never a silent pass).
       let forgeRows = null;
-      if (!proven && !freshComparison && identity && typeof forgeExec === 'function') {
+      // Both dry-runs consume the live clone's pool/dispatch roots (see cloneIndependent in daemon-live-smoke), so Forge may
+      // stand in only for a shareable check explicitly flagged environment-independent; today that set is empty.
+      const forgeable = SMOKE_CHECKS.filter((c) => c.shareable && c.cloneIndependent).map((c) => c.name);
+      if (!proven && !freshComparison && identity && forgeable.length && typeof forgeExec === 'function') {
         const f = await runSmokeCodeChecksOnForge({ cwd: candidate.path, env, expectedTree: identity.tree,
           expectedNode: process.version, expectedHarness: smokeHarnessHash(),
-          allowedChecks: SHAREABLE_CHECK_NAMES, exec: forgeExec });
+          allowedChecks: forgeable, exec: forgeExec });
         log.error?.(`daemon-rebuild: smoke-forge ${JSON.stringify(f.ran ? { ran: true, checks: Object.keys(f.rows) } : { ran: false, reason: f.reason })}`);
         if (f.ran) forgeRows = f.rows;
       }

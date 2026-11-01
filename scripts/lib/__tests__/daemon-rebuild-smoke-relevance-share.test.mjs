@@ -190,8 +190,10 @@ describe('identity and harness hash', () => {
     const before = await runLiveSmoke(opts(root, { ...options, relevanceProof: makeRelevanceProof({ identity: baseline, git: git('a'.repeat(40)), env }) }));
     expect(before.results.find((r) => r.name === check.name)).toMatchObject({ skipped: true, skipReason: 'relevance' });
     const changed = smokePassIdentity(git('a'.repeat(40), component === 'lockfile' ? 'L2' : 'L'), 'sha', 'drain', {
-      harnessHash: component === 'harness' ? 'h2' : 'h1', nodeVersion: component === 'Node' ? 'v2' : 'v1',
+      harnessHash: component === 'harness' ? 'h2' : 'h1', nodeVersion: component === 'Node' ? 'v2' : 'v1', smokeEnv: SENV,
     });
+    expect(changed.relevanceKey).toMatch(/^[0-9a-f]{64}$/);
+    expect(changed.relevanceKey).not.toBe(baseline.relevanceKey);
     const proof = makeRelevanceProof({ identity: changed, git: git('a'.repeat(40)), env });
     expect(proof(check.name, closureHash)).toBe(false);
     const child = vi.fn(failing);
@@ -363,6 +365,9 @@ describe('audit findings (xfwf4zc)', () => {
     const id = (e) => smokePassIdentity(g, 'sha', 'drain', { harnessHash: 'h1', smokeEnv: { ...SENV, ...e } });
     expect(id({ WE_SMOKE_DISPATCH_PASSES: '1' }).relevanceKey).not.toBe(id({ WE_SMOKE_DISPATCH_PASSES: '0' }).relevanceKey);
     expect(id({ UNRELATED_VAR: '1' }).relevanceKey).toBe(id({}).relevanceKey);
+  });
+  it('Forge is inert until a shareable check is proven environment-independent (none today)', () => {
+    expect(SMOKE_CHECKS.filter((c) => c.shareable && c.cloneIndependent)).toEqual([]);
   });
 });
 
