@@ -32,6 +32,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir, sealJobEnv } from './card-batch-io.mjs';
 import { STEP_MIN_MS, budgetError, isBudgetError } from '../lib/tick-deadline.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
+import { fetchFresh, fetchFreshRemoteIdentity, fetchFreshWindowMs } from '../lib/git-fetch-fresh.mjs';
 import { raisedByMemberId } from '../lib/raised-by.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
@@ -82,8 +83,9 @@ const MAIN_BASE_CACHE = new Map();
  */
 export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS, deadline } = {}) {
   const key = resolve(laneDir);
+  const identity = fetchFreshRemoteIdentity(laneDir, 'origin', (args, cwd) => run(cwd, args));
   const hit = cache.get(key);
-  if (hit && now() - hit.at < maxAgeMs) return hit.sha;
+  if (identity !== null && hit?.identity === identity && now() - hit.at < Math.min(maxAgeMs, fetchFreshWindowMs())) return hit.sha; // never outlive the shared window
   const cap = (max) => {
     if (!deadline) return undefined;
     const left = deadline.left();
@@ -92,13 +94,15 @@ export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN
   };
   let fetched = true;
   const at = now();
-  try { run(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main'], cap(30_000)); } catch (error) {
+  let ageMs = 0;
+  // Only the fetch itself is capped at the time left; a budget error propagates, any other failure falls back to the lane's last fetch.
+  try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, maxAgeMs, run: (args, cwd) => run(cwd, args, args[0] === 'fetch' ? cap(30_000) : undefined) })); } catch (error) {
     cache.delete(key);
     if (isBudgetError(error)) throw error;
     fetched = false; /* fall back to the lane's last fetch */
   }
   const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}'], cap(Infinity));
-  if (fetched) cache.set(key, { at, sha });
+  if (fetched && identity !== null) cache.set(key, { at: at - ageMs, sha, identity }); // the window runs from the real fetch, never from a shared skip
   else cache.delete(key);
   return sha;
 }
