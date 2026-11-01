@@ -666,7 +666,8 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     const remoteRoot = join(f.lockRoot, '..', 'remote');
     mkdirSync(remoteRoot, { recursive: true });
     const marker = join(remoteRoot, 'slot-0.unconfirmed');
-    writeFileSync(marker, 'remote termination unconfirmed\n');
+    // A live owner (this process): a bare text marker with no lock holder would now be reaped as having no live owner.
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: Date.now() }) + '\n');
     const base = Date.now();
     let t = base;
     f.clock = () => (t += 10_000);
@@ -682,6 +683,21 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0, remoteResult: { mode: 'remote', code: 0 } });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('waiting for a remote slot instead of deferring locally');
+  });
+
+  it('records the Forge run id into the execution marker once the client reports it', async () => {
+    const f = await overloadFixture({ overloaded: false, freeAtMs: null });
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    rmSync(join(remoteRoot, 'slot-0.unconfirmed'));
+    let seen;
+    f.remoteExec = vi.fn(async options => {
+      options.onRun('r-' + 'a'.repeat(32));
+      seen = JSON.parse(readFileSync(join(remoteRoot, 'slot-0.unconfirmed.run'), 'utf8'));
+      return { mode: 'remote', code: 0 };
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(seen.run).toBe('r-' + 'a'.repeat(32));
+    expect(seen.owner).toBeTruthy();
   });
 
   it('reaps a dead client\'s stale marker and runs on the idle Forge instead of remote-full (perf10)', async () => {
