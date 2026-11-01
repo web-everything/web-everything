@@ -2009,10 +2009,15 @@ or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and lo
 Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-report guards,
 isolated retries and unsupported shell syntax stay local. Keep both planning and actual
 spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
-When a phase planned without a local slot exits non-zero, confirm it once locally through
-normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
+When a phase planned without a local slot exits non-zero without proven local execution,
+confirm it once locally through normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
 local timeout flags). Log the confirmation and use its result and failure details for the
 phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
+A valid `local-fallback` report already supplies the local verdict: preserve its exit code and
+failure details without another confirmation, including for edited tests and with isolated retry off.
+The `proven local fallback verdict` regressions execute production `timedRunGate` with injected
+child IO for Vitest and standards under both admission modes, offering a passing second child
+to catch an unconditional retry into green.
 Only a remote-planned first attempt sets `WE_FORGE_GATE_DISPATCH`, without a held local slot.
 Local phases and confirmation clear even an inherited dispatch flag so nested wrappers cannot
 dispatch remotely while the local slot is held. Pin both environment shapes in the spawn fixture.

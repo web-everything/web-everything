@@ -3,6 +3,63 @@ import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { runInNewContext } from 'node:vm';
+
+describe('proven local fallback verdict', () => {
+  it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
+    const ranOn = phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode })));
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode, ranOn })).toBe(false);
+  });
+
+  it.each(['remote', 'mixed', 'unknown', undefined])('preserves confirmation for unproven local execution: %s', location => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+      ...(location ? { ranOn: { location } } : {}) })).toBe(true);
+  });
+
+  // Execute the production orchestration with admission and child IO injected. No fixture Git writes.
+  // A second (passing) child is deliberately available to expose an unconditional retry into green.
+  it.each([false, true].flatMap(phaseAdmission => [
+    ['vitestMs', 'npx vitest run scripts/changed.test.mjs'],
+    ['standardsMs', 'npm run check:standards'],
+  ].map(([phase, command]) => ({ phaseAdmission, phase, command }))))(
+    'retains the failed child and its evidence: $phase, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command }) => {
+      const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+      const start = source.indexOf('async function timedRunGate(');
+      const end = source.indexOf('// runVitestOnBase', start);
+      expect(start).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(start);
+      const failure = { exitCode: 1, remoteAttempt: true,
+        ranOn: phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode: 1 }))),
+        failureDetails: { summary: 'local failure in scripts/changed.test.mjs' },
+        output: { stdout: '', stderr: 'FAIL scripts/changed.test.mjs' } };
+      const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: 0, ranOn: { location: 'local' } });
+      const acquireAdmission = vi.fn(async () => ({ ok: true }));
+      const recordOutcome = vi.fn();
+      const context = {
+        phaseAdmission, firstPhaseAdmission: { remote: true }, admission: { remote: true }, currentAdmission: null,
+        phaseAdmissionPlan, shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
+        runGate, acquireAdmission, recordOutcome, buildPhaseOutcome: value => value,
+        ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
+        resolvedGate: { decision: { changedFiles: ['scripts/changed.test.mjs'] } },
+        slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+        heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(),
+        ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1, REPO: repo, SLOT_HEARTBEAT_MS: 1000,
+        PHASE_TIMEOUT_MS: 10000, MARKER_NONCE_SUFFIX: '', performance,
+        process: { stderr: { write: vi.fn() } },
+      };
+      const timedRunGate = runInNewContext(`${source.slice(start, end)}; timedRunGate`, context);
+      const result = await timedRunGate(phase, command);
+      expect(result).toBe(failure);
+      expect(runGate).toHaveBeenCalledTimes(1);
+      expect(runGate).toHaveBeenCalledWith(phaseAdmissionPlan({ command, decision: { remote: true } }).command,
+        undefined, { forgeDispatch: true });
+      expect(acquireAdmission).not.toHaveBeenCalled();
+      expect(recordOutcome).toHaveBeenCalledWith(phase.replace(/Ms$/, ''), expect.objectContaining({ exitCode: 1,
+        failureDetails: failure.failureDetails }));
+      expect(context.ranOnPhases[phase.replace(/Ms$/, '')]).toEqual({ location: 'local' });
+      expect(context.process.stderr.write).not.toHaveBeenCalled();
+    });
+});
 
 describe('verify remote routing', () => {
   it.each([

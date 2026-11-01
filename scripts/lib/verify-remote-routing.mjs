@@ -51,8 +51,11 @@ export function phaseAdmissionPlan({ command, decision }) {
   return { command, takeLocalSlot: !remote, setHeld: !remote };
 }
 
-export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut } = {}) {
-  return plan?.takeLocalSlot === false && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
+export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
+  // The nested wrapper owns local fallback; its local red is already the local verdict.
+  // Confirming it again could discard a real failure before isolated-retry safeguards run.
+  return plan?.takeLocalSlot === false && ranOn?.location !== 'local'
+    && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }
 
