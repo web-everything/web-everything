@@ -44,6 +44,67 @@ describe('forge leaked-state reaper', () => {
     expect((await readdir(receipts)).filter(n => n.includes('.tomb-'))).toEqual([]);
     expect(await readFile(join(receipts, 'reap-audit.log'), 'utf8')).toContain('worker-active-1 run=' + dead.run);
   });
+  it('keeps a dead-owner run that has completed but not finished', async () => {
+    const completed = await leak(1, 15, {owner});
+    const receipt = join(receipts, completed.run + '.receipt');
+    await writeFile(receipt, JSON.stringify({run: completed.run, nonce, code: 0}));
+    probe.start = async () => null;
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    for (const path of [completed.lock, completed.file, receipt]) expect(await exists(path)).toBe(true);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+  });
+  it.each(['prepared', 'orphan', 'reservation-only'])('keeps a fresh receipt with %s state', async shape => {
+    const completed = await leak(1, 16, {owner, phase: shape === 'prepared' ? 'prepared' : 'running', ageMs: 3600e3});
+    if (shape === 'orphan') await rm(completed.lock, {recursive: true});
+    if (shape === 'reservation-only') await rm(completed.file);
+    const receipt = join(receipts, completed.run + '.receipt');
+    await writeFile(receipt, '{}');
+    probe.start = async () => null;
+    expect((await makeRunner().telemetry()).activeRuns).toBe(shape === 'reservation-only' ? 0 : 1);
+    expect(await exists(shape === 'orphan' ? completed.file : completed.lock)).toBe(true);
+    expect(await exists(receipt)).toBe(true);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+  });
+  it.each(['running', 'prepared', 'orphan', 'reservation-only'])('reaps completed-unfinished %s state once its receipt is aged', async shape => {
+    const completed = await leak(1, 17, {owner, phase: shape === 'prepared' ? 'prepared' : 'running', ageMs: 3600e3});
+    if (shape === 'orphan') await rm(completed.lock, {recursive: true});
+    if (shape === 'reservation-only') await rm(completed.file);
+    const receipt = join(receipts, completed.run + '.receipt');
+    await writeFile(receipt, '{}');
+    const old = new Date(Date.now() - 3600e3);
+    await utimes(receipt, old, old);
+    probe.start = async () => null;
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(await exists(completed.lock)).toBe(false);
+    expect(await exists(completed.file)).toBe(false);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(true);
+  });
+  it.each(['running', 'orphan', 'reservation-only'])('rechecks the receipt under the lease for %s state', async shape => {
+    const completed = await leak(1, 18, {owner, ageMs: 3600e3});
+    if (shape === 'orphan') await rm(completed.lock, {recursive: true});
+    if (shape === 'reservation-only') await rm(completed.file);
+    const receipt = join(receipts, completed.run + '.receipt');
+    probe.start = async () => null;
+    // This probe runs under the exclusive lease, after the initial decision.
+    probe.uidBusy = async () => { await writeFile(receipt, '{}'); return false; };
+    expect((await makeRunner().telemetry()).activeRuns).toBe(shape === 'reservation-only' ? 0 : 1);
+    expect(await exists(shape === 'orphan' ? completed.file : completed.lock)).toBe(true);
+    expect(await exists(receipt)).toBe(true);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+  });
+  it.each(['running', 'orphan'])('keeps %s state when receipt metadata is not a regular file', async shape => {
+    const completed = await leak(1, 19, {owner});
+    if (shape === 'orphan') await rm(completed.lock, {recursive: true});
+    const receipt = join(receipts, completed.run + '.receipt');
+    await mkdir(receipt);
+    const old = new Date(Date.now() - 3600e3);
+    await utimes(receipt, old, old);
+    probe.start = async () => null;
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    expect(await exists(completed.file)).toBe(true);
+    if (shape === 'running') expect(await exists(completed.lock)).toBe(true);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+  });
   it('reaps a run whose pid was reused by a process with a different start time', async () => {
     const reused = await leak(1, 2, {owner});
     probe.start = async () => '999';

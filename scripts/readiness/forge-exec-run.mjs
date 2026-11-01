@@ -677,6 +677,14 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
   async function readRecord(file) {try{const parsed=JSON.parse(await readPinned(file));return parsed!==null&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed:undefined;}catch(error){return error.code==='ENOENT'?null:undefined;}}
   // A reservation must carry a string run id; anything else is unprovable and kept.
   async function readReservation(file) {const r=await readRecord(file);return r===null||(r!==undefined&&typeof r.run==='string')?r:undefined;}
+  // run() may exit before finish() consumes its receipt. Owner death is not
+  // enough to reclaim that completed run until the receipt's own grace expires.
+  async function keepReceipt(run) {
+    try {
+      const st=await lstat(statePath(run,'receipt'));
+      return !st.isFile()||!(clock()-st.mtimeMs>=REAP_GRACE_MS);
+    }catch(error){if(error.code==='ENOENT')return false;throw error;}
+  }
   async function reapLeaked() {
     const names=await readdir(receipts);
     const found=names.map(n=>/^(r-[a-f0-9]{32})\.(prepared|running)$/.exec(n)).filter(Boolean).map(m=>({run:m[1],phase:m[2],file:join(receipts,m[0])}));
@@ -694,6 +702,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(!reservation||reservation.writerGuard!==1||reservation.slot!=='forge-exec-'+slotNumber||!runName(reservation.run)||!nonceOK(reservation.nonce))continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
       const decide=async()=>{
+        if(await keepReceipt(reservation.run))return false;
         if(entries.length>1)return false;
         if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:true});}
         const age=await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0);
@@ -719,11 +728,13 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       const reservationFile=join(receipts,writerName(record),'reservation.json');
       const reservation=await readReservation(reservationFile);
       if(reservation===undefined||reservation?.run===entry.run)continue;
+      if(await keepReceipt(entry.run))continue;
       if(!await ownerGone(record,entry.file,{allowAge:true}))continue;
       await withWorkerExclusive(writerName(record),async()=>{
         const again=await readReservation(reservationFile);
         if(again===undefined||again?.run===entry.run)return;
         if(await reapProbe.uidBusy((await identity(record.slot)).uid))return;
+        if(await keepReceipt(entry.run))return;
         if(!await ownerGone(record,entry.file,{allowAge:true}))return;
         await dropRecords(entry.run);
         await reapLog(`${entry.run}.${entry.phase} slot=${record.slot} reason=no-reservation`);
