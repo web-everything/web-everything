@@ -1,10 +1,14 @@
 import { it, expect, afterEach, beforeEach } from 'vitest';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, linkSync, mkdirSync, renameSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { acquireSeatSlot, pruneSeatPool } from '../../lib/review-seat-pool.mjs';
+import { acquireSeatSlot, pruneSeatPool, slotBusy } from '../../lib/review-seat-pool.mjs';
+import { ownReviewScratch, removeReviewScratch } from '../../lib/review-scratch.mjs';
+import { spawnKeepAlive } from '../../lib/test-keepalive.mjs';
+// Collect the review module before test deadlines start; cold module transforms are not slot operations.
+import { repoRelativeFindings, seatInputDir } from '../review-extra-seats.mjs';
 
 const roots = [];
 let lane; let pool; let rev1; let rev2;
@@ -39,8 +43,7 @@ it('gives two concurrent seats on one commit separate slots, then reuses a relea
   b.release(); c.release();
 });
 
-it('keeps seat inputs outside the pinned tree and clears them on reuse; a live or fresh lock is never reclaimed', async () => {
-  const { seatInputDir } = await import('../review-extra-seats.mjs');
+it('keeps seat inputs outside the pinned tree and clears them on reuse; a live or fresh lock is never reclaimed', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const input = seatInputDir(a.dir);
   expect(input.startsWith(a.slotDir + '/')).toBe(false);
@@ -67,8 +70,7 @@ it('keeps seat inputs outside the pinned tree and clears them on reuse; a live o
   expect(existsSync(`${lock}.reclaim-t0`)).toBe(false);
 });
 
-it('a repeated release or cleanup never frees or deletes a slot another seat now holds', async () => {
-  const { ownReviewScratch, removeReviewScratch } = await import('../../lib/review-scratch.mjs');
+it('a repeated release or cleanup never frees or deletes a slot another seat now holds', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   ownReviewScratch(a.dir, undefined, { release: a.release });
   removeReviewScratch(a.dir);
@@ -85,8 +87,7 @@ it('a repeated release or cleanup never frees or deletes a slot another seat now
   expect(readdirSync(join(pool, 'views'))).toEqual([]);
 });
 
-it('normalizes findings cited by the view path or by the physical slot path to repo-relative', async () => {
-  const { repoRelativeFindings } = await import('../review-extra-seats.mjs');
+it('normalizes findings cited by the view path or by the physical slot path to repo-relative', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const mk = (file) => ({ s: { findings: [{ file }] } });
   for (const file of [join(a.dir, 'src/x.mjs'), join(a.slotDir, 'src/x.mjs'), join(realpathSync(a.slotDir), 'src/x.mjs'), join(readlinkSync(a.dir), 'src/x.mjs')]) {
@@ -139,8 +140,7 @@ it('ignores replace refs and refuses a store that points at another repository',
   expect(git(lane, 'worktree', 'list').split('\n').length).toBe(1);
 });
 
-it('rewrites a poisoned store config, and a slot with a live cwd inside it is never reclaimed', async () => {
-  const { slotBusy } = await import('../../lib/review-seat-pool.mjs');
+it('rewrites a poisoned store config, and a slot with a live cwd inside it is never reclaimed', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
   const marker = join(lane, 'hook-ran');
   writeFileSync(join(pool, 'repo.git', 'config'), `[core]\n\tbare = true\n\thooksPath = ${join(lane, 'hooks')}\n[filter "x"]\n\tsmudge = touch ${marker}\n`);
@@ -167,7 +167,7 @@ it('refuses a store whose objects are redirected or borrowed, and never fetches 
 
 it('skips a released slot a surviving process still sits in, and rejects links inside object storage', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
-  const sitter = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 30000)'], { cwd: a.slotDir, stdio: 'ignore' });
+  const sitter = spawnKeepAlive({ cwd: a.slotDir, maxLifetimeMs: 30_000 });
   try {
     const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
     expect(b.slotDir).not.toBe(a.slotDir);
