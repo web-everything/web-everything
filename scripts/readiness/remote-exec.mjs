@@ -1081,6 +1081,13 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
+      // Scanners may skip nonexistent paths. Require the entire requested scope
+      // in the final snapshot, including warm-base leaves, before remote admission.
+      if (Object.hasOwn(executionEnv, 'VERIFY_SCAN_FILES')) {
+        const shipped = new Set(manifest.entries.map(entry => entry.path.toString('hex')));
+        const missing = JSON.parse(executionEnv.VERIFY_SCAN_FILES).find(path => !shipped.has(Buffer.from(path).toString('hex')));
+        if (missing !== undefined) return fallback('unshipped-scan-file', missing);
+      }
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
       const selectedKeys=new Set(selected.map(path=>path.toString('hex')));
       const stageDone=begin('mac-stage-and-rehash');
