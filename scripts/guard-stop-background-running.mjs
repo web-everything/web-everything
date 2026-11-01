@@ -44,7 +44,7 @@ export function findRunningBackgroundTask(entries) {
           if (bashUses.has(block.tool_use_id) && !started.has(block.tool_use_id) && block.is_error !== true && /running in background with ID/i.test(text)) {
             started.set(block.tool_use_id, { name: 'Bash', label: bashUses.get(block.tool_use_id) });
           }
-          const m = /(?:with ID|task[_ ]id|id)[:=\s"]+([a-z0-9]{6,})/i.exec(text);
+          const m = /(?:with ID|task[_ ]id|task|id)[:=\s"]+([a-z0-9]{6,})/i.exec(text);
           if (m && started.has(block.tool_use_id)) taskIdByUse.set(block.tool_use_id, m[1]);
         }
       }

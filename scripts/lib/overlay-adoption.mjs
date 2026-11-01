@@ -7,6 +7,7 @@
 import { spawnSync } from 'node:child_process';
 import nodeFs from 'node:fs';
 import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { overlayFilePath } from './daemon-overlays.mjs';
 
 export const OVERLAY_ADOPTION_OVERDUE_MS = 15 * 60 * 1000;
@@ -61,7 +62,7 @@ function updatePending(root, env, fs, change, { staleMs = 10000, waitMs = 3000 }
 export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOString(), loadedBy = null }, { env = process.env, fs = nodeFs } = {}) {
   if (!FULL_SHA.test(sha || '') || typeof ref !== 'string') return false;
   try {
-    updatePending(root, env, fs, (list) => [...list.filter((r) => r.ref !== ref), { ref, sha, at, loadedBy }]);
+    updatePending(root, env, fs, (list) => [...list.filter((r) => r.ref !== ref), { ref, sha, at, loadedBy, nonce: randomUUID() }]);
     return true;
   } catch { return false; }
 }
@@ -98,7 +99,7 @@ export async function checkPendingAdoptions({ root, env = process.env, fs = node
     }
     if (sent.length) {
       // Reconcile against FRESH state under the lock: a registration made while we emitted must survive.
-      const same = (list, r) => list.some((x) => x.ref === r.ref && x.sha === r.sha && x.at === r.at);
+      const same = (list, r) => list.some((x) => x.ref === r.ref && x.sha === r.sha && x.nonce === r.nonce);
       updatePending(root, env, fs, (fresh) => fresh.filter((r) => !same(adoptedDone, r))
         .map((r) => (same(overdueDone, r) ? { ...r, overdueSent: true } : r)));
     }

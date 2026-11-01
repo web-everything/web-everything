@@ -64,7 +64,7 @@ describe('overlay adoption events', () => {
     const { root, env } = setup();
     recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0).toISOString() }, { env });
     await checkPendingAdoptions({ root, env, daemon: 'd', now: () => t0, isAncestor: () => true,
-      emit: async () => { recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0 + 1000).toISOString() }, { env }); return true; } });
+      emit: async () => { recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0).toISOString() }, { env }); return true; } });
     expect(readPendingAdoptions(root, { env })).toHaveLength(1);
   });
   it('is best-effort: bad sha, unreadable file, throwing git or emit never throw', async () => {

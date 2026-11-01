@@ -47,6 +47,11 @@ describe('guard-stop-background-running', () => {
     const auto = [use('toolu_a', 'Bash', { command: 'sleep 999' }), ack('toolu_a', 'Command running in background with ID: auto777abc. Output is being written to /tmp/y')];
     expect(findRunningBackgroundTask(auto)).toMatchObject({ taskId: 'auto777abc' });
   });
+  it('reads the Monitor acknowledgment format and honours a TaskStop of it', () => {
+    const mon = [use('toolu_m', 'Monitor', { description: 'w' }), ack('toolu_m', 'Monitor started (task ba59nqsob, timeout 300000ms). You will be notified.')];
+    expect(findRunningBackgroundTask(mon)).toMatchObject({ taskId: 'ba59nqsob' });
+    expect(findRunningBackgroundTask([...mon, use('toolu_t', 'TaskStop', { task_id: 'ba59nqsob' }), ack('toolu_t', 'ok')])).toBeNull();
+  });
   it('fails open on junk input', () => {
     expect(findRunningBackgroundTask(null)).toBeNull();
     expect(findRunningBackgroundTask([null, {}, { message: 7 }])).toBeNull();
