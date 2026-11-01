@@ -27,6 +27,7 @@
  * (`<poolDir>/.lane-journal.jsonl`, never trimmed, rotated by size), which records every lease write/delete AND
  * every reset/clean/reclaim/litter deletion with its actor, reason and before-state. See its own section header.
  */
+import { dropLaneStatusCacheRow } from './lane-status-cache.mjs';
 import {
   existsSync, appendFileSync, readFileSync, writeFileSync, readdirSync, renameSync, statSync, openSync, readSync, closeSync,
 } from 'node:fs';
@@ -423,6 +424,7 @@ export function journalLaneEvent(dir, fields = {}, {
   try {
     const where = laneOfDir(dir);
     if (!where) return false;
+    dropLaneStatusCacheRow(where.poolDir, where.lane); // perf #3 — a mutated lane must be re-probed
     const entry = laneJournalEntry({ ...fields, nowMs, lane: where.lane, actor });
     if (unlessRepeat) {
       const previous = readLaneJournalTail(where.poolDir, { maxBytes: 256 * 1024 }).filter((e) => e?.lane === where.lane).at(-1);

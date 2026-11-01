@@ -675,7 +675,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     ];
     const allowedReader = [
       'run(bin, argv)', "run('git', hardenLaneGitArgs(argv))",
-      "exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'])",
+      "exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json', '--max-age-ms=0'])",
       'laneGit([...LANE_CONFIG_LIST_ARGS])',
       "laneGit(['rev-parse', '--verify', '--quiet', ref])",
       "laneGit(['rev-list', '--count', 'HEAD', '--not', ...tips])",
@@ -729,7 +729,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     // Exact commands, not a blacklist of today's destructive verbs. Any added
     // action must change this contract and demonstrate its guardLaneAction gate.
     expect(run.mock.calls.map(([, argv]) => argv)).toEqual([
-      ['/fixture/scripts/lane-pool.mjs', 'status', '--json'],
+      ['/fixture/scripts/lane-pool.mjs', 'status', '--json', '--max-age-ms=0'],
       ['config', '--show-scope', '--list', '--includes', '-z'],
       ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/lane/fixture'],
       ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'],
