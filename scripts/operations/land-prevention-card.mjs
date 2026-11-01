@@ -110,7 +110,7 @@ import {
   remainingAfter,
 } from '../lib/card-dedupe.mjs';
 
-import { STEP_MIN_MS, boundExec, isBudgetError, makeDeadline } from '../lib/tick-deadline.mjs';
+import { STEP_MIN_MS, boundExec, budgetError, isBudgetError, makeDeadline } from '../lib/tick-deadline.mjs';
 import { cursorSeed, readDrainCursor, rotateAfter, writeDrainCursor } from '../lib/prevention-drain-cursor.mjs';
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
 import { cappedLaneGit, removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
@@ -895,8 +895,8 @@ async function landPreventionCardImpl(input, {
   } finally {
     if (laneDir) {
       try {
-        // In a tick every cleanup git call is capped at the time left (5-30 s), so cleanup cannot outlast the tick before the release below.
-        const gitRun = inTick ? cappedLaneGit(() => Math.min(30_000, Math.max(5_000, deadline.left()))) : undefined;
+        // In a tick every cleanup git call is capped at the time left (at most the time left, none once it is spent: the non-fatal catch skips cleanup and the release below still runs).
+        const gitRun = inTick ? cappedLaneGit(() => { const left = deadline.left(); if (left < 1_000) throw budgetError('git'); return Math.min(30_000, left); }) : undefined;
         const removed = durable ? removeCards({ dir: laneDir, expected: handedOn, isLeaseCurrent, ...(gitRun ? { gitRun } : {}) }) : [];
         if (removed.length) write(`land-prevention-card: removed ${removed.length} filed card copy(ies) from the lane — ${removed.join(', ')}\n`);
         const saved = salvageCards({ dir: laneDir, lane: laneNum ?? 0, isLeaseCurrent, ...(gitRun ? { gitRun } : {}), reason: `land-prevention-card ${input.session}: card files left after ${durable ? 'a landed' : 'an unlanded'} filing` });
