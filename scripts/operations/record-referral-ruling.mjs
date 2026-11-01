@@ -46,6 +46,7 @@
  */
 
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
+import { canonicalRepoSlug } from '../lib/repo-slug.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
@@ -76,6 +77,7 @@ export const isBlockedFinding = (o) => o?.state === OPEN_FINDING_STATES.BLOCKED;
  */
 export function openReferralFindings({ comments, repo, pr, head, body = '', createdAt = '', cardReadable = () => false,
   unchangedFinding = () => null, autoPolicyRespectsNotReal = true }) {
+  repo = canonicalRepoSlug(repo);
   const context = { repo, pr, head, body, createdAt, cardReadable };
   const state = mandatoryReferralState(comments, context);
   // Unlike the gate's current-head hold, automatic writes require sound historical proof too.

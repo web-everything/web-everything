@@ -39,6 +39,7 @@
  */
 import { FALSE_FINDING_CAUSES } from './false-finding-causes.mjs';
 import { createHash } from 'node:crypto';
+import { canonicalRepoSlug } from './repo-slug.mjs';
 import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
@@ -3875,7 +3876,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      rulings.push(Object.freeze({ operator: true, repo: canonicalRepoSlug(r.repo), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
@@ -3885,9 +3886,13 @@ export function readOperatorRulings(comments, { head } = {}) {
 
 /** Shared fresh-read acceptance boundary and replay state. */
 export function mandatoryReferralState(comments, context = {}) {
-  const { records, malformed } = readReferralRecords(comments, context);
+  // One canonical repo spelling on both sides of every (repo, pr, head, run, key) match: a ruling written under the repo's
+  // old owner still rules the finding a record names under the new one (#6170). Nothing else about the key loosens.
+  const read = readReferralRecords(comments, context);
+  const records = read.records.map(r => ({ ...r, repo: canonicalRepoSlug(r.repo) }));
+  const malformed = read.malformed;
   const operator = readOperatorRulings(comments, context);
-  context = { ...context, operatorRulings: operator.rulings };
+  context = { ...context, ...(context.repo ? { repo: canonicalRepoSlug(context.repo) } : {}), operatorRulings: operator.rulings };
   const pending = malformed ? ['malformed-referral-record'] : [];
   if (operator.malformed) pending.push('malformed-operator-ruling');
   if (records.length && Object.hasOwn(context, 'head') && !/^[a-f0-9]{40}$/.test(context.head ?? '')) {
