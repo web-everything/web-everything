@@ -30,10 +30,13 @@ import yaml from 'js-yaml';
 import { fileIntoBatch } from '../card-batch-file.mjs';
 import { resolvePreventionBatchSettings } from '../../lib/card-batch-settings.mjs';
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
+import { removeFiledCards, salvageLaneCards } from '../../lib/lane-card-salvage.mjs';
+import { execFileSync } from 'node:child_process';
 
 const landPreventionCard = (input, deps) => realLandPreventionCard(input, {
   pendingDir: '/tmp/no-prevention-spool-for-unit-tests',
-  batch: async () => ({ batched: false, disabled: true, reason: 'per-card test' }), ...deps,
+  batch: async () => ({ batched: false, disabled: true, reason: 'per-card test' }),
+  removeCards: () => [], salvageCards: () => ({ status: 'none', removed: [] }), ...deps,
 });
 
 const INPUT = {
@@ -528,6 +531,101 @@ describe('landPreventionCard — dedupe before filing', () => {
     const result = await landPreventionCard(INPUT, { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe: () => { throw new Error('boom'); } });
     expect(result).toMatchObject({ ok: true, num: 9001 });
     expect(calls[1].args).toContain('file-item');
+  });
+});
+
+// R310 — 2026-11-01 03:25 ET, 75 of 90 pool lanes were released DIRTY with this filer's card files. The lane must be
+// clean when `release` runs, on every exit path: removed once the card is durable, saved-then-removed otherwise.
+describe('landPreventionCard — the lane is clean before release, on every exit path (R310)', () => {
+  const gitIn = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  function realLane() {
+    const root = mkdtempSync(join(tmpdir(), 'lpc-r310-'));
+    const lane = join(root, 'lane-7');
+    mkdirSync(join(lane, 'backlog'), { recursive: true });
+    gitIn(lane, ['init', '--quiet', '--initial-branch=main']);
+    gitIn(lane, ['config', 'user.email', 't@t.com']);
+    gitIn(lane, ['config', 'user.name', 't']);
+    writeFileSync(join(lane, 'backlog', '100-old.md'), 'old\n');
+    gitIn(lane, ['add', '.']);
+    gitIn(lane, ['commit', '--quiet', '-m', 'seed']);
+    return { root, lane, salvageRoot: join(root, 'salvage') };
+  }
+  const acquire = (lane) => JSON.stringify({ lane: 7, path: lane, session: 'prevention-card-test', holder: 'h' });
+  const REL = 'backlog/xabc123-prevention-guard.md';
+  /** A file-item stub that really writes the card into the lane, then answers `answer` (or throws it). */
+  const fileItem = (lane, answer) => () => {
+    writeFileSync(join(lane, REL), 'card\n');
+    if (answer instanceof Error) throw answer;
+    return answer;
+  };
+  const releaseSeesStatus = (lane, seen) => () => { seen.push(gitIn(lane, ['status', '--porcelain', '--untracked-files=all'])); return 'released'; };
+  const deps = (salvageRoot) => ({
+    write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
+    dedupe: () => null, removeCards: (o) => removeFiledCards({ ...o, salvageRoot }),
+    salvageCards: (o) => salvageLaneCards({ ...o, salvageRoot }),
+  });
+
+  it('forced error: file-item writes the card then times out — the card is saved and the lane is clean at release', async () => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      const seen = [];
+      const timeout = Object.assign(new Error('spawnSync node ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      const { exec } = scriptedExec([acquire(lane), fileItem(lane, timeout), releaseSeesStatus(lane, seen)]);
+      const result = await landPreventionCard(INPUT, { exec, ...deps(salvageRoot) });
+      expect(result).toMatchObject({ ok: false, step: 'file-item' });
+      expect(seen).toEqual(['']);
+      const [pool] = readdirSync(salvageRoot).filter((n) => n !== 'index.jsonl');
+      const [stamp] = readdirSync(join(salvageRoot, pool));
+      expect(readFileSync(join(salvageRoot, pool, stamp, REL), 'utf8')).toBe('card\n');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a staged card with a red commit step is saved and the lane is clean at release', async () => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      const seen = [];
+      const { exec } = scriptedExec([acquire(lane), fileItem(lane, JSON.stringify({ verdict: { num: null, rel: REL } })),
+        () => { gitIn(lane, ['add', '--', REL]); return ''; }, new Error('commit hook refused'), releaseSeesStatus(lane, seen)]);
+      const result = await landPreventionCard(INPUT, { exec, ...deps(salvageRoot) });
+      expect(result).toMatchObject({ ok: false, step: 'commit' });
+      expect(seen).toEqual(['']);
+      expect(readFileSync(join(salvageRoot, 'index.jsonl'), 'utf8')).toContain(REL);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a batched card (durable in the collector) has its lane copy removed before release', async () => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      const seen = [];
+      const { exec } = scriptedExec([acquire(lane), fileItem(lane, JSON.stringify({ verdict: { num: null, rel: REL } })), releaseSeesStatus(lane, seen)]);
+      const result = await landPreventionCard(INPUT, {
+        exec, ...deps(salvageRoot), batch: async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }),
+      });
+      expect(result).toMatchObject({ ok: true, step: 'batched' });
+      expect(seen).toEqual(['']);
+      expect(existsSync(join(salvageRoot, 'index.jsonl'))).toBe(false); // durable elsewhere: nothing to salvage
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a deduped batch admission (identity match only) saves the lane copy instead of just deleting it', async () => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      const seen = [];
+      const { exec } = scriptedExec([acquire(lane), fileItem(lane, JSON.stringify({ verdict: { num: null, rel: REL } })), releaseSeesStatus(lane, seen)]);
+      const result = await landPreventionCard(INPUT, {
+        exec, ...deps(salvageRoot), batch: async () => ({ batched: true, deduped: true, batchRef: 'lane/card-batch-prevention-1' }),
+      });
+      expect(result).toMatchObject({ ok: true, step: 'batched' });
+      expect(seen).toEqual(['']);
+      expect(readFileSync(join(salvageRoot, 'index.jsonl'), 'utf8')).toContain(REL);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a lane-cleanup throw never blocks the release', async () => {
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, new Error('boom'), 'released']);
+    const result = await landPreventionCard(INPUT, { exec, write: () => {}, salvageCards: () => { throw new Error('disk gone'); } });
+    expect(result).toMatchObject({ ok: false });
+    expect(calls.at(-1).args).toEqual(expect.arrayContaining(['release', '--lane=7']));
   });
 });
 

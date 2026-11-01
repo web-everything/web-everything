@@ -161,6 +161,7 @@ import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict
 // the acquire-time twin of `cleanLaneLitter`'s release-time cleanup — same allowlist, same verdict, never a
 // second hand-rolled classifier.
 import { cleanLaneLitter, planLitterCleanup } from './lib/lane-litter.mjs';
+import { salvageLaneCards } from './lib/lane-card-salvage.mjs';
 import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // #3383 gap 2 (auto-reclaim) — the SAME preservation primitives `lane-whois.mjs` itself uses to prove a lane's
 // uncommitted/ahead content is provably preserved (identical blob in origin, or a pushed/patch-equivalent
@@ -2985,6 +2986,14 @@ async function cmdRelease(repo) {
         reason: `release reaped known-safe scratch litter: ${litter.removed.join(', ')}`,
         unpushed: Number.isFinite(beforeLitter.unpushedCommits) ? beforeLitter.unpushedCommits > 0 : undefined,
       });
+    }
+    // R310 — a lane dirty ONLY with leftover backlog card files is saved, then cleaned; never handed back dirty.
+    if (!sameLease(readLease(dir), lease)) { log(`  lane-${n}: lease changed since it was read — not releasing; re-run if lane-${n} still looks wrong`); continue; }
+    const cards = salvageLaneCards({ dir, lane: n, pool: basename(repo.poolDir), reason: `release of lane-${n} (${lease.purpose || 'no purpose'})` });
+    if (cards.status === 'failed') { log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`); continue; }
+    if (cards.status === 'salvaged') {
+      log(`  lane-${n}: saved ${cards.removed.length} leftover card file(s) to ${cards.outDir} and cleaned them`);
+      journalLaneEvent(dir, { action: 'card-salvage', before: beforeLitter, removed: cards.removed, salvagedTo: cards.outDir, reason: 'release saved and cleaned leftover backlog card files' });
     }
     // #x96v5hl — was an unconditional `rmSync` right after the ownership/contested decision above, which was
     // made against `lease` as read at the TOP of this loop iteration — `cleanLaneLitter` and every check since

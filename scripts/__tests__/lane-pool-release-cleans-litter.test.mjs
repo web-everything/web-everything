@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -23,7 +23,7 @@ function git(args, cwd) {
 let base, originDir, referenceDir, poolRoot;
 
 function runPool(args) {
-  const env = { ...process.env, LANE_POOL_ROOT: poolRoot };
+  const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_SALVAGE_DIR: join(base, 'salvage') };
   delete env.LANE_SESSION;
   delete env.CLAUDE_CODE_SESSION_ID;
   const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env });
@@ -177,5 +177,55 @@ describe('lane-pool release reaps known-safe litter (#3568)', () => {
 
     expect(git(['rev-parse', 'HEAD'], dir)).toBe(head); // commit preserved — no reset/clean of tracked history
     expect(statusOf(lane).clean).toBe(true);
+  });
+});
+
+// R310 — 2026-11-01: 75 of 90 lanes were released DIRTY with only leftover card files and the pool read 0 acquirable.
+describe('lane-pool release saves, then cleans, a lane dirty only with backlog card files (R310)', () => {
+  function leaveCards(dir) {
+    mkdirSync(join(dir, 'backlog', 'raised-by', '5360'), { recursive: true });
+    writeFileSync(join(dir, 'backlog', 'xfmkody-prevention-guard.md'), 'card\n');
+    writeFileSync(join(dir, 'backlog', 'raised-by', '5360', '5771-abc.md'), 'raise\n');
+    git(['add', '--', 'backlog/raised-by/5360/5771-abc.md'], dir);
+  }
+
+  it('card-only dirt: the cards are saved byte for byte and the released lane reads clean', () => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    leaveCards(dir);
+    writeFileSync(join(dir, '.pr-body.md'), 'litter\n');
+    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    expect(release.code).toBe(0);
+    expect(JSON.parse(release.out).released).toBe(1);
+    expect(git(['status', '--porcelain', '--untracked-files=all'], dir)).toBe('');
+    expect(statusOf(lane).clean).toBe(true);
+    const out = join(base, 'salvage', 'litterpool');
+    const [stamp] = readdirSync(out);
+    expect(readFileSync(join(out, stamp, 'backlog/xfmkody-prevention-guard.md'), 'utf8')).toBe('card\n');
+    expect(readFileSync(join(out, stamp, 'backlog/raised-by/5360/5771-abc.md'), 'utf8')).toBe('raise\n');
+  });
+
+  it('cards plus other real work: nothing is touched (the existing release behavior)', () => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    leaveCards(dir);
+    writeFileSync(join(dir, 'file.txt'), 'real edit\n');
+    const before = git(['status', '--porcelain', '--untracked-files=all'], dir);
+    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    expect(release.code).toBe(0);
+    expect(git(['status', '--porcelain', '--untracked-files=all'], dir)).toBe(before);
+    expect(existsSync(join(base, 'salvage'))).toBe(false);
+  });
+
+  it('a save that fails refuses the release: the lease is kept and every card stays in the lane', () => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    leaveCards(dir);
+    writeFileSync(join(base, 'salvage'), 'not a directory'); // forced error
+    const before = git(['status', '--porcelain', '--untracked-files=all'], dir);
+    const release = runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    expect(JSON.parse(release.out).released).toBe(0);
+    expect(release.err + release.out).toMatch(/KEPT — card files could not be saved/);
+    expect(git(['status', '--porcelain', '--untracked-files=all'], dir)).toBe(before);
   });
 });
