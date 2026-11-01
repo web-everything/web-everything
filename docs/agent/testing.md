@@ -552,11 +552,7 @@ Its production admission regression in `review-job-red-team-only.test.mjs` is
 it verifies that refusal restores the original finished/null status and publishes no comment.
 Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
 with a finite abandonment time and an integer abandonment PID matching the status PID. Production
-admission must still prove the writer dead before clearing that prior. The execution guard
-refuses every still-running prior, including one marked abandoned: direct callers cannot
-use abandonment as proof of death. The regression
-**refuses direct fresh recovery without admission for an abandoned running live writer with zero calls**
-in `review-red-team-resume-only.test.mjs` pins that closed path. The regressions
+admission must still prove the writer dead before clearing that prior. The regressions
 **fresh recovery launches an abandoned stale running pass through production admission and the shared guard**,
 **fresh production admission holds a live running writer without stale abandonment**, and
 **fresh production admission and shared guard never rerun a finished ran result with a posted comment**

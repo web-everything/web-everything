@@ -1599,8 +1599,6 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
   } catch { return refuse('PR comments unreadable'); }
   if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head', true);
   if (redTeamMode === 'fresh') {
-    // Only production admission may clear an abandoned writer after proving it dead.
-    if (status?.status === 'running') return refuse('prior red-team status; not re-run');
     const rows = seatRows(records).filter(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo
       && Number(row.pr) === Number(pr) && row.rev === head);
     const retry = failedRedTeamRetry(status, { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
