@@ -100,6 +100,26 @@ export function isDesignTokenPath(path) {
   return designTokenLeaf.test(leaf)&&!credentialComponent.test(leaf.slice(0,-'.tokens.json'.length))
     &&!excludedComponent(leaf,true,true);
 }
+// Ruling R316: the SAME strict channel for tracked JSON directly inside four
+// public data registries (src/_data/<dir>/<stem>.json, one level, no nesting).
+// The stem must be credential-named by token/credential only; any other
+// credential word (secret, password, oauth, api-key, ...) stays excluded.
+const dataRegistryDirs=['protocols','intents','semantics','researchTopics'].map(dir=>Buffer.from(dir));
+const dataRegistryLeaf=/^[a-z0-9][a-z0-9-]*\.json$/;
+// credentialComponent minus token|credential: tested on the raw stem, never on
+// an edited copy, so no overlap (e.g. "secretoken") can hide a match.
+const otherCredentialWord=/secret|creds|passwd|password|oauth|api[-_ .]?key|^id_/;
+export function isDataRegistryPath(path) {
+  const parts=pathParts(path);
+  if(parts.length!==4||!parts[0].equals(Buffer.from('src'))||!parts[1].equals(Buffer.from('_data'))
+    ||!dataRegistryDirs.some(dir=>parts[2].equals(dir)))return false;
+  const leaf=parts[3].toString('latin1'),stem=leaf.slice(0,-'.json'.length);
+  // Only stems the credential regex would exclude join the channel; ordinary
+  // registry JSON keeps its unchanged path (tracked or not).
+  return dataRegistryLeaf.test(leaf)&&/token|credential/.test(stem)&&!otherCredentialWord.test(stem)
+    &&!excludedComponent(leaf,true,true);
+}
+const isStrictJsonPath=path=>isDesignTokenPath(path)||isDataRegistryPath(path);
 const secretField=/key|secret|token|passw(?:or)?d/i;
 const secretText=[
   [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
@@ -137,16 +157,16 @@ export function designTokenSecretFinding(content) {
 export function classifyManifestPath(path) {
   const parts=pathParts(path),names=parts.map(normalizedComponent);
   const excluded=names.some((name,i)=>excludedComponent(name,i===names.length-1));
-  const credentialSource=excluded && (isDesignTokenPath(path) || (sourceExtension.test(names.at(-1))
+  const credentialSource=excluded && (isStrictJsonPath(path) || (sourceExtension.test(names.at(-1))
     && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true))));
   return {parts,names,excluded,credentialSource};
 }
 export function manifestEntry(path,content,executable,tracked) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
-  if(isDesignTokenPath(path)) {
+  if(isStrictJsonPath(path)) {
     const finding=tracked?designTokenSecretFinding(content):'untracked';
-    if(finding)throw Object.assign(new Error(`Excluded design-token file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
+    if(finding)throw Object.assign(new Error(`Excluded credential-named JSON file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   return {path,sha256:sha(content),executable,tracked};
 }
