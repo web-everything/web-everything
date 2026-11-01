@@ -867,6 +867,8 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
+      // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
+      if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
       writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}),{flag:'wx',mode:0o600});
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }

@@ -25,7 +25,8 @@ export function markerContent({owner, pid, nowMs}) {
 export function blockedSlots(root, cap, readdir = readdirSync) {
   const blocked = new Set();
   let names = [];
-  try { names = readdir(root); } catch { /* unreadable root: caller's slot scan will fail closed elsewhere */ }
+  // Fail closed: only a missing directory means "nothing held"; any other error must stop admission.
+  try { names = readdir(root); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
   for (const name of names) {
     const m = HELD_NAME.exec(name);
     if (m && Number(m[1]) < cap) blocked.add(Number(m[1]));

@@ -53,6 +53,10 @@ describe('stale remote slot markers (perf10)', () => {
     writeFileSync(join(root, 'slot-3.unconfirmed.dead'), '{}');
     expect([...blockedSlots(root, 8)].sort()).toEqual([0, 1, 2]);
   });
+  it('fails closed when the marker directory cannot be listed', () => {
+    expect(() => blockedSlots('/x', 8, () => { throw Object.assign(new Error('boom'), {code: 'EIO'}); })).toThrow('boom');
+    expect([...blockedSlots('/x', 8, () => { throw Object.assign(new Error('none'), {code: 'ENOENT'}); })]).toEqual([]);
+  });
   it('reaps a dead owner whose run Forge cannot account for', async () => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, clock: () => NOW, liveness: liveness([111])});
