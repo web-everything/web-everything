@@ -739,6 +739,19 @@ export function appendVerifyRemoteReport(env, result) {
   try { appendFileSync(env.WE_VERIFY_REMOTE_REPORT, JSON.stringify(result) + '\n', { mode: 0o600 }); } catch { /* best-effort */ }
 }
 
+/** How long a remote-routed run waits for a free Forge slot before local admission (unless the host is overloaded). */
+export const REMOTE_FULL_WAIT_MS = 30_000;
+
+/** 7579: true only on a definite local-overload verdict: a measured load ratio over its limit, or measured memory
+ * headroom/pressure below its minimum. Anything else (unknown readings, the cpu-mem capacity verdict, which cannot
+ * tell "low" from "unknown") is not an overload here and keeps today's routing. Held re-entrant runs never count. */
+export const DEFINITE_OVERLOAD = /^host (load \d|memory (headroom|pressure) )/;
+export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmission) {
+  if (env?.[ADMISSION_HELD_ENV] === '1') return false;
+  const verdict = admit({ env, interactive: !!process.stdin.isTTY, log: () => {} });
+  return verdict?.admitted === false && DEFINITE_OVERLOAD.test(String(verdict.reason ?? ''));
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -754,10 +767,22 @@ export async function runWithRemoteDecision({
   loadPerCore = () => loadavg()[0] / cpus().length,
   remoteExec, remoteClientOverride = null, onDecision,
   log = (line) => process.stderr.write(line),
+  // Under test the real host's load must not change routing; tests inject this seam.
+  hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
-  const decision = decideRemote({ policy, loadPerCore: load, argv });
+  // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite
+  // overload verdict counts; an unreadable or throwing host check keeps today's routing.
+  let overloaded = null;
+  const isOverloaded = () => {
+    if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
+    return overloaded;
+  };
+  let decision = decideRemote({ policy, loadPerCore: load, argv });
+  if (!decision.remote && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
+    && Number.isFinite(load) && isOverloaded()) decision = { remote: true, reason: `${decision.reason}; host overloaded` };
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
@@ -777,14 +802,34 @@ export async function runWithRemoteDecision({
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   const waitAt = clock();
   let slot;
+  let healthAt = waitAt;
+  let overloadWaitLogged = false;
   try {
     for (;;) {
       const nowMs = clock();
+      // The extended overload wait never acquires a slot past the run's own timeout.
+      if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
       const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
       slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
       if(slot.ok)break;
-      if(nowMs-waitAt>=30000)return localFallback('remote-full (30s wait exhausted)');
-      await new Promise(resolve=>setTimeout(resolve,Math.min(1000,30000-(nowMs-waitAt))));
+      const waited = nowMs - waitAt;
+      if (waited >= REMOTE_FULL_WAIT_MS) {
+        // 7579: local admission would defer an overloaded host at once, so keep queueing for a Forge slot
+        // (same cap, same slot locks, health rechecked) up to the run's own timeout instead.
+        overloaded = null;
+        if (!isOverloaded()) return localFallback('remote-full (30s wait exhausted)');
+        if (waited >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round(waited / 1000)}s wait exhausted)`);
+        if (!overloadWaitLogged) {
+          log(`heavy-admission: remote full (cap=${cap}) and host overloaded - waiting for a remote slot instead of deferring locally\n`);
+          overloadWaitLogged = true;
+        }
+        if (nowMs - healthAt >= 10000) {
+          const checked = await health();
+          if (!checked.ok) return localFallback(checked.reason);
+          healthAt = clock();
+        }
+      }
+      await sleep(waited >= REMOTE_FULL_WAIT_MS ? 1000 : Math.min(1000, REMOTE_FULL_WAIT_MS - waited));
     }
   } catch { return localFallback('remote-slot-unreadable'); }
   const heartbeat = setInterval(() => heartbeatOwnedSlot({...slotOptions,fastSlots:0}),60000);

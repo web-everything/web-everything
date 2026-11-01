@@ -652,3 +652,118 @@ it('carries stage timings through legacy pre-execution adaptation without changi
   expect(adaptLegacyRemoteResult({mode:'fallback',reason:'copy-failed',timings}))
     .toEqual({mode:'not-started',terminated:true,reason:'copy-failed',timings});
 });
+
+// 7579: an overloaded host must not turn a full-but-healthy Forge into a local deferral.
+describe('host overload routes to Forge instead of deferring (7579)', () => {
+  async function overloadFixture({ overloaded = true, freeAtMs = 60_000, remote = { mode: 'always', maxConcurrent: 1 }, health = true } = {}) {
+    const { easternTimestamp } = await import('../forge-exec-run.mjs');
+    const f = fixture({ remote });
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    mkdirSync(remoteRoot, { recursive: true });
+    const marker = join(remoteRoot, 'slot-0.unconfirmed');
+    writeFileSync(marker, 'remote termination unconfirmed\n');
+    const base = Date.now();
+    let t = base;
+    f.clock = () => (t += 10_000);
+    f.readTelemetry = async () => (health ? { sampledAtET: easternTimestamp(t), cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] } : null);
+    f.sleep = vi.fn(async () => { if (freeAtMs !== null && t - base >= freeAtMs && existsSync(marker)) rmSync(marker); });
+    f.hostOverloaded = vi.fn(() => overloaded);
+    f.timeoutMs = 600_000;
+    return f;
+  }
+
+  it('[A1] waits for the Forge slot and runs remotely when the host is overloaded', async () => {
+    const f = await overloadFixture();
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0, remoteResult: { mode: 'remote', code: 0 } });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('waiting for a remote slot instead of deferring locally');
+  });
+
+  it('keeps the 30s remote-full fallback when the host is not overloaded', async () => {
+    const f = await overloadFixture({ overloaded: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('remote-full (30s wait exhausted)');
+  });
+
+  it('treats a throwing overload check as not overloaded (today\'s fallback)', async () => {
+    const f = await overloadFixture();
+    f.hostOverloaded = vi.fn(() => { throw new Error('boom'); });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(f.remoteExec).not.toHaveBeenCalled();
+  });
+
+  it('never exceeds maxConcurrent: a slot that never frees falls back at the run timeout', async () => {
+    const f = await overloadFixture({ freeAtMs: null });
+    f.timeoutMs = 120_000;
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('host overloaded; ');
+  });
+
+  it('never takes a slot that frees only after the run timeout', async () => {
+    const f = await overloadFixture({ freeAtMs: null });
+    f.timeoutMs = 120_000;
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    // Once the overload wait has begun, the slot frees during a sleep that also passes the run timeout.
+    const tick = f.clock; let offset = 0;
+    f.clock = () => tick() + offset;
+    const { easternTimestamp } = await import('../forge-exec-run.mjs');
+    let now = Date.now();
+    const clock = f.clock; f.clock = () => (now = clock());
+    // Forge stays healthy on the shifted clock, so only the timeout can refuse the late slot.
+    f.readTelemetry = async () => ({ sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] });
+    f.sleep = vi.fn(async () => {
+      if (f.log.mock.calls.some(c => /waiting for a remote slot/.test(c[0])) && existsSync(marker)) { rmSync(marker); offset = f.timeoutMs; }
+    });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(f.remoteExec).not.toHaveBeenCalled();
+  });
+
+  it('falls back locally when Forge health turns unreadable while waiting', async () => {
+    const f = await overloadFixture({ freeAtMs: null });
+    let reads = 0;
+    const healthy = f.readTelemetry;
+    f.readTelemetry = async () => (++reads === 1 ? healthy() : null);
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toMatch(/remote unavailable \((forge-unreachable|backoff)/);
+  });
+
+  it('above-threshold mode routes an overloaded host remote even below the threshold', async () => {
+    const f = fixture({ remote: { mode: 'above-threshold', loadPerCoreThreshold: 3 }, load: 1 });
+    f.hostOverloaded = vi.fn(() => true);
+    const onDecision = vi.fn();
+    expect(await runWithRemoteDecision({ ...f, onDecision })).toMatchObject({ handled: true, exitCode: 0 });
+    expect(onDecision).toHaveBeenCalledWith({ remote: true, reason: expect.stringContaining('host overloaded') });
+  });
+
+  it('above-threshold mode stays local when load is unreadable or remote is disabled', async () => {
+    const unreadable = fixture({ remote: { mode: 'above-threshold' } });
+    unreadable.loadPerCore = () => { throw new Error('no load'); };
+    unreadable.hostOverloaded = vi.fn(() => true);
+    expect(await runWithRemoteDecision(unreadable)).toEqual({ handled: false });
+    const disabled = fixture({ remote: { enabled: false, mode: 'above-threshold' }, load: 1 });
+    disabled.hostOverloaded = vi.fn(() => true);
+    expect(await runWithRemoteDecision(disabled)).toEqual({ handled: false });
+    expect(unreadable.remoteExec).not.toHaveBeenCalled();
+    expect(disabled.remoteExec).not.toHaveBeenCalled();
+  });
+});
+
+describe('hostOverloadedForRemote (7579)', () => {
+  it('is true only for a definite refusal', async () => {
+    const { hostOverloadedForRemote } = await import('../heavy-admission.mjs');
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host load 84.00/12=7.00; host.maxLoadPerCore=2 (standard)' }))).toBe(true);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: true, reason: 'ok' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host load unknown: x' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host memory unknown: x' }))).toBe(false);
+    expect(hostOverloadedForRemote({ WE_HEAVY_ADMISSION_HELD: '1' }, () => ({ admitted: false, reason: 'host load 9/1' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host memory headroom 300MB (free+swap); host.minMemoryHeadroomMb=512 (platform); source=vm_stat+swap' }))).toBe(true);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host memory pressure warn; reclaimable headroom 100MB; host.minMemoryHeadroomMb=512' }))).toBe(true);
+    // cpu-mem capacity verdicts cannot tell low from unknown capacity: never an overload for routing.
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host capacity: unknown; host.capacitySignal=cpu-mem (platform)' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host capacity: cpu idle 5%; host.capacitySignal=cpu-mem (platform)' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false }))).toBe(false);
+  });
+});

@@ -630,9 +630,9 @@ jobs:
   # GitHub jobs don't share a workspace; that duplicated setup runs concurrently with `test`, so it costs
   # runner-minutes, not wall-clock. The `visual` job (below, disabled) already duplicates the same setup.
   smoke:
+    # Pinned (not ubuntu-latest): -latest became Ubuntu 26.04, which Playwright's `install --with-deps` rejects.
     needs: changes
     if: ${{ !cancelled() }}
-    # Playwright 1.58.1 supports Ubuntu 24.04; ubuntu-latest can select unsupported 26.04.
     runs-on: ubuntu-24.04
     # xd1sfms (#4075/#3383) — same measurement pass: 15 successful runs sampled 2026-09-25 gave this job
     # (docs build + Playwright install + the interaction lane) min=129s max=146s p50=135s p95=146s —
