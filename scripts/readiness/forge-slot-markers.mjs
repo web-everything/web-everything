@@ -3,9 +3,10 @@
 // forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
 // A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
 // telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
-import {readdirSync, readFileSync, statSync, unlinkSync} from 'node:fs';
+import {readdirSync, readFileSync, statSync, unlinkSync, writeFileSync} from 'node:fs';
+import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
-import {readLockEntry} from './file-locks.mjs';
+import {readLockEntry, reserve, releaseLockDir} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
 export const MARKER_GRACE_MS = 120_000;
@@ -14,6 +15,24 @@ const NAME = /^slot-(\d+)\.unconfirmed$/;
 /** New markers carry their owner pid so a later client can prove the owner is dead. */
 export function markerContent({owner, pid, nowMs}) {
   return JSON.stringify({v: 1, owner, pid, at: nowMs}) + '\n';
+}
+
+const LOCK_KEY = 'marker-mutation';
+/** Marker creation and reaping share one short mutex, so a reaper can never remove a marker it did not judge. */
+async function withMarkerLock(root, work, {clock = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms))} = {}) {
+  const owner = 'marker-' + randomBytes(12).toString('hex'), start = clock();
+  for (;;) {
+    const now = clock(), entry = readLockEntry(root, LOCK_KEY);
+    const liveness = Number.isInteger(entry?.pid) && entry.pid !== process.pid ? probePidLiveness(entry.pid, process.pid) : 'unknown';
+    if (reserve(root, LOCK_KEY, owner, now, new Date(now).toISOString(), process.pid, liveness, 1, null, true).ok) break;
+    if (clock() - start >= 3000) throw new Error('remote-marker-busy');
+    await sleep(25);
+  }
+  try { return await work(); } finally { releaseLockDir(root, LOCK_KEY); }
+}
+/** Exclusive create of a dispatch marker under the mutex; throws if one already exists. */
+export function writeMarkerExclusive(root, file, content, opts) {
+  return withMarkerLock(root, () => writeFileSync(file, content, {flag: 'wx', mode: 0o600}), opts);
 }
 
 function ownerPid(root, index, file) {
@@ -44,12 +63,12 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
         const m = NAME.exec(name);
         if (!m) continue;
         const file = join(root, name);
-        let mtimeMs;
-        try { mtimeMs = fs.statSync(file).mtimeMs; } catch { continue; }
+        let mtimeMs, ino;
+        try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const pid = ownerPid(root, Number(m[1]), file);
         if (liveness(pid, selfPid) !== 'dead') { firstDead.delete(name); continue; }
         if (!firstDead.has(name)) firstDead.set(name, now);
-        dead.push({name, file, mtimeMs});
+        dead.push({name, file, mtimeMs, ino, index: Number(m[1])});
       }
       if (!dead.length) return [];
       const telemetry = await getTelemetry();
@@ -60,7 +79,17 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
       const reaped = [];
       for (const entry of dead) {
         if (now - entry.mtimeMs < graceMs || firstDead.get(entry.name) > sampledAt) continue;
-        try { fs.unlinkSync(entry.file); } catch { continue; }
+        // Re-judge under the mutex: the marker must be the very file we judged and its owner still provably dead.
+        const removed = await withMarkerLock(root, () => {
+          try {
+            const seen = fs.statSync(entry.file);
+            if (seen.ino !== entry.ino || seen.mtimeMs !== entry.mtimeMs) return false;
+            if (liveness(ownerPid(root, entry.index, entry.file), selfPid) !== 'dead') return false;
+            fs.unlinkSync(entry.file);
+            return true;
+          } catch { return false; }
+        }).catch(() => false);
+        if (!removed) continue;
         firstDead.delete(entry.name);
         reaped.push(entry.name);
       }

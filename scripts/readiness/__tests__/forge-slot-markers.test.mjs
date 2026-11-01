@@ -3,7 +3,7 @@ import {describe, it, expect, afterEach} from 'vitest';
 import {mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createMarkerReaper, markerContent} from '../forge-slot-markers.mjs';
+import {createMarkerReaper, markerContent, writeMarkerExclusive} from '../forge-slot-markers.mjs';
 
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, {recursive: true, force: true}); });
@@ -23,6 +23,24 @@ const liveness = dead => pid => (dead.includes(pid) ? 'dead' : 'alive');
 const names = root => ['0', '1', '2'].filter(i => existsSync(join(root, `slot-${i}.unconfirmed`)));
 
 describe('stale remote slot markers (perf10)', () => {
+  it('never removes a replacement marker created after the one it judged', async () => {
+    const root = setup({0: {pid: 111}});
+    const file = join(root, 'slot-0.unconfirmed');
+    const reaper = createMarkerReaper({root, clock: () => NOW, liveness: liveness([111])});
+    const swapped = async () => { // the dispatcher replaces the marker while the reaper awaits telemetry
+      rmSync(file); writeFileSync(file, markerContent({owner: 'new', pid: 111, nowMs: NOW}));
+      const t = (NOW - 600_000) / 1000; utimesSync(file, t + 1, t + 1);
+      return {sampledAtET: iso(NOW + 5_000), activeRuns: 0};
+    };
+    expect(await reaper.step(swapped)).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('creates a marker exclusively under the shared mutex', async () => {
+    const root = setup({});
+    const file = join(root, 'slot-1.unconfirmed');
+    await writeMarkerExclusive(root, file, markerContent({owner: 'o', pid: 1, nowMs: NOW}));
+    await expect(writeMarkerExclusive(root, file, 'x')).rejects.toThrow();
+  });
   it('reaps a dead owner whose run Forge cannot account for', async () => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, clock: () => NOW, liveness: liveness([111])});

@@ -173,7 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { stripGateOnlyOptions } from './forge-gate-options.mjs';
-import { createMarkerReaper, markerContent } from './forge-slot-markers.mjs';
+import { createMarkerReaper, markerContent, writeMarkerExclusive } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -867,7 +867,7 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}),{flag:'wx',mode:0o600});
+      await writeMarkerExclusive(remoteRoot,executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}));
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {
