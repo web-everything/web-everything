@@ -100,7 +100,7 @@ function excludedComponent(name, leaf, allowCredential = false) {
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 const secretText=[
   [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
-  [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/sk-[A-Za-z0-9_-]{16,}/,'sk-token'],
+  [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
   [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
 ];
 const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
@@ -110,8 +110,9 @@ function entropy(text) {
   return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
 }
 // Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
-// JSON gets the full structural scan; every other type gets all raw token
-// patterns. A file that fails (scrubbers, docs spelling out secrets) stays
+// JSON gets the full structural scan; other UTF-8 text gets raw token patterns
+// and keyed-field entropy checks. Unknown encodings stay excluded.
+// A file that fails (scrubbers, docs spelling out secrets) stays
 // excluded, so a run that needs it falls back to the Mac. Returns the first
 // finding or null when clean.
 export function credentialContentFinding(path,content) {
@@ -119,7 +120,17 @@ export function credentialContentFinding(path,content) {
   // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
-  return textFinding(Buffer.from(content).toString('utf8'));
+  let text;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
+  if(text.includes('\0'))return 'unsupported-text-encoding';
+  const raw=textFinding(text);
+  if(raw)return raw;
+  // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
+  // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
+  for(const [,field,value] of text.matchAll(/(?:^|[\r\n])[\t ]*(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
+    if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+  }
+  return null;
 }
 // Returns the first secret-like finding, or null when the content is clean.
 export function designTokenSecretFinding(content) {

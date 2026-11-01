@@ -963,6 +963,31 @@ describe('warm-base tick',()=>{
     const install=vi.fn(async()=>({code:0}));
     return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs,runs:join(root,'slots'),receipts:join(root,'receipts')}};
   }
+  it('warmTick excludes flagged public files with secret-like content and matches full/delta inventories',async()=>{
+    const refused={
+      'token-patterns.mjs':'const sample = "ghp_abcdefghijklmnopqrstuvwxyz0123";',
+      'credentials.yaml':'password: q8Zr2LmX9vT4pW7kJ1nB5cY3',
+      'token-utf16.txt':Buffer.from('password: q8Zr2LmX9vT4pW7kJ1nB5cY3','utf16le'),
+    };
+    for(const [path,bytes] of Object.entries(refused))await fs.writeFile(join(repo,path),bytes);
+    await fs.writeFile(join(repo,'token-clean.mjs'),'export const ok = 1;');
+    git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    const f=await tickFixture();
+    await expect(f.warm.warmTick(f.options)).resolves.toMatchObject({sha:f.base.sha});
+    const published=join(f.target,f.base.sha),wire=JSON.parse(await fs.readFile(join(published,'manifest.json'),'utf8'));
+    expect(wire).toEqual(f.base.manifest);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base:f.base});
+    expect(manifestWire(delta)).toEqual(wire);
+    const paths=Buffer.from(wire.paths,'base64').toString().split('\0');
+    const excluded=Buffer.from(wire.excluded,'base64').toString().split('\0');
+    for(const path of Object.keys(refused)){
+      expect(excluded).toContain(path);expect(paths).not.toContain(path);
+      await expect(fs.lstat(join(published,'tree',path))).rejects.toMatchObject({code:'ENOENT'});
+    }
+    expect(paths).toEqual(expect.arrayContaining(['mode.txt','token-clean.mjs']));
+    expect(await fs.readFile(join(published,'tree','token-clean.mjs'),'utf8')).toBe('export const ok = 1;');
+    expect(f.install).toHaveBeenCalledOnce();
+  });
   it('publishes only ready verified trees, logs latency and does not pass tokens to anonymous git',async()=>{
     const f=await tickFixture();await f.warm.warmTick(f.options);
     const ready=JSON.parse(await fs.readFile(join(f.target,f.base.sha,'READY'),'utf8'));

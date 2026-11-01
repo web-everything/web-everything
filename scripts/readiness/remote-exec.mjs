@@ -226,7 +226,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, credentialContentFinding, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -538,6 +538,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     hashDone();
+    // Match warm export: pattern-spelling public files stay excluded without
+    // aborting unrelated work. The public worktree identity check above still
+    // refuses private edits; manifestEntry remains a fail-closed leaf guard.
+    if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
     return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });
   for (const leaf of leaves) {

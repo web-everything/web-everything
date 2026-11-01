@@ -5,8 +5,9 @@ import {afterEach,beforeEach,describe,expect,it} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {buildManifest} from '../remote-exec.mjs';
-import {classifyManifestPath,designTokenSecretFinding,credentialContentFinding} from '../forge-exec-manifest.mjs';
+import {classifyManifestPath,designTokenSecretFinding,credentialContentFinding,isTestFile} from '../forge-exec-manifest.mjs';
 let cwd;
 const exec=async ({file,args,cwd,input})=>{
   const result=spawnSync(file,args,{cwd,input,maxBuffer:4*1024*1024});
@@ -19,6 +20,12 @@ const commit=async()=>{await git(['-c','user.name=Fixture','-c','user.email=fixt
 const write=async(name,data)=>{await fs.mkdir(join(cwd,name,'..'),{recursive:true});await fs.writeFile(join(cwd,name),data);};
 const tokens=JSON.stringify({color:{primary:{$value:'#3366ff',$type:'color'}},tokens:{space:{$value:'4px'}}});
 const names=list=>list.map(p=>Buffer.from(p.path??p).toString());
+const expectExcluded=async path=>{
+  const manifest=await buildManifest({cwd,exec});
+  expect(names(manifest.excluded)).toContain(path);
+  expect(names(manifest.entries)).not.toContain(path);
+  expect(names(manifest.entries)).toContain('keep.txt');
+};
 beforeEach(async()=>{
   cwd=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-design-token-')));
   await git(['init','-q']);await write('keep.txt','keep');
@@ -32,6 +39,46 @@ const shipped=['design-systems/acme.tokens.json','src/_data/protocols/credential
   'docs/password-policy.md'];
 const content=p=>p.endsWith('.njk')||p.endsWith('.md')?njk:tokens;
 describe('credential-name rule (R321)',()=>{
+  it('excludes real tracked pattern-spelling files individually and retains the missing-test fallback',async()=>{
+    const repo=fileURLToPath(new URL('../../../',import.meta.url));
+    const inventory=await exec({file:'git',args:['ls-files','-z'],cwd:repo});
+    expect(inventory.code).toBe(0);
+    const flagged=inventory.stdout.toString().split('\0').filter(p=>p&&classifyManifestPath(Buffer.from(p)).credentialSource);
+    const refused=[],refusedTests=[];
+    for(const p of flagged){
+      const bytes=await fs.readFile(join(repo,p));
+      if(credentialContentFinding(Buffer.from(p),bytes)){
+        if(isTestFile(Buffer.from(p))){refusedTests.push([p,bytes]);continue;}
+        refused.push(p);
+      }
+      await write(p,bytes);
+    }
+    expect(flagged).toContain('scripts/lib/secret-scrub.mjs');
+    expect(refused).toContain('scripts/lib/secret-scrub.mjs');
+    await git(['add','.']);await commit();
+    const manifest=await buildManifest({cwd,exec});
+    expect(names(manifest.excluded)).toEqual(expect.arrayContaining(refused));
+    expect(names(manifest.entries)).toContain('keep.txt');
+    for(const p of refused)expect(names(manifest.entries)).not.toContain(p);
+    expect(refusedTests.length).toBeGreaterThan(0);
+    for(const [p,bytes] of refusedTests)await write(p,bytes);
+    await git(['add','.']);await commit();
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-test-file'});
+  });
+  it('keeps every real tracked design-system tokens file scan-clean and shippable',async()=>{
+    const repo=fileURLToPath(new URL('../../../',import.meta.url));
+    const inventory=await exec({file:'git',args:['ls-files','-z','--','design-systems/*.tokens.json'],cwd:repo});
+    expect(inventory.code).toBe(0);
+    const paths=inventory.stdout.toString().split('\0').filter(Boolean);
+    expect(paths.length).toBeGreaterThanOrEqual(8);
+    for(const p of paths){
+      const bytes=await fs.readFile(join(repo,p));
+      expect(designTokenSecretFinding(bytes),p).toBe(null);
+      await write(p,bytes);
+    }
+    await git(['add','.']);await commit();
+    expect(names((await buildManifest({cwd,exec})).entries)).toEqual(expect.arrayContaining(paths));
+  });
   it('ships a tracked file identical to origin/main with clean content, in any folder',async()=>{
     for(const p of shipped)await write(p,content(p));await git(['add','.']);await commit();
     const manifest=await buildManifest({cwd,exec});
@@ -76,9 +123,9 @@ describe('credential-name rule (R321)',()=>{
     await fs.symlink('../../design-systems',join(cwd,'.claude/skills/design-systems'));await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
-  it('refuses fake secrets even when tracked and identical to origin/main',async()=>{
+  it('excludes fake secrets even when tracked and identical to origin/main',async()=>{
     await write('a/token-page.njk','x ghp_abcdefghijklmnopqrstuvwxyz0123 y');await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('a/token-page.njk')});
+    await expectExcluded('a/token-page.njk');
   });
   it('keeps names unsafe for other reasons excluded even when tracked and identical',async()=>{
     const kept=['.env.token','keys/server_rsa','certs/token.pem','.hidden/token.json'];
@@ -95,20 +142,18 @@ describe('credential-name rule (R321)',()=>{
     const secret=Buffer.from('{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}');
     expect(credentialContentFinding(Buffer.from('a/'+name),secret)).toBe('high-entropy-password');
   });
-  it('refuses a tracked name-flagged JSON secret under a normalized-extension name',async()=>{
+  it('excludes a tracked name-flagged JSON secret under a normalized-extension name',async()=>{
     await write('a/token.json.','{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}');await git(['add','.']);await commit();
-    const manifest=await buildManifest({cwd,exec}).catch(error=>error);
-    if(manifest instanceof Error)expect(manifest).toMatchObject({code:'excluded-source-file'});
-    else expect(names(manifest.entries)).not.toContain('a/token.json.');
+    await expectExcluded('a/token.json.');
   });
   it('does not ship a name-flagged JSON file through the agent-memory bridge',async()=>{
     await write('agent-memory-src/token.json',tokens);await fs.mkdir(join(cwd,'.claude'),{recursive:true});
     await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
-  it.each(['lib/token-scrub.mjs','docs/token-notes.md','src/credential-view.ts'])('refuses a tracked flagged %s containing a fake secret (R323, no type skip)',async p=>{
+  it.each(['lib/token-scrub.mjs','docs/token-notes.md','src/credential-view.ts'])('excludes a tracked flagged %s containing a fake secret (R323, no type skip)',async p=>{
     await write(p,'const x = "ghp_abcdefghijklmnopqrstuvwxyz0123";\n');await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining(p)});
+    await expectExcluded(p);
   });
   it('refuses a flagged source file with a PEM marker too',()=>{
     expect(credentialContentFinding(Buffer.from('a/token.mjs'),Buffer.from('-----BEGIN PRIVATE KEY-----'))).toBe('pem-header');
@@ -122,7 +167,7 @@ describe('credential-name rule (R321)',()=>{
     await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
     await write('agent-memory-src/token-note.md','ghp_abcdefghijklmnopqrstuvwxyz0123');await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('agent-memory-src/token-note.md')});
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
   it('refuses a bridge alias whose real source directory is name-flagged (token-src)',async()=>{
     await write('token-src/note.md','clean notes');await fs.mkdir(join(cwd,'.claude'),{recursive:true});
@@ -137,6 +182,34 @@ describe('credential-name rule (R321)',()=>{
 
 describe('content secret scan',()=>{
   it.each([
+    ['PEM','-----BEGIN','pem-header'],
+    ['standalone private key','PRIVATE KEY','private-key'],
+    ['AWS','AKIAABCDEFGHIJKLMNOP','aws-access-key'],
+    ...'opsur'.split('').map(kind=>['GitHub '+kind,`gh${kind}_abcdefghijklmnopqrstuvwxyz0123`,'github-token']),
+    ['sk','sk-abcdefghijklmnopqrstuvwxyz0123','sk-token'],
+    ['Slack bot','xoxb-12345678-abcdefgh','slack-token'],
+    ['Slack user','xoxp-12345678-abcdefgh','slack-token'],
+  ])('detects %s signatures in raw text and decoded JSON literals',(_label,value,reason)=>{
+    expect(credentialContentFinding(Buffer.from('token.txt'),Buffer.from(value))).toBe(reason);
+    const escaped=[...value].map(c=>'\\u'+c.charCodeAt(0).toString(16).padStart(4,'0')).join('');
+    expect(designTokenSecretFinding(Buffer.from(`{"value":"${escaped}","value":"safe"}`))).toBe(reason);
+  });
+  it.each(['credentials.yaml','credentials.ini','credentials.txt','credentials'])('detects keyed random passwords in %s',path=>{
+    for(const line of ['password: ','password = ','  - "password": ',"\r\n'password': "]){
+      expect(credentialContentFinding(Buffer.from(path),Buffer.from(line+'q8Zr2LmX9vT4pW7kJ1nB5cY3'))).toBe('high-entropy-password');
+    }
+    expect(credentialContentFinding(Buffer.from(path),Buffer.from('password: example'))).toBe(null);
+  });
+  it.each([
+    ['UTF-16LE',Buffer.from('password: q8Zr2LmX9vT4pW7kJ1nB5cY3','utf16le')],
+    ['invalid UTF-8',Buffer.from([0xff,0xfe,0x61])],
+  ])('refuses unsupported %s text encoding',(_label,bytes)=>{
+    expect(credentialContentFinding(Buffer.from('credentials.txt'),bytes)).toBe('unsupported-text-encoding');
+  });
+  it('does not mistake task- or disk-prefixed prose for an sk token',()=>{
+    for(const value of ['task-abcdefghijklmnopqrstuvwxyz','disk-abcdefghijklmnopqrstuvwxyz'])expect(credentialContentFinding(Buffer.from('token.md'),Buffer.from(value))).toBe(null);
+  });
+  it.each([
     ['private key','{"a":"-----BEGIN OPENSSH PRIVATE KEY-----\\nabc\\n-----END OPENSSH PRIVATE KEY-----"}','pem-header'],
     ['AWS key','{"a":"AKIAABCDEFGHIJKLMNOP"}','aws-access-key'],
     ['GitHub token','{"a":"ghp_abcdefghijklmnopqrstuvwxyz0123"}','github-token'],
@@ -150,10 +223,10 @@ describe('content secret scan',()=>{
     ['astral-character password',JSON.stringify({password:String.fromCodePoint(...Array.from({length:24},(_,i)=>0x1F600+i))}),'high-entropy-password'],
     ['letter-prefixed GitHub token','{"value":"prefixghp_abcdefghijklmnopqrstuvwxyz0123456789"}','github-token'],
     ['underscore-prefixed GitHub token','{"a":"_ghp_abcdefghijklmnopqrstuvwxyz0123"}','github-token'],
-  ])('refuses a tracked tokens file containing a %s',async(_label,content,reason)=>{
+  ])('excludes a tracked tokens file containing a %s',async(_label,content,reason)=>{
     expect(designTokenSecretFinding(Buffer.from(content))).toBe(reason);
     await write('design-systems/foo.tokens.json',content);await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('design-systems/foo.tokens.json')});
+    await expectExcluded('design-systems/foo.tokens.json');
   });
   it.each([
     ['GitHub token','{"a":"ghp_abcdefghijklmnopqrstuvwxyz0123"}','github-token'],
@@ -166,10 +239,10 @@ describe('content secret scan',()=>{
     ['high-entropy creds field','{"creds":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}','high-entropy-creds'],
     ['high-entropy oauth field','{"oauth":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}','high-entropy-oauth'],
     ['secret used as a key under a token field','{"token":{"q8Zr2LmX9vT4pW7kJ1nB5cY3":"public"}}','high-entropy-nested-key'],
-  ])('refuses a registry file containing a %s',async(_label,content,reason)=>{
+  ])('excludes a registry file containing a %s',async(_label,content,reason)=>{
     expect(designTokenSecretFinding(Buffer.from(content))).toBe(reason);
     await write('src/_data/protocols/credential-management.json',content);await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('src/_data/protocols/credential-management.json')});
+    await expectExcluded('src/_data/protocols/credential-management.json');
   });
   it('leaves the taint scoped to the secret field',()=>{
     expect(designTokenSecretFinding(Buffer.from('{"token":["x"],"summary":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}'))).toBe(null);
