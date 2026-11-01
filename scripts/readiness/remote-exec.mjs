@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
+import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -133,7 +134,7 @@ export async function bindGit({cwd=process.cwd(),env=process.env,exec=defaultExe
     if(call.cwd!==cwd)return (await bindGit({cwd:call.cwd,env:cleanEnv,exec:raw}))(call);
     return raw({...call,args:[...prefix,...call.args],env:cleanEnv});
   };
-  bound[gitBinding]={cwd,raw,prefix,env:cleanEnv,default:raw===defaultExec};
+  bound[gitBinding]={cwd,dir,raw,prefix,env:cleanEnv,default:raw===defaultExec};
   return bound;
 }
 // Keep nanoseconds for reuse comparisons; Number millisecond timestamps lose bits.
@@ -788,6 +789,204 @@ export function easternTimestamp(ms) {
   const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23',timeZoneName:'longOffset'}).formatToParts(new Date(ms)).map(p=>[p.type,p.value]));
   return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(new Date(ms).getUTCMilliseconds()).padStart(3,'0')}${parts.timeZoneName.replace('GMT','')}`;
 }
+const stageDirectoryIn=(fs,root,rootMode,dirMode)=>async path=>{
+  const mode = path === root ? rootMode : dirMode;
+  await fs.mkdir(path,{recursive:true,mode});
+  await fs.chmod(path,mode);
+  const st = await fs.lstat(path);
+  if (!st.isDirectory() || st.isSymbolicLink() || (st.mode & 0o7777) !== mode)
+    throw new Error('Invalid staging directory mode');
+};
+// Copy manifest leaves into a private stage, re-hashing every staged byte.
+async function stageSnapshot({fs,stageDirectory,source:sourceRoot,destination:destinationRoot,entries,onStaged}) {
+  await stageDirectory(destinationRoot);
+  const rootInfo = await fs.lstat(sourceRoot);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Unsafe staging root');
+  for (const entry of entries) {
+    const parts = pathParts(entry.path);
+    let source = Buffer.from(sourceRoot), destination = Buffer.from(destinationRoot);
+    if (entry.sourcePath)for(const link of entry.links)await verifyTrackedLink(sourceRoot,link,fs);
+    const sourceParts = pathParts(entry.sourcePath ?? entry.path);
+    for (const [i, part] of sourceParts.entries()) {
+      source = bytePath(source, part);
+      const st = await fs.lstat(source);
+      if (st.isSymbolicLink() || (i === sourceParts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
+    }
+    for (const [i, part] of parts.entries()) {
+      destination = bytePath(destination, part);
+      if (i < parts.length - 1) await stageDirectory(destination);
+    }
+    // Pin the leaf and reject special files before reading; NONBLOCK also
+    // prevents a raced-in FIFO from hanging admission before fstat.
+    const fd = await fs.open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    let sourceStamp;
+    try {
+      const st = await fd.stat({bigint:true});
+      sourceStamp = st;
+      if (!st.isFile() || !!(st.mode & 0o111n) !== entry.executable) throw new Error('Invalid staging source');
+      const mode = entry.executable ? 0o755 : 0o644;
+      await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode});
+      await fs.chmod(destination, mode);
+      await fs.utimes(destination, timestampSeconds(st,'atime'), timestampSeconds(st,'mtime'));
+      const staged = await fs.lstat(destination);
+      if (!staged.isFile() || staged.isSymbolicLink() || (staged.mode & 0o7777) !== mode)
+        throw new Error('Invalid staging file mode');
+    } finally {await fd.close();}
+    // Node has no openat: an ancestor can race the leaf open. Re-hashing
+    // every staged byte against the verified public-content manifest
+    // confines swaps to identical bytes or not-started, before any rsync.
+    const stagedContent=await fs.readFile(destination);
+    const hash = createHash('sha256').update(stagedContent).digest('hex');
+    if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
+    await onStaged?.(entry,destination,stagedContent,sourceStamp);
+  }
+  const after = await fs.lstat(sourceRoot);
+  if (after.isSymbolicLink() || after.ino !== rootInfo.ino || after.dev !== rootInfo.dev) throw new Error('Staging root swapped');
+}
+
+// Shared by the run and presync: one base selection and one delta manifest
+// builder, so both apply identical exclusion and walk checks.
+async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming}) {
+  const gitDir=exec[gitBinding]?.dir;
+  if(discovery.code!==0)throw new Error('No base capabilities');
+  const caps=JSON.parse(protocolText(discovery.stdout,8192));
+  if(caps.delta!==1)throw new Error('Delta unavailable');
+  const candidates=await rankBases({cwd,exec,bases:caps.bases});
+  if(!candidates.length)throw new Error('No local ready base');
+  let selected,lastError;
+  for(const base of candidates) {
+    // A locally cached base manifest is used only when it hashes to the digest
+    // Forge advertised in this run's fresh base discovery.
+    const cached=gitDir?await readCachedBaseManifest(gitDir,host,base.manifestDigest,fs):undefined;
+    if(cached){selected={...base,manifest:cached};break;}
+    for(let attempt=0;attempt<2;attempt++) {
+      try {
+        const response=await fetchBaseManifest(base.sha);
+        if(response.code!==0)throw new Error('Base manifest unavailable');
+        const wire=JSON.parse(protocolText(response.stdout,LIMIT));
+        if(digestManifest(wire)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
+        decodeManifest(wire);
+        selected={...base,manifest:wire};
+        if(gitDir)try{writeJsonAtomic(join(gitDir,PRESYNC_BASE),{v:1,host,manifestDigest:base.manifestDigest,wire},{mode:0o600});}catch { /* cache is advisory */ }
+        break;
+      }catch(error){lastError=error;if(attempt===0)await delay(300);}
+    }
+    if(selected)break;
+  }
+  if(!selected)throw lastError;
+  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub});
+}
+
+// Presync (card 7515): ship a lane's delta leaves to a per-lane Forge cache
+// ahead of the run. The run passes the cache only as an rsync --copy-dest
+// basis, so nothing about what is trusted changes: rsync reuses a cached leaf
+// only on a checksum match and Forge re-verifies every assembled byte.
+const PRESYNC_ROOT=ROOT+'/presync';
+const PRESYNC_STATE='forge-presync.json';
+const PRESYNC_LOCK='forge-presync.lock';
+const PRESYNC_BASE='forge-presync-base.json';
+// @test-only-export-ok: tests prove a stale or tampered cache is never used.
+export async function readCachedBaseManifest(gitDir,host,manifestDigest,fs=filesystem) {
+  try {
+    const path=join(gitDir,PRESYNC_BASE),st=await fs.lstat(path);
+    if(!st.isFile()||st.size>2*LIMIT+4096)return undefined;
+    const record=JSON.parse(await fs.readFile(path,'utf8'));
+    if(!record||record.v!==1||record.host!==host||record.manifestDigest!==manifestDigest)return undefined;
+    if(digestManifest(record.wire)!==manifestDigest)return undefined;
+    decodeManifest(record.wire);
+    return record.wire;
+  } catch {return undefined;}
+}
+const PRESYNC_MAX_FILES=20000;
+const presyncKeyPattern=/^[a-f0-9]{32}$/;
+// @test-only-export-ok: tests read the lane state the run trusts.
+export async function readPresyncState(gitDir,fs=filesystem) {
+  try {
+    const st=await fs.lstat(join(gitDir,PRESYNC_STATE));
+    if(!st.isFile()||st.size>LIMIT)return null;
+    const state=JSON.parse(await fs.readFile(join(gitDir,PRESYNC_STATE),'utf8'));
+    if(!state||state.v!==1||typeof state.host!=='string'||!presyncKeyPattern.test(state.key))return null;
+    return state;
+  } catch {return null;}
+}
+async function matchPresync({exec,fs,host,delta,entries}) {
+  try {
+    const gitDir=exec[gitBinding]?.dir;
+    if(!gitDir)return undefined;
+    const state=await readPresyncState(gitDir,fs);
+    // A cache synced against another base, host or file set is never offered.
+    if(!state||state.host!==host||state.baseManifestDigest!==delta.baseManifestDigest||!state.files||typeof state.files!=='object')return undefined;
+    let count=0,bytes=0;
+    for(const entry of entries)if(Object.hasOwn(state.files,entry.path.toString('hex'))&&state.files[entry.path.toString('hex')]?.sha256===entry.sha256){count++;bytes+=state.files[entry.path.toString('hex')].size;}
+    return {key:state.key,count,bytes};
+  } catch {return undefined;}
+}
+const presyncEnv=env=>Object.fromEntries(['PATH','HOME','SSH_AUTH_SOCK'].filter(key=>typeof env[key]==='string').map(key=>[key,env[key]]));
+async function acquirePresyncLock(path,fs) {
+  for(let attempt=0;attempt<2;attempt++) {
+    try {const handle=await fs.open(path,'wx',0o600);try{await handle.writeFile(`${process.pid}\n`);}finally{await handle.close();}return true;}
+    catch(error) {
+      if(error.code!=='EEXIST')throw error;
+      const pid=Number((await fs.readFile(path,'utf8').catch(()=>'')).trim());
+      let alive=true;
+      try{if(Number.isSafeInteger(pid)&&pid>0)process.kill(pid,0);else alive=false;}catch(e){alive=e.code==='EPERM';}
+      if(alive)return false;
+      await fs.rm(path,{force:true});
+    }
+  }
+  return false;
+}
+// One presync round. Every failure is recorded in the lane state and never
+// thrown: a run must behave exactly as without presync.
+export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now}={}) {
+  if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))return {status:'failed',reason:'invalid-host'};
+  try {exec=await bindGit({cwd,env,exec});}catch {return {status:'failed',reason:'unbound-worktree'};}
+  const gitDir=exec[gitBinding].dir;
+  sshOptions ??= connectionOptions();
+  const lock=join(gitDir,PRESYNC_LOCK);
+  if(!await acquirePresyncLock(lock,fs).catch(()=>false))return {status:'busy'};
+  let staging;
+  const previous=await readPresyncState(gitDir,fs);
+  const key=previous?.host===host?previous.key:randomBytes(16).toString('hex');
+  const record=state=>writeJsonAtomic(join(gitDir,PRESYNC_STATE),{v:1,host,key,atET:easternTimestamp(clock()),...state},{mode:0o600});
+  try {
+    const ssh=(command,request)=>exec({file:'ssh',args:[host,`sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],input:JSON.stringify(request),cwd,sshOptions});
+    const delta=await discoverDelta({cwd,exec,fs,env,host,discovery:await ssh('bases',{}),fetchBaseManifest:sha=>ssh('base-manifest',{sha})});
+    // Never ship a full tree or coverage in the background. Sibling trees are
+    // left to the run's own transfer (a Follow-up).
+    if(delta.manifestMode==='full-scan'){record({skipped:'full-scan'});return {status:'skipped',reason:'full-scan'};}
+    const keys=new Set(delta.deltaPaths.map(path=>path.toString('hex')));
+    const entries=delta.entries.filter(entry=>keys.has(entry.path.toString('hex')));
+    if(entries.some(entry=>entry.path.equals(Buffer.from('coverage/coverage-final.json')))){record({skipped:'coverage'});return {status:'skipped',reason:'coverage'};}
+    if(entries.length>PRESYNC_MAX_FILES){record({skipped:'too-many-files'});return {status:'skipped',reason:'too-many-files'};}
+    staging=await fs.mkdtemp(join(tmpdir(),'forge-presync-'));
+    // Slot users traverse but cannot list the cache; files stay readable.
+    const files={};
+    await stageSnapshot({fs,stageDirectory:stageDirectoryIn(fs,staging,0o711,0o711),source:cwd,destination:staging,entries,
+      onStaged:(entry,destination,content)=>{files[entry.path.toString('hex')]={sha256:entry.sha256,size:content.length};}});
+    const ready=await exec({file:'ssh',args:[host,`umask 077 && mkdir -p -m 0711 ${PRESYNC_ROOT} && test -d ${PRESYNC_ROOT} && test ! -L ${PRESYNC_ROOT} && test -O ${PRESYNC_ROOT}`],cwd,sshOptions});
+    if(ready.code!==0)throw new Error('Presync cache unavailable');
+    const copied=await exec({file:'rsync',args:['-a','--delete','--no-links','--safe-links','-e',`ssh ${sshOptions.map(quote).join(' ')}`,
+      './',`${host}:${PRESYNC_ROOT}/${key}/`],cwd:staging});
+    if(copied.code!==0)throw new Error('Presync copy failed');
+    record({baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,files});
+    return {status:'synced',count:entries.length,bytes:Object.values(files).reduce((n,f)=>n+f.size,0)};
+  } catch(error) {
+    try{record({error:manifestFailure(error)});}catch { /* state is advisory */ }
+    return {status:'failed',reason:manifestFailure(error)};
+  } finally {
+    if(staging)await fs.rm(staging,{recursive:true,force:true}).catch(()=>{});
+    await fs.rm(lock,{force:true}).catch(()=>{});
+  }
+}
+// The run starts the next presync detached with a minimal env; it never waits.
+export function spawnPresync({cwd,host,env=process.env,spawnFn=spawn}={}) {
+  try {
+    const child=spawnFn(process.execPath,[fileURLToPath(import.meta.url),'presync',`--host=${host}`],{cwd,env:presyncEnv(env),detached:true,stdio:'ignore'});
+    child.on?.('error',()=>{});child.unref?.();
+  } catch { /* presync is best effort */ }
+}
+
 export async function runRemote(options={}) {
   const clock=options.clock??Date.now,timings=[],start=clock();
   const pending=new Map();
@@ -799,6 +998,9 @@ export async function runRemote(options={}) {
   const result=await executeRemote({...options,clock,timings,begin});
   for(const [item,at] of pending)item.ms=Math.max(0,Math.round(clock()-at));
   timings.push({stage:'total',startedAtET:easternTimestamp(start),ms:Math.max(0,Math.round(clock()-start))});
+  // Only the real transport presyncs; injected transports opt in explicitly.
+  const after=options.spawnPresync??(options.exec===undefined?spawnPresync:null);
+  if(after&&result.mode==='remote'&&timings.some(t=>t.stage==='rsync'&&t.shipMode==='delta'))after({cwd:options.cwd??process.cwd(),host:options.host??'forge',env:options.env??process.env});
   return {...result,timings};
 }
 
@@ -865,28 +1067,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // subcommand; their full-ship path retains its existing admission order.
       try {
         if(disableDelta)throw new Error('Full ship selected');
-        const discovery=unwrap(initial[2]);
-        if(discovery.code!==0)throw new Error('No base capabilities');
-        const caps=JSON.parse(protocolText(discovery.stdout,8192));
-        if(caps.delta!==1)throw new Error('Delta unavailable');
-        const candidates=await rankBases({cwd,exec,bases:caps.bases});
-        if(!candidates.length)throw new Error('No local ready base');
-        let selected,lastError;
-        for(const base of candidates) {
-          for(let attempt=0;attempt<2;attempt++) {
-            try {
-              const response=await ssh('base-manifest',{sha:base.sha});
-              if(response.code!==0)throw new Error('Base manifest unavailable');
-              const wire=JSON.parse(protocolText(response.stdout,LIMIT));
-              if(digestManifest(wire)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
-              decodeManifest(wire);
-              selected={...base,manifest:wire};break;
-            }catch(error){lastError=error;if(attempt===0)await delay(300);}
-          }
-          if(selected)break;
-        }
-        if(!selected)throw lastError;
-        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,env,beginSub});
+        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
@@ -903,71 +1084,22 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       try {
         staging = await fs.mkdtemp(join(tmpdir(), 'forge-exec-stage-'));
         workStage = manifest.siblings ? join(staging,'work') : staging;
-        const stageDirectory = async path => {
-          const mode = path === staging ? 0o700 : 0o755;
-          await fs.mkdir(path,{recursive:true,mode});
-          await fs.chmod(path,mode);
-          const st = await fs.lstat(path);
-          if (!st.isDirectory() || st.isSymbolicLink() || (st.mode & 0o7777) !== mode)
-            throw new Error('Invalid staging directory mode');
-        };
+        const stageDirectory = stageDirectoryIn(fs,staging,0o700,0o755);
         await stageDirectory(staging);
         const snapshots = [{source:cwd,destination:workStage,entries:manifest.entries.filter(entry=>selectedKeys.has(entry.path.toString('hex')))}];
         if (manifest.siblings) snapshots.push({source:resolve(cwd,'../frontierui'),destination:join(staging,'frontierui'),entries:manifest.siblings.frontierui.entries});
-        for (const snapshot of snapshots) {
-          await stageDirectory(snapshot.destination);
-          const rootInfo = await fs.lstat(snapshot.source);
-          if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Unsafe staging root');
-          for (const entry of snapshot.entries) {
-            const parts = pathParts(entry.path);
-            let source = Buffer.from(snapshot.source), destination = Buffer.from(snapshot.destination);
-            if (entry.sourcePath)for(const link of entry.links)await verifyTrackedLink(snapshot.source,link,fs);
-            const sourceParts = pathParts(entry.sourcePath ?? entry.path);
-            for (const [i, part] of sourceParts.entries()) {
-              source = bytePath(source, part);
-              const st = await fs.lstat(source);
-              if (st.isSymbolicLink() || (i === sourceParts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
-            }
-            for (const [i, part] of parts.entries()) {
-              destination = bytePath(destination, part);
-              if (i < parts.length - 1) await stageDirectory(destination);
-            }
-            // Pin the leaf and reject special files before reading; NONBLOCK also
-            // prevents a raced-in FIFO from hanging admission before fstat.
-            const fd = await fs.open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-            let sourceStamp;
-            try {
-              const st = await fd.stat({bigint:true});
-              sourceStamp = st;
-              if (!st.isFile() || !!(st.mode & 0o111n) !== entry.executable) throw new Error('Invalid staging source');
-              const mode = entry.executable ? 0o755 : 0o644;
-              await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode});
-              await fs.chmod(destination, mode);
-              await fs.utimes(destination, timestampSeconds(st,'atime'), timestampSeconds(st,'mtime'));
-              const staged = await fs.lstat(destination);
-              if (!staged.isFile() || staged.isSymbolicLink() || (staged.mode & 0o7777) !== mode)
-                throw new Error('Invalid staging file mode');
-            } finally {await fd.close();}
-            // Node has no openat: an ancestor can race the leaf open. Re-hashing
-            // every staged byte against the verified public-content manifest
-            // confines swaps to identical bytes or not-started, before any rsync.
-            const stagedContent=await fs.readFile(destination);
-            transferBytes+=stagedContent.length;transferCount++;
-            const hash = createHash('sha256').update(stagedContent).digest('hex');
-            if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
-            if (snapshot.source === cwd && entry.path.equals(Buffer.from('coverage/coverage-final.json'))) {
-              const portable=portableCoverage(stagedContent,cwd);
-              await fs.writeFile(destination,portable);
-              // Reuse the pinned source stamp: a second timestamp round trip can
-              // truncate another microsecond and make fresh coverage look stale.
-              await fs.utimes(destination,timestampSeconds(sourceStamp,'atime'),timestampSeconds(sourceStamp,'mtime'));
-              transferBytes+=portable.length-stagedContent.length;
-              entry.sha256=createHash('sha256').update(portable).digest('hex');
-            }
+        for (const snapshot of snapshots) await stageSnapshot({fs,stageDirectory,...snapshot,onStaged:async(entry,destination,stagedContent,sourceStamp)=>{
+          transferBytes+=stagedContent.length;transferCount++;
+          if (snapshot.source === cwd && entry.path.equals(Buffer.from('coverage/coverage-final.json'))) {
+            const portable=portableCoverage(stagedContent,cwd);
+            await fs.writeFile(destination,portable);
+            // Reuse the pinned source stamp: a second timestamp round trip can
+            // truncate another microsecond and make fresh coverage look stale.
+            await fs.utimes(destination,timestampSeconds(sourceStamp,'atime'),timestampSeconds(sourceStamp,'mtime'));
+            transferBytes+=portable.length-stagedContent.length;
+            entry.sha256=createHash('sha256').update(portable).digest('hex');
           }
-          const after = await fs.lstat(snapshot.source);
-          if (after.isSymbolicLink() || after.ino !== rootInfo.ino || after.dev !== rootInfo.dev) throw new Error('Staging root swapped');
-        }
+        }});
         if (manifest.siblings && !sameSiblingEvidence(await checkSibling(resolve(cwd,'../frontierui'),exec,fs),manifest.siblings.frontierui))
           throw new Error('Sibling HEAD changed');
       } catch(error) {
@@ -1020,7 +1152,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // close the pre-created Forge work directory to the ops runner. Staging
       // already normalizes every mode; additive directory access avoids Apple
       // openrsync's '=' parser corrupting file permission masks.
+      // Presynced bytes are only an rsync basis: the receiver reuses a cached
+      // leaf only when its checksum matches, and Forge still verifies the
+      // assembled tree against the sha256 manifest before anything runs.
+      const presynced=delta?await matchPresync({exec,fs,host,delta,entries:manifest.entries.filter(entry=>selectedKeys.has(entry.path.toString('hex')))}):undefined;
       const copied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
+        ...(presynced?.count?['--checksum',`--copy-dest=${PRESYNC_ROOT}/${presynced.key}/`]:[]),
         '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
         './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
@@ -1031,7 +1168,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           './',`${host}:${runRoot}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
         if (siblingsCopied.code !== 0) throw new Error('Sibling copy failed');
       }
-      rsyncDone({shipMode:delta?'delta':'full',fileCount:transferCount,bytesSent:transferBytes,deltaFileCount:delta?selected.length:0,deltaBytes:delta?delta.deltaBytes:0});
+      rsyncDone({shipMode:delta?'delta':'full',fileCount:transferCount,bytesSent:transferBytes,deltaFileCount:delta?selected.length:0,deltaBytes:delta?delta.deltaBytes:0,...(delta?{presyncClaimed:{count:presynced?.count??0,bytes:presynced?.bytes??0}}:{})});
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:wireDigest,...(manifest.siblings ? {siblingShas:siblingShas(wire)} : {})};
       expectedManifest = wire;
     } catch (error) {
@@ -1129,7 +1266,7 @@ export async function main(options = {}) {
     host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
     remoteExec:async decisionOptions=>{const value=await remoteExecutor(decisionOptions);capturedTimings=value?.timings;return value;},
   });
-  if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes`:''}${t.substages?.length ? `\n${t.substages.map(s=>`  ${s.stage} | ${s.ms}`).join('\n')}`:''}`)].join('\n')+'\n');
+  if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes${t.presyncClaimed?` presynced ${t.presyncClaimed.count} files ${t.presyncClaimed.bytes} bytes`:''}`:''}${t.substages?.length ? `\n${t.substages.map(s=>`  ${s.stage} | ${s.ms}`).join('\n')}`:''}`)].join('\n')+'\n');
   if (result.handled) return result.exitCode;
   const local = options.local ?? (async (argv) => (await defaultExec({ file: process.execPath,
     args: ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=600000', '--', ...argv], cwd: options.cwd, inherit: true })).code);
@@ -1152,7 +1289,15 @@ export function parseArgs(args) {
 const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
 if (process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   (async () => {
-  try { process.exitCode = await main(parseArgs(process.argv.slice(2))); }
+  try {
+    if(process.argv[2]==='presync'){
+      const extra=process.argv.slice(3),host=extra.length===1&&extra[0].startsWith('--host=')?extra[0].slice(7):extra.length===0?'forge':null;
+      if(host===null)throw new Error('Usage: remote-exec.mjs presync [--host=forge]');
+      const result=await presync({host});
+      process.stderr.write(`presync: ${JSON.stringify(result)}\n`);
+      process.exitCode=result.status==='failed'?1:0;
+    } else process.exitCode = await main(parseArgs(process.argv.slice(2)));
+  }
   catch (error) { process.stderr.write(`remote-exec: ${error.message}\n`); process.exitCode = 1; }
   })();
 }
