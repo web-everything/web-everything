@@ -6,7 +6,7 @@
  *   old-reader vs new-reader equivalence run on a copy of the real store (path from JOB_STORE_COPY or a `.job-store-copy` pointer file).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,7 @@ import { runPath } from '../../operations/run-store.mjs';
 
 const noop = defineJobKind({ kind: 'noop', entry: 'x.mjs', codeMode: 'readonly-tree', maxAttempts: 1, resumable: false });
 const project = (r) => Object.freeze({ id: r.id, kind: r.job.kind, status: r.job.status });
+const NO_RACY = { racyWindowMs: 0 };
 let dir; let store;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-job-scan-')); store = createJobStore(dir); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -31,7 +32,7 @@ const mk = (status) => {
 /** The old reader vs the new one: same answer, split by the terminal rule. */
 function expectEquivalent(s) {
   const old = s.list();
-  const now = s.scan(project, 'test');
+  const now = s.scan(project, 'test', NO_RACY);
   const terminal = old.records.filter((r) => TERMINAL_JOB_STATUSES.includes(r.job.status));
   expect(now.live).toEqual(old.records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)));
   expect(now.done).toEqual(terminal.map(project));
@@ -55,19 +56,19 @@ describe('store.scan equals store.list', () => {
     const rec = mk('succeeded');
     let calls = 0;
     const counting = (r) => { calls += 1; return project(r); };
-    store.scan(counting, 'count'); store.scan(counting, 'count');
+    store.scan(counting, 'count', NO_RACY); store.scan(counting, 'count', NO_RACY);
     expect(calls).toBe(1);
     store.update(rec.id, (r) => ({ ...r, job: { ...r.job, status: 'queued' } }));
-    const now = store.scan(counting, 'count');
+    const now = store.scan(counting, 'count', NO_RACY);
     expect(now.live.map((r) => r.id)).toEqual([rec.id]);
     expect(now.done).toEqual([]);
     store.update(rec.id, (r) => ({ ...r, job: { ...r.job, status: 'failed' } }));
-    expect(store.scan(counting, 'count').done[0].status).toBe('failed');
+    expect(store.scan(counting, 'count', NO_RACY).done[0].status).toBe('failed');
   });
 
   it('crash before the rename: the old record stays whole and the temp file is ignored', () => {
     const rec = mk('succeeded');
-    store.scan(project, 'crash');
+    store.scan(project, 'crash', NO_RACY);
     const next = { ...store.read(rec.id), job: { ...store.read(rec.id).job, status: 'running' } };
     expect(() => writeJsonAtomic(runPath(rec.id, dir), next, { renameSyncFn: () => { throw new Error('crash'); } })).toThrow();
     expect(readdirSync(dir).some((f) => f.endsWith('.tmp'))).toBe(false); // the writer cleans its own temp
@@ -81,7 +82,7 @@ describe('store.scan equals store.list', () => {
     const rec = mk('succeeded');
     const path = runPath(rec.id, dir);
     const good = readFileSync(path, 'utf8');
-    store.scan(project, 'torn');
+    store.scan(project, 'torn', NO_RACY);
     writeFileSync(path, good.slice(0, 20)); // in-place torn write, different size
     let now = expectEquivalent(store);
     expect(now.corrupt).toEqual([rec.id]);
@@ -94,7 +95,7 @@ describe('store.scan equals store.list', () => {
 
   it('a record deleted after it was cached disappears', () => {
     const a = mk('succeeded'); const b = mk('succeeded');
-    store.scan(project, 'gone');
+    store.scan(project, 'gone', NO_RACY);
     unlinkSync(runPath(a.id, dir));
     expect(expectEquivalent(store).done.map((d) => d.id)).toEqual([b.id]);
   });
@@ -109,6 +110,39 @@ describe('store.scan equals store.list', () => {
 // The hermetic test env strips ambient variables, so the copy's path comes from a one-line pointer file in the
 // checkout root (untracked; absent in CI, which skips this block) or, outside the hermetic runner, JOB_STORE_COPY.
 const POINTER = join(dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url))))), '.job-store-copy');
+describe('store.scan hardening (audit)', () => {
+  it('never trusts a just-touched file from cache: an equal-size in-place rewrite is still seen', () => {
+    const rec = mk('succeeded');
+    const path = runPath(rec.id, dir);
+    store.scan(project, 'racy'); // default window: fresh file, so nothing is cached
+    const text = readFileSync(path, 'utf8');
+    const flipped = text.replace('"status": "succeeded"', '"status": "launching"'.padEnd('"status": "succeeded"'.length, ' '));
+    expect(flipped.length).toBe(text.length);
+    writeFileSync(path, flipped); // same inode, same size, within one timestamp quantum
+    const old = store.list();
+    const now = store.scan(project, 'racy');
+    expect(now.live.map((r) => r.id)).toEqual(old.records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).map((r) => r.id));
+    expect(now.live.map((r) => r.id)).toEqual([rec.id]);
+  });
+
+  it('a stat failure that is not "absent" is judged by the read path like list() does', () => {
+    mk('succeeded');
+    symlinkSync('job-noop-loop.json', join(dir, 'job-noop-loop.json')); // stat -> ELOOP, not ENOENT
+    const now = expectEquivalent(store);
+    expect(now.done).toHaveLength(1);
+  });
+
+  it('walks in listing (filename) order even when a record id differs from its filename', () => {
+    const a = mk('queued'); const b = mk('queued');
+    const [first, second] = [a.id, b.id].sort();
+    const pa = runPath(first, dir); const pb = runPath(second, dir);
+    const ra = JSON.parse(readFileSync(pa, 'utf8')); const rb = JSON.parse(readFileSync(pb, 'utf8'));
+    writeFileSync(pa, JSON.stringify({ ...ra, id: second }));
+    writeFileSync(pb, JSON.stringify({ ...rb, id: first }));
+    expect(store.scan(project, 'order', NO_RACY).ordered.map((e) => e.live.id)).toEqual(store.list().records.map((r) => r.id));
+  });
+});
+
 const REAL = process.env.JOB_STORE_COPY || (existsSync(POINTER) ? readFileSync(POINTER, 'utf8').trim() : undefined);
 describe.skipIf(!REAL || !existsSync(REAL))('old reader vs new reader on a copy of the real store', () => {
   it('returns the same answer', () => {

@@ -77,10 +77,10 @@ export function enqueueItemTask({ store, kindDef, kind = kindDef?.kind, repo, it
   const lockPath = join(store.dir, `${taskTupleLockId(identity)}.lock`);
   try {
     return withFileLock(lockPath, () => {
-      const { live, done, corrupt } = scanStore(store, tupleProjection, 'item-task-tuple');
+      const { ordered, corrupt } = scanStore(store, tupleProjection, 'item-task-tuple');
       if (corrupt.length) throw new Error(`corrupt records ${corrupt.join(', ')}`);
-      const rows = [...live.map(tupleProjection), ...done].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-      for (const row of rows) {
+      for (const entry of ordered) { // listing order, as store.list() walked it
+        const row = entry.live ? tupleProjection(entry.live) : entry.done;
         if (!row.hasTask) continue;
         if (row.invalid) throw new Error(`corrupt record ${row.id}`);
         if (row.kind === kind && row.repo === repo && row.item === item && !row.terminal) {
