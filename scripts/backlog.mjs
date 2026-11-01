@@ -206,7 +206,7 @@ function missingItemMessage(padded) {
     // Bounded + non-interactive: a stalled remote or a credential prompt must not hang the death path
     // (this also runs unattended in the drain). timeout → SIGTERM → the catch below returns `plain`.
     const gitEnv = { cwd: ROOT, timeout: 5000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } };
-    fetchFresh({ cwd: ROOT, branches: ['main'], run: (args) => execFileSync('git', args, { ...gitEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) });
+    fetchFresh({ cwd: ROOT, branches: ['main'], run: (args) => execFileSync('git', args, { ...gitEnv, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }) });
     const onOrigin = execFileSync('git', ['ls-tree', '--name-only', 'origin/main', 'backlog/'], { ...gitEnv, encoding: 'utf8' })
       .split('\n')
       .some((p) => p.startsWith(`backlog/${padded}-`));
