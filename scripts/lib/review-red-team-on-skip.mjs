@@ -65,15 +65,15 @@ const staleStatusPath = ({ repo, pr, head, env = process.env }) =>
 /** Legacy marker 1 remains a spent first attempt. Unreadable or inconsistent marker evidence stays closed. */
 export function staleRedTeamRedispatch(key) {
   const path = staleStatusPath(key), markers = [];
-  for (const suffix of ['stale-redispatch-1', 'stale-redispatch-2', 'stale-norestart']) {
+  for (let attempt = 1; attempt <= MAX_STALE_REDISPATCHES; attempt++) {
     try {
-      const marker = statSync(`${path}.${suffix}`);
+      const marker = statSync(`${path}.stale-redispatch-${attempt}`);
       if (!marker.isFile() || !Number.isFinite(marker.mtimeMs)) throw new Error('invalid stale redispatch marker');
       markers.push(marker);
     } catch (error) { if (error.code === 'ENOENT') markers.push(null); else throw error; }
   }
   if (markers[1] && !markers[0]) throw new Error('stale redispatch marker 2 without marker 1');
-  const count = markers[2] ? MAX_STALE_REDISPATCHES : markers.filter(Boolean).length;
+  const count = markers.filter(Boolean).length;
   return { count, nextOrdinal: count < MAX_STALE_REDISPATCHES ? count + 1 : null,
     firstMarkerMtimeMs: markers[0]?.mtimeMs ?? null };
 }
@@ -83,8 +83,7 @@ export function staleRedTeamSpent(key) {
 }
 
 function claimStaleNoRestart({ count, ...key }) {
-  if (count !== 1) return { ok: false };
-  const marker = `${staleStatusPath(key)}.stale-norestart`;
+  const marker = `${staleStatusPath(key)}.stale-norestart-${count}`;
   try {
     closeSync(openSync(marker, 'wx'));
     return { ok: true, release: () => {
@@ -356,11 +355,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (spent || redispatch.count > 0) {
           // Admission replaces the abandoned row with queued before a run starts.
           // An unchanged abandoned row means the prior job never launched a call.
-          if (redTeamStatusWithoutRun(status)) {
-            if (redispatch.count === 1) return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: false,
-              why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
-            return skip('stale red team already re-dispatched; inspect review run');
-          }
+          if (redTeamStatusWithoutRun(status)) return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: false,
+            why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
           if (spent || redispatch.nextOrdinal !== 2 || !isRedispatchedRun(status, redispatch.firstMarkerMtimeMs)) {
             return skip('stale red team already re-dispatched; inspect review run');
           }

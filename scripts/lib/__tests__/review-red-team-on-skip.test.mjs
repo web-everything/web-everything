@@ -1614,9 +1614,8 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
       .toMatchObject({ action: 'skip', why: expect.stringContaining('already re-dispatched') });
   });
   it.each([null, undefined].flatMap(result => [0, undefined].map(retryCount => ({ result, retryCount }))))(
-    'first stale marker with unchanged abandonment dispatches without abandon: %j', ({ result, retryCount }) => {
-      const f = staleFixture({
-        staleRedispatch: () => ({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: staleNow }) });
+    'spent stale marker with unchanged abandonment dispatches without abandon: %j', ({ result, retryCount }) => {
+      const f = staleFixture({ staleSpent: () => true });
       Object.assign(f.readStatus(), { result, retryCount, staleAbandoned: { at: staleNow, pid: f.readStatus().pid } });
       expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: false,
         why: 'abandoned stale run never restarted; re-dispatch without re-abandoning' });
@@ -1631,8 +1630,7 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
     ['completed result', { result: 'ran' }],
     ['spent retry', { retryCount: 1 }],
   ])('spent stale marker still skips with %s', (_name, over) => {
-    const f = staleFixture({
-      staleRedispatch: () => ({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: staleNow }) });
+    const f = staleFixture({ staleSpent: () => true });
     Object.assign(f.readStatus(), { staleAbandoned: { at: staleNow, pid: f.readStatus().pid } }, over);
     expect(planRedTeamOnSkip(f)[0].action).toBe('skip');
     const o = staleRunFixture({ ...f, now: () => staleNow });
@@ -1640,9 +1638,8 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
     expect(o.abandonStale).not.toHaveBeenCalled();
     expect(o.dispatch).not.toHaveBeenCalled();
   });
-  it('unchanged abandonment with a first marker still respects retry cooldown', () => {
-    const f = staleFixture({
-      staleRedispatch: () => ({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: staleNow }),
+  it('unchanged abandonment with a spent marker still respects retry cooldown', () => {
+    const f = staleFixture({ staleSpent: () => true,
       lastDispatch: new Map([[`${repo}#${pr}@${head}`, staleNow - 1]]) });
     f.readStatus().staleAbandoned = { at: staleNow, pid: f.readStatus().pid };
     expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
@@ -1673,10 +1670,10 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
         readStatus: key => readRedTeamStatus({ ...key, env }),
         staleSpent: key => staleRecovery.staleRedTeamSpent({ ...key, env }),
         staleRedispatch: key => staleRecovery.staleRedTeamRedispatch({ ...key, env }) });
-      check({ o, statusPath, marker: `${statusPath}.stale-norestart` });
+      check({ o, statusPath, marker: `${statusPath}.stale-norestart-${count}` });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  it('unchanged abandonment ordinal 1 dispatches only once across a cleared cooldown map', () => {
+  it.each([1, 2])('unchanged abandonment ordinal %i dispatches only once across a cleared cooldown map', count => {
     withAbandoned(({ o, statusPath, marker }) => {
       const abandoned = readFileSync(statusPath, 'utf8');
       o.dispatch = vi.fn(() => {
@@ -1687,29 +1684,15 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(readFileSync(statusPath, 'utf8')).toBe(abandoned);
       o.lastDispatch.clear();
       o.capacity = { lanes: 1, budget: { left: 1 } };
-      const why = 'stale red team already re-dispatched; inspect review run';
+      const why = 'stale red team no-restart re-dispatch already spent; inspect review run';
       o.log = vi.fn();
       expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }],
-        dispatched: [], notStarted: [] });
-      expect(o.log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} already-reviewed-head — red team not dispatched for head ${head.slice(0, 12)}: ${why}`);
+        dispatched: [], notStarted: [{ prNumber: pr, reason: why }] });
+      expect(o.log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr}: ${why}`);
       expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
       expect(o.dispatch).toHaveBeenCalledOnce();
       expect(o.abandonStale).not.toHaveBeenCalled();
-    });
-  });
-  it('unchanged abandonment ordinal 2 refuses a no-restart dispatch', () => {
-    withAbandoned(({ o, statusPath, marker }) => {
-      const abandoned = readFileSync(statusPath, 'utf8');
-      const why = 'stale red team already re-dispatched; inspect review run';
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }],
-        dispatched: [], notStarted: [] });
-      expect(readFileSync(statusPath, 'utf8')).toBe(abandoned);
-      expect(existsSync(marker)).toBe(false);
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-      expect(o.lastDispatch.size).toBe(0);
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(o.dispatch).not.toHaveBeenCalled();
-    }, 2);
+    }, count);
   });
   it.each([{ skipped: 'no capacity' }, {}])('confirmed no-restart non-start %j releases its marker for a later tick', result => {
     withAbandoned(({ o, marker }) => {
@@ -1733,47 +1716,8 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(runRedTeamOnSkip(o).rows[0].why).toBe('dispatch failed; start unknown');
       expect(existsSync(marker)).toBe(true);
       o.capacity = { lanes: 1, budget: { left: 1 } };
-      expect(runRedTeamOnSkip(o).rows[0].why).toBe('stale red team already re-dispatched; inspect review run');
+      expect(runRedTeamOnSkip(o).rows[0].why).toBe('stale red team no-restart re-dispatch already spent; inspect review run');
       expect(o.dispatch).toHaveBeenCalledOnce();
-    });
-  });
-  it.each([0, 2, 3, Number.MAX_SAFE_INTEGER, undefined])('no-restart claim refuses count %s if evidence changes after planning', count => {
-    withAbandoned(({ o, marker }) => {
-      o.staleRedispatch = vi.fn()
-        .mockReturnValueOnce({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: staleNow })
-        .mockReturnValue({ count });
-      const why = 'stale red team no-restart re-dispatch already spent; inspect review run';
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }],
-        dispatched: [], notStarted: [{ prNumber: pr, reason: why }] });
-      expect(o.staleRedispatch).toHaveBeenCalledTimes(2);
-      expect(existsSync(marker)).toBe(false);
-      expect(o.dispatch).not.toHaveBeenCalled();
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-    });
-  });
-  it('no-restart exclusive claim refuses an existing per-head marker despite stale planning evidence', () => {
-    withAbandoned(({ o, marker }) => {
-      writeFileSync(marker, 'already claimed');
-      o.staleSpent = () => false;
-      o.staleRedispatch = () => ({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: staleNow });
-      const why = 'stale red team no-restart re-dispatch already spent; inspect review run';
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }],
-        dispatched: [], notStarted: [{ prNumber: pr, reason: why }] });
-      expect(readFileSync(marker, 'utf8')).toBe('already claimed');
-      expect(o.dispatch).not.toHaveBeenCalled();
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-    });
-  });
-  it('invalid no-restart marker metadata fails closed before dispatch or abandonment', () => {
-    withAbandoned(({ o, statusPath, marker }) => {
-      mkdirSync(marker);
-      const abandoned = readFileSync(statusPath, 'utf8');
-      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
-        why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
-      expect(o.dispatch).not.toHaveBeenCalled();
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(readFileSync(statusPath, 'utf8')).toBe(abandoned);
     });
   });
   it.each(['refused', 'unknown', 'throw', 'missing directory'])('no-restart claim %s fails closed before dispatch', kind => {
@@ -1818,8 +1762,8 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(o.abandonStale).not.toHaveBeenCalled();
       expect(o.dispatch).toHaveBeenCalledOnce();
       expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
-      expect(staleRecovery.staleRedTeamRedispatch({ repo, pr, head, env })).toMatchObject({ count: 2, nextOrdinal: null });
-      expect(staleRecovery.staleRedTeamSpent({ repo, pr, head, env })).toBe(true);
+      expect(staleRecovery.staleRedTeamRedispatch({ repo, pr, head, env })).toMatchObject({ count: 1, nextOrdinal: 2 });
+      expect(staleRecovery.staleRedTeamSpent({ repo, pr, head, env })).toBe(false);
       // Remove cooldown and capacity effects so the queued row itself must block another start.
       o.lastDispatch.clear();
       o.capacity = { lanes: 1, budget: { left: 1 } };
@@ -1880,59 +1824,6 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
     expect(release).toHaveBeenCalledOnce();
     expect(o.dispatch.mock.invocationCallOrder[0]).toBeLessThan(release.mock.invocationCallOrder[0]);
     expect(o.lastDispatch.size).toBe(0);
-  });
-});
-
-describe('stale recovery — absolute combined dispatch cap', () => {
-  it.each(['no-restart', 'abandon'])('abandon-1 then %s spends both dispatches and refuses further recovery', second => {
-    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-combined-cap-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
-    try {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-      const key = { repo, pr, head, env };
-      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-      writeFileSync(statusPath, JSON.stringify(deadRunningStatus()));
-      const o = staleRunFixture({ env,
-        readStatus: key => readRedTeamStatus({ ...key, env }),
-        staleSpent: undefined, staleRedispatch: undefined,
-        abandonStale: vi.fn(staleRecovery.abandonStaleRedTeamRun) });
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'dispatch', abandonStale: true }],
-        dispatched: [{ prNumber: pr, jobPid: 42 }] });
-      expect(o.abandonStale).toHaveBeenCalledOnce();
-      expect(o.dispatch).toHaveBeenCalledOnce();
-      const markerAt = staleNow - staleRecovery.STALE_REDISPATCH_BACKOFF_MS;
-      utimesSync(`${statusPath}.stale-redispatch-1`, new Date(markerAt), new Date(markerAt));
-      expect(staleRecovery.staleRedTeamRedispatch(key)).toEqual({ count: 1, nextOrdinal: 2, firstMarkerMtimeMs: markerAt });
-      if (second === 'abandon') writeFileSync(statusPath, JSON.stringify(deadRunningStatus({ pid: 60284 })));
-      o.lastDispatch.clear();
-      o.capacity = { lanes: 1, budget: { left: 1 } };
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'dispatch', abandonStale: second === 'abandon' }],
-        dispatched: [{ prNumber: pr, jobPid: 42 }] });
-      const abandonments = second === 'abandon' ? 2 : 1;
-      expect(o.abandonStale).toHaveBeenCalledTimes(abandonments);
-      expect(o.dispatch).toHaveBeenCalledTimes(2);
-      expect(existsSync(`${statusPath}.stale-norestart`)).toBe(second === 'no-restart');
-      expect(existsSync(`${statusPath}.stale-redispatch-2`)).toBe(second === 'abandon');
-      expect(staleRecovery.staleRedTeamRedispatch(key)).toEqual({ count: 2, nextOrdinal: null, firstMarkerMtimeMs: markerAt });
-      expect(staleRecovery.staleRedTeamSpent(key)).toBe(true);
-      o.lastDispatch.clear();
-      o.capacity = { lanes: 1, budget: { left: 1 } };
-      const why = 'stale red team already re-dispatched; inspect review run';
-      // Even an unchanged abandoned row cannot claim a no-restart after both slots are spent.
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }], dispatched: [] });
-      const third = deadRunningStatus({ pid: 60285, pidStart: new Date(staleNow + 1).toISOString() });
-      writeFileSync(statusPath, JSON.stringify(third));
-      o.now = () => staleNow + staleRecovery.STALE_REDISPATCH_BACKOFF_MS;
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }], dispatched: [] });
-      expect(staleRecovery.abandonStaleRedTeamRun({ ...key, status: third, now: o.now(), probe: o.probe })).toEqual({ ok: false });
-      expect(o.abandonStale).toHaveBeenCalledTimes(abandonments);
-      expect(o.dispatch).toHaveBeenCalledTimes(2);
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-      expect(o.lastDispatch.size).toBe(0);
-      expect(readFileSync(statusPath, 'utf8')).toBe(JSON.stringify(third));
-      expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n')).toHaveLength(abandonments);
-      expect(existsSync(`${statusPath}.stale-redispatch-3`)).toBe(false);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
