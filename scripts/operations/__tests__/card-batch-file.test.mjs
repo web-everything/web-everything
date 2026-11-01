@@ -113,7 +113,7 @@ describe('fileIntoBatch against a real origin', () => {
         let text = '';
         try { text = readFileSync(trace, 'utf8'); } catch { return 0; }
         return text.split('\n').filter((l) => l.includes('"event":"start"'))
-          .filter((l) => JSON.parse(l).argv.slice(1).join(' ') === 'fetch --no-tags -q origin main').length;
+          .filter((l) => JSON.parse(l).argv.slice(1).join(' ') === 'fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main').length;
       };
       const bases = [];
       const admit = async (input) => { bases.push(input.baseSha); return { action: 'refuse', reason: 'head-mismatch' }; };
