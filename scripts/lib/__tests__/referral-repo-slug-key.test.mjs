@@ -88,4 +88,13 @@ describe('operator ruling repo spelling (#6170)', () => {
     const { comments } = world();
     expect(readOperatorRulings([comments[0], post(block, 'chalbert')]).rulings.map(r => r.repo)).toEqual([OLD_REPO]);
   });
+  it('an old-owner card beside an old-owner block on the same finding stays unadopted, so the block is never bypassed', () => {
+    const { referral, comments } = world();
+    const run = 'review-pr-ddbf3105-8ecb-4f6e-b25e-fb5173fa3a1c';
+    const block = buildOperatorRulingComment({ version: 1, repo: OLD_REPO, pr: 6170, head: HEAD, actor: 'chalbert', channel: 'c',
+      reason: 'r', at: '2026-11-01T19:45:00.000Z', clearerId: 'x', rulings: [{ runId: run, key: referral.key, result: 'block' }] });
+    const c = [...comments, post(block, 'chalbert')];
+    expect(readOperatorRulings(c).rulings.map(r => r.repo)).toEqual([OLD_REPO, OLD_REPO]);
+    expect(state(c, NEW_REPO).pending).toContain(referral.key);
+  });
 });
