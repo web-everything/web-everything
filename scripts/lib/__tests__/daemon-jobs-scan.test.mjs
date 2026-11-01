@@ -68,7 +68,7 @@ describe('store.scan equals store.list', () => {
 
   it('crash before the rename: the old record stays whole and the temp file is ignored', () => {
     const rec = mk('succeeded');
-    store.scan(project, 'crash', NO_RACY);
+    store.scan(project, 'test', NO_RACY);
     const next = { ...store.read(rec.id), job: { ...store.read(rec.id).job, status: 'running' } };
     expect(() => writeJsonAtomic(runPath(rec.id, dir), next, { renameSyncFn: () => { throw new Error('crash'); } })).toThrow();
     expect(readdirSync(dir).some((f) => f.endsWith('.tmp'))).toBe(false); // the writer cleans its own temp
@@ -82,7 +82,7 @@ describe('store.scan equals store.list', () => {
     const rec = mk('succeeded');
     const path = runPath(rec.id, dir);
     const good = readFileSync(path, 'utf8');
-    store.scan(project, 'torn', NO_RACY);
+    store.scan(project, 'test', NO_RACY);
     writeFileSync(path, good.slice(0, 20)); // in-place torn write, different size
     let now = expectEquivalent(store);
     expect(now.corrupt).toEqual([rec.id]);
@@ -95,7 +95,7 @@ describe('store.scan equals store.list', () => {
 
   it('a record deleted after it was cached disappears', () => {
     const a = mk('succeeded'); const b = mk('succeeded');
-    store.scan(project, 'gone', NO_RACY);
+    store.scan(project, 'test', NO_RACY);
     unlinkSync(runPath(a.id, dir));
     expect(expectEquivalent(store).done.map((d) => d.id)).toEqual([b.id]);
   });

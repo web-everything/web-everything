@@ -188,7 +188,7 @@ export function createJobStore(dir) {
      * record in full (fresh from disk, same objects `list()` would give); `done` is `project(record)` for every
      * TERMINAL one; `corrupt` is exactly `list().corrupt`. A terminal record is parsed once per process: a cached
      * projection is reused only while the file's inode, size, mtime and ctime are unchanged, and a record write is
-     * always temp-file + rename (new inode), so a changed record can never be served stale; a file touched in the last 2 s is never trusted from cache (coarse timestamps). Corrupt or foreign
+     * always temp-file + rename (new inode), so a changed record can never be served stale (each file is judged as of its stat, the same per-file, non-atomic view `list()` has as of its read: a write that lands between a file's check and the caller's use is invisible to both, and the next call sees it); a file touched in the last 2 s is never trusted from cache (coarse timestamps). Corrupt or foreign
      * files are never cached and are re-judged on every call, and a file that vanishes mid-scan is skipped, as in
      * `list()`. `project` must be pure and return read-only data; `projectKey` names it for the cache.
      */
