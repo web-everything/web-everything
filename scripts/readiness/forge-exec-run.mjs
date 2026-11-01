@@ -72,6 +72,7 @@ export function allowedCommand(argv) {
       if (!npx || !safeRelPath(arg.slice('--outputFile.json='.length))) return false;
       continue;
     }
+    if (arg === '--reporter=json' && !npx) return false; // the json report is the guard's (npx class) only
     const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
     if (!VITEST_ALLOWED_OPTIONS.includes(option) && !gateTimeoutOption(arg)) return false;
     // Vitest consumes a following boolean-looking token as the flag's value,

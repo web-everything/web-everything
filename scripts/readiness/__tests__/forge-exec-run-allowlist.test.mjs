@@ -44,6 +44,10 @@ describe('runner allowlist widening', () => {
   it('refuses a config together with a report path, since a config can move the reporter root', () => {
     expect(allowedCommand(['npx','vitest','run','--config','vitest.soak.config.ts','a.test.mjs','--reporter=json','--outputFile.json=r.json'])).toBe(false);
   });
+  it('keeps refusing the json reporter on the npm classes', () => {
+    for (const cls of ['test:unit','test:integration:vitest','test:coverage'])
+      expect(allowedCommand(['npm','run',cls,'--','a.test.mjs','--reporter=json'])).toBe(false);
+  });
   it('refuses the audit-flagged combinations (narrow R335 reading)', () => {
     expect(allowedCommand(['npx','vitest','run','--config','vitest.soak.config.ts','a.test.mjs','--reporter=json'])).toBe(false);
     expect(allowedCommand(['npx','vitest','run','--config','other.config.ts','a.test.mjs'])).toBe(false);
