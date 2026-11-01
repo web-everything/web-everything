@@ -30,7 +30,14 @@ export const VITEST_ALLOWED_OPTIONS = Object.freeze([
   '--run', '--silent', '--no-color',
   '--reporter=default', '--reporter=dot', '--reporter=verbose', '--reporter=basic', '--reporter=tap',
   '-t', '--testNamePattern=',
+  '--passWithNoTests',
 ]);
+// R314: the verify gate's load-scaled timeouts, `=` spelling only, digits only, 1..MAX_GATE_TIMEOUT_MS.
+export const MAX_GATE_TIMEOUT_MS = 3_600_000;
+export function gateTimeoutOption(arg) {
+  const match = /^--(?:testTimeout|hookTimeout)=([1-9]\d{0,6})$/.exec(arg);
+  return match !== null && Number(match[1]) <= MAX_GATE_TIMEOUT_MS;
+}
 export function allowedCommand(argv) {
   if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0')))) return false;
   if(argv[0]==='npm' && argv[1]==='run' && argv[2]==='check:standards')
@@ -53,10 +60,10 @@ export function allowedCommand(argv) {
       continue;
     }
     const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
-    if (!VITEST_ALLOWED_OPTIONS.includes(option)) return false;
+    if (!VITEST_ALLOWED_OPTIONS.includes(option) && !gateTimeoutOption(arg)) return false;
     // Vitest consumes a following boolean-looking token as the flag's value,
     // even when that token could also be a valid positional file filter.
-    if (['--run','--silent','--no-color'].includes(arg) && /^(?:true|false)/i.test(argv[i+1] ?? '')) return false;
+    if (['--run','--silent','--no-color','--passWithNoTests'].includes(arg) && /^(?:true|false)/i.test(argv[i+1] ?? '')) return false;
     // Vitest reparses dash-prefixed -t values as options (including --help).
     if (arg === '-t' && (++i >= argv.length || argv[i].startsWith('-'))) return false;
   }
@@ -104,12 +111,36 @@ export function formatTelemetry(value,host='forge') {
   const last=v.recent.find(r=>r.code!==null);
   return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
 }
-const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS'];
+const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS','VERIFY_SCAN_FILES'];
+// R309: the repo-scanning tests' changed-file list. verify-lane sends a JSON array of repo-relative
+// paths; a newline- or comma-separated list is also accepted. Every entry is a plain repo-relative
+// path: no absolute path, no `.`/`..` segment, no empty segment, no shell metacharacter.
+const SCAN_FILES_MAX = 65536;
+const scanPath = path => typeof path === 'string' && path.length > 0 && path.length <= 4096
+  && /^[A-Za-z0-9_@+.][A-Za-z0-9_@+.\/-]*$/.test(path) && !path.includes('..')
+  && path.split('/').every(part => part !== '' && part !== '.' && part !== '..');
+// Scanners consume JSON only. Bound both the incoming and canonical representations so
+// client normalization never produces a value the runner would reject as oversized.
+export function normalizeScanFilesValue(value) {
+  if (typeof value !== 'string' || value.length > SCAN_FILES_MAX) return null;
+  let paths;
+  if (value.startsWith('[')) {
+    try { paths = JSON.parse(value); } catch { return null; }
+    if (!Array.isArray(paths)) return null;
+  } else paths = value.split(/\n|,/);
+  if (paths.length > 4096 || !paths.every(scanPath)) return null;
+  const normalized = JSON.stringify(paths);
+  return normalized.length <= SCAN_FILES_MAX ? normalized : null;
+}
+export function scanFilesValue(value) {
+  return normalizeScanFilesValue(value) !== null;
+}
 export function allowedEnv(env) {
   return env && typeof env === 'object' && !Array.isArray(env) && Object.entries(env).every(([key,value]) =>
     ENV_KEYS.includes(key) && !/secret|token|password|credential|auth|key/i.test(key)
     && typeof value === 'string' && !value.includes('\0')
     && (key !== 'WE_VITEST_MAX_WORKERS' || /^[1-9]\d*$/.test(value))
+    && (key !== 'VERIFY_SCAN_FILES' || scanFilesValue(value))
     && (key !== 'DIFF_COVERAGE_BASE' || (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)
       && !/\s/.test(value) && !value.includes('..') && !value.includes('//') && !/(?:^|\/)\.|\.lock(?:\/|$)|[/.]$/.test(value))));
 }
@@ -960,7 +991,10 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         runAt=clock();
         await update();
         if(telemetryError)throw telemetryError;
-        result=await command(executionArgv(request.argv),work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
+        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
+        if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
+          executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
+        result=await command(executionArgv(request.argv),work,executionEnv);
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));

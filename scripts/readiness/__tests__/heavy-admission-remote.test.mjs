@@ -156,8 +156,8 @@ describe('remote admission policy', () => {
     {env:{},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['node','scripts/check-standards.mjs','--local','--files=a.mjs'],expected:['npm','run','check:standards','--','--local','--files=a.mjs']},
-    // Only verify-lane's handoff drops the trailing gate-only options, and only from the remote argv.
-    {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','a.test.mjs','--reporter=dot','--passWithNoTests','--testTimeout=15000','--hookTimeout=30000'],expected:['npm','run','test:unit','--','a.test.mjs','--reporter=dot']},
+    // Forge accepts the gate options (R314): the remote argv carries them unchanged.
+    {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','a.test.mjs','--reporter=dot','--passWithNoTests','--testTimeout=15000','--hookTimeout=30000'],expected:['npm','run','test:unit','--','a.test.mjs','--reporter=dot','--passWithNoTests','--testTimeout=15000','--hookTimeout=30000']},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','a.test.mjs','--testTimeout=15000','--testTimeout=15000'],expected:['npm','run','test:unit','--','a.test.mjs','--testTimeout=15000','--testTimeout=15000']},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','--config','vitest.integration.config.ts','a.test.mjs','--passWithNoTests'],expected:['npm','run','test:integration:vitest','--','a.test.mjs','--passWithNoTests']},
     {env:{},command:['vitest','run','a.test.mjs','--passWithNoTests'],expected:['npm','run','test:unit','--','a.test.mjs','--passWithNoTests']},
