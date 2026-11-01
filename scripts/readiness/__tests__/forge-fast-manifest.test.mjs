@@ -320,3 +320,41 @@ describe('ignored build output test policy',()=>{
     await expect(buildManifest({cwd,exec:broken})).rejects.toMatchObject({code:'ignored-test-file'});
   });
 });
+describe('parallel manifest leaves',()=>{
+  it('accounts for every git ls-files path: shipped, or explicitly excluded by policy',async()=>{
+    await fs.mkdir(join(cwd,'design-systems'));
+    await write('design-systems/brand.tokens.json','{}');await write('plain.json','{}');
+    await git(['add','.']);await commit();
+    const manifest=await buildManifest({cwd,exec});
+    const shipped=new Set(manifest.entries.map(e=>e.path.toString())),excluded=new Set(manifest.excluded.map(p=>p.toString()));
+    const tracked=(await git(['ls-files','-z'])).toString().split('\0').filter(Boolean);
+    expect(tracked.filter(path=>!shipped.has(path)&&!excluded.has(path))).toEqual([]);
+    expect(shipped.has('plain.json')).toBe(true);
+    // Current policy: credential-named components (/token/) are excluded, visibly.
+    expect(excluded.has('design-systems/brand.tokens.json')).toBe(true);
+  });
+  it('keeps inventory order and bounds concurrent leaf reads',async()=>{
+    for(let i=0;i<60;i++)await write(`leaf-${String(i).padStart(2,'0')}.txt`,`leaf ${i}`);
+    await git(['add','.']);await commit();
+    let active=0,maximum=0;
+    const slow={...fs,readFile:async path=>{active++;maximum=Math.max(maximum,active);
+      try{await new Promise(r=>setTimeout(r,Math.random()*3));return await fs.readFile(path);}finally{active--;}}};
+    const parallel=await buildManifest({cwd,exec,fs:slow});
+    const serial=await buildManifest({cwd,exec});
+    expect(maximum).toBeGreaterThan(1);expect(maximum).toBeLessThanOrEqual(16);
+    expect(parallel.entries).toEqual(serial.entries);
+    expect(parallel.manifestDigest).toBe(serial.manifestDigest);
+  });
+  it('throws the first failing leaf in inventory order, as a serial walk would',async()=>{
+    for(let i=0;i<30;i++)await write(`leaf-${String(i).padStart(2,'0')}.txt`,'leaf');
+    await git(['add','.']);await commit();
+    const failing=new Set(['leaf-07.txt','leaf-03.txt','leaf-21.txt']);
+    const faulty={...fs,readFile:async path=>{
+      const name=Buffer.from(path).subarray(Buffer.byteLength(cwd)+1).toString();
+      // Later failures resolve first; the reported error must still be leaf-03.
+      if(failing.has(name)){await new Promise(r=>setTimeout(r,name==='leaf-03.txt'?20:0));throw new Error(`read ${name}`);}
+      return fs.readFile(path);
+    }};
+    await expect(buildManifest({cwd,exec,fs:faulty})).rejects.toThrow('read leaf-03.txt');
+  });
+});
