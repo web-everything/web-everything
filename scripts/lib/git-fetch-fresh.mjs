@@ -11,7 +11,7 @@
  *   Policy cascade: standard 60 s -> platform `gitFetchFresh` -> tool `scripts/settings/git-fetch-fresh.json`
  *   -> env `WE_GIT_FETCH_FRESH_SECONDS` (0 = always fetch; max 3600).
  * Sharing: a narrow fetch is keyed by the OBJECT STORE (the alternates target when a lane borrows one, else the
- * clone's own store) + remote + refspecs, so lanes that share an alternate share freshness. Refs are per clone,
+ * clone's own store) + remote's effective URL + refspecs, so lanes that share an alternate share freshness. Refs are per clone,
  * so a skip never trusts the stamp blindly: the stamp records the sha each ref had after the real fetch, and the
  * skipping clone fast-forwards its own ref to it (object present, ancestor-only, never regresses). If it cannot
  * honour the stamp it does the real fetch. A FAILED fetch is never stamped.
@@ -76,18 +76,24 @@ export function objectStoreOf(cwd) {
 /** The window (ms) a caller's own cache must not outlive. */
 export const fetchFreshWindowMs = (env = process.env) => defaultMaxAgeMs(env);
 
-/** `remote.<name>.url` read from the clone's config file (no spawn); '' when unreadable. */
-function remoteUrl(cwd, remote) {
+/** Effective fetch configuration through the fetch runner; null disables reuse when unprovable. */
+export function fetchFreshRemoteIdentity(cwd, remote = 'origin', run = defaultRun) {
   try {
     const git = commonGitDir(cwd);
     const text = readFileSync(join(git, 'config'), 'utf8');
     // Includes and url rewrites change the effective destination: identity cannot be established from this file.
     if (/^\s*\[include|insteadOf/mi.test(text)) return null;
-    const block = text.split(/^\[/m).find((b) => b.startsWith(`remote "${remote}"]`));
-    const url = /^\s*url\s*=\s*(.+)$/m.exec(block ?? '')?.[1]?.trim() ?? '';
+    // Git applies system/global/XDG/includes and environment or runner-supplied overrides here,
+    // including url.*.insteadOf. Use the SAME runner as fetch, not a separate process environment.
+    const url = String(run(['remote', 'get-url', remote], cwd) ?? '').replace(/\r?\n$/, '');
     if (!url) return null;
+    // Some caller runners trim output. NUL-terminated config preserves significant URL whitespace,
+    // and also keys changes to other fetch configuration (e.g. a wide fetch's configured refspecs).
+    const config = String(run(['config', '--null', '--list', '--includes'], cwd) ?? '');
+    if (!config.endsWith('\0')) return null;
     // A relative url means a different repository per clone location.
-    return /^([a-z][a-z0-9+.-]*:\/\/|[^/@:]+@[^/:]+:|\/)/i.test(url) ? url : `${resolve(cwd)}|${url}`;
+    const destination = /^([a-z][a-z0-9+.-]*:\/\/|[^/@:]+@[^/:]+:|\/)/i.test(url) ? url : `${resolve(cwd)}|${url}`;
+    return identityKey([destination, config]);
   } catch { return null; }
 }
 
@@ -95,6 +101,7 @@ export const refspecFor = (remote, branch) => `+refs/heads/${branch}:refs/remote
 const trackingRef = (remote, branch) => `refs/remotes/${remote}/${branch}`;
 
 function stampPath(dir, key) { return join(dir, `${key}.json`); }
+const identityKey = (parts) => createHash('sha1').update(JSON.stringify(parts)).digest('hex').slice(0, 24);
 function readStamp(path) { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } }
 function writeStamp(path, value) {
   try {
@@ -138,9 +145,9 @@ export function fetchFresh({
   const window = maxAgeMs ?? defaultMaxAgeMs(env);
   const specs = narrow ? [...new Set(branches)].sort().map((b) => refspecFor(remote, b)) : [];
   const refs = narrow ? [...new Set(branches)].sort().map((b) => trackingRef(remote, b)) : [];
-  const url = remoteUrl(cwd, remote);
-  const scope = url === null ? null : narrow ? objectStoreOf(cwd) : (commonGitDir(cwd) && resolve(cwd));
-  const key = scope ? createHash('sha1').update([scope, remote, url, noTags ? 'nt' : 't', ...specs].join('\n')).digest('hex').slice(0, 24) : null;
+  const identity = fetchFreshRemoteIdentity(cwd, remote, run);
+  const scope = identity === null ? null : narrow ? objectStoreOf(cwd) : (commonGitDir(cwd) && resolve(cwd));
+  const key = scope ? identityKey([scope, remote, identity, noTags ? 'nt' : 't', ...specs]) : null;
   const path = key ? stampPath(stampDir, key) : null;
   const fetchArgs = ['fetch', '--quiet', ...(noTags ? ['--no-tags'] : []), remote, ...specs];
 
@@ -149,16 +156,21 @@ export function fetchFresh({
     const age = stamp ? now() - stamp.at : Infinity;
     if (stamp && age >= 0 && age < window) {
       let honoured = false;
-      try { honoured = narrow ? applyStamp(run, cwd, stamp.refs ?? {}, refs) : true; } catch { honoured = false; }
+      try {
+        // A wide fetch cannot restore refs. On A -> B -> A, A's old stamp is unsafe if B
+        // changed any refs. Comparing the full snapshot detects ref changes since the stamp.
+        honoured = narrow ? applyStamp(run, cwd, stamp.refs ?? {}, refs)
+          : stamp.key === key && JSON.stringify(refShas(run, cwd, refs)) === JSON.stringify(stamp.refs);
+      } catch { honoured = false; }
       if (honoured) return { fetched: false, skipped: true, key, ageMs: age };
     }
   }
   const at = now();
   run(fetchArgs, cwd); // a throw leaves any previous stamp alone and writes nothing: a failure is never cached
   if (path) {
-    let shas = {};
-    if (narrow) { try { shas = refShas(run, cwd, refs); } catch { shas = null; } }
-    if (shas && refs.every((ref) => shas[ref])) writeStamp(path, { at, remote, refs: shas });
+    let shas;
+    try { shas = refShas(run, cwd, refs); } catch { shas = null; }
+    if (shas && refs.every((ref) => shas[ref])) writeStamp(path, { at, remote, key, refs: shas });
   }
   return { fetched: true, skipped: false, key, ageMs: 0 };
 }

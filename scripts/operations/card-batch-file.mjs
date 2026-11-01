@@ -31,7 +31,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir, sealJobEnv } from './card-batch-io.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
-import { fetchFresh, fetchFreshWindowMs } from '../lib/git-fetch-fresh.mjs';
+import { fetchFresh, fetchFreshRemoteIdentity, fetchFreshWindowMs } from '../lib/git-fetch-fresh.mjs';
 import { raisedByMemberId } from '../lib/raised-by.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings, formatPreventionBatchSettings, loadPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
@@ -81,14 +81,15 @@ const MAIN_BASE_CACHE = new Map();
  */
 export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS } = {}) {
   const key = resolve(laneDir);
+  const identity = fetchFreshRemoteIdentity(laneDir, 'origin', (args, cwd) => run(cwd, args));
   const hit = cache.get(key);
-  if (hit && now() - hit.at < Math.min(maxAgeMs, fetchFreshWindowMs())) return hit.sha; // never outlive the shared window
+  if (identity !== null && hit?.identity === identity && now() - hit.at < Math.min(maxAgeMs, fetchFreshWindowMs())) return hit.sha; // never outlive the shared window
   let fetched = true;
   const at = now();
   let ageMs = 0;
   try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, maxAgeMs, run: (args, cwd) => run(cwd, args) })); } catch { fetched = false; /* fall back to the lane's last fetch */ }
   const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}']);
-  if (fetched) cache.set(key, { at: at - ageMs, sha }); // the window runs from the real fetch, never from a shared skip
+  if (fetched && identity !== null) cache.set(key, { at: at - ageMs, sha, identity }); // the window runs from the real fetch, never from a shared skip
   else cache.delete(key);
   return sha;
 }

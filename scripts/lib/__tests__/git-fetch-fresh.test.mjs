@@ -108,6 +108,98 @@ describe('window policy', () => {
 });
 
 describe('identity is unprovable', () => {
+  for (const branches of [['main'], null]) {
+    it.each(['counted env', 'parameters env', 'global', 'system', 'xdg', 'included global', 'runner -c'])(
+      `uses the effective destination from %s configuration (branches=${JSON.stringify(branches)})`,
+      (source) => {
+        const w = world();
+        const mirror = join(w.root, 'mirror');
+        git(w.root, 'clone', '-q', w.origin, mirror);
+        writeFileSync(join(mirror, 'f'), 'mirror');
+        git(mirror, 'commit', '-qam', 'mirror');
+        const mirrorSha = git(mirror, 'rev-parse', 'main');
+        let overrides = {};
+        let configArgs = [];
+        const invoke = (args, cwd) => execFileSync('git', [...configArgs, ...args], {
+          cwd, env: { ...process.env, ...overrides }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const run = counting(invoke);
+        const o = { cwd: w.a, stampDir: w.stampDir, run, branches, maxAgeMs: 60_000 };
+        expect(fetchFresh(o).fetched).toBe(true);
+        const key = `url.${mirror}.insteadOf`;
+        const config = join(w.root, 'external-config');
+        writeFileSync(config, `[url "${mirror}"]\n\tinsteadOf = ${w.origin}\n`);
+        if (source === 'counted env') overrides = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: w.origin };
+        if (source === 'parameters env') overrides = { GIT_CONFIG_PARAMETERS: `'${key}=${w.origin}'` };
+        if (source === 'global') overrides = { GIT_CONFIG_GLOBAL: config };
+        if (source === 'system') overrides = { GIT_CONFIG_NOSYSTEM: '0', GIT_CONFIG_SYSTEM: config };
+        if (source === 'xdg') {
+          const xdg = join(w.root, 'xdg'); mkdirSync(join(xdg, 'git'), { recursive: true });
+          writeFileSync(join(xdg, 'git', 'config'), `[include]\n\tpath = ${config}\n`);
+          overrides = { GIT_CONFIG_GLOBAL: undefined, HOME: w.root, XDG_CONFIG_HOME: xdg };
+        }
+        if (source === 'included global') {
+          const global = join(w.root, 'global-config');
+          writeFileSync(global, `[include]\n\tpath = ${config}\n`);
+          overrides = { GIT_CONFIG_GLOBAL: global };
+        }
+        if (source === 'runner -c') configArgs = ['-c', `${key}=${w.origin}`];
+
+        // A separate read-only Git probe proves the destination changed before consulting the cache.
+        expect(invoke(['remote', 'get-url', 'origin'], w.a).trim()).toBe(mirror);
+        expect(fetchFresh(o)).toMatchObject({ fetched: true, skipped: false });
+        expect(git(w.a, 'rev-parse', 'origin/main')).toBe(mirrorSha);
+        expect(run.fetches()).toHaveLength(2);
+        // Returning to the canonical configuration must restore the canonical identity too.
+        overrides = {}; configArgs = [];
+        expect(fetchFresh(o).key).not.toBeNull();
+        expect(git(w.a, 'rev-parse', 'origin/main')).toBe(git(w.origin, 'rev-parse', 'main'));
+      },
+      60_000,
+    );
+  }
+
+  it('keeps significant URL whitespace when a caller runner trims its output', () => {
+    const w = world();
+    let overrides = {};
+    const run = counting((args, cwd) => execFileSync('git', args, {
+      cwd, env: { ...process.env, ...overrides }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim());
+    const o = { cwd: w.a, stampDir: w.stampDir, run, maxAgeMs: 60_000 };
+    const keys = [];
+    for (const suffix of ['', ' ']) {
+      const mirror = join(w.root, `mirror${suffix}`);
+      git(w.root, 'clone', '-q', w.origin, mirror);
+      writeFileSync(join(mirror, 'f'), `mirror${suffix}`);
+      git(mirror, 'commit', '-qam', `mirror${suffix}`);
+      overrides = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${mirror}.insteadOf`, GIT_CONFIG_VALUE_0: w.origin };
+      const result = fetchFresh(o);
+      expect(result.fetched).toBe(true);
+      keys.push(result.key);
+      expect(git(w.a, 'rev-parse', 'origin/main')).toBe(git(mirror, 'rev-parse', 'main'));
+    }
+    expect(keys[0]).not.toBe(keys[1]);
+  }, 60_000);
+
+  it.each(['throw', 'empty', 'config throw', 'config truncated'])('fetches without cache reuse when effective configuration is unprovable: %s', (failure) => {
+    const w = world();
+    const run = counting((args, cwd) => {
+      if (args[0] === 'remote' && args[1] === 'get-url' && !failure.startsWith('config')) {
+        if (failure === 'throw') throw new Error('configuration unreadable');
+        return '';
+      }
+      if (args[0] === 'config' && failure.startsWith('config')) {
+        if (failure === 'config throw') throw new Error('configuration unreadable');
+        return 'remote.origin.url\ntruncated';
+      }
+      return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    });
+    const o = { cwd: w.a, stampDir: w.stampDir, run, maxAgeMs: 60_000 };
+    expect(fetchFresh(o)).toMatchObject({ fetched: true, key: null });
+    expect(fetchFresh(o)).toMatchObject({ fetched: true, key: null });
+    expect(run.fetches()).toHaveLength(2);
+  });
+
   it('a url rewrite (insteadOf) disables sharing: every call fetches', () => {
     const w = world(); const run = counting();
     git(w.a, 'config', 'url.file:///x/.insteadOf', 'file:///y/');
