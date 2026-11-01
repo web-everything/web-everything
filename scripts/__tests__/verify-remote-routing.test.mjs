@@ -33,10 +33,18 @@ describe('timeout preservation', () => {
     '--hookTimeout=30000 --testTimeout=15000 --passWithNoTests',
     '--testTimeout=5000 --hookTimeout=10000',
     '--passWithNoTests',
-  ])('hands the nested wrapper every gate option under remote policy: %s', flags => {
+  ])('hands the nested wrapper a Forge-compatible command stripped daemon-side: %s', flags => {
+    // The lane's own heavy-admission may predate stripGateOnlyOptions; the daemon's snapshot strips here.
     const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
-      .toEqual({ command: `npm run test:unit -- 'scripts/changed test.test.mjs' ${flags}`, takeLocalSlot: false, setHeld: false });
+      .toEqual({ command: "npm run test:unit -- 'scripts/changed test.test.mjs'", takeLocalSlot: false, setHeld: false, stripped: true });
+    expect(phaseAdmissionPlan({ command, decision: { remote: false } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([
+    'npx vitest run --passWithNoTests',
+    'npx vitest run --testTimeout=15000 --hookTimeout=30000',
+  ])('fails closed when stripping would leave no test filter: %s', command => {
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
   it.each([
     "'--testTimeout=15000' --hookTimeout='30000'",
@@ -65,7 +73,7 @@ describe('timeout preservation', () => {
     const decidePhaseRemote = vi.fn(async () => ({ remote: true }));
     // Simulate Forge becoming unavailable: the child runs locally and needs the requested
     // timeout for a six-second edited test. A stripped command produces the original red.
-    const runGate = vi.fn(async (childCommand, _args, { forgeDispatch }) => ({
+    const runGate = vi.fn(async (childCommand, _args, { forgeDispatch = false } = {}) => ({
       exitCode: childCommand.includes('--testTimeout=15000') && childCommand.includes('--hookTimeout=30000') ? 0 : 1,
       remoteAttempt: forgeDispatch, ranOn: { location: 'local' },
     }));
@@ -90,16 +98,25 @@ describe('timeout preservation', () => {
     const timedRunGate = runInNewContext(`${source.slice(runStart, runEnd)}; timedRunGate`, context);
     const result = await timedRunGate('vitestMs', command);
     expect(result.exitCode).toBe(0);
-    expect(runGate).toHaveBeenCalledTimes(1);
-    expect(runGate).toHaveBeenCalledWith('npm run test:unit -- scripts/changed.test.mjs --testTimeout=15000 --hookTimeout=30000',
-      undefined, { forgeDispatch: true });
-    expect(acquireSlotBlocking).not.toHaveBeenCalled();
+    // The stripped handoff fell back inside an old lane's wrapper and went red; the original command,
+    // with every flag, then runs locally under a local slot and owns the verdict.
+    expect(runGate).toHaveBeenCalledTimes(2);
+    expect(runGate).toHaveBeenNthCalledWith(1, 'npm run test:unit -- scripts/changed.test.mjs', undefined, { forgeDispatch: true });
+    expect(runGate).toHaveBeenNthCalledWith(2, command, undefined);
+    expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+    expect(acquireSlotBlocking).toHaveBeenCalledTimes(1);
     expect(decidePhaseRemote).toHaveBeenCalledTimes(1);
     expect(context.vitestAdmittedLocally).toBe(true);
   });
 });
 
 describe('proven local fallback verdict', () => {
+  it.each(['local', 'mixed'])('confirms a stripped plan\'s %s red: it ran the stricter command, not the original', location => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, stripped: true }, exitCode: 1, ranOn: { location } })).toBe(true);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, stripped: true }, exitCode: 124, ranOn: { location } })).toBe(false);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, stripped: true }, exitCode: 0, ranOn: { location } })).toBe(false);
+  });
+
   it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
     const ranOn = phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode })));
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode, ranOn })).toBe(false);
@@ -127,7 +144,7 @@ describe('proven local fallback verdict', () => {
   it.each([false, true].flatMap(phaseAdmission => [
     ['vitestMs', 'npx vitest run scripts/changed.test.mjs', ['local-fallback']],
     ['standardsMs', 'npm run check:standards', ['local-fallback']],
-    ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npx vitest run scripts/changed.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ['remote', 'local-fallback']],
+    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run scripts/changed.test.mjs', ['remote', 'local-fallback']],
     ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run scripts/changed.test.mjs', ['local-fallback', 'remote']],
   ].map(([phase, command, locations]) => ({ phaseAdmission, phase, command, locations }))))(
     'retains the failed child and its evidence: $phase, $locations, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command, locations }) => {
@@ -260,19 +277,19 @@ describe('verify remote routing', () => {
     '--hookTimeout=30000',
     '--testTimeout=5000 --hookTimeout=10000',
     '--reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
-  ])('selected Vitest run with trailing gate flags goes to the wrapper with every flag intact: %s', flags => {
+  ])('selected Vitest run with trailing gate flags goes to the wrapper stripped daemon-side: %s', flags => {
     const files = "'scripts/path with spaces.test.mjs' 'scripts/two.test.mjs'";
+    const kept = flags.startsWith('--reporter=dot') ? ' --reporter=dot' : '';
     expect(phaseAdmissionPlan({ command: `npx vitest run ${files} ${flags}`, decision: { remote: true } })).toEqual({
-      command: `npm run test:unit -- ${files} ${flags}`, takeLocalSlot: false, setHeld: false,
+      command: `npm run test:unit -- ${files}${kept}`, takeLocalSlot: false, setHeld: false, stripped: true,
     });
   });
   it('the daemon selected-tests gate chain is remote-eligible segment by segment', () => {
     const one = "npx vitest run 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000";
     const two = "TZ=UTC npx vitest run 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000";
     expect(phaseAdmissionPlan({ command: `${one} && ${two}`, decision: { remote: true } })).toEqual({
-      command: "npm run test:unit -- 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000"
-        + " && TZ=UTC npm run test:unit -- 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000",
-      takeLocalSlot: false, setHeld: false,
+      command: "npm run test:unit -- 'a.test.mjs' && TZ=UTC npm run test:unit -- 'b.test.mjs'",
+      takeLocalSlot: false, setHeld: false, stripped: true,
     });
     expect(phaseAdmissionPlan({ command: `${one} && ${two}`, decision: { remote: false } }))
       .toEqual({ command: `${one} && ${two}`, takeLocalSlot: true, setHeld: true });
@@ -468,7 +485,7 @@ describe('verify-lane remote phase spawn', () => {
     ['raw', 0, 'local', true],
     ['raw', 0, 'local', true, 'npm run test:unit && node raw.cjs'],
     ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
-      ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot', '--passWithNoTests', '--testTimeout=15000', '--hookTimeout=30000']],
+      ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot']],
     ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot",
       ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot']],
     ['raw', 0, 'local', true, 'npx vitest run one.test.mjs --unknown --passWithNoTests --testTimeout=15000 --hookTimeout=30000',

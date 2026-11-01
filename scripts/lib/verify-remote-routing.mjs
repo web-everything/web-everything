@@ -36,27 +36,31 @@ function wrappedVitestCommand(command) {
   }
   if (words[start] !== 'npx' || words[start + 1] !== 'vitest' || words[start + 2] !== 'run') return null;
   const args = words.slice(start + 3);
-  // The nested wrapper can fall back locally, so it receives every original argument. Only the
-  // Forge-dispatched remote argv drops the trailing gate-only options (stripGateOnlyOptions); the
-  // options themselves must be literal words, so a quoted spelling stays local.
+  // The daemon strips the trailing gate-only options (stripGateOnlyOptions) HERE, from its own snapshot, so
+  // the command handed to the lane's nested wrapper is Forge-compatible whatever version of
+  // heavy-admission the lane carries. The stripped form is stricter (vitest's default timeouts, no
+  // passWithNoTests), so its green implies the original's; any red of a stripped phase, remote or a nested
+  // local fallback, is re-run locally with the original command (shouldConfirmRemoteRed). Only the exact
+  // trailing `=` spellings are recognized; anything else stays in place and keeps the command local.
   const remoteArgs = stripGateOnlyOptions(args);
-  if (!remoteArgs || !args.length) return null;
+  if (!remoteArgs || !args.length || !remoteArgs.length) return null;
   if (!allowedCommand(['npx', 'vitest', 'run', ...remoteArgs.map(unquote)])) return null;
-  return [...words.slice(0, start), 'npm run test:unit --', ...args].join(' ');
+  return { command: [...words.slice(0, start), 'npm run test:unit --', ...remoteArgs].join(' '), stripped: remoteArgs.length !== args.length };
 }
 
 // A gate built as `vitest run … && VAR=… vitest run …` is remote-eligible only when EVERY top-level
 // segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its own fallback.
 function wrappedVitestChain(command) {
-  const segments = command.split(' && ');
-  const wrapped = segments.map(wrappedVitestCommand);
-  return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
+  const wrapped = command.split(' && ').map(wrappedVitestCommand);
+  if (!wrapped.every(Boolean)) return null;
+  return { command: wrapped.map(w => w.command).join(' && '), stripped: wrapped.some(w => w.stripped) };
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
   if (command.split(' && ').every(segment => VITEST_SEGMENT.test(segment))) {
     const wrapped = decision?.remote === true ? wrappedVitestChain(command) : null;
-    return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
+    if (!wrapped) return { command, takeLocalSlot: true, setHeld: true };
+    return { command: wrapped.command, takeLocalSlot: false, setHeld: false, ...(wrapped.stripped ? { stripped: true } : {}) };
   }
   const words = simpleShellWords(command)?.map(unquote);
   const eligible = !!words && (
@@ -71,7 +75,9 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
   // The nested wrapper owns local fallback. A local or mixed phase has already run locally;
   // confirming the whole chain again could discard a failure before isolated-retry safeguards run.
-  return plan?.takeLocalSlot === false && !['local', 'mixed'].includes(ranOn?.location)
+  // A stripped plan is the exception: its nested local fallback ran the stricter stripped command, not the
+  // original, so its red is not the original's verdict and is confirmed with the original command too.
+  return plan?.takeLocalSlot === false && (plan.stripped === true || !['local', 'mixed'].includes(ranOn?.location))
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }
