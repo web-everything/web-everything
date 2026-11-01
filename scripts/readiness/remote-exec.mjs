@@ -281,7 +281,8 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
-        // (a) Ignored tests still belong to the runner's discovery universe.
+        // (a) Discovery excludes entry points, not imports. Every test-shaped
+        // leaf must ship, even when Git ignores it or Vitest does not list it.
         if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
@@ -347,14 +348,18 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Git ignore rules do not establish test-runner exclusions. Even a whole
-  // ignored build directory can contain runnable tests (scripts/build/__tests__).
+  // Neither Git ignores nor Vitest discovery prove that a file is unused:
+  // selected tests can import excluded tests, directly or through helpers.
+  // Until dependency inclusion is established, retain local fallback.
   const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredPaths = splitPaths(ignored.stdout);
   for (const path of ignoredPaths) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
-    if (isTestFile(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
+    if (isTestFile(path)) {
+      const refusal=manifestRefusal('ignored-test-file',path);
+      throw Object.assign(refusal,{message:`Ignored test ${refusal.detail}: use local fallback`});
+    }
   }
   const walkDone=beginSub('inventory-walk');
   let files;
@@ -521,7 +526,15 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
       const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
-      if(policy.excluded||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
+      // A credential-named alias is refused unless it is the memory bridge's exact
+      // image of a tracked agent-memory-src/ source that itself passed the public-blob check above.
+      const sourcePath=entry.sourcePath??entry.path,memoryRoot=Buffer.from('agent-memory-src/');
+      const verifiedMemory=bridge==='.claude/agent-memory/'&&policy.credentialSource
+        &&sourcePath.subarray(0,memoryRoot.length).equals(memoryRoot)
+        &&sourcePath.subarray(memoryRoot.length).equals(path.subarray(bridge.length))
+        &&indexBlobs.has(sourcePath.toString('base64'))&&classifyManifestPath(sourcePath).credentialSource
+        &&sourceEntries.some(source=>source.path.equals(sourcePath));
+      if((policy.excluded&&!verifiedMemory)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }
@@ -699,7 +712,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,beginSub});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -873,14 +886,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           if(selected)break;
         }
         if(!selected)throw lastError;
-        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,beginSub});
+        delta=await buildDeltaManifest({cwd,exec,fs,base:selected,head:logicalHead,env,beginSub});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,beginSub});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));

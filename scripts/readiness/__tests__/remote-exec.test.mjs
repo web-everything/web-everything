@@ -1096,8 +1096,28 @@ describe('runRemote', () => {
     expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['a.test.mjs', 'package-lock.json', 'src', 'src/kept.mjs']);
   });
 
+  it('retains ignored-test fallback without discovery after finalizing the Forge coverage environment', async () => {
+    const f = fixture();
+    const gitIn=(...args)=>{
+      const result=spawnSync('git',['-c','user.name=t','-c','user.email=t@t',...args],{cwd,encoding:'utf8',timeout:10000});
+      expect(result.status,result.stderr).toBe(0);return result.stdout.trim();
+    };
+    gitIn('init','--quiet');
+    writeFileSync(join(cwd,'.gitignore'),'dist/\nheavy/\n');
+    mkdirSync(join(cwd,'dist'),{recursive:true});writeFileSync(join(cwd,'dist/hidden.test.mjs'),'must run');
+    gitIn('add','.');gitIn('commit','-q','-m','base');gitIn('branch','coverage-base');
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git'
+      ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
+    f.selectorExec = vi.fn(async () => ({stdout:JSON.stringify([join(cwd,'a.test.mjs')])}));
+    const result = await runRemote({...f,listFiles:undefined,argv:['npx','vitest','run','a.test.mjs'],env:{...f.env,DIFF_COVERAGE_BASE:'coverage-base'}});
+    expect(f.selectorExec).not.toHaveBeenCalled();
+    expect(result).toMatchObject({mode:'not-started',reason:'ignored-test-file',detail:'dist/hidden.test.mjs'});
+  });
+
   it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
   ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
+    writeFileSync(join(cwd,'vitest.config.mjs'), "export default {test:{include:['**/*.{test,spec}.{ts,mjs}', '**/__tests__/**/*.js'],exclude:[]}};");
     spawnSync('git',['init','--quiet'],{cwd});
     writeFileSync(join(cwd,'.gitignore'), name+'\n');
     mkdirSync(join(cwd, ...name.split('/').slice(0,-1)),{recursive:true});
@@ -1106,7 +1126,7 @@ describe('runRemote', () => {
     const fake = f.exec;
     f.exec = vi.fn(async call => call.file === 'git'
       ? remoteManifestAPI.defaultExec({...call,env:{...call.env,PATH:process.env.PATH}}) : fake(call));
-    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it.each([
@@ -1123,6 +1143,7 @@ describe('runRemote', () => {
     'dist/output.test.mjs',
     'scripts/quote\' space 雪/build/__tests__/unit/lost.test.mjs',
   ])('falls back before transport for a whole-directory ignored test: %s', async name => {
+    writeFileSync(join(cwd,'vitest.config.mjs'), readFileSync(new URL('./fixtures/forge-selection-patterns.mjs',import.meta.url)));
     const f = fixture();
     f.argv = ['npm', 'run', 'test:unit'];
     const exec = f.exec;
@@ -1137,7 +1158,7 @@ describe('runRemote', () => {
       return exec(call);
     });
     await expect(remoteManifestAPI.buildManifest(f)).rejects.toMatchObject({code:'ignored-test-file'});
-    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file'});
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'ignored-test-file',detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
