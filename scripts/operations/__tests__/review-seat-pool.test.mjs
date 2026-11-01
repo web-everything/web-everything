@@ -101,10 +101,11 @@ it('refuses a planted slot link: never resets a directory it did not create', ()
   rmSync(a.slotDir, { recursive: true, force: true });
   symlinkSync(lane, a.slotDir); // attacker/mistake: slot-1 -> the lane
   writeFileSync(join(lane, 'precious.txt'), 'keep');
-  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool })).toThrow(/not a private directory/); // caller falls back to a full copy
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(b.slotDir).not.toBe(a.slotDir); // the planted path is skipped, never reset or deleted
   expect(readFileSync(join(lane, 'precious.txt'), 'utf8')).toBe('keep');
   expect(git(lane, 'rev-parse', 'HEAD')).toBe(rev2);
-  expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+  b.release(); expect(readdirSync(join(pool, 'locks'))).toEqual([]);
 });
 
 it('restores a slot a seat left sparse, and refuses a slot whose admin dir is redirected or a planted store', () => {
@@ -150,7 +151,7 @@ it('rewrites a poisoned store config, and a slot with a live cwd inside it is ne
   b.release();
   expect(slotBusy(b.slotDir, () => ({ status: 0, stdout: `p1\nn${realpathSync(b.slotDir)}/sub\n` }))).toBe(true);
   expect(slotBusy(b.slotDir, () => ({ status: 0, stdout: 'p1\nn/elsewhere\n' }))).toBe(false);
-  expect(slotBusy(b.slotDir, () => ({ status: 2, stdout: '' }))).toBe(true); // unknown counts as busy
+  expect(() => slotBusy(b.slotDir, () => ({ status: 2, stdout: '' }))).toThrow(/lsof/); // unknown disables pooling
 });
 
 it('refuses a store whose objects are redirected or borrowed, and never fetches into the lane', () => {
@@ -271,3 +272,182 @@ it('makeScratch hands out a pooled checkout at the pinned rev and removeScratch 
   expect(r.status, r.stderr).toBe(0);
   expect(readdirSync(join(pool, 'locks'))).toEqual([]);
 });
+
+it('expired live-owner lock is preserved', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  const ownerPath = join(pool, 'locks', 'slot-1', 'owner.json');
+  const owner = JSON.parse(readFileSync(ownerPath, 'utf8'));
+  writeFileSync(ownerPath, JSON.stringify({ ...owner, expiresAt: 1 }));
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, now: () => 100 });
+  expect(b.slotDir).not.toBe(a.slotDir);
+  expect(JSON.parse(readFileSync(ownerPath, 'utf8')).token).toBe(owner.token);
+  a.release(); b.release();
+});
+
+it('expired dead-owner lock with reclaim marker is preserved', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const lock = join(pool, 'locks', 'slot-1'); mkdirSync(lock);
+  writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2 ** 22 + 12345, token: 'expired', expiresAt: 1 }));
+  mkdirSync(`${lock}.reclaim-expired`);
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, now: () => 100 });
+  expect(b.slotDir).not.toBe(a.slotDir);
+  expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).token).toBe('expired');
+  expect(existsSync(`${lock}.reclaim-expired`)).toBe(true);
+  b.release();
+});
+
+it('default pruning retains four recent idle slots', () => {
+  const seats = Array.from({ length: 6 }, () => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }));
+  seats.forEach((s, i) => {
+    s.release();
+    utimesSync(join(pool, 'state', `slot-${i + 1}.rev`), new Date(1000 + i * 1000), new Date(1000 + i * 1000));
+  });
+  expect(pruneSeatPool({ poolDir: pool, now: () => 10_000 })).toEqual([2, 1]);
+  expect(readdirSync(join(pool, 'slots')).sort()).toEqual(['slot-3', 'slot-4', 'slot-5', 'slot-6']);
+});
+
+it('default pruning expires an idle slot after 24 hours', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const stamp = join(pool, 'state', 'slot-1.rev'); utimesSync(stamp, new Date(1000), new Date(1000));
+  expect(pruneSeatPool({ poolDir: pool, now: () => 1000 + 24 * 3600_000 - 1 })).toEqual([]);
+  expect(pruneSeatPool({ poolDir: pool, now: () => 1000 + 24 * 3600_000 })).toEqual([1]);
+  expect(readdirSync(join(pool, 'slots'))).toEqual([]);
+});
+
+it('prune honors an injected idle age and clock', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  utimesSync(join(pool, 'state', 'slot-1.rev'), new Date(1000), new Date(1000));
+  expect(pruneSeatPool({ poolDir: pool, now: () => 1099, maxIdleMs: 100 })).toEqual([]);
+  expect(pruneSeatPool({ poolDir: pool, now: () => 1100, maxIdleMs: 100 })).toEqual([1]);
+  expect(existsSync(a.slotDir)).toBe(false);
+});
+
+it('prune removes abandoned views and inputs after reclaim while preserving the current seat', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  mkdirSync(`${a.dir}.input`); writeFileSync(join(`${a.dir}.input`, 'net.diff'), 'private diff');
+  const ownerPath = join(pool, 'locks', 'slot-1', 'owner.json');
+  const owner = JSON.parse(readFileSync(ownerPath, 'utf8'));
+  writeFileSync(ownerPath, JSON.stringify({ ...owner, pid: 2 ** 22 + 12345, expiresAt: 1 }));
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, now: () => 100 });
+  expect(b.slotDir).toBe(a.slotDir);
+  mkdirSync(`${b.dir}.input`); writeFileSync(join(`${b.dir}.input`, 'net.diff'), 'current diff');
+  pruneSeatPool({ poolDir: pool, now: () => 100, maxIdleMs: 1 });
+  expect(existsSync(a.dir)).toBe(false);
+  expect(existsSync(`${a.dir}.input`)).toBe(false);
+  expect(readFileSync(join(`${b.dir}.input`, 'net.diff'), 'utf8')).toBe('current diff');
+  expect(existsSync(b.dir)).toBe(true);
+  a.release(); b.release();
+});
+
+it.each([
+  ['missing', { error: Object.assign(new Error('missing lsof'), { code: 'ENOENT' }) }],
+  ['timed out', { error: Object.assign(new Error('lsof timeout'), { code: 'ETIMEDOUT' }) }],
+  ['failed', { status: 2, stdout: '' }],
+])('unavailable lsof (%s) refuses acquisition without growing the pool or leaking locks', (_label, result) => {
+  acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }).release();
+  const runLsof = () => result;
+  for (let i = 0; i < 5; i++) {
+    expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, runLsof })).toThrow(/lsof/);
+    expect(pruneSeatPool({ poolDir: pool, keep: 0, runLsof })).toEqual([]);
+    expect(readdirSync(join(pool, 'slots'))).toEqual(['slot-1']);
+    expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+  }
+  const cold = join(pool, 'cold');
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: cold, runLsof })).toThrow(/lsof/);
+  expect(existsSync(cold)).toBe(false);
+});
+
+it('a probe failure after claiming a free slot releases the new lock', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  let calls = 0;
+  const runLsof = () => ++calls === 1 ? { status: 1, stdout: '' } : { error: new Error('lsof timeout') };
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, runLsof })).toThrow(/lsof/);
+  expect(calls).toBe(2);
+  expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+  expect(readdirSync(join(pool, 'slots'))).toEqual(['slot-1']);
+});
+
+it('recovers after one malformed slot and quarantines it without deleting foreign files', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  rmSync(a.slotDir, { recursive: true }); mkdirSync(a.slotDir); writeFileSync(join(a.slotDir, 'foreign.txt'), 'keep');
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool });
+  expect(b.slotDir).toBe(join(pool, 'slots', 'slot-2'));
+  expect(readFileSync(join(b.dir, 'moves.txt'), 'utf8')).toBe('two\n');
+  expect(existsSync(join(pool, 'state', 'slot-1.bad'))).toBe(true);
+  b.release();
+  const c = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(c.slotDir).toBe(b.slotDir);
+  expect(readFileSync(join(a.slotDir, 'foreign.txt'), 'utf8')).toBe('keep');
+  c.release(); expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+});
+
+it('recovers from a reset failure and prune removes the quarantined owned worktree', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  writeFileSync(join(pool, 'repo.git', 'worktrees', 'slot-1', 'index.lock'), 'interrupted git');
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool });
+  expect(b.slotDir).toBe(join(pool, 'slots', 'slot-2'));
+  expect(existsSync(join(pool, 'state', 'slot-1.bad'))).toBe(true);
+  expect(pruneSeatPool({ poolDir: pool, keep: 0 })).toEqual([1]); // B still held
+  expect(existsSync(join(pool, 'state', 'slot-1.bad'))).toBe(false);
+  expect(readFileSync(join(b.dir, 'moves.txt'), 'utf8')).toBe('two\n');
+  b.release();
+});
+
+it('caps all slots including quarantined paths and falls back when capacity is exhausted', () => {
+  // Unverified paths must count toward the cap even though housekeeping cannot delete them.
+  const runLsof = () => ({ status: 1, stdout: '' });
+  for (let i = 1; i <= 16; i++) {
+    const seat = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, runLsof }); seat.release();
+    rmSync(seat.slotDir, { recursive: true }); mkdirSync(seat.slotDir);
+    writeFileSync(join(seat.slotDir, 'foreign.txt'), 'keep');
+    // The next acquisition quarantines this slot and moves to the next number.
+  }
+  for (let i = 0; i < 3; i++) expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool, runLsof })).toThrow(/no review seat slot/);
+  expect(readdirSync(join(pool, 'slots')).length).toBe(16);
+  expect(readdirSync(join(pool, 'locks'))).toEqual([]);
+  expect(pruneSeatPool({ poolDir: pool, keep: 0, runLsof })).toEqual([]);
+  expect(readdirSync(join(pool, 'slots')).length).toBe(16);
+});
+
+for (const [mode, title] of Object.entries({
+  'opt-out': 'pool opt-out returns a standalone checkout',
+  private: 'explicit private checkout bypasses the pool',
+  'red-team': 'private re-check requests a standalone checkout',
+  'probe-failure': 'makeScratch falls back to a standalone checkout when lsof is unavailable',
+})) {
+  it(title, () => {
+    const url = pathToFileURL(resolve('scripts/operations/review-extra-seats.mjs')).href;
+    const code = `import { createExtraSeatsIo, createRedTeamIo } from ${JSON.stringify(url)};
+      import { lstatSync, existsSync, renameSync } from 'node:fs';
+      const check = d => {
+        if (lstatSync(d).isSymbolicLink() || !lstatSync(d + '/.git').isDirectory()) throw new Error('not a standalone checkout');
+        if (existsSync(process.env.WE_REVIEW_SEAT_POOL_DIR)) throw new Error('pool must not be acquired');
+      };
+      ${mode === 'red-team' ? `
+      let called = false, dir;
+      const io = createRedTeamIo({ spawnRecheck: async options => {
+        called = true; dir = options.cwd; check(dir);
+        return { value: { verdict: 'accept', findings: [] } };
+      } });
+      await io.runRecheck({ pr: 1, lanePath: ${JSON.stringify(lane)}, rev: ${JSON.stringify(rev1)}, mandate: 'test', input: 'test', shape: {} });
+      if (!called || existsSync(dir)) throw new Error('recheck did not run or clean up');
+      ` : `
+      const io = createExtraSeatsIo();
+      const d = io.makeScratch({ lanePath: ${JSON.stringify(lane)}, rev: ${JSON.stringify(rev1)}, private: ${mode === 'private'} });
+      check(d); const moved = d + '-renamed'; renameSync(d, moved); io.removeScratch(d); check(moved); io.removeScratch(moved);
+      if (existsSync(moved)) throw new Error('checkout should be cleaned');
+      `}`;
+    const scratchTmp = join(lane, '..', 'scratch-tmp'); mkdirSync(scratchTmp);
+    // A missing host lsof must not make a bypass regression pass by falling back before the pool is created.
+    const bin = join(scratchTmp, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'lsof'), `#!/bin/sh\nexit ${mode === 'probe-failure' ? 2 : 1}\n`, { mode: 0o755 });
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_REVIEW_SEAT_POOL: mode === 'opt-out' ? '0' : '1', WE_REVIEW_SEAT_POOL_DIR: pool, TMPDIR: scratchTmp },
+      encoding: 'utf8', timeout: 30000,
+    });
+    expect(r.status, r.stderr).toBe(0);
+    if (mode === 'probe-failure') expect(r.stderr).toMatch(/review seat pool unavailable.*lsof unavailable/);
+    expect(existsSync(pool)).toBe(false);
+    expect(readdirSync(scratchTmp).filter(name => name.startsWith('we-review-seat-') || name.startsWith('we-red-team-recheck-'))).toEqual([]);
+  });
+}

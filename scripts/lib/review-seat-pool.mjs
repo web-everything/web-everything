@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
 export const SEAT_POOL_KEEP = 4;
+export const SEAT_POOL_MAX_SLOTS = 16; // includes quarantined slots; exhaustion uses the caller's full-copy fallback
 export const SEAT_POOL_MAX_IDLE_MS = 24 * 60 * 60 * 1000;
 export const SEAT_LEASE_DEFAULT_MS = 6 * 60 * 60 * 1000;
 const SLOT = /^slot-(\d+)$/;
@@ -35,12 +36,12 @@ function assertNoLinks(dir) {
   }
 }
 
-/** Is any process's working directory inside `dir`? Unknown (lsof failed) counts as busy. */
+/** Is any process's working directory inside `dir`? Unknown disables pooling, rather than allocating more slots. */
 export function slotBusy(dir, run = spawnSync) {
   let real;
   try { real = realpathSync(dir); } catch { return false; }
   const r = run('lsof', ['-a', '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
-  if (r.error || (r.status !== 0 && r.status !== 1)) return true;
+  if (r.error || (r.status !== 0 && r.status !== 1)) throw new Error(`seat pool lsof unavailable: ${r.error?.message ?? `exit ${r.status}`}`);
   return String(r.stdout).split('\n').some((l) => l.startsWith('n') && (l.slice(1) === real || l.slice(1).startsWith(`${real}/`)));
 }
 
@@ -112,7 +113,10 @@ function tryLock(lockDir, now, token = randomUUID(), leaseMs = SEAT_LEASE_DEFAUL
 
 function slotNumbers(p) {
   const names = new Set();
-  for (const dir of [p.slots, p.locks]) if (existsSync(dir)) for (const n of readdirSync(dir)) if (SLOT.test(n)) names.add(Number(n.match(SLOT)[1]));
+  for (const dir of [p.slots, p.locks, p.state]) if (existsSync(dir)) for (const name of readdirSync(dir)) {
+    const n = dir === p.state ? name.replace(/\.(bad|rev)$/, '') : name;
+    if (SLOT.test(n)) names.add(Number(n.match(SLOT)[1]));
+  }
   return [...names].sort((a, b) => a - b);
 }
 const readRev = (p, n) => { try { return readFileSync(join(p.state, `slot-${n}.rev`), 'utf8').trim(); } catch { return null; } };
@@ -137,7 +141,8 @@ function validateSlot(p, dir) {
  * name, release or delete a later seat's checkout; `slotDir` is the shared slot behind it.
  * @returns {{dir:string, slotDir:string, reused:boolean, release:()=>void}}
  */
-export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP, leaseMs = SEAT_LEASE_DEFAULT_MS } = {}) {
+export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP, leaseMs = SEAT_LEASE_DEFAULT_MS, runLsof = spawnSync } = {}) {
+  slotBusy(lanePath, runLsof); // availability check before even a cold pool can allocate a worktree
   const p = paths(poolDir);
   for (const d of [poolDir, p.slots, p.locks, p.state, p.views]) ownPrivateDir(d);
   // Validate before Git ever touches it: a planted `repo.git` link must never reach `git init`.
@@ -159,14 +164,15 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
     git(['-C', p.repo, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, `+${rev}:refs/seat/${rev}`]);
   }
   const known = slotNumbers(p);
-  const order = [...known.filter((n) => readRev(p, n) === rev), ...known.filter((n) => readRev(p, n) !== rev), (known.at(-1) ?? 0) + 1];
+  const usable = known.filter(n => !lstatOrNull(join(p.state, `slot-${n}.bad`)));
+  const next = known.length < SEAT_POOL_MAX_SLOTS
+    ? Array.from({ length: SEAT_POOL_MAX_SLOTS }, (_, i) => i + 1).find(n => !known.includes(n)) : undefined;
+  const order = [...usable.filter((n) => readRev(p, n) === rev), ...usable.filter((n) => readRev(p, n) !== rev), ...(next ? [next] : [])];
   for (const n of order) {
     const lockDir = join(p.locks, `slot-${n}`);
     const token = randomUUID();
-    if (!tryLock(lockDir, now, token, leaseMs, () => slotBusy(join(p.slots, `slot-${n}`)))) continue;
+    if (!tryLock(lockDir, now, token, leaseMs, () => slotBusy(join(p.slots, `slot-${n}`), runLsof))) continue;
     const dir = join(p.slots, `slot-${n}`);
-    // A lock being free does not prove nothing is reading the slot: a surviving descendant may still sit in it.
-    if (lstatOrNull(dir) && slotBusy(dir)) { rmSync(lockDir, { recursive: true, force: true }); continue; }
     // Idempotent and token-checked: a repeated release can never free a lock that a later seat now holds.
     const view = join(p.views, token);
     let released = false;
@@ -178,6 +184,11 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
       rmSync(`${view}.input`, { recursive: true, force: true });
       rmSync(lockDir, { recursive: true, force: true });
     };
+    // A free lock does not exclude a surviving descendant. A failed probe must also release this new lock.
+    try {
+      if (lstatOrNull(join(p.state, `slot-${n}.bad`))) { release(); continue; } // re-read after the lock
+      if (lstatOrNull(dir) && slotBusy(dir, runLsof)) { release(); continue; }
+    } catch (error) { release(); throw error; }
     try {
       const reused = existsSync(join(dir, '.git')) && readRev(p, n) === rev;
       rmSync(join(p.state, `slot-${n}.rev`), { force: true }); // unknown while the tree is being brought to `rev`
@@ -207,15 +218,19 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
       symlinkSync(dir, view); // inputs for this acquisition live in `${view}.input`, outside every PR tree
       return { dir: view, slotDir: dir, reused, release };
     } catch (error) {
-      release();
-      throw error;
+      // Never delete an unverifiable slot. Quarantine it and try a healthy slot; the fixed cap bounds even
+      // repeated partial-setup failures. Pruning may later remove it only after validating its ownership.
+      try {
+        const bad = join(p.state, `slot-${n}.bad`);
+        writeFileSync(bad, `${String(error.message).slice(0, 300)}\n`, { flag: 'wx' });
+      } finally { release(); }
     }
   }
   throw new Error('no review seat slot could be claimed');
 }
 
 /** Remove idle slots beyond `keep` (oldest first) and any idle longer than maxIdleMs. Best effort, never throws. */
-export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP, maxIdleMs = SEAT_POOL_MAX_IDLE_MS } = {}) {
+export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP, maxIdleMs = SEAT_POOL_MAX_IDLE_MS, runLsof = spawnSync } = {}) {
   const p = paths(poolDir);
   const removed = [];
   try {
@@ -231,9 +246,9 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
     slots.forEach(({ n, mtime }, i) => {
       if (i < keep && now() - mtime < maxIdleMs) return;
       const lockDir = join(p.locks, `slot-${n}`);
-      if (!tryLock(lockDir, now, undefined, undefined, () => slotBusy(join(p.slots, `slot-${n}`)))) return;
+      if (!tryLock(lockDir, now, undefined, undefined, () => slotBusy(join(p.slots, `slot-${n}`), runLsof))) return;
       try {
-        if (slotBusy(join(p.slots, `slot-${n}`))) return;
+        if (slotBusy(join(p.slots, `slot-${n}`), runLsof)) return;
         const slotDir = join(p.slots, `slot-${n}`);
         if (lstatOrNull(slotDir)) {
           validateSlot(p, slotDir); // never delete a directory that is not provably this pool's worktree
@@ -241,13 +256,21 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
         }
         rmSync(slotDir, { recursive: true, force: true });
         rmSync(join(p.state, `slot-${n}.rev`), { force: true });
+        rmSync(join(p.state, `slot-${n}.bad`), { force: true });
         removed.push(n);
       } catch { /* an unverifiable slot is kept, not deleted */ } finally { rmSync(lockDir, { recursive: true, force: true }); }
     });
-    for (const name of existsSync(p.views) ? readdirSync(p.views) : []) { // views whose slot is gone or whose seat died
+    // List views BEFORE reading owners: an acquisition publishes its owner before its view. A view created
+    // after this listing must wait for the next sweep, rather than being deleted against an older owner snapshot.
+    const viewNames = existsSync(p.views) ? readdirSync(p.views) : [];
+    const liveTokens = new Set();
+    for (const n of slotNumbers(p)) {
+      try { liveTokens.add(JSON.parse(readFileSync(join(p.locks, `slot-${n}`, 'owner.json'), 'utf8')).token); } catch { /* no owner */ }
+    }
+    for (const name of viewNames) { // a reclaimed slot can still exist
       const v = join(p.views, name);
-      if (name.endsWith('.input')) { if (!existsSync(v.slice(0, -6)) && !lstatOrNull(v.slice(0, -6))) rmSync(v, { recursive: true, force: true }); continue; }
-      if (!existsSync(v)) rmSync(v, { force: true });
+      const token = name.endsWith('.input') ? name.slice(0, -6) : name;
+      if (!liveTokens.has(token)) rmSync(v, { recursive: true, force: true });
     }
     if (removed.length) { checkAdminRoot(p); git(['-C', p.repo, 'worktree', 'prune'], { allowFail: true }); }
   } catch { /* pruning is housekeeping */ }
