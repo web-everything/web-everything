@@ -75,6 +75,15 @@ describe('per-PR loop cap', () => {
   });
 });
 
+describe('guard interplay', () => {
+  it('a shadow same-tree decision never hides an enforcing loop cap', () => {
+    const heads = ['a', 'b', 'c'].map(sha); const TREE = sha('1');
+    const comments = [accept(heads[0], 1), accept(heads[1], 3), accept(heads[2], 5)];
+    const d = decideReviewChurn(mkPr(comments, sha('d'), { settings: SET({ sameTree: 'shadow' }), headTree: TREE, trees: { [heads[0]]: TREE } }));
+    expect(d).toMatchObject({ kind: 'loop-cap', mode: 'on' });
+  });
+});
+
 describe('settings and enrichment', () => {
   it('standard is shadow, cascade env wins, invalid env is ignored', () => {
     const none = resolveReviewChurn({ env: {}, tool: undefined, platform: null, file: '/nonexistent' });

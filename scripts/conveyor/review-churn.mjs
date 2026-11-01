@@ -67,17 +67,19 @@ export function decideReviewChurn(pr) {
   const { sameTree, capMode, maxLoopsPerPr } = f.settings;
   const head = typeof pr.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
   const verdicts = reviewedHeadVerdicts(pr.comments);
+  const found = [];
   if (sameTree !== 'off' && head && f.headTree) {
     const twin = verdicts.find((v) => v.accept && !head.startsWith(v.head) && !v.head.startsWith(head)
       && f.trees?.[v.head] && f.trees[v.head] === f.headTree);
-    if (twin) return { kind: 'same-tree', mode: sameTree, head, reviewedHead: twin.head, tree: f.headTree };
+    if (twin) found.push({ kind: 'same-tree', mode: sameTree, head, reviewedHead: twin.head, tree: f.headTree });
   }
   if (capMode !== 'off') {
     const loops = countReviewLoops(pr.comments);
     const reviewedThisHead = verdicts.some((v) => head.startsWith(v.head));
-    if (loops >= maxLoopsPerPr && !reviewedThisHead) return { kind: 'loop-cap', mode: capMode, loops, cap: maxLoopsPerPr };
+    if (loops >= maxLoopsPerPr && !reviewedThisHead) found.push({ kind: 'loop-cap', mode: capMode, loops, cap: maxLoopsPerPr });
   }
-  return null;
+  // An enforcing ('on') decision always wins over a shadow one, whatever the other guard's mode.
+  return found.find((d) => d.mode === 'on') ?? found[0] ?? null;
 }
 
 const defaultReadTree = (repo, sha, { exec = execFileSync } = {}) => {
