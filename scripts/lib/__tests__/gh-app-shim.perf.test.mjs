@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
@@ -52,7 +52,8 @@ for (let i = 0; i < ${CALLS}; i++) { const r = spawnSync(${JSON.stringify(shimPa
 
 describe('gh shim process fan-out (R320 #1)', () => {
   it('keeps the generator closure complete with its throttle dependency', () => {
-    const root = fileURLToPath(new URL('../../../', import.meta.url));
+    // Resolve as a Node path so Vite cannot rewrite this as a browser asset URL.
+    const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
     const closure = collectImportClosure({ root, entries: ['scripts/lib/gh-app-shim.mjs'] });
     expect(closure?.complete).toBe(true);
     expect(closure.files.has('scripts/lib/gh-throttle.mjs')).toBe(true);
