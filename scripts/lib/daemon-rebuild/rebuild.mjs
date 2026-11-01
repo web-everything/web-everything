@@ -32,6 +32,7 @@ export const FAILURE_REASONS = new Set([
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
+  'overlay-registration-duplicate', // Invalid registry state requires operator repair, unlike a retryable CAS race.
   'overlay-source-unavailable', 'overlay-source-unverifiable', 'overlay-state-corrupt', 'overlay-state-malformed',
   'pinned-overlay-conflict', 'pinned-overlay-unavailable', 'pinned-overlay-unbound',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',

@@ -94,7 +94,7 @@ describe('rebuildClone coordination events', () => {
 
   it.each(['quarantined', 'established-overlay-conflict', 'still-rejected',
     'overlay-source-unavailable', 'overlay-source-unverifiable',
-    'overlay-state-malformed', 'overlay-state-malformed: invalid registration',
+    'overlay-state-malformed', 'overlay-state-malformed: invalid registration', 'overlay-registration-duplicate',
     'error: build unavailable', 'established-overlay-conflict: lane/example'])(
     'emits rebuild-failed once for a prepare refusal: %s', async (reason) => {
       terminal({ moved: false, reason });
@@ -123,7 +123,7 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
-  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted', 'closure-opaque'])(
+  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted', 'closure-opaque', 'overlay-registration-changed'])(
     'emits nothing for a no-op result: %s', async (reason) => {
       terminal({ moved: false, reason });
       expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
