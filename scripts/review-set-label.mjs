@@ -1,3 +1,4 @@
+import { DELEGATED_CLEARANCE_INELIGIBLE_LABELS } from './lib/review-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
@@ -319,10 +320,20 @@ export function isHumanSurfacePark({ provider, repo, pr, labels, headSha, commen
  * PR #5273 — after a swap-first `clear-human` (the PR was already accepted), re-read once its comment is posted and
  * undo a human-surface park that landed after the swap. Only that park: any other hold is left alone. A failed read
  * is reported, not fatal: the clearance is already durable, and the sweep heals its own park on a later tick.
+ * Delegated callers supply their eligibility assertion and treat a reported error as fatal; operator callers keep
+ * the best-effort behavior. Eligibility refusal propagates before any reassertion write.
  */
-export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
+export function reassertHumanClearance({ provider, repo, pr, headSha, assertEligible = () => {}, warn = s => process.stderr.write(s) }) {
+  let fresh;
+  try { fresh = provider.readPrState(repo, pr); }
+  catch (e) {
+    warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
+    return { reapplied: false, error: true };
+  }
+  // Outside the recovery catch: a delegated refusal must exit, never become a successful no-op.
+  // Validate even when the repark marker is absent or labels are unreadable.
+  assertEligible(fresh?.labels);
   try {
-    const fresh = provider.readPrState(repo, pr);
     if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
     provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
@@ -1187,7 +1198,13 @@ export function runReviewLabelCli({
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  // Delegated clearances pin the observed head; delegation never bypasses operator identity or hold checks.
+  const guardedClearHuman = to === 'clear-human' && expectHeadFlag !== undefined;
+  if (guardedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg
+    || !argv.some(a => a.startsWith('--delegation-json=')))) {
+    fail('pinned clear-human requires --expect-head=<full 40-hex SHA> and --delegation-json (and no --new-head)');
+  }
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && !guardedClearHuman && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm, a pinned accept or pinned clear-human');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
@@ -1329,11 +1346,22 @@ export function runReviewLabelCli({
   // #4708 — set when the referral gate accepted this head on an earlier head's carried clean review (see
   // `referralEvidenceCarry`); the durable comment then records which head, which run and which diff fingerprint.
   let referralCarry = null;
+  const assertGuardedClearHumanEligible = labels => {
+    if (!guardedClearHuman) return;
+    if (!Array.isArray(labels) || labels.some(l => {
+      const name = typeof l === 'string' ? l : l?.name;
+      return typeof name !== 'string' || !name;
+    })) fail('delegated clearance refused: live labels unreadable; operator review required', 1);
+    if (DELEGATED_CLEARANCE_INELIGIBLE_LABELS.some(l => hasReviewLabel(labels, l))) {
+      fail('delegated clearance refused: live hold/block label; operator review required', 1);
+    }
+  };
   try {
     const parsed = provider.readPrState(repo, pr);
     if (['accepted', 'restamp', 'clear-human'].includes(to)) {
       referralCarry = assertMandatoryReferralsCleared(parsed, { repo, pr, ...referralOptions })?.carry ?? null;
     }
+    assertGuardedClearHumanEligible(parsed.labels);
     currentLabels = onlyIf === 'missing' ? parsed.labels : Array.isArray(parsed.labels) ? parsed.labels : [];
     headSha = typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '';
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
@@ -1367,7 +1395,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedRearm || guardedClearHuman || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -2017,6 +2045,7 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+        assertGuardedClearHumanEligible(fresh.labels);
         // PR #5273: the human-surface sweep can park `review:human` after the first read; this clearance supersedes
         // that park at this head, so remove it too. Any other concurrent hold keeps the first read's view.
         if (to === 'clear-human' && !removals.includes(REVIEW_LABELS.human)
@@ -2067,6 +2096,14 @@ export function runReviewLabelCli({
         try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
       }
       try {
+        // Delegated clearance must refuse a newly arrived hold before minting its marker,
+        // including on the comment-first path. The swap independently checks again.
+        if (guardedClearHuman) {
+          const fresh = provider.readPrState(repo, pr);
+          if (fresh.headRefOid !== headSha) throw new Error('head changed before acceptance; hold retained');
+          assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+          assertGuardedClearHumanEligible(fresh.labels);
+        }
         provider.postComment(repo, pr, commentBody);
         return;
       } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
@@ -2162,7 +2199,11 @@ export function runReviewLabelCli({
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
-  if (to === 'clear-human' && acceptanceAlreadyLive) reassertHumanClearance({ provider, repo, pr, headSha });
+  if (to === 'clear-human' && acceptanceAlreadyLive) {
+    const result = reassertHumanClearance({ provider, repo, pr, headSha,
+      assertEligible: assertGuardedClearHumanEligible });
+    if (guardedClearHuman && result.error) fail('delegated clearance refused: post-clearance re-check failed; operator review required', 1);
+  }
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and

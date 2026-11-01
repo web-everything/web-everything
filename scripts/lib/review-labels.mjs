@@ -33,3 +33,8 @@ export const REVIEW_LABELS = {
   heldMechanical: 'review:held-mechanical',
 };
 
+/** R130 delegation may clear review:human only; every other blocking disposition stays with the operator. */
+export const DELEGATED_CLEARANCE_INELIGIBLE_LABELS = Object.freeze([
+  REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.awaitingAdvisory,
+  'advisory:changes', 'advisory:ruling-needed', 'red-team:blocked', 'red-team:pending', 'operator:hold', 'hold:fix',
+]);

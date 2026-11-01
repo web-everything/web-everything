@@ -21,6 +21,7 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+import { quickFinalizeWaitMs, resolveQuick } from './quick.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -33,7 +34,7 @@ export const FAILURE_REASONS = new Set([
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
   'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
-  'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
+  'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined', 'quick-soak-', 'quick-soak-unavailable', 'quick-soak-rollback-failed', 'adopted-head-changed-or-unreadable', 'worker-dead-missing-or-expired', 'worker-launch-failed', 'soak-could-not-run', 'soak-deadline', 'worker-fatal', 'rollback-threw',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
@@ -146,10 +147,12 @@ async function rebuildCloneInternal({
   const pendingReady = readReadyCandidate(root, stEnv);
   const readyOnHead = !!pendingReady
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+  const readyLockOpts = readyOnHead && pendingReady.quick && resolveQuick(env).quick
+    ? { ...finalizeLockOpts, waitMs: quickFinalizeWaitMs({ quick: true, env }) } : finalizeLockOpts;
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
     root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
-  }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  }), readyOnHead ? readyLockOpts : admissionLockOpts);
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.

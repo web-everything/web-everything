@@ -9,6 +9,7 @@ import {
   needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels, _resetStrandedCheckMemo, STRANDED_BACKOFF_MS, STRANDED_RECHECK_MS,
 } from '../review-hold-reconcile.mjs';
 import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
+import { sweepLabelStateReconcile } from '../label-state-reconcile.mjs';
 import { resolveAcceptCarryForward } from '../../lib/accept-carry-forward.mjs';
 import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestampMemo } from '../../lib/numbering-carry.mjs';
 
@@ -16,6 +17,25 @@ import { buildNumberingRestampBody, restampAfterNumbering, _resetNumberingRestam
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/accept-carry-forward-4535.json'), 'utf8'));
 
 const pr = (number, names) => ({ number, labels: names.map((name) => ({ name })) });
+
+it('composes label-state reconciliation with live readers, provider and dryRun', () => {
+  const head = 'a'.repeat(40);
+  const snapshot = { number: 5973, headRefOid: head, labels: ['red-team:blocked'] };
+  const live = { ...snapshot, state: 'OPEN' };
+  const p = { ...provider(), ensureLabel: vi.fn() };
+  const emit = vi.fn();
+  const options = { repo: 'o/n', provider: p, dryRun: true, listPrs: () => [snapshot],
+    readPr: () => live, readComments: () => [{ author: { login: 'web-everything' },
+      body: `<!-- we:red-team-advisory pr=5973 rev=${head} -->\nACCEPTS` }],
+    numberingRestamp: () => null, exec: () => 'git@github.com:o/n.git', settings: { referralDefault: 'operator' },
+    delegatedClearance: { prs: [] }, labelState: { readReviews: () => [], readRedTeam: () => null, emit } };
+  const out = sweepReviewHoldLabels(options);
+  expect(out).toContainEqual(expect.objectContaining({ num: 5973, dryRun: true,
+    labelsReconciled: expect.objectContaining({ to: ['red-team:clear'] }) }));
+  expect(out).toContainEqual(sweepLabelStateReconcile({ ...options, prs: [snapshot], ...options.labelState })[0]);
+  expect(p.calls.set).toEqual([]);
+  expect(emit).not.toHaveBeenCalled();
+});
 
 // Existing cleanup fixtures describe the live PR explicitly through their listed labels.
 // The later boundary regressions supply independently stale snapshots and fresh records.
