@@ -19,7 +19,9 @@ export const defaultPoolDir = (env = process.env) => env.WE_REVIEW_SEAT_POOL_DIR
 
 // Pool git calls run with no hooks, no user/system config and no replace refs: a seat or a stale file in the shared
 // store can then never cause code to run, or a pinned commit to mean something else, during slot setup.
-const gitEnv = () => ({ ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_'))), // no inherited repo/config/object redirection of any kind
+/** The process environment without any GIT_* variable: no inherited repo, config or object redirection. */
+export const cleanGitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+const gitEnv = () => ({ ...cleanGitEnv(),
   GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
 const STORE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n';
 
@@ -168,7 +170,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
         // Only ever reset a slot that is a real directory of ours, registered in THIS pool's store through a real admin dir.
         ownPrivateDir(dir);
         const admin = join(p.repo, 'worktrees', basename(dir));
-        ownPrivateDir(join(p.repo, 'worktrees')); ownPrivateDir(admin);
+        checkAdminRoot(p); ownPrivateDir(admin); // every admin dir, logs/ and info/ included, must be link-free before git writes
         const dotGit = lstatOrNull(join(dir, '.git'));
         if (!dotGit?.isFile()) throw new Error(`seat slot is not a worktree of this pool: ${dir}`);
         const forward = readFileSync(join(dir, '.git'), 'utf8').trim().replace(/^gitdir: /, '');

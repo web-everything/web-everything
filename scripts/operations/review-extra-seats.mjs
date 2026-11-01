@@ -7,7 +7,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
-import { acquireSeatSlot, pruneSeatPool } from '../lib/review-seat-pool.mjs';
+import { acquireSeatSlot, cleanGitEnv, pruneSeatPool } from '../lib/review-seat-pool.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
 import { PROVIDER_CAP_ENV, resolveProviderCap, resolveRoutingProviderCap } from './review-seat-policy.mjs';
@@ -1086,7 +1086,7 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       }
       const dir = mkdtempSync(join(tmpdir(), REVIEW_SCRATCH_PREFIXES.seat));
       const git = (args) => {
-        const r = spawnSync('git', args, { encoding: 'utf8', timeout: 5 * 60 * 1000 });
+        const r = spawnSync('git', args, { encoding: 'utf8', timeout: 5 * 60 * 1000, env: cleanGitEnv() }); // GIT_DIR & co must not redirect these at a lane
         if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
       };
       try {
