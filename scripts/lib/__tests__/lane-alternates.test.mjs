@@ -100,3 +100,22 @@ describe('hardening', () => {
     expect(findPrimaryForPool({ workspaceDir: ws, poolName: 'web-everything', readOrigin: (d) => origins[d.split('/').pop()] })).toBeNull();
   });
 });
+
+describe('review round 2', () => {
+  it('refuses a lane directory that is itself a symlink and a primary with a commondir', () => {
+    const primary = mkRepo(join(root, 'primary')), real = mkRepo(join(root, 'real-lane'));
+    symlinkSync(real, join(root, 'lane-9'));
+    expect(ensureLaneAlternates({ laneDir: join(root, 'lane-9'), referencePath: primary }).status).toBe('skipped');
+    const ws = join(root, 'ws'); mkdirSync(ws);
+    mkRepo(join(ws, 'wt')); writeFileSync(join(ws, 'wt', '.git', 'commondir'), '../x');
+    expect(findPrimaryForPool({ workspaceDir: ws, poolName: 'web-everything', readOrigin: () => 'git@github.com:chalbert/web-everything.git' })).toBeNull();
+  });
+  it('fills an existing EMPTY alternates file without truncating, and refuses a reference under .lanes', () => {
+    const primary = mkRepo(join(root, 'primary')), lane = mkRepo(join(root, 'lane-1'));
+    mkdirSync(join(lane, '.git', 'objects', 'info'), { recursive: true });
+    writeFileSync(join(lane, '.git', 'objects', 'info', 'alternates'), '');
+    expect(ensureLaneAlternates({ laneDir: lane, referencePath: primary }).status).toBe('added');
+    const other = mkRepo(join(root, '.lanes', 'p', 'lane-2')), lane3 = mkRepo(join(root, 'lane-3'));
+    expect(ensureLaneAlternates({ laneDir: lane3, referencePath: other }).status).toBe('skipped');
+  });
+});

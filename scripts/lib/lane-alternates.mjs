@@ -7,7 +7,7 @@
  * the fact needs no clone flag, works for a shallow primary (verified: a fetch then transfers 0 objects), and
  * never removes an object.
  */
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { constants as FS, closeSync, existsSync, lstatSync, openSync, writeSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 /** GitHub redirects chalbert/web-everything to web-everything/web-everything; that ONE pair is the same repo. */
@@ -39,7 +39,7 @@ export function ensureLaneAlternates({ laneDir, referencePath, laneOrigin, refer
   const objects = existsSync(join(referencePath, '.git', 'objects')) ? join(referencePath, '.git', 'objects')
     : existsSync(join(referencePath, 'objects')) ? join(referencePath, 'objects') : null;
   if (!objects) return { status: 'skipped', reason: 'reference object store not found' };
-  if (resolve(objects).startsWith(resolve(laneDir))) return { status: 'skipped', reason: 'reference is the lane itself' };
+  if (/\/\.lanes\//.test(resolve(objects)) || resolve(objects).startsWith(resolve(laneDir))) return { status: 'skipped', reason: 'reference is a lane' };
   if (laneOrigin && referenceOrigin && !sameRepoUrl(laneOrigin, referenceOrigin)) {
     return { status: 'skipped', reason: 'lane origin differs from the reference origin' };
   }
@@ -47,13 +47,20 @@ export function ensureLaneAlternates({ laneDir, referencePath, laneOrigin, refer
   const file = join(infoDir, 'alternates');
   // Lane-controlled paths: never write through a symlink, never follow one out of the lane.
   const isLink = (p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } };
-  if ([join(laneDir, '.git'), join(laneDir, '.git', 'objects'), infoDir, file].some(isLink)) return { status: 'skipped', reason: 'symlink in lane object store path' };
+  if ([laneDir, join(laneDir, '.git'), join(laneDir, '.git', 'objects'), infoDir, file].some(isLink)) return { status: 'skipped', reason: 'symlink in lane object store path' };
   let current = '';
   try { current = readFileSync(file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') return { status: 'skipped', reason: e.message }; }
   if (current.split('\n').some((l) => l.trim())) return { status: 'present' };
   mkdirSync(infoDir, { recursive: true });
   if (isLink(infoDir)) return { status: 'skipped', reason: 'symlink in lane object store path' };
-  writeFileSync(file, `${resolve(objects)}\n`, { flag: current === '' && !existsSync(file) ? 'wx' : 'w' });
+  // No truncation and no symlink following: create exclusively, or open an existing EMPTY file with O_NOFOLLOW.
+  const flags = FS.O_WRONLY | FS.O_NOFOLLOW | (existsSync(file) ? 0 : FS.O_CREAT | FS.O_EXCL);
+  let fd;
+  try { fd = openSync(file, flags, 0o644); } catch (e) { return { status: 'skipped', reason: e.code || e.message }; }
+  try {
+    if (existsSync(file) && readFileSync(file, 'utf8').trim()) return { status: 'present' };
+    writeSync(fd, `${resolve(objects)}\n`);
+  } finally { closeSync(fd); }
   return { status: 'added' };
 }
 
@@ -80,6 +87,8 @@ export function findPrimaryForPool({ workspaceDir, poolName, readOrigin, expecte
       // A real directory with a real .git directory; a symlink (to a lane, say) is never a primary.
       if (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory() || !lstatSync(join(dir, '.git')).isDirectory()) continue;
       if (realpathSync(dir) !== join(realpathSync(workspaceDir), name) || /\/\.lanes\//.test(realpathSync(dir))) continue;
+      // A linked worktree or redirected git dir (commondir) shares another repository's ownership; only a self-owned primary counts.
+      if (existsSync(join(dir, '.git', 'commondir')) || existsSync(join(dir, '.git', 'gitdir'))) continue;
     } catch { continue; }
     const origin = readOrigin(dir);
     const slug = canonicalRepoSlug(origin);

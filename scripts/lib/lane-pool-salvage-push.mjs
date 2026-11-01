@@ -129,8 +129,8 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     if (preflightError) throw preflightError;
     checkTransportConfig(dir);
     // A fetch into a lane without alternates re-downloads the repository; repair them first (best effort, add-only).
-    if (command === 'fetch' && repo.referencePath) {
-      try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.referencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
+    if (command === 'fetch' && (repo.alternatesReferencePath || repo.referencePath)) {
+      try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.alternatesReferencePath || repo.referencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
     }
     return git(dir, transportArgs, 120_000, true);
   };
@@ -139,7 +139,10 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     unmatchedShas: (dir, ahead) => {
       // All branch tips are needed for exact-SHA reachability, but only the integration branch
       // participates in patch equivalence. Explicit refspecs also make pruning independent of lane config.
-      transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*');
+      transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*',
+        // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and this explicit
+        // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
+        '^refs/heads/ops/*');
       const matched = new Set();
       for (const line of git(dir, ['cherry', `origin/${repo.branch}`, 'HEAD']).split('\n')) {
         if (line.startsWith('- ')) matched.add(line.slice(2).trim());

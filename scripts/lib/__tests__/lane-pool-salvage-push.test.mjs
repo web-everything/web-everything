@@ -499,7 +499,7 @@ describe('real salvage preservation and transport', () => {
       }
     }
     const fetchArgs = runGit.mock.calls.find(([, args]) => args.includes('fetch'))[1];
-    expect(fetchArgs).toEqual(expect.arrayContaining(['--recurse-submodules=no', '--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*']));
+    expect(fetchArgs).toEqual(expect.arrayContaining(['--recurse-submodules=no', '--prune', '--no-tags', '+refs/heads/*:refs/remotes/origin/*', '^refs/heads/ops/*']));
     const pushArgs = runGit.mock.calls.find(([, args]) => args.includes('push'))[1];
     expect(pushArgs.slice(pushArgs.indexOf('push'))).toEqual(['push', '--recurse-submodules=no', repo.originUrl, `${head}:refs/heads/${ref}`]);
     expect(runGit.mock.calls.findIndex(([, args]) => args.includes('fetch')))

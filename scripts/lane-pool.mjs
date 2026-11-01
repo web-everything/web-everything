@@ -386,6 +386,7 @@ function resolveRepo(repoFlags = flags) {
   // GC and release can maintain leases without a trusted origin, but recovery must never forward a lane remote.
   let canonicalOrigin = true;
   let smokeOrigin = null;
+  let discoveredPrimaryPath = null;
   let originBase = topLevel;
   if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
@@ -434,7 +435,7 @@ function resolveRepo(repoFlags = flags) {
           workspaceDir: dirname(resolve(POOL_ROOT)), poolName: originSourcePaths.map(poolNameFromLanePath).find(Boolean),
           readOrigin: (dir) => tryGit(['remote', 'get-url', 'origin'], dir, gitOptions),
         });
-        if (primary) { smokeOrigin = primary.origin; originBase = primary.path; }
+        if (primary) { smokeOrigin = primary.origin; originBase = primary.path; discoveredPrimaryPath = primary.path; }
       }
       canonicalOrigin = !!smokeOrigin;
       if (!canonicalOrigin && needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
@@ -470,7 +471,8 @@ function resolveRepo(repoFlags = flags) {
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
   const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
-  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
+  // alternatesReferencePath: the object store lanes may borrow. A primary found by name replaces the invoking lane.
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath: discoveredPrimaryPath || topLevel, branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -1038,7 +1040,7 @@ function ensureAlternatesFor(repo, n) {
   const dir = laneDir(repo, n);
   try {
     const result = ensureLaneAlternates({
-      laneDir: dir, referencePath: repo.referencePath, laneOrigin: tryGit(['remote', 'get-url', 'origin'], dir), referenceOrigin: repo.originUrl,
+      laneDir: dir, referencePath: repo.alternatesReferencePath || repo.referencePath, laneOrigin: tryGit(['remote', 'get-url', 'origin'], dir), referenceOrigin: repo.originUrl,
     });
     if (result.status === 'added') log(`  lane-${n}: repaired missing alternates → ${repo.referencePath}`);
     else if (result.status === 'skipped') log(`  ⚠ lane-${n}: alternates not set (${result.reason})`);
