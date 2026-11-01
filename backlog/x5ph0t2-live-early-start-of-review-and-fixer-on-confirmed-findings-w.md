@@ -4,7 +4,7 @@ size: 5
 parent: "5467"
 status: open
 blockedBy: ["xtxt36v"]
-scope: ["["we:scripts/lib/review-timing.mjs"", ""we:scripts/lib/review-timing-settings.mjs"", ""we:scripts/operations/fix-run.mjs"", ""we:scripts/lib/__tests__/review-timing.test.mjs"]"]
+scope: ["we:scripts/lib/review-timing.mjs", "we:scripts/lib/review-timing-settings.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/lib/__tests__/review-timing.test.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---

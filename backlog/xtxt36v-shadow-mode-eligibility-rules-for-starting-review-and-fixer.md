@@ -3,7 +3,7 @@ kind: story
 size: 5
 parent: "5467"
 status: open
-scope: ["["we:scripts/lib/review-timing.mjs"", ""we:scripts/lib/review-timing-settings.mjs"", ""we:scripts/lib/__tests__/review-timing.test.mjs"", ""we:scripts/lib/__tests__/review-timing-settings.test.mjs"]"]
+scope: ["we:scripts/lib/review-timing.mjs", "we:scripts/lib/review-timing-settings.mjs", "we:scripts/lib/__tests__/review-timing.test.mjs", "we:scripts/lib/__tests__/review-timing-settings.test.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
