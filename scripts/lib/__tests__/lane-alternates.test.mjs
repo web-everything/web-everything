@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { canonicalRepoSlug, sameRepoUrl, ensureLaneAlternates, poolNameFromLanePath, findPrimaryForPool } from '../lane-alternates.mjs';
 import { boundedGitCommand } from '../git-bounded.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'lane-alt-')); });
@@ -77,6 +78,33 @@ describe('git-bounded', () => {
     const cmd = boundedGitCommand([], 5000);
     expect(spawnSync(process.execPath, [cmd.args[0], '--timeout-ms=5000', '--', 'sh', '-c', 'exit 3']).status).toBe(3);
   });
+  it.each(['timeout', 'completion'])('reaps descendants after %s without shell tools on PATH', async (mode) => {
+    const marker = join(root, 'shell-free.pids');
+    const keepAlive = { anchorPid: process.pid, maxLifetimeMs: 15000 };
+    const script = keepAliveScript({ ...keepAlive, prelude: `
+      const { spawn } = require('node:child_process');
+      const { writeFileSync } = require('node:fs');
+      const child = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript(keepAlive))}], { stdio: 'inherit' });
+      writeFileSync(${JSON.stringify(marker)}, JSON.stringify([process.pid, child.pid]));
+    `, postlude: mode === 'completion' ? 'process.exit(7);' : '' });
+    const cmd = boundedGitCommand([], 2000);
+    let pids = [];
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      const result = spawnSync(process.execPath, [cmd.args[0], '--timeout-ms=2000', '--', process.execPath, '-e', script], {
+        stdio: 'ignore', timeout: 8000, killSignal: 'SIGKILL',
+        env: { ...process.env, PATH: join(root, 'no-shell-tools') },
+      });
+      // Read before assertions so failed runs can clean up both recorded descendants too.
+      pids = JSON.parse(readFileSync(marker, 'utf8'));
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(mode === 'timeout' ? 124 : 7);
+      for (let i = 0; i < 50 && pids.some(alive); i++) await new Promise(r => setTimeout(r, 100));
+      expect(pids.map(alive)).toEqual([false, false]);
+    } finally {
+      for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch { /* already reaped */ } }
+    }
+  }, 15000);
 });
 
 describe('hardening', () => {

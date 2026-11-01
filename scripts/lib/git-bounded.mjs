@@ -47,7 +47,11 @@ function leader(argv) {
   const child = spawn(cmd[0], cmd.slice(1), { stdio: ['ignore', 'inherit', 'inherit'] }); // same group as this leader
   // The leader is in the group it must kill: a detached reaper kills the group a moment after the leader has exited with
   // its real status, so the supervisor still reads a meaningful code.
-  const reapGroup = () => spawn('sh', ['-c', `sleep 0.3; kill -9 -- -${process.pid} 2>/dev/null`], { detached: true, stdio: 'ignore' }).unref();
+  // Use our runtime rather than a shell: dash's kill builtin rejects `kill -9 -- -PGID`, and shell tools
+  // may be absent from PATH. The reaper must outlive this leader and signal its group from outside it.
+  const reapGroup = () => spawn(process.execPath, ['--input-type=module', '-e',
+    'setTimeout(() => { try { process.kill(-Number(process.argv[1]), "SIGKILL"); } catch {} }, 300);',
+    String(process.pid)], { detached: true, stdio: 'ignore' }).unref();
   const stop = (code) => { reapGroup(); process.exit(code); };
   setTimeout(() => { process.stderr.write(`git-bounded: timed out after ${timeoutMs}ms; killing process group\n`); stop(124); }, timeoutMs);
   if (process.ppid !== parentPid) return stop(143);
