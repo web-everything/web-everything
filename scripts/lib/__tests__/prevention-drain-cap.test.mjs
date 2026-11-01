@@ -171,7 +171,7 @@ describe('fairness without a writable cursor, and the shared allowance', () => {
   });
   it('an owed filing whose acquire used up the deadline is deferred, not run, and its lane is released', async () => {
     const f = fixture([]); let t = 0; const calls = [];
-    const exec = (cmd, args) => { calls.push(args[1]); if (args[1] === 'acquire') { t = 61_000; return JSON.stringify({ lane: 3, path: f.lane }); } return ''; };
+    const exec = (cmd, args) => { calls.push(args[1]); if (args[1] === 'acquire') { t = 61_000; return JSON.stringify({ lane: 3, path: f.lane, holder: 'sess-holder' }); } return ''; };
     const result = await landPreventionCard({ title: 't', session: 's' }, { owedClaimed: true, exec, write: () => {}, skipPendingDrain: true,
       loadFilingSettings: () => ({ filingEnabled: true }), drainLimit: { deadlineAt: 60_000, now: () => t }, acquireWait: () => 30_000 });
     expect(result).toMatchObject({ ok: true, skipped: true, deferred: true });

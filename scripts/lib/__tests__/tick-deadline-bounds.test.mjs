@@ -107,7 +107,7 @@ describe('round-4 bounds', () => {
   it('inside the tick the dedupe reads NO hosted-PR cards (no gh-throttle subprocess to escape the deadline); outside it still does', async () => {
     const seen = [];
     const settings = resolvePreventionBatchSettings({ standard: loadCardBatchPolicy().prevention, repo: { filingEnabled: true }, env: {} });
-    const exec = (cmd, args) => (args[1] === 'acquire' ? JSON.stringify({ lane: 3, path: '/lane' }) : args[1] === 'file-item' ? JSON.stringify({ verdict: { num: 'x1abcde', rel: 'backlog/x1abcde-card.md' } }) : '');
+    const exec = (cmd, args) => (args[1] === 'acquire' ? JSON.stringify({ lane: 3, path: '/lane', holder: 'sess-holder' }) : args[1] === 'file-item' ? JSON.stringify({ verdict: { num: 'x1abcde', rel: 'backlog/x1abcde-card.md' } }) : '');
     const common = { owedClaimed: true, exec, write: () => {}, pendingDir: tmp(), skipPendingDrain: true, batch: vi.fn(async () => ({ batched: true, batchRef: 'r' })), readFile: () => '#',
       loadFilingSettings: () => settings, loadPreventionBatchSettings: () => settings, acquireWait: () => 5_000,
       dedupe: (input, o) => { seen.push(o.readPrCards ? o.readPrCards('/lane') : 'default'); return null; } };
@@ -177,7 +177,7 @@ describe('fileIntoBatch lease wait', () => {
 });
 
 describe('landPreventionCard inside the tick', () => {
-  const LANE_OUT = JSON.stringify({ lane: 3, path: '/lane' });
+  const LANE_OUT = JSON.stringify({ lane: 3, path: '/lane', holder: 'sess-holder' });
   const FILED = JSON.stringify({ verdict: { num: 'x1abcde', rel: 'backlog/x1abcde-card.md' } });
   function run({ left = 110_000, onExec, batch, dedupe = () => null, sleep = async () => {} } = {}) {
     let t = 0; const calls = [];
