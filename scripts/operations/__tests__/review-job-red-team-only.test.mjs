@@ -96,8 +96,7 @@ describe('review-job CLI --red-team-only', () => {
     [['--red-team-only=resume'], true, 'resume'],
     [['--red-team-only=unknown'], true, 'unknown'],
     [['--red-team-only='], true, ''],
-    [['--red-team-only=fresh', '--red-team-stale-recovery'], true, 'fresh', true],
-  ])('passes %j to the job without losing its recovery mode', (flags, redTeamOnly, redTeamMode, redTeamStaleRecovery) => {
+  ])('passes %j to the job without losing its recovery mode', (flags, redTeamOnly, redTeamMode) => {
     const source = `
       import { runReviewJobCli } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-job.mjs')).href)};
       runReviewJobCli(process.argv.slice(1), { runJob: options => options });
@@ -106,8 +105,7 @@ describe('review-job CLI --red-team-only', () => {
       'run', '--pr=5762', '--repo=web-everything/web-everything', '--prefer-lane=7', ...flags], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
     });
-    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode,
-      ...(redTeamStaleRecovery === true ? { redTeamStaleRecovery: true } : {}) });
+    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode });
   });
 });
 
@@ -651,12 +649,7 @@ describe('red-team-only review job', () => {
       expect(io.runRedTeamGate).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each([
-    ['fresh recovery launches an abandoned stale running pass through production admission and the shared guard', true],
-    ['fresh recovery without the stale flag refuses an abandoned running prior and keeps it intact', undefined],
-    ['fresh recovery with a false stale flag refuses an abandoned running prior and keeps it intact', false],
-    ['fresh recovery with a non-boolean stale flag refuses an abandoned running prior and keeps it intact', 'true'],
-  ])('%s', (_name, redTeamStaleRecovery) => {
+  it('fresh recovery launches an abandoned stale running pass through production admission and the shared guard', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-abandoned-running-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
     const loopPayload = { ...payload(), findings: { read: { netBasis: { rev: head },
@@ -684,18 +677,8 @@ describe('red-team-only review job', () => {
       expect(read()).toMatchObject({ status: 'running', result: null,
         staleAbandoned: { at: expect.any(String), pid: status.pid } });
 
-      const prior = read();
-      const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh',
-        ...(redTeamStaleRecovery === undefined ? {} : { redTeamStaleRecovery }) }, io);
-      if (redTeamStaleRecovery !== true) {
-        expect(result).toMatchObject({ outcome: 'blocked-on-infra',
-          label: expect.stringContaining('prior red-team status; not re-run') });
-        expect(io.runRedTeam).not.toHaveBeenCalled();
-        expect(read()).toEqual(prior);
-        return;
-      }
+      const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
       expect(io.runRedTeam).toHaveBeenCalledOnce();
-      expect(io.runRedTeam.mock.calls[0][0].redTeamStaleRecovery).toBe(true);
       expect(result.redTeam?.reason ?? '').not.toContain('prior red-team status; not re-run');
       expect(observed.calls.model).toBe(1);
       expect(observed.result.deferredByGuard).not.toBe(true);
@@ -1449,12 +1432,10 @@ describe('red-team-only dispatch', () => {
       resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: false })), spawnJob: vi.fn(() => 4242) };
     try { run(options); } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  it.each(['fresh', 'resume'].flatMap(redTeamMode => [false, true].map(redTeamStaleRecovery => ({ redTeamMode, redTeamStaleRecovery }))))(
-    'passes --red-team-only=$redTeamMode and preferred lane, skipping CI admission (stale=$redTeamStaleRecovery)', ({ redTeamMode, redTeamStaleRecovery }) => withDispatch(options => {
-    const out = dispatchReviewJob({ ...options, redTeamMode, redTeamStaleRecovery, preferLane: 7 });
+  it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane, skipping CI admission', redTeamMode => withDispatch(options => {
+    const out = dispatchReviewJob({ ...options, redTeamMode, preferLane: 7 });
     expect(out.jobPid).toBe(4242); expect(options.ciGate).not.toHaveBeenCalled();
     expect(options.spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining(['run', `--pr=${pr}`, `--repo=${repo}`, `--red-team-only=${redTeamMode}`, '--prefer-lane=7']));
-    expect(options.spawnJob.mock.calls[0][0].argv.includes('--red-team-stale-recovery')).toBe(redTeamStaleRecovery);
   }));
   it('still skips live-job with the same slug and record', () => withDispatch(options => {
     writeJobRecord({ slug: `review-${pr}`, pr, repo, pid: 99, cwd: '/daemon', startedAt: new Date().toISOString() }, options.dir);
@@ -1474,13 +1455,11 @@ describe('red-team child resume enforcement', () => {
     [undefined, []],
     ['fresh', ['--red-team-mode=fresh']],
     ['resume', ['--resume-only', '--red-team-mode=resume']],
-  ].flatMap(([redTeamMode, modeArgs]) => [undefined, true].map(redTeamStaleRecovery => [redTeamMode, modeArgs, redTeamStaleRecovery])))(
-    'builds exact child argv for %s mode (%j, stale=%s)', (redTeamMode, modeArgs, redTeamStaleRecovery) => {
+  ])('builds exact child argv for %s mode', (redTeamMode, modeArgs) => {
     const loopFile = `review-${pr}.red-team.loop.json`;
-    expect(redTeamRunnerArgs({ pr, repo, lanePath: '/lanes/lane-7', loopFile, redTeamMode, redTeamStaleRecovery })).toEqual([
+    expect(redTeamRunnerArgs({ pr, repo, lanePath: '/lanes/lane-7', loopFile, redTeamMode })).toEqual([
       'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`,
       '--lane=/lanes/lane-7', `--loop-json=${loopFile}`, ...modeArgs,
-      ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
     ]);
   });
   it.each(['fresh', 'resume'])('carries the exact pre-queue %s evidence to the shared child argv', redTeamMode => {

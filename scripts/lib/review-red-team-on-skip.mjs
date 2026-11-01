@@ -525,8 +525,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           try {
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
-              ...((row.abandonStale === true && abandonment?.ok === true)
-                || (row.abandonStale === false && noRestart?.ok === true) ? { redTeamStaleRecovery: true } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
               const refundable = result?.skipped !== 'live-job'

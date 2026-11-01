@@ -286,12 +286,11 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 }
 
 /** PURE — carry recovery mode and pre-admission evidence to the shared red-team entry. */
-export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamStaleRecovery }) {
+export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission }) {
   return [
     'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
     ...(redTeamMode === 'resume' ? ['--resume-only'] : []),
     ...(redTeamMode === undefined ? [] : [`--red-team-mode=${redTeamMode}`]),
-    ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
     ...(redTeamAdmission === undefined ? [] : [`--red-team-admission=${JSON.stringify(redTeamAdmission)}`]),
   ];
 }
@@ -403,17 +402,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
           const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
-          const withoutRun = redTeamStatusWithoutRun(admissionPrior, {
-            originalStatus: prior, allowAbandonedRunning: input.redTeamStaleRecovery === true,
-          });
-          if (input.redTeamMode === 'fresh' && admissionPrior?.status === 'running' && !withoutRun) {
-            throw Error('prior red-team status; not re-run');
-          }
           if (input.redTeamMode === 'fresh'
             && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
             && !retry
             && (redTeamSkipNeedsSettlement(admissionPrior)
-            || withoutRun)) admissionPrior = null;
+            || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior, allowAbandonedRunning: true }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }
@@ -569,13 +562,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
-    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode, redTeamAdmission, redTeamStaleRecovery }) => {
+    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode, redTeamAdmission }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
-        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamStaleRecovery }),
+        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission }),
           { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -1024,7 +1017,7 @@ export function prepareReviewArc(input, io) {
 }
 
 function runReviewArc({
-  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1232,8 +1225,7 @@ function runReviewArc({
         return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }
       classified = { outcome: 'red-team-only' };
-      return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode,
-        ...(redTeamStaleRecovery === true ? { redTeamStaleRecovery: true } : {}) });
+      return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode });
     }
 
     // Card xbizuci — `review.speculativeRedTeam`: start the red team NOW, beside the loop. It waits for the loop's
@@ -1324,7 +1316,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
-  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false,
+  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -1368,7 +1360,6 @@ export function dispatchReviewJob({
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
-      ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1517,7 +1508,6 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
-        ...(rest.includes('--red-team-stale-recovery') ? { redTeamStaleRecovery: true } : {}),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from

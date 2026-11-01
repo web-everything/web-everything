@@ -1872,7 +1872,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       });
       expect(o.abandonStale).not.toHaveBeenCalled();
       expect(o.dispatch).toHaveBeenCalledOnce();
-      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh', redTeamStaleRecovery: true });
+      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
       expect(staleRecovery.staleRedTeamRedispatch({ repo, pr, head, env })).toMatchObject({ count: 2, nextOrdinal: null });
       expect(staleRecovery.staleRedTeamSpent({ repo, pr, head, env })).toBe(true);
       // Remove cooldown and capacity effects so the queued row itself must block another start.
@@ -1907,7 +1907,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
     expect(o.abandonStale).toHaveBeenCalledWith({ repo, pr, head,
       status: o.readStatus(), env: o.env, now: staleNow, probe: o.probe });
     expect(o.dispatch).toHaveBeenCalledOnce();
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh', redTeamStaleRecovery: true });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
     expect(o.abandonStale.mock.invocationCallOrder[0]).toBeLessThan(o.dispatch.mock.invocationCallOrder[0]);
   });
   it('two ticks share the real cooldown map and abandon/dispatch only once', () => {
