@@ -63,7 +63,7 @@ export async function checkRemoteHealth({root,settings,clock=Date.now,readTeleme
     else if(state.telemetry.loadPerCore>settings.maxLoadPerCore)trigger='maxLoadPerCore';
     else if(state.telemetry.memFreePct<settings.minFreeRamPct)trigger='minFreeRamPct';
     if(trigger){state.trigger=trigger;state.backoffUntil=clock()+settings.backoffMs;return {ok:false,reason:trigger};}
-    return {ok:true};
+    return {ok:true,telemetry:state.telemetry};
   },host);}catch(error){return {ok:false,reason:error.message==='remote-health-busy'?error.message:'remote-health-unreadable'};}
 }
 export async function recordRemoteResult({root,settings,clock=Date.now,result,host='forge'}) {
