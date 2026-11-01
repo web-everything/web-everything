@@ -141,7 +141,7 @@ export function makeConfirmMissingOnMain({ exec = execFileSync, cwd = resolve(di
     if (unavailable) return false;
     try {
       if (!names) {
-        retryTransientGit(() => fetchFresh({ cwd, branches: ['main'], run: (args) => exec('git', args, opts) }));
+        retryTransientGit(() => fetchFresh({ cwd, branches: ['main'], maxAgeMs: 0, run: (args) => exec('git', args, opts) }));
         // `-z` + quotePath off: a non-ASCII filename must not be quoted into an unparseable token.
         names = new Set(exec('git', ['-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--name-only', 'origin/main', '--', 'backlog/'], opts)
           .split('\0').map((f) => normNum(idFromName(f.replace(/^backlog\//, '')) || '')).filter(Boolean));

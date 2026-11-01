@@ -29,8 +29,8 @@ export async function landPrepareStamp({ num }, {
     // Preserve the original PR's entire tree when repairing its head; otherwise start from fresh main.
     const path = status.path;
     if (!new RegExp(`^backlog/${num}-[^/]+\\.md$`).test(path ?? '')) throw new Error('invalid prepare card path');
-    // One narrow fetch of main (+ the PR head). A skipped fetch leaves FETCH_HEAD alone, so read the tracking ref.
-    retryTransientGit(() => fetchFresh({ cwd, branches: source ? ['main', source.headRefName] : ['main'], run: (args, dir) => run('git', args, dir) }));
+    // One narrow fetch of main (+ the PR head), always real (maxAgeMs: 0): head-change detection must not trust a cached ref.
+    retryTransientGit(() => fetchFresh({ cwd, branches: source ? ['main', source.headRefName] : ['main'], maxAgeMs: 0, run: (args, dir) => run('git', args, dir) }));
     const headRef = source ? `origin/${source.headRefName}` : null;
     if (source && run('git', ['rev-parse', headRef], cwd).trim() !== source.headRefOid) {
       throw new Error('prepare PR changed during recovery; retry observation');
