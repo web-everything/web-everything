@@ -26,8 +26,10 @@ const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*npx vitest(?=\s|$)
 // Dropping `--testTimeout=`/`--hookTimeout=` is only stricter when the lane's own config resolves to timeouts
 // no longer than the flags: a CLI flag overrides the config, so stripping it lets the config's value win.
 // The lane's config is arbitrary code, so it is RESOLVED by the lane's own Vitest (config only: no tests,
-// no globalSetup), under the local env and under minimal envs standing in for Forge's. Any probe that fails,
-// times out, or yields a non-integer counts as a longer timeout. Memoized per checkout for this process.
+// no globalSetup), under the env the gate segment itself runs with — the local env and minimal envs standing
+// in for Forge's, each with the segment's own leading assignments, npm's run-script markers and the variables
+// Vitest's CLI sets before loading the config (TEST, VITEST, NODE_ENV). Any probe that fails, times out, or
+// yields a non-integer counts as a longer timeout. Memoized per checkout and segment env for this process.
 const TIMEOUT_PROBE = `import { createVitest } from 'vitest/node';
 const v = await createVitest('test', { watch: false, run: true, reporters: [] }, {}, {});
 try {
@@ -35,17 +37,19 @@ try {
   process.stdout.write('\\n' + JSON.stringify([[v.config.testTimeout, v.config.hookTimeout], ...projects]) + '\\n');
 } finally { await v.close(); }`;
 const resolvedTimeoutsCache = new Map();
-export function resolvedLaneTimeouts(cwd, { env = process.env, run = spawnSync } = {}) {
-  const key = resolve(cwd);
+export function resolvedLaneTimeouts(cwd, { env = process.env, segmentEnv = {}, run = spawnSync } = {}) {
+  const key = JSON.stringify([resolve(cwd), Object.entries(segmentEnv).sort()]);
   if (resolvedTimeoutsCache.has(key)) return resolvedTimeoutsCache.get(key);
   const minimal = { PATH: env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: env.HOME ?? '/nonexistent', LANG: 'C' };
-  const envs = [env, minimal, { ...minimal, CI: 'true' }];
+  const asRun = base => ({ ...base, npm_lifecycle_event: 'test:unit', npm_command: 'run-script', ...segmentEnv,
+    TEST: 'true', VITEST: 'true', NODE_ENV: base.NODE_ENV ?? 'test' });
+  const envs = [env, minimal, { ...minimal, CI: 'true' }].map(asRun);
   let pairs = [];
   for (const probeEnv of envs) {
     let parsed = null;
     try {
       const child = run(process.execPath, ['--input-type=module', '-e', TIMEOUT_PROBE], {
-        cwd: key, env: probeEnv, encoding: 'utf8', timeout: 60_000, maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+        cwd: resolve(cwd), env: probeEnv, encoding: 'utf8', timeout: 60_000, maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
       if (child.status === 0 && !child.signal) parsed = JSON.parse(String(child.stdout).trim().split('\n').at(-1));
     } catch { parsed = null; }
     if (!Array.isArray(parsed) || !parsed.length || !parsed.every(pair => Array.isArray(pair) && pair.length === 2
@@ -55,12 +59,12 @@ export function resolvedLaneTimeouts(cwd, { env = process.env, run = spawnSync }
   resolvedTimeoutsCache.set(key, pairs);
   return pairs;
 }
-function strippedTimeoutsStricter(cwd, stripped) {
+function strippedTimeoutsStricter(cwd, stripped, segmentEnv) {
   const flag = name => { const hit = stripped.find(arg => arg.startsWith(`${name}=`)); return hit ? Number(hit.slice(name.length + 1)) : null; };
   const testTimeout = flag('--testTimeout');
   const hookTimeout = flag('--hookTimeout');
   if (testTimeout === null && hookTimeout === null) return true;
-  const pairs = resolvedLaneTimeouts(cwd);
+  const pairs = resolvedLaneTimeouts(cwd, { segmentEnv });
   return !!pairs && pairs.every(([test, hook]) => (testTimeout === null || test <= testTimeout) && (hookTimeout === null || hook <= hookTimeout));
 }
 
@@ -79,10 +83,12 @@ function wrappedVitestCommand(command, cwd) {
   // Leading assignments run with the nested wrapper, so they apply locally and reach Forge only
   // through its env allowlist. Any other key keeps the segment local.
   let start = 0;
+  const segmentEnv = {};
   for (; start < words.length; start++) {
     const assignment = ENV_ASSIGNMENT.exec(words[start]);
     if (!assignment) break;
     if (!SEGMENT_ENV_KEYS.includes(assignment[1]) || !allowedEnv({ [assignment[1]]: unquote(assignment[2]) })) return null;
+    segmentEnv[assignment[1]] = unquote(assignment[2]);
   }
   if (words[start] !== 'npx' || words[start + 1] !== 'vitest' || words[start + 2] !== 'run') return null;
   const args = words.slice(start + 3);
@@ -92,7 +98,7 @@ function wrappedVitestCommand(command, cwd) {
   const remoteArgs = stripGateOnlyOptions(args);
   if (!remoteArgs || !args.length || !remoteArgs.length) return null;
   if (!allowedCommand(['npx', 'vitest', 'run', ...remoteArgs.map(unquote)])) return null;
-  if (!strippedTimeoutsStricter(cwd, args.slice(remoteArgs.length).map(unquote))) return null;
+  if (!strippedTimeoutsStricter(cwd, args.slice(remoteArgs.length).map(unquote), segmentEnv)) return null;
   // A #6154+ lane wrapper strips for Forge and falls back locally with every original option. Any other lane
   // gets the stripped command from this (the daemon's) side, so Forge accepts it whatever the lane's version;
   // its nested local fallback then runs the stricter form, and its red stands (shouldConfirmRemoteRed).

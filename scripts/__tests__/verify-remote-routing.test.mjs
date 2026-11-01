@@ -142,6 +142,15 @@ describe('daemon-side gate option stripping (lanes without #6154)', () => {
     });
   });
 
+  it('memoizes per checkout AND segment env, so one segment\'s proof never covers another', () => {
+    const run = vi.fn((_bin, _args, { env }) => ({ status: 0, stdout: env.TZ === 'UTC' ? '[[60000,10000]]' : '[[5000,10000]]' }));
+    const cwd = join(tmpdir(), `probe-${Math.random()}`);
+    expect(resolvedLaneTimeouts(cwd, { run })).toEqual(Array(3).fill([5000, 10000]));
+    expect(resolvedLaneTimeouts(cwd, { run, segmentEnv: { TZ: 'UTC' } })).toEqual(Array(3).fill([60000, 10000]));
+    expect(run).toHaveBeenCalledTimes(6);
+    for (const [, , { env }] of run.mock.calls) expect(env).toMatchObject({ TEST: 'true', VITEST: 'true', NODE_ENV: 'test', npm_lifecycle_event: 'test:unit' });
+  });
+
   it('a lane config with timeouts no longer than the flags still strips', () => {
     const root = oldLane({ config: 'export default { test: { testTimeout: 15000, hookTimeout: 20000 } };\n' });
     try {
@@ -162,6 +171,9 @@ describe('daemon-side gate option stripping (lanes without #6154)', () => {
     ['imported shared config sets hookTimeout', { config: "import s from './shared';\nexport default s;\n", files: { 'shared.ts': 'export default { test: { hookTimeout: 60000 } };\n' } }],
     ['computed key', { config: "export default { test: { ['test' + 'Timeout']: 60000 } };\n" }],
     ['env-dependent timeout (Forge-like env)', { config: 'export default { test: { testTimeout: process.env.CI ? 60000 : 5000 } };\n' }],
+    ['timeout under the Vitest CLI env', { config: 'export default { test: { testTimeout: process.env.VITEST && process.env.TEST && process.env.NODE_ENV === "test" ? 60000 : 5000 } };\n' }],
+    ['timeout under the npm run-script env', { config: 'export default { test: { hookTimeout: process.env.npm_lifecycle_event === "test:unit" ? 60000 : 10000 } };\n' }],
+    ['timeout under the segment env (TZ=UTC on the second segment)', { config: 'export default { test: { testTimeout: process.env.TZ === "UTC" ? 60000 : 5000 } };\n' }],
     ['workspace project sets testTimeout', { files: { 'vitest.workspace.ts': "export default [{ test: { name: 'p', testTimeout: 60000 } }];\n" } }],
     ['config fails to load', { config: "throw new Error('boom');\n" }],
     ['lane has no vitest installed', { modules: false }],
