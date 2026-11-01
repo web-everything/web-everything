@@ -1,6 +1,7 @@
 import {execFile} from 'node:child_process';
+import {realpath} from 'node:fs/promises';
 import {promisify} from 'node:util';
-import {isAbsolute, relative} from 'node:path';
+import {isAbsolute, relative, sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const refuse = async () => true;
@@ -47,13 +48,19 @@ export async function loadTestSelector({cwd, argv, env = process.env, exec = exe
   try {
     const selection = selectionArgs(argv);
     if (!selection || !isAbsolute(cwd) || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return refuse;
+    // A child reports physical process.cwd(), even when the caller used a lane
+    // symlink (or /var on macOS). Compare paths in that same coordinate system.
+    cwd = await realpath(cwd);
     const {stdout} = await exec(process.execPath, [child, JSON.stringify(selection)], {
       cwd, env, encoding:'utf8', timeout:timeoutMs, killSignal:'SIGKILL', maxBuffer:MAX_OUTPUT,
     });
     if (typeof stdout !== 'string' || Buffer.byteLength(stdout) > MAX_OUTPUT) return refuse;
     const files = JSON.parse(stdout);
-    if (!Array.isArray(files) || files.some(file => typeof file !== 'string' || !isAbsolute(file) || file.includes('\0') || /[\uD800-\uDFFF]/u.test(file))) return refuse;
-    const selected = new Set(files.map(file => Buffer.from(relative(cwd, file)).toString('hex')));
+    if (!Array.isArray(files) || !files.length || files.some(file => typeof file !== 'string' || !isAbsolute(file) || file.includes('\0') || /[\uD800-\uDFFF]/u.test(file))) return refuse;
+    const paths = files.map(file => relative(cwd, file));
+    // Empty/outside listings cannot establish safe non-selection in this repo.
+    if (paths.some(path => !path || path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path))) return refuse;
+    const selected = new Set(paths.map(path => Buffer.from(path).toString('hex')));
     return async path => {
       if (typeof path !== 'string' && !Buffer.isBuffer(path)) return true;
       const bytes = Buffer.from(path);

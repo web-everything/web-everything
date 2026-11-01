@@ -70,6 +70,28 @@ it('omits a Vitest-excluded ignored test from full and delta entries with the sa
   expect(selectorExec).toHaveBeenCalledTimes(2);
 });
 
+it.each(['full','delta'])('refuses a selected ignored test through a symlinked cwd in %s manifests',async mode=>{
+  const path='_site/assets/js/__tests__/x.test.ts';
+  await write(path,'export {};');await write('.gitignore','_site/\n');
+  await fs.symlink(new URL('../../../node_modules',import.meta.url).pathname,join(cwd,'node_modules'),'dir');
+  await write('vitest.integration.config.mjs',"export default {test:{include:['_site/**/*.test.ts'],exclude:[]}};\n");
+  const alias=join(root,'lane-alias');await fs.symlink(root,alias,'dir');
+  const options={cwd:join(alias,'work'),env,argv:['npx','vitest','run','--config','vitest.integration.config.mjs']};
+  await expect(mode==='full'?buildManifest(options):buildDeltaManifest({...options,base}))
+    .rejects.toMatchObject({code:'ignored-test-file',detail:path});
+});
+
+it.each(['full','delta'])('retains ignored-test refusal when filterEnv rejects the environment in %s manifests',async mode=>{
+  await write('_site/assets/js/__tests__/x.test.ts','export {};');await write('.gitignore','_site/\n');
+  const invalidEnv={...env,DIFF_COVERAGE_BASE:'--unsafe'};
+  expect(()=>filterEnv(invalidEnv)).toThrow('Invalid DIFF_COVERAGE_BASE');
+  const selectorExec=vi.fn(async()=>({stdout:'[]'}));
+  const options={cwd,env:invalidEnv,argv:['npx','vitest','run'],selectorExec};
+  await expect(mode==='full'?buildManifest(options):buildDeltaManifest({...options,base}))
+    .rejects.toMatchObject({code:'ignored-test-file',detail:'_site/assets/js/__tests__/x.test.ts'});
+  expect(selectorExec).not.toHaveBeenCalled();
+});
+
 it('refuses a subdirectory or unreadable binding as unbound-worktree before remote dispatch',async()=>{
   const sub=join(cwd,'sub');await fs.mkdir(sub);
   await expect(bindGit({cwd:sub,env})).rejects.toMatchObject({code:'unbound-worktree'});
@@ -237,6 +259,28 @@ it.each(['x-tokens.md','id_rsa','secret.pem'])
       expect(actual.manifestMode).toBe('git-delta');
       expect(actual.deltaPaths).toContainEqual(Buffer.from(alias));
     }
+  }
+});
+
+it.each(['untracked source','missing public blob','index differs from public','working bytes differ','deleted source'])
+('requires verified public source evidence for memory credential aliases: %s',async fault=>{
+  const source='agent-memory-src/x-tokens.md';
+  await write(source,'# Public tokens\n');await write('agent-memory-src/MEMORY.md','# Memory\n');
+  await fs.mkdir(join(cwd,'.claude'));await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));commit();
+  git(['update-ref','refs/remotes/origin/main','HEAD']);
+  if(fault==='untracked source')git(['rm','--cached',source]);
+  if(fault==='missing public blob')git(['update-ref','refs/remotes/origin/main',base.sha]);
+  if(fault==='index differs from public'||fault==='working bytes differ')await write(source,'private fixture bytes');
+  if(fault==='index differs from public')git(['add',source]);
+  if(fault==='deleted source'){await fs.unlink(join(cwd,source));git(['add',source]);}
+  for(const delta of [false,true]) {
+    const build=()=>delta?buildDeltaManifest({cwd,env,base}):buildManifest({cwd,env});
+    if(fault==='deleted source') {
+      // A deleted source cannot contribute a source entry or a projected alias.
+      const actual=await build();
+      expect(actual.entries.map(entry=>entry.path.toString())).not.toContain('.claude/agent-memory/x-tokens.md');
+      expect(actual.entries.map(entry=>entry.path.toString())).not.toContain(source);
+    } else await expect(build()).rejects.toMatchObject({code:'excluded-source-file'});
   }
 });
 

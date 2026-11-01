@@ -3,18 +3,18 @@ import {afterEach,expect,it,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {join,resolve} from 'node:path';
+import {join} from 'node:path';
 import {loadTestSelector} from '../forge-test-selection.mjs';
 import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const argv=['npx','vitest','run'];
-const cwd=resolve('fixture-lane');
+const cwd=await fs.realpath(process.cwd());
 const output=files=>({stdout:JSON.stringify(files)});
 const execute=promisify(execFile);
 const roots=[];
 afterEach(async()=>{await Promise.all(roots.splice(0).map(root=>fs.rm(root,{recursive:true,force:true})));});
 async function fixture(config) {
-  const root=await fs.mkdtemp(join(process.env.TMPDIR,'forge-selection-'));roots.push(root);
+  const root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-selection-')));roots.push(root);
   await fs.symlink(new URL('../../../node_modules',import.meta.url).pathname,join(root,'node_modules'),'dir');
   await fs.writeFile(join(root,'vitest.config.mjs'),config);
   return root;
@@ -29,11 +29,36 @@ it('uses the absolute discovery set as cwd-relative byte paths, retaining select
   expect(await selected(null)).toBe(true);
 });
 
+it('selects with a symlinked cwd using real Vitest discovery',async()=>{
+  const root=await fixture("export default {test:{include:['selected.test.mjs'],exclude:[]}};");
+  await fs.writeFile(join(root,'selected.test.mjs'),"throw new Error('must never execute');");
+  const alias=join(root,'lane-alias');await fs.symlink(root,alias,'dir');
+  const selected=await loadTestSelector({cwd:alias,argv});
+  expect(await selected('selected.test.mjs')).toBe(true);
+  expect(await selected('omitted.test.mjs')).toBe(false);
+});
+
+it.each(['empty','outside only','mixed outside','cwd itself'])('retains refusal for invalid discovery boundaries: %s',async fault=>{
+  const root=await fixture('export default {};');
+  const physical=await fs.realpath(root);
+  const files=fault==='empty'?[]:fault==='outside only'?[join(physical,'../outside.test.mjs')]
+    :fault==='mixed outside'?[join(physical,'selected.test.mjs'),join(physical,'../outside.test.mjs')]:[physical];
+  const selected=await loadTestSelector({cwd:root,argv,exec:async()=>output(files)});
+  expect(await selected('unlisted.test.mjs')).toBe(true);
+});
+
+it('retains refusal without launching discovery when cwd cannot be resolved',async()=>{
+  const root=await fixture('export default {};'),exec=vi.fn(async()=>output([]));
+  const selected=await loadTestSelector({cwd:join(root,'missing'),argv,exec});
+  expect(await selected('unlisted.test.mjs')).toBe(true);
+  expect(exec).not.toHaveBeenCalled();
+});
+
 it.each([
   ['npx','vitest','run','--config','custom.mjs','--root','other','--dir','tests','--project','one','--project=two','filter'],
   ['vitest','run','-c','custom.mjs','-r','other','--dir=tests','--project=one','--project','two','filter'],
 ].map(command=>[command]))('maps only known selection flags and positional filters: %j',async command=>{
-  const env={DISCOVERY_INPUT:'forwarded'},exec=vi.fn(async()=>output([]));
+  const env={DISCOVERY_INPUT:'forwarded'},exec=vi.fn(async()=>output([join(cwd,'selected.test.mjs')]));
   const selected=await loadTestSelector({cwd,argv:command,env,exec});
   expect(await selected('omitted.test.ts')).toBe(false);
   expect(exec).toHaveBeenCalledOnce();

@@ -3637,6 +3637,13 @@ filters. Reporting accepts `--reporter`, `--silent` and bare/boolean `--coverage
 unknown options, other commands and missing argv retain the existing ignored/unshipped-test
 local fallback. Repeated scalar selection flags also retain fallback.
 
+Discovery resolves the lane cwd with `realpath` before spawning and comparing Vitest's
+absolute paths, including when the caller reaches the lane through a symlink. An empty
+listing, the cwd itself, or any selected path outside that physical cwd retains local fallback.
+The selector's native-child symlink regression and the full/delta symlink manifest regressions
+pin this boundary. Invalid selection environments retain ignored-test refusal in both manifest
+modes without launching discovery.
+
 The listing has a 60-second SIGKILL deadline and a 4 MiB output bound. Child/listing errors,
 timeouts, oversized output, invalid JSON or paths retain local fallback; use local execution
 through heavy admission when evidence is unavailable. Keep native-child regressions for
@@ -3647,3 +3654,10 @@ still refuse test-shaped entries, as do commandless manifest callers. The refusa
 A credential-named alias is refused like any excluded path. The one exemption is the
 `.claude/agent-memory/` bridge's exact image of a tracked `agent-memory-src/` source-extension
 file that itself passed the public-blob check; any other credential-named alias still refuses.
+Full/delta memory-bridge regressions also require index membership, matching public and index
+blobs, and matching working bytes. A deleted source contributes neither a source entry nor an alias.
+Review each exemption conjunct against a named fixture or an explicit upstream invariant.
+The projection's index, source-classification and source-entry checks repeat source-admission
+invariants: a credential source must pass the public-blob checks before entering the projection
+corpus. Do not claim independent mutation coverage for those redundant checks from a test
+that already refuses at source admission.
