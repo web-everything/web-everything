@@ -43,7 +43,7 @@ describe('one run-store read per round (#5322)', () => {
       { key: 'dispatch:0:0', type: DISPATCH_EFFECT, stepIndex: 0, index: 0, status: 'in-flight', startedAt: new Date().toISOString(),
         payload: { num: '7003', launchKind: 'prepare-item' }, handle: null, error: null },
     ]);
-    write('review-pr-ignored', []);
+    store.write({ ...newRunRecord({ id: 'review-pr-ignored', op: 'review-pr' }), pending: null, effects: [] });
   }
 
   it('lists only dispatch-lane runs, each once', () => {

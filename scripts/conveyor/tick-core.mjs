@@ -161,6 +161,7 @@ import { readPreparePolicy } from './prepare-policy-settings.mjs';
 import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
 import { costAdmissionOn, jobCostClass } from '../lib/cost-admission.mjs'; // card x60i0ie — heavy/light cost classes (pure)
 import { ciHealBudgetEvidence, resolveCiHealBudget, resolveCiHealBudgetRestore } from './ci-heal-mark.mjs'; // #5968 — the shared CI-heal budget calculation
+import { ciHealOwed } from './ci-heal-rule.mjs';
 
 /** Held reasons (from {@link ../readiness/dispatch-plan.mjs HELD_REASONS}) that already have their OWN dedicated
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
@@ -408,10 +409,9 @@ function labelSet(labels) {
   );
 }
 
-/** True when the PR's required-check rollup is DEFINITIVELY red (`ci === 'fail'` — `ciRollup` in conveyor-state.mjs
- *  distills the whole rollup to `pass|fail|pending|none`; only `fail` is a settled red check the drain would skip). */
+/** Shared red-CI decision, requiring definitive rollup failure. */
 function isRedCi(prRow) {
-  return String(prRow?.ci || '').toLowerCase() === 'fail';
+  return ciHealOwed({ labels: prRow?.labels, ci: String(prRow?.ci || '').toLowerCase() });
 }
 
 /** True when the PR is BEHIND its base (`main` advanced under it). Read from `mergeStateStatus` — the gh field name
@@ -449,7 +449,7 @@ function isCiHealTarget(prRow) {
   if (!prRow || !isOpenPr(prRow)) return false;
   const labels = prRow.labels;
   if (hasReviewChanges(prRow)) return false; // owned by the review:changes fix loop (§3c) — it already rebases
-  if (isRedCi(prRow) && wasGreenAtOpen(labels)) return true; // red required check on a PR that was green at open
+  if (isRedCi(prRow) && wasGreenAtOpen(labels)) return true;
   if (isBehind(prRow) && isReviewParked(labels)) return true; // not-landable BEHIND — the case #2183 leaves unhealed
   return false;
 }
@@ -775,7 +775,8 @@ export function planFixSpawns({ prs = [], launchedNums = [], liveFixGuards = [],
     // overlay (it alone catches a claimed fix that died before posting a re-arm comment). The cap binds on
     // whichever is higher, so a restart can never reset a PR that already burned its attempts (#2643).
     const attempts = Math.max(Number(nextAttempts[pr]) || 0, Number(durable[pr]) || 0);
-    if (attempts >= retryCap) {
+    const owed = isRedCi(p) ? ciHealOwed({ labels: p.labels, ci: p.ci, attempts, cap: retryCap }) : attempts < retryCap;
+    if (!owed) {
       notes.push({ kind: 'fix-exhausted', num: p.num, pr, attempts, text: `PR #${pr} (#${p.num}) bounced ${attempts}× — auto-fix exhausted, run /review ${pr}` });
       continue;
     }

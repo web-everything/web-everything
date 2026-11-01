@@ -49,7 +49,7 @@ import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import {
-  activeReferrals, buildOperatorRulingComment, mandatoryReferralState, referralRecordState,
+  sameRepo, activeReferrals, buildOperatorRulingComment, mandatoryReferralState, referralRecordState,
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
   readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy, referralRecheck,
 } from '../lib/jury-core.mjs';
@@ -141,7 +141,7 @@ const view = (f) => ({ file: f?.finding?.file, line: f?.finding?.line, summary: 
 /** Authenticated operator provenance and counted reviewer negatives; a policy skip never grants clearance. */
 function operatorProtection(target, record, state, unchangedFinding, autoPolicyRespectsNotReal) {
   const protectingRulings = [], protectionUnknown = [];
-  const subject = (x) => x.repo === record.repo && x.pr === record.pr;
+  const subject = (x) => sameRepo(x.repo, record.repo) && x.pr === record.pr;
   const sourceOf = (o) => state.records.find((r) => subject(r) && r.head === o.head && r.runId === o.runId)
     ?.referrals.find((f) => f.key === o.key);
   const operators = state.operatorRulings.filter((o) => subject(o) && OPERATOR_LOGINS.includes(o.actor.toLowerCase()));

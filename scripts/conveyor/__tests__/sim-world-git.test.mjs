@@ -1,3 +1,5 @@
+// @vitest-environment node
+// Temporary clone imports need SSR loading, outside Vite's web file allowlist.
 /**
  * @file Pins no-clone commitToMain/createBranch plumbing, the slim sim template,
  * and the whole-scenario budget error.
@@ -13,6 +15,32 @@ import { scenario, runScenario } from './sim/scenario.mjs';
 const IMPORTED = 'scripts/lib/daemon-self-sync.mjs';
 
 describe('simulator git and budget regressions', () => {
+  it('provides isolated LaunchAgents evidence to in-process and child candidate discovery', async () => {
+    await runScenario(scenario('clone runtime evidence', {
+      repos: ['we'], lanes: 1, daemons: [],
+      play: [async (w) => {
+        const agents = join(w.env.HOME, 'Library', 'LaunchAgents');
+        expect(existsSync(agents)).toBe(true);
+        const entriesUrl = pathToFileURL(join(w.simCloneRoot, 'scripts/lib/daemon-clone-entries.mjs')).href;
+        const bootUrl = pathToFileURL(join(w.simCloneRoot, 'scripts/lib/daemon-boot-smoke.mjs')).href;
+        const { cloneRuntimeEntries } = await import(entriesUrl);
+        const { checkDaemonEntriesBoot, DAEMON_ENTRY_MODULES } = await import(bootUrl);
+        expect(cloneRuntimeEntries({ root: w.simCloneRoot, env: w.env })).toEqual(DAEMON_ENTRY_MODULES);
+        const child = execFileSync(process.execPath, ['--input-type=module', '-e', `
+          import { cloneRuntimeEntries } from ${JSON.stringify(entriesUrl)};
+          console.log(JSON.stringify(cloneRuntimeEntries({ root: process.cwd() })));
+        `], { cwd: w.simCloneRoot, env: w.env, encoding: 'utf8', timeout: 5_000 });
+        expect(JSON.parse(child)).toEqual(DAEMON_ENTRY_MODULES);
+        const smoke = await checkDaemonEntriesBoot({ root: w.simCloneRoot,
+          env: { ...w.env, WE_SMOKE_LIVE_CLONE: w.simCloneRoot },
+          runChild: async () => '{"ok":true}',
+        });
+        expect(smoke.ok, smoke.detail).toBe(true);
+        expect(smoke.entries.map(row => row.entry)).toEqual(DAEMON_ENTRY_MODULES);
+      }],
+    }));
+  }, 180_000);
+
   it('imports the operation registry and renders the living reviewer checklist from the isolated simulator clone', async () => {
     const checklistPath = 'docs/agent/reviewer-expectations.md';
     const checklist = readFileSync(resolve(process.cwd(), checklistPath), 'utf8').trim();

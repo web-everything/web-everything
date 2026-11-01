@@ -64,6 +64,19 @@ it('builds commands with the repo and number, or returns null without a note', (
   });
 });
 
+it('#5647: prints the withdrawn draft release command under NEEDS YOU without executing it', () => {
+  execFileSync.mockReturnValue(JSON.stringify([{ number: 5647, title: 'withdrawn draft', isDraft: true,
+    headRefOid: 'a'.repeat(40), mergeable: 'MERGEABLE', comments: [], statusCheckRollup: [],
+    labels: [{ name: 'review-status:draft-withdrawn' }] }]));
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  main(['--repo=o/n'], {});
+  const output = log.mock.calls.map(c => c[0]).join('\n');
+  expect(output).toContain('NEEDS YOU');
+  expect(output).toContain('release draft: gh pr edit 5647 --repo=o/n --remove-label review-status:draft-withdrawn');
+  expect(output).not.toContain('extend rounds: undefined');
+  expect(execFileSync.mock.calls.some(([, args]) => args.includes('edit') || args.includes('ready'))).toBe(false);
+});
+
 it('main moves a review:human PR to NEEDS YOU, retaining its reasons; also lists non-human PRs', () => {
   const prs = [5270, 5271].map(number => ({ number, title: 'repair', headRefOid: 'a'.repeat(40), mergeable: 'MERGEABLE',
     statusCheckRollup: [], labels: (number === 5270 ? ['review:human', 'status:escalated'] : ['status:at-round-limit']).map(name => ({ name })), comments: [note()] }));
