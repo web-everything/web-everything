@@ -1,4 +1,5 @@
 ---
+bornAs: x9syioh
 kind: decision
 size: 3
 status: active
@@ -10,7 +11,7 @@ tags: []
 
 # Require a linked prepared card before elevated or high-care builds start
 
-Builds at elevated or high care (daemons, gates, guards) need a linked card with a `preparedDate` before the brief writer or the build dispatcher starts them. This includes work that comes from operator rulings or design notes. Motivated by #6033: a daemon build driven from a design note with no prepared card, which took 7+ red-team rounds (see [#7582](/backlog/7582-decide-the-fate-of-6033-overlay-generation-s1-keep-and-card/)). Operator ruling R327 (2026-11-01): "Do as suggested". This card is policy only. Mechanics live in the build child `xnzadym`.
+Builds at elevated or high care (daemons, gates, guards) need a linked card with a `preparedDate` before the brief writer or the build dispatcher starts them. This includes work that comes from operator rulings or design notes. Motivated by #6033: a daemon build driven from a design note with no prepared card, which took 7+ red-team rounds (see [#7582](/backlog/7582-decide-the-fate-of-6033-overlay-generation-s1-keep-and-card/)). Operator ruling R327 (2026-11-01): "Do as suggested". This card is policy only. Mechanics live in the build child `7591`.
 
 ## Acceptance
 
@@ -82,7 +83,7 @@ Screen: clear - name-only vs file-covering is a merit call.
 
 1. **False elevated**: routine work routed to prepare. Guard: only the named path classes raise the band; "no files declared" holds the work and asks for files, it does not guess.
 2. **Hand-typed briefs skip the start check.** Guard: the PR-open check from the real diff catches elevated work with no prepared card; this is the backstop and is in scope.
-3. **Prepare becomes a rubber stamp to unlock builds.** Guard: the preparer's skeptic and screen are separate agents, and the sibling card on break-family stops (`xtv879w`) catches PRs that still do not converge.
+3. **Prepare becomes a rubber stamp to unlock builds.** Guard: the preparer's skeptic and screen are separate agents, and the sibling card on break-family stops (`7592`) catches PRs that still do not converge.
 4. **Stale stamps** unlock changed code. Guard: the shared freshness rule.
 5. **Rollout window**: until the PR-open check is enforcing, T1 stays open. Named; the child reports it.
 
@@ -95,4 +96,4 @@ Screen: clear - name-only vs file-covering is a merit call.
 
 ## Build child
 
-`xnzadym` holds the mechanics.
+`7591` holds the mechanics.

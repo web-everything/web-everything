@@ -1,11 +1,12 @@
 ---
+bornAs: xnzadym
 kind: story
 size: 5
-parent: "x9syioh"
+parent: "7590"
 status: open
 scaffoldedBy: "r327-cards-ab-lane-26-fb353f00"
 dateScaffolded: "2026-11-01"
-blockedBy: ["x9syioh"]
+blockedBy: ["7590"]
 scope: ["we:scripts/worker-brief.mjs", "we:scripts/lib/prepared-card-gate.mjs"]
 dateOpened: "2026-11-01"
 tags: []
@@ -13,7 +14,7 @@ tags: []
 
 # Build the prepared-card gate for worker-brief and build-dispatch
 
-Build child of x9syioh. Policy, forks and defaults live there; this card holds mechanics only and is dispatched after the parent is ratified.
+Build child of 7590. Policy, forks and defaults live there; this card holds mechanics only and is dispatched after the parent is ratified.
 
 ## Acceptance
 

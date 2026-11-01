@@ -1,4 +1,5 @@
 ---
+bornAs: xtv879w
 kind: decision
 size: 3
 status: active
@@ -10,7 +11,7 @@ tags: []
 
 # Stop granting fix rounds after 3 new red-team break families on a PR and route it back to /prepare
 
-The review daemon counts NEW red-team break families per PR lineage. At 3 it stops granting fix rounds and routes the PR back to `/prepare` with a "needs-design" hold. Motivated by #6033, which was never prepared and drew a new break family every round for 7+ rounds (inventory: [#7582](/backlog/7582-decide-the-fate-of-6033-overlay-generation-s1-keep-and-card/), 12 classes). Operator ruling R327 (2026-11-01): "Do as suggested". This card is policy only. Mechanics, files, settings and rollout live in the build child `xccdjyl`.
+The review daemon counts NEW red-team break families per PR lineage. At 3 it stops granting fix rounds and routes the PR back to `/prepare` with a "needs-design" hold. Motivated by #6033, which was never prepared and drew a new break family every round for 7+ rounds (inventory: [#7582](/backlog/7582-decide-the-fate-of-6033-overlay-generation-s1-keep-and-card/), 12 classes). Operator ruling R327 (2026-11-01): "Do as suggested". This card is policy only. Mechanics, files, settings and rollout live in the build child `7593`.
 
 Terms. A **severity class** (`broken`/`degraded`/`unconfirmed`) says how bad a finding is. A **break family** says what kind of defect it is. This card adds the second and leaves the first alone.
 
@@ -116,4 +117,4 @@ Screen: clear - grants vs a scoped, independently prepared design step is a meri
 
 ## Build child
 
-`xccdjyl` holds the mechanics.
+`7593` holds the mechanics.
