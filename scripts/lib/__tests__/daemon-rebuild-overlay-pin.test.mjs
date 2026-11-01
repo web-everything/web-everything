@@ -114,7 +114,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(f.smoke).not.toHaveBeenCalled();
   }, 60_000);
 
-  it.each([false, true])('persists pin notices across refused ticks and recovers safely (re-register=%s)', async (reregister) => {
+  async function checkRefusedPinRecovery(reregister) {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
     expect(await f.tick()).toMatchObject({ adopted: true });
@@ -169,6 +169,14 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
       .toEqual(registered.filter(o => o.ref !== 'lane/refusal').map(o => o.ref).sort());
     if (reregister) expect(readRebuildState(f.clone, f.env).adopted.applied.find(o => o.ref === 'lane/moving'))
       .toMatchObject({ registrationId: replacement.registrationId, sha: recoveryTip });
+  }
+
+  it('persists pin notices before a later overlay refuses the plan and deduplicates repeated refused ticks', async () => {
+    await checkRefusedPinRecovery(false);
+  }, 90_000);
+
+  it('preserves notices across re-registration and requires a compatible tip to recover', async () => {
+    await checkRefusedPinRecovery(true);
   }, 90_000);
 
   it('refuses to pin when the adopted head also conflicts', async () => {
