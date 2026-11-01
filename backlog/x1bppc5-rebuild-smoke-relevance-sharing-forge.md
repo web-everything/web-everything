@@ -1,8 +1,11 @@
 ---
 kind: decision
 size: 3
-status: open
+status: resolved
 dateOpened: "2026-11-01"
+dateResolved: "2026-11-01"
+graduatedTo: xfwf4zc
+codifiedIn: one-off
 preparedDate: "2026-11-01"
 preparedAgainstSha: "ba3415c4eadc847701ed1f287e38dded49646ec8"
 tags: []
@@ -112,6 +115,17 @@ It is three weeks later and this went badly. Likely causes: (1) a daemon import 
 
 - Keep the 12 h window and the `reuseEnabled` knob; keep transient-retry and env-timeout classification untouched.
 - Leave the `reconcile-dry-run` gh-slot refusal to its own fix.
+
+## Ratified - 2026-11-01
+
+Operator chalbert, 2026-11-01 15:44 ET: "Ratify x1bppc5" (ruling R344). All four forks ratified with their bold defaults, including the skeptic amendments recorded under each fork.
+
+- **Fork 1 - (a)** Relevance by per-daemon import closure, with the live-pass-on-identical-closure rule for `skipped:relevance` rows.
+- **Fork 2 - (a)** One shared verdict per (tree, lockHash, node, harness, plus `cloneKind` where it matters), valid 12 h.
+- **Fork 3 - (a)** Code checks on Forge, Mac fallback with the same checks, and a Mac reject on tree mismatch.
+- **Fork 4 - (a)** gh checks, boot smoke and tree-stays-clean always run.
+
+Build is sequenced after R333. Build child carved from this ruling (see `graduatedTo`).
 
 ## Done when
 
