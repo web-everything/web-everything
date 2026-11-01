@@ -701,6 +701,25 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('host overloaded; ');
   });
 
+  it('never takes a slot that frees only after the run timeout', async () => {
+    const f = await overloadFixture({ freeAtMs: null });
+    f.timeoutMs = 120_000;
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    // Once the overload wait has begun, the slot frees during a sleep that also passes the run timeout.
+    const tick = f.clock; let offset = 0;
+    f.clock = () => tick() + offset;
+    const { easternTimestamp } = await import('../forge-exec-run.mjs');
+    let now = Date.now();
+    const clock = f.clock; f.clock = () => (now = clock());
+    // Forge stays healthy on the shifted clock, so only the timeout can refuse the late slot.
+    f.readTelemetry = async () => ({ sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] });
+    f.sleep = vi.fn(async () => {
+      if (f.log.mock.calls.some(c => /waiting for a remote slot/.test(c[0])) && existsSync(marker)) { rmSync(marker); offset = f.timeoutMs; }
+    });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(f.remoteExec).not.toHaveBeenCalled();
+  });
+
   it('falls back locally when Forge health turns unreadable while waiting', async () => {
     const f = await overloadFixture({ freeAtMs: null });
     let reads = 0;
@@ -740,5 +759,11 @@ describe('hostOverloadedForRemote (7579)', () => {
     expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host load unknown: x' }))).toBe(false);
     expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host memory unknown: x' }))).toBe(false);
     expect(hostOverloadedForRemote({ WE_HEAVY_ADMISSION_HELD: '1' }, () => ({ admitted: false, reason: 'host load 9/1' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host memory headroom 300MB (free+swap); host.minMemoryHeadroomMb=512 (platform); source=vm_stat+swap' }))).toBe(true);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host memory pressure warn; reclaimable headroom 100MB; host.minMemoryHeadroomMb=512' }))).toBe(true);
+    // cpu-mem capacity verdicts cannot tell low from unknown capacity: never an overload for routing.
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host capacity: unknown; host.capacitySignal=cpu-mem (platform)' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false, reason: 'host capacity: cpu idle 5%; host.capacitySignal=cpu-mem (platform)' }))).toBe(false);
+    expect(hostOverloadedForRemote({}, () => ({ admitted: false }))).toBe(false);
   });
 });

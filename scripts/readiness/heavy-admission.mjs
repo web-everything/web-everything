@@ -742,12 +742,14 @@ export function appendVerifyRemoteReport(env, result) {
 /** How long a remote-routed run waits for a free Forge slot before local admission (unless the host is overloaded). */
 export const REMOTE_FULL_WAIT_MS = 30_000;
 
-/** 7579: true only on a definite local-overload verdict. An unknown load or memory reading is not an overload here:
- * it keeps today's routing, where local admission fails closed on it. Held re-entrant runs are never overloaded. */
+/** 7579: true only on a definite local-overload verdict: a measured load ratio over its limit, or measured memory
+ * headroom/pressure below its minimum. Anything else (unknown readings, the cpu-mem capacity verdict, which cannot
+ * tell "low" from "unknown") is not an overload here and keeps today's routing. Held re-entrant runs never count. */
+export const DEFINITE_OVERLOAD = /^host (load \d|memory (headroom|pressure) )/;
 export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmission) {
   if (env?.[ADMISSION_HELD_ENV] === '1') return false;
   const verdict = admit({ env, interactive: !!process.stdin.isTTY, log: () => {} });
-  return verdict?.admitted === false && !/^host (load|memory) unknown\b/.test(String(verdict.reason ?? ''));
+  return verdict?.admitted === false && DEFINITE_OVERLOAD.test(String(verdict.reason ?? ''));
 }
 
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
@@ -805,6 +807,8 @@ export async function runWithRemoteDecision({
   try {
     for (;;) {
       const nowMs = clock();
+      // The extended overload wait never acquires a slot past the run's own timeout.
+      if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
       const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
       slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
       if(slot.ok)break;
