@@ -24,7 +24,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
@@ -406,7 +406,8 @@ describe('runBounded failure details', () => {
   });
 
   it('classifies stderr emitted by the shipped reconcile CLI catch for a throttle exception', async () => {
-    const cli = fileURLToPath(new URL('../../conveyor/reconcile-pass.mjs', import.meta.url));
+    // Resolve a filesystem path directly: Vite rewrites new URL(relative, import.meta.url) to an HTTP asset URL.
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
     const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
     // Inject the failed state read at the module boundary; execute the actual CLI and its catch unchanged.
     const snapshot = `export function readSharedOpenPrs() {
