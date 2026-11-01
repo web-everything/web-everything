@@ -1576,17 +1576,6 @@ describe('staleRedTeamRun — dead running owner recovery', () => {
 });
 
 describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
-  it.each([1, 2])('dead owner with pending labels skips a spent retry count of %i', retryCount => {
-    const f = staleFixture();
-    f.readStatus().retryCount = retryCount;
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip',
-      why: 'red-team retry already spent; inspect stored evidence' });
-  });
-  it.each([0, undefined])('dead owner with pending labels still dispatches with retryCount=%s', retryCount => {
-    const f = staleFixture();
-    if (retryCount !== undefined) f.readStatus().retryCount = retryCount;
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });
-  });
   it.each([true, false])('dead owner dispatches fresh with pending label %s', pending => {
     const f = staleFixture();
     if (!pending) f.rawPrs[0].labels = ['review:accepted'];

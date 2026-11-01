@@ -305,7 +305,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if ((!staleOwed && evidence.inFlight) || evidence.queued) return skip('red-team pass in flight');
       if (staleOwed) {
-        if (status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
         if (staleSpent({ repo, pr, head })) return skip('stale red team already re-dispatched; inspect review run');
         return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: true,
           why: 'running red team owner is dead; abandon and re-dispatch' });
