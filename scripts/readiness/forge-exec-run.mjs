@@ -28,7 +28,7 @@ export const sameSiblingShas = (actual, expected) => expected !== undefined && a
 // Shared by the client and fixed wrapper through allowedCommand. Match spellings exactly.
 export const VITEST_ALLOWED_OPTIONS = Object.freeze([
   '--run', '--silent', '--no-color',
-  '--reporter=default', '--reporter=dot', '--reporter=verbose', '--reporter=basic', '--reporter=tap',
+  '--reporter=default', '--reporter=dot', '--reporter=verbose', '--reporter=basic', '--reporter=tap', '--reporter=json',
   '-t', '--testNamePattern=',
   '--passWithNoTests',
 ]);
@@ -38,6 +38,11 @@ export function gateTimeoutOption(arg) {
   const match = /^--(?:testTimeout|hookTimeout)=([1-9]\d{0,6})$/.exec(arg);
   return match !== null && Number(match[1]) <= MAX_GATE_TIMEOUT_MS;
 }
+// R335: narrow widening. `--config <path>` (two argv tokens, npx class only) and `--outputFile.json=<path>`
+// accept only plain repo-relative paths: no absolute, backslash, dot or `..` segment, no leading dash, no .git.
+const SAFE_REL_PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/;
+const safeRelPath = value => SAFE_REL_PATH.test(value) && !value.split('/').some(part => part === '.git' || part === '..' || part === '.');
+const safeConfigPath = value => safeRelPath(value) && /\.(?:ts|mts|mjs|js)$/.test(value);
 export function allowedCommand(argv) {
   if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0')))) return false;
   if(argv[0]==='npm' && argv[1]==='run' && argv[2]==='check:standards')
@@ -57,6 +62,14 @@ export function allowedCommand(argv) {
         pathParts(Buffer.from(arg));
         files.push(Buffer.from(arg));
       } catch { return false; }
+      continue;
+    }
+    if (npx && arg === '--config') {
+      if (++i >= argv.length || !safeConfigPath(argv[i])) return false;
+      continue;
+    }
+    if (arg.startsWith('--outputFile.json=')) {
+      if (!safeRelPath(arg.slice('--outputFile.json='.length))) return false;
       continue;
     }
     const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
