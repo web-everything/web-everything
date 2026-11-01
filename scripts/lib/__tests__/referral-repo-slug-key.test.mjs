@@ -67,4 +67,17 @@ describe('operator ruling repo spelling (#6170)', () => {
     const c = [post(renderReferralRecord(old), 'web-everything'), comments[1]];
     expect(mandatoryReferralState(c, { head: HEAD, repo: OLD_REPO, pr: 6170, body: rec.authorBody, cardReadable: () => true }).pending).toEqual([]);
   });
+  it('an alias-equal record of the same run that does not name the ruled finding never takes the ruling', () => {
+    const { comments } = world();
+    const rec = readReferralRecords(comments).records[0];
+    const o2 = { ...original, line: 99, summary: 'A different unrelated finding on the same run.' };
+    const unrelated = { ...rec, referrals: [{ key: referralFindingKey('judge', o2), seat: 'judge', original: o2, finding: normalizeFinding(o2) }] };
+    expect(readOperatorRulings([post(renderReferralRecord(unrelated), 'web-everything'), comments[1]]).rulings.map(r => r.repo)).toEqual([OLD_REPO]);
+  });
+  it('two records naming the finding under different spellings are ambiguous: the ruling keeps its own', () => {
+    const { comments } = world();
+    const rec = readReferralRecords(comments).records[0];
+    const both = [comments[0], post(renderReferralRecord({ ...rec, repo: OLD_REPO }), 'web-everything'), comments[1]];
+    expect(readOperatorRulings(both).rulings.map(r => r.repo)).toEqual([OLD_REPO]);
+  });
 });

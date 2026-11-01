@@ -3874,11 +3874,14 @@ export function readOperatorRulings(comments, { head } = {}) {
   // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
   // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
   let recordRepos;
-  const spellingOf = (repo, pr, head, runId) => {
+  const spellingOf = (repo, pr, head, runId, key) => {
     if (canonicalRepoSlug(repo) === repo) return repo;
     recordRepos ??= readReferralRecords(comments).records;
-    return recordRepos.find(x => x.pr === pr && x.head === head && x.runId === runId
-      && canonicalRepoSlug(x.repo) === canonicalRepoSlug(repo))?.repo ?? repo;
+    // Only a record that names THIS finding counts, and only when every such record agrees on one spelling: an
+    // ambiguous match keeps the ruling's own spelling, so it can never attach to a record it does not rule.
+    const spellings = new Set(recordRepos.filter(x => x.pr === pr && x.head === head && x.runId === runId
+      && canonicalRepoSlug(x.repo) === canonicalRepoSlug(repo) && x.referrals.some(f => f.key === key)).map(x => x.repo));
+    return spellings.size === 1 ? [...spellings][0] : repo;
   };
   for (const comment of Array.isArray(comments) ? comments : []) {
     const parsed = parseOperatorRulingComment(comment);
@@ -3887,7 +3890,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
