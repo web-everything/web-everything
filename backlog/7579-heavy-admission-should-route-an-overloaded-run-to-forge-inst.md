@@ -3,7 +3,8 @@ bornAs: xoi0zbm
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/readiness/heavy-admission.mjs"]
+scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/__tests__/heavy-admission-remote.test.mjs"]
+scopeRationale: "we:scripts/readiness/remote-exec.mjs and we:scripts/readiness/forge-remote-health.mjs are named only as non-goals and as the out-of-scope finding; they are not changed"
 dateOpened: "2026-10-31"
 tags: []
 ---
@@ -14,24 +15,23 @@ Live 2026-10-31 10:40 ET (lane-2): heavy-admission DEFERRED 'npm run check:stand
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — the 7579 cases in `we:scripts/readiness/__tests__/heavy-admission-remote.test.mjs` (run that file with `npx vitest run <file> -t 7579`): with the host overloaded and every Forge slot taken, `runWithRemoteDecision` keeps waiting for a Forge slot and runs remotely (fails before: falls back to local after 30 s and defers).
+- [A2] Must refuse on error: a throwing or "unknown" host-load/memory reading is NOT an overload; an unreadable/unhealthy Forge, backoff, a refused remote result, or a run timeout falls back to local admission exactly as before (local then defers on overload).
+- [A3] Must respect `remote.maxConcurrent` and the remote slot locks (`slot-N.unconfirmed` markers stay excluded); nothing becomes remote-eligible that was not before, except `above-threshold` mode with remote enabled and a readable load, where a definite host overload now counts as a remote trigger.
+- [A4] Live proof (2026-11-01 ET, lane-60, private pool with all 8 Forge slots filled, overload simulated with `WE_HOST_MAX_LOAD_PER_CORE=0.01`): before 01:42 ET `remote-full (30s wait exhausted)` → `heavy-command admission deferred` exit 75; after 01:43 ET `waiting for a remote slot instead of deferring locally` → slots freed → `RUN /srv/forge-exec/slot-8/...` 17/17, exit 0.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+Finding: the 10:40 ET incident's own path was different: Forge ran check:standards, and the client returned `cancelled` `incomplete-standards-inputs` (its output classifier matches "no changed tier lines; nothing to attribute"), so the run fell back locally and deferred. That is a remote refusal and stays fail-closed here; the classifier lives in `we:scripts/readiness/remote-exec.mjs` (out of scope).
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not change `we:scripts/readiness/remote-exec.mjs` or its check:standards completeness classifier, the remote allowlist, `we:scripts/readiness/forge-remote-health.mjs`, or local admission itself.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
-
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: only reads the local load verdict object; the reason string is matched against a fixed prefix and never executed.
+2. **Truncated reads** — n/a: no new file reads; slot-marker scans and health reads are the existing ones.
+3. **Shared state files** — the remote slot locks and `.unconfirmed` markers are used exactly as before (same `tryAcquireSlot`, same cap); the longer wait only polls them.
+4. **Fail closed** — unreadable host load/memory, a throwing check, unhealthy Forge (rechecked every 10 s while waiting) or reaching the run timeout all take today's local fallback.
+5. **Identity scoping** — n/a: the slot owner identity is unchanged (per-process `remote-<pid>-<random>`).
+6. **State over time** — overload is re-read on every wait step after 30 s; if the host recovers, the run falls back to local admission as before.
+7. **Who wrote it** — n/a: no new authored input; settings come from the existing cascade.
