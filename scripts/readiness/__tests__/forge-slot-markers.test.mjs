@@ -3,7 +3,7 @@ import {describe, it, expect, afterEach} from 'vitest';
 import {mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createMarkerReaper, markerContent, writeMarkerExclusive} from '../forge-slot-markers.mjs';
+import {createMarkerReaper, markerContent, blockedSlots} from '../forge-slot-markers.mjs';
 
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, {recursive: true, force: true}); });
@@ -47,11 +47,11 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(tel(0, NOW + 95_000))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
-  it('creates a marker exclusively under the shared mutex', async () => {
-    const root = setup({});
-    const file = join(root, 'slot-1.unconfirmed');
-    await writeMarkerExclusive(root, file, markerContent({owner: 'o', pid: 1, nowMs: NOW}));
-    await expect(writeMarkerExclusive(root, file, 'x')).rejects.toThrow();
+  it('blocks a slot for a marker or a held tombstone, never for a sidecar', () => {
+    const root = setup({0: {pid: 1}, 2: {pid: 1}});
+    writeFileSync(join(root, 'slot-1.unconfirmed.held-0123456789abcdef'), 'x');
+    writeFileSync(join(root, 'slot-3.unconfirmed.dead'), '{}');
+    expect([...blockedSlots(root, 8)].sort()).toEqual([0, 1, 2]);
   });
   it('reaps a dead owner whose run Forge cannot account for', async () => {
     const root = setup({0: {pid: 111}});

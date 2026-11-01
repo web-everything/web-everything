@@ -173,7 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { stripGateOnlyOptions } from './forge-gate-options.mjs';
-import { createMarkerReaper, markerContent, writeMarkerExclusive } from './forge-slot-markers.mjs';
+import { createMarkerReaper, markerContent, blockedSlots } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -813,7 +813,7 @@ export async function runWithRemoteDecision({
       const nowMs = clock();
       // The extended overload wait never acquires a slot past the run's own timeout.
       if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
-      const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
+      const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
       if(slot.ok)break;
       // Dead clients' markers must not wall off the cap while Forge is idle: reap by owner liveness plus Forge's own state.
@@ -867,7 +867,7 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      await writeMarkerExclusive(remoteRoot,executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}));
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}),{flag:'wx',mode:0o600});
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {

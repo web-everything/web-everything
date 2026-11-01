@@ -3,10 +3,10 @@
 // forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
 // A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
 // telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
-import {readdirSync, readFileSync, statSync, unlinkSync, writeFileSync} from 'node:fs';
+import {readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
-import {readLockEntry, reserve, releaseLockDir} from './file-locks.mjs';
+import {readLockEntry} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
 export const MARKER_GRACE_MS = 120_000;
@@ -14,32 +14,23 @@ export const MARKER_GRACE_MS = 120_000;
 // a receipt created between Forge's receipt listing and its timestamp, so a sample can never predate a surviving run.
 export const DEATH_SAMPLE_MARGIN_MS = 90_000;
 const NAME = /^slot-(\d+)\.unconfirmed$/;
+const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
 
 /** New markers carry their owner pid so a later client can prove the owner is dead. */
 export function markerContent({owner, pid, nowMs}) {
   return JSON.stringify({v: 1, owner, pid, at: nowMs}) + '\n';
 }
 
-const LOCK_KEY = 'marker-mutation';
-// The critical section is a stat plus an unlink (milliseconds); a long lease makes takeover of a live holder implausible.
-const LOCK_LEASE_MINUTES = 10;
-const holds = (root, owner) => readLockEntry(root, LOCK_KEY)?.owner === owner;
-/** Marker creation and reaping share one short mutex, so a reaper can never remove a marker it did not judge. */
-async function withMarkerLock(root, work, {clock = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms))} = {}) {
-  const owner = 'marker-' + randomBytes(12).toString('hex'), start = clock();
-  for (;;) {
-    // Never hand `reserve` a liveness verdict read earlier: it rereads the holder itself, so a stale `dead` could
-    // reclaim a live holder's lock. A crashed holder is reclaimed by its 1-minute lease instead.
-    const now = clock();
-    if (reserve(root, LOCK_KEY, owner, now, new Date(now).toISOString(), process.pid, 'unknown', LOCK_LEASE_MINUTES, null, true).ok) break;
-    if (clock() - start >= 3000) throw new Error('remote-marker-busy');
-    await sleep(25);
+/** Slot indices whose marker (or a held tombstone) is present: those slots are never handed out. */
+export function blockedSlots(root, cap, readdir = readdirSync) {
+  const blocked = new Set();
+  let names = [];
+  try { names = readdir(root); } catch { /* unreadable root: caller's slot scan will fail closed elsewhere */ }
+  for (const name of names) {
+    const m = HELD_NAME.exec(name);
+    if (m && Number(m[1]) < cap) blocked.add(Number(m[1]));
   }
-  try { return await work(() => holds(root, owner)); } finally { if (holds(root, owner)) releaseLockDir(root, LOCK_KEY); }
-}
-/** Exclusive create of a dispatch marker under the mutex; throws if one already exists. */
-export function writeMarkerExclusive(root, file, content, opts) {
-  return withMarkerLock(root, still => { if (!still()) throw new Error('remote-marker-lock-lost'); writeFileSync(file, content, {flag: 'wx', mode: 0o600}); }, opts);
+  return blocked;
 }
 
 function ownerPid(root, index, file) {
@@ -73,6 +64,19 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
     firstDead.set(key, at);
     return at;
   }
+  function claimAndRemove(entry) {
+    const tomb = `${entry.file}.held-${randomBytes(8).toString('hex')}`; // a held name still blocks its slot
+    try { renameSync(entry.file, tomb); } catch { return false; }
+    let judged = false;
+    try {
+      const seen = statSync(tomb);
+      judged = seen.ino === entry.ino && seen.mtimeMs === entry.mtimeMs
+        && liveness(ownerPid(root, entry.index, tomb), selfPid) === 'dead';
+    } catch { /* unreadable claim: treat as not judged */ }
+    if (judged) { try { unlinkSync(tomb); return true; } catch { /* fall through and restore */ } }
+    try { linkSync(tomb, entry.file); unlinkSync(tomb); } catch { /* the held tombstone stays and keeps blocking its slot */ }
+    return false;
+  }
   const forget = (file, key) => { firstDead.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } };
   return {
     async step(getTelemetry, now = clock()) {
@@ -100,17 +104,10 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
       const reaped = [];
       for (const entry of dead) {
         if (now - entry.mtimeMs < graceMs || sampledAt < firstDead.get(entry.key) + DEATH_SAMPLE_MARGIN_MS) continue;
-        // Re-judge under the mutex: the marker must be the very file we judged and its owner still provably dead.
-        const removed = await withMarkerLock(root, still => {
-          try {
-            if (!still()) return false;
-            const seen = fs.statSync(entry.file);
-            if (seen.ino !== entry.ino || seen.mtimeMs !== entry.mtimeMs) return false;
-            if (liveness(ownerPid(root, entry.index, entry.file), selfPid) !== 'dead') return false;
-            fs.unlinkSync(entry.file);
-            return true;
-          } catch { return false; }
-        }).catch(() => false);
+        // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
+        // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
+        // dispatch marker is ever lost, whatever the timing and without any lease or lock.
+        const removed = claimAndRemove(entry);
         if (!removed) continue;
         forget(entry.file, entry.key);
         reaped.push(entry.name);
