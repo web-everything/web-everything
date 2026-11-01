@@ -97,6 +97,8 @@ export function noteEpisodeKey(note) {
     return `liveness-wait-exhausted:${pr}:${note.since ?? 'unknown-since'}`;
   }
   // One dispute per head: the same head can keep waiting for days without minting a second comment.
+  // One escalation per PR and cap: the loop count keeps growing without minting a comment per reviewed head.
+  if (note?.kind === 'review-churn') return `review-churn:${pr}:${note.cap}`;
   if (note?.kind === 'ruling-dispute') return `ruling-dispute:${pr}:${note.head ?? 'unknown-head'}`;
   return `${note?.kind ?? 'note'}:${pr}:${note?.text ?? ''}`;
 }

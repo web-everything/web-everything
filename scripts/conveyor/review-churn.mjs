@@ -58,7 +58,12 @@ export function reviewedHeadVerdicts(comments) {
 
 /** PURE: how many reviews of DISTINCT heads this PR has had. */
 export function countReviewLoops(comments) {
-  return new Set(reviewedHeadVerdicts(comments).map((v) => v.head).filter(Boolean)).size;
+  const seen = [];
+  for (const { head } of reviewedHeadVerdicts(comments)) {
+    // A full sha and its abbreviation are one commit.
+    if (head && !seen.some((h) => h.startsWith(head) || head.startsWith(h))) seen.push(head);
+  }
+  return seen.length;
 }
 
 /**

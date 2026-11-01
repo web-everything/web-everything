@@ -4,6 +4,7 @@ import { planReconcile, REFUSAL_KINDS } from '../reconcile-core.mjs';
 import {
   decideReviewChurn, countReviewLoops, resolveReviewChurn, enrichPrsWithReviewChurn, REVIEW_CHURN_STANDARD,
 } from '../review-churn.mjs';
+import { noteEpisodeKey } from '../reconcile-note-comment.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 
 const BOT = { login: 'web-everything' };
@@ -72,6 +73,18 @@ describe('per-PR loop cap', () => {
     const r = plan(mkPr(comments, sha('d'), { settings: SET({ sameTree: 'off', capMode: 'shadow' }) }));
     expect(row(r)?.kind).toBe('review');
     expect(row(r)?.churnShadow?.kind).toBe('loop-cap');
+  });
+});
+
+describe('dedupe', () => {
+  it('a full sha and its abbreviation are one loop', () => {
+    const A = sha('a');
+    const abbr = { author: BOT, createdAt: at(2), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${A.slice(0, 7)} -->` };
+    expect(countReviewLoops([accept(A, 1), abbr])).toBe(1);
+  });
+  it('the needs-you note has one stable episode per PR as the count grows', () => {
+    const n = (loops) => ({ kind: 'review-churn', prNumber: 7, loops, cap: 3, text: `x ${loops}` });
+    expect(noteEpisodeKey(n(3))).toBe(noteEpisodeKey(n(4)));
   });
 });
 
