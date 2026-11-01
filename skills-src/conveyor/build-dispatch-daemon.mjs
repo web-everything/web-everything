@@ -2222,10 +2222,10 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
   let listingCalls = 0;
   const queryResults = new Map();
   const reserve = Math.min(Math.max(0, Number.isInteger(launchReserve) ? launchReserve : 0), Math.max(0, maxPrListingCalls - 8));
-  function reserveListingCall(forLaunch = false) {
+  function reserveListingCall(forLaunch = false, count = 1) {
     const cap = forLaunch ? maxPrListingCalls : maxPrListingCalls - reserve;
-    if (listingCalls >= cap) throw new Error(`prepare PR listing call budget exhausted (${cap} of ${maxPrListingCalls}${forLaunch ? '' : `, ${reserve} reserved for launch checks`})`);
-    listingCalls++;
+    if (listingCalls + count > cap) throw new Error(`prepare PR listing call budget exhausted (${cap} of ${maxPrListingCalls}${forLaunch ? '' : `, ${reserve} reserved for launch checks`})`);
+    listingCalls += count;
   }
   const itemListings = new Map();
   const parkedKeys = new Set();
@@ -2339,7 +2339,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     useParkedCache(key);
     return !itemListings.has(key);
   };
-  /** Prefetch independent card searches concurrently, sharing the tick's budget and cached failures. */
+  /** Prefetch complete card searches concurrently, admitting active cards before parked cards. */
   async function prefetchItemListings(entries) {
     const todo = [...new Map(entries.flatMap(e => {
       const card = tree?.get(normNum(e.num));
@@ -2351,20 +2351,29 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
       if (!needsItemListing(e.num, e.claimedAt, bornAs)) return [];
       const query = itemQuery(e.num, bornAs);
       return [[query.key, query]];
-    })).values()];
+    })).values()].sort((a, b) => Number(parkedKeys.has(a.key)) - Number(parkedKeys.has(b.key)));
+    const reservedSearches = new Set();
+    const pendingSearches = new Map();
     let next = 0;
     const worker = async () => {
       while (next < todo.length) {
         const { key, searches } = todo[next++];
         try {
+          // Reserve the whole identity before yielding: interleaved partial listings must not consume
+          // the settlement allowance without completing any claim. Shared searches are charged once.
+          const missing = searches.filter(search => !queryResults.has(search) && !reservedSearches.has(search));
+          if (missing.length) reserveListingCall(false, missing.length);
+          for (const search of missing) reservedSearches.add(search);
           const prs = [];
           for (const search of searches) {
             if (!queryResults.has(search)) {
-              reserveListingCall();
-              try {
-                const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
-                queryResults.set(search, { list });
-              } catch (error) { queryResults.set(search, { error }); }
+              if (!pendingSearches.has(search)) pendingSearches.set(search, (async () => {
+                try {
+                  const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+                  queryResults.set(search, { list });
+                } catch (error) { queryResults.set(search, { error }); }
+              })());
+              await pendingSearches.get(search);
             }
             const result = queryResults.get(search);
             if (result.error) throw result.error;
@@ -2377,6 +2386,9 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
       }
     };
     await Promise.all(Array.from({ length: Math.min(prefetchConcurrency, todo.length) }, worker));
+    // An earlier component failure can leave reserved searches unissued. Return those calls for lazy reads
+    // only after all workers finish, since a sibling identity may still need the same reserved search.
+    for (const search of reservedSearches) if (!pendingSearches.has(search)) listingCalls--;
   }
   return {
     resolveCard({ num }) {

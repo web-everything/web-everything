@@ -4686,6 +4686,106 @@ describe('grouped PREPARE daemon ticks', () => {
 
 
 describe('prepare discovery under repository PR volume', () => {
+  it.each([0, 1, 2])('settles two aliased claims across ticks with async prefetch and a parked card at position %s', async parkedPosition => {
+    const claims = ['8300', '8301'].map((num, i) => ({ meta: { num }, bornAs: `xlow00${i}` }));
+    const parked = { num: '8302', bornAs: 'xpark02', parked: true };
+    const git = prepareGitFixture(Object.fromEntries([...claims.map(c => ({ num: c.meta.num, bornAs: c.bornAs })), parked]
+      .map(({ num, bornAs }) => [num, `---\nbornAs: ${bornAs}\nstatus: open\n---\nfinished ${num}`])));
+    const policy = resolvePreparePolicy({ env: { WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK: '16' } });
+    const parkedListings = new Map();
+    for (let tickNumber = 0; tickNumber < 2; tickNumber++) {
+      const searches = [];
+      const exec = (cmd, args, opts) => {
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1];
+        searches.push(search);
+        const claim = claims.find(c => search === `head:lane/${c.meta.num}`);
+        return JSON.stringify(claim ? [{ number: Number(claim.meta.num), state: 'CLOSED',
+          headRefName: `lane/${claim.meta.num}-prepare-x`, createdAt: '2026-11-01T00:00:00Z', isCrossRepository: false }] : []);
+      };
+      const reader = createPrepareStatusReader({ exec, execAsync: async (...args) => exec(...args),
+        maxPrListingCalls: policy.maxPrListingCallsPerTick, launchReserve: policy.launchPrListingReserve,
+        parkedCacheMs: 15 * 60_000, parkedListings });
+      const released = [];
+      const tick = await runBuildDispatchTick({ live: true, effects: {
+        planTick: () => ({ decisions: { itemPrepareSpawns: [] }, nextState: {} }),
+        preparePolicy: () => policy,
+        fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], killSwitch: () => ({ engaged: false }),
+        listPrepareClaims: () => claims, listPrepareInFlight: () => [],
+        listHolds: () => [{ num: parked.num, reason: 'prepare-unstamped' }],
+        primePrepareStatus: ({ nums, parked: parkedNums }) => {
+          const entries = nums.filter(num => num !== parked.num).map(num => ({ num }));
+          entries.splice(parkedPosition, 0, { num: parked.num, parked: parkedNums.includes(parked.num) });
+          return reader.prime(entries);
+        },
+        readPrepareStatus: args => reader.read(args), listPreparePrs: args => reader.listPrs(args),
+        releasePrepareClaim: ({ num }) => released.push(num), placePrepareHold: () => {},
+        recordPrepareFailure: () => ({ cause: 'infra-transient', retry: true, held: false }),
+      } });
+      expect(released.sort()).toEqual(['8300', '8301']);
+      expect(tick.prepare.inFlight).toEqual([]);
+      expect(searches).toHaveLength(8);
+      expect(searches.some(search => search.includes(parked.num) || search.includes(parked.bornAs))).toBe(false);
+      expect(parkedListings.size).toBe(0);
+      // Settlement cannot consume the launch reserve, and deferred parked reads stay fail closed.
+      expect(() => reader.listPrs(parked)).toThrow('budget exhausted');
+      expect(reader.listPrs({ num: '8303', bornAs: '', forLaunch: true })).toEqual([]);
+      expect(searches).toHaveLength(10);
+    }
+  });
+
+  it('charges overlapping async identity searches once and awaits their shared result', async () => {
+    const git = prepareGitFixture({ 8310: '---\nbornAs: xshared\n---\na', 8311: '---\nbornAs: xshared\n---\nb' });
+    const searches = [];
+    const exec = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      searches.push(args[args.indexOf('--search') + 1]);
+      return '[]';
+    };
+    const reader = createPrepareStatusReader({ exec, maxPrListingCalls: 6,
+      execAsync: async (...args) => { await new Promise(resolve => setTimeout(resolve, 1)); return exec(...args); } });
+    await reader.prime([{ num: '8310' }, { num: '8311' }]);
+    expect(reader.listPrs({ num: '8310' })).toEqual([]);
+    expect(reader.listPrs({ num: '8311' })).toEqual([]);
+    expect(searches).toHaveLength(6);
+    expect(new Set(searches).size).toBe(6);
+    expect(() => reader.listPrs({ num: '8312', bornAs: '' })).toThrow('budget exhausted');
+  });
+
+  it('defers an unaffordable identity without spending calls needed by a smaller complete listing', async () => {
+    const git = prepareGitFixture({ 8310: '---\nbornAs: xlarge0\n---\na', 8311: '---\nstatus: open\n---\nb' });
+    const searches = [];
+    const exec = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      searches.push(args[args.indexOf('--search') + 1]);
+      return '[]';
+    };
+    const reader = createPrepareStatusReader({ exec, execAsync: async (...args) => exec(...args), maxPrListingCalls: 3 });
+    await reader.prime([{ num: '8310' }, { num: '8311' }]);
+    expect(searches).toEqual(['head:lane/8311', 'in:title "prepare" "8311"']);
+    expect(reader.listPrs({ num: '8311' })).toEqual([]);
+    expect(() => reader.listPrs({ num: '8310' })).toThrow('budget exhausted');
+    expect(searches).toHaveLength(3);
+  });
+
+  it('returns unissued reservations after a component fails while retaining the observation failure', async () => {
+    const git = prepareGitFixture({ 8310: '---\nbornAs: xfailed\n---\na', 8311: '---\nstatus: open\n---\nb' });
+    const searches = [];
+    const exec = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      if (search === 'head:lane/8310') throw new Error('listing unavailable');
+      return '[]';
+    };
+    const reader = createPrepareStatusReader({ exec, execAsync: async (...args) => exec(...args), maxPrListingCalls: 4 });
+    await reader.prime([{ num: '8310' }, { num: '8311' }]);
+    expect(searches).toEqual(['head:lane/8310']);
+    expect(() => reader.listPrs({ num: '8310' })).toThrow('listing unavailable');
+    expect(reader.listPrs({ num: '8311' })).toEqual([]);
+    expect(searches).toHaveLength(3);
+  });
+
   it.each([2, 4, 8, 16, 32])('keeps settlement reads available with the default reserve and a %s-call budget', async maxPrListingCalls => {
     const policy = resolvePreparePolicy({ env: { WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK: String(maxPrListingCalls) } });
     const git = prepareGitFixture({ 8300: '---\nstatus: open\n---\nfinished' });

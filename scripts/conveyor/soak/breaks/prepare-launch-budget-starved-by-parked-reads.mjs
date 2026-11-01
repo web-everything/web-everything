@@ -22,9 +22,10 @@ export default {
     const violations = [];
     // PR #6148 send-back: the default reserve must not prevent two finished claims from settling.
     // Include bornAs aliases: each complete status read needs four searches, not just two.
-    for (const prefetch of [false, true]) {
+    for (const prefetch of [false, true]) for (const tickNumber of [1, 2]) {
       const claims = ['8300', '8301'].map((num, i) => ({ meta: { num }, bornAs: `xlow00${i}` }));
-      const blobs = claims.map(({ meta: { num }, bornAs }) => {
+      const parked = { num: '8302', bornAs: 'xpark02', parked: true };
+      const blobs = [...claims.map(c => ({ num: c.meta.num, bornAs: c.bornAs })), parked].map(({ num, bornAs }) => {
         const body = Buffer.from(`---\nbornAs: ${bornAs}\nstatus: open\n---\nfinished ${num}`);
         const sha = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
         return { num, body, sha };
@@ -55,13 +56,14 @@ export default {
         preparePolicy: () => policy,
         fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], killSwitch: () => ({ engaged: false }),
         listPrepareClaims: () => claims, listPrepareInFlight: () => [],
-        primePrepareStatus: () => r.prime(claims.map(c => ({ num: c.meta.num }))),
+        listHolds: () => [{ num: parked.num, reason: 'prepare-unstamped' }],
+        primePrepareStatus: () => r.prime([...claims.map(c => ({ num: c.meta.num })), parked]),
         readPrepareStatus: args => r.read(args), listPreparePrs: args => r.listPrs(args),
         releasePrepareClaim: ({ num }) => released.push(num), placePrepareHold: () => {},
         recordPrepareFailure: () => ({ cause: 'infra-transient', retry: true, held: false }),
       } });
       if (released.sort().join() !== '8300,8301' || tick.prepare.inFlight.length || calls !== 8) {
-        violations.push(`small-budget settlement (prefetch=${prefetch}): released [${released}], busy [${tick.prepare.inFlight}], calls=${calls}, failures=${JSON.stringify(tick.prepare.failures)}`);
+        violations.push(`small-budget settlement (prefetch=${prefetch}, tick=${tickNumber}): released [${released}], busy [${tick.prepare.inFlight}], calls=${calls}, failures=${JSON.stringify(tick.prepare.failures)}`);
       }
     }
     const searches = [];
