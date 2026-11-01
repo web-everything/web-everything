@@ -152,7 +152,7 @@ describe('auto-rebase executed-test inventory', () => {
       return order === 'before' ? result.stdout.slice(boundary) + result.stdout.slice(0, boundary) : result.stdout;
     };
     const test = { type: 'test', name: 'instant test', mode: 'run', result: { state: 'pass', duration: 0 } };
-    const stdout = emit([test, { ...test, mode: 'skip' }, { ...test, mode: 'todo' }]);
+    const stdout = emit([test, { ...test, mode: 'skip', result: undefined }, { ...test, mode: 'todo', result: undefined }]);
     const exec = vi.fn(async () => ({ status: 0, stdout, stderr: '' }));
     await runHeavyTests(invocation, { exec });
     expect(exec).toHaveBeenCalledOnce();

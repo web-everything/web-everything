@@ -596,6 +596,9 @@ Async child output is complete at `close`; `exit` can precede the final stdout/s
 chunks. Exercise that ordering for success and failure with an injected child, alongside
 real-process tests. Keep timeout and output bounds active while draining pipes retained
 by descendants; reaching either bound must still reject the result.
+When updating the shared spawn wrapper, check every caller's injected child fixture:
+emit `close` after `exit` and the final output, and use real streams when the wrapper
+can destroy retained pipes. An exit-only fixture leaves the completion promise pending.
 
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
