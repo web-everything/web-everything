@@ -97,10 +97,17 @@ describe('data-registry exemption (R316)',()=>{
     ['GitHub token','{"a":"ghp_abcdefghijklmnopqrstuvwxyz0123"}','github-token'],
     ['high-entropy token field','{"token":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}','high-entropy-token'],
     ['private key','{"a":"-----BEGIN RSA PRIVATE KEY-----"}','pem-header'],
+    ['secret in an array under a token field','{"token":["public","q8Zr2LmX9vT4pW7kJ1nB5cY3"]}','high-entropy-nested'],
+    ['secret in an object under a token field','{"token":{"value":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}}','high-entropy-nested'],
+    ['deeply nested secret under a token field','{"token":{"a":{"b":["q8Zr2LmX9vT4pW7kJ1nB5cY3"]}}}','high-entropy-nested'],
+    ['high-entropy credential field','{"credential":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}','high-entropy-credential'],
   ])('refuses a registry file containing a %s',async(_label,content,reason)=>{
     expect(designTokenSecretFinding(Buffer.from(content))).toBe(reason);
     await write('src/_data/protocols/credential-management.json',content);await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('src/_data/protocols/credential-management.json')});
+  });
+  it('leaves the taint scoped to the secret field',()=>{
+    expect(designTokenSecretFinding(Buffer.from('{"token":["x"],"summary":"q8Zr2LmX9vT4pW7kJ1nB5cY3"}'))).toBe(null);
   });
   it('refuses an untracked registry file',async()=>{
     await git(['add','.']);await commit();await write('src/_data/intents/credential-enrollment.json',data);

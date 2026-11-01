@@ -120,7 +120,7 @@ export function isDataRegistryPath(path) {
     &&!excludedComponent(leaf,true,true);
 }
 const isStrictJsonPath=path=>isDesignTokenPath(path)||isDataRegistryPath(path);
-const secretField=/key|secret|token|passw(?:or)?d/i;
+const secretField=/key|secret|token|passw(?:or)?d|credential/i;
 const secretText=[
   [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/sk-[A-Za-z0-9_-]{16,}/,'sk-token'],
@@ -142,12 +142,19 @@ export function designTokenSecretFinding(content) {
   if(!json||typeof json!=='object'||Array.isArray(json))return 'non-object-json';
   // Scan every string literal in the raw bytes, decoded, in order. JSON.parse
   // keeps only the last duplicate property, so its object view is never used.
-  let field;
-  for(const [,literal,colon] of text.matchAll(/("(?:[^"\\]|\\.)*")(\s*:)?/g)) {
+  // A secret-named field taints every string nested under it (arrays, objects).
+  const stack=[false];let field;
+  for(const [token,literal,colon] of text.matchAll(/("(?:[^"\\]|\\.)*")(\s*:)?|[{}[\],]/g)) {
+    if(!literal) {
+      if(token==='{'||token==='[')stack.push(stack.at(-1)||(field!==undefined&&secretField.test(field)));
+      else if(token!==',')stack.pop();
+      field=undefined;continue;
+    }
     const value=JSON.parse(literal),decoded=textFinding(value);
     if(decoded)return decoded;
     if(colon) {field=value;continue;}
-    if(field!==undefined&&secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    const name=field!==undefined&&secretField.test(field)?field:stack.at(-1)?'nested':null;
+    if(name&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${name}`;
     field=undefined;
   }
   return null;
