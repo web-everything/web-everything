@@ -375,24 +375,39 @@ export async function prepareRebuild({
       // inputs (bound to this registration) or a recorded full tip identify pins only, never fresh
       // build/retirement inputs. When the running build's adopted record carries a row for this ref that is
       // NOT bound to this registration (a re-registered overlay, or an unprovable legacy row), that row is
-      // another registration's evidence: this registration inherits no pin from it. With no row at all, or
-      // lost/mismatched rebuild state, the pin is unknown: refuse rather than silently dropping a possible
-      // mechanism overlay.
+      // another registration's evidence: this registration inherits no pin from it. The row still states
+      // what is RUNNING, though: if that content changes the mechanism, building without it would revert
+      // the live daemon, so hold under a distinct reason that claims nothing about this registration.
+      // With no row at all, or lost/mismatched rebuild state, the pin is unknown: refuse rather than
+      // silently dropping a possible mechanism overlay.
       const adoptedRows = state.adopted?.head === prevHead && Array.isArray(state.adopted?.applied)
         ? state.adopted.applied : null;
+      const pinMain = state.adopted?.mainSha ?? fetchedMainSha;
       const adopted = adoptedRows ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
-      const unboundRow = !adopted && !!adoptedRows?.some((row) => row?.ref === raw.ref);
+      const unboundRow = adopted ? null : adoptedRows?.find((row) => row?.ref === raw.ref) ?? null;
       const tipSha = adopted?.sha ?? validTipSha(raw);
-      const pin = tipSha || raw.pinned === true
-        ? pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, tipSha)
-        : unboundRow ? { pinned: false } : { pinned: true, why: 'unknown' };
+      let reason = 'pinned-overlay-unavailable';
+      let detailSha = tipSha ?? null;
+      let pin;
+      if (tipSha || raw.pinned === true) pin = pinnedStatus(git, raw, pinMain, tipSha);
+      else if (!unboundRow) pin = { pinned: true, why: 'unknown' };
+      else {
+        // Unparseable running evidence cannot prove the running content is harmless: fail closed.
+        pin = FULL_SHA_RE.test(unboundRow.sha ?? '') ? pinnedStatus(git, raw, pinMain, unboundRow.sha)
+          : { pinned: true, why: 'unknown' };
+        reason = 'pinned-overlay-unbound';
+        detailSha = FULL_SHA_RE.test(unboundRow.sha ?? '') ? unboundRow.sha : null;
+      }
       // pinnedStatus runs Git; the list may be re-registered meanwhile. Never refuse for a replaced registration.
       if (!snapshotHolds()) return registrationChanged();
       if (!pin.pinned) continue;
       unavailablePinned = {
-        ok: false, reason: 'pinned-overlay-unavailable',
-        detail: { ref: raw.ref, pr: raw.pr ?? null, sha: tipSha ?? null,
-          dropReason: 'ref-unavailable', pinnedBy: pin.why, message: PINNED_OVERLAY_GONE_MESSAGE },
+        ok: false, reason,
+        detail: { ref: raw.ref, pr: raw.pr ?? null, registrationId: snap.get(raw.ref) ?? null, sha: detailSha,
+          dropReason: 'ref-unavailable', pinnedBy: pin.why,
+          message: reason === 'pinned-overlay-unbound'
+            ? 'the running build carries mechanism changes for this ref under an earlier registration, and the branch is unavailable — restore the branch, or remove the overlay to drop that content deliberately'
+            : PINNED_OVERLAY_GONE_MESSAGE },
       };
       break;
     }
@@ -522,6 +537,8 @@ export async function prepareRebuild({
   }
   if (!plan.ok) {
     // A pinned refusal keeps the current tree AND the overlay list untouched (no decisions were applied).
+    // An unavailable-pin refusal names a registration; never alert or hold for one replaced since it was built.
+    if (plan === unavailablePinned && !snapshotHolds()) return registrationChanged();
     alert(plan.reason, plan.detail);
     // xpinskip — a pinned refusal that still stands (explicit pin, or main lacks the mechanism) must not freeze
     // dispatch either: when the clone sits on its last smoke-verified build, record it as HELD there, so

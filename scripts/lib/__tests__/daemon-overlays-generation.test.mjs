@@ -349,6 +349,38 @@ describe('overlay registration generations', () => {
     expect(f.list()[0].registrationId).toBe(migrated.list[0].registrationId);
   });
 
+  it('T11 a re-registered ref whose RUNNING content changes the mechanism holds as pinned-overlay-unbound when its branch is missing', async () => {
+    const f = gitFixture();
+    const replacement = f.add();
+    const result = await f.prepare();
+    // No borrowed pin: the refusal names the running row's content, never the old registration's evidence.
+    expectNoBorrowedPin(result);
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'pinned-overlay-unbound',
+      detail: { ref: REF, registrationId: replacement.registrationId, sha: f.adopted.head, pinnedBy: 'mechanism' } } });
+    expect(result.alerts.map(a => a.kind)).toContain('pinned-overlay-unbound');
+    expect(f.list()).toEqual([expect.objectContaining({ ref: REF, registrationId: replacement.registrationId })]);
+    expect(f.list()[0].tipSha).toBeUndefined();
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'pinned-overlay-unbound', lastGood: f.adopted.head });
+  });
+
+  it.each(['main-content', 'malformed-sha'])('T11 unbound running row: %s', async (kind) => {
+    const f = gitFixture();
+    f.add();
+    const sha = kind === 'main-content' ? f.adopted.mainSha : 'not-a-sha';
+    f.save({ ...f.adopted, applied: [{ ...f.adopted.applied[0], sha }] });
+    const result = await f.prepare();
+    expectNoBorrowedPin(result);
+    if (kind === 'main-content') {
+      // Running content main already has changes no mechanism: the replacement is skipped, never held.
+      expect(result.result?.reason).not.toBe('pinned-overlay-unbound');
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-fetch-unverifiable');
+    } else {
+      // Unreadable running evidence cannot prove the content harmless: fail closed.
+      expect(result).toMatchObject({ terminal: true, result: { reason: 'pinned-overlay-unbound',
+        detail: { sha: null, pinnedBy: 'unknown' } } });
+    }
+  });
+
   it.each(['already-adopted', 'moved'])('T10 adopt CAS: %s strips replaced ids and preserves matching evidence', async (branch) => {
     const f = gitFixture();
     const kept = overlays.addOverlay(f.root, { ref: 'lane/kept' }, { env: f.env }).find(o => o.ref === 'lane/kept');
