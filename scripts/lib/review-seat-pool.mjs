@@ -88,8 +88,11 @@ const readRev = (p, n) => { try { return readFileSync(join(p.state, `slot-${n}.r
 export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now = Date.now, keep = SEAT_POOL_KEEP, leaseMs = SEAT_LEASE_DEFAULT_MS } = {}) {
   const p = paths(poolDir);
   for (const d of [poolDir, p.slots, p.locks, p.state, p.views]) ownPrivateDir(d);
-  if (!existsSync(join(p.repo, 'HEAD'))) git(['init', '--quiet', '--bare', p.repo]);
+  // Validate before Git ever touches it: a planted `repo.git` link must never reach `git init`.
+  if (lstatOrNull(p.repo)) ownPrivateDir(p.repo);
+  else git(['init', '--quiet', '--bare', p.repo]);
   ownPrivateDir(p.repo);
+  if (!existsSync(join(p.repo, 'HEAD'))) throw new Error('seat pool store has no HEAD');
   if (git(['-C', p.repo, 'cat-file', '-e', `${rev}^{commit}`], { allowFail: true }).status !== 0) {
     git(['-C', p.repo, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, `+${rev}:refs/seat/${rev}`]);
   }
@@ -114,13 +117,26 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
     try {
       const reused = existsSync(join(dir, '.git')) && readRev(p, n) === rev;
       rmSync(join(p.state, `slot-${n}.rev`), { force: true }); // unknown while the tree is being brought to `rev`
-      if (existsSync(dir)) {
-        // Only ever reset a slot that is a real directory of ours registered in THIS pool's store, never a planted link.
+      if (lstatOrNull(dir)) {
+        // Only ever reset a slot that is a real directory of ours, registered in THIS pool's store through a real admin dir.
         ownPrivateDir(dir);
-        const link = readFileSync(join(dir, '.git'), 'utf8').trim().replace(/^gitdir: /, '');
-        if (realpathSync(link) !== realpathSync(join(p.repo, 'worktrees', basename(dir)))) throw new Error(`seat slot is not a worktree of this pool: ${dir}`);
-        git(['-C', dir, 'reset', '--quiet', '--hard', rev]);
+        const admin = join(p.repo, 'worktrees', basename(dir));
+        ownPrivateDir(join(p.repo, 'worktrees')); ownPrivateDir(admin);
+        const dotGit = lstatOrNull(join(dir, '.git'));
+        if (!dotGit?.isFile()) throw new Error(`seat slot is not a worktree of this pool: ${dir}`);
+        const forward = readFileSync(join(dir, '.git'), 'utf8').trim().replace(/^gitdir: /, '');
+        const reverse = readFileSync(join(admin, 'gitdir'), 'utf8').trim();
+        if (realpathSync(forward) !== realpathSync(admin) || realpathSync(reverse) !== realpathSync(join(dir, '.git'))
+          || readFileSync(join(admin, 'commondir'), 'utf8').trim() !== '../..') throw new Error(`seat slot is not registered in this pool: ${dir}`);
+        // A previous seat may have left sparse-checkout state or per-worktree config: reset to the plain full tree.
+        git(['-C', dir, 'sparse-checkout', 'disable'], { allowFail: true }); // restores the full tree and clears skip-worktree bits
+        rmSync(join(admin, 'config.worktree'), { force: true });
+        rmSync(join(admin, 'info'), { recursive: true, force: true });
+        git(['-C', dir, '-c', 'core.sparseCheckout=false', 'reset', '--quiet', '--hard', rev]);
+        git(['-C', dir, '-c', 'core.sparseCheckout=false', 'read-tree', '--reset', '-u', rev]); // also clears skip-worktree bits
         git(['-C', dir, 'clean', '--quiet', '-ffdx']); // drop anything a previous seat left, ignored files included
+        const tags = git(['-C', dir, 'ls-files', '-v']).stdout.split('\n').filter((l) => l && !l.startsWith('H '));
+        if (tags.length || git(['-C', dir, 'status', '--porcelain', '--untracked-files=all']).stdout.trim()) throw new Error(`seat slot is not exactly ${rev}`);
       } else {
         rmSync(dir, { recursive: true, force: true });
         git(['-C', p.repo, 'worktree', 'prune'], { allowFail: true });

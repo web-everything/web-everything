@@ -106,6 +106,27 @@ it('refuses a planted slot link: never resets a directory it did not create', ()
   expect(readdirSync(join(pool, 'locks'))).toEqual([]);
 });
 
+it('restores a slot a seat left sparse, and refuses a slot whose admin dir is redirected or a planted store', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  git(a.slotDir, 'sparse-checkout', 'set', '--no-cone', 'stable.txt'); // a seat narrowing the tree
+  expect(existsSync(join(a.slotDir, 'moves.txt'))).toBe(false);
+  a.release();
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+  expect(b.slotDir).toBe(a.slotDir);
+  expect(readFileSync(join(b.dir, 'moves.txt'), 'utf8')).toBe('one\n'); // whole tree again
+  b.release();
+  // redirect the slot's admin dir at the lane's own .git
+  const admin = join(pool, 'repo.git', 'worktrees', 'slot-1');
+  rmSync(admin, { recursive: true }); symlinkSync(join(lane, '.git'), admin);
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool })).toThrow();
+  expect(git(lane, 'rev-parse', 'HEAD')).toBe(rev2);
+  // a planted store link never reaches git init
+  const pool2 = join(pool, '..', 'pool2'); mkdirSync(pool2);
+  const target = join(pool, '..', 'victim'); mkdirSync(target); symlinkSync(target, join(pool2, 'repo.git'));
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool2 })).toThrow(/private directory/);
+  expect(readdirSync(target)).toEqual([]);
+});
+
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const stable = statSync(join(a.dir, 'stable.txt')).ino; a.release();
