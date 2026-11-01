@@ -85,6 +85,7 @@ describe('dedupe', () => {
   it('the needs-you note has one stable episode per PR as the count grows', () => {
     const n = (loops) => ({ kind: 'review-churn', prNumber: 7, loops, cap: 3, text: `x ${loops}` });
     expect(noteEpisodeKey(n(3))).toBe(noteEpisodeKey(n(4)));
+    expect(noteEpisodeKey(n(3))).toBe(noteEpisodeKey({ ...n(3), cap: 9 }));
   });
 });
 

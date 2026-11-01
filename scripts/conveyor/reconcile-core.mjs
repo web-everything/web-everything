@@ -1695,6 +1695,16 @@ function dispatchReviewRow({
       return;
     }
   }
+  // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
+  // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
+  // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
+  // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
+  const churnRaw = decideReviewChurn(pr);
+  const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
+  if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
+  // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
+  // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
+  if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
@@ -1707,16 +1717,6 @@ function dispatchReviewRow({
     });
     return;
   }
-  // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
-  // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
-  // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
-  // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
-  const churnRaw = decideReviewChurn(pr);
-  const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
-  if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
-  // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
-  // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
-  if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
   // count exceeds the cap: the last allowed fix is always owed its final review.
   const finalReview = attempts >= roundCap;
