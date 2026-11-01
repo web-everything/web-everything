@@ -3,7 +3,8 @@ import { cpus, loadavg } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
-import { allowedCommand } from '../readiness/forge-exec-run.mjs';
+import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
+import { stripGateOnlyOptions } from '../readiness/forge-gate-options.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
 
 function simpleShellWords(command) {
@@ -15,22 +16,46 @@ function simpleShellWords(command) {
 }
 const unquote = arg => arg.replaceAll("'", '');
 
+const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+// Keys that change neither the nested wrapper's admission (CI bypasses it) nor its routing. Each must
+// also pass Forge's env allowlist, so the remote run sees the same value.
+const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR']);
+const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*npx vitest(?=\s|$)/;
+
 function wrappedVitestCommand(command) {
   if (/[\r\n]/.test(command)) return null;
-  const match = /^npx vitest run[ \t]+(.+)$/.exec(command);
-  if (!match) return null;
-  const words = simpleShellWords(match[1]);
+  const words = simpleShellWords(command);
   if (!words) return null;
-  // The nested wrapper can fall back locally, so it must receive every original argument.
-  // Unsupported options (including timeouts and passWithNoTests) retain local admission;
-  // stripping them would change the local verdict after a successful remote preflight.
-  if (!allowedCommand(['npx', 'vitest', 'run', ...words.map(unquote)])) return null;
-  return `npm run test:unit -- ${words.join(' ')}`;
+  // Leading assignments run with the nested wrapper, so they apply locally and reach Forge only
+  // through its env allowlist. Any other key keeps the segment local.
+  let start = 0;
+  for (; start < words.length; start++) {
+    const assignment = ENV_ASSIGNMENT.exec(words[start]);
+    if (!assignment) break;
+    if (!SEGMENT_ENV_KEYS.includes(assignment[1]) || !allowedEnv({ [assignment[1]]: unquote(assignment[2]) })) return null;
+  }
+  if (words[start] !== 'npx' || words[start + 1] !== 'vitest' || words[start + 2] !== 'run') return null;
+  const args = words.slice(start + 3);
+  // The nested wrapper can fall back locally, so it receives every original argument. Only the
+  // Forge-dispatched remote argv drops the trailing gate-only options (stripGateOnlyOptions); the
+  // options themselves must be literal words, so a quoted spelling stays local.
+  const remoteArgs = stripGateOnlyOptions(args);
+  if (!remoteArgs || !args.length) return null;
+  if (!allowedCommand(['npx', 'vitest', 'run', ...remoteArgs.map(unquote)])) return null;
+  return [...words.slice(0, start), 'npm run test:unit --', ...args].join(' ');
+}
+
+// A gate built as `vitest run … && VAR=… vitest run …` is remote-eligible only when EVERY top-level
+// segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its own fallback.
+function wrappedVitestChain(command) {
+  const segments = command.split(' && ');
+  const wrapped = segments.map(wrappedVitestCommand);
+  return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
-  if (/^npx vitest(?=\s|$)/.test(command)) {
-    const wrapped = decision?.remote === true ? wrappedVitestCommand(command) : null;
+  if (command.split(' && ').every(segment => VITEST_SEGMENT.test(segment))) {
+    const wrapped = decision?.remote === true ? wrappedVitestChain(command) : null;
     return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
   }
   const words = simpleShellWords(command)?.map(unquote);
@@ -44,9 +69,10 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 }
 
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
-  // The nested wrapper owns local fallback; its local red is already the local verdict.
-  // Confirming it again could discard a real failure before isolated-retry safeguards run.
-  return plan?.takeLocalSlot === false && ranOn?.location !== 'local'
+  // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
+  // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
+  return plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
+    && ranOn.failureLocation === 'remote'
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }
@@ -89,7 +115,8 @@ export function readRemoteReport(path, read = readBoundedReport) {
     const reports = text.trim().split('\n').map(line => JSON.parse(line));
     if (!reports.length || reports.some(r => !['remote', 'local-fallback'].includes(r?.location)
       || !Number.isInteger(r.exitCode) || r.exitCode < 0 || r.exitCode > 254
-      || (r.location === 'remote' && typeof r.receiptId !== 'string')
+      // The executor also accepts receiptless completions. Receipts are optional metadata, but
+      // when supplied must remain valid; a missing receipt must not discard a sibling local red.
       || (r.receiptId !== undefined && (typeof r.receiptId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(r.receiptId))))) return [];
     return reports;
   } catch { return []; }
@@ -101,7 +128,17 @@ export function phaseRunLocation(reports, { remoteAttempt } = {}) {
   if (!reports.length) return { location: remoteAttempt === false ? 'local' : 'unknown' };
   const locations = new Set(reports.map(r => r.location === 'remote' ? 'remote' : 'local'));
   const receiptId = reports.find(r => r.location === 'remote' && r.receiptId)?.receiptId;
-  return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}) };
+  // A successful local segment in an && chain says nothing about a later remote failure.
+  // Even inconsistent reports must preserve a local red rather than let confirmation erase it.
+  const failureLocation = reports.some(r => r.location === 'local-fallback' && r.exitCode > 0) ? 'local'
+    : reports.some(r => r.location === 'remote' && r.exitCode > 0) ? 'remote' : null;
+  const last = reports.at(-1);
+  // An && chain stops at its first nonzero exit. Only a final local completion after a successful
+  // prefix can explain the overall local exit; an earlier local success cannot explain exit 124.
+  const localExitCode = last.location === 'local-fallback' && reports.slice(0, -1).every(r => r.exitCode === 0)
+    ? last.exitCode : undefined;
+  return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}),
+    ...(failureLocation ? { failureLocation } : {}), ...(localExitCode !== undefined ? { localExitCode } : {}) };
 }
 export function mergeRunLocation(a, b) {
   if (a === 'unknown' || b === 'unknown') return 'unknown';
@@ -114,8 +151,8 @@ export function overallRunLocation(phases) {
 export const REMOTE_TERMINATION_UNCONFIRMED = Object.freeze({ reason: 'remote-termination-unconfirmed',
   detail: 'verification infrastructure failure: remote termination unconfirmed (exit 124); confirm remote termination before retrying; no test verdict.' });
 // Exit 124 means "remote termination unconfirmed" only for an attempt dispatched to the remote wrapper whose report
-// does not prove it finished locally. A local attempt (never dispatched, or a local confirmation) exiting 124 is an
-// ordinary local exit code.
+// does not prove that the failing segment finished locally with 124. A local attempt (never dispatched,
+// or a local confirmation) exiting 124 is an ordinary local exit code.
 export function remoteInfrastructureFailure({ exitCode, remoteAttempt, ranOn } = {}) {
-  return exitCode === 124 && remoteAttempt === true && ranOn?.location !== 'local' ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
+  return exitCode === 124 && remoteAttempt === true && ranOn?.localExitCode !== 124 ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
 }

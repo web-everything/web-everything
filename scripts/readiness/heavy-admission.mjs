@@ -172,6 +172,7 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
+import { stripGateOnlyOptions } from './forge-gate-options.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -2447,7 +2448,10 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
         const integration=requested[2]==='--config'&&requested[3]==='vitest.integration.config.ts';
         const coverage=requested[2]==='--coverage';
         const script=integration?'test:integration:vitest':coverage?'test:coverage':'test:unit';
-        const rest=requested.slice(integration?4:coverage?3:2);
+        let rest=requested.slice(integration?4:coverage?3:2);
+        // Only verify-lane's Forge handoff, which confirms any remote red locally, sends the stricter
+        // remote form without the trailing gate-only options. Local fallback below keeps `command` intact.
+        if(forgeGate&&script==='test:unit') rest=stripGateOnlyOptions(rest)??rest;
         remoteArgv=['npm','run',script,...(rest.length?['--',...rest]:[])];
       }
       const result = await runWithRemoteDecision({
