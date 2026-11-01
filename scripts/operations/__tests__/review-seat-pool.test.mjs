@@ -1,6 +1,6 @@
 import { it, expect, afterEach, beforeEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -151,6 +151,18 @@ it('rewrites a poisoned store config, and a slot with a live cwd inside it is ne
   expect(slotBusy(b.slotDir, () => ({ status: 0, stdout: `p1\nn${realpathSync(b.slotDir)}/sub\n` }))).toBe(true);
   expect(slotBusy(b.slotDir, () => ({ status: 0, stdout: 'p1\nn/elsewhere\n' }))).toBe(false);
   expect(slotBusy(b.slotDir, () => ({ status: 2, stdout: '' }))).toBe(true); // unknown counts as busy
+});
+
+it('refuses a store whose objects are redirected or borrowed, and never fetches into the lane', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const objects = join(pool, 'repo.git', 'objects');
+  mkdirSync(join(objects, 'info'), { recursive: true });
+  writeFileSync(join(objects, 'info', 'alternates'), `${join(lane, '.git', 'objects')}\n`);
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow(/borrows/);
+  rmSync(join(objects, 'info', 'alternates'));
+  const moved = join(pool, 'objects.real'); renameSync(objects, moved); symlinkSync(join(lane, '.git', 'objects'), objects);
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow(/private directory/);
+  expect(readdirSync(join(lane, '.git', 'objects')).length).toBeGreaterThan(0);
 });
 
 it('moves a warm slot to a new commit rewriting only the changed file', () => {

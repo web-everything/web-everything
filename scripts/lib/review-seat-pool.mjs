@@ -113,6 +113,9 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   const cfgTmp = join(p.repo, `config.${process.pid}.${randomUUID()}.tmp`); // rename, never write through a planted link
   writeFileSync(cfgTmp, STORE_CONFIG, { flag: 'wx' });
   renameSync(cfgTmp, join(p.repo, 'config')); // no leftover filter drivers, hooks path or worktree-config extension
+  // Object storage must be this pool's own: no linked objects dir, no alternates borrowing a lane's objects.
+  ownPrivateDir(join(p.repo, 'objects'));
+  if (lstatOrNull(join(p.repo, 'objects', 'info', 'alternates'))) throw new Error('seat pool store borrows another repository\'s objects');
   // Git must resolve exactly this directory as the bare store, not follow a pointer inside it to another repository.
   if (realpathSync(git(['-C', p.repo, 'rev-parse', '--absolute-git-dir']).stdout.trim()) !== realpathSync(p.repo)
     || git(['-C', p.repo, 'rev-parse', '--is-bare-repository']).stdout.trim() !== 'true') throw new Error('seat pool store is not its own bare repository');
@@ -194,7 +197,7 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
     slots.forEach(({ n, mtime }, i) => {
       if (i < keep && now() - mtime < maxIdleMs) return;
       const lockDir = join(p.locks, `slot-${n}`);
-      if (!tryLock(lockDir, now)) return;
+      if (!tryLock(lockDir, now, undefined, undefined, () => slotBusy(join(p.slots, `slot-${n}`)))) return;
       try {
         git(['-C', p.repo, 'worktree', 'remove', '--force', join(p.slots, `slot-${n}`)], { allowFail: true });
         rmSync(join(p.slots, `slot-${n}`), { recursive: true, force: true });
