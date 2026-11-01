@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { planLaneCardDirt, salvageLaneCards, removeFiledCards, isCardFilePath } from '../lane-card-salvage.mjs';
 import { refreshSalvageIndex } from '../salvage-index.mjs';
+import ts from 'typescript';
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
@@ -56,14 +57,42 @@ describe('planLaneCardDirt — PURE', () => {
 });
 
 describe('salvageLaneCards — real git', () => {
+  it.each([salvageLaneCards, removeFiledCards])('requires an explicit ownership predicate before any git IO (%s)', cleanup => {
+    let calls = 0;
+    expect(() => cleanup({ dir: lane, lane: 7, salvageRoot, gitRun: () => { calls++; return ''; } })).toThrow('requires isLeaseCurrent');
+    expect(calls).toBe(0);
+    expect(existsSync(salvageRoot)).toBe(false);
+  });
+
+  it('production cleanup call sites explicitly pass isLeaseCurrent', () => {
+    const files = ['../../operations/land-prevention-card.mjs', '../../lane-pool.mjs'];
+    const names = new Set(['removeCards', 'salvageCards', 'removeFiledCards', 'salvageLaneCards']);
+    let calls = 0;
+    for (const rel of files) {
+      const file = resolve(dirname(fileURLToPath(import.meta.url)), rel);
+      const ast = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      const visit = node => {
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && names.has(node.expression.text)) {
+          calls++;
+          const options = node.arguments[0];
+          expect(ts.isObjectLiteralExpression(options), `${rel}: explicit cleanup options`).toBe(true);
+          expect(options.properties.some(p => p.name?.getText(ast) === 'isLeaseCurrent'), `${rel}: ${node.expression.text} must state ownership`).toBe(true);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(ast);
+    }
+    expect(calls).toBe(3);
+  });
+
   it('an unreadable status is unknown, rather than a known card-save failure', () => {
-    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, gitRun: () => { throw new Error('status unavailable'); } });
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true, gitRun: () => { throw new Error('status unavailable'); } });
     expect(result).toEqual({ status: 'unknown', reason: 'status read failed: status unavailable', removed: [] });
     expect(existsSync(salvageRoot)).toBe(false);
   });
   it('saves every card byte for byte, indexes it, then leaves the lane clean', () => {
     leaveCards();
-    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, now: new Date('2026-11-01T07:25:00Z') });
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true, now: new Date('2026-11-01T07:25:00Z') });
     expect(result.status).toBe('salvaged');
     expect(git(['status', '--porcelain', '--untracked-files=all'], lane)).toBe('');
     expect(readFileSync(join(result.outDir, 'backlog/xfmkody-prevention-guard.md'), 'utf8')).toBe('card body\n');
@@ -80,7 +109,7 @@ describe('salvageLaneCards — real git', () => {
     leaveCards();
     writeFileSync(join(lane, 'backlog', '100-old.md'), 'edited\n');
     const before = git(['status', '--porcelain', '--untracked-files=all'], lane);
-    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot }).status).toBe('mixed');
+    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true }).status).toBe('mixed');
     expect(git(['status', '--porcelain', '--untracked-files=all'], lane)).toBe(before);
     expect(existsSync(salvageRoot)).toBe(false);
   });
@@ -88,7 +117,7 @@ describe('salvageLaneCards — real git', () => {
     leaveCards();
     writeFileSync(salvageRoot, 'not a directory');
     const before = git(['status', '--porcelain', '--untracked-files=all'], lane);
-    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot });
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true });
     expect(result.status).toBe('failed');
     expect(result.removed).toEqual([]);
     expect(git(['status', '--porcelain', '--untracked-files=all'], lane)).toBe(before);
@@ -100,7 +129,7 @@ describe('salvageLaneCards — real git', () => {
       if (args[0] === 'status' && ++statusReads === 2) writeFileSync(join(lane, 'late-edit.txt'), 'new work\n');
       return git(args, dir) + (args[0] === 'status' ? '\n' : '');
     };
-    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, gitRun });
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true, gitRun });
     expect(result.status).toBe('failed');
     expect(result.removed).toEqual([]);
     expect(existsSync(join(lane, 'backlog', 'xfmkody-prevention-guard.md'))).toBe(true);
@@ -108,7 +137,7 @@ describe('salvageLaneCards — real git', () => {
   });
   it('a card whose bytes differ from what was handed on is never deleted', () => {
     leaveCards();
-    const removed = removeFiledCards({ dir: lane, salvageRoot, expected: new Map([['backlog/xfmkody-prevention-guard.md', 'older text\n']]) });
+    const removed = removeFiledCards({ dir: lane, salvageRoot, isLeaseCurrent: () => true, expected: new Map([['backlog/xfmkody-prevention-guard.md', 'older text\n']]) });
     expect(removed).toEqual([]);
     expect(readFileSync(join(lane, 'backlog', 'xfmkody-prevention-guard.md'), 'utf8')).toBe('card body\n');
   });
@@ -117,7 +146,7 @@ describe('salvageLaneCards — real git', () => {
     writeFileSync(join(lane, rel), 'before\n');
     const before = git(['status', '--porcelain', '--untracked-files=all'], lane);
     let reads = 0;
-    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, gitRun: (dir, args) => {
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true, gitRun: (dir, args) => {
       if (args[0] === 'status' && ++reads === 2) writeFileSync(join(lane, rel), 'after\n');
       return git(args, dir);
     } });
@@ -131,7 +160,7 @@ describe('salvageLaneCards — real git', () => {
   it('a status-read failure after saving known cards still fails closed', () => {
     leaveCards();
     let reads = 0;
-    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, gitRun: (dir, args) => {
+    const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true, gitRun: (dir, args) => {
       if (args[0] === 'status' && ++reads === 2) throw new Error('status unavailable');
       return git(args, dir);
     } });
@@ -200,6 +229,7 @@ describe('salvageLaneCards — real git', () => {
       syncBuiltinESMExports();
       const { salvageLaneCards, removeFiledCards } = await import(${JSON.stringify(moduleUrl)});
       const o = ${JSON.stringify({ dir: lane, lane: 7, salvageRoot })};
+      o.isLeaseCurrent = () => true;
       const result = ${JSON.stringify(mode)} === 'salvage' ? salvageLaneCards(o)
         : removeFiledCards({ ...o, expected: new Map([['backlog/raised-by/5360/5771-abc.md', 'raise body\\n']]) });
       console.log(JSON.stringify({ result, attempts }));
@@ -224,11 +254,11 @@ describe('salvageLaneCards — real git', () => {
     try {
       let retiredDir;
       if (mode === 'salvage') {
-        const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, now: new Date('2026-11-01T07:25:00Z') });
+        const result = salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true, now: new Date('2026-11-01T07:25:00Z') });
         expect(result.status).toBe('salvaged');
         retiredDir = join(result.outDir, 'retired');
       } else {
-        expect(removeFiledCards({ dir: lane, salvageRoot, expected: new Map([[rel, 'original\n']]) })).toEqual([rel]);
+        expect(removeFiledCards({ dir: lane, salvageRoot, isLeaseCurrent: () => true, expected: new Map([[rel, 'original\n']]) })).toEqual([rel]);
         retiredDir = join(salvageRoot, 'web-everything', 'retired-cards');
       }
       const [name] = readdirSync(retiredDir);
@@ -247,19 +277,51 @@ describe('salvageLaneCards — real git', () => {
   it('a staged-then-edited card (AM) is not treated as a card: the lane is left alone', () => {
     leaveCards();
     writeFileSync(join(lane, 'backlog', 'raised-by', '5360', '5771-abc.md'), 'edited after staging\n');
-    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot }).status).toBe('mixed');
+    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true }).status).toBe('mixed');
   });
   it('a clean lane is a no-op', () => {
-    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot }).status).toBe('none');
+    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent: () => true }).status).toBe('none');
   });
 });
 
 describe('removeFiledCards', () => {
+  it.each(['before-retirement', 'after-retirement'])('lost ownership %s preserves the staged index', boundary => {
+    const rel = 'backlog/xlease3-filed.md';
+    writeFileSync(join(lane, rel), 'card\n');
+    git(['add', '--', rel], lane);
+    const beforeIndex = readFileSync(join(lane, '.git', 'index'));
+    const retiredDir = join(salvageRoot, 'web-everything', 'retired-cards');
+    const removed = removeFiledCards({ dir: lane, salvageRoot, expected: new Map([[rel, 'card\n']]),
+      isLeaseCurrent: () => boundary === 'before-retirement' ? !existsSync(retiredDir) : existsSync(join(lane, rel)),
+    });
+    expect(readFileSync(join(lane, '.git', 'index'))).toEqual(beforeIndex);
+    if (boundary === 'before-retirement') {
+      expect(removed).toEqual([]);
+      expect(readFileSync(join(lane, rel), 'utf8')).toBe('card\n');
+    } else {
+      expect(removed).toEqual([rel]);
+      const [name] = readdirSync(retiredDir);
+      expect(readFileSync(join(retiredDir, name), 'utf8')).toBe('card\n');
+    }
+  });
+
+  it.each([() => false, () => { throw new Error('lease unreadable'); }])('unproven ownership leaves every card and index untouched', isLeaseCurrent => {
+    leaveCards();
+    const beforeStatus = git(['status', '--porcelain', '--untracked-files=all'], lane);
+    const beforeIndex = readFileSync(join(lane, '.git', 'index'));
+    const expected = new Map([['backlog/xfmkody-prevention-guard.md', 'card body\n'], ['backlog/raised-by/5360/5771-abc.md', 'raise body\n']]);
+    expect(removeFiledCards({ dir: lane, expected, salvageRoot, isLeaseCurrent })).toEqual([]);
+    expect(salvageLaneCards({ dir: lane, lane: 7, salvageRoot, isLeaseCurrent }).status).toBe('failed');
+    expect(readFileSync(join(lane, '.git', 'index'))).toEqual(beforeIndex);
+    expect(git(['status', '--porcelain', '--untracked-files=all'], lane)).toBe(beforeStatus);
+    expect(existsSync(salvageRoot)).toBe(false);
+  });
+
   it('removes only the named, still-uncommitted card files', () => {
     leaveCards();
     writeFileSync(join(lane, 'backlog', 'xother1-keep.md'), 'not mine\n');
     const expected = new Map([['backlog/xfmkody-prevention-guard.md', 'card body\n'], ['backlog/raised-by/5360/5771-abc.md', 'raise body\n'], ['backlog/100-old.md', 'old\n']]);
-    const removed = removeFiledCards({ dir: lane, expected, salvageRoot });
+    const removed = removeFiledCards({ dir: lane, expected, salvageRoot, isLeaseCurrent: () => true });
     expect(removed.sort()).toEqual(['backlog/raised-by/5360/5771-abc.md', 'backlog/xfmkody-prevention-guard.md']);
     expect(git(['status', '--porcelain', '--untracked-files=all'], lane)).toBe('?? backlog/xother1-keep.md');
     expect(readFileSync(join(lane, 'backlog', '100-old.md'), 'utf8')).toBe('old\n');

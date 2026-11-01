@@ -78,17 +78,21 @@ function pruneEmptyParents(dir, rel) {
 
 /**
  * Save the lane's card files durably, prove the save, then remove them from the lane.
- * Never throws: returns `unknown` (initial status unreadable; untouched, no cards identified), `none` (no card
- * dirt), `mixed` (other dirt too; untouched), `failed` (known cards could not be saved or cleaning did not
+ * Requires an explicit ownership predicate (missing predicates throw before IO). Otherwise returns `unknown`
+ * (initial status unreadable; untouched, no cards identified), `none` (no card dirt), `mixed` (other dirt too;
+ * untouched), `failed` (ownership unproven, known cards could not be saved or cleaning did not
  * complete — the saved copies stay) or `salvaged`. An unreadable re-check after identifying cards is `failed`.
  * @param {{dir: string, lane: (number|string), pool?: string, reason?: string, salvageRoot?: string, now?: Date,
- *   gitRun?: (dir: string, args: string[]) => string, isLeaseCurrent?: () => boolean}} o
+ *   gitRun?: (dir: string, args: string[]) => string, isLeaseCurrent: () => boolean}} o
  */
 export function salvageLaneCards({
   dir, lane, pool = 'web-everything', reason = 'card files left in a lane at release', salvageRoot = resolveSalvageRoot(),
-  now = new Date(), gitRun = git, isLeaseCurrent = () => true,
+  now = new Date(), gitRun = git, isLeaseCurrent,
 }) {
+  if (typeof isLeaseCurrent !== 'function') throw new TypeError('salvageLaneCards requires isLeaseCurrent');
   let plan; let porcelain;
+  try { if (!isLeaseCurrent()) return { status: 'failed', reason: 'lease changed before card salvage; lane untouched', removed: [] }; }
+  catch { return { status: 'failed', reason: 'lease ownership unreadable; lane untouched', removed: [] }; }
   try { porcelain = gitRun(dir, ['status', '--porcelain', '--untracked-files=all']); plan = planLaneCardDirt(porcelain); }
   catch (e) { return { status: 'unknown', reason: `status read failed: ${String(e?.message || e).split('\n')[0]}`, removed: [] }; }
   if (!plan.cards.length) return { status: 'none', removed: [] };
@@ -131,11 +135,11 @@ export function salvageLaneCards({
       removed.push(rel);
     }
     checkLease();
-    unstage(dir, plan.cards, removed, gitRun);
+    unstage(dir, plan.cards, removed, gitRun, isLeaseCurrent);
     const left = planLaneCardDirt(gitRun(dir, ['status', '--porcelain', '--untracked-files=all'])).cards;
     if (left.length) throw new Error(`still present: ${left.map(({ path }) => path).join(', ')}`);
   } catch (e) {
-    try { if (isLeaseCurrent()) unstage(dir, plan.cards, removed, gitRun); } catch { /* a replacement holder owns its index; saved bytes stay */ }
+    try { if (isLeaseCurrent()) unstage(dir, plan.cards, removed, gitRun, isLeaseCurrent); } catch { /* a replacement holder owns its index; saved bytes stay */ }
     return { status: 'failed', reason: `clean after salvage incomplete (copies kept in ${outDir}): ${String(e?.message || e).split('\n')[0]}`, outDir, removed };
   }
   return { status: 'salvaged', outDir, removed };
@@ -147,7 +151,7 @@ export function salvageLaneCards({
  * the lane cannot reach it; never expired by `salvage-index.mjs`), so even a write that races the compare through an
  * already-open descriptor lands in a kept inode. A rename across filesystems fails (EXDEV) and moves nothing.
  */
-function retireIfUnchanged(dir, rel, expected, trashDir, isLeaseCurrent = () => true) {
+function retireIfUnchanged(dir, rel, expected, trashDir, isLeaseCurrent) {
   const src = join(dir, rel);
   if (!readFileSync(src).equals(expected)) return false;
   mkdirSync(trashDir, { recursive: true });
@@ -158,27 +162,35 @@ function retireIfUnchanged(dir, rel, expected, trashDir, isLeaseCurrent = () => 
 }
 
 /** Drop the index entries of the staged cards whose bytes were deleted (their saved copy holds the same bytes). */
-function unstage(dir, cards, removed, gitRun) {
+function unstage(dir, cards, removed, gitRun, isLeaseCurrent) {
   const done = new Set(removed);
   const staged = cards.filter(({ status, path }) => status !== '??' && done.has(path) && !existsSync(join(dir, path)));
-  if (staged.length) gitRun(dir, ['rm', '--cached', '--quiet', '--ignore-unmatch', '--', ...staged.map(({ path }) => `:(literal)${path}`)]);
+  if (staged.length) {
+    if (!isLeaseCurrent()) throw new Error('lease changed before unstaging cards; index untouched');
+    gitRun(dir, ['rm', '--cached', '--quiet', '--ignore-unmatch', '--', ...staged.map(({ path }) => `:(literal)${path}`)]);
+  }
 }
 
 /**
  * Remove ONE filing's own card files from a lane after the cards are durable elsewhere (pushed in a PR, admitted
  * to a batch, or spooled for the next batch window). `expected` maps each path to the exact text the filer handed
- * on; a file whose bytes differ now is left for the salvage pass. Never throws; returns the removed paths.
+ * on; a file whose bytes differ now is left for the salvage pass. Requires an explicit ownership predicate
+ * (missing predicates throw before IO); otherwise returns the removed paths without throwing.
  */
-export function removeFiledCards({ dir, expected, pool = 'web-everything', salvageRoot = resolveSalvageRoot(), gitRun = git }) {
+export function removeFiledCards({ dir, expected, pool = 'web-everything', salvageRoot = resolveSalvageRoot(), gitRun = git, isLeaseCurrent }) {
+  if (typeof isLeaseCurrent !== 'function') throw new TypeError('removeFiledCards requires isLeaseCurrent');
   const wanted = new Map([...(expected ?? new Map())].filter(([path, text]) => isCardFilePath(path) && typeof text === 'string'));
   if (!wanted.size) return [];
   let plan;
-  try { plan = planLaneCardDirt(gitRun(dir, ['status', '--porcelain', '--untracked-files=all'])); } catch { return []; }
+  try {
+    if (!isLeaseCurrent()) return [];
+    plan = planLaneCardDirt(gitRun(dir, ['status', '--porcelain', '--untracked-files=all']));
+  } catch { return []; }
   const mine = plan.cards.filter(({ path }) => wanted.has(path));
   const removed = [];
   try {
-    for (const { path } of mine) if (retireIfUnchanged(dir, path, Buffer.from(wanted.get(path), 'utf8'), join(salvageRoot, pool, 'retired-cards'))) removed.push(path);
+    for (const { path } of mine) if (retireIfUnchanged(dir, path, Buffer.from(wanted.get(path), 'utf8'), join(salvageRoot, pool, 'retired-cards'), isLeaseCurrent)) removed.push(path);
   } catch { /* the salvage pass that follows saves whatever is left */ }
-  try { unstage(dir, mine, removed, gitRun); } catch { /* ditto */ }
+  try { unstage(dir, mine, removed, gitRun, isLeaseCurrent); } catch { /* ditto */ }
   return removed;
 }

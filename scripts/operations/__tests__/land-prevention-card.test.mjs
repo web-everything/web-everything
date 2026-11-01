@@ -134,7 +134,8 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     expect(calls[5].args).toContain('--requireVerified=true');
     expect(calls[5].args.some((a) => a.startsWith('--ref=lane/9001-'))).toBe(true);
     // release — the pool slot is freed once the content is pushed, by lane NUMBER.
-    expect(calls[7].args).toEqual(expect.arrayContaining(['release', '--lane=7', '--session=prevention-card-test']));
+    expect(calls[7].args).toEqual(expect.arrayContaining(['release', '--lane=7', '--session=h']));
+    expect(calls[7].opts.env.CLAUDE_CODE_SESSION_ID).toBe('');
     expect(written.some((w) => w.p.endsWith('commit-msg.txt') && w.c.includes('Co-Authored-By'))).toBe(true);
     expect(written.some((w) => w.p.endsWith('pr-body.md') && w.c.includes(INPUT.digest))).toBe(true);
   });
@@ -548,6 +549,7 @@ describe('landPreventionCard — the lane is clean before release, on every exit
     writeFileSync(join(lane, 'backlog', '100-old.md'), 'old\n');
     gitIn(lane, ['add', '.']);
     gitIn(lane, ['commit', '--quiet', '-m', 'seed']);
+    writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({ session: INPUT.session, holder: 'h', acquiredAt: '2026-11-01T07:25:00Z' }));
     return { root, lane, salvageRoot: join(root, 'salvage') };
   }
   const acquire = (lane) => JSON.stringify({ lane: 7, path: lane, session: 'prevention-card-test', holder: 'h' });
@@ -563,6 +565,67 @@ describe('landPreventionCard — the lane is clean before release, on every exit
     write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {},
     dedupe: () => null, removeCards: (o) => removeFiledCards({ ...o, salvageRoot }),
     salvageCards: (o) => salvageLaneCards({ ...o, salvageRoot }),
+  });
+
+  it.each(['batched', 'failed'])('filer finally preserves replacement holder cards and index (%s)', async outcome => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      const other = 'backlog/xnew123-replacement.md';
+      let beforeIndex;
+      let beforeStatus;
+      const replace = () => {
+        // A new holder may reacquire under the same session name.
+        writeFileSync(join(lane, '.git', '.lane-lease'), JSON.stringify({ session: INPUT.session, holder: 'new-holder', acquiredAt: '2026-11-01T12:25:00Z' }));
+        writeFileSync(join(lane, other), 'replacement card\n');
+        gitIn(lane, ['add', '--', REL]);
+        beforeStatus = gitIn(lane, ['status', '--porcelain', '--untracked-files=all']);
+        beforeIndex = readFileSync(join(lane, '.git', 'index'));
+      };
+      const { exec, calls } = scriptedExec([acquire(lane), () => {
+        writeFileSync(join(lane, REL), 'card\n');
+        if (outcome === 'failed') { replace(); throw new Error('file-item timed out after lease replacement'); }
+        return JSON.stringify({ verdict: { num: null, rel: REL } });
+      }, 'released']);
+      await landPreventionCard(INPUT, {
+        exec, ...deps(salvageRoot), batch: async () => {
+          replace();
+          return { batched: true, batchRef: 'lane/card-batch-prevention-1' };
+        },
+      });
+      expect(existsSync(join(lane, REL))).toBe(true);
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe('card\n');
+      expect(readFileSync(join(lane, other), 'utf8')).toBe('replacement card\n');
+      expect(readFileSync(join(lane, '.git', 'index'))).toEqual(beforeIndex);
+      expect(gitIn(lane, ['status', '--porcelain', '--untracked-files=all'])).toBe(beforeStatus);
+      expect(existsSync(salvageRoot)).toBe(false);
+      expect(calls.at(-1).args).toContain('--session=h');
+      expect(calls.at(-1).opts.env.CLAUDE_CODE_SESSION_ID).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['missing', 'malformed', 'unreadable', 'missing-holder'])('filer cleanup preserves cards and index when lease evidence is %s', async state => {
+    const { root, lane, salvageRoot } = realLane();
+    try {
+      let beforeIndex;
+      const { exec, calls } = scriptedExec([
+        state === 'missing-holder' ? JSON.stringify({ lane: 7, path: lane, session: INPUT.session }) : acquire(lane),
+        () => {
+          writeFileSync(join(lane, REL), 'card\n');
+          gitIn(lane, ['add', '--', REL]);
+          beforeIndex = readFileSync(join(lane, '.git', 'index'));
+          const marker = join(lane, '.git', '.lane-lease');
+          if (state === 'missing' || state === 'unreadable') rmSync(marker);
+          if (state === 'malformed') writeFileSync(marker, '{bad json');
+          if (state === 'unreadable') mkdirSync(marker);
+          throw new Error('file-item failed');
+        }, 'released',
+      ]);
+      await landPreventionCard(INPUT, { exec, ...deps(salvageRoot) });
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe('card\n');
+      expect(readFileSync(join(lane, '.git', 'index'))).toEqual(beforeIndex);
+      expect(existsSync(salvageRoot)).toBe(false);
+      if (state === 'missing-holder') expect(calls.some(call => call.args.includes('release'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('forced error: file-item writes the card then times out — the card is saved and the lane is clean at release', async () => {
@@ -1052,7 +1115,7 @@ describe('prevention batch landing', () => {
     const rel = 'backlog/x123456-pending.md';
     writeFileSync(join(dir, 'x123456.json'), JSON.stringify({ cardId: 'x123456', rel, content: 'pending bytes', idemKey: 'prevention:x123456', source: { repo: 'web-everything/web-everything' } }));
     try {
-      const { exec } = scriptedExec([JSON.stringify({ lane: 7, path: lane }), () => '', FILE_ITEM_OK, 'released']);
+      const { exec } = scriptedExec([JSON.stringify({ lane: 7, path: lane, holder: 'h' }), () => '', FILE_ITEM_OK, 'released']);
       const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }));
       const write = vi.fn();
       const result = await realLandPreventionCard(INPUT, { ...deps, exec, batch, write, pendingDir: dir, writeFile: writeFileSync });
@@ -1071,7 +1134,7 @@ describe('prevention batch landing', () => {
     writeFileSync(spool, JSON.stringify({ cardId: 'x123456', rel, content: 'pending bytes', idemKey: 'prevention:x123456', source: {} }));
     const batch = vi.fn(async () => ({ batched: false, retryable: true, reason: 'lease-held' }));
     const probe = state === 'lookup-error' ? new Error('missing origin/main') : () => state === 'landed' ? '100644 blob abc card' : '';
-    const { exec, calls } = scriptedExec([JSON.stringify({ lane: 7, path: lane }), probe, 'released']);
+    const { exec, calls } = scriptedExec([JSON.stringify({ lane: 7, path: lane, holder: 'h' }), probe, 'released']);
     try {
       const result = await runLandPreventionCardCli(['--drain-pending'], {
         exec, pendingDir: dir, batch, write: () => {}, writeErr: () => {},

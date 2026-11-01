@@ -9,7 +9,9 @@
  *
  * Scenario: the REAL filer against a scratch pool through the REAL `lane-pool.mjs` CLI. `file-item` writes the card
  * and then times out (the forced error path). Also releases a clean lane whose status read fails: unknown dirt
- * must not become a known card-save failure that strands its lease. GREEN = clean, card saved, unknown released.
+ * must not become a known card-save failure that strands its lease. A replaced lease during filing must keep
+ * the replacement holder's untracked cards, staged index and lease, including a same-session reacquisition.
+ * GREEN = clean, card saved, unknown released, replacement holder untouched.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -65,6 +67,62 @@ export default {
       if (left) violations.push({ invariant: 'released-lane-clean', detail: left });
       const index = join(base, 'salvage', 'index.jsonl');
       if (!left && !(existsSync(index) && readFileSync(index, 'utf8').includes(CARD))) violations.push({ invariant: 'card-saved', detail: 'card removed without a salvage record' });
+      for (const outcome of ['batched', 'failed']) {
+        let replacementLane;
+        let replacementNumber;
+        let replacementLease;
+        let indexBefore;
+        let statusBefore;
+        const otherCard = 'backlog/xr310cd-replacement.md';
+        const session = `soak-filer-replaced-${outcome}`;
+        const replace = () => {
+          // Reacquisition may use the same session, so only the minted holder proves ownership.
+          const marker = join(replacementLane, '.git', '.lane-lease');
+          replacementLease = JSON.stringify({ ...JSON.parse(readFileSync(marker, 'utf8')), holder: `${session}-replacement` });
+          writeFileSync(marker, replacementLease);
+          writeFileSync(join(replacementLane, otherCard), 'new holder card\n');
+          git(['add', '--', CARD], replacementLane);
+          statusBefore = git(['status', '--porcelain', '--untracked-files=all'], replacementLane);
+          indexBefore = readFileSync(join(replacementLane, '.git', 'index'));
+        };
+        const replacementExec = (cmd, args, opts) => {
+          if (cmd === 'node' && /lane-pool\.mjs$/.test(args[0])) {
+            // Exercise the filer's release environment too: no ambient ownerSession fallback.
+            const out = execRead('node', [join(ROOT, 'scripts/lane-pool.mjs'),
+              ...args.slice(1), ...(args[1] === 'acquire' ? ['--no-reset'] : []), ...pool],
+            { env: { ...env, CLAUDE_CODE_SESSION_ID: opts?.env?.CLAUDE_CODE_SESSION_ID ?? '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+            if (args[1] === 'acquire') {
+              const acquired = JSON.parse(out);
+              replacementLane = acquired.path;
+              replacementNumber = acquired.lane;
+            }
+            return out;
+          }
+          if (cmd === 'node' && args.includes('file-item')) {
+            writeFileSync(join(replacementLane, CARD), 'filer card\n');
+            if (outcome === 'failed') { replace(); throw new Error('forced failure after lease replacement'); }
+            return JSON.stringify({ verdict: { rel: CARD } });
+          }
+          throw new Error(`unexpected exec ${cmd} ${args.join(' ')}`);
+        };
+        await landPreventionCard({ title: 't', kind: 'story', size: '1', digest: '1. x', scope: 'we:a.mjs', parent: '', queue: 'false', session },
+          { exec: replacementExec, write: () => {}, dedupe: () => null, pendingDir: join(base, 'pending'),
+            batch: async () => { replace(); return { batched: true, batchRef: 'lane/soak-card-batch' }; } });
+        if (!existsSync(join(replacementLane, CARD)) || !existsSync(join(replacementLane, otherCard))
+          || readFileSync(join(replacementLane, CARD), 'utf8') !== 'filer card\n'
+          || readFileSync(join(replacementLane, otherCard), 'utf8') !== 'new holder card\n'
+          || !readFileSync(join(replacementLane, '.git', 'index')).equals(indexBefore)
+          || git(['status', '--porcelain', '--untracked-files=all'], replacementLane) !== statusBefore
+          || !existsSync(join(replacementLane, '.git', '.lane-lease'))
+          || readFileSync(join(replacementLane, '.git', '.lane-lease'), 'utf8') !== replacementLease) {
+          violations.push({ invariant: 'filer-finally-ownership', detail: `${outcome}: replacement holder cards, index or lease changed` });
+        }
+        // Retire only this fixture's replacement work and lease before the next scratch-pool case.
+        git(['rm', '--cached', '--quiet', '--ignore-unmatch', '--', CARD], replacementLane);
+        rmSync(join(replacementLane, CARD), { force: true });
+        rmSync(join(replacementLane, otherCard), { force: true });
+        cli(['release', `--lane=${replacementNumber}`, `--session=${session}-replacement`]);
+      }
       const unknown = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-unknown', '--json']));
       const hook = join(base, 'unreadable-status.mjs');
       writeFileSync(hook, `import cp from 'node:child_process';
