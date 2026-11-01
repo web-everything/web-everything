@@ -7,7 +7,7 @@ import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { allowedCommand, allowedEnv, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
+import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
@@ -55,7 +55,8 @@ export function filterEnv(env = {}) {
   // A dropped scan list would widen the remote scan; refuse it so the run stays local instead.
   if (Object.hasOwn(env, 'VERIFY_SCAN_FILES') && !allowedEnv({VERIFY_SCAN_FILES:env.VERIFY_SCAN_FILES}))
     throw Object.assign(new Error('Invalid VERIFY_SCAN_FILES: use local fallback'), {code:'invalid-scan-files'});
-  return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value})));
+  return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value}))
+    .map(([key,value]) => [key,key === 'VERIFY_SCAN_FILES' ? normalizeScanFilesValue(value) : value]));
 }
 
 // Project only verified report bytes; the staged manifest is rehashed below.

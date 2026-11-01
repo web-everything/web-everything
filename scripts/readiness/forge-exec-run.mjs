@@ -119,14 +119,21 @@ const SCAN_FILES_MAX = 65536;
 const scanPath = path => typeof path === 'string' && path.length > 0 && path.length <= 4096
   && /^[A-Za-z0-9_@+.][A-Za-z0-9_@+.\/-]*$/.test(path) && !path.includes('..')
   && path.split('/').every(part => part !== '' && part !== '.' && part !== '..');
-export function scanFilesValue(value) {
-  if (typeof value !== 'string' || value.length > SCAN_FILES_MAX) return false;
+// Scanners consume JSON only. Bound both the incoming and canonical representations so
+// client normalization never produces a value the runner would reject as oversized.
+export function normalizeScanFilesValue(value) {
+  if (typeof value !== 'string' || value.length > SCAN_FILES_MAX) return null;
   let paths;
   if (value.startsWith('[')) {
-    try { paths = JSON.parse(value); } catch { return false; }
-    if (!Array.isArray(paths)) return false;
+    try { paths = JSON.parse(value); } catch { return null; }
+    if (!Array.isArray(paths)) return null;
   } else paths = value.split(/\n|,/);
-  return paths.length <= 4096 && paths.every(scanPath);
+  if (paths.length > 4096 || !paths.every(scanPath)) return null;
+  const normalized = JSON.stringify(paths);
+  return normalized.length <= SCAN_FILES_MAX ? normalized : null;
+}
+export function scanFilesValue(value) {
+  return normalizeScanFilesValue(value) !== null;
 }
 export function allowedEnv(env) {
   return env && typeof env === 'object' && !Array.isArray(env) && Object.entries(env).every(([key,value]) =>
@@ -984,7 +991,10 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         runAt=clock();
         await update();
         if(telemetryError)throw telemetryError;
-        result=await command(executionArgv(request.argv),work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
+        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
+        if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
+          executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
+        result=await command(executionArgv(request.argv),work,executionEnv);
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));

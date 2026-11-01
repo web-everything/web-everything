@@ -19,6 +19,7 @@ import {materializeWorktree} from '../forge-exec-bases.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 import {scanDiffBranchCoverage} from '../../lib/diff-branch-coverage.mjs';
+import {scanScope} from '../../lib/repo-scan-tests.mjs';
 
 vi.mock('../forge-telemetry.mjs', async importOriginal => {
   const actual=await importOriginal();
@@ -772,10 +773,28 @@ describe('standards input parity', () => {
 });
 
 describe('filterEnv', () => {
+  it.each([
+    ['scripts/readiness/remote-exec.mjs', ['scripts/readiness/remote-exec.mjs']],
+    ['scripts/a.mjs,src/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['scripts/a.mjs\nsrc/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['scripts/a.mjs,src/b.ts\nREADME.md', ['scripts/a.mjs', 'src/b.ts', 'README.md']],
+    ['[ "scripts/a.mjs", "src/b.ts" ]', ['scripts/a.mjs', 'src/b.ts']],
+    ['["\\u0073cripts/a.mjs"]', ['scripts/a.mjs']],
+    ['[]', []],
+  ])('normalizes accepted scan list %j for the actual scanner', (value, paths) => {
+    const input = {VERIFY_SCAN_FILES:value};
+    const env = filterEnv(input);
+    expect([...scanScope(env)]).toEqual(paths);
+    expect(env.VERIFY_SCAN_FILES).toBe(JSON.stringify(paths));
+    expect(forgeManifestAPI.allowedEnv(env)).toBe(true);
+    expect(filterEnv(env)).toEqual(env);
+    expect(input.VERIFY_SCAN_FILES).toBe(value);
+  });
   it('forwards a valid VERIFY_SCAN_FILES and refuses an unsafe one with a local fallback reason (R309)', () => {
     const value = '["scripts/a.mjs","src/b.ts"]';
     expect(filterEnv({VERIFY_SCAN_FILES:value, OTHER:'x'})).toEqual({VERIFY_SCAN_FILES:value});
-    for (const bad of ['/etc/passwd', '../x', 'a;rm'])
+    for (const bad of ['/etc/passwd', '../x', 'a;rm', 'a,,b', 'a\r\nb', 'a\u2028b', '\uff41', 'a\u200bb', '["a",1]',
+      Array(1024).fill('a'.repeat(62)).join(','), Array(4097).fill('a').join(',')])
       expect(() => filterEnv({VERIFY_SCAN_FILES:bad})).toThrow('Invalid VERIFY_SCAN_FILES: use local fallback');
   });
   it.each(['HEAD', 'origin/main', 'refs/heads/fix.v1', 'a'.repeat(40)])('accepts safe coverage base %s for local commit resolution', base => {

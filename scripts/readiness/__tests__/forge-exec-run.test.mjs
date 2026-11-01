@@ -10,6 +10,7 @@ import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
+import {scanScope} from '../../lib/repo-scan-tests.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -51,6 +52,7 @@ cat > stdin-seen
 node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "$@" > argv-seen
 printf '%s\n' "$*|$NODE_ENV" > task-seen
 echo forged > .exit-code
+printf '%s' "$VERIFY_SCAN_FILES" > scan-files-seen
 echo '{"phase":"test","code":0}' > receipt.json
 exit 3
 `, {mode:0o755});
@@ -151,6 +153,20 @@ describe('sibling root snapshot acceptance', () => {
 });
 
 describe('gate option and scan-file allowlist (R314, R309)', () => {
+  it.each([
+    ['scripts/a.mjs', ['scripts/a.mjs']],
+    ['scripts/a.mjs,src/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['scripts/a.mjs\nsrc/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['[ "scripts/a.mjs", "src/b.ts" ]', ['scripts/a.mjs', 'src/b.ts']],
+    ['[]', []],
+  ])('executes direct runner scan list %j as JSON consumable by scanScope', async (value, paths) => {
+    request.env.VERIFY_SCAN_FILES = value;
+    expect((await runner.run(request)).code).toBe(3);
+    const actual = await readFile(join(work,'scan-files-seen'),'utf8');
+    expect([...scanScope({VERIFY_SCAN_FILES:actual})]).toEqual(paths);
+    expect(actual).toBe(JSON.stringify(paths));
+    expect(request.env.VERIFY_SCAN_FILES).toBe(value);
+  });
   const unit = (...args) => ['npm','run','test:unit','--','a.test.mjs',...args];
   it.each([
     ['--passWithNoTests'], ['--testTimeout=15000'], ['--hookTimeout=30000'], ['--testTimeout=1'], ['--hookTimeout=3600000'],
@@ -183,6 +199,16 @@ describe('gate option and scan-file allowlist (R314, R309)', () => {
     'a\0b', 'x'.repeat(65537),
   ])('rejects VERIFY_SCAN_FILES=%j', value => {
     expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:value})).toBe(false);
+  });
+  it('bounds canonical JSON size and entry count before client or runner execution', () => {
+    const expanded = Array(1024).fill('a'.repeat(62)).join(',');
+    expect(expanded.length).toBeLessThan(65536);
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:expanded})).toBe(false);
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:Array(4097).fill('a').join(',')})).toBe(false);
+    const boundary = JSON.stringify([...Array(15).fill('a'.repeat(4096)), 'a'.repeat(4047)]);
+    expect(boundary.length).toBe(65536);
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:boundary})).toBe(true);
+    expect(manifestAPI.normalizeScanFilesValue(boundary)).toBe(boundary);
   });
 });
 
