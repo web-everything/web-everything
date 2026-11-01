@@ -348,7 +348,6 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
-    env,
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
@@ -1164,7 +1163,7 @@ function runReviewArc({
         classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
         return result({ ...classified, lanePath });
       }
-      const deadlineMs = staleRunDeadlineMs(io.env ?? process.env);
+      const deadlineMs = staleRunDeadlineMs(process.env);
       // Recheck the stored owner before recovering a missing accepting payload, including marked abandonment.
       const staleStored = redTeamMode === 'fresh' && !redTeamOwedFor(loopPayload)
         && (staleRedTeamRun({ status: stored?.status, probe: io.staleProbe, deadlineMs }).stale

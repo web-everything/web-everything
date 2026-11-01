@@ -35,13 +35,6 @@ export function staleRunDeadlineMs(env = process.env) {
     ? Number(value) : STALE_RUN_DEADLINE_MS;
 }
 
-/** Legacy ps lstart stamps are written in UTC without a zone; ISO stamps retain their zone. */
-export function parsePidStart(stamp) {
-  if (typeof stamp !== 'string') return NaN;
-  return Date.parse(/^\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.test(stamp)
-    ? `${stamp} UTC` : stamp);
-}
-
 /** A matching live local owner always wins over the age deadline. Unknown age stays closed. */
 export function staleRedTeamRun({ status, now = Date.now(), deadlineMs = STALE_RUN_DEADLINE_MS,
   probe = {} } = {}) {
@@ -60,7 +53,7 @@ export function staleRedTeamRun({ status, now = Date.now(), deadlineMs = STALE_R
       }
     }
   } catch { return answer(false, 'running red team owner probe unreadable'); }
-  const at = parsePidStart(status.pidStart);
+  const at = Date.parse(status.pidStart);
   return Number.isFinite(at) && Number.isFinite(deadlineMs) && deadlineMs >= 0 && now - at > deadlineMs
     ? answer(true, 'unprobeable running red team owner exceeded deadline')
     : answer(false, 'unprobeable running red team owner within deadline or age unknown');
@@ -102,14 +95,17 @@ export function verifiedStaleRedTeamAbandonment(key, status) {
   if (status?.repo !== key.repo || Number(status?.pr) !== Number(key.pr) || status?.head !== key.head
     || !redTeamStatusWithoutRun(status, { allowAbandonedRunning: true })) return false;
   try {
+    const { count } = staleRedTeamRedispatch(key), spent = staleRedTeamSpent(key);
     const markers = readStaleRedispatchMarkers(key);
-    const count = markers.filter(Boolean).length;
-    if (!markers[0] || count < 1 || count > MAX_STALE_REDISPATCHES) return false;
+    if (!markers[0] || count < 1 || count > MAX_STALE_REDISPATCHES
+      || markers.filter(Boolean).length !== count || spent !== (count === MAX_STALE_REDISPATCHES)) return false;
     const abandonedAt = typeof status.staleAbandoned.at === 'string'
       ? Date.parse(status.staleAbandoned.at) : status.staleAbandoned.at;
-    // A known-dead local owner can have no birth stamp; its claimed abandonment still binds it.
+    // pidStartTime's legacy ps stamp is UTC without an explicit zone. A known-dead
+    // local owner can also have no birth stamp; its claimed abandonment still binds it.
     const birth = status.pidStart;
-    const startedAt = parsePidStart(birth);
+    const startedAt = Date.parse(/^\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.test(birth)
+      ? `${birth} UTC` : birth);
     const latestClaim = (markers[1] ?? markers[0]).mtimeMs;
     return status.pid > 0 && (birth == null || (Number.isFinite(startedAt) && startedAt <= abandonedAt))
       && abandonedAt >= latestClaim - 1000;
@@ -119,21 +115,16 @@ export function verifiedStaleRedTeamAbandonment(key, status) {
 function claimStaleNoRestart({ count, ...key }) {
   if (count !== 1) return { ok: false };
   const marker = `${staleStatusPath(key)}.stale-norestart`;
-  let claimed = false;
-  const release = () => {
-    try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  };
   try {
-    closeSync(openSync(marker, 'wx')); claimed = true;
-    if (readStaleRedispatchMarkers(key).filter(Boolean).length > MAX_STALE_REDISPATCHES) {
-      throw new Error('combined stale recovery cap exceeded');
-    }
-    return { ok: true, release };
-  } catch { if (claimed) { try { release(); } catch { /* keep closed */ } } return { ok: false }; }
+    closeSync(openSync(marker, 'wx'));
+    return { ok: true, release: () => {
+      try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    } };
+  } catch { return { ok: false }; }
 }
 
 function isRedispatchedRun(status, firstMarkerMtimeMs) {
-  const started = parsePidStart(status?.pidStart);
+  const started = Date.parse(status?.pidStart);
   return status?.status === 'running' && status.result == null
     && (status.retryCount === undefined || status.retryCount === 0)
     && Number.isFinite(started) && Number.isFinite(firstMarkerMtimeMs) && started > firstMarkerMtimeMs;
@@ -142,8 +133,7 @@ function isRedispatchedRun(status, firstMarkerMtimeMs) {
 /** The exclusive-create marker spends recovery; the re-read is a best-effort recheck, not an atomic lock.
  * Only a confirmed non-start may release the recovery spend.
  */
-export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(),
-  clock = Date.now, probe = {} }) {
+export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(), probe = {} }) {
   const key = { repo, pr, head, env }, path = staleStatusPath(key);
   let claimed = false, marker;
   const release = () => { try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
@@ -159,11 +149,8 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
       || !Number.isFinite(now) || now - firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS))) return { ok: false };
     marker = `${path}.stale-redispatch-${attempt}`;
     closeSync(openSync(marker, 'wx')); claimed = true;
-    const at = new Date(clock()).toISOString();
-    if (readStaleRedispatchMarkers(key).filter(Boolean).length > MAX_STALE_REDISPATCHES) {
-      throw new Error('combined stale recovery cap exceeded');
-    }
     const reason = 'running red team owner is dead or exceeded stale deadline';
+    const at = new Date(now).toISOString();
     writeJsonAtomic(path, { ...current, staleAbandoned: { at, pid: status.pid, reason } });
     const events = daemonEventsPath({ env });
     mkdirSync(dirname(events), { recursive: true });

@@ -2249,31 +2249,6 @@ describe('PR 6039 red-team-only stale running payload recovery', () => {
   const options = { repo, pr, redTeamOnly: true, redTeamMode: 'fresh' };
   describe.each([false, true])('environment deadline recheck (staleAbandoned=%s)', abandoned => {
     it.each([
-      ['shorter injected deadline', '60000', '14400000', 60 * 60 * 1000, true],
-      ['longer injected deadline', '14400000', '60000', 3 * 60 * 60 * 1000, false],
-      ['injected default', undefined, '60000', 60 * 60 * 1000, false],
-    ])('%s takes precedence over process.env', (_name, injected, host, age, recovered) => {
-      const now = Date.parse('2026-10-29T15:00:00Z');
-      const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
-      vi.stubEnv('WE_RED_TEAM_STALE_RUN_MS', host);
-      try {
-        const env = injected === undefined ? {} : { WE_RED_TEAM_STALE_RUN_MS: injected };
-        const io = staleJob({ abandoned });
-        io.env = createReviewJobIo({ env }).env;
-        const { status } = io.readRedTeamOnlyPayload();
-        Object.assign(status, { host: 'remote', pidStart: new Date(now - age).toISOString(),
-          ...(abandoned ? { status: 'finished', result: { status: 'not-owed' } } : {}) });
-        expect(runReviewJob(options, io).outcome).toBe(recovered ? 'red-team-only' : 'red-team-not-owed');
-        expect(io.readStaleRunPayload).toHaveBeenCalledTimes(recovered ? 1 : 0);
-        expect(io.runRedTeam).toHaveBeenCalledTimes(recovered ? 1 : 0);
-        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(recovered ? ['queued', 'finished'] : []);
-      } finally {
-        clock.mockRestore();
-        vi.unstubAllEnvs();
-      }
-    });
-
-    it.each([
       ['shorter override', '60000', 60 * 60 * 1000, true],
       ['longer override', '14400000', 3 * 60 * 60 * 1000, false],
       ['invalid override within default', 'invalid', 60 * 60 * 1000, false],
