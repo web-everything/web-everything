@@ -35,6 +35,7 @@ export function findRunningBackgroundTask(entries) {
           }
         }
         if (entry.type === 'user' && block?.type === 'tool_result') {
+          if (block.is_error === true && started.has(block.tool_use_id)) { finishedUses.add(block.tool_use_id); continue; } // the launch failed
           const text = typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? '');
           const m = /(?:with ID|task[_ ]id|id)[:=\s"]+([a-z0-9]{6,})/i.exec(text);
           if (m && started.has(block.tool_use_id)) taskIdByUse.set(block.tool_use_id, m[1]);
@@ -58,9 +59,12 @@ export function findRunningBackgroundTask(entries) {
   return null;
 }
 
+export const GUARD_MARKER = '[background-task-guard]';
+export const MAX_BLOCKS = 3;
+
 export function stopReason(task) {
   const what = `${task.name}${task.taskId ? ` task ${task.taskId}` : ''}${task.label ? ` (${task.label})` : ''}`;
-  return `You started ${what} in the background and it is still running. Do not end your turn: its completion will not wake you. `
+  return `${GUARD_MARKER} You started ${what} in the background and it is still running. Do not end your turn: its completion will not wake you. `
     + 'Run the work in the foreground instead (re-call it with a bounded wait, or its --status call), or stop it with TaskStop if you no longer need it, '
     + 'or report a concrete blocker in your final message.';
 }
@@ -74,7 +78,9 @@ if (IS_CLI) {
     if (typeof path !== 'string' || !path) process.exit(0);
     const entries = readTranscriptTail(path).filter((entry) =>
       (!entry?.sessionId || entry.sessionId === event.session_id) && (!entry?.agentId || entry.agentId === event.agent_id));
-    const task = findRunningBackgroundTask(entries);
+    // Bounded: after MAX_BLOCKS refusals in this transcript let the stop through rather than wedge the worker.
+    const priorBlocks = entries.filter((e) => e?.type !== 'assistant' && JSON.stringify(e).includes(GUARD_MARKER)).length;
+    const task = priorBlocks >= MAX_BLOCKS ? null : findRunningBackgroundTask(entries);
     if (task) {
       const reason = stopReason(task);
       console.log(JSON.stringify({ decision: 'block', reason, hookSpecificOutput: { hookEventName: 'SubagentStop', reason } }));

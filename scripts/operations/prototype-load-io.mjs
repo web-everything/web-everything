@@ -553,7 +553,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // about 180 s. By default return right after registration; the rebuild path emits overlay-adopted later.
       const waitMs = Math.min(WAIT_ADOPTION_CAP_MS, Math.max(0, Number(input.waitAdoptionMs) || 0), config.adoption.timeoutMs);
       const deadline = registeredAt + waitMs;
-      recordPendingAdoption(out.clone, { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null }, { env: childEnv, fs });
+      out.adoptionEventTracked = recordPendingAdoption(out.clone, { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null }, { env: childEnv, fs });
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.
       const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
@@ -596,7 +596,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           out.adoption.reason = reason;
           // Registered and waiting for the next rebuild is not a failure: it succeeded, adoption is pending.
           Object.assign(out, { ok: true, result: 'registered-pending', adopted: false,
-            message: `Registered ${out.effectiveRef}@${out.effectiveSha.slice(0, 7)} on ${input.daemon}; not adopted yet. ${detail} The rebuild emits an overlay-adopted daemon event when it lands (overlay-adoption-overdue if it takes over 15 minutes). Do not wait or poll for it.`,
+            message: `Registered ${out.effectiveRef}@${out.effectiveSha.slice(0, 7)} on ${input.daemon}; not adopted yet. ${detail} The rebuild emits an overlay-adopted daemon event when it lands (overlay-adoption-overdue if it takes over 15 minutes). Do not wait or poll for it.${out.adoptionEventTracked ? '' : ' Warning: the pending-adoption record could not be written, so no overlay-adopted event will follow; check the daemon rebuild state instead.'}`,
             fallback: `${detail}${keptNote()}` });
           return out;
         }

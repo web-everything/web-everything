@@ -13,6 +13,15 @@ export const OVERLAY_ADOPTION_OVERDUE_MS = 15 * 60 * 1000;
 const FULL_SHA = /^[a-f0-9]{40}$/i;
 export const pendingAdoptionPath = (root, env = process.env) => `${overlayFilePath(root, env)}.adoption-pending.json`;
 
+/** Strict read for read-modify-write: a missing file is empty, any other read/parse failure throws (never overwrite). */
+function readPendingStrict(root, env, fs) {
+  let text;
+  try { text = fs.readFileSync(pendingAdoptionPath(root, env), 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; }
+  const list = JSON.parse(text);
+  if (!Array.isArray(list)) throw new Error('adoption-pending file is not a list');
+  return list.filter((r) => r && typeof r.ref === 'string' && FULL_SHA.test(r.sha || ''));
+}
+
 export function readPendingAdoptions(root, { env = process.env, fs = nodeFs } = {}) {
   try {
     const list = JSON.parse(fs.readFileSync(pendingAdoptionPath(root, env), 'utf8'));
@@ -24,7 +33,9 @@ function writePending(root, env, fs, list) {
   const file = pendingAdoptionPath(root, env);
   if (!list.length) { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } return; }
   fs.mkdirSync(dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(list)}\n`, 'utf8');
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(list)}\n`, 'utf8');
+  fs.renameSync(tmp, file);
 }
 
 /** Read-modify-write under a short mkdir mutex, so a concurrent registration is never overwritten. */
@@ -36,13 +47,13 @@ function updatePending(root, env, fs, change, { staleMs = 10000, waitMs = 3000 }
     try { fs.mkdirSync(lock); break; } catch (e) {
       if (e?.code !== 'EEXIST') throw e;
       let age = 0;
-      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
+      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { age = 0; }
       if (age > staleMs) { try { fs.rmdirSync(lock); } catch { /* raced */ } continue; }
       if (Date.now() - start > waitMs) throw new Error('adoption-pending lock busy');
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
   }
-  try { writePending(root, env, fs, change(readPendingAdoptions(root, { env, fs }))); }
+  try { writePending(root, env, fs, change(readPendingStrict(root, env, fs))); }
   finally { try { fs.rmdirSync(lock); } catch { /* best effort */ } }
 }
 

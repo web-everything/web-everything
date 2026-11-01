@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import nodeFs, { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkPendingAdoptions, pendingAdoptionPath, readPendingAdoptions, recordPendingAdoption } from '../overlay-adoption.mjs';
@@ -52,6 +52,13 @@ describe('overlay adoption events', () => {
     expect(readPendingAdoptions(root, { env })).toHaveLength(1);
     expect((await checkPendingAdoptions({ ...args, isAncestor: () => true, emit: async () => true })).map((e) => e.kind)).toEqual(['overlay-adopted']);
     expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
+  it('never overwrites existing records after a read error', () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/a', sha: SHA }, { env });
+    const fs = { ...nodeFs, readFileSync: () => { throw Object.assign(new Error('io'), { code: 'EIO' }); } };
+    expect(recordPendingAdoption(root, { ref: 'lane/b', sha: 'b'.repeat(40) }, { env, fs })).toBe(false);
+    expect(readPendingAdoptions(root, { env }).map((r) => r.ref)).toEqual(['lane/a']);
   });
   it('is best-effort: bad sha, unreadable file, throwing git or emit never throw', async () => {
     const { root, env } = setup();

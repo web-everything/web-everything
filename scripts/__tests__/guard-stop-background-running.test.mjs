@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { findRunningBackgroundTask, stopReason } from '../guard-stop-background-running.mjs';
+import { findRunningBackgroundTask, stopReason, GUARD_MARKER } from '../guard-stop-background-running.mjs';
 
 const use = (id, name, input) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] } });
 const ack = (id, text) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content: text }] } });
@@ -29,6 +29,17 @@ describe('guard-stop-background-running', () => {
   });
   it('still reports a task whose notice is for a different tool use', () => {
     expect(findRunningBackgroundTask([...bg, note('toolu_other', 'completed')])).not.toBeNull();
+  });
+  it('a failed launch is not a running task', () => {
+    const failed = { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', is_error: true, content: 'spawn failed' }] } };
+    expect(findRunningBackgroundTask([bg[0], failed])).toBeNull();
+  });
+  it('lets the stop through after three refusals instead of wedging', () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'bgstop-')), 't.jsonl');
+    const refusal = { type: 'user', message: { content: `Stop hook feedback: ${GUARD_MARKER} You started Bash` } };
+    writeFileSync(file, [...bg, refusal, refusal, refusal].map((e) => JSON.stringify(e)).join('\n'));
+    expect(spawnSync('node', [resolve(import.meta.dirname, '../guard-stop-background-running.mjs')], { input: JSON.stringify({ hook_event_name: 'SubagentStop', agent_transcript_path: file }), encoding: 'utf8' }).status).toBe(0);
+    expect(stopReason(findRunningBackgroundTask(bg))).toContain(GUARD_MARKER);
   });
   it('fails open on junk input', () => {
     expect(findRunningBackgroundTask(null)).toBeNull();
