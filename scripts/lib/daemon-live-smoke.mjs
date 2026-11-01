@@ -370,6 +370,13 @@ async function checkLanePoolList(ctx) {
 /** lane-pool acquire exits 75 (EX_TEMPFAIL) only when a parked lane-hold refusal was seen and no other failure kind was (the rest of the pool was busy). */
 const LANE_POOL_ENV_ONLY_EXIT = 75;
 const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?.signal;
+// lane-pool's own reason is its LAST `✗ ` stderr line; the first line is often just progress (a reclaim
+// listing, a config scrub). Live 2026-11-01: the detail showed "lane-33: reclaiming 127 … safe to drop" for an
+// acquire that actually failed on a lane-hold + busy pool, so the busy-pool classifier never saw "no free lane".
+export const lanePoolFailureLine = (e) => {
+  const reason = String(e?.stderr ?? '').split(/\r?\n/).filter((l) => l.startsWith('✗ ')).pop();
+  return reason && Number.isInteger(e?.status) ? `exited ${e.status}: ${reason.slice(2)}` : firstLine(e);
+};
 
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
@@ -402,18 +409,18 @@ async function checkLaneAcquireRelease(ctx) {
       } catch (retryError) {
         // Structural, not textual: only lane-pool's own environmental-only exit (75) twice in a row is a skip.
         if (!isEnvOnlyAcquireExit(retryError)) {
-          return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(retryError)}`,
+          return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${lanePoolFailureLine(retryError)}`,
             ...childFailureDiagnostics(retryError) };
         }
         return { ok: true, skipped: true, skipReason: 'lane-hold-refused',
-          detail: `skipped: acquire found only lane-hold refusals after one retry: ${firstLine(retryError)}` };
+          detail: `skipped: acquire found only lane-hold refusals after one retry: ${lanePoolFailureLine(retryError)}` };
       }
     }
     const parsed = JSON.parse(out);
     laneNum = Number.isInteger(parsed?.lane) ? parsed.lane : null;
     if (laneNum == null) return { ok: false, detail: 'lane-pool acquire returned no lane number' };
   } catch (e) {
-    const detail = `lane-pool acquire --purpose=smoke failed: ${firstLine(e)}`;
+    const detail = `lane-pool acquire --purpose=smoke failed: ${lanePoolFailureLine(e)}`;
     const skip = busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs: budgets.laneAcquireWaitMs, ctx });
     if (!skip) return { ok: false, detail, ...childFailureDiagnostics(e) };
     // A killed acquire may have written a lease just before it died: release this smoke session's leases (best-effort).
