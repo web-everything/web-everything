@@ -127,6 +127,18 @@ it('restores a slot a seat left sparse, and refuses a slot whose admin dir is re
   expect(readdirSync(target)).toEqual([]);
 });
 
+it('ignores replace refs and refuses a store that points at another repository', () => {
+  acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }).release(); // both commits present in the store
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool }); a.release();
+  git(join(pool, 'repo.git'), 'replace', rev2, rev1); // the shared store claims rev2 is rev1
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool });
+  expect(readFileSync(join(b.dir, 'moves.txt'), 'utf8')).toBe('two\n'); // still the real rev2 tree
+  b.release();
+  writeFileSync(join(pool, 'repo.git', '.git'), `gitdir: ${join(lane, '.git')}\n`);
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow(/bare repository/);
+  expect(git(lane, 'worktree', 'list').split('\n').length).toBe(1);
+});
+
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const stable = statSync(join(a.dir, 'stable.txt')).ino; a.release();

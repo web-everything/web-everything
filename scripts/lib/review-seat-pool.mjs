@@ -18,7 +18,8 @@ const GIT_TIMEOUT_MS = 5 * 60 * 1000;
 export const defaultPoolDir = (env = process.env) => env.WE_REVIEW_SEAT_POOL_DIR || join(tmpdir(), 'we-seat-pool');
 
 function git(args, { allowFail = false } = {}) {
-  const r = spawnSync('git', args, { encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
+  const r = spawnSync('git', ['--no-replace-objects', ...args], {  // a replace ref in the shared store must never change what a pinned commit means
+     encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
   if (r.status !== 0 && !allowFail) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
   return r;
 }
@@ -92,7 +93,10 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   if (lstatOrNull(p.repo)) ownPrivateDir(p.repo);
   else git(['init', '--quiet', '--bare', p.repo]);
   ownPrivateDir(p.repo);
-  if (!existsSync(join(p.repo, 'HEAD'))) throw new Error('seat pool store has no HEAD');
+  if (!existsSync(join(p.repo, 'HEAD')) || lstatOrNull(join(p.repo, '.git'))) throw new Error('seat pool store is not a bare repository');
+  // Git must resolve exactly this directory as the bare store, not follow a pointer inside it to another repository.
+  if (realpathSync(git(['-C', p.repo, 'rev-parse', '--absolute-git-dir']).stdout.trim()) !== realpathSync(p.repo)
+    || git(['-C', p.repo, 'rev-parse', '--is-bare-repository']).stdout.trim() !== 'true') throw new Error('seat pool store is not its own bare repository');
   if (git(['-C', p.repo, 'cat-file', '-e', `${rev}^{commit}`], { allowFail: true }).status !== 0) {
     git(['-C', p.repo, 'fetch', '--quiet', '--no-tags', '--depth=1', lanePath, `+${rev}:refs/seat/${rev}`]);
   }
@@ -143,6 +147,8 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
         git(['-C', p.repo, 'worktree', 'add', '--quiet', '--detach', '--force', dir, rev]);
       }
       if (!existsSync(join(dir, '.git'))) throw new Error('seat slot has no worktree after setup');
+      if (git(['-C', dir, 'rev-parse', 'HEAD']).stdout.trim() !== rev
+        || realpathSync(git(['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir']).stdout.trim()) !== realpathSync(p.repo)) throw new Error(`seat slot is not ${rev} of this pool`);
       git(['-C', p.repo, 'update-ref', '-d', `refs/seat/${rev}`], { allowFail: true });
       writeFileSync(join(p.state, `slot-${n}.rev`), `${rev}\n`);
       symlinkSync(dir, view); // inputs for this acquisition live in `${view}.input`, outside every PR tree
