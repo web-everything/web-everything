@@ -28,6 +28,7 @@ import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = resolve(HERE, '..', 'merge-ai-prs.mjs'); // the REAL entrypoint under test
+const LABEL_REPO_URL = 'https://github.com/web-everything/web-everything';
 
 // ── fake gh: answers pr list / pr view from the fixture pointed to by $GATE_FIXTURE; succeeds quietly else ──
 const FAKE_GH = `#!/usr/bin/env node
@@ -38,6 +39,10 @@ const a = process.argv.slice(2);
 const ji = a.indexOf('--json');
 const fields = ji >= 0 ? String(a[ji + 1] || '') : '';
 function out(o) { fs.writeSync(1, JSON.stringify(o)); process.exit(0); }
+// Label provisioning resolves gh's effective repository before writing a repo-keyed memo.
+if (a[0] === 'repo' && a[1] === 'view' && fields === 'url' && a[a.indexOf('--jq') + 1] === '.url') {
+  fs.writeSync(1, '${LABEL_REPO_URL}'); process.exit(0);
+}
 // The live head: real GitHub always has one, so a fixture whose commits carry no oid gets a stable per-PR stand-in.
 function headOf(pr) {
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
@@ -183,7 +188,7 @@ function runDrain(fixture, args, extraEnv = {}) {
   writeFileSync(fxPath, JSON.stringify(fixture));
   const stdout = execFileSync('node', [SCRIPT, ...args, '--dry-run', '--this-repo', '--json'], {
     cwd: workDir,                                   // a clean dir — no park-state, no real repo
-    env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
+    env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, WE_DRAIN_LABEL_MEMO_PATH: `${fxPath}.labels.json` },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -202,7 +207,7 @@ function runDrainLive(fixture, args, extraEnv = {}) {
   writeFileSync(logPath, '');
   const stdout = execFileSync('node', [SCRIPT, ...args, '--no-drain-lease', '--this-repo', '--json'], {
     cwd: workDir,
-    env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
+    env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath, WE_DRAIN_LABEL_MEMO_PATH: `${fxPath}.labels.json` },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -316,6 +321,8 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     };
     const { result } = runDrainLive(fixture, ['--label=ready-to-merge', '--no-reconcile-labels']);
     expect(result.merged.find((x) => Number(x.num) === 911)?.headSha).toBe('sha-merged-911');
+    const memo = JSON.parse(readFileSync(join(workDir, `fixture-${fixture._id}.json.labels.json`), 'utf8'));
+    expect(memo.labels[`${LABEL_REPO_URL}::review:human`]).toBeTypeOf('number');
   });
 
   // A merge FAILURE makes the real entrypoint exit non-zero (some merge failed this pass), so runDrainLive's
@@ -337,7 +344,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     try {
       const stdout = execFileSync('node', [SCRIPT, '--label=ready-to-merge', '--no-reconcile-labels', '--no-drain-lease', '--this-repo', '--json'], {
         cwd: workDir,
-        env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
+        env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, WE_DRAIN_LABEL_MEMO_PATH: `${fxPath}.labels.json` },
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -368,7 +375,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     try {
       stdout = execFileSync('node', [SCRIPT, '--label=ready-to-merge', '--no-reconcile-labels', '--no-drain-lease', '--this-repo', '--json'], {
         cwd: workDir,
-        env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_MERGE_LOG: mergeLog, GATE_COMMENT_LOG: commentLog },
+        env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_MERGE_LOG: mergeLog, GATE_COMMENT_LOG: commentLog, WE_DRAIN_LABEL_MEMO_PATH: `${fxPath}.labels.json` },
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
