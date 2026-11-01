@@ -70,7 +70,7 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
@@ -84,9 +84,11 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
+const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
 const flags = {};
@@ -602,8 +604,9 @@ if (MODE === 'request') {
 //    with a stderr warning) — the residual-risk tradeoff `heavy-admission.mjs`'s own header names.
 //
 // #4360 — THIS `acquireSlotBlocking` CALL IS THE SOLE ADMISSION CHOKEPOINT FOR THE WHOLE DISPATCH PATH,
-// including `scripts/conveyor/verify-dispatch.mjs`'s daemon-side dispatch of several lanes' gates at once. The
-// daemon spawns this file as a plain child and lets EACH child queue on this SAME semaphore — it must NEVER
+// including `scripts/conveyor/verify-dispatch.mjs`'s daemon-side dispatch of several lanes' gates at once.
+// Remote-eligible phases skip this local slot; their nested wrapper owns remote dispatch and local fallback.
+// The daemon spawns this file as a plain child and lets EACH child queue on this SAME semaphore — it must NEVER
 // also acquire a slot itself before spawning, since that would either double-acquire (two slots consumed per
 // lane) or stall a child behind a slot its own parent is holding. If a future change ever needs the daemon to
 // reason about admission before spawning, that reasoning belongs here, not as a second chokepoint upstream.
@@ -616,7 +619,14 @@ const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? ''
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase) {
+async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
+  let decision = { remote: false, reason: 'raw-command' };
+  if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
+    decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
+    process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
+  }
+  const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
+  if (!plan.takeLocalSlot) return { ok: false, waitedMs: 0, remote: true, ...plan };
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
@@ -636,18 +646,19 @@ async function acquireAdmission(phase) {
   }
   return acquired;
 }
-const admission = await acquireAdmission('vitest');
-let firstPhaseAdmission = phaseAdmission ? admission : null;
+const admission = await acquireAdmission('vitest', retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
+let currentAdmission = admission;
+let vitestAdmittedLocally = admission.ok;
+const ranOnPhases = {};
+let remoteUnconfirmed = false;
+let firstPhaseAdmission = admission;
 // verify-admission (2026-10-20) — keep whichever slot this process holds alive while the gate runs. The slot lease
 // had no refresh, so a gate past ADMISSION_LEASE_MINUTES lost its slot to the next waiter and kept running
 // unslotted (12 concurrent verify-lanes, `heavy-queue` showing 0 held). The per-phase timeout below bounds how
 // long a refreshed slot can be kept. Unref'd: never keeps this process alive by itself.
 const SLOT_HEARTBEAT_MS = verifySetting('slotHeartbeatMs', process.env);
 process.stderr.write(`verify-lane: slot heartbeat every ${SLOT_HEARTBEAT_MS}ms (slotHeartbeatMs, ${verifySettingSource('slotHeartbeatMs', process.env)})\n`);
-const slotHeartbeat = setInterval(() => {
-  try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
-}, SLOT_HEARTBEAT_MS);
-slotHeartbeat.unref();
+let slotHeartbeat = null;
 // verify-admission — the hard per-phase ceiling (verify setting `phaseTimeoutMs`, logged with its source).
 const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
 const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
@@ -677,8 +688,19 @@ let isolatedRetry = null;
 let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
-const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal });
-async function runGate(command, args) {
+// The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
+const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
+async function runGate(command, args, { forgeDispatch = false } = {}) {
+  const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
+  const reportFile = join(reportDir, 'report.jsonl');
+  const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
+  if (forgeDispatch) {
+    childEnv.WE_FORGE_GATE_DISPATCH = '1';
+    delete childEnv[ADMISSION_HELD_ENV];
+  } else {
+    delete childEnv.WE_FORGE_GATE_DISPATCH;
+    childEnv[ADMISSION_HELD_ENV] = '1';
+  }
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
   let bytes = 0;
@@ -687,9 +709,10 @@ async function runGate(command, args) {
   // PR #5768 — a per-phase env marker every descendant inherits: the watchdog finds one that left the tree AND the group by it.
   const phaseToken = randomBytes(8).toString('hex');
   const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
+  try {
   const result = await new Promise((resolveGate, reject) => {
     const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
-      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
+      env: { ...childEnv, [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
@@ -718,20 +741,20 @@ async function runGate(command, args) {
     const finish = (code, closeSignal) => {
       if (settled) return;
       settled = true;
-      watchdog?.stop();
+      const stopped = watchdog?.stop();
       clearTimeout(grace);
       const timedOut = Boolean(watchdog?.fired());
       if (timedOut) announce();
       const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) };
       // The tree can close before the escape sweeps finish (an escapee that holds no pipe): the phase, and with it the
       // slot, is not over until they ran.
-      if (timedOut && watchdog) watchdog.settled().then(() => resolveGate(result));
-      else resolveGate(result);
+      if (timedOut && watchdog) Promise.all([watchdog.settled(), stopped]).then(() => resolveGate(result));
+      else Promise.resolve(stopped).then(() => resolveGate(result));
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
       pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
-      heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS },
+      ...(currentAdmission.ok ? { heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS } } : {}),
       onFire: () => {
         if (settled) return;
         announce();
@@ -743,11 +766,18 @@ async function runGate(command, args) {
         grace.unref();
       },
     }) : null;
-    child.on('error', (e) => { watchdog?.stop(); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    child.on('error', (e) => {
+      const stopped = watchdog?.stop();
+      clearTimeout(grace);
+      if (!settled) { settled = true; Promise.resolve(stopped).then(() => reject(e)); }
+    });
     child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
     child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });
-  return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
+  const reports = readRemoteReport(reportFile);
+  if (reports.some(r => r.location === 'local-fallback')) process.stderr.write('verify-lane: remote attempt fell back to local admission (nested wrapper owns the slot)\n');
+  return { ...result, remoteAttempt: forgeDispatch, ranOn: phaseRunLocation(reports, { remoteAttempt: forgeDispatch }), failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
+  } finally { rmSync(reportDir, { recursive: true, force: true }); }
 }
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
 const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
@@ -762,30 +792,88 @@ function recordOutcome(key, outcome) {
 async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const kind = phase?.replace(/Ms$/, '');
   let acquired = null;
-  if (phaseAdmission && firstPhaseAdmission) acquired = firstPhaseAdmission;
-  else if (phaseAdmission) {
+  if (firstPhaseAdmission) acquired = firstPhaseAdmission;
+  else if (phaseAdmission || admission.remote) {
     // Dispatch already saw the one-shot started marker, so a later phase's wait would count as hung gate time.
     // Tell it we are queueing again, and that real gate work resumes once the slot is held. Keep both lines in
     // step with `GATE_QUEUED_MARKER` / `GATE_STARTED_MARKER` in `verify-dispatch.mjs`.
     // The leading newline keeps the marker at a line start even when the previous phase's output stopped mid-line.
     process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-    acquired = await acquireAdmission(kind);
+    acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command);
     process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
   }
+  currentAdmission = acquired ?? admission;
+  function startHeartbeat() {
+    if (currentAdmission.ok) {
+      slotHeartbeat = setInterval(() => {
+        try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+      }, SLOT_HEARTBEAT_MS);
+      slotHeartbeat.unref();
+    }
+  }
+  startHeartbeat();
   firstPhaseAdmission = null;
   const started = performance.now();
   try {
-    const result = await runGate(command, args);
+    // Admission may span the whole gate; a command rewrite belongs only to this phase.
+    const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
+    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
+    if (shouldConfirmRemoteRed({ plan, ...result })) {
+      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
+      process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
+      acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command, { forceLocal: true });
+      currentAdmission = acquired;
+      process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
+      startHeartbeat();
+      // Run the original command. One confirmation only;
+      // its verdict and failure inventory replace the remote result before isolated retry.
+      result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
+    }
+    // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
+    if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
+      || (result.remoteAttempt === true && result.ranOn.location === 'local');
+    const locationKey = outcomeKey ?? kind ?? (/^npm run test:unit(?=\s|$)/.test(command) ? 'vitest' : /^npm run check:standards(?=\s|$)/.test(command) ? 'standards' : 'gate');
+    const previousLocation = ranOnPhases[locationKey];
+    ranOnPhases[locationKey] = previousLocation ? {
+      ...previousLocation, ...result.ranOn,
+      location: mergeRunLocation(previousLocation.location, result.ranOn.location),
+    } : result.ranOn;
+    const remoteFailure = remoteInfrastructureFailure(result);
+    if (remoteFailure) remoteUnconfirmed = true;
     if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
-    if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }));
+    if (kind) recordOutcome(outcomeKey ?? kind, { ...buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }), ...(remoteFailure ? { reason: 'remote-termination-unconfirmed', infrastructure: remoteFailure } : {}) });
     return result;
   } catch (error) {
     if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ kind, signal: error?.signal,
       exitCode: Number.isFinite(error?.status) ? error.status : 2, decision: resolvedGate?.decision }));
     throw error;
   } finally {
+    clearInterval(slotHeartbeat);
+    slotHeartbeat = null;
     if (phase) phaseMs[phase] = (phaseMs[phase] ?? 0) + performance.now() - started;
-    if (acquired?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
+    if (acquired?.ok && (phaseAdmission || admission.remote)) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
+  }
+}
+// runVitestOnBase runs inside the caller's slot. Only a whole-gate local slot is still held at that point; per-phase
+// and remote-planned gates released theirs (or never took one), so the base comparison takes its own local slot.
+const holdsWholeGateSlot = () => !phaseAdmission && admission.ok;
+async function withBaseRerunSlot(run) {
+  if (holdsWholeGateSlot()) return run();
+  const acquired = await acquireSlotBlocking({
+    lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
+    lane: laneMatch ? laneMatch[1] : null,
+    // The same kind the Vitest phase (per-phase) or the whole gate is admitted under.
+    kind: phaseAdmission ? phaseAdmissionKind({ phase: 'vitest', decision: resolvedGate.decision,
+      standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env }).kind : classifyCommandKind(GATE),
+  });
+  if (acquired.timedOut) process.stderr.write(`⚠ heavy-command admission: base comparison timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+  const heartbeat = acquired.ok ? setInterval(() => {
+    try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+  }, SLOT_HEARTBEAT_MS) : null;
+  heartbeat?.unref();
+  try { return await run(); } finally {
+    clearInterval(heartbeat);
+    if (acquired.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
   }
 }
 const gateStarted = performance.now();
@@ -812,7 +900,7 @@ try {
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
     retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
-  if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
+  if (retryableGate && vitestAdmittedLocally && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
     editedDuringRun = changedNow?.changedFiles ?? [];
@@ -889,7 +977,7 @@ try {
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
-      runBase: (files) => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs }) });
+      runBase: (files) => withBaseRerunSlot(() => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs })) });
   }
 } catch (e) {
   signal = e?.signal || null;
@@ -942,7 +1030,8 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) });
+const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
+  ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
@@ -990,7 +1079,7 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);

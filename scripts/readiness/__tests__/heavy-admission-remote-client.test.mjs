@@ -8,6 +8,7 @@ import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createRemoteExec, formatAdmissionPolicy, loadAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision, settleClientProvenance } from '../heavy-admission.mjs';
+import { easternTimestamp } from '../forge-exec-run.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFile: vi.fn(),
@@ -23,6 +24,8 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const success = "export async function runRemote() { return { mode: 'remote', code: 0 }; }";
+const healthyRead = async () => ({ sampledAtET: easternTimestamp(Date.now()),
+  cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] });
 const pathKeyFor = (clientPath) => createHash('sha256').update(clientPath).digest('hex');
 function fixture(source = success) {
   const root = mkdtempSync(join(tmpdir(), 'remote-client-'));
@@ -34,9 +37,12 @@ function fixture(source = success) {
   const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', clientPath } } });
   const seams = { policy, lockRoot, laneRoots: [], readSha: vi.fn(() => 'abc123'),
     log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false } };
+  // Keep admission health/slot state separate from the provenance IO under test.
+  // The default-executor wiring test below exercises their shared production root.
+  const admission = { lockRoot: join(root, 'admission', 'heavy'), readTelemetry: healthyRead };
   const run = (extra = {}) => runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: root, env: {},
-    policy, loadPerCore: () => 0, log: seams.log, remoteExec: createRemoteExec({ ...seams, ...extra }) });
-  return { root, clientPath, policy, seams, run, state: join(dirname(lockRoot), 'remote', 'client-override.json') };
+    ...admission, policy, loadPerCore: () => 0, log: seams.log, remoteExec: createRemoteExec({ ...seams, ...extra }) });
+  return { root, clientPath, policy, seams, admission, run, state: join(dirname(lockRoot), 'remote', 'client-override.json') };
 }
 
 function mockProvenanceFs() {
@@ -67,8 +73,8 @@ describe('remote client override', () => {
     expect(formatAdmissionPolicy(policy)).toContain(reason);
     const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env, policy,
-      log: f.seams.log, remoteExec: createRemoteExec({ ...f.seams, policy, env, importClient }) }))
-      .toEqual({ handled: true, exitCode: 0 });
+      ...f.admission, log: f.seams.log, remoteExec: createRemoteExec({ ...f.seams, policy, env, importClient }) }))
+      .toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
     expect(f.seams.readSha).not.toHaveBeenCalled();
     expect(f.seams.appendEvent).not.toHaveBeenCalled();
@@ -91,7 +97,7 @@ describe('remote client override', () => {
     expect(load(false)).toBe(host);
     expect(load(true)).toBe(selected);
     const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
-    expect(await f.run({ policy: host, importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ policy: host, importClient })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(importClient.mock.calls).toEqual([[pathToFileURL(resolveRemoteClient({ clientPath: f.clientPath }).clientPath).href]]);
     await settleClientProvenance();
   });
@@ -192,7 +198,7 @@ describe('remote client override', () => {
     f.policy.settings.remote.clientPath = clientPath;
     const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
     const importClient = vi.fn(async () => ({ runRemote }));
-    expect(await f.run({ importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ importClient })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(importClient).toHaveBeenCalledTimes(1);
     expect(importClient).toHaveBeenCalledWith('./remote-exec.mjs');
     expect(f.seams.log.mock.calls).toEqual([['heavy-admission: remote (remote.enabled=true (platform); mode=always)\n']]);
@@ -203,14 +209,18 @@ describe('remote client override', () => {
   });
 
   it('delegates a real module; logs once and persists events only when path or sha changes', async () => {
+    // Exercise successful real IO without racing its optional 100ms storage deadline on busy CI.
+    // Deadline/late-completion behavior is covered by the stalled-provenance tests below.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
-    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
+    expect(await settleClientProvenance()).toBe(true);
     const first = { clientPath: f.clientPath, sha: 'abc123' };
     // realpath may expand a platform tmpdir symlink.
     first.clientPath = resolveRemoteClient({ clientPath: f.clientPath }).clientPath;
     expect(f.seams.log).toHaveBeenCalledWith(`heavy-admission: remote client override ${first.clientPath} @ abc123\n`);
     const pathKey = pathKeyFor(first.clientPath);
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, pathKey }));
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, pathKey });
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(1);
     expect(f.seams.appendEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...first, previous: null } });
     const realOpen = provenanceIo.open;
@@ -220,26 +230,31 @@ describe('remote client override', () => {
       close = vi.spyOn(handle, 'close');
       return handle;
     });
-    await f.run();
-    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
-    await close.mock.results[0].value;
-    reads.mockRestore();
+    try {
+      expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
+      expect(await settleClientProvenance()).toBe(true);
+      expect(close).toHaveBeenCalledTimes(1);
+      await close.mock.results[0].value;
+    } finally { reads.mockRestore(); }
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(1);
     f.seams.readSha.mockReturnValue('def456');
-    await f.run();
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, sha: 'def456', pathKey }));
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
+    expect(await settleClientProvenance()).toBe(true);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...first, sha: 'def456', pathKey });
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(2);
     expect(f.seams.appendEvent.mock.calls[1][0].detail).toEqual({ ...first, sha: 'def456', previous: first });
     const other = fixture();
     f.policy.settings.remote.clientPath = other.clientPath;
-    await f.run();
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
+    expect(await settleClientProvenance()).toBe(true);
     const otherPath = resolveRemoteClient({ clientPath: other.clientPath }).clientPath;
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({
       clientPath: otherPath, sha: 'def456', pathKey: pathKeyFor(otherPath),
-    }));
+    });
     expect(f.seams.appendEvent).toHaveBeenCalledTimes(3);
     expect(f.seams.appendEvent.mock.calls[2][0].detail.previous).toEqual({ ...first, sha: 'def456' });
     expect(f.seams.log.mock.calls.filter(([line]) => line.includes(' @ '))).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('removing the clientPath setting leaves unrelated admission state untouched', async () => {
@@ -270,9 +285,9 @@ describe('remote client override', () => {
     const provenanceFs = mockProvenanceFs();
     const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
-      policy: withoutClient, log: f.seams.log, remoteExec: createRemoteExec({
+      ...f.admission, policy: withoutClient, log: f.seams.log, remoteExec: createRemoteExec({
         ...f.seams, policy: withoutClient, importClient, provenanceFs,
-      }) })).toEqual({ handled: true, exitCode: 0 });
+      }) })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(await settleClientProvenance()).toBe(true);
     expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
     expect(f.seams.readSha).not.toHaveBeenCalled();
@@ -296,11 +311,11 @@ describe('remote client override', () => {
     const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
     const pair = { clientPath: displayPath, sha: 'abc123' };
     f.policy.settings.remote.clientPath = firstPath;
-    expect(await f.run({ fs, importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ fs, importClient })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(await settleClientProvenance()).toBe(true);
     expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual({ ...pair, pathKey: pathKeyFor(firstPath) });
     f.policy.settings.remote.clientPath = secondPath;
-    expect(await f.run({ fs, importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ fs, importClient })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(await settleClientProvenance()).toBe(true);
     expect(f.seams.appendEvent.mock.calls).toEqual([
       [{ kind: 'remote-client-override', detail: { ...pair, previous: null } }],
@@ -317,7 +332,7 @@ describe('remote client override', () => {
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
     mkdirSync(dirname(f.state), { recursive: true });
     writeFileSync(f.state, JSON.stringify(pair));
-    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(await settleClientProvenance()).toBe(true);
     expect(f.seams.appendEvent.mock.calls).toEqual([
       [{ kind: 'remote-client-override', detail: { ...pair, previous: pair } }],
@@ -329,7 +344,7 @@ describe('remote client override', () => {
     const f = fixture();
     f.policy.settings.remote.clientPath = 'relative/remote-exec.mjs';
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], policy: f.policy, cwd: f.root,
-      env: {}, log: f.seams.log })).toEqual({ handled: false });
+      ...f.admission, env: {}, log: f.seams.log })).toEqual({ handled: false });
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('clientPath must be absolute'));
   });
 
@@ -341,7 +356,8 @@ describe('remote client override', () => {
     vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(null, 'production-sha\n'));
     // main() supplies lockRoot to this entry point; leave remoteExec unset to exercise its wiring.
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env,
-      policy: f.policy, lockRoot, log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
+      policy: f.policy, lockRoot, readTelemetry: healthyRead,
+      log: f.seams.log })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'production-sha' };
     await vi.waitFor(() => expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8')))
       .toEqual({ ...pair, pathKey: pathKeyFor(pair.clientPath) }));
@@ -380,7 +396,7 @@ describe('remote client override', () => {
       const open = vi.spyOn(provenanceIo, 'open').mockImplementation((file, ...args) =>
         file === destination ? Promise.resolve(handle) : realOpen(file, ...args));
       try {
-        expect(await f.run({ appendEvent: undefined })).toEqual({ handled: true, exitCode: 0 });
+        expect(await f.run({ appendEvent: undefined })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
         await vi.waitFor(() => expect(handle.close).toHaveBeenCalledTimes(1));
         if (kind === 'regular') {
           await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
@@ -499,7 +515,7 @@ describe('remote client override', () => {
     expect(real).toEqual(expect.any(String));
     expect(resolveRemoteClient({ clientPath, laneRoots: f.seams.laneRoots })).toEqual({ clientPath: real });
     const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
-    expect(await f.run({ importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ importClient })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(importClient).toHaveBeenCalledWith(pathToFileURL(real).href);
   });
 
@@ -559,7 +575,7 @@ describe('remote client override', () => {
   it('git and event failures never block remote execution', async () => {
     const f = fixture();
     expect(await f.run({ readSha: () => { throw new Error('no git'); }, appendEvent: async () => { throw new Error('no storage'); } }))
-      .toEqual({ handled: true, exitCode: 0 });
+      .toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     await vi.waitFor(() => expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown')));
   });
 
@@ -567,7 +583,7 @@ describe('remote client override', () => {
     const f = fixture();
     const sha = 'ab\n\x1bc'.repeat(100);
     f.seams.readSha.mockReturnValue(sha);
-    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     const line = f.seams.log.mock.calls.find(([value]) => value.includes(' @ '))[0];
     expect(line).toMatch(/^[\x20-\x7e]+\n$/);
     expect(line.split(' @ ')[1]).toBe(`${'ab??c'.repeat(16)}\n`);
@@ -594,7 +610,7 @@ describe('remote client override', () => {
     const f = fixture();
     mkdirSync(dirname(f.state), { recursive: true });
     writeFileSync(f.state, raw);
-    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'abc123' };
     const state = { ...pair, pathKey: pathKeyFor(pair.clientPath) };
     await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(state));
@@ -608,7 +624,7 @@ describe('remote client override', () => {
     const f = fixture();
     mkdirSync(dirname(f.state), { recursive: true });
     writeFileSync(f.state, JSON.stringify({ clientPath: 'p'.repeat(1300), sha: 's'.repeat(200), extra: '\n\x1braw' }));
-    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     await vi.waitFor(() => expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual({ clientPath: 'p'.repeat(1024), sha: 's'.repeat(80) }));
   });
 
@@ -617,7 +633,7 @@ describe('remote client override', () => {
     const previous = { clientPath: 'old-client', sha: 'old-sha' };
     mkdirSync(dirname(f.state), { recursive: true });
     writeFileSync(f.state, JSON.stringify(previous).padEnd(4096, ' '));
-    expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     await vi.waitFor(() => expect(f.seams.appendEvent.mock.calls[0][0].detail.previous).toEqual(previous));
   });
 
@@ -642,7 +658,9 @@ describe('remote client override', () => {
       return handle;
     });
     try {
-      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      // Probe the bounded reader directly; admission health IO has its own deadline and state.
+      expect(await createRemoteExec(f.seams)({ argv: ['npm', 'run', 'build'] }))
+        .toEqual({ mode: 'remote', code: 0 });
       await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
       expect(open.mock.calls.filter(([file]) => file === f.state)).toEqual([
         [f.state, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0)],
@@ -670,7 +688,7 @@ describe('remote client override', () => {
     writeFileSync(f.state, 'x'.repeat(8192));
     const open = vi.spyOn(provenanceIo, 'open');
     try {
-      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
       await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
       expect(open).toHaveBeenCalledTimes(1);
       const [temporary, flags, mode] = open.mock.calls[0];
@@ -702,7 +720,7 @@ describe('remote client override', () => {
       return cleanup;
     });
     try {
-      expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+      expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
       await vi.waitFor(() => expect(unlink).toHaveBeenCalledTimes(1));
       await cleanup.catch(() => {});
       expect(rename).toHaveBeenCalledTimes(1);
@@ -736,7 +754,7 @@ describe('remote client override', () => {
       const mkdir = vi.spyOn(provenanceIo, 'mkdir');
       const rename = vi.spyOn(provenanceIo, 'rename');
       try {
-        expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+        expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
         await vi.waitFor(() => expect(stat).toHaveBeenCalledWith(f.state));
         await stat.mock.results[0].value;
         expect(open).not.toHaveBeenCalled();
@@ -767,7 +785,7 @@ describe('remote client override', () => {
       const unlink = vi.spyOn(provenanceIo, 'unlink');
       const rename = vi.spyOn(provenanceIo, 'rename');
       try {
-        expect(await f.run()).toEqual({ handled: true, exitCode: 0 });
+        expect(await f.run()).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
         await vi.waitFor(() => expect(unlink).toHaveBeenCalledTimes(1));
         await unlink.mock.results[0].value;
         expect(rename).not.toHaveBeenCalled();
@@ -781,7 +799,7 @@ describe('remote client override', () => {
   it('bounds the default git SHA lookup to at most one second and continues on timeout', async () => {
     const f = fixture();
     vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(new Error('ETIMEDOUT')));
-    expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(execFile).toHaveBeenCalledWith('git', ['-C', expect.any(String), 'rev-parse', 'HEAD'],
       expect.objectContaining({ timeout: expect.any(Number), maxBuffer: 4096 }), expect.any(Function));
     const { timeout } = vi.mocked(execFile).mock.calls[0][2];
@@ -795,7 +813,7 @@ describe('remote client override', () => {
     vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => {
       callback(Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT', signal: 'SIGKILL' }));
     });
-    expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(execFile).toHaveBeenCalledTimes(1);
     const { clientPath } = resolveRemoteClient({ clientPath: f.clientPath });
     expect(execFile).toHaveBeenCalledWith('git', ['-C', dirname(clientPath), 'rev-parse', 'HEAD'],
@@ -820,7 +838,7 @@ describe('remote client override', () => {
     const provenanceFs = mockProvenanceFs();
     let result;
     const pending = runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env: {},
-      policy: f.policy, timeoutMs: 1000, loadPerCore: () => 0, log: f.seams.log,
+      ...f.admission, policy: f.policy, timeoutMs: 1000, loadPerCore: () => 0, log: f.seams.log,
       remoteExec: createRemoteExec({ ...f.seams, provenanceFs, ...extra,
         importClient: async () => ({ runRemote }) }),
     }).then((value) => { result = value; return value; });
@@ -828,9 +846,9 @@ describe('remote client override', () => {
     expect(stalled).toHaveBeenCalledTimes(1);
     expect(runRemote).toHaveBeenCalledTimes(1);
     expect(runRemote.mock.invocationCallOrder[0]).toBeLessThan(stalled.mock.invocationCallOrder[0]);
-    expect(result).toEqual({ handled: true, exitCode: 0 });
+    expect(result).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     await vi.advanceTimersByTimeAsync(1100);
-    expect(await pending).toEqual({ handled: true, exitCode: 0 });
+    expect(await pending).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -842,7 +860,7 @@ describe('remote client override', () => {
     const provenanceFs = mockProvenanceFs();
     const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
     expect(await f.run({ readSha, provenanceFs, importClient: async () => ({ runRemote }) }))
-      .toEqual({ handled: true, exitCode: 0 });
+      .toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(runRemote).toHaveBeenCalledTimes(1);
     expect(f.seams.log.mock.calls.filter(([line]) => line.includes(' @ '))).toHaveLength(0);
     resolveSha('delayed-sha');
@@ -864,7 +882,7 @@ describe('remote client override', () => {
       } };
     const runRemote = vi.fn(async () => ({ mode: 'remote', code: 0 }));
     expect(await f.run({ ...extra, importClient: async () => ({ runRemote }) }))
-      .toEqual({ handled: true, exitCode: 0 });
+      .toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(runRemote).toHaveBeenCalledTimes(1);
     expect(f.seams.appendEvent).not.toHaveBeenCalled();
   });
@@ -884,7 +902,7 @@ describe('remote client override', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(stalled).toHaveBeenCalledTimes(1);
       expect(runRemote).toHaveBeenCalledTimes(1);
-      expect(await pending).toEqual({ handled: true, exitCode: 0 });
+      expect(await pending).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
       expect(runRemote.mock.invocationCallOrder[0]).toBeLessThan(stalled.mock.invocationCallOrder[0]);
       await vi.advanceTimersByTimeAsync(operation === 'readSha' ? 1000 : 100);
       expect(runRemote).toHaveBeenCalledTimes(1);
@@ -902,7 +920,7 @@ describe('remote client override', () => {
     const f = fixture();
     const provenanceFs = mockProvenanceFs();
     provenanceFs[operation].mockRejectedValue(new Error('storage unavailable'));
-    expect(await f.run({ provenanceFs })).toEqual({ handled: true, exitCode: 0 });
+    expect(await f.run({ provenanceFs })).toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     await vi.waitFor(() => expect(provenanceFs[operation]).toHaveBeenCalledTimes(1));
     if (operation === 'lstat') {
       expect(provenanceFs.readFile).not.toHaveBeenCalled();
@@ -930,7 +948,10 @@ describe('remote client override', () => {
       return { runRemote: async () => ({ mode: 'remote', code: 0 }) };
     });
     expect(await f.run({ fs, importClient })).toEqual(kind === 'unreadable'
-      ? { handled: false } : { handled: true, exitCode: kind === 'selected' ? 0 : 124 });
+      ? { handled: false }
+      : kind === 'selected'
+        ? { handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) }
+        : { handled: true, exitCode: 124 });
     for (const [line] of f.seams.log.mock.calls) {
       expect(line).toMatch(/^[\x20-\x7e]+\n$/);
       expect(line.length).toBeLessThan(1200);
@@ -957,8 +978,8 @@ describe('remote client override', () => {
     if (layer === 'tool') expect(policy.ignored).toContainEqual(expect.stringContaining('tool.remote.clientPath='));
     const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
     expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env, policy,
-      log: f.seams.log, remoteExec: createRemoteExec({ ...f.seams, policy, env, importClient }) }))
-      .toEqual({ handled: true, exitCode: 0 });
+      ...f.admission, log: f.seams.log, remoteExec: createRemoteExec({ ...f.seams, policy, env, importClient }) }))
+      .toEqual({ handled: true, exitCode: 0, remoteResult: expect.objectContaining({ mode: 'remote', code: 0 }) });
     expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
     expect(f.seams.readSha).not.toHaveBeenCalled();
     expect(f.seams.appendEvent).not.toHaveBeenCalled();

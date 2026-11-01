@@ -36,7 +36,7 @@ export const FAILURE_REASONS = new Set([
   'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined', 'quick-soak-', 'quick-soak-unavailable', 'quick-soak-rollback-failed', 'adopted-head-changed-or-unreadable', 'worker-dead-missing-or-expired', 'worker-launch-failed', 'soak-could-not-run', 'soak-deadline', 'worker-fatal', 'rollback-threw',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
-  'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
+  'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
   'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
   'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',

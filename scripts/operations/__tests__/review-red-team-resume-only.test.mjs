@@ -63,6 +63,7 @@ const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr,
 
 describe('shared red-team recovery entry guards', () => {
   const finished = result => ({ repo, pr, head: rev, status: 'finished', result });
+  const queued = result => ({ repo, pr, head: rev, status: 'queued', pid: 42, result });
   function fakeIo(mode, over = {}) {
     return { now: () => 1_000, log: () => {},
       readRecords: vi.fn(() => mode === 'resume' ? [prior] : []),
@@ -70,18 +71,18 @@ describe('shared red-team recovery entry guards', () => {
       readRecoveryComments: vi.fn(() => []), listComments: () => [],
       cliAvailable: vi.fn(() => { throw Error('provider reached'); }),
       reserveCalls: vi.fn(), runSeat: vi.fn(), runRecheck: vi.fn(), makeScratch: vi.fn(),
-      postComment: vi.fn(), append: vi.fn(), ...over };
+      postComment: vi.fn(), append: vi.fn(), redTeamStatus: vi.fn(), ...over };
   }
   const run = (redTeamMode, io, extra = {}) => runRedTeam({ pr, repo, loopPayload, env: {}, redTeamMode, ...extra }, io);
   function noLaunch(io) {
     for (const key of ['cliAvailable', 'reserveCalls', 'runSeat', 'runRecheck', 'makeScratch']) expect(io[key], key).not.toHaveBeenCalled();
   }
-  async function refused(mode, io, reason, extra) {
-    expect(await run(mode, io, extra)).toEqual({ status: 'not-owed',
+  async function refused(mode, io, reason, extra, invalidAdmission = false) {
+    expect(await run(mode, io, extra)).toEqual({ status: 'not-owed', ...(invalidAdmission ? { invalidAdmission: true } : {}),
       ...(reason === 'red-team result already on head' ? {} : { deferredByGuard: true }),
       reason: `${reason}; inspect stored evidence before retrying — no call launched` });
     noLaunch(io);
-    for (const key of ['postComment', 'append']) expect(io[key], key).not.toHaveBeenCalled();
+    for (const key of ['postComment', 'append', 'redTeamStatus']) expect(io[key], key).not.toHaveBeenCalled();
   }
   it('live bare resumed review-pr row without a seat follows fresh dispatch', async () => {
     const row = { repo, pr: 5762, head: rev, status: 'finished', result: 'resumed', loopPayload: { ...loopPayload, op: 'review-pr' } };
@@ -219,9 +220,9 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
   it.each([false, true])('refuses a finished null result without queued provenance and with no seat or comment (admitted=%s)', async admitted => {
     const status = finished(null);
     const io = fakeIo('fresh', { readRedTeamStatus: () => admitted
-      ? { status: 'queued', pid: 42, result: null } : status });
+      ? queued(null) : status });
     await refused('fresh', io, 'prior red-team status; not re-run', admitted
-      ? { redTeamAdmission: { pid: 42, prior: status } } : {});
+      ? { redTeamAdmission: { schema: 1, pid: 42, queued: queued(null), prior: status } } : {});
   });
   it.each(['ran', { status: 'ran', comment: 'error' }, 'resumed', { status: 'resumed', comment: { status: 'error' } }])(
     'resumes both production result shapes %j with a clean matching row and zero model calls', async result => {
@@ -268,25 +269,24 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
   });
   it.each(['fresh', 'resume'])('verifies the queued admission and its prior status in %s mode', async mode => {
     const status = mode === 'resume' ? finished('ran') : null;
-    const io = fakeIo(mode, { readRedTeamStatus: () => ({ repo, pr, head: rev, status: 'queued', pid: 42, result: status?.result ?? null }) });
-    const extra = { redTeamAdmission: { pid: 42, prior: status } };
+    const io = fakeIo(mode, { readRedTeamStatus: () => queued(status?.result ?? null) });
+    const extra = { redTeamAdmission: { schema: 1, pid: 42, queued: queued(status?.result ?? null), prior: status } };
     expect((await run(mode, io, extra)).status).toBe(mode === 'resume' ? 'resumed' : 'error');
     if (mode === 'resume') noLaunch(io);
     else expect(io.cliAvailable).toHaveBeenCalledOnce();
   });
   it.each(['finished', 'error', 'queued'])('cannot hide a prior %s status behind fresh queued admission', async status => {
-    const io = fakeIo('fresh', { readRedTeamStatus: () => ({ status: 'queued', pid: 42, result: null }) });
+    const io = fakeIo('fresh', { readRedTeamStatus: () => queued(null) });
     await refused('fresh', io, 'prior red-team status; not re-run', {
-      redTeamAdmission: { pid: 42, prior: { repo, pr, head: rev, status, result: 'error' } },
+      redTeamAdmission: { schema: 1, pid: 42, queued: queued(null), prior: { repo, pr, head: rev, status, result: 'error' } },
     });
   });
   it.each(['writer', 'result', 'prior-repo', 'missing-prior'])('refuses changed or incomplete queued admission (%s) with zero model calls', async kind => {
-    const io = fakeIo('resume', { readRedTeamStatus: () => ({ status: 'queued', pid: kind === 'writer' ? 99 : 42,
-      result: kind === 'result' ? null : 'ran' }) });
+    const io = fakeIo('resume', { readRedTeamStatus: () => ({ ...queued(kind === 'result' ? null : 'ran'), pid: kind === 'writer' ? 99 : 42 }) });
     await refused('resume', io, kind === 'prior-repo' ? 'prior red-team status identity mismatch'
-      : kind === 'result' ? 'red-team admission result changed' : 'red-team admission changed', {
-      redTeamAdmission: { pid: 42, ...(kind === 'missing-prior' ? {} : { prior: { ...finished('ran'), ...(kind === 'prior-repo' ? { repo: 'other/repo' } : {}) } }) },
-    });
+      : kind === 'result' ? 'red-team admission result changed' : kind === 'writer' ? 'queued admission mismatch' : 'red-team admission unreadable', {
+      redTeamAdmission: { schema: 1, pid: 42, queued: queued(kind === 'result' ? null : 'ran'), ...(kind === 'missing-prior' ? {} : { prior: { ...finished('ran'), ...(kind === 'prior-repo' ? { repo: 'other/repo' } : {}) } }) },
+    }, true);
   });
 });
 
@@ -297,15 +297,17 @@ describe('red-team CLI recovery mode plumbing', () => {
       const payloadPath = join(dir, 'loop.json');
       writeFileSync(payloadPath, JSON.stringify(loopPayload));
       const source = `
+        import { writeFileSync } from 'node:fs';
         import { runExtraSeatsCli, redTeamMarker } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
         import { redTeamRunnerArgs } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-job.mjs')).href)};
         const [mode, loopFile, lanePath] = process.argv.slice(1);
         const pr = ${pr}, repo = ${JSON.stringify(repo)}, head = ${JSON.stringify(rev)};
         const prior = ${JSON.stringify(prior)};
-        const calls = { provider: 0, reserve: 0, model: 0, recheck: 0, post: 0, append: 0 };
+        const calls = { provider: 0, reserve: 0, model: 0, recheck: 0, post: 0, append: 0, write: 0 };
         const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
         for (const failure of ['late-result', 'comments', 'scorecards', 'evidence', 'admitted-late-result']) {
-          const admission = failure === 'admitted-late-result' ? { pid: 42,
+          const queued = { repo, pr, head, status: 'queued', pid: 42, result: mode === 'resume' ? 'ran' : null };
+          const admission = failure === 'admitted-late-result' ? { schema: 1, pid: 42, queued,
             prior: mode === 'resume' ? { repo, pr, head, status: 'finished', result: 'ran' } : null } : undefined;
           const io = {
             now: () => 1000, log: () => {},
@@ -313,7 +315,7 @@ describe('red-team CLI recovery mode plumbing', () => {
               if (failure === 'scorecards') throw Error('EIO');
               return mode === 'resume' ? [prior] : failure === 'evidence' ? [{ ...prior, status: 'error' }] : [];
             },
-            readRedTeamStatus: () => admission ? { status: 'queued', pid: 42, result: mode === 'resume' ? 'ran' : null }
+            readRedTeamStatus: () => admission ? queued
               : mode === 'resume' ? { status: 'finished', result: failure === 'evidence' ? 'error' : 'ran' } : null,
             readRecoveryComments: () => {
               if (failure === 'comments') throw Error('thread incomplete');
@@ -321,9 +323,11 @@ describe('red-team CLI recovery mode plumbing', () => {
             },
             cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
             runSeat: forbid('model'), runRecheck: forbid('recheck'),
-            postComment: forbid('post'), append: forbid('append'),
+            postComment: forbid('post'), append: forbid('append'), redTeamStatus: forbid('write'),
           };
-          const argv = redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode: mode, redTeamAdmission: admission });
+          const admissionFile = loopFile + '.admission.json';
+          if (admission) writeFileSync(admissionFile, JSON.stringify(admission));
+          const argv = redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode: mode, redTeamAdmission: admission ? admissionFile : undefined });
           await runExtraSeatsCli(argv.slice(1), { redTeamIo: io });
         }
         process.stdout.write(JSON.stringify(calls) + '\\n');
@@ -333,7 +337,7 @@ describe('red-team CLI recovery mode plumbing', () => {
         env: { PATH: '', WE_REVIEW_EXTRA_SEATS: '1', WE_REVIEW_RED_TEAM: '1' },
       });
       const results = output.trim().split('\n').map(line => JSON.parse(line));
-      expect(results.pop()).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0, post: 0, append: 0 });
+      expect(results.pop()).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0, post: 0, append: 0, write: 0 });
       expect(results).toEqual(['red-team result already on head', 'PR comments unreadable', 'scorecard store unreadable',
         mode === 'resume' ? 'prior red-team result is not resumable' : 'prior red-team seat row; not re-run',
         'red-team result already on head'].map(reason => ({ status: 'not-owed',

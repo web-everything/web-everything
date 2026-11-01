@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
@@ -8,7 +9,7 @@ import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
 import { openOperatorSendBacks, renderOperatorSendBackReviewBlock } from '../lib/operator-send-backs.mjs';
-import { PROVIDER_CAP_ENV, resolveProviderCap } from './review-seat-policy.mjs';
+import { PROVIDER_CAP_ENV, resolveProviderCap, resolveRoutingProviderCap } from './review-seat-policy.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT, resolveProviderCap, resolveDailyCap } from './review-seat-policy.mjs';
 import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '../lib/provider-quota-hold.mjs';
 /**
@@ -56,6 +57,7 @@ import { providerQuotaHold, QUOTA_COOLOFF_MS, CODEX_QUOTA_FULL_PERCENT } from '.
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { rosterForKey } from '../lib/dispatch-routing-providers.mjs';
 import { agyRunEvidence, pickAgyEvidence } from '../lib/antigravity-run-evidence.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -67,7 +69,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS } from './review-dispatch.mjs';
+import { reviewSeatRoutes, reviewSeatKey, REVIEW_SEAT_MODELS, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from './review-dispatch.mjs';
 import {
   REVIEW_SEAT_DISPATCH_KIND, REVIEW_SEAT_PROVIDERS, reviewSeatTaskType, selectReviewSeatProvider,
 } from '../lib/provider-routing.mjs';
@@ -645,11 +647,18 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     const now = io.now();
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`added seats: could not read the scorecard store (${e.message}) — treating it as empty`); }
-    // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveProviderCap`/
+    // Card xn2wf9t — PER-PROVIDER caps, counted and reserved separately (see `resolveRoutingProviderCap`/
     // `callsUsedTodayForProvider`): a provider at its own cap is treated exactly like a quota hold or a missing
     // CLI — excluded from `available` — so `reviewSeatRoutes` naturally falls the seat back to whichever OTHER
     // provider still has budget, never to "no seat" while at least one provider does.
-    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
+    const seatCaps = Object.fromEntries([`extra-juror:${EXTRA_JUROR_MANDATE}`, ...ROUTED_ADVISORY_LENSES]
+      .map(task => [task, Object.fromEntries(REVIEW_SEAT_PROVIDERS.map(p => [p, resolveRoutingProviderCap(p, env,
+        routingPolicy.operations[`review-seat:${task}`] ?? routingPolicy.operations['review-seat'])]))]));
+    // Reservations share a provider ledger, but eligibility is checked against EACH seat's own cap.
+    // An enable on one seat must never make that provider available to another seat.
+    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p,
+      Math.max(...Object.values(seatCaps).map(byProvider => byProvider[p])),
+    ]));
     const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     let available = [];
     const unavailable = [];
@@ -671,7 +680,8 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     }
     for (const u of unavailable) io.log(`added seats: skipping ${u.provider} — ${u.reason}`);
     const remainingCalls = (list) => list.reduce((sum, p) => sum + Math.max(0, caps[p] - usedByProvider[p]), 0);
-    let plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+    const providerAvailable = (provider, seatKey) => usedByProvider[provider] < seatCaps[seatKey][provider];
+    let plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
 
     // RESERVE each distinct provider's ONE call under ITS OWN cap, before launching anything, so concurrent
     // reviews can never together overspend any one provider's budget. A provider that cannot be granted (another
@@ -699,7 +709,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         if (reservation.callIds.length === reservation.models.length) { callIdOf.set(p, new Map(reservation.models.map((model, index) => [model, reservation.callIds[index]]))); } else { anyDenied = true; available = available.filter((x) => x !== p); }
       }
       if (!anyDenied) break;
-      plan = reviewSeatRoutes({ available, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+      plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
     }
     const providerUsage = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, { usedToday: usedByProvider[p] + (callIdOf.get(p)?.size ?? 0), cap: caps[p] }]));
     const totalUsedToday = Object.values(providerUsage).reduce((sum, u) => sum + u.usedToday, 0);
@@ -1571,6 +1581,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     reason: `${reason}; inspect stored evidence before retrying — no call launched` });
   if (!['fresh', 'resume'].includes(redTeamMode) || typeof repo !== 'string' || !repo.trim()
     || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !isPinnedRev(head)) return refuse('invalid red-team recovery identity or mode');
+  const refuseAdmission = reason => ({ ...refuse(reason), invalidAdmission: true });
   let records, status, comments, admittedStatus;
   try {
     records = io.readRecords({ strict: true });
@@ -1582,17 +1593,19 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     // Admission replaced the status while the job still held its claim. Only that
     // exact queued writer may carry its prior evidence through to this shared seat.
     if (redTeamAdmission !== undefined) {
+      redTeamAdmission = decodeRecoveryAdmission(redTeamAdmission);
+      if (JSON.stringify(status) !== JSON.stringify(redTeamAdmission.queued)) return refuseAdmission('queued admission mismatch');
       if (!redTeamAdmission || !Object.hasOwn(redTeamAdmission, 'prior')
         || !Number.isInteger(redTeamAdmission.pid) || redTeamAdmission.pid <= 0
-        || status?.status !== 'queued' || status.pid !== redTeamAdmission.pid) return refuse('red-team admission changed');
+        || status?.status !== 'queued' || status.pid !== redTeamAdmission.pid) return refuseAdmission('red-team admission changed');
       const prior = redTeamAdmission.prior;
-      if (prior !== null && (!prior || prior.repo !== repo || Number(prior.pr) !== Number(pr) || prior.head !== head)) return refuse('prior red-team status identity mismatch');
+      if (prior !== null && (!prior || prior.repo !== repo || Number(prior.pr) !== Number(pr) || prior.head !== head)) return refuseAdmission('prior red-team status identity mismatch');
       const result = ['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult) ? prior.result : null;
-      if (JSON.stringify(status.result) !== JSON.stringify(result)) return refuse('red-team admission result changed');
+      if (JSON.stringify(status.result) !== JSON.stringify(result)) return refuseAdmission('red-team admission result changed');
       admittedStatus = status;
       status = prior;
     }
-  } catch { return refuse('red-team status unreadable'); }
+  } catch { return redTeamAdmission !== undefined ? refuseAdmission('red-team admission unreadable') : refuse('red-team status unreadable'); }
   try {
     comments = io.readRecoveryComments({ pr, repo });
     if (!Array.isArray(comments)) throw Error('invalid comments');
@@ -1687,9 +1700,12 @@ export async function speculateRedTeam({
     let available = [];
     const unavailable = [];
     let deferredByCap = false;
-    const caps = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, resolveProviderCap(p, env)]));
-    const usedByProvider = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
-    for (const p of REVIEW_SEAT_PROVIDERS) {
+    const routingPolicy = (io.readRoutingPolicy ?? readRoutingPolicy)();
+    const routingEntry = routingPolicy.operations['review-seat:red-team'];
+    const providers = rosterForKey('review-seat:red-team');
+    const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
+    for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) {
@@ -1708,8 +1724,8 @@ export async function speculateRedTeam({
     let callId = null;
     let lastReason = null;
     let configuredRoute = null;
-    for (let attempt = 0; attempt <= REVIEW_SEAT_PROVIDERS.length && available.length && !callId; attempt += 1) {
-      try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available }); }
+    for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      try { configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
       catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
@@ -2058,6 +2074,10 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
   };
+  const readAdmission = () => {
+    try { return decodeRecoveryAdmission(readFileSync(flag('red-team-admission'), 'utf8')); }
+    catch { return null; } // A missing/corrupt handoff must enter the guard, never ordinary execution.
+  };
   const readPayload = () => {
     try { return existsSync(flag('loop-json')) ? JSON.parse(readFileSync(flag('loop-json'), 'utf8')) : null; } catch { return null; }
   };
@@ -2070,7 +2090,7 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
     return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only'),
-      redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : JSON.parse(flag('red-team-admission')) }, redTeamIo)
+      redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : readAdmission() }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));
   } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the

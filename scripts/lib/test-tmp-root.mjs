@@ -15,7 +15,7 @@
 //   WE_TMP_LEAK_MODE  'warn' (default) | 'fail' | 'off'
 //   WE_TMP_LEAK_MAX   leftover entries allowed before warn/fail fires (default 50)
 //   WE_TMP_LEAK_KEEP  '1' keeps the root on disk for debugging instead of removing it
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { delimiter, join } from 'node:path';
 import { fakeGhScript, gitShimScript } from './hermetic-tests.mjs';
@@ -75,7 +75,9 @@ export function sweepStaleRunRoots({ baseTmp, uid, isAlive = isPidAlive, now = D
 }
 
 export function createRunTmpRoot({ baseTmp, pid = process.pid, uid }) {
-  const parent = join(baseTmp, runRootParentName(uid));
+  // macOS temp paths commonly use /var's symlink alias. Allocate beneath the
+  // canonical base so descriptor-relative no-follow guards can inspect fixtures.
+  const parent = join(realpathSync(baseTmp), runRootParentName(uid));
   mkdirSync(parent, { recursive: true });
   return mkdtempSync(join(parent, `${pid}-`));
 }

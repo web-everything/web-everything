@@ -89,7 +89,7 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { parseEscalationReason } from '../../scripts/review-detail.mjs';
-import { dispatchReviewJob, dispatchReviewByMode, readRedTeamRecoveryStatus } from '../../scripts/operations/review-job.mjs';
+import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
 import { loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
@@ -1235,7 +1235,7 @@ export function cliReviewTickOpts({ log = console } = {}) {
     acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
-    redTeamOnSkip: o => runRedTeamOnSkip({ ...o, readStatus: readRedTeamRecoveryStatus,
+    redTeamOnSkip: o => runRedTeamOnSkip({ ...o,
       dispatch: d => dispatchReviewJob(d), log: line => log.error(line) }),
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,

@@ -19,7 +19,7 @@ import {
   acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
   runUnderAdmission, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
-  admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
+  admissionLockRoot, admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
   DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_SWITCH_ENV,
   DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, LOAD_ADMISSION_MIN_IDLE_PCT_ENV,
   DEFAULT_LOAD_ADMISSION_WINDOW, LOAD_ADMISSION_WINDOW_ENV,
@@ -127,6 +127,27 @@ const iso = (ms) => new Date(ms).toISOString();
 let lockRoot;
 beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'heavy-admission-test-')); });
 afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+
+describe('daemon scratch pool resolution (GUARD)', () => {
+  it('a temp-dir repo resolves the own-checkout pool', () => {
+    const ownCheckout = join(lockRoot, 'workspace', '.lanes', 'web-everything', 'lane-1');
+    const pool = join(lockRoot, 'workspace', '.lanes');
+    const exists = vi.fn(path => path === pool);
+    expect(admissionLockRoot(join(lockRoot, 'scratch', 'repo'), {}, { ownCheckout, exists }))
+      .toBe(join(pool, '.admission', 'heavy'));
+    expect(exists.mock.calls.map(([path]) => path)).toEqual([join(lockRoot, 'scratch', '.lanes'), pool]);
+  });
+
+  it('does not use the own-checkout pool under test or over an explicit pool', () => {
+    const ownCheckout = join(lockRoot, 'workspace', '.lanes', 'web-everything', 'lane-1');
+    const repo = join(lockRoot, 'scratch', 'repo'), exists = vi.fn(() => true);
+    expect(admissionLockRoot(repo, { VITEST: 'true' }, { ownCheckout, exists }))
+      .toBe(join(lockRoot, 'scratch', '.lanes', '.admission', 'heavy'));
+    expect(admissionLockRoot(repo, { LANE_POOL_ROOT: join(lockRoot, 'private-pool') }, { ownCheckout, exists }))
+      .toBe(join(lockRoot, 'private-pool', '.admission', 'heavy'));
+    expect(exists).not.toHaveBeenCalled();
+  });
+});
 
 describe('CLI relative --repo', () => {
   it('resolves the repo before deriving the shared admission root and owner', () => {
@@ -387,6 +408,40 @@ describe('#3383 live incident — slot reentrancy is keyed by REAL PROCESS IDENT
 });
 
 describe('probeSlotHolderLiveness — the PID fast path in isolation', () => {
+  it.each([['Z', 'dead'], ['X', 'dead'], ['S', 'alive']])('reads state %s after a comm containing parentheses as %s', (state, verdict) => {
+    const readStat = vi.fn(() => `123 (holder (with) spaces)) ${state} 1 2 3`);
+    expect(probeSlotHolderLiveness(process.ppid, process.pid, readStat)).toBe(verdict);
+    expect(readStat).toHaveBeenCalledWith(process.ppid);
+  });
+  it('keeps a holder alive when its stat file is unreadable', () => {
+    expect(probeSlotHolderLiveness(process.ppid, process.pid, () => { throw new Error('unreadable'); })).toBe('alive');
+  });
+  it('reports ESRCH as dead without reading stat', () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('gone'), {code:'ESRCH'}); });
+    const readStat = vi.fn();
+    try {
+      expect(probeSlotHolderLiveness(process.ppid, process.pid, readStat)).toBe('dead');
+      expect(readStat).not.toHaveBeenCalled();
+    } finally { kill.mockRestore(); }
+  });
+  it.skipIf(process.platform !== 'linux')('reports a real unreaped zombie as dead despite successful kill-0', async () => {
+    const childSource = "require('node:fs').writeSync(1, String(process.pid));";
+    const holder = spawn(process.execPath, ['-e', `
+      require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childSource)}], {stdio:['ignore',1,'ignore']});
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);
+    `], {stdio:['ignore','pipe','pipe']});
+    const exited = new Promise(resolve => holder.once('close', resolve));
+    try {
+      const pid = await new Promise((resolve, reject) => {
+        holder.once('error', reject);
+        holder.stdout.once('data', chunk => resolve(Number(chunk.toString())));
+      });
+      await new Promise(resolve => setTimeout(resolve, 250));
+      expect(readFileSync(`/proc/${pid}/stat`, 'utf8')).toMatch(/\) Z /);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      expect(probeSlotHolderLiveness(pid, process.pid)).toBe('dead');
+    } finally { await exited; }
+  });
   it('reports dead for a pid that cannot exist', () => {
     expect(probeSlotHolderLiveness(999999, process.pid)).toBe('dead');
   });

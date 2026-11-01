@@ -64,6 +64,33 @@ export function cardIdOf(cardPath) {
 
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }).trim();
 
+/**
+ * How long one `git fetch origin main` in a lane stays fresh enough to be every admission's base. A prevention
+ * run drains its whole pending spool in one lane, one admission per entry; fetching main per entry made it the
+ * host's top git cost (git trace2, 2026-10-31: ×818 fetches in 15 min, lanes 63/65). The base only seeds a NEW
+ * batch ref, and admission re-reads the remote batch head itself, so the base is a recent snapshot of main (at
+ * most this old), never required to equal main at admission time.
+ */
+export const MAIN_BASE_FRESH_MS = 60_000;
+const MAIN_BASE_CACHE = new Map();
+
+/**
+ * Resolve `origin/main` for `laneDir`, fetching at most once per `maxAgeMs` per lane. A failed fetch is never
+ * cached: the call falls back to the lane's last fetch (as before) and the next call fetches again.
+ */
+export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS } = {}) {
+  const key = resolve(laneDir);
+  const hit = cache.get(key);
+  if (hit && now() - hit.at < maxAgeMs) return hit.sha;
+  let fetched = true;
+  const at = now();
+  try { run(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main']); } catch { fetched = false; /* fall back to the lane's last fetch */ }
+  const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}']);
+  if (fetched) cache.set(key, { at, sha });
+  else cache.delete(key);
+  return sha;
+}
+
 /** Start the detached seal worker: it opens/refreshes the batch PR and seals at the count limit. Never waits. */
 export function launchSealJob(statePath, { spawn = spawnChild, open = openSync } = {}) {
   // The job's outcome goes to `<state>.seal.log`: a detached failure (live 2026-10-10: `unverified`) must be readable.
@@ -85,6 +112,7 @@ export async function fileIntoBatch({
 }, {
   settings = loadCardBatchSettings(), preventionSettings = loadPreventionBatchSettings(), admit = admitCard, launch = launchSealJob, stateDir = cardBatchStateDir(),
   baseSha, log = (line) => console.error(line), retries = 5, pause = (ms) => new Promise((done) => setTimeout(done, ms)),
+  mainBase = freshMainBase,
 } = {}) {
   log(kind === 'prevention' ? formatPreventionBatchSettings(preventionSettings) : formatCardBatchSettings(settings));
   const policy = effectiveCardBatchPolicy(settings, preventionSettings);
@@ -94,10 +122,7 @@ export async function fileIntoBatch({
   if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
-    const base = baseSha ?? (() => {
-      try { git(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main']); } catch { /* fall back to the lane's last fetch */ }
-      return git(laneDir, ['rev-parse', 'origin/main^{commit}']);
-    })();
+    const base = baseSha ?? mainBase(laneDir);
     const input = {
       kind, cardPath, cardId, idemKey: idemKey ?? `card:${cardId}`, baseSha: base, laneDir,
       source: { repo, pr: source.pr ?? null, head: source.head ?? null, note: source.note ?? null },

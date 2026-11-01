@@ -15,11 +15,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { pidIdentity } from '../lib/pid-alive.mjs';
+// A killed process whose parent died too is adopted by its reaper. On Linux that can be a PR_SET_CHILD_SUBREAPER
+// ancestor that reaps only when its own task ends (the Forge runner supervisor), so the corpse stays a zombie and
+// `kill(pid, 0)` still succeeds. Dead means gone or zombie; an unreadable probe is not proof of death.
+const expectDead = (pid, message) => expect(pidIdentity(pid), message).toMatchObject({ alive: false });
 import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
 import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
@@ -120,6 +126,40 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
 });
 
 describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
+  it.each(['commonjs', 'module'])('can stop local heartbeat watchdogs during module startup from a %s entry without crashing Node', (inputType) => {
+    // Run outside Vitest's process: terminating a worker while its heartbeat import evaluates
+    // a top-level await used to abort the entire Node process, not merely reject the worker.
+    // Resolve filesystem paths first so Vite cannot turn child imports into HTTP asset URLs.
+    const scriptsDir = dirname(dirname(fileURLToPath(import.meta.url)));
+    const script = `
+(async () => {
+const { startTreeWatchdog } = await import(${JSON.stringify(pathToFileURL(join(scriptsDir, 'lib/tree-watchdog.mjs')).href)});
+for (let round = 0; round < 24; round++) {
+  const watchdog = startTreeWatchdog({
+    pid: process.pid, timeoutMs: 60000,
+    warn: message => { throw new Error(message); },
+    heartbeat: {
+      module: ${JSON.stringify(pathToFileURL(join(scriptsDir, 'readiness/heavy-admission.mjs')).href)},
+      exportName: 'heartbeatOwnedSlot',
+      args: { lockRoot: ${JSON.stringify(join(dir, 'watchdog-pool'))}, cap: 1, owner: 'startup-probe' },
+      everyMs: 300000,
+    },
+  });
+  await new Promise(resolve => setTimeout(resolve, 50 + (round % 8) * 25));
+  watchdog.stop();
+}
+console.log('watchdogs stopped');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`;
+    const result = spawnSync(process.execPath, ['--input-type=' + inputType, '-e', script], {
+      encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal, result.stderr).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('watchdogs stopped\n');
+  }, 25000);
+
   it('non-leader timeout does not sweep unrelated group orphans', () => {
     // Isolate the shared group from Vitest/the agent shell. The supervisor leads it; verify-lane and an
     // unrelated, reparented sleeper share it. Removing the caller's leader guard kills this survivor.
@@ -131,13 +171,15 @@ const orphan = Number(sleeper.stdout.trim());
 if (sleeper.status !== 0 || !Number.isInteger(orphan) || orphan <= 1) throw new Error('could not start unrelated sleeper');
 let verify;
 try {
+  // Its parent exited, so the reaper adopted it: init, or on Linux the nearest subreaper (Forge's runner supervisor).
   let before;
   const deadline = Date.now() + 10_000;
   do {
     before = snapshot(orphan);
-    if (Number(before[1]) === 1) break;
+    if (Number(before[1]) !== sleeper.pid) break;
     await new Promise((r) => setTimeout(r, 20));
   } while (Date.now() < deadline);
+  const reaper = snapshot(Number(before[1]));
   verify = spawn(process.execPath, [${JSON.stringify(VERIFY_LANE)}, '--gate=sleep 120', '--json'], {
     cwd: ${JSON.stringify(dir)}, detached: false, stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -149,7 +191,7 @@ try {
   const result = await closed;
   let after = null;
   try { process.kill(orphan, 0); after = snapshot(orphan); } catch {}
-  console.log(JSON.stringify({ leader: process.pid, before, verifier, after, ...result, stdout, stderr }));
+  console.log(JSON.stringify({ leader: process.pid, spawner: sleeper.pid, before, reaper, verifier, after, ...result, stdout, stderr }));
 } finally {
   try { process.kill(orphan, 'SIGKILL'); } catch {}
   if (verify && verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch {} }
@@ -163,7 +205,12 @@ try {
     expect(r.error).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
     const result = JSON.parse(r.stdout.trim());
-    expect(Number(result.before[1])).toBe(1);
+    // Reparented out of the group, to init or (Linux) a subreaper outside it. Where init reaps (macOS) this is exactly
+    // what the leader's ppid-1 orphan sweep targets, so the test proves the leader guard. Under a subreaper (Forge) that
+    // sweep never targets it; there the test proves only that no other sweep (env marker, output pipes) kills it.
+    expect(Number(result.before[1])).not.toBe(result.spawner);
+    expect(Number(result.reaper[0])).toBe(Number(result.before[1]));
+    expect(Number(result.reaper[2])).not.toBe(result.leader);
     expect(Number(result.before[2])).toBe(result.leader);
     expect(Number(result.verifier[2])).toBe(result.leader);
     expect(Number(result.verifier[0])).not.toBe(result.leader);
@@ -193,7 +240,7 @@ try {
     expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout', ceilingMs: 2000, signal: 'SIGKILL' });
     expect(onDisk.infrastructure.detail).toContain('verify-lane killed the process tree');
     const grandchild = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(grandchild, 0)).toThrow();
+    expectDead(grandchild);
   }, 70_000);
 
   it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
@@ -208,7 +255,7 @@ try {
     expect(Date.now() - started).toBeLessThan(45_000);
     expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
     const orphan = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(orphan, 0)).toThrow();
+    expectDead(orphan);
     expect(r.status).not.toBe(0);
   }, 70_000);
 
@@ -239,7 +286,7 @@ ${keepAliveScript()}
       detached = Number(readFileSync(pidFile, 'utf8'));
       expect(r.status).not.toBe(0);
       expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
-      expect(() => process.kill(detached, 0), 'the detached descendant must not survive the timeout').toThrow();
+      expectDead(detached, 'the detached descendant must not survive the timeout');
     } finally {
       if (detached) { try { process.kill(detached, 'SIGKILL'); } catch { /* gone */ } }
     }
@@ -1374,7 +1421,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, outputLines = 148 } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1403,9 +1450,11 @@ it('first attempt times out', async () => {
     if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'vitest run', 'check:standards': 'true' } }));
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
+import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
@@ -1415,17 +1464,17 @@ if (${live} && args[0] === 'vitest') {
   process.exit(result.status ?? 2);
 }
 if (args[0] === 'vitest' && args[1] === 'related') {
-  process.stdout.write('passed file\\n'.repeat(148));
-  process.stderr.write(${JSON.stringify(stderr)});
-  process.stdout.write(${JSON.stringify(stdout)});
+  writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
+  writeAllSync(2, ${JSON.stringify(stderr)});
+  writeAllSync(1, ${JSON.stringify(stdout)});
   process.exit(1);
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('conformance'))) {
-  if (${scanExit}) process.stderr.write(' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
+  if (${scanExit}) writeAllSync(2, ' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
   process.exit(${scanExit});
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
-  if (${guardExit}) process.stderr.write(' FAIL  guard.test.mjs > repo-wide guard\\n');
+  if (${guardExit}) writeAllSync(2, ' FAIL  guard.test.mjs > repo-wide guard\\n');
   const report = args.find(a => a.startsWith('--outputFile.json='));
   if (report && ${guardReport}) {
     const names = args.filter(a => a.endsWith('.test.mjs') && !a.includes('excluded')).map(a => process.cwd() + '/' + a);
@@ -1434,25 +1483,46 @@ if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
   process.exit(${guardExit});
 }
 if (args[0] === 'vitest') process.exit(${retryExit});
-if (${standardsExit}) process.stdout.write('  error  invisible-characters: U+200B in source.mjs\\n');
+if (${standardsExit}) writeAllSync(1, '  error  invisible-characters: U+200B in source.mjs\\n');
 process.exit(${standardsExit});
 `;
     for (const name of ['npx', 'npm']) {
       writeFileSync(join(dir, 'bin', name), fake); chmodSync(join(dir, 'bin', name), 0o755);
     }
+    // Pin the local slot layout instead of inheriting host admission preferences.
+    const preferences = join(dir, 'admission-preferences.json');
+    writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
+      cap: 1, fastSlots: 1, fastScale: { maxSlots: 1 }, remote: { enabled: false },
+    } }));
     // Keep fixture infrastructure out of the change's own edited set.
     writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\n*.attempt\n');
     execFileSync('git', ['add', '.'], { cwd: dir });
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
+    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
-      return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.signal, result.stderr).toBeNull();
+      const terminal = result.stdout.trim().split('\n').at(-1);
+      let json;
+      try { json = JSON.parse(terminal); } catch { /* the assertion below reports the full child diagnostics */ }
+      expect(json, `missing verification verdict (exit ${result.status}): ${result.stdout}\n${result.stderr}`).toHaveProperty('sha', headSha());
+      return { code: result.status, json, stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  it('drains phase output larger than a pipe buffer before the terminal JSON verdict', () => {
+    const outputLines = 24000;
+    const f = fixture({ outputLines });
+    const result = f.invoke();
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.json).toMatchObject({ status: 'green', retriedTimeouts: f.files });
+    expect(result.stdout.split('passed file\n')).toHaveLength(outputLines + 1);
+    expect(f.calls()).toHaveLength(3);
+  });
 
   // #verify-phase-admission — real slots across the related run, retry, and standards.
   it.each([undefined, '0'])('records phase admission or the opt-out (%s)', phaseAdmission => {
