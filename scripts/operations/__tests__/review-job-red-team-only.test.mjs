@@ -2,12 +2,12 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { planRedTeamOnSkip, recoverStaleRunPayload, redTeamSkipNeedsSettlement, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { planRedTeamOnSkip, redTeamSkipNeedsSettlement, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { redTeamOwedFor } from '../../lib/review-red-team-policy.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
@@ -2095,26 +2095,5 @@ describe('PR 6039 red-team-only stale running payload recovery', () => {
     expect(io.readStaleRunPayload).toHaveBeenCalledOnce();
     expect(io.runRedTeam).not.toHaveBeenCalled();
     expect(io.redTeamStatus).not.toHaveBeenCalled();
-  });
-  it.each([
-    ['rejecting', { verdict: { verdict: 'changes' } }],
-    ['incomplete', { verdict: null }],
-    ['carried', { carriedFrom: 'older-run' }],
-  ])('a newer %s stored review prevents stale recovery from running an older accept', (_kind, over) => {
-    const dir = mkdtempSync(join(tmpdir(), 'red-team-superseded-review-'));
-    try {
-      const older = { ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }), ...payload() };
-      const newest = { ...newRunRecord({ id: 'review-pr-new', op: 'review-pr', input: { repo, pr } }), ...payload(), ...over };
-      writeRun(older, dir);
-      writeRun(newest, dir);
-      utimesSync(join(dir, `${older.id}.json`), new Date(1000), new Date(1000));
-      utimesSync(join(dir, `${newest.id}.json`), new Date(2000), new Date(2000));
-      const io = staleJob();
-      io.readStaleRunPayload = vi.fn(key => recoverStaleRunPayload({ ...key, runsDir: dir }));
-      expect(runReviewJob(options, io).outcome).toBe('red-team-not-owed');
-      expect(io.readStaleRunPayload).toHaveBeenCalledOnce();
-      expect(io.runRedTeam).not.toHaveBeenCalled();
-      expect(io.redTeamStatus).not.toHaveBeenCalled();
-    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

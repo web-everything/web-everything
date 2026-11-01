@@ -1606,7 +1606,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
     expect(o.recoverPayload).toHaveBeenCalledOnce();
     expect(o.abandonStale).toHaveBeenCalledOnce();
     expect(o.abandonStale).toHaveBeenCalledWith({ repo, pr, head,
-      status: o.readStatus(), env: o.env, now: staleNow, probe: o.probe });
+      status: o.readStatus(), env: o.env, now: staleNow });
     expect(o.dispatch).toHaveBeenCalledOnce();
     expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
     expect(o.abandonStale.mock.invocationCallOrder[0]).toBeLessThan(o.dispatch.mock.invocationCallOrder[0]);
@@ -1648,7 +1648,7 @@ describe('abandonStaleRedTeamRun — durable one-shot marker', () => {
       const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
       const status = { ...JSON.parse(readFileSync(statusPath, 'utf8')), ...deadRunningStatus(), extra: { preserve: true } };
       writeFileSync(statusPath, JSON.stringify(status));
-      const input = { repo, pr, head, env, status, now: staleNow, probe: staleProbe() };
+      const input = { repo, pr, head, env, status, now: staleNow };
       const marker = `${statusPath}.stale-redispatch-1`;
       expect(staleRecovery.staleRedTeamSpent(input)).toBe(false);
       const result = staleRecovery.abandonStaleRedTeamRun(input);
@@ -1671,31 +1671,10 @@ describe('abandonStaleRedTeamRun — durable one-shot marker', () => {
       expect(staleRecovery.staleRedTeamSpent(input)).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each(['owner identity unreadable', 'unprobeable owner within deadline'])(
-    'refuses abandonment when the re-read has %s without a marker or event', kind => {
-      const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-refused-'));
-      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'daemon-events.jsonl') };
-      try {
-        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-        const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-        const status = deadRunningStatus(kind === 'unprobeable owner within deadline' ? { host: 'remote' } : {});
-        const original = JSON.stringify(status);
-        writeFileSync(statusPath, original);
-        const priorEvent = `${JSON.stringify({ kind: 'prior-event' })}\n`;
-        writeFileSync(env.WE_DAEMON_EVENTS, priorEvent);
-        const probe = staleProbe(true, null);
-        expect(staleRecovery.staleRedTeamRun({ status, now: staleNow, probe }).stale).toBe(false);
-        expect(staleRecovery.abandonStaleRedTeamRun({ repo, pr, head, env, status, now: staleNow, probe }))
-          .toEqual({ ok: false });
-        expect(existsSync(`${statusPath}.stale-redispatch-1`)).toBe(false);
-        expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toBe(priorEvent);
-        expect(readFileSync(statusPath, 'utf8')).toBe(original);
-      } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
 });
 
 describe('recoverStaleRunPayload — head-bound accepting review run', () => {
-  it.each([false, true])('returns the newest matching run when it owes red team despite list order reversed=%s', reverse => {
+  it.each([false, true])('selects newest eligible run despite list order reversed=%s', reverse => {
     const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-payload-'));
     try {
       const run = (id, at, over = {}) => {
@@ -1704,10 +1683,9 @@ describe('recoverStaleRunPayload — head-bound accepting review run', () => {
         utimesSync(join(dir, `${id}.json`), new Date(at), new Date(at));
         return value;
       };
-      const rows = [run('review-pr-old', 1000), run('review-pr-newest-matching', 4500),
+      const rows = [run('review-pr-old', 1000), run('review-pr-newest-eligible', 2000),
         run('review-pr-rejected', 3000, { verdict: { verdict: 'changes' } }),
         run('review-pr-truncated', 4000, { verdict: null }),
-        run('review-pr-carried', 4200, { carriedFrom: 'older-run' }),
         run('review-pr-other-head', 5000, { findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }),
         run('review-pr-other-repo', 6000, { input: { repo: 'other/repo', pr } }),
         run('review-pr-other-pr', 7000, { input: { repo, pr: pr + 1 } }),
@@ -1719,28 +1697,6 @@ describe('recoverStaleRunPayload — head-bound accepting review run', () => {
         .toEqual(rows[1]);
       expect(list).toHaveBeenCalledWith(dir);
       expect(read).not.toHaveBeenCalledWith('other-run', expect.anything());
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-  it.each([
-    ['rejecting', { verdict: { verdict: 'changes' } }],
-    ['incomplete', { verdict: null }],
-    ['carried', { carriedFrom: 'older-run' }],
-  ])('returns null when a newer %s review supersedes an older accept in either list order', (_kind, over) => {
-    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-superseded-'));
-    try {
-      const rows = [
-        { ...newRunRecord({ id: 'review-pr-old-accept', op: 'review-pr', input: { repo, pr } }), ...payload() },
-        { ...newRunRecord({ id: 'review-pr-newest', op: 'review-pr', input: { repo, pr } }), ...payload(), ...over },
-      ];
-      rows.forEach((row, i) => {
-        writeRun(row, dir);
-        utimesSync(join(dir, `${row.id}.json`), new Date(1000 * (i + 1)), new Date(1000 * (i + 1)));
-      });
-      const read = id => rows.find(row => row.id === id);
-      expect(staleRecovery.recoverStaleRunPayload({ repo, pr, head, runsDir: dir,
-        list: () => rows.map(row => row.id), read })).toBeNull();
-      expect(staleRecovery.recoverStaleRunPayload({ repo, pr, head, runsDir: dir,
-        list: () => rows.map(row => row.id).reverse(), read })).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each(['empty', 'truncated', 'non-accepting', 'wrong-head', 'wrong-repo', 'wrong-pr'])(

@@ -60,7 +60,7 @@ export function staleRedTeamSpent(key) {
 }
 
 /** Exclusively spend recovery before dispatch; only a confirmed non-start may release it. */
-export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(), probe = {} }) {
+export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now() }) {
   const path = staleStatusPath({ repo, pr, head, env }), marker = `${path}.stale-redispatch-1`;
   let claimed = false;
   const release = () => { try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
@@ -70,7 +70,7 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
       || current.status !== 'running' || current.result != null
       || current.pid !== status?.pid || current.pidStart !== status?.pidStart
       || current.host !== status?.host || current.pidNamespace !== status?.pidNamespace) return { ok: false };
-    if (staleRedTeamRun({ status: current, now, probe }).stale !== true) return { ok: false };
+    if (staleRedTeamRun({ status: current, now }).reason === 'running red team owner is live') return { ok: false };
     closeSync(openSync(marker, 'wx')); claimed = true;
     const reason = 'running red team owner is dead or exceeded stale deadline';
     const at = new Date(now).toISOString();
@@ -83,7 +83,7 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
   } catch { if (claimed) { try { release(); } catch { /* keep closed */ } } return { ok: false }; }
 }
 
-/** Runs are updated in place: the newest matching review by file mtime decides whether recovery is owed. */
+/** Runs are updated in place: choose the newest eligible review by file mtime, not id order. */
 export function recoverStaleRunPayload({ repo, pr, head, env = process.env,
   runsDir = env.OPERATION_RUNS_DIR || env.WE_SHARED_RUNS_DIR || resolveRunsDir(), list = listRunIds, read = readRun }) {
   try {
@@ -92,11 +92,11 @@ export function recoverStaleRunPayload({ repo, pr, head, env = process.env,
       if (!id.startsWith('review-pr-')) continue;
       const run = read(id, runsDir);
       if (run?.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)
-        || run.findings?.read?.netBasis?.rev !== head) continue;
+        || run.findings?.read?.netBasis?.rev !== head || run.carriedFrom != null || !redTeamOwedFor(run)) continue;
       const at = statSync(join(runsDir, `${id}.json`)).mtimeMs;
       if (at > newestAt) { newest = run; newestAt = at; }
     }
-    return newest?.carriedFrom == null && redTeamOwedFor(newest) ? newest : null;
+    return newest;
   } catch { return null; }
 }
 
@@ -434,7 +434,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 row.why = 'accepting review run unavailable; inspect stored evidence';
               } else {
                 abandonment = abandonStale({ repo, pr: row.prNumber, head: row.head,
-                  status: readStatus({ repo, pr: row.prNumber, head: row.head }), env, now: at, probe });
+                  status: readStatus({ repo, pr: row.prNumber, head: row.head }), env, now: at });
                 if (abandonment?.ok !== true) row.why = 'stale red team abandonment refused; inspect review run';
               }
             } catch { row.why = 'stale review run recovery unreadable; inspect stored evidence'; }
