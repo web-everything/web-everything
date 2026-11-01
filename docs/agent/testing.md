@@ -2039,10 +2039,12 @@ checkout; foreign directories with the same suffix retain local admission.
 Keep the compound-wrapper table for both npm scripts and the direct heavy-admission wrapper,
 plus the native spawn regression that observes HELD on both the wrapper and following scanner.
 Plan each phase's own command even when admission spans the whole gate; never reuse an
-earlier phase's rewrite for standards, scanners or guards. Strip only trailing
-`--passWithNoTests`, `--testTimeout=<digits>` (at least 5000) and `--hookTimeout=<digits>`
-(at least 10000) before checking the remaining arguments with Forge's existing `allowedCommand` guard.
-Smaller timeouts stay local so remote defaults cannot loosen them. Remote location evidence
+earlier phase's rewrite for standards, scanners or guards. Check all original arguments with
+Forge's existing `allowedCommand` guard. Unsupported flags, including `--passWithNoTests`,
+`--testTimeout` and `--hookTimeout`, keep the original command and local admission. Never strip
+flags to qualify a command for Forge: its nested wrapper may fall back locally, where losing
+the requested timeouts or empty-match behavior changes the verdict. Keep the timeout-preservation
+regression for both whole-gate and per-phase admission, including quoted flags. Remote location evidence
 requires a non-empty receipt ID and an integer exit code; a dispatched attempt with an incomplete or missing report is location `unknown` (never local), and any unknown phase makes the overall location unknown.
 Observe report reads in tests: reject an already oversized file before reading content, and
 request at most 65,537 bytes even if a regular file grows after its size check.

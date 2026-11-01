@@ -825,7 +825,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       currentAdmission = acquired;
       process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
       startHeartbeat();
-      // Run the original command, including flags stripped for Forge. One confirmation only;
+      // Run the original command. One confirmation only;
       // its verdict and failure inventory replace the remote result before isolated retry.
       result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
     }

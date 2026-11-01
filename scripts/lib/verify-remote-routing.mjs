@@ -21,19 +21,11 @@ function wrappedVitestCommand(command) {
   if (!match) return null;
   const words = simpleShellWords(match[1]);
   if (!words) return null;
-  // Strip only the gate's trailing local flags: default timeouts (5s tests, 10s hooks) and
-  // failing empty matches without passWithNoTests make remote runs stricter or equal,
-  // never greener. Forge is not loaded, so load-scaled timeouts are unneeded.
-  const canStrip = arg => {
-    const value = unquote(arg);
-    if (value === '--passWithNoTests') return true;
-    const timeout = /^--(testTimeout|hookTimeout)=(\d+)$/.exec(value);
-    return !!timeout && Number(timeout[2]) >= (timeout[1] === 'testTimeout' ? 5000 : 10000);
-  };
-  const args = words.slice(0, words.findLastIndex(arg => !canStrip(arg)) + 1);
-  // Reuse Forge's guard: unknown options, report files and worker overrides stay local.
-  if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
-  return `npm run test:unit -- ${args.join(' ')}`;
+  // The nested wrapper can fall back locally, so it must receive every original argument.
+  // Unsupported options (including timeouts and passWithNoTests) retain local admission;
+  // stripping them would change the local verdict after a successful remote preflight.
+  if (!allowedCommand(['npx', 'vitest', 'run', ...words.map(unquote)])) return null;
+  return `npm run test:unit -- ${words.join(' ')}`;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {

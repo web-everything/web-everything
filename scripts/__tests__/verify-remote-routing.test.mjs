@@ -11,6 +11,71 @@ vi.mock('node:fs', async importOriginal => {
   return { ...fs, fstatSync: vi.fn(fs.fstatSync), readSync: vi.fn(fs.readSync) };
 });
 
+describe('timeout preservation', () => {
+  it.each([
+    '--testTimeout=15000 --hookTimeout=30000',
+    '--hookTimeout=30000 --testTimeout=15000 --passWithNoTests',
+    '--testTimeout=5000 --hookTimeout=10000',
+    "'--testTimeout=15000' --hookTimeout='30000'",
+    "--test'Timeout'=15000",
+    '--testTimeout 15000 --hookTimeout 30000',
+    '--testTimeout=15000 --testTimeout=30000',
+    '--testTimeout=15000 --reporter=dot',
+    '--passWithNoTests',
+  ])('keeps unsupported gate options intact under remote policy: %s', flags => {
+    const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
+      .toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+
+  it.each([false, true])('runs the edited test once with its original timeouts and local admission (phase=%s)', async phaseAdmission => {
+    const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
+    const admissionStart = source.indexOf('async function acquireAdmission(');
+    const admissionEnd = source.indexOf('const admission = await acquireAdmission(', admissionStart);
+    const runStart = source.indexOf('async function timedRunGate(');
+    const runEnd = source.indexOf('// runVitestOnBase', runStart);
+    expect(admissionStart).toBeGreaterThan(-1);
+    expect(admissionEnd).toBeGreaterThan(admissionStart);
+    expect(runStart).toBeGreaterThan(-1);
+    expect(runEnd).toBeGreaterThan(runStart);
+    const command = 'npx vitest run scripts/changed.test.mjs --testTimeout=15000 --hookTimeout=30000';
+    const acquireSlotBlocking = vi.fn(async () => ({ ok: true, slot: 0, waitedMs: 0 }));
+    const decidePhaseRemote = vi.fn(async () => ({ remote: true }));
+    // Simulate Forge becoming unavailable: the child runs locally and needs the requested
+    // timeout for a six-second edited test. A stripped command produces the original red.
+    const runGate = vi.fn(async childCommand => ({
+      exitCode: childCommand.includes('--testTimeout=15000') && childCommand.includes('--hookTimeout=30000') ? 0 : 1,
+      ranOn: { location: 'local' },
+    }));
+    const context = {
+      phaseAdmission, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
+      phaseAdmissionKind: () => ({ kind: 'files' }), classifyCommandKind: () => 'selected',
+      admissionPhases: {}, laneMatch: null, GATE: command, ADMISSION_TIMEOUT_MS: 1000,
+      shouldConfirmRemoteRed, remoteInfrastructureFailure, mergeRunLocation: (a, b) => a === b ? a : 'mixed',
+      runGate, recordOutcome: vi.fn(), buildPhaseOutcome: value => value,
+      ranOnPhases: {}, phaseMs: {}, remoteUnconfirmed: false, phaseTimeout: null, vitestAdmittedLocally: false,
+      resolvedGate: { decision: { changedFiles: ['scripts/changed.test.mjs'] } },
+      slotHeartbeat: null, setInterval: vi.fn(() => ({ unref() {} })), clearInterval: vi.fn(),
+      heartbeatOwnedSlot: vi.fn(), releaseOwnedSlot: vi.fn(),
+      ADMISSION_LOCK_ROOT: '', ADMISSION_CAP: 1, REPO: repo, SLOT_HEARTBEAT_MS: 1000,
+      PHASE_TIMEOUT_MS: 60000, MARKER_NONCE_SUFFIX: '', performance,
+      process: { env: {}, stderr: { write: vi.fn() } },
+    };
+    const acquireAdmission = runInNewContext(`${source.slice(admissionStart, admissionEnd)}; acquireAdmission`, context);
+    context.admission = await acquireAdmission('vitest', command);
+    context.firstPhaseAdmission = context.admission;
+    context.currentAdmission = context.admission;
+    const timedRunGate = runInNewContext(`${source.slice(runStart, runEnd)}; timedRunGate`, context);
+    const result = await timedRunGate('vitestMs', command);
+    expect(result.exitCode).toBe(0);
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(runGate).toHaveBeenCalledWith(command, undefined, { forgeDispatch: false });
+    expect(acquireSlotBlocking).toHaveBeenCalledTimes(1);
+    expect(decidePhaseRemote).not.toHaveBeenCalled();
+    expect(context.vitestAdmittedLocally).toBe(true);
+  });
+});
+
 describe('proven local fallback verdict', () => {
   it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
     const ranOn = phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode })));
@@ -148,17 +213,18 @@ describe('verify remote routing', () => {
     });
   });
   it.each([
-    ['--passWithNoTests --testTimeout=15000 --hookTimeout=30000', ''],
-    ['--testTimeout=15000 --hookTimeout=30000 --passWithNoTests', ''],
-    ['--passWithNoTests', ''],
-    ['--testTimeout=15000', ''],
-    ['--hookTimeout=30000', ''],
-    ['--testTimeout=5000 --hookTimeout=10000', ''],
-    ['--reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ' --reporter=dot'],
-  ])('remote selected Vitest run strips only trailing local gate flags: %s', (flags, retained) => {
+    '--passWithNoTests --testTimeout=15000 --hookTimeout=30000',
+    '--testTimeout=15000 --hookTimeout=30000 --passWithNoTests',
+    '--passWithNoTests',
+    '--testTimeout=15000',
+    '--hookTimeout=30000',
+    '--testTimeout=5000 --hookTimeout=10000',
+    '--reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
+  ])('selected Vitest run retains unsupported trailing gate flags with local admission: %s', flags => {
     const files = "'scripts/path with spaces.test.mjs' 'scripts/two.test.mjs'";
-    expect(phaseAdmissionPlan({ command: `npx vitest run ${files} ${flags}`, decision: { remote: true } })).toEqual({
-      command: `npm run test:unit -- ${files}${retained}`, takeLocalSlot: false, setHeld: false,
+    const command = `npx vitest run ${files} ${flags}`;
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({
+      command, takeLocalSlot: true, setHeld: true,
     });
   });
   it('local selected Vitest run retains its command, slot and HELD', () => {
@@ -327,7 +393,9 @@ describe('verify-lane remote phase spawn', () => {
     ['unreadable', 0, 'unknown', false],
     ['raw', 0, 'local', true],
     ['raw', 0, 'local', true, 'npm run test:unit && node raw.cjs'],
-    ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
+    ['raw', 0, 'local', true, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
+      ['vitest', 'run', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot', '--passWithNoTests', '--testTimeout=15000', '--hookTimeout=30000']],
+    ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot",
       ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot']],
     ['raw', 0, 'local', true, 'npx vitest run one.test.mjs --unknown --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
       ['vitest', 'run', 'one.test.mjs', '--unknown', '--passWithNoTests', '--testTimeout=15000', '--hookTimeout=30000']],
@@ -339,13 +407,13 @@ describe('verify-lane remote phase spawn', () => {
       ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', 'retry.test.mjs']],
     ['raw', 0, 'local', true, "VERIFY_SCAN_FILES='one.mjs' npx vitest run scan.test.mjs", ['vitest', 'run', 'scan.test.mjs']],
     ...[false, true].map(phaseAdmission => ['remote', 0, 'remote', false,
-      "npx vitest run 'one.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
+      "npx vitest run 'one.test.mjs'",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission]),
     ['remote', 0, 'local', false, 'npm run check:standards', undefined, undefined, 75],
     ['remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1],
     ['local', 1, 'local', true, 'npm run test:unit', undefined, undefined, 0, 1],
     ...[false, true].flatMap(phaseAdmission => [0, 1].map(localExit => ['remote', localExit, 'local', false,
-      "npx vitest run 'one.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
+      "npx vitest run 'one.test.mjs'",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, localExit])),
     ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], true, 1, 1, 0],
     ...[false, true].map(phaseAdmission => ['remote', 1, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, 1, 1]),
