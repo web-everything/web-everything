@@ -304,7 +304,9 @@ export const BUSY_POOL_SIGNATURES = Object.freeze([
   /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
   /scan exceeded its \d+ms budget/,
   /gave up waiting for the shared acquirability-scan lock/,
-  /no free lane/i,
+  // The other "no free lane" reasons include failed provisioning and incomplete scans, neither of
+  // which proves pool exhaustion. Only the completed all-held/dirty result is a busy-pool signature.
+  /no free lane in pool "[^"\r\n]+" \(\d+ all held\/dirty\)/i,
   LOCK_CONTENTION_SIGNATURE,
 ]);
 export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
