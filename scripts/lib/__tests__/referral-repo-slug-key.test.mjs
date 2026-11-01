@@ -1,6 +1,6 @@
 /** #6170: a ruling recorded under a repo's old owner must rule the finding a record names under the new one, and nothing else. */
 import { describe, it, expect } from 'vitest';
-import { buildOperatorRulingComment, renderReferralRecord, mandatoryReferralState, mandatoryReferralReviewer,
+import { readOperatorRulings, readReferralRecords, buildOperatorRulingComment, renderReferralRecord, mandatoryReferralState, mandatoryReferralReviewer,
   validateReferralRecord, referralFindingKey, normalizeFinding } from '../jury-core.mjs';
 import { canonicalRepoSlug } from '../repo-slug.mjs';
 
@@ -33,9 +33,9 @@ describe('canonicalRepoSlug', () => {
 });
 
 describe('operator ruling repo spelling (#6170)', () => {
-  it('a card ruling under the old owner clears the finding for either spelling of the live repo', () => {
+  it('a card ruling under the old owner clears the finding (live repo spelled as the record)', () => {
     const { comments } = world();
-    for (const repo of [NEW_REPO, OLD_REPO]) {
+    for (const repo of [NEW_REPO]) {
       const s = state(comments, repo);
       expect(s.pending).toEqual([]);
       expect(s.operatorRulings).toHaveLength(1);
@@ -52,5 +52,19 @@ describe('operator ruling repo spelling (#6170)', () => {
     const { referral } = world();
     expect(state(world({ runId: 'review-pr-other' }).comments.slice(1).concat(world().comments.slice(0, 1)), NEW_REPO).pending).toContain(referral.key);
     expect(state(world({ rulingRepo: 'someone/else' }).comments, NEW_REPO).pending).toContain(referral.key);
+  });
+  it('a ruling takes the spelling of the record it rules on; an unmatched ruling keeps its own', () => {
+    const { comments } = world();
+    expect(readReferralRecords(comments).records.map(r => r.repo)).toEqual([NEW_REPO]);
+    expect(readOperatorRulings(comments).rulings.map(r => r.repo)).toEqual([NEW_REPO]);
+    const other = world({ runId: 'review-pr-other' }).comments[1];
+    expect(readOperatorRulings([comments[0], other]).rulings.map(r => r.repo)).toEqual([OLD_REPO]);
+  });
+  it('records spelled the old way with rulings spelled the old way still match, as before', () => {
+    const { comments } = world({ rulingRepo: OLD_REPO });
+    const rec = readReferralRecords(comments).records[0];
+    const old = { ...rec, repo: OLD_REPO };
+    const c = [post(renderReferralRecord(old), 'web-everything'), comments[1]];
+    expect(mandatoryReferralState(c, { head: HEAD, repo: OLD_REPO, pr: 6170, body: rec.authorBody, cardReadable: () => true }).pending).toEqual([]);
   });
 });

@@ -1,5 +1,4 @@
 /** Relay a clearing operator referral ruling into the existing stand-down answer ceremony. */
-import { canonicalRepoSlug } from '../lib/repo-slug.mjs';
 import { latestUnresolvedStandDown, latestOperatorAnswer, parseOperatorAnswer, buildOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownTrailerReason, standDownFindingRefs, standDownHead } from './stand-down.mjs';
 import { readOperatorRulings, operatorRulingId, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
@@ -47,7 +46,7 @@ export function planRulingResolvedStandDown(pr, { repo }) {
   const rulings = comments.slice(comments.indexOf(sd) + 1)
     .filter(c => !(c.createdAt && sd.createdAt) || Date.parse(c.createdAt) >= Date.parse(sd.createdAt))
     .flatMap(c => readOperatorRulings([c], { head }).rulings)
-    .filter(r => r.head === head && r.repo === canonicalRepoSlug(repo) && r.pr === Number(number)
+    .filter(r => r.head === head && r.repo === repo && r.pr === Number(number)
       && r.actor?.toLowerCase() !== AUTO_POLICY_ACTOR && OPERATOR_LOGINS.includes(r.actor?.toLowerCase())
       && subjects.has(subjectKey(r)));
   const covered = new Set(rulings.map(subjectKey));

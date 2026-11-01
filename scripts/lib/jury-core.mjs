@@ -3758,9 +3758,7 @@ export function readReferralRecords(comments, { head } = {}) {
       } catch { malformed = true; }
     }
   }
-  // Every reader sees the canonical repo spelling (the map key above keeps the stored one for de-duplication), so a record
-  // and an operator ruling (see readOperatorRulings) compare equal at every site, never at some sites only (#6170).
-  return { records: [...records.values()].map(r => ({ ...r, repo: canonicalRepoSlug(r.repo) })), malformed };
+  return { records: [...records.values()], malformed };
 }
 
 /**
@@ -3871,6 +3869,17 @@ export function readOperatorRulings(comments, { head } = {}) {
   const rulings = [];
   let malformed = false;
   const current = /^[a-f0-9]{40}$/.test(head ?? '') ? head : null;
+  // #6170 — a repo that changed owner is spelled two ways in one thread (a ruling written from a clone with the old
+  // origin, records written under the new name). A ruling takes the spelling of the ONE record it rules on, found by
+  // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
+  // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
+  let recordRepos;
+  const spellingOf = (repo, pr, head, runId) => {
+    if (canonicalRepoSlug(repo) === repo) return repo;
+    recordRepos ??= readReferralRecords(comments).records;
+    return recordRepos.find(x => x.pr === pr && x.head === head && x.runId === runId
+      && canonicalRepoSlug(x.repo) === canonicalRepoSlug(repo))?.repo ?? repo;
+  };
   for (const comment of Array.isArray(comments) ? comments : []) {
     const parsed = parseOperatorRulingComment(comment);
     if (!parsed) continue;
@@ -3878,7 +3887,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: canonicalRepoSlug(r.repo), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
@@ -3890,7 +3899,7 @@ export function readOperatorRulings(comments, { head } = {}) {
 export function mandatoryReferralState(comments, context = {}) {
   const { records, malformed } = readReferralRecords(comments, context);
   const operator = readOperatorRulings(comments, context);
-  context = { ...context, ...(context.repo ? { repo: canonicalRepoSlug(context.repo) } : {}), operatorRulings: operator.rulings };
+  context = { ...context, operatorRulings: operator.rulings };
   const pending = malformed ? ['malformed-referral-record'] : [];
   if (operator.malformed) pending.push('malformed-operator-ruling');
   if (records.length && Object.hasOwn(context, 'head') && !/^[a-f0-9]{40}$/.test(context.head ?? '')) {
