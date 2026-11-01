@@ -657,11 +657,9 @@ function deriveCaller(env) {
 }
 const CALLER = deriveCaller(process.env);
 
-function runThrottled(argv, env) {
-  if (!existsSync(GH_THROTTLE_CLI)) {
-    warnFallback('throttle CLI not found at ' + GH_THROTTLE_CLI);
-    return runDirect(argv, env, 'missing-entry');
-  }
+// Spawn path: the throttle entry run as its own node process. Kept for a throttle module that does not export
+// \`runGhCliPassthrough\` (older checkouts, test relays) so the contract with the CLI is unchanged.
+function runThrottledSpawn(argv, env) {
   const result = spawnSync(process.execPath, [GH_THROTTLE_CLI, ...argv], {
     stdio: ['inherit', 'pipe', 'pipe'],
     env: Object.assign({}, env, { WE_GH_THROTTLE_GH_BIN: REAL_GH }, CALLER ? { WE_GH_THROTTLE_CALLER: CALLER } : {}),
@@ -676,6 +674,59 @@ function runThrottled(argv, env) {
     return runDirect(argv, env, 'missing-import');
   }
   return result;
+}
+// perf (R320 #1): the throttle runs IN this process (one node before gh, not two). The process env is swapped to
+// exactly what the spawned CLI would have received, then restored. A module that fails to LOAD proves gh was
+// never reached, so it degrades to the direct call without the old extra probe process.
+async function runThrottled(argv, env) {
+  if (!existsSync(GH_THROTTLE_CLI)) {
+    warnFallback('throttle CLI not found at ' + GH_THROTTLE_CLI);
+    return runDirect(argv, env, 'missing-entry');
+  }
+  const saved = Object.assign({}, process.env);
+  const merged = Object.assign({}, env, { WE_GH_THROTTLE_GH_BIN: REAL_GH }, CALLER ? { WE_GH_THROTTLE_CALLER: CALLER } : {});
+  const setEnv = (values) => {
+    for (const k of Object.keys(process.env)) delete process.env[k];
+    Object.assign(process.env, values);
+  };
+  try {
+    setEnv(merged);
+    // Only the real throttle module (it exports runGhCliPassthrough and does nothing at import) is loaded in
+    // process; any other entry (an older checkout, a relay) is run as a child exactly as before, never imported.
+    let inProcessOk = false;
+    try { inProcessOk = /export function runGhCliPassthrough\\(/.test(readFileSync(GH_THROTTLE_CLI, 'utf8')); } catch { /* unreadable: child path decides */ }
+    if (!inProcessOk) { setEnv(saved); return runThrottledSpawn(argv, env); }
+    // Output of module load and of the call is captured exactly as the child's piped stdio was (a droppable
+    // diagnostic on an auth retry), and discarded when the child path is taken instead (it re-emits its own).
+    const out = []; const err = [];
+    const realOut = process.stdout.write; const realErr = process.stderr.write;
+    const grab = (sink) => function (chunk, enc, cb) { sink.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), typeof enc === 'string' ? enc : 'utf8')); const done = typeof enc === 'function' ? enc : cb; if (typeof done === 'function') done(); return true; };
+    const capture = (on) => { process.stdout.write = on ? grab(out) : realOut; process.stderr.write = on ? grab(err) : realErr; };
+    let mod;
+    capture(true);
+    try { mod = await import(pathToFileURL(GH_THROTTLE_CLI).href); } catch (e) {
+      capture(false);
+      setEnv(saved);
+      // Only a stranded file/import (probe-proven) degrades to the direct call, exactly as before. Any other load
+      // failure is handed to the child path, which reproduces the old loader diagnostics byte for byte.
+      if (!e || e.code !== 'ERR_MODULE_NOT_FOUND' || !throttleCliFailsToLoad(env)) return runThrottledSpawn(argv, env);
+      warnFallback('throttle CLI at ' + GH_THROTTLE_CLI + ' failed to load (its checkout or one of its own imports is unavailable)');
+      return runDirect(argv, env, 'missing-import');
+    }
+    if (typeof mod.runGhCliPassthrough !== 'function') { capture(false); setEnv(saved); return runThrottledSpawn(argv, env); }
+    try {
+      const repo = merged.WE_GH_THROTTLE_OWNER_REPO || process.cwd();
+      const owner = merged.WE_GH_THROTTLE_OWNER || process.pid + ':' + randomUUID();
+      // Re-arm the once-per-process warning flag so a retry behaves like a fresh child.
+      if (typeof mod.resetGhThrottleFailOpenWarning === 'function') mod.resetGhThrottleFailOpenWarning();
+      const r = mod.runGhCliPassthrough(argv, { throttle: { repo, owner, caller: merged.WE_GH_THROTTLE_CALLER || (merged.GH_CALLER ? undefined : 'unknown') }, bin: REAL_GH });
+      capture(false);
+      return { status: r.status, stdout: Buffer.concat([...out, r.stdout || Buffer.alloc(0)]), stderr: Buffer.concat([...err, r.stderr || Buffer.alloc(0)]) };
+    } catch (e) {
+      capture(false);
+      return { status: 1, stdout: Buffer.concat(out), stderr: Buffer.concat([...err, Buffer.from('✗ gh-throttle error: ' + String(e && e.stack || e) + '\\n')]) };
+    } finally { capture(false); }
+  } finally { setEnv(saved); }
 }
 
 let cachedInstallationId = null;
@@ -768,7 +819,7 @@ function invalidateSharedCache() {
 // for a payload over the ~64KB pipe-buffer size that write is ASYNCHRONOUS — \`process.exit()\` tears the
 // process down before it drains, silently truncating whatever \`gh\` printed. Setting \`exitCode\` and letting the
 // script fall off the end instead keeps the event loop alive until every queued write really lands.
-function runInherited(env, reason, rejectedStderr) {
+async function runInherited(env, reason, rejectedStderr) {
   const inheritedApp = DAEMON && !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
   if (DAEMON) {
     if (!inheritedApp) {
@@ -789,7 +840,7 @@ function runInherited(env, reason, rejectedStderr) {
   // #4064: was a direct \`spawnSync(REAL_GH, ..., {stdio:'inherit'})\` — now routed through the SAME throttled
   // hop as the tokened path below (stdout/stderr captured then relayed, never \`process.exit()\`'d past — see
   // the block comment above), so the concurrency cap still applies on the no-cached-token fallback too.
-  const result = runThrottled(inheritedApp ? appTokenArgv(process.argv.slice(2)) : process.argv.slice(2), env);
+  const result = await runThrottled(inheritedApp ? appTokenArgv(process.argv.slice(2)) : process.argv.slice(2), env);
   if (result.error) {
     process.stderr.write(String(result.error && result.error.message || result.error) + '\\n');
     process.exitCode = 1;
@@ -1047,8 +1098,11 @@ function unsupportedTargetHost(argv, env) {
   }
   return null;
 }
-const unsupportedHost = DAEMON ? unsupportedTargetHost(process.argv.slice(2), process.env) : null;
-let token = unsupportedHost ? null : freshCachedToken();
+let unsupportedHost = null;
+let token = null;
+async function mainFlow() {
+unsupportedHost = DAEMON ? unsupportedTargetHost(process.argv.slice(2), process.env) : null;
+token = unsupportedHost ? null : freshCachedToken();
 if (!token && DAEMON && !unsupportedHost) {
   // One bounded synchronous mint attempt, then one cache re-read. CLI output never reaches the caller.
   try {
@@ -1064,9 +1118,9 @@ if (!token && DAEMON && !unsupportedHost) {
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 if (!token) {
-  runInherited(process.env, unsupportedHost ? 'unsupported GitHub host (' + unsupportedHost + ')' : undefined);
+  await runInherited(process.env, unsupportedHost ? 'unsupported GitHub host (' + unsupportedHost + ')' : undefined);
 } else {
-  const withToken = runThrottled(appTokenArgv(process.argv.slice(2)), Object.assign({}, process.env, { GH_TOKEN: token }));
+  const withToken = await runThrottled(appTokenArgv(process.argv.slice(2)), Object.assign({}, process.env, { GH_TOKEN: token }));
   if (withToken.error) {
     process.stderr.write(String(withToken.error.message || withToken.error) + '\\n');
     process.exitCode = 1;
@@ -1074,7 +1128,7 @@ if (!token) {
     const stderrText = withToken.stderr ? withToken.stderr.toString('utf8') : '';
     if (withToken.status !== 0 && looksLikeAppTokenAuthFailure(stderrText)) {
       invalidateSharedCache();
-      runInherited(process.env, 'App token rejected (HTTP 401 / Bad credentials)', stderrText); // guarded inherited-auth retry
+      await runInherited(process.env, 'App token rejected (HTTP 401 / Bad credentials)', stderrText); // guarded inherited-auth retry
     } else {
       if (withToken.stdout && withToken.stdout.length) process.stdout.write(withToken.stdout);
       if (withToken.stderr && withToken.stderr.length) process.stderr.write(withToken.stderr);
@@ -1082,6 +1136,8 @@ if (!token) {
     }
   }
 }
+}
+mainFlow().catch((e) => { process.stderr.write('gh-shim: ' + String(e && e.stack || e) + '\\n'); process.exitCode = 1; });
 `;
 }
 
