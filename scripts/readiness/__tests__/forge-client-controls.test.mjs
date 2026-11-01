@@ -181,7 +181,7 @@ describe('shared command classes', () => {
   });
   const rejected=['--config','--config=','--config=x','--root','--root=x','--dir','--dir=x','--outputFile','--outputFile=x',
     '--coverage.reportsDirectory','--coverage.reportsDirectory=x','--coverage.reporter=html','--coverage.thresholds.lines=0',
-    '--setupFiles=x','--reporter=./evil.mjs','--poolOptions.threads.execArgv=--import=x','--passWithNoTests','--run=false',
+    '--setupFiles=x','--reporter=./evil.mjs','--poolOptions.threads.execArgv=--import=x','--passWithNoTests=true','--testTimeout=abc','--run=false',
     '--Run','--coverage=false','--watch','--inspect','--','../a.test.mjs','x/../a.test.mjs','/a.test.mjs','C:\\a.test.mjs','x\\..\\a.test.mjs'];
   it.each(classes.flatMap(argv=>rejected.map(arg=>[argv,arg])))('rejects unsafe spelling %j %s on both sides', (argv,arg) => {
     expect(isAllowedCommand(withArg(argv,arg))).toBe(false);
