@@ -150,6 +150,37 @@ describe('createSharedReconcile — decision equivalence with the old per-step p
   });
 });
 
+describe('createSharedReconcile — external changes and incomplete evidence', () => {
+  it('a fix claim taken by another process after planning drops the snapshot (ownership is never stale)', () => {
+    const w = world();
+    let claimSet = '';
+    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, claimFingerprint: () => claimSet });
+    expect(decide.ciHeal(s.reconcile({ repo: 'we' }))).toEqual([2]);
+    w.claims.add(2);
+    claimSet = 'we#2:fix:other-process';
+    expect(decide.ciHeal(s.reconcile({ repo: 'we' }))).toEqual([]);
+    expect(w.calls.length).toBe(2);
+  });
+
+  it('an unchanged claim set keeps serving the snapshot', () => {
+    const w = world();
+    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, claimFingerprint: () => 'we#1:fix:me' });
+    s.reconcile({ repo: 'we' });
+    s.reconcile({ repo: 'we' });
+    expect(w.calls.length).toBe(1);
+  });
+
+  it('a plan built on a failed or deferred hydration read is not cached: the next step retries', () => {
+    let n = 0;
+    const run = ({ readPrs }) => { readPrs({ repo: 'we' }); n += 1; return { dispatch: [], refusals: n === 1 ? [{ kind: 'check-read-failed', prNumber: 1 }] : [], notes: [] }; };
+    const s = createSharedReconcile({ run, readPrs: () => [{ number: 1 }] });
+    expect(s.reconcile({ repo: 'we' }).refusals.length).toBe(1);
+    expect(s.reconcile({ repo: 'we' }).refusals.length).toBe(0); // retried, now readable
+    s.reconcile({ repo: 'we' });
+    expect(n).toBe(2); // the recovered plan is cached
+  });
+});
+
 describe('stepMayHaveMutated', () => {
   it('a dispatch, a park or a failed tick may have mutated PRs; read-only refusals may not', () => {
     expect(stepMayHaveMutated({ dispatched: [{ pr: 1 }] })).toBe(true);

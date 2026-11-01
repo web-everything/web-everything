@@ -11,7 +11,9 @@
  * Staleness rule (exact, no partial re-plan): any step that may have changed PR state calls
  * `invalidate(repo)`, which drops the repo's snapshot; the next request re-runs the planner in full from fresh
  * reads, i.e. the old behaviour. A snapshot is also never kept when discovery was incomplete or deferred, or when
- * the request carries anything beyond `{repo, allowStandDownAutoProceed}` (those bypass the cache).
+ * the plan carries a read-failure/deferral refusal (so the next step retries the read), or when the request carries anything beyond `{repo, allowStandDownAutoProceed}` (those bypass the cache).
+ * A cached snapshot is also dropped at serve time if the live fix-claim set differs from the one it was planned
+ * under (another process took or released a claim), so ownership is never read stale.
  * A snapshot computed with allowStandDownAutoProceed=true serves callers asking for false; a true request after
  * a false snapshot recomputes.
  */
@@ -30,8 +32,18 @@ export function stepMayHaveMutated(entry) {
     || (entry?.refusals ?? []).some((r) => !READ_ONLY_REFUSAL_KINDS.has(r?.kind));
 }
 
-export function createSharedReconcile({ run = runReconcilePass, readPrs = defaultReadPrs, clone = structuredClone } = {}) {
-  const cache = new Map(); // repo -> {plan, allow}
+const INCOMPLETE_KIND = /read-failed|deferred|unavailable|unreadable|incomplete/i;
+/** A plan built on a failed or deferred read must not be reused: the next step retries the read. */
+export function planIsIncomplete(plan) {
+  return (plan?.refusals ?? []).some((r) => INCOMPLETE_KIND.test(String(r?.kind ?? '')))
+    || (plan?.notes ?? []).some((n) => typeof n === 'string');
+}
+
+export function createSharedReconcile({
+  run = runReconcilePass, readPrs = defaultReadPrs, clone = structuredClone,
+  claimFingerprint = () => '', // the live fix-claim set as a string; a change since planning drops the snapshot
+} = {}) {
+  const cache = new Map(); // repo -> {plan, allow, claims}
   const stats = { computed: 0, served: 0 };
 
   function compute(repo, allow) {
@@ -56,9 +68,10 @@ export function createSharedReconcile({ run = runReconcilePass, readPrs = defaul
     if (Object.keys(rest).length || repo == null) return run(input);
     const allow = allowStandDownAutoProceed === true;
     const hit = cache.get(repo);
-    if (hit && (hit.allow || !allow)) { stats.served += 1; return clone(hit.plan); }
+    if (hit && (hit.allow || !allow) && hit.claims === claimFingerprint()) { stats.served += 1; return clone(hit.plan); }
+    const claims = claimFingerprint(); // read BEFORE planning: a claim taken mid-plan makes the next serve re-plan
     const { plan, complete } = compute(repo, allow);
-    if (complete) cache.set(repo, { plan, allow }); else cache.delete(repo);
+    if (complete && !planIsIncomplete(plan)) cache.set(repo, { plan, allow, claims }); else cache.delete(repo);
     return clone(plan);
   }
 

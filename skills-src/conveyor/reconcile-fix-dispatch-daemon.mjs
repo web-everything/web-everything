@@ -870,7 +870,10 @@ export async function runTickAllRepos({
   // run comes after its own pre-plan flushes. Any step that may have mutated a repo's PRs drops that repo's snapshot, so
   // the next consumer re-plans in full (see scripts/conveyor/shared-reconcile.mjs). Real passes only: any injected
   // tick keeps the historical per-step planner run.
-  const shared = realTick && !ciHealTick && !promoteDraftTick ? createSharedReconcile() : null;
+  const shared = realTick && !ciHealTick && !promoteDraftTick ? createSharedReconcile({
+    claimFingerprint: () => listFixDispatchClaims(undefined, { liveOnly: true })
+      .map((c) => `${c.meta.repo}#${c.meta.pr}:${c.meta.kind}:${c.owner}`).sort().join('|'),
+  }) : null;
   const invalidateMutated = (result) => {
     if (!shared) return;
     const repoOf = new Set();
