@@ -45,7 +45,7 @@ export function refusal(records, ref, since, alerts = false) {
     && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(r.kind || r.event || r.type || '')));
 }
 export function prototypeLoadOperation() {
-  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace'].map((key) => [key, { type: 'string', required: false, default: '' }]));
+  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms'].map((key) => [key, { type: 'string', required: false, default: '' }]));
   input['dry-run'] = { type: 'boolean', required: false, default: false };
   // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
   input.retire = { type: 'boolean', required: false, default: false };
@@ -53,7 +53,7 @@ export function prototypeLoadOperation() {
     input, verdictFrom: 'assess',
     load: effect({ reads: Object.keys(input).map((key) => `input.${key}`),
       effects: ({ input: values }) => [{ type: PROTOTYPE_LOAD_EFFECT,
-        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'] }, idempotent: false }] }),
+        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'], waitAdoptionMs: values['wait-adoption-ms'] }, idempotent: false }] }),
     assess: compute({ reads: ['findings.load'], fn: ({ findings }) => {
       const entry = findings.load?.effects?.[0];
       if (entry?.status !== 'applied' || !entry.result) throw new Error('prototype-load: transaction did not complete');
