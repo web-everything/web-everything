@@ -279,7 +279,7 @@ it.each(['other-src','vendor-src'])
 });
 
 it.each(['x-tokens.md','id_rsa','secret.pem'])
-('memory bridge credential-policy parity in full and delta manifests: %s',async name=>{
+('memory bridge refuses name-flagged files in full and delta manifests: %s',async name=>{
   await write('agent-memory-src/x-tokens.md','# Tokens\n');
   if(name!=='x-tokens.md')await write('agent-memory-src/'+name,'private fixture');
   await fs.mkdir(join(cwd,'.claude'));
@@ -287,20 +287,8 @@ it.each(['x-tokens.md','id_rsa','secret.pem'])
   git(['update-ref','refs/remotes/origin/main','HEAD']);
   for(const delta of [false,true]) {
     const build=()=>delta?buildDeltaManifest({cwd,env,base}):buildManifest({cwd,env});
-    if(name!=='x-tokens.md') {
-      await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
-      continue;
-    }
-    const actual=await build();
-    const alias='.claude/agent-memory/x-tokens.md';
-    expect(actual.entries.map(({path,sha256,executable})=>({path:path.toString(),sha256,executable}))).toEqual(await oracle());
-    expect(actual.entries.find(entry=>entry.path.toString()===alias)).toMatchObject({
-      sha256:sha('# Tokens\n'),sourcePath:Buffer.from('agent-memory-src/x-tokens.md'),
-    });
-    if(delta) {
-      expect(actual.manifestMode).toBe('git-delta');
-      expect(actual.deltaPaths).toContainEqual(Buffer.from(alias));
-    }
+    // R321/R323: a name-flagged file reached through the memory bridge never ships.
+    await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
   }
 });
 

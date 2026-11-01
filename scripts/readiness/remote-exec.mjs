@@ -563,17 +563,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
       const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
-      // A credential-named alias is refused unless it is the memory bridge's exact
-      // image of a tracked agent-memory-src/ source that itself passed the public-blob check above.
-      const sourcePath=entry.sourcePath??entry.path,memoryRoot=Buffer.from('agent-memory-src/');
-      // The memory-bridge alias exception stays limited to source/docs files, as before R321:
-      // a symlink-reached file never ships under the broader name-flagged rule.
-      const verifiedMemory=bridge==='.claude/agent-memory/'&&policy.credentialSource&&sourceExtension.test(policy.names.at(-1))
-        &&sourcePath.subarray(0,memoryRoot.length).equals(memoryRoot)
-        &&sourcePath.subarray(memoryRoot.length).equals(path.subarray(bridge.length))
-        &&indexBlobs.has(sourcePath.toString('base64'))&&classifyManifestPath(sourcePath).credentialSource
-        &&sourceEntries.some(source=>source.path.equals(sourcePath));
-      if((policy.excluded&&!verifiedMemory)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
+      // R321/R323: a name-flagged file reached through a symlink (including the agent-memory
+      // bridge) never ships: the alias is not itself tracked-and-identical, so the run falls back.
+      if(policy.excluded||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }
