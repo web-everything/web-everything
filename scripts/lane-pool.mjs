@@ -1052,7 +1052,8 @@ function ensureAlternatesFor(repo, n) {
 }
 function fetchOriginHealing(repo, n, { allowReclone = false, dietConfig } = {}) {
   const dir = laneDir(repo, n);
-  ensureAlternatesFor(repo, n);
+  // Only a caller that holds the lane's lease (or finds none) may touch it; a refresh of someone else's live lane may not.
+  if (allowReclone) ensureAlternatesFor(repo, n);
   try {
     return fetchOriginPruneWithRetry(dir, dietConfig);
   } catch (e) {

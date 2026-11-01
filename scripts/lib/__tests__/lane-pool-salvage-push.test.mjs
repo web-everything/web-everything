@@ -512,7 +512,7 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.filter(([, args]) => args.includes('cherry')).map(([, args]) => args))
       .toEqual([['cherry', 'origin/main', 'HEAD']]);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref')).map(([, args]) => args))
-      .toEqual([['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', older, 'refs/remotes/origin', '--count=1']]);
+      .toEqual([['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', older, '--format=%(refname)\t%(symref)', 'refs/remotes/origin']]);
   });
 
   it('returns matched without pushing when the exact SHAs are reachable from remote branches', async () => {
@@ -520,6 +520,12 @@ describe('real salvage preservation and transport', () => {
     expect(await salvagePushLane({ lane: 7, laneDir, io })).toMatchObject({ status: 'matched', unmatched: [] });
     expect(runGit.mock.calls.some(([, args]) => args.includes('push'))).toBe(false);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref'))).toHaveLength(2);
+  });
+
+  it('does not accept a symbolic ref (such as one aimed at origin/ops) as reachability evidence', async () => {
+    const { io, runGit } = realHarness({ contains: 'refs/remotes/origin/HEAD\trefs/remotes/origin/ops/ledger' });
+    const result = await salvagePushLane({ lane: 7, laneDir, io });
+    expect(result.status).not.toBe('matched');
   });
 
   it.each(['fetch', 'cherry', 'for-each-ref'])('fails closed without pushing when %s evidence is unreadable', async fail => {
