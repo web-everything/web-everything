@@ -42,7 +42,7 @@ export function gateTimeoutOption(arg) {
 // accept only plain repo-relative paths: no absolute, backslash, dot or `..` segment, no leading dash, no .git.
 const SAFE_REL_PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/;
 const safeRelPath = value => SAFE_REL_PATH.test(value) && !value.split('/').some(part => part === '.git' || part === '..' || part === '.');
-const safeConfigPath = value => safeRelPath(value) && /\.(?:ts|mts|mjs|js)$/.test(value);
+const safeConfigPath = value => value === 'vitest.soak.config.ts';
 export function allowedCommand(argv) {
   if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0')))) return false;
   if(argv[0]==='npm' && argv[1]==='run' && argv[2]==='check:standards')
@@ -69,7 +69,7 @@ export function allowedCommand(argv) {
       continue;
     }
     if (arg.startsWith('--outputFile.json=')) {
-      if (!safeRelPath(arg.slice('--outputFile.json='.length))) return false;
+      if (!npx || !safeRelPath(arg.slice('--outputFile.json='.length))) return false;
       continue;
     }
     const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
@@ -80,8 +80,8 @@ export function allowedCommand(argv) {
     // Vitest reparses dash-prefixed -t values as options (including --help).
     if (arg === '-t' && (++i >= argv.length || argv[i].startsWith('-'))) return false;
   }
-  // A config can move vitest's root, so a report path is only trustworthy without one.
-  if (argv.includes('--config') && argv.some(a => a.startsWith('--outputFile.json='))) return false;
+  // Exactly two forms: soak's config alone, or the guard's work-relative json report without a config.
+  if (argv.includes('--config') && (argv.includes('--reporter=json') || argv.some(a => a.startsWith('--outputFile')))) return false;
   try { validateTestNames(files); } catch { return false; }
   if (npx && (!files.length || (argv[2] === 'related' && !argv.includes('--run')))) return false;
   return true;
