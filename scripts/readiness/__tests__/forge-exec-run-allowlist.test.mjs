@@ -1,6 +1,8 @@
 // @vitest-environment node
 import {describe, it, expect} from 'vitest';
-import {allowedCommand, executionArgv} from '../forge-exec-run.mjs';
+import {mkdtemp, mkdir, symlink, rm, realpath} from 'node:fs/promises';
+import {join} from 'node:path';
+import {allowedCommand, executionArgv, createRunner} from '../forge-exec-run.mjs';
 // R335: soak's --config flag and the always-run guard's json report, nothing wider.
 const soak = ['npx','vitest','run','--config','vitest.soak.config.ts','a.test.mjs'];
 describe('runner allowlist widening', () => {
@@ -24,5 +26,19 @@ describe('runner allowlist widening', () => {
     for (const bad of ['--outputFile.json=/tmp/r.json','--outputFile.json=../r.json','--outputFile.json=a/../../r.json','--outputFile.json=',
       '--outputFile.json=-r.json','--outputFile.json=.git/r.json','--outputFile.json=a\\r.json','--outputFile=r.json','--outputFile.junit=r.xml','--outputFile.json','--reporter=junit'])
       expect(allowedCommand(['npx','vitest','run','a.test.mjs',bad])).toBe(false);
+  });
+  it('refuses a report or config path that goes through a link inside the work dir', async () => {
+    const root = await realpath(await mkdtemp(join(process.env.TMPDIR, 'forge-contain-')));
+    try {
+      const work = join(root, 'work');
+      await mkdir(join(root, 'outside'), {recursive: true});
+      await mkdir(work, {recursive: true});
+      await symlink(join(root, 'outside'), join(work, 'guard'));
+      const runner = createRunner({testRoot: root, testPath: '/usr/bin:/bin'});
+      await expect(runner.assertContained(work, ['npx','vitest','run','a.test.mjs','--outputFile.json=guard/r.json'])).rejects.toThrow('escapes');
+      await symlink(join(root, 'outside'), join(work, 'cfg.config.ts'));
+      await expect(runner.assertContained(work, ['npx','vitest','run','--config','cfg.config.ts','a.test.mjs'])).rejects.toThrow('escapes');
+      await expect(runner.assertContained(work, ['npx','vitest','run','--outputFile.json=new/r.json','a.test.mjs'])).resolves.toBeUndefined();
+    } finally { await rm(root, {recursive: true, force: true}); }
   });
 });
