@@ -370,6 +370,19 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Stale abandonment publishes a complete marker before replacing the writer, under the shared status
+claim. Its intent binds the old writer digest, evidence digest, timestamp and the exact JSON bytes
+of the abandoned writer. Recovery may finish that intent only while those inputs still match;
+admission still requires the completed writer binding. Keep the atomic JSON rendering and digest
+in agreement. The persistence-boundary matrix in `review-recovery-witness.test.mjs` interrupts
+before/after each rename for queued/running owners and fresh/resume modes, then attempts admission
+twice. The dead-owner soak also interrupts after marker publication and requires one dispatch.
+Keep a named mutation row for each intent binding: old writer, evidence, expected writer and
+abandonment timestamp. Change the timestamp alone to exercise its digest binding; for a non-string
+timestamp, recompute the expected writer digest so the type guard is tested independently.
+The same suite exercises production carry-conflict selection and isolates each admission codec
+field and rollback identity check. Exact-head panel evidence takes precedence over a carry journal.
+
 The status writer may repair truncated JSON, null JSON or a mismatched identity only when no retry
 marker exists; readers still reject that evidence. The writer-contract table in
 `drain-red-team-evidence.test.mjs` covers queued, running, finished, fresh-retry and refund writes,
@@ -3563,6 +3576,23 @@ indeterminate run must be inspected before starting a new pass. Focused proof li
 map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
 discovers script modules dynamically and has no hand-maintained operation list.
 
+## Raw red-team recovery witnesses (#7537)
+
+Recovery fixtures persist the panel read as a `review-pr` run and inject the scorecard store;
+`status.loopPayload` is deliberately truncated. Bind abandonment to raw writer bytes and seat/run
+evidence, then test mutations before queued admission. Never normalize the status in a reader.
+Inject raw witness/probe failures directly for liveness refusals; do not infer them from normalized drain flags.
+Only a raw `running` writer can infer an interrupted failure from a single failed seat and no result.
+A dead `queued` writer with an existing failed seat and no result must refuse planning, abandonment and admission
+without spending either marker; test null/missing results and zero/missing retry counts alongside running recovery.
+The dead-owner and skip-settlement breaks are discovered from disk and run with `vitest.soak.config.ts` using the shared repo registry.
+Status-write claims record the holder's PID, birth time, host and PID namespace. The recovery-witness
+fixtures cover reused PIDs in abandonment and every ordinary status write, live and unreadable
+identities, initialization grace, legacy numeric claims, and post-move identity verification.
+The dead-owner soak includes a 24-hour-old claim whose numeric PID is alive but whose birth time
+belongs to a dead owner; recovery must dispatch and publish exactly once. Preserve the numeric
+first line for older writers. Legacy claims with a live PID and no birth time remain protected;
+inspect the owner before manually removing such a claim, since age alone cannot prove it dead.
 ## Forge coverage timestamp parity
 
 Remote transport stubs must answer the worktree-binding probe before inventory or SSH;
