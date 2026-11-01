@@ -5,7 +5,7 @@
 // The user's primary checkout and the lane are never touched: objects arrive by `fetch` into the pool's own store.
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, realpathSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync, renameSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -17,8 +17,23 @@ const GIT_TIMEOUT_MS = 5 * 60 * 1000;
 
 export const defaultPoolDir = (env = process.env) => env.WE_REVIEW_SEAT_POOL_DIR || join(tmpdir(), 'we-seat-pool');
 
+// Pool git calls run with no hooks, no user/system config and no replace refs: a seat or a stale file in the shared
+// store can then never cause code to run, or a pinned commit to mean something else, during slot setup.
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+const STORE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n';
+
+/** Is any process's working directory inside `dir`? Unknown (lsof failed) counts as busy. */
+export function slotBusy(dir, run = spawnSync) {
+  let real;
+  try { real = realpathSync(dir); } catch { return false; }
+  const r = run('lsof', ['-a', '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+  if (r.error || (r.status !== 0 && r.status !== 1)) return true;
+  return String(r.stdout).split('\n').some((l) => l.startsWith('n') && (l.slice(1) === real || l.slice(1).startsWith(`${real}/`)));
+}
+
 function git(args, { allowFail = false } = {}) {
-  const r = spawnSync('git', ['--no-replace-objects', ...args], {  // a replace ref in the shared store must never change what a pinned commit means
+  const r = spawnSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], {
+    env: GIT_ENV,  // a replace ref in the shared store must never change what a pinned commit means
      encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
   if (r.status !== 0 && !allowFail) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
   return r;
@@ -46,7 +61,7 @@ const paths = (poolDir) => ({
  * several reclaimers of one stale lock exactly one wins, and none can remove a lock a later seat has taken. A
  * process killed inside that few-millisecond window leaks the one slot (it is skipped, never shared).
  */
-function tryLock(lockDir, now, token = randomUUID(), leaseMs = SEAT_LEASE_DEFAULT_MS) {
+function tryLock(lockDir, now, token = randomUUID(), leaseMs = SEAT_LEASE_DEFAULT_MS, busy = () => false) {
   const take = () => {
     try {
       mkdirSync(lockDir);
@@ -62,6 +77,7 @@ function tryLock(lockDir, now, token = randomUUID(), leaseMs = SEAT_LEASE_DEFAUL
   try { owner = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8')); } catch { /* half-written lock */ }
   if (!owner.token || (owner.pid && pidAlive(owner.pid))) return false;
   if (!Number.isFinite(owner.expiresAt) || now() < owner.expiresAt) return false;
+  if (busy()) return false; // a surviving seat still has its working directory in the slot
   const marker = `${lockDir}.reclaim-${owner.token}`;
   try { mkdirSync(marker); } catch (e) { if (e.code === 'EEXIST') return false; throw e; }
   try {
@@ -94,6 +110,9 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   else git(['init', '--quiet', '--bare', p.repo]);
   ownPrivateDir(p.repo);
   if (!existsSync(join(p.repo, 'HEAD')) || lstatOrNull(join(p.repo, '.git'))) throw new Error('seat pool store is not a bare repository');
+  const cfgTmp = join(p.repo, `config.${process.pid}.${randomUUID()}.tmp`); // rename, never write through a planted link
+  writeFileSync(cfgTmp, STORE_CONFIG, { flag: 'wx' });
+  renameSync(cfgTmp, join(p.repo, 'config')); // no leftover filter drivers, hooks path or worktree-config extension
   // Git must resolve exactly this directory as the bare store, not follow a pointer inside it to another repository.
   if (realpathSync(git(['-C', p.repo, 'rev-parse', '--absolute-git-dir']).stdout.trim()) !== realpathSync(p.repo)
     || git(['-C', p.repo, 'rev-parse', '--is-bare-repository']).stdout.trim() !== 'true') throw new Error('seat pool store is not its own bare repository');
@@ -105,7 +124,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   for (const n of order) {
     const lockDir = join(p.locks, `slot-${n}`);
     const token = randomUUID();
-    if (!tryLock(lockDir, now, token, leaseMs)) continue;
+    if (!tryLock(lockDir, now, token, leaseMs, () => slotBusy(join(p.slots, `slot-${n}`)))) continue;
     const dir = join(p.slots, `slot-${n}`);
     // Idempotent and token-checked: a repeated release can never free a lock that a later seat now holds.
     const view = join(p.views, token);
@@ -133,6 +152,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
         if (realpathSync(forward) !== realpathSync(admin) || realpathSync(reverse) !== realpathSync(join(dir, '.git'))
           || readFileSync(join(admin, 'commondir'), 'utf8').trim() !== '../..') throw new Error(`seat slot is not registered in this pool: ${dir}`);
         // A previous seat may have left sparse-checkout state or per-worktree config: reset to the plain full tree.
+        rmSync(join(admin, 'config.worktree'), { force: true });
         git(['-C', dir, 'sparse-checkout', 'disable'], { allowFail: true }); // restores the full tree and clears skip-worktree bits
         rmSync(join(admin, 'config.worktree'), { force: true });
         rmSync(join(admin, 'info'), { recursive: true, force: true });

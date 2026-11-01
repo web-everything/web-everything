@@ -139,6 +139,20 @@ it('ignores replace refs and refuses a store that points at another repository',
   expect(git(lane, 'worktree', 'list').split('\n').length).toBe(1);
 });
 
+it('rewrites a poisoned store config, and a slot with a live cwd inside it is never reclaimed', async () => {
+  const { slotBusy } = await import('../../lib/review-seat-pool.mjs');
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const marker = join(lane, 'hook-ran');
+  writeFileSync(join(pool, 'repo.git', 'config'), `[core]\n\tbare = true\n\thooksPath = ${join(lane, 'hooks')}\n[filter "x"]\n\tsmudge = touch ${marker}\n`);
+  const b = acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool });
+  expect(readFileSync(join(pool, 'repo.git', 'config'), 'utf8')).not.toMatch(/filter|hooksPath/);
+  expect(existsSync(marker)).toBe(false);
+  b.release();
+  expect(slotBusy(b.slotDir, () => ({ status: 0, stdout: `p1\nn${realpathSync(b.slotDir)}/sub\n` }))).toBe(true);
+  expect(slotBusy(b.slotDir, () => ({ status: 0, stdout: 'p1\nn/elsewhere\n' }))).toBe(false);
+  expect(slotBusy(b.slotDir, () => ({ status: 2, stdout: '' }))).toBe(true); // unknown counts as busy
+});
+
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const stable = statSync(join(a.dir, 'stable.txt')).ino; a.release();
