@@ -674,7 +674,9 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     }finally{await guard.close();}
   }
   // null = provably absent (ENOENT); undefined = unreadable or malformed, which is unprovable: keep.
-  async function readRecord(file) {try{return JSON.parse(await readPinned(file));}catch(error){return error.code==='ENOENT'?null:undefined;}}
+  async function readRecord(file) {try{const parsed=JSON.parse(await readPinned(file));return parsed!==null&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed:undefined;}catch(error){return error.code==='ENOENT'?null:undefined;}}
+  // A reservation must carry a string run id; anything else is unprovable and kept.
+  async function readReservation(file) {const r=await readRecord(file);return r===null||(r!==undefined&&typeof r.run==='string')?r:undefined;}
   async function reapLeaked() {
     const names=await readdir(receipts);
     const found=names.map(n=>/^(r-[a-f0-9]{32})\.(prepared|running)$/.exec(n)).filter(Boolean).map(m=>({run:m[1],phase:m[2],file:join(receipts,m[0])}));
@@ -715,11 +717,11 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(!record?.slot)continue;
       if(!/^forge-exec-[1-9]\d*$/.test(record.slot))continue;
       const reservationFile=join(receipts,writerName(record),'reservation.json');
-      const reservation=await readRecord(reservationFile);
+      const reservation=await readReservation(reservationFile);
       if(reservation===undefined||reservation?.run===entry.run)continue;
       if(!await ownerGone(record,entry.file,{allowAge:true}))continue;
       await withWorkerExclusive(writerName(record),async()=>{
-        const again=await readRecord(reservationFile);
+        const again=await readReservation(reservationFile);
         if(again===undefined||again?.run===entry.run)return;
         if(await reapProbe.uidBusy((await identity(record.slot)).uid))return;
         if(!await ownerGone(record,entry.file,{allowAge:true}))return;
