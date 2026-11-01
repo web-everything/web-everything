@@ -2252,7 +2252,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     else parkedListings.delete(key);
   }
   function readTree() {
-    retryTransientGit(() => fetchFresh({ cwd: opts.cwd, branches: ['main'], run: (args) => exec('git', args, opts) }));
+    retryTransientGit(() => fetchFresh({ cwd: opts.cwd, branches: ['main'], maxAgeMs: 0, run: (args) => exec('git', args, opts) }));
     const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
     const cards = new Map();
     for (const line of output.trim().split('\n')) {
