@@ -311,7 +311,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
                 && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
                 && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap));
           })()
-          && redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+          // The stored verdict may predate the acceptance (a round-budget accept leaves `changes` behind);
+          // a finished not-owed status on this accepted head settles as policy-clear (R100/R338).
+          && (redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+            || [evidence.status, status].every(candidate => candidate?.status === 'finished'
+              && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
           if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
           const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
