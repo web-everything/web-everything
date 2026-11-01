@@ -23,7 +23,10 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
   it('every other job stays on ubuntu-latest (the switch must not widen)', () => {
     for (const [name, j] of Object.entries(jobs)) {
       if (name === 'test-shard') continue;
-      expect(j['runs-on'], `${name} must not follow the Arm switch`).toBe('ubuntu-latest');
+      // smoke may sit on the emergency ubuntu-24.04 pin (card xvlstad: Playwright rejects ubuntu-latest = 26.04);
+      // it must still never follow the Arm switch or any other runner.
+      const allowed = name === 'smoke' ? ['ubuntu-latest', 'ubuntu-24.04'] : ['ubuntu-latest'];
+      expect(allowed, `${name} must not follow the Arm switch`).toContain(j['runs-on']);
     }
     for (const name of ['test', 'changes', 'daemon-soak-scope', 'soak-shard']) expect(jobs[name]).toBeDefined();
   });
