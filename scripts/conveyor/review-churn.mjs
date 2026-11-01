@@ -4,8 +4,10 @@
  *   loops): three PRs took 13, 11 and 10 loops (29% of all loops). Their loops were NOT same-content re-arms: every
  *   loop judged a head with a genuinely new tree (fixer / advisory-fix pushes after an accept), so the driver is a
  *   fix-push -> re-review ping-pong. Two guards, each a policy-cascade leaf, both SHADOW by default:
- *   - `sameTree`: a head whose git tree equals the tree of an already ACCEPTED reviewed head owes no review (a new
- *     commit id over identical content). A changed tree is always reviewed.
+ *   - `sameTree` (off|shadow only): records `churnShadow` when a head's git tree equals the tree of an already
+ *     ACCEPTED reviewed head. It is deliberately NOT enforceable here: skipping that review would strand the PR in
+ *     `review:pending` without an accept carry (the existing carryAcrossRebase / accept-carry-forward own that
+ *     path). Enforcing it needs a carry first; a changed tree is always reviewed.
  *   - `maxLoopsPerPr` (+ `capMode`): once a PR has accumulated that many reviews of distinct heads, a needs-you note
  *     (`review-churn`) tells a person the loop is not converging. The review itself STILL runs: changed code is never
  *     left unreviewed.
@@ -20,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf, verdictKind } from './mechanical-round-cap.mjs';
 
+const parseSameTree = (v) => { const x = parseMode(v); return x === 'off' || x === 'shadow' ? x : undefined; };
 export const REVIEW_CHURN_STANDARD = Object.freeze({ sameTree: 'shadow', capMode: 'shadow', maxLoopsPerPr: 8 });
 const MODES = new Set(['off', 'shadow', 'on']);
 const parseMode = (v) => { const x = String(v ?? '').trim().toLowerCase(); return MODES.has(x) ? x : undefined; };
@@ -31,11 +34,11 @@ export function resolveReviewChurn({ env = process.env, file = SETTINGS_FILE, pl
   let block = tool;
   if (block === undefined) { try { block = JSON.parse(readFileSync(file, 'utf8'))?.reviewChurn; } catch { block = undefined; } }
   const envValues = {
-    sameTree: parseMode(env?.WE_REVIEW_CHURN_SAME_TREE), capMode: parseMode(env?.WE_REVIEW_CHURN_CAP_MODE),
+    sameTree: parseSameTree(env?.WE_REVIEW_CHURN_SAME_TREE), capMode: parseMode(env?.WE_REVIEW_CHURN_CAP_MODE),
     maxLoopsPerPr: parseLoops(env?.WE_REVIEW_CHURN_MAX_LOOPS),
   };
   const c = cascadePolicy('reviewChurn', block, { standard: REVIEW_CHURN_STANDARD, envValues, env, platform,
-    valid: { sameTree: (v) => parseMode(v) === v, capMode: (v) => parseMode(v) === v, maxLoopsPerPr: (v) => Number.isInteger(v) && v >= 1 && v <= 999 } });
+    valid: { sameTree: (v) => parseSameTree(v) === v, capMode: (v) => parseMode(v) === v, maxLoopsPerPr: (v) => Number.isInteger(v) && v >= 1 && v <= 999 } });
   return { ...REVIEW_CHURN_STANDARD, ...(c.value ?? {}), sources: c.sources, invalid: c.invalid };
 }
 
@@ -47,14 +50,15 @@ export function reviewedHeadVerdicts(comments) {
     const kind = verdictKind(c);
     if (kind === 'advisory') continue;
     const head = reviewedHeadsOf(c)[0];
-    if (head) out.push({ head, accept: kind === 'accept' });
+    // A verdict with no structured sha still counts as a later non-accept: it voids earlier accepts (fail closed).
+    if (head) out.push({ head, accept: kind === 'accept' }); else if (kind !== 'accept') out.push({ head: null, accept: false });
   }
   return out;
 }
 
 /** PURE: how many reviews of DISTINCT heads this PR has had. */
 export function countReviewLoops(comments) {
-  return new Set(reviewedHeadVerdicts(comments).map((v) => v.head)).size;
+  return new Set(reviewedHeadVerdicts(comments).map((v) => v.head).filter(Boolean)).size;
 }
 
 /**
@@ -72,14 +76,14 @@ export function decideReviewChurn(pr) {
   if (sameTree !== 'off' && head && f.headTree) {
     // Only a head whose LATEST verdict is an accept counts: a later changes verdict on it supersedes the accept.
     // An accept is voided by ANY later non-accept verdict naming a compatible (prefix-equal) head.
-    const live = (v, i) => v.accept && !verdicts.slice(i + 1).some((w) => !w.accept && (v.head.startsWith(w.head) || w.head.startsWith(v.head)));
+    const live = (v, i) => v.accept && !verdicts.slice(i + 1).some((w) => !w.accept && (w.head === null || v.head.startsWith(w.head) || w.head.startsWith(v.head)));
     const twin = verdicts.find((v, i) => live(v, i) && !head.startsWith(v.head) && !v.head.startsWith(head)
       && f.trees?.[v.head] && f.trees[v.head] === f.headTree);
     if (twin) found.push({ kind: 'same-tree', mode: sameTree, head, reviewedHead: twin.head, tree: f.headTree });
   }
   if (capMode !== 'off') {
     const loops = countReviewLoops(pr.comments);
-    const reviewedThisHead = verdicts.some((v) => head.startsWith(v.head));
+    const reviewedThisHead = verdicts.some((v) => v.head && head.startsWith(v.head));
     if (loops >= maxLoopsPerPr && !reviewedThisHead) found.push({ kind: 'loop-cap', mode: capMode, loops, cap: maxLoopsPerPr });
   }
   // An enforcing ('on') decision always wins over a shadow one, whatever the other guard's mode.
@@ -109,8 +113,8 @@ export function enrichPrsWithReviewChurn(prs, { repo, settings = resolveReviewCh
     const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
     const verdicts = reviewedHeadVerdicts(pr?.comments);
     const facts = { settings: { sameTree: settings.sameTree, capMode: settings.capMode, maxLoopsPerPr: settings.maxLoopsPerPr } };
-    const accepted = verdicts.filter((v) => v.accept && /^[0-9a-f]{40}$/.test(v.head));
-    if (settings.sameTree !== 'off' && head.length === 40 && accepted.length && !verdicts.some((v) => head.startsWith(v.head))) {
+    const accepted = verdicts.filter((v) => v.accept && v.head && /^[0-9a-f]{40}$/.test(v.head));
+    if (settings.sameTree !== 'off' && head.length === 40 && accepted.length && !verdicts.some((v) => v.head && head.startsWith(v.head))) {
       const headTree = tree(head);
       if (headTree) {
         facts.headTree = headTree; facts.trees = {};

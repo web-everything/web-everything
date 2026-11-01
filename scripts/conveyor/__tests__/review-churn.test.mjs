@@ -11,7 +11,7 @@ const sha = (c) => c.repeat(40);
 const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 const accept = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
 const rearm = (h) => ({ author: BOT, createdAt: at(h), body: `${REARM_COMMENT_MARKER}\n\nrepaired` });
-const SET = (o = {}) => ({ sameTree: 'on', capMode: 'on', maxLoopsPerPr: 3, ...o });
+const SET = (o = {}) => ({ sameTree: 'shadow', capMode: 'on', maxLoopsPerPr: 3, ...o });
 const mkPr = (comments, head, churn) => ({
   number: 7, headRefName: 'lane/x-thing', headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
   labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
@@ -26,11 +26,11 @@ const refusal = (r, kind) => r.refusals.find((x) => x.prNumber === 7 && x.kind =
 describe('same tree, new head', () => {
   const A = sha('a'); const B = sha('b'); const TREE = sha('1');
   const comments = [accept(A, 1)];
-  it('on: no re-review when the tree equals an accepted reviewed head', () => {
+  it('same tree is recorded, never enforced: the review is still dispatched', () => {
     const r = plan(mkPr(comments, B, { settings: SET(), headTree: TREE, trees: { [A]: TREE } }));
-    expect(row(r)).toBeUndefined();
-    expect(refusal(r, 'review-same-tree')).toBeTruthy();
-    expect(REFUSAL_KINDS).toContain('review-same-tree');
+    expect(row(r)?.kind).toBe('review');
+    expect(row(r)?.churnShadow?.kind).toBe('same-tree');
+    expect(REFUSAL_KINDS).not.toContain('review-same-tree');
   });
   it('changed tree: reviewed', () => {
     const r = plan(mkPr(comments, B, { settings: SET(), headTree: sha('2'), trees: { [A]: TREE } }));
@@ -75,6 +75,14 @@ describe('per-PR loop cap', () => {
   });
 });
 
+describe('stale accept (no sha)', () => {
+  it('a later changes verdict without a structured sha still voids the accept', () => {
+    const A = sha('a'); const TREE = sha('1');
+    const bounce = { author: BOT, createdAt: at(2), body: '🔁 review — changes requested\n\n### Findings\n- bad' };
+    expect(decideReviewChurn(mkPr([accept(A, 1), bounce], sha('b'), { settings: SET(), headTree: TREE, trees: { [A]: TREE } }))).toBeNull();
+  });
+});
+
 describe('stale accept', () => {
   it('a later changes verdict on the same head voids its accept for the same-tree skip', () => {
     const A = sha('a'); const TREE = sha('1');
@@ -88,13 +96,6 @@ describe('same-tree edge cases', () => {
     const A = sha('a'); const TREE = sha('1');
     const bounce = { author: BOT, createdAt: at(2), body: `🔁 review — changes requested\n\n<!-- reviewed-sha: ${A.slice(0, 7)} -->` };
     expect(decideReviewChurn(mkPr([accept(A, 1), bounce], sha('b'), { settings: SET(), headTree: TREE, trees: { [A]: TREE } }))).toBeNull();
-  });
-  it('a needs-human PR owed its advisory review keeps it despite an identical tree', () => {
-    const A = sha('a'); const B = sha('b'); const TREE = sha('1');
-    const p = mkPr([accept(A, 1)], B, { settings: SET(), headTree: TREE, trees: { [A]: TREE } });
-    p.labels = [{ name: 'review:human' }];
-    const r = plan(p);
-    expect(refusal(r, 'review-same-tree')).toBeUndefined();
   });
 });
 
@@ -111,8 +112,10 @@ describe('settings and enrichment', () => {
   it('standard is shadow, cascade env wins, invalid env is ignored', () => {
     const none = resolveReviewChurn({ env: {}, tool: undefined, platform: null, file: '/nonexistent' });
     expect(none.sameTree).toBe('shadow'); expect(none.maxLoopsPerPr).toBe(REVIEW_CHURN_STANDARD.maxLoopsPerPast ?? 8);
-    const env = resolveReviewChurn({ env: { WE_REVIEW_CHURN_SAME_TREE: 'on', WE_REVIEW_CHURN_MAX_LOOPS: '5' }, platform: null, file: '/nonexistent' });
-    expect(env.sameTree).toBe('on'); expect(env.maxLoopsPerPr).toBe(5);
+    const env = resolveReviewChurn({ env: { WE_REVIEW_CHURN_SAME_TREE: 'off', WE_REVIEW_CHURN_MAX_LOOPS: '5' }, platform: null, file: '/nonexistent' });
+    expect(env.sameTree).toBe('off'); expect(env.maxLoopsPerPr).toBe(5);
+    const on = resolveReviewChurn({ env: { WE_REVIEW_CHURN_SAME_TREE: 'on' }, platform: null, file: '/nonexistent' });
+    expect(on.sameTree).toBe('shadow'); // 'on' is not offered for sameTree
     const bad = resolveReviewChurn({ env: { WE_REVIEW_CHURN_SAME_TREE: 'bogus' }, platform: null, file: '/nonexistent' });
     expect(bad.sameTree).toBe('shadow');
   });

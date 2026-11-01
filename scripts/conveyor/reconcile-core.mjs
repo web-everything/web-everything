@@ -298,7 +298,7 @@ export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
-  'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'review-same-tree', 'already-landed',
+  'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
   // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — a ci-heal already escalated THIS EXACT
   // head (`ci-heal-escalation-mark.mjs`); see that file's own header for the live incident (#2783, three
   // sessions in one evening). `ci-heal-escalated` — a genuine judgment call, terminal until a new push.
@@ -1707,18 +1707,13 @@ function dispatchReviewRow({
     });
     return;
   }
-  // ── R365 fix 4 (`review-churn.mjs`): a head whose tree equals an already-ACCEPTED reviewed head's owes no review, and a
-  // PR that has had `maxLoopsPerPr` reviews of distinct heads is parked for a person instead of another round. Shadow
-  // by default: the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
+  // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
+  // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
+  // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
   // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
   const churnRaw = decideReviewChurn(pr);
   const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
   if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
-  if (churn?.mode === 'on' && churn.kind === 'same-tree') {
-    refuse('review-same-tree', { ...withPhase, ...extra, churn,
-      why: `head \`${churn.head}\` has the identical tree (\`${churn.tree}\`) of already-accepted reviewed head \`${churn.reviewedHead}\` — nothing new to review (review.reviewChurn.sameTree)` });
-    return;
-  }
   // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
   // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
   if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
