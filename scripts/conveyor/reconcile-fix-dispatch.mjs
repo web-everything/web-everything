@@ -126,7 +126,7 @@ import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, merge
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
-import { runReconcilePass, resolveLaneHead } from './reconcile-pass.mjs';
+import { runReconcilePass, resolveLaneHead, isRealReconcile } from './reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { CONFLICT_LABEL } from './parked-pr-conflict-watch.mjs';
@@ -1813,8 +1813,8 @@ export function runReconcileFixDispatch({
   allowStandDownAutoProceed = false,
   // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
   // setting). Real git only with the real reconcile; an injected `reconcile` (every test) keeps its own fences.
-  netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
-  prStack = reconcile === runReconcilePass ? readStacksForPass : null,
+  netScope = (reconcile === runReconcilePass || isRealReconcile(reconcile)) ? applyNetScopeToReconcile : null,
+  prStack = (reconcile === runReconcilePass || isRealReconcile(reconcile)) ? readStacksForPass : null,
   prStackSettings = resolvePrStackSettings(),
   // Where the remembered stacks are saved: the real memory file with the real stack reader, nowhere for an injected one.
   writeStacks = prStack === readStacksForPass ? writeRemembered : null,

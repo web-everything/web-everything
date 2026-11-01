@@ -1446,6 +1446,10 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
  *   repo?:string|null, defaultBranch?:string}} [o]
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
+/** Marker for a `reconcile` wrapper that IS the real planner (shared-snapshot wrapper): keeps the real-IO defaults on. */
+export const REAL_RECONCILE = Symbol.for('we.reconcile.real');
+export const isRealReconcile = (fn) => fn === runReconcilePass || fn?.[REAL_RECONCILE] === true;
+
 export function runReconcilePass({
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,

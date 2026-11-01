@@ -97,6 +97,7 @@ import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-re
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
+import { createSharedReconcile } from '../../scripts/conveyor/shared-reconcile.mjs'; // R365 — one planner run per repo per pass
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 /** Per-owner App auth: this daemon fixes PRs in every org (live 2026-10-04: plateau-app calls failed with the
  *  web-everything token pinned). */
@@ -868,7 +869,7 @@ export async function runTickAllRepos({
     let entries = [];
     return runReconcileCiHealDispatch({ ...options,
       reconcile: (input) => {
-        const plan = runReconcilePass(input);
+        const plan = (!ciHealTick && shared ? shared.reconcile : runReconcilePass)(input);
         entries = plan.dispatch ?? [];
         return plan;
       },
@@ -884,6 +885,17 @@ export async function runTickAllRepos({
   // R242: share discovery only. Do not speculatively reconcile/hydrate active
   // PRs: their owners still need those reads, and notes needs post-dispatch evidence.
   const snapshots = new Map();
+  // R365 (perf D fix #3) — ONE planner run per repo per pass, shared by fix, ci-heal, promote-draft and notes.
+  // Each step keeps its own decision logic; a step that acted on PRs invalidates just those PRs, so the next step
+  // re-plans only them (see scripts/conveyor/shared-reconcile.mjs). Real passes only: any injected tick keeps the
+  // historical per-step planner run. Raw rows come from the discovery snapshot when there is one.
+  const shared = realTick && !promoteDraftTick && !notesTick
+    ? createSharedReconcile({ readPrs: (o) => (snapshots.has(o.repo) ? structuredClone(snapshots.get(o.repo).rows) : defaultReadPrs(o)) })
+    : null;
+  const invalidateDispatched = (result, patch = null) => {
+    if (!shared) return;
+    for (const d of (result?.dispatched ?? [])) shared.invalidate(d.repo, [d.pr ?? d.prNumber], patch);
+  };
   const skipEmptySteps = fixSettings.skipEmptySteps ?? resolveFixDispatchSettings().skipEmptySteps;
   if (skipEmptySteps && (readPrs || realTick)) {
     timed('snapshot', () => {
@@ -935,24 +947,26 @@ export async function runTickAllRepos({
     const reconcile = input => runReconcilePass({ ...input, readPrs: sharedRead });
     if (step === 'fix' && tick === runReconcileFixDispatch) {
       // Preserve reconcile's identity: fix uses it to enable net-scope and stack IO.
-      return tick({ ...options, readPrs: sharedRead });
+      return tick({ ...options, ...(shared ? { reconcile: shared.reconcile } : { readPrs: sharedRead }) });
     }
     const readOpenPrs = input => {
       const fields = input?.extraFields ?? [];
       return snapshot.rows.every(pr => fields.every(field => Object.hasOwn(pr, field)))
         ? sharedRead() : defaultReadOpenPrs(input);
     };
-    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile });
+    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile: step === 'promote-draft' && shared ? shared.reconcile : reconcile });
   };
   const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  invalidateDispatched(fix);
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
     : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
+  invalidateDispatched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
@@ -968,9 +982,10 @@ export async function runTickAllRepos({
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
   const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: stepRepos.get('promote-draft'), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
+  invalidateDispatched(promoteDraft, { isDraft: false });
   // #4191: surface notes using fresh evidence after the dispatch/promote steps.
   const notes = timed('notes', () => runReconcileNotesAllRepos({
-    repos, ...(notesTick ? { tick: notesTick } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
+    repos, ...(notesTick ? { tick: notesTick } : (shared ? { tick: shared.readNotes } : {})), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
   }));
   // #3383 follow-up — tag EVERY freshly-dispatched fix/ci-heal session's PR right away, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound
