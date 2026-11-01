@@ -1,15 +1,10 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
-import { writeJsonAtomic } from './atomic-json-file.mjs';
-import { listRunIds, readRun, resolveRunsDir } from '../operations/run-store.mjs';
-import { daemonEventsPath } from './daemon-events.mjs';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -24,81 +19,6 @@ import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accep
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
-
-export const STALE_RUN_DEADLINE_MS = 2 * 60 * 60 * 1000;
-
-/** A matching live local owner always wins over the age deadline. Unknown age stays closed. */
-export function staleRedTeamRun({ status, now = Date.now(), deadlineMs = STALE_RUN_DEADLINE_MS,
-  probe = {} } = {}) {
-  const answer = (stale, reason) => ({ stale, reason });
-  if (status?.status !== 'running' || status.result != null) return answer(false, 'no incomplete running pass');
-  const { host = hostname(), namespace = pidNamespace(), isAlive = pidAlive, readPidStart = pidStartTime } = probe;
-  try {
-    if (status.host === host && status.pidNamespace === namespace && Number.isInteger(status.pid) && status.pid > 0) {
-      const alive = isAlive(status.pid);
-      if (alive === false) return answer(true, 'running red team owner is dead');
-      if (alive === true) {
-        const start = status.pidStart == null ? null : readPidStart(status.pid);
-        if (status.pidStart == null || start === status.pidStart) return answer(false, 'running red team owner is live');
-        if (start != null) return answer(true, 'running red team owner pid was reused');
-        return answer(false, 'running red team owner identity unreadable');
-      }
-    }
-  } catch { return answer(false, 'running red team owner probe unreadable'); }
-  const at = Date.parse(status.pidStart);
-  return Number.isFinite(at) && Number.isFinite(deadlineMs) && deadlineMs >= 0 && now - at > deadlineMs
-    ? answer(true, 'unprobeable running red team owner exceeded deadline')
-    : answer(false, 'unprobeable running red team owner within deadline or age unknown');
-}
-
-const staleStatusPath = ({ repo, pr, head, env = process.env }) =>
-  join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
-
-export function staleRedTeamSpent(key) {
-  try { statSync(`${staleStatusPath(key)}.stale-redispatch-1`); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-}
-
-/** Exclusively spend recovery before dispatch; only a confirmed non-start may release it. */
-export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now() }) {
-  const path = staleStatusPath({ repo, pr, head, env }), marker = `${path}.stale-redispatch-1`;
-  let claimed = false;
-  const release = () => { try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
-  try {
-    const current = JSON.parse(readFileSync(path, 'utf8'));
-    if (current.repo !== repo || Number(current.pr) !== Number(pr) || current.head !== head
-      || current.status !== 'running' || current.result != null
-      || current.pid !== status?.pid || current.pidStart !== status?.pidStart
-      || current.host !== status?.host || current.pidNamespace !== status?.pidNamespace) return { ok: false };
-    if (staleRedTeamRun({ status: current, now }).reason === 'running red team owner is live') return { ok: false };
-    closeSync(openSync(marker, 'wx')); claimed = true;
-    const reason = 'running red team owner is dead or exceeded stale deadline';
-    const at = new Date(now).toISOString();
-    writeJsonAtomic(path, { ...current, staleAbandoned: { at, pid: status.pid, reason } });
-    const events = daemonEventsPath({ env });
-    mkdirSync(dirname(events), { recursive: true });
-    appendFileSync(events, `${JSON.stringify({ at, kind: 'red-team-stale-run-abandoned', repo, pr,
-      daemon: 'review', detail: { head, pid: status.pid, reason } })}\n`);
-    return { ok: true, release };
-  } catch { if (claimed) { try { release(); } catch { /* keep closed */ } } return { ok: false }; }
-}
-
-/** Runs are updated in place: choose the newest eligible review by file mtime, not id order. */
-export function recoverStaleRunPayload({ repo, pr, head, env = process.env,
-  runsDir = env.OPERATION_RUNS_DIR || env.WE_SHARED_RUNS_DIR || resolveRunsDir(), list = listRunIds, read = readRun }) {
-  try {
-    let newest = null, newestAt = -Infinity;
-    for (const id of list(runsDir)) {
-      if (!id.startsWith('review-pr-')) continue;
-      const run = read(id, runsDir);
-      if (run?.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)
-        || run.findings?.read?.netBasis?.rev !== head || run.carriedFrom != null || !redTeamOwedFor(run)) continue;
-      const at = statSync(join(runsDir, `${id}.json`)).mtimeMs;
-      if (at > newestAt) { newest = run; newestAt = at; }
-    }
-    return newest;
-  } catch { return null; }
-}
 
 // review-labels.mjs exports names only. Fail closed for every review hold namespace,
 // including future merge holds, rather than maintaining a partial list here.
@@ -193,8 +113,7 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
-  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, probe, staleSpent = staleRedTeamSpent,
-  deadlineMs = STALE_RUN_DEADLINE_MS }) {
+  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -218,8 +137,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return skip('red-team result already on head');
       const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
-      if (evidence?.queued || (evidence?.inFlight && (!accepted
-        || !staleRedTeamRun({ status: readStatus({ repo, pr, head }), now, probe, deadlineMs }).stale))) return skip('red-team pass in flight');
+      if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
       const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
       const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
       if (acceptance?.sha === head
@@ -256,10 +174,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
       const status = unfinishedCarry ? evidence.status : readStatus({ repo, pr, head });
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
-      const stale = staleRedTeamRun({ status, now, probe, deadlineMs }).stale;
-      const staleOwed = stale && accepted && status?.head === head
-        && (rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:pending') || status.result == null)
-        && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head;
       const owed = redTeamOwedFor(evidence?.loopPayload);
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
@@ -279,7 +193,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
         return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
       }
-      if (!staleOwed && !movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
+      if (!movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
@@ -303,12 +217,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (!owed) return skip('stored review does not owe a red team');
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
-      if ((!staleOwed && evidence.inFlight) || evidence.queued) return skip('red-team pass in flight');
-      if (staleOwed) {
-        if (staleSpent({ repo, pr, head })) return skip('stale red team already re-dispatched; inspect review run');
-        return dispatchDecision({ action: 'dispatch', mode: 'fresh', abandonStale: true,
-          why: 'running red team owner is dead; abandon and re-dispatch' });
-      }
+      if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
       const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
       // A null completion alone is unknown. Only the recovery reader's normalization
@@ -344,10 +253,7 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
  * host start on success or an unknown outcome. Both are optional for standalone callers.
  */
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
-  env = process.env, setting, probe,
-  staleSpent = key => staleRedTeamSpent({ ...key, env }),
-  recoverPayload = recoverStaleRunPayload, abandonStale = abandonStaleRedTeamRun,
-  readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
+  env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviews = ({ repo, pr }) => JSON.parse(runGhSync([
     'pr', 'view', String(pr), '--repo', repo, '--json', 'reviews',
@@ -380,9 +286,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
-      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, probe, staleSpent,
-      deadlineMs: /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '') && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS))
-        ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : STALE_RUN_DEADLINE_MS }));
+      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry }));
     for (const row of rows) {
       let started = false;
       if (row.action === 'carry') {
@@ -427,24 +331,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           || (capacity.remainingStarts != null && !(capacity.remainingStarts > 0))) row.why = 'no review capacity left';
         else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
         else {
-          let abandonment;
-          if (row.abandonStale) {
-            try {
-              if (!recoverPayload({ repo, pr: row.prNumber, head: row.head, env })) {
-                row.why = 'accepting review run unavailable; inspect stored evidence';
-              } else {
-                abandonment = abandonStale({ repo, pr: row.prNumber, head: row.head,
-                  status: readStatus({ repo, pr: row.prNumber, head: row.head }), env, now: at });
-                if (abandonment?.ok !== true) row.why = 'stale red team abandonment refused; inspect review run';
-              }
-            } catch { row.why = 'stale review run recovery unreadable; inspect stored evidence'; }
-            if (abandonment?.ok !== true) {
-              row.action = 'skip';
-              notStarted.push({ prNumber: row.prNumber, reason: row.why });
-              note(`review-daemon: ${repo}#${row.prNumber}: ${row.why}`);
-              continue;
-            }
-          }
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
@@ -456,7 +342,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 || (budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
               if (reserved && refundable) budget.left++;
               row.why = result?.skipped ?? 'job did not start';
-              abandonment?.release?.();
             } else {
               capacity.lanes--;
               if (capacity.remainingStarts != null) capacity.remainingStarts--;

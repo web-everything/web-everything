@@ -91,7 +91,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { recoverStaleRunPayload, staleRedTeamRun, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -466,7 +466,6 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
-    readStaleRunPayload: key => recoverStaleRunPayload({ ...key, env }),
     readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ ...readEvidence({ repo, pr, head, env }), head }),
     redTeamSkipCardOnlySetting: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
@@ -1154,16 +1153,6 @@ function runReviewArc({
       if (stored?.carryConflict) {
         classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
         return result({ ...classified, lanePath });
-      }
-      if (redTeamMode === 'fresh' && !redTeamOwedFor(loopPayload)
-        && (staleRedTeamRun({ status: stored?.status, probe: io.staleProbe }).stale
-          || (stored?.status?.staleAbandoned && staleRedTeamRun({
-            status: { ...stored.status, status: 'running', result: null }, probe: io.staleProbe }).stale))) {
-        let recovered;
-        try { recovered = (io.readStaleRunPayload ?? recoverStaleRunPayload)({ repo: planned.repo, pr: planned.pr, head }); }
-        catch { /* Missing or unreadable full review evidence stays not owed. */ }
-        if (redTeamOwedFor(recovered) && recovered.findings?.read?.netBasis?.rev === head
-          && recovered.carriedFrom == null && loopPayload?.carriedFrom == null) loopPayload = recovered;
       }
       let cardOnlyRecovery = false;
       const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
