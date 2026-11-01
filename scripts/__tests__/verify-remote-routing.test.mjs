@@ -4,6 +4,12 @@ import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
+import { fstatSync, readSync } from 'node:fs';
+
+vi.mock('node:fs', async importOriginal => {
+  const fs = await importOriginal();
+  return { ...fs, fstatSync: vi.fn(fs.fstatSync), readSync: vi.fn(fs.readSync) };
+});
 
 describe('proven local fallback verdict', () => {
   it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
@@ -94,6 +100,16 @@ describe('verify remote routing', () => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: false, setHeld: false });
     expect(phaseAdmissionPlan({ command, decision: { remote: false } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
+  it('resolves direct wrappers against the target checkout, including quoted absolute paths', () => {
+    const cwd = '/tmp/target-checkout';
+    for (const path of ['scripts/readiness/heavy-admission.mjs', './scripts/readiness/heavy-admission.mjs',
+      "'/tmp/target-checkout/scripts/readiness/heavy-admission.mjs'"]) {
+      expect(phaseAdmissionPlan({ cwd, command: `node ${path} run -- vitest run`, decision: { remote: true } }).takeLocalSlot).toBe(false);
+    }
+    expect(phaseAdmissionPlan({ cwd, command: `node ${resolve(repo, 'scripts/readiness/heavy-admission.mjs')} run -- vitest run`,
+      decision: { remote: true } }).takeLocalSlot).toBe(true);
+    expect(phaseAdmissionPlan({ cwd, command: 'node', decision: { remote: true } }).takeLocalSlot).toBe(true);
+  });
   it.each([
     'npm run test:unit',
     'npm run check:standards',
@@ -115,7 +131,10 @@ describe('verify remote routing', () => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
       .toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
-  it.each(['npm run test:unit --prefix=other', 'node other/heavy-admission.mjs run -- vitest run'])(
+  it.each(['npm run test:unit --prefix=other', 'node other/heavy-admission.mjs run -- vitest run',
+    'node /tmp/foreign/scripts/readiness/heavy-admission.mjs run -- vitest run',
+    "node 'other/scripts/readiness/heavy-admission.mjs' run -- vitest run",
+    'node ../other/scripts/readiness/heavy-admission.mjs run -- vitest run'])(
     'unsupported wrapper forms retain local admission: %s', command => {
       expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
         .toEqual({ command, takeLocalSlot: true, setHeld: true });
@@ -223,7 +242,10 @@ describe('verify remote routing', () => {
       const report = JSON.stringify({ location: 'remote', receiptId: 'run-123456', exitCode: 0 });
       const file = join(root, 'report.jsonl');
       writeFileSync(file, report + '\n');
+      vi.mocked(readSync).mockClear();
       expect(readRemoteReport(file)).toEqual([JSON.parse(report)]);
+      expect(readSync).toHaveBeenCalledTimes(1);
+      expect(readSync).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0, 65537, 0);
       symlinkSync(file, join(root, 'link.jsonl'));
       expect(readRemoteReport(join(root, 'link.jsonl'))).toEqual([]);
       execFileSync('mkfifo', [join(root, 'fifo.jsonl')]);
@@ -231,7 +253,19 @@ describe('verify remote routing', () => {
       mkdirSync(join(root, 'dir.jsonl'));
       expect(readRemoteReport(join(root, 'dir.jsonl'))).toEqual([]);
       writeFileSync(join(root, 'big.jsonl'), report + '\n' + ' '.repeat(65536));
+      vi.mocked(readSync).mockClear();
       expect(readRemoteReport(join(root, 'big.jsonl'))).toEqual([]);
+      expect(readSync).not.toHaveBeenCalled();
+      // Grow a valid file after the size check: no unbounded read may follow fstat.
+      const actualFstat = vi.mocked(fstatSync).getMockImplementation();
+      vi.mocked(fstatSync).mockImplementationOnce(fd => {
+        const stat = actualFstat(fd);
+        writeFileSync(file, report + '\n' + ' '.repeat(131072));
+        return stat;
+      });
+      expect(readRemoteReport(file)).toEqual([]);
+      expect(readSync).toHaveBeenCalledTimes(1);
+      expect(readSync).toHaveBeenLastCalledWith(expect.any(Number), expect.any(Buffer), 0, 65537, 0);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it.each([
@@ -341,10 +375,12 @@ describe('verify-lane remote phase spawn', () => {
           referencedTests: [], relatedFiles: ['one.test.mjs'], standards: { run: true, scoped: false, policy: 'always' } } };
       const loader = join(root, 'loader.mjs');
       writeFileSync(loader, `export async function load(url, context, next) {
+        if (url === ${JSON.stringify(pathToFileURL(resolve(repo, 'scripts/lib/host-load.mjs')).href)}) return {format:'module',shortCircuit:true,source:
+          'export * from ' + JSON.stringify(url+'?actual') + '; export function hostLoadAdmission() { return {admitted:true}; }'};
         if (url === ${JSON.stringify(gate)} && process.env.ROUTING_PHASES === '1') return {format:'module',shortCircuit:true,source:
           'export * from ' + JSON.stringify(url+'?actual') + ';' +
           'export function resolveDefaultGate() { return ' + ${JSON.stringify(JSON.stringify(phasePlan))} + '; }'};
-        if (url === ${JSON.stringify(heavy)}) return {format:'module',shortCircuit:true,source:
+        if (url === ${JSON.stringify(heavy)} && process.env.ROUTING_NESTED !== '1') return {format:'module',shortCircuit:true,source:
           'export * from ' + JSON.stringify(url+'?actual') + ';' +
           "import {appendFileSync} from 'node:fs';" +
           "export async function acquireSlotBlocking({kind}) { appendFileSync(process.env.ROUTING_EVENTS, JSON.stringify({event:'acquire',kind})+'\\\\n'); return {ok:true,slot:0,waitedMs:0}; }" +
@@ -366,15 +402,22 @@ const localBehavior=held ? process.env.ROUTING_LOCAL_BEHAVIOR : '';
 const exitCode=process.env.ROUTING_STANDARDS_EXIT && process.argv.includes('check:standards') ? Number(process.env.ROUTING_STANDARDS_EXIT)
   : held ? (retry ? Number(process.env.ROUTING_RETRY_EXIT) : Number(process.env.ROUTING_LOCAL_EXIT)) : Number(process.env.ROUTING_REMOTE_EXIT);
 fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'spawn',held, env:{WE_HEAVY_ADMISSION_HELD:process.env.WE_HEAVY_ADMISSION_HELD,WE_FORGE_GATE_DISPATCH:process.env.WE_FORGE_GATE_DISPATCH}, report:!!process.env.WE_VERIFY_REMOTE_REPORT, executable:require('node:path').basename(process.argv[1]), args:process.argv.slice(2)})+'\\n');
+if(mode==='nested-local') {
+  const child = require('node:child_process').spawnSync(process.execPath, ['--import', ${JSON.stringify(preload)}, ${JSON.stringify(resolve(repo, 'scripts/readiness/heavy-admission.mjs'))}, 'run', '--repo='+process.cwd(), '--', process.execPath, 'nested-child.cjs'], {
+    stdio:'inherit', env:{...process.env, ROUTING_NESTED:'1', LANE_POOL_ROOT:${JSON.stringify(join(root, 'pool'))}, WE_PLATFORM_PREFERENCES:${JSON.stringify(join(root, 'preferences.json'))}, CI:'', WE_HEAVY_ADMISSION:'on'}
+  });
+  process.exit(child.status ?? 3);
+}
 if(mode==='local-fallback') {
-  if(held) throw Error('double local admission');
-  fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'nested-acquire'})+'\\n');
+  if(held && !retry) throw Error('double local admission');
+  if(!held) fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'nested-acquire'})+'\\n');
 }
 if(['remote','local-fallback'].includes(mode) && !held)fs.appendFileSync(process.env.WE_VERIFY_REMOTE_REPORT,JSON.stringify({location:mode,receiptId:'run-123456',exitCode})+'\\n');
 if(mode==='unreadable')fs.writeFileSync(process.env.WE_VERIFY_REMOTE_REPORT,'{');
 if(exitCode) {
-  const file=held ? (process.env.ROUTING_RETRY_EXIT ? 'local.test.mjs' : 'one.test.mjs') : 'remote.test.mjs';
-  fs.writeSync(2,' FAIL  '+file+' > '+(held?'local':'remote')+' failure\\nAssertionError: fixture failure\\n');
+  const local=held || mode==='local-fallback';
+  const file=local ? (process.env.ROUTING_RETRY_EXIT ? 'local.test.mjs' : 'one.test.mjs') : 'remote.test.mjs';
+  fs.writeSync(2,' FAIL  '+file+' > '+(local?'local':'remote')+' failure\\nAssertionError: fixture failure\\n');
   fs.writeSync(1,' Test Files  1 failed (1)\\n Tests  1 failed (1)\\n Duration  1s\\n');
 }
 if((mode === 'watchdog' && !held) || localBehavior === 'watchdog') { ${keepAliveScript({ maxLifetimeMs: 15000 })} }
@@ -386,6 +429,17 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
       writeFileSync(join(bin, 'npm'), wrapper, { mode: 0o755 });
       writeFileSync(join(bin, 'npx'), wrapper, { mode: 0o755 });
       writeFileSync(join(root, 'raw.cjs'), wrapper.replace(/^#!.*\n/, ''));
+      const foreignWrapper = join(root, 'foreign/scripts/readiness/heavy-admission.mjs');
+      mkdirSync(resolve(foreignWrapper, '..'), { recursive: true });
+      writeFileSync(foreignWrapper, "import {createRequire} from 'node:module'; const require=createRequire(import.meta.url);\n" + wrapper.replace(/^#!.*\n/, ''));
+      mkdirSync(join(root, 'pool'));
+      writeFileSync(join(root, 'preferences.json'), JSON.stringify({ heavyAdmission: { remote: { enabled: false } } }));
+      writeFileSync(join(root, 'nested-child.cjs'), `const fs=require('node:fs');
+const events=fs.readFileSync(process.env.ROUTING_EVENTS,'utf8');
+const again=events.includes('nested-child');
+fs.appendFileSync(process.env.ROUTING_EVENTS,JSON.stringify({event:'nested-child',held:process.env.WE_HEAVY_ADMISSION_HELD==='1'})+'\\n');
+if(!again)process.stderr.write(' FAIL  one.test.mjs > first local failure\\nAssertionError: first local failure\\n');
+process.exit(again?0:1);`);
       if (retryExit !== undefined) {
         writeFileSync(join(root, 'local.test.mjs'), '// untouched fixture\n');
         execFileSync('git', ['add', 'local.test.mjs'], { cwd: root });
@@ -400,7 +454,7 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
           ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched',
-          ROUTING_STANDARDS_EXIT: baseCompared ? '0' : '',
+          ROUTING_STANDARDS_EXIT: baseCompared || (mode === 'local-fallback' && retryExit !== undefined) ? '0' : '',
           WE_VERIFY_RUN_ALL_PHASES: '1', WE_FORGE_GATE_DISPATCH: '1',
           ...(watchdogKill ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}), ROUTING_LOCAL_BEHAVIOR: localBehavior,
           ROUTING_PHASES: laterPhases ? '1' : '0',
@@ -445,12 +499,12 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
           ]);
         expect(marker.ranOn.phases.standards).toEqual(confirmed && !baseCompared
           ? { location: 'local', remoteRedConfirmedLocally: true }
-          : { location: 'remote', receiptId: 'run-123456' });
+          : mode === 'local-fallback' ? { location: 'local' } : { location: 'remote', receiptId: 'run-123456' });
         if (confirmed) expect(observed.filter(e => e.event === 'acquire').map(e => e.kind)).toEqual(
           baseCompared ? (phaseAdmission ? ['files', 'files', 'files'] : ['selected', 'selected', 'selected'])
             : phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
       }
-      expect(observed.filter(e => e.event === 'nested-acquire')).toHaveLength(mode === 'local-fallback' ? 1 : 0);
+      expect(observed.filter(e => e.event === 'nested-acquire')).toHaveLength(mode === 'local-fallback' ? (laterPhases ? 2 : 1) : 0);
       const phase = laterPhases || command.startsWith('npm run test:unit') ? 'vitest' : command.startsWith('npm run check:standards') ? 'standards' : 'gate';
       // The base-compare case keeps standards remote and green, so the gate as a whole ran mixed.
       expect(marker.ranOn).toMatchObject({ location: baseCompared ? 'mixed' : location, phases: { [phase]: { location } } });
@@ -464,7 +518,14 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
         }
       } else {
         expect(result.stderr).not.toContain('confirming locally');
-        if (!laterPhases && command !== 'npm run test:unit && node raw.cjs') expect(observed.filter(e => e.event === 'spawn')).toHaveLength(1);
+        if (!laterPhases && retryExit === undefined && command !== 'npm run test:unit && node raw.cjs') expect(observed.filter(e => e.event === 'spawn')).toHaveLength(1);
+      }
+      if (mode === 'nested-local') {
+        expect(observed.filter(e => e.event === 'nested-child')).toEqual([{event:'nested-child',held:true}]);
+        expect(result.stderr).toContain('heavy-admission: local (remote.enabled=false');
+        expect(result.stderr).not.toContain('heavy-admission: remote');
+        expect(marker.failureDetails.summary).toContain('first local failure');
+        expect(marker.ranOn.phases[phase]).not.toHaveProperty('remoteRedConfirmedLocally');
       }
       if (mode === 'remote' && !confirmed) {
         expect(marker.ranOn.phases[phase].receiptId).toBe('run-123456');
@@ -504,6 +565,15 @@ else process.exit(mode==='unconfirmed'?124:exitCode);
   it.each(cases)('%s phase (exit %i, %s, held=%s): %s preserves admission and terminal evidence (argv=%j, phaseAdmission=%s, remoteExit=%s, localExit=%s, retryExit=%s)', verifyRemotePhase);
   it('local confirmation holds admission and clears inherited Forge dispatch after a remote red', () => {
     verifyRemotePhase('remote', 0, 'local', false, 'npm run test:unit', undefined, undefined, 1);
+  });
+  it.each([false, true])('local-fallback red in an untouched file gets one admitted isolated retry (phaseAdmission=%s)', phaseAdmission => {
+    verifyRemotePhase('local-fallback', 0, 'local', false, "npx vitest run 'one.test.mjs'", ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission, 1, 0, 0);
+  });
+  it('a foreign directory with the wrapper suffix retains local admission in the spawned child', () => {
+    verifyRemotePhase('raw', 0, 'local', true, 'node foreign/scripts/readiness/heavy-admission.mjs run -- vitest run');
+  });
+  it('nested local decision preserves the first local failure after remote preflight', () => {
+    verifyRemotePhase('nested-local', 1, 'local', false, 'npm run test:unit', undefined, undefined, 1);
   });
   it('remote watchdog timeout remains infrastructure failure without local confirmation', () => {
     verifyRemotePhase('watchdog', 2, 'unknown', false);

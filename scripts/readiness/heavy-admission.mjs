@@ -2389,7 +2389,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Forge. Consume this internal handoff once; local fallback stays reentrant.
     const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
     delete process.env.WE_FORGE_GATE_DISPATCH;
-    let verifyRemoteFallback = false;
+    // Preflight may have chosen remote before policy/load changed or admission was bypassed.
+    // Every local completion of that handoff still needs evidence of the first local verdict.
+    let reportLocalExecution = forgeGate;
     if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
@@ -2406,10 +2408,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
-        onDecision: decision => { verifyRemoteFallback = decision.remote; },
+        onDecision: decision => { reportLocalExecution ||= decision.remote; },
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
-      verifyRemoteFallback = verifyRemoteFallback && !result.handled;
       if (result.handled) {
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
@@ -2444,7 +2445,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
-    if (verifyRemoteFallback) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
+    if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }
   process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);

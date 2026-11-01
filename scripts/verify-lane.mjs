@@ -621,11 +621,11 @@ const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate
 const admissionPhases = {};
 async function acquireAdmission(phase, command, { forceLocal = false } = {}) {
   let decision = { remote: false, reason: 'raw-command' };
-  if (!forceLocal && !phaseAdmissionPlan({ command, decision: { remote: true } }).takeLocalSlot) {
+  if (!forceLocal && !phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
   }
-  const plan = phaseAdmissionPlan({ command, decision });
+  const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
   if (!plan.takeLocalSlot) return { ok: false, waitedMs: 0, remote: true, ...plan };
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
@@ -816,7 +816,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const started = performance.now();
   try {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
-    const plan = phaseAdmissionPlan({ command, decision: { remote: currentAdmission.remote === true } });
+    const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
     let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
     if (shouldConfirmRemoteRed({ plan, ...result })) {
       process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming locally\n`);
@@ -829,7 +829,9 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       // its verdict and failure inventory replace the remote result before isolated retry.
       result = { ...await runGate(command, args), ranOn: { location: 'local', remoteRedConfirmedLocally: true } };
     }
-    if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok;
+    // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
+    if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
+      || (result.remoteAttempt === true && result.ranOn.location === 'local');
     const locationKey = outcomeKey ?? kind ?? (/^npm run test:unit(?=\s|$)/.test(command) ? 'vitest' : /^npm run check:standards(?=\s|$)/.test(command) ? 'standards' : 'gate');
     const previousLocation = ranOnPhases[locationKey];
     ranOnPhases[locationKey] = previousLocation ? {

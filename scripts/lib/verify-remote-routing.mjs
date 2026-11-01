@@ -1,6 +1,6 @@
 import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { cpus, loadavg } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand } from '../readiness/forge-exec-run.mjs';
@@ -36,7 +36,7 @@ function wrappedVitestCommand(command) {
   return `npm run test:unit -- ${args.join(' ')}`;
 }
 
-export function phaseAdmissionPlan({ command, decision }) {
+export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
   if (/^npx vitest(?=\s|$)/.test(command)) {
     const wrapped = decision?.remote === true ? wrappedVitestCommand(command) : null;
     return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
@@ -45,8 +45,8 @@ export function phaseAdmissionPlan({ command, decision }) {
   const eligible = !!words && (
     (words[0] === 'npm' && words[1] === 'run' && ['test:unit', 'check:standards'].includes(words[2])
       && (words.length === 3 || words[3] === '--'))
-    || (words[0] === 'node' && /^(?:.*\/)?scripts\/readiness\/heavy-admission\.mjs$/.test(words[1])
-      && words[2] === 'run'));
+    || (words[0] === 'node' && words[2] === 'run'
+      && resolve(cwd, words[1]) === resolve(cwd, 'scripts/readiness/heavy-admission.mjs')));
   const remote = eligible && decision?.remote === true;
   return { command, takeLocalSlot: !remote, setHeld: !remote };
 }

@@ -2015,6 +2015,9 @@ local timeout flags). Log the confirmation and use its result and failure detail
 phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
 A valid `local-fallback` report already supplies the local verdict: preserve its exit code and
 failure details without another confirmation, including for edited tests and with isolated retry off.
+Untouched failing files remain eligible for the existing one-time isolated retry, which acquires
+its own local slot. The nested wrapper must report a local completion even when its policy/load
+decision changes after verify's remote preflight, or admission takes a bypass branch.
 The `proven local fallback verdict` regressions execute production `timedRunGate` with injected
 child IO for Vitest and standards under both admission modes, offering a passing second child
 to catch an unconditional retry into green.
@@ -2031,6 +2034,8 @@ Set `WE_VERIFY_PHASE_ADMISSION` to `0`/`1` in fixtures and assert the recorded a
 `false`/`true` strings are ignored and can silently exercise the default twice.
 Wrapper eligibility checks the entire command: compound commands, redirections and shell
 expansions retain a local slot and `WE_HEAVY_ADMISSION_HELD` for their full execution scope.
+Direct wrapper paths must resolve to `scripts/readiness/heavy-admission.mjs` in the target
+checkout; foreign directories with the same suffix retain local admission.
 Keep the compound-wrapper table for both npm scripts and the direct heavy-admission wrapper,
 plus the native spawn regression that observes HELD on both the wrapper and following scanner.
 Plan each phase's own command even when admission spans the whole gate; never reuse an
@@ -2039,6 +2044,8 @@ earlier phase's rewrite for standards, scanners or guards. Strip only trailing
 (at least 10000) before checking the remaining arguments with Forge's existing `allowedCommand` guard.
 Smaller timeouts stay local so remote defaults cannot loosen them. Remote location evidence
 requires a non-empty receipt ID and an integer exit code; a dispatched attempt with an incomplete or missing report is location `unknown` (never local), and any unknown phase makes the overall location unknown.
+Observe report reads in tests: reject an already oversized file before reading content, and
+request at most 65,537 bytes even if a regular file grows after its size check.
 Keep allowlisted reporters; unknown options retain the original local command and admission.
 
 The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
