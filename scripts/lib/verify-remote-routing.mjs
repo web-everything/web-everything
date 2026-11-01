@@ -69,9 +69,9 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 }
 
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
-  // The nested wrapper owns local fallback; its local red is already the local verdict.
-  // Confirming it again could discard a real failure before isolated-retry safeguards run.
-  return plan?.takeLocalSlot === false && ranOn?.location !== 'local'
+  // The nested wrapper owns local fallback. A local or mixed phase has already run locally;
+  // confirming the whole chain again could discard a failure before isolated-retry safeguards run.
+  return plan?.takeLocalSlot === false && !['local', 'mixed'].includes(ranOn?.location)
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }

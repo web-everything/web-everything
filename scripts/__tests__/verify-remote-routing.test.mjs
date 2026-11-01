@@ -105,25 +105,42 @@ describe('proven local fallback verdict', () => {
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode, ranOn })).toBe(false);
   });
 
-  it.each(['remote', 'mixed', 'unknown', undefined])('preserves confirmation for unproven local execution: %s', location => {
+  it.each(['remote', 'unknown', undefined])('preserves confirmation for unproven local execution: %s', location => {
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
       ...(location ? { ranOn: { location } } : {}) })).toBe(true);
+  });
+
+  it.each([
+    [['remote', 0], ['local-fallback', 1]],
+    [['local-fallback', 0], ['remote', 1]],
+    [['remote', 0], ['local-fallback', 0], ['local-fallback', 1]],
+  ])('never confirms a mixed chain verdict: %j', (...segments) => {
+    const reports = readRemoteReport('report', () => segments.map(([location, exitCode]) =>
+      JSON.stringify({ location, exitCode, ...(location === 'remote' ? { receiptId: 'run-123456' } : {}) })).join('\n'));
+    const ranOn = phaseRunLocation(reports, { remoteAttempt: true });
+    expect(ranOn.location).toBe('mixed');
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn })).toBe(false);
   });
 
   // Execute the production orchestration with admission and child IO injected. No fixture Git writes.
   // A second (passing) child is deliberately available to expose an unconditional retry into green.
   it.each([false, true].flatMap(phaseAdmission => [
-    ['vitestMs', 'npx vitest run scripts/changed.test.mjs'],
-    ['standardsMs', 'npm run check:standards'],
-  ].map(([phase, command]) => ({ phaseAdmission, phase, command }))))(
-    'retains the failed child and its evidence: $phase, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command }) => {
+    ['vitestMs', 'npx vitest run scripts/changed.test.mjs', ['local-fallback']],
+    ['standardsMs', 'npm run check:standards', ['local-fallback']],
+    ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npx vitest run scripts/changed.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ['remote', 'local-fallback']],
+    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run scripts/changed.test.mjs', ['local-fallback', 'remote']],
+  ].map(([phase, command, locations]) => ({ phaseAdmission, phase, command, locations }))))(
+    'retains the failed child and its evidence: $phase, $locations, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command, locations }) => {
       const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
       const start = source.indexOf('async function timedRunGate(');
       const end = source.indexOf('// runVitestOnBase', start);
       expect(start).toBeGreaterThan(-1);
       expect(end).toBeGreaterThan(start);
       const failure = { exitCode: 1, remoteAttempt: true,
-        ranOn: phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode: 1 }))),
+        ranOn: phaseRunLocation(readRemoteReport('report', () => locations.map((location, i) => JSON.stringify({
+          location, exitCode: i === locations.length - 1 ? 1 : 0,
+          ...(location === 'remote' ? { receiptId: 'run-123456' } : {}),
+        })).join('\n'))),
         failureDetails: { summary: 'local failure in scripts/changed.test.mjs' },
         output: { stdout: '', stderr: 'FAIL scripts/changed.test.mjs' } };
       const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: 0, ranOn: { location: 'local' } });
@@ -150,7 +167,7 @@ describe('proven local fallback verdict', () => {
       expect(acquireAdmission).not.toHaveBeenCalled();
       expect(recordOutcome).toHaveBeenCalledWith(phase.replace(/Ms$/, ''), expect.objectContaining({ exitCode: 1,
         failureDetails: failure.failureDetails }));
-      expect(context.ranOnPhases[phase.replace(/Ms$/, '')]).toEqual({ location: 'local' });
+      expect(context.ranOnPhases[phase.replace(/Ms$/, '')]).toEqual(failure.ranOn);
       expect(context.process.stderr.write).not.toHaveBeenCalled();
     });
 });
