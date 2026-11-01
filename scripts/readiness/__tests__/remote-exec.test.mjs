@@ -776,6 +776,7 @@ describe('standards input parity', () => {
     });
     const result = await runRemote(f);
     expect(callsOf(f.exec).some(isCleanup)).toBe(true);
+    expect(JSON.parse(callsOf(f.exec).find(isCleanup).input).cancel).toBe(true);
     expect(result).toEqual(mode === 'cancelled' ? {mode, terminated: true, reason: 'client-signal'} : {mode, reason: 'ambiguous-result'});
   });
 
@@ -788,6 +789,50 @@ describe('standards input parity', () => {
       return original(call);
     });
     expect(await runRemote(f)).toEqual({mode: 'unconfirmed', reason: 'ambiguous-result'});
+    expect(JSON.parse(callsOf(f.exec).find(isCleanup).input).cancel).toBeUndefined();
+  });
+
+  it.each(['install','task'])('cancels an executing numbered worker during %s through protected finish', async stage => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'active-cancel-')); auxiliary.push(root);
+    mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
+    let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const stopped = new Promise(resolve => { release = resolve; });
+    const commands = [];
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:async call => {
+      commands.push(call.argv);
+      if (call.argv[0] !== 'npm' || (stage === 'install' ? call.argv[1] !== 'ci' : call.argv[1] === 'ci')) return {code:0};
+      entered(call);
+      await stopped;
+      return {code:143};
+    }});
+    const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
+    const work = join(root, 'runs/slot-1', prepared.run, 'work');
+    writeFileSync(join(work, 'package-lock.json'), 'lock');
+    const manifest = forgeManifestAPI.manifestWire({entries:[{path:Buffer.from('package-lock.json'),
+      sha256:createHash('sha256').update('lock').digest('hex'), executable:false}], excluded:[]});
+    const request = {...prepared, nonce, argv, env:{}, manifest, manifestDigest:forgeManifestAPI.digestManifest(manifest),
+      lock:createHash('sha256').update('lock').digest('hex'), inputDigest:await digestInput(work), argvDigest:digestArgv(argv)};
+    const running = runner.run(request);
+    let watcher;
+    try {
+      const call = await Promise.race([ready, running.then(() => {throw new Error('worker never started');})]);
+      expect(call.cancel).toBe(join(root, 'receipts', prepared.run+'.cancel'));
+      // Model the fixed supervisor observing protected cancellation while SSH is disconnected.
+      watcher = setInterval(() => {if (call.cancel && existsSync(call.cancel)) release();}, 5);
+      // Ordinary finish must retain the guard; invalid cancellation must not signal the worker.
+      await expect(runner.finish({...prepared, nonce})).rejects.toThrow('Worker execution unconfirmed');
+      // A mismatched running record cannot authenticate; the prepared phase no longer exists.
+      await expect(runner.finish({...prepared, nonce:'b'.repeat(32), cancel:true})).rejects.toMatchObject({code:'ENOENT'});
+      expect(existsSync(call.cancel)).toBe(false);
+      const receipt = await runner.finish({...prepared, nonce, cancel:true});
+      await running;
+      expect(receipt).toMatchObject({run:prepared.run, nonce, phase:stage === 'install' ? 'install' : 'test', code:stage === 'install' ? 97 : 143});
+      expect(commands).toHaveLength(stage === 'install' ? 2 : 3); // install, optional task, UID cleanup
+      expect(existsSync(join(root, 'receipts/worker-active-1'))).toBe(false);
+      expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(false);
+      expect((await runner.prepare({nonce})).slot).toBe('forge-exec-1');
+    } finally {clearInterval(watcher); release(); await running;}
   });
 
   it('keeps skipped standards unconfirmed when the completion receipt is invalid', async () => {
@@ -795,6 +840,84 @@ describe('standards input parity', () => {
     f.argv = ['npm','run','check:standards'];
     f.exec = vi.fn(async call => ({...await original(call),...(isRun(call) ? {stdout:'skipping'} : {})}));
     expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
+  it.each(['wrong slot','replacement reservation','cleanup failure','stale execution'])('retains the reservation after %s during cancellation', async fault => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-refusal-')); auxiliary.push(root);
+    mkdirSync(join(root, 'runs/slot-1'), {recursive:true, mode:0o710});
+    const cleanup = vi.fn(async () => ({code:1}));
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin', testWorkerExec:cleanup});
+    const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
+    const active = join(root, 'receipts/worker-active-1'), cancel = join(root, 'receipts', prepared.run+'.cancel');
+    if (fault === 'replacement reservation') writeFileSync(join(active, 'reservation.json'), JSON.stringify({run:'r-'+'b'.repeat(32), nonce, slot:prepared.slot}));
+    let time;
+    if (fault === 'stale execution') {
+      mkdirSync(join(active, 'executing'));
+      let tick = 0n;
+      time = vi.spyOn(process.hrtime, 'bigint').mockImplementation(() => (tick += 50000000000n));
+    }
+    try {
+      await expect(runner.finish({...prepared, nonce, cancel:true, ...(fault === 'wrong slot' ? {slot:'forge-exec-2'} : {})})).rejects.toThrow(
+        fault === 'wrong slot' ? 'Slot mismatch' : fault === 'replacement reservation' ? 'Reservation mismatch' : fault === 'cleanup failure' ? 'Worker cleanup unconfirmed' : 'Worker cancellation unconfirmed');
+      expect(existsSync(active)).toBe(true);
+      expect(existsSync(join(root, 'runs/slot-1', prepared.run))).toBe(true);
+      expect(existsSync(cancel)).toBe(['cleanup failure','stale execution'].includes(fault));
+      expect(cleanup).toHaveBeenCalledTimes(fault === 'cleanup failure' ? 1 : 0);
+    } finally {time?.mockRestore();}
+  });
+
+  it('does not certify cancellation of a legacy shared-UID reservation', async () => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-legacy-')); auxiliary.push(root);
+    const runner = createRunner({testRoot:root, testPath:'/usr/bin:/bin'});
+    const nonce = 'a'.repeat(32), prepared = await runner.prepare({nonce});
+    await expect(runner.finish({...prepared, nonce, cancel:true})).rejects.toThrow('Cancellation requires a numbered worker');
+    expect(existsSync(join(root, 'runs', prepared.run))).toBe(true);
+    expect(existsSync(join(root, 'receipts', prepared.run+'.cancel'))).toBe(false);
+  });
+
+  it.each(['before launch','while running'].flatMap(stage => [false,true].map(archive => [stage,archive])))('the shipped supervisor stops a real worker cancelled %s (archive=%s)', async (stage, archive) => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'cancel-supervisor-')); auxiliary.push(root);
+    const probe = String.raw`import ctypes, json, os, subprocess, sys, time
+from unittest.mock import patch
+source, root, stage, archive = sys.argv[1:]
+cancel = os.path.join(root, 'run.cancel')
+writer = dict(guard=os.path.join(root, 'writer'), reservation=os.path.join(root, 'reservation'), run='fixture', nonce='fixture', slot='forge-exec-1')
+fd = os.open(writer['guard'], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+with open(writer['reservation'], 'w') as stream: json.dump(writer, stream)
+started, survived = os.path.join(root, 'started'), os.path.join(root, 'survived')
+task = "import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(%r, 'w').write(str(os.getpid())); time.sleep(2); open(%r, 'w').close()" % (started, survived)
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=[sys.executable, '-I', '-c', task], cwd=root, env={}, writer=writer, cancel=cancel, status=os.path.join(root, 'status'))
+if archive == 'true':
+    cfg['archive'] = os.path.join(root, 'archive')
+    open(cfg['archive'], 'w').close()
+real_popen = subprocess.Popen
+def launch(*args, **kwargs):
+    assert stage == 'while running', 'cancelled task was launched'
+    child = real_popen(*args, **kwargs)
+    deadline = time.monotonic() + 1
+    while not os.path.exists(started):
+        if time.monotonic() >= deadline:
+            child.kill()
+            child.wait()
+            raise AssertionError('task never started')
+        time.sleep(0.005)
+    open(cancel, 'w').close()
+    return child
+if stage == 'before launch': open(cancel, 'w').close()
+# Darwin has no prctl/proc. Keep the actual child, signal, wait and protected
+# files; suppress only Linux discovery so no other local UID is ever targeted.
+with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_value=[]), patch.object(subprocess, 'Popen', side_effect=launch):
+    libc.return_value.prctl.return_value = 0
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    const result = spawnSync('python3', ['-I','-c',probe,forgeManifestAPI.supervisorSource,root,stage,String(archive)], {encoding:'utf8',timeout:5000,maxBuffer:1024*1024});
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(root, 'status'), 'utf8')).toBe('255');
+    expect(existsSync(join(root, 'started'))).toBe(stage === 'while running');
+    expect(existsSync(join(root, 'survived'))).toBe(false);
+    if (stage === 'while running') expect(() => process.kill(Number(readFileSync(join(root, 'started'), 'utf8')), 0)).toThrow();
   });
 });
 

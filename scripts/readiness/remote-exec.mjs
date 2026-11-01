@@ -1084,7 +1084,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     if (!run || finished) return null;
     finished = true;
     const done=begin('finish-receipt');
-    try{return await ssh('finish', {nonce,run});}finally{done();}
+    try{return await ssh('finish', {nonce,run,...(cancel.signal.aborted?{cancel:true}:{})});}finally{done();}
   };
   try {
     let expected, expectedManifest, delta, transferBytes=0, transferCount=0;
