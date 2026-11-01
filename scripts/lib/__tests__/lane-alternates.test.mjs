@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, realpathSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -29,7 +29,7 @@ describe('ensureLaneAlternates', () => {
     writeFileSync(join(lane, '.git', 'objects', 'keep'), 'x');
     const r = ensureLaneAlternates({ laneDir: lane, referencePath: primary, laneOrigin: 'git@github.com:chalbert/web-everything.git', referenceOrigin: 'git@github.com:web-everything/web-everything.git' });
     expect(r.status).toBe('added');
-    expect(readFileSync(join(lane, '.git', 'objects', 'info', 'alternates'), 'utf8').trim()).toBe(join(primary, '.git', 'objects'));
+    expect(readFileSync(join(lane, '.git', 'objects', 'info', 'alternates'), 'utf8').trim()).toBe(realpathSync(join(primary, '.git', 'objects')));
     expect(existsSync(join(lane, '.git', 'objects', 'keep'))).toBe(true);
   });
   it('keeps an existing alternate and never switches it', () => {
@@ -118,4 +118,11 @@ describe('review round 2', () => {
     const other = mkRepo(join(root, '.lanes', 'p', 'lane-2')), lane3 = mkRepo(join(root, 'lane-3'));
     expect(ensureLaneAlternates({ laneDir: lane3, referencePath: other }).status).toBe('skipped');
   });
+});
+
+it('refuses a reference whose .git/objects is a symlink into a lane', () => {
+  const lane = mkRepo(join(root, 'lane-1')), victim = mkRepo(join(root, '.lanes', 'p', 'lane-2'));
+  const ref = join(root, 'ref'); mkdirSync(join(ref, '.git'), { recursive: true });
+  symlinkSync(join(victim, '.git', 'objects'), join(ref, '.git', 'objects'));
+  expect(ensureLaneAlternates({ laneDir: lane, referencePath: ref }).status).toBe('skipped');
 });

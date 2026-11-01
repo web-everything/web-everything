@@ -1001,7 +1001,7 @@ function cloneLane(repo, n) {
     gitQuiet(['remote', 'add', 'origin', repo.originUrl], dest);
     ensureAlternatesFor(repo, n);
     gitQuiet(['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/*:refs/remotes/origin/*'], dest);
-    tryGit(['remote', 'set-head', 'origin', '--auto'], dest);
+    tryGit(['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${repo.branch}`], dest); // local only: no network outside git-bounded
   }
   ensureAlternatesFor(repo, n);
   gitQuiet(['config', '--local', 'gc.auto', '0'], dest);

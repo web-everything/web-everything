@@ -8,7 +8,7 @@
  * never removes an object.
  */
 import { constants as FS, closeSync, existsSync, lstatSync, openSync, writeSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 
 /** GitHub redirects chalbert/web-everything to web-everything/web-everything; that ONE pair is the same repo. */
 const REPO_ALIASES = new Map([['chalbert/web-everything', 'web-everything/web-everything']]);
@@ -36,10 +36,13 @@ export function sameRepoUrl(a, b) {
  * never touches objects. `isGitDir` lets a caller inject the store check.
  */
 export function ensureLaneAlternates({ laneDir, referencePath, laneOrigin, referenceOrigin }) {
-  const objects = existsSync(join(referencePath, '.git', 'objects')) ? join(referencePath, '.git', 'objects')
+  const objectsCandidate = existsSync(join(referencePath, '.git', 'objects')) ? join(referencePath, '.git', 'objects')
     : existsSync(join(referencePath, 'objects')) ? join(referencePath, 'objects') : null;
-  if (!objects) return { status: 'skipped', reason: 'reference object store not found' };
-  if (/\/\.lanes\//.test(resolve(objects)) || resolve(objects).startsWith(resolve(laneDir))) return { status: 'skipped', reason: 'reference is a lane' };
+  if (!objectsCandidate) return { status: 'skipped', reason: 'reference object store not found' };
+  // Real paths only: a symlinked reference or `.git/objects` must not smuggle a lane into the trusted store.
+  let objects, realLane;
+  try { objects = realpathSync(objectsCandidate); realLane = realpathSync(laneDir); } catch { return { status: 'skipped', reason: 'unresolvable path' }; }
+  if (/\/\.lanes\//.test(`${objects}/`) || objects.startsWith(`${realLane}/`) || basename(objects) !== 'objects') return { status: 'skipped', reason: 'reference is a lane' };
   if (laneOrigin && referenceOrigin && !sameRepoUrl(laneOrigin, referenceOrigin)) {
     return { status: 'skipped', reason: 'lane origin differs from the reference origin' };
   }
@@ -52,14 +55,18 @@ export function ensureLaneAlternates({ laneDir, referencePath, laneOrigin, refer
   try { current = readFileSync(file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') return { status: 'skipped', reason: e.message }; }
   if (current.split('\n').some((l) => l.trim())) return { status: 'present' };
   mkdirSync(infoDir, { recursive: true });
-  if (isLink(infoDir)) return { status: 'skipped', reason: 'symlink in lane object store path' };
+  let realInfo;
+  try { realInfo = realpathSync(infoDir); } catch { return { status: 'skipped', reason: 'unresolvable path' }; }
+  // Every ancestor is resolved: the write goes to a symlink-free absolute path that must sit inside the lane's own object store.
+  if (realInfo !== join(realLane, '.git', 'objects', 'info')) return { status: 'skipped', reason: 'symlink in lane object store path' };
   // No truncation and no symlink following: create exclusively, or open an existing EMPTY file with O_NOFOLLOW.
+  const realFile = join(realInfo, 'alternates');
   const flags = FS.O_WRONLY | FS.O_NOFOLLOW | (existsSync(file) ? 0 : FS.O_CREAT | FS.O_EXCL);
   let fd;
-  try { fd = openSync(file, flags, 0o644); } catch (e) { return { status: 'skipped', reason: e.code || e.message }; }
+  try { fd = openSync(realFile, flags, 0o644); } catch (e) { return { status: 'skipped', reason: e.code || e.message }; }
   try {
     if (existsSync(file) && readFileSync(file, 'utf8').trim()) return { status: 'present' };
-    writeSync(fd, `${resolve(objects)}\n`);
+    writeSync(fd, `${objects}\n`);
   } finally { closeSync(fd); }
   return { status: 'added' };
 }
