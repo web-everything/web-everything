@@ -592,6 +592,14 @@ as browser asset URLs, which can become HTTP URLs under Vitest's DOM environment
 Node's ESM loader refuses those URLs, and a settings read can silently fall back instead.
 Assert tool-layer provenance when testing a real default settings path.
 
+Async child output is complete at `close`; `exit` can precede the final stdout/stderr
+chunks. Exercise that ordering for success and failure with an injected child, alongside
+real-process tests. Keep timeout and output bounds active while draining pipes retained
+by descendants; reaching either bound must still reject the result.
+When updating the shared spawn wrapper, check every caller's injected child fixture:
+emit `close` after `exit` and the final output, and use real streams when the wrapper
+can destroy retained pipes. An exit-only fixture leaves the completion promise pending.
+
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
 The existing label provider provisions the known metadata and writes the mutually exclusive
