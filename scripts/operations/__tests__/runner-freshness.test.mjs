@@ -129,6 +129,7 @@ describe('runner freshness policy', () => {
         "unpark",
         "verify",
         "why",
+        "worker-capacity",
       ]
     `);
     for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load', 'routing-override']) {
