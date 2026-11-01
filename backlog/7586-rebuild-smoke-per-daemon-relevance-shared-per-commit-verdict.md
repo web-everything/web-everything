@@ -1,16 +1,17 @@
 ---
+bornAs: xfwf4zc
 kind: story
 size: 5
-parent: "x1bppc5"
+parent: "7585"
 status: open
 scope: ["we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/skip-unrelated.mjs", "we:scripts/lib/verify-remote-routing.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Rebuild smoke: per-daemon relevance, shared per-commit verdict, Forge routing (x1bppc5 ruling R344)
+# Rebuild smoke: per-daemon relevance, shared per-commit verdict, Forge routing (7585 ruling R344)
 
-Build the ratified x1bppc5 ruling: per-daemon import-closure relevance for dispatch-dry-run/reconcile-dry-run, a shared host-level verdict store keyed tree+lockfile+node+harness(+cloneKind) valid 12h, code checks on Forge with Mac fallback and tree-mismatch reject, and the always-run floor. Scope: we:scripts/lib/daemon-live-smoke.mjs, we:scripts/lib/daemon-rebuild/smoke.mjs, we:scripts/lib/daemon-rebuild/skip-unrelated.mjs, we:scripts/lib/verify-remote-routing.mjs. Tests and proof plan are in the card. Build after R333.
+Build the ratified 7585 ruling: per-daemon import-closure relevance for dispatch-dry-run/reconcile-dry-run, a shared host-level verdict store keyed tree+lockfile+node+harness(+cloneKind) valid 12h, code checks on Forge with Mac fallback and tree-mismatch reject, and the always-run floor. Scope: we:scripts/lib/daemon-live-smoke.mjs, we:scripts/lib/daemon-rebuild/smoke.mjs, we:scripts/lib/daemon-rebuild/skip-unrelated.mjs, we:scripts/lib/verify-remote-routing.mjs. Tests and proof plan are in the card. Build after R333.
 
 ## Acceptance
 
