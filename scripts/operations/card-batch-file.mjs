@@ -86,7 +86,7 @@ export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN
   let fetched = true;
   const at = now();
   let ageMs = 0;
-  try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, run: (args, cwd) => run(cwd, args) })); } catch { fetched = false; /* fall back to the lane's last fetch */ }
+  try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, maxAgeMs, run: (args, cwd) => run(cwd, args) })); } catch { fetched = false; /* fall back to the lane's last fetch */ }
   const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}']);
   if (fetched) cache.set(key, { at: at - ageMs, sha }); // the window runs from the real fetch, never from a shared skip
   else cache.delete(key);

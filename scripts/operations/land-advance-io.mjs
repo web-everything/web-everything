@@ -127,7 +127,7 @@ export function createLandAdvanceReader(ports = {}) {
       const path = join(jobsDir, n); return { path, provider: resultProvider(io.readFileSync(path, 'utf8')), mtime: io.statSync(path).mtime.toISOString() };
     }), []);
     const prototype = get('prototype', readPrototype ?? (() => {
-      if (refreshPrototype) fetchFresh({ cwd: ROOT, branches: null, run: (args) => run('git', args) });
+      if (refreshPrototype) fetchFresh({ cwd: ROOT, branches: null, maxAgeMs: 0, run: (args) => run('git', args) });
       const [behind, ahead] = run('git', ['rev-list', '--left-right', '--count', 'origin/main...origin/lane/mechanical-dispatcher']).trim().split(/\s+/).map(Number);
       if (![ahead, behind].every(Number.isFinite)) throw new Error('Invalid branch counts');
       return { ahead, behind, refreshed: refreshPrototype, reason: refreshPrototype ? 'fetched origin' : 'cached refs; plan does not fetch' };

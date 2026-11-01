@@ -173,7 +173,7 @@ export async function main(argv, deps = {}) {
       const ref = flags.ref || 'origin/main';
       const git = (...args) => command('git', ['-C', root, ...args]);
       const tryGit = (...args) => { try { return git(...args); } catch { return null; } };
-      if (!flags['no-fetch']) { try { retryTransientGit(() => fetchFresh({ cwd: root, branches: ['main'], run: (args) => git(...args) })); } catch { /* best-effort */ } }
+      if (!flags['no-fetch']) { try { retryTransientGit(() => fetchFresh({ cwd: root, branches: ['main'], maxAgeMs: 0, run: (args) => git(...args) })); } catch { /* best-effort */ } }
       const wanted = flags.item ? new Set(String(flags.item).split(',').map(Number)) : null;
       const selected = items.filter(item => wanted ? wanted.has(item.num) : flags.all || !item.done);
       const gh = env.WE_HELD_CARDS_GH_BIN || 'gh';

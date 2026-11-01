@@ -244,7 +244,7 @@ export function autoResolvableStrandings(cards = [], mainLog = []) {
 // EXPORTED (xvr2o8r) so `autoStrandedSweepPass` below — and the drain's own wiring — share this ONE read
 // rather than a second copy that could drift on the fetch/window behaviour.
 export function readMainLog(limit) {
-  try { fetchFresh({ cwd: process.cwd(), branches: ['main'], run: (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* best-effort — a stale local origin/main still degrades safely below */ }
+  try { fetchFresh({ cwd: process.cwd(), branches: ['main'], maxAgeMs: 0, run: (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }); } catch { /* best-effort — a stale local origin/main still degrades safely below */ }
   try {
     const out = execFileSync('git', ['log', '--pretty=%s', ...(limit ? [`-n${limit}`] : []), 'origin/main'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
     return out.split('\n').filter(Boolean);

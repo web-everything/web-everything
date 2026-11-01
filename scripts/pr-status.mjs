@@ -857,7 +857,7 @@ async function main(argv) {
 
   // Ancestry is only as truthful as the refs behind it: a stale `origin/<branch>` makes a lane that HAS the work
   // look like a stranger. Fetch first unless told not to.
-  if (!flags['no-fetch']) fetchFresh({ cwd: gitRoot, branches: null, run: (args) => sh('git', ['-C', gitRoot, ...args]) });
+  if (!flags['no-fetch']) fetchFresh({ cwd: gitRoot, branches: null, maxAgeMs: 0, run: (args) => sh('git', ['-C', gitRoot, ...args]) });
 
   const lanes = listLanes(lanesRoot);
   // One configured-store read shared by every row. On failure, rounds come from the jury ledger only.
