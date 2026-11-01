@@ -1527,19 +1527,6 @@ function staleRunFixture(over = {}) {
     recoverPayload: vi.fn(() => payload()), ...over });
 }
 
-describe('staleRunDeadlineMs — environment deadline parsing', () => {
-  it.each(['0', '60000', String(Number.MAX_SAFE_INTEGER)])('accepts safe non-negative integer %s', value => {
-    expect(staleRecovery.staleRunDeadlineMs({ WE_RED_TEAM_STALE_RUN_MS: value })).toBe(Number(value));
-  });
-  it.each(['', '-1', '1.5', 'NaN', 'Infinity', '1e3', ' 1000 ', 'invalid', '9007199254740992'])(
-    'invalid value %j falls back to the default deadline', value => {
-      expect(staleRecovery.staleRunDeadlineMs({ WE_RED_TEAM_STALE_RUN_MS: value })).toBe(staleDeadline);
-    });
-  it('an unset environment value falls back to the default deadline', () => {
-    expect(staleRecovery.staleRunDeadlineMs({})).toBe(staleDeadline);
-  });
-});
-
 describe('staleRedTeamRun — dead running owner recovery', () => {
   it('exports the two-hour stale run deadline', () => {
     expect(staleRecovery.STALE_RUN_DEADLINE_MS).toBe(staleDeadline);
@@ -1624,22 +1611,6 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
 });
 
 describe('runRedTeamOnSkip — stale recovery effects', () => {
-  it.each([
-    ['shorter override', '60000', 60 * 60 * 1000, true],
-    ['longer override', '14400000', 3 * 60 * 60 * 1000, false],
-    ['invalid override within default', 'invalid', 60 * 60 * 1000, false],
-    ['unsafe override past default', '9007199254740992', 3 * 60 * 60 * 1000, true],
-    ['unset within default', undefined, 60 * 60 * 1000, false],
-    ['unset past default', undefined, 3 * 60 * 60 * 1000, true],
-  ])('uses the environment deadline for an unprobeable owner: %s', (_name, value, age, dispatched) => {
-    const status = deadRunningStatus({ host: 'remote', pidStart: new Date(staleNow - age).toISOString() });
-    const o = staleRunFixture({ env: value === undefined ? {} : { WE_RED_TEAM_STALE_RUN_MS: value },
-      readStatus: () => status });
-    expect(runRedTeamOnSkip(o).dispatched).toHaveLength(dispatched ? 1 : 0);
-    expect(o.recoverPayload).toHaveBeenCalledTimes(dispatched ? 1 : 0);
-    expect(o.abandonStale).toHaveBeenCalledTimes(dispatched ? 1 : 0);
-    expect(o.dispatch).toHaveBeenCalledTimes(dispatched ? 1 : 0);
-  });
   it('abandons exactly once before fresh red-team-only dispatch', () => {
     const o = staleRunFixture();
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });

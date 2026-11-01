@@ -27,12 +27,6 @@ import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 
 export const STALE_RUN_DEADLINE_MS = 2 * 60 * 60 * 1000;
 
-export function staleRunDeadlineMs(env = process.env) {
-  const value = env.WE_RED_TEAM_STALE_RUN_MS;
-  return /^\d+$/.test(value ?? '') && Number.isSafeInteger(Number(value))
-    ? Number(value) : STALE_RUN_DEADLINE_MS;
-}
-
 /** A matching live local owner always wins over the age deadline. Unknown age stays closed. */
 export function staleRedTeamRun({ status, now = Date.now(), deadlineMs = STALE_RUN_DEADLINE_MS,
   probe = {} } = {}) {
@@ -65,9 +59,7 @@ export function staleRedTeamSpent(key) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
-/** The exclusive-create marker spends recovery; the re-read is a best-effort recheck, not an atomic lock.
- * Only a confirmed non-start may release the recovery spend.
- */
+/** Exclusively spend recovery before dispatch; only a confirmed non-start may release it. */
 export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(), probe = {} }) {
   const path = staleStatusPath({ repo, pr, head, env }), marker = `${path}.stale-redispatch-1`;
   let claimed = false;
@@ -266,6 +258,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
       const stale = staleRedTeamRun({ status, now, probe, deadlineMs }).stale;
       const staleOwed = stale && accepted && status?.head === head
+        && (rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:pending') || status.result == null)
         && evidence?.loopPayload?.findings?.read?.netBasis?.rev === head;
       const owed = redTeamOwedFor(evidence?.loopPayload);
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
@@ -389,7 +382,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, probe, staleSpent,
-      deadlineMs: staleRunDeadlineMs(env) }));
+      deadlineMs: /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '') && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS))
+        ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : STALE_RUN_DEADLINE_MS }));
     for (const row of rows) {
       let started = false;
       if (row.action === 'carry') {
