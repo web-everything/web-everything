@@ -208,6 +208,21 @@ it('refuses a reused slot whose admin dir holds a link', () => {
   expect(readdirSync(join(lane, '.git')).sort()).toEqual(before);
 });
 
+it('refuses a store with a redirected refs dir, and prune will not delete through a redirected parent', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const refs = join(pool, 'repo.git', 'refs', 'seat');
+  mkdirSync(join(pool, 'repo.git', 'refs'), { recursive: true }); rmSync(refs, { recursive: true, force: true });
+  symlinkSync(join(lane, '.git', 'refs'), refs);
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow(/contains a link/);
+  rmSync(refs);
+  // a redirected views dir must not expose a foreign foo.input to deletion
+  const victim = join(pool, '..', 'victim-views'); mkdirSync(join(victim, 'foo.input'), { recursive: true });
+  rmSync(join(pool, 'views'), { recursive: true, force: true }); symlinkSync(victim, join(pool, 'views'));
+  expect(pruneSeatPool({ poolDir: pool, keep: 0 })).toEqual([]);
+  expect(existsSync(join(victim, 'foo.input'))).toBe(true);
+  expect(existsSync(join(a.slotDir, '.git'))).toBe(true);
+});
+
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const stable = statSync(join(a.dir, 'stable.txt')).ino; a.release();

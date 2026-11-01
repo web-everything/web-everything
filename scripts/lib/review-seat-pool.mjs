@@ -135,7 +135,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   renameSync(cfgTmp, join(p.repo, 'config')); // no leftover filter drivers, hooks path or worktree-config extension
   // Object storage must be this pool's own: no linked objects dir, no alternates borrowing a lane's objects.
   ownPrivateDir(join(p.repo, 'objects'));
-  assertNoLinks(join(p.repo, 'objects'));
+  assertNoLinks(p.repo); // refs/, logs/, objects/, worktrees/, hooks/ ...: nothing Git writes can be redirected out of the store
   if (lstatOrNull(join(p.repo, 'objects', 'info', 'alternates'))) throw new Error('seat pool store borrows another repository\'s objects');
   // Git must resolve exactly this directory as the bare store, not follow a pointer inside it to another repository.
   if (realpathSync(git(['-C', p.repo, 'rev-parse', '--absolute-git-dir']).stdout.trim()) !== realpathSync(p.repo)
@@ -213,6 +213,10 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
   const p = paths(poolDir);
   const removed = [];
   try {
+    if (!lstatOrNull(poolDir)) return removed;
+    // Same trust as acquisition, before anything is deleted through these parents.
+    for (const d of [poolDir, p.slots, p.locks, p.state, p.views, p.repo]) { if (lstatOrNull(d)) ownPrivateDir(d); }
+    if (lstatOrNull(p.repo)) assertNoLinks(p.repo);
     const slots = slotNumbers(p).map((n) => {
       let mtime = 0;
       try { mtime = statSync(join(p.state, `slot-${n}.rev`)).mtimeMs; } catch { /* no state: oldest */ }
@@ -224,6 +228,7 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
       if (!tryLock(lockDir, now, undefined, undefined, () => slotBusy(join(p.slots, `slot-${n}`)))) return;
       try {
         if (slotBusy(join(p.slots, `slot-${n}`))) return;
+        ownPrivateDir(join(p.slots, `slot-${n}`));
         checkAdminRoot(p);
         git(['-C', p.repo, 'worktree', 'remove', '--force', join(p.slots, `slot-${n}`)], { allowFail: true });
         rmSync(join(p.slots, `slot-${n}`), { recursive: true, force: true });
