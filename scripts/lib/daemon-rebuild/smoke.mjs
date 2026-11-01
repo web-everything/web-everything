@@ -23,7 +23,7 @@ import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './cand
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, SHAREABLE_CHECK_NAMES } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SHAREABLE_CHECK_NAMES, relevanceDiffSafe } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -63,14 +63,22 @@ export function smokePassTtlMs(env = process.env) {
 
 /** The relevance proof a `skipped:relevance` row needs: a recorded prior LIVE pass of that check on an identical
  *  closure, harness, Node version and lockfile. Missing identity or legacy records mean "no proof" (the check runs). */
-export function makeRelevanceProof({ identity = null, env = process.env, now = Date.now, ttlMs = smokePassTtlMs(env) } = {}) {
+export function makeRelevanceProof({ identity = null, git = null, env = process.env, now = Date.now, ttlMs = smokePassTtlMs(env) } = {}) {
   return (name, closureHash) => {
     if (!validRelevanceIdentity(identity)) return false;
     if (!SHAREABLE_CHECK_NAMES.includes(name) || !/^[0-9a-f]{64}$/.test(String(closureHash))) return false;
     const rec = readStoreRecord(closureProofPath(name, closureHash, identity.relevanceKey, env));
     const age = now() - Date.parse(rec?.passedAt);
-    return rec?.v === 2 && rec.kind === 'closure-pass' && rec.relevanceKey === identity.relevanceKey
-      && rec.name === name && rec.closureHash === closureHash && age >= 0 && age < ttlMs;
+    if (!(rec?.v === 3 && rec.kind === 'closure-pass' && rec.relevanceKey === identity.relevanceKey
+      && rec.name === name && rec.closureHash === closureHash && age >= 0 && age < ttlMs)) return false;
+    // Equivalence with the proof's tree: the two trees may differ only in plain code and docs. Runtime-read files
+    // (markdown briefs, skills, config, manifests) that the closure hash cannot see make this false (fail closed).
+    if (typeof git !== 'function' || !/^[0-9a-f]{40,64}$/.test(String(rec.tree)) || !/^[0-9a-f]{40,64}$/.test(String(identity.tree))) return false;
+    if (rec.tree === identity.tree) return true;
+    try {
+      const d = git(['diff', '--name-only', '--no-renames', rec.tree, identity.tree]);
+      return d.status === 0 && relevanceDiffSafe(String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean));
+    } catch { return false; }
   };
 }
 
@@ -145,8 +153,8 @@ export function writeClosureProofs(rows, { identity = null, env = process.env, n
   for (const row of rows || []) {
     if (!row || row.ok !== true || row.skipped || row.skipReason || !SHAREABLE_CHECK_NAMES.includes(row.name)
       || !/^[0-9a-f]{64}$/.test(String(row.closureHash))) continue;
-    writeStoreRecord(closureProofPath(row.name, row.closureHash, identity.relevanceKey, env), { v: 2, kind: 'closure-pass', name: row.name,
-      relevanceKey: identity.relevanceKey,
+    writeStoreRecord(closureProofPath(row.name, row.closureHash, identity.relevanceKey, env), { v: 3, kind: 'closure-pass', name: row.name,
+      relevanceKey: identity.relevanceKey, tree: identity.tree,
       closureHash: row.closureHash, passedAt: new Date(now()).toISOString(), writer: { host: hostname(), pid: process.pid } });
   }
 }
@@ -188,7 +196,7 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon', { harnessHash 
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
     const execution = { lockHash, nodeVersion, harnessHash };
     const base = { tree, ...execution };
-    return { tree, key: smokePassKey({ ...base, cloneKind }), sharedKey: smokePassKey({ ...base, cloneKind: '*' }),
+    return { tree, key: smokePassKey({ ...base, cloneKind }), sharedKey: smokePassKey({ ...base, cloneKind: SMOKE_CHECKS.filter((c) => c.shareable).every((c) => c.cloneIndependent === true) ? '*' : cloneKind }),
       relevanceKey: sha256(JSON.stringify(execution)) };
   } catch {
     return null;
@@ -576,7 +584,7 @@ export async function smokeAndAdopt({
     let dispatch = null;
     const t0 = now();
     // Fresh recovery comparisons and a disabled reuse knob demand live evidence: no historical relevance skips.
-    const relevanceProof = (freshComparison || !reuse.reuseEnabled) ? null : makeRelevanceProof({ identity, env: stEnv, now, ttlMs: reuse.reuseHours * 3_600_000 });
+    const relevanceProof = (freshComparison || !reuse.reuseEnabled) ? null : makeRelevanceProof({ identity, git, env: stEnv, now, ttlMs: reuse.reuseHours * 3_600_000 });
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
       // Fork 3: shareable code checks on Forge when an executor is wired and Forge is ready; a Forge result is

@@ -36,9 +36,9 @@ const opts = (root, extra = {}) => ({ root, env: {}, repos: [], runChild: failin
   load: () => 0, cores: () => 8, shadow: () => {}, admit: () => undefined, ...extra });
 
 describe('check flags (Fork 4 floor)', () => {
-  it('only the two dry-runs are shareable and cloneIndependent; the floor is neither', () => {
+  it('only the two dry-runs are shareable and none is cloneIndependent; the floor is neither', () => {
     expect(SMOKE_CHECKS.filter((c) => c.shareable).map((c) => c.name).sort()).toEqual(['dispatch-dry-run', 'reconcile-dry-run']);
-    expect(SMOKE_CHECKS.filter((c) => c.cloneIndependent).map((c) => c.name).sort()).toEqual(['dispatch-dry-run', 'reconcile-dry-run']);
+    expect(SMOKE_CHECKS.filter((c) => c.cloneIndependent).map((c) => c.name)).toEqual([]); // both dry-runs read the live clone env
     for (const n of ['gh-api-repo', 'gh-pr-list', 'tree-stays-clean', 'daemon-entries-boot']) {
       const c = SMOKE_CHECKS.find((x) => x.name === n);
       expect(c, n).toBeTruthy();
@@ -114,7 +114,7 @@ describe('completeSmokePass accepts a relevance skip only with its proof', () =>
 });
 
 describe('Fork 2: the shared host store', () => {
-  const identity = { tree: 't'.repeat(40), sharedKey: 'k'.repeat(64), relevanceKey: 'e'.repeat(64) };
+  const identity = { tree: 'a'.repeat(40), sharedKey: 'k'.repeat(64), relevanceKey: 'e'.repeat(64) };
   let env;
   beforeEach(() => { env = { WE_DAEMON_STATE_DIR: mk() }; });
   const file = () => join(env.WE_DAEMON_STATE_DIR, 'smoke-verdicts', `verdict-${identity.sharedKey}.json`);
@@ -148,12 +148,13 @@ describe('Fork 2: the shared host store', () => {
       { name: 'gh-pr-list', ok: true, closureHash: h },
       { name: 'dispatch-dry-run', ok: false, closureHash: 'c'.repeat(64) },
     ], { identity, env });
-    const proof = makeRelevanceProof({ identity, env });
+    const sameTree = () => ({ status: 0, stdout: '' });
+    const proof = makeRelevanceProof({ identity, git: sameTree, env });
     expect(proof('dispatch-dry-run', h)).toBe(true);
     expect(proof('reconcile-dry-run', h)).toBe(false);
     expect(proof('gh-pr-list', h)).toBe(false);
     expect(proof('dispatch-dry-run', 'c'.repeat(64))).toBe(false);
-    expect(makeRelevanceProof({ identity, env, now: () => Date.now() + 13 * 3_600_000 })('dispatch-dry-run', h)).toBe(false);
+    expect(makeRelevanceProof({ identity, git: () => ({ status: 0, stdout: '' }), env, now: () => Date.now() + 13 * 3_600_000 })('dispatch-dry-run', h)).toBe(false);
   });
   it('rejects missing identity, legacy records, and mismatched stored execution identity', () => {
     const h = 'b'.repeat(64);
@@ -184,13 +185,13 @@ describe('identity and harness hash', () => {
     const closureHash = checkClosureHash({ check, root });
     const baseline = smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1', nodeVersion: 'v1' });
     writeClosureProofs([{ name: check.name, ok: true, closureHash }], { identity: baseline, env });
-    const options = { daemonEntries: ['skills-src/conveyor/verify-daemon.mjs'] };
-    const before = await runLiveSmoke(opts(root, { ...options, relevanceProof: makeRelevanceProof({ identity: baseline, env }) }));
+    const options = { daemonEntries: ['skills-src/conveyor/verify-daemon.mjs'], changedFiles: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] };
+    const before = await runLiveSmoke(opts(root, { ...options, relevanceProof: makeRelevanceProof({ identity: baseline, git: git('a'.repeat(40)), env }) }));
     expect(before.results.find((r) => r.name === check.name)).toMatchObject({ skipped: true, skipReason: 'relevance' });
     const changed = smokePassIdentity(git('a'.repeat(40), component === 'lockfile' ? 'L2' : 'L'), 'sha', 'drain', {
       harnessHash: component === 'harness' ? 'h2' : 'h1', nodeVersion: component === 'Node' ? 'v2' : 'v1',
     });
-    const proof = makeRelevanceProof({ identity: changed, env });
+    const proof = makeRelevanceProof({ identity: changed, git: git('a'.repeat(40)), env });
     expect(proof(check.name, closureHash)).toBe(false);
     const child = vi.fn(failing);
     const after = await runLiveSmoke(opts(root, { ...options, relevanceProof: proof, runChild: child }));
@@ -198,9 +199,9 @@ describe('identity and harness hash', () => {
     expect(after.results.find((r) => r.name === check.name).skipped).toBeUndefined();
     expect(child.mock.calls.some(([cmd, argv]) => cmd === 'node' && argv.includes('--input-type=module'))).toBe(true);
   });
-  it('key parts: tree, lockfile, harness change the key; cloneKind changes `key` but not `sharedKey`', () => {
+  it('key parts: tree, lockfile, harness change the key; cloneKind changes both `key` and `sharedKey` while no check is cloneIndependent', () => {
     const base = smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1' });
-    expect(base.sharedKey).toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1' }).sharedKey);
+    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1' }).sharedKey);
     expect(base.key).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1' }).key);
     expect(base.sharedKey).not.toBe(smokePassIdentity(git('b'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1' }).sharedKey);
     expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40), 'L2'), 'sha', 'drain', { harnessHash: 'h1' }).sharedKey);
@@ -313,4 +314,20 @@ describe('audit findings (xfwf4zc)', () => {
       expect(out.results.find((r) => r.name === 'dispatch-dry-run').skipReason, JSON.stringify(changedFiles)).toBeUndefined();
     }
   });
+  it('a proof from another tree counts only when the trees differ in plain code/docs (markdown briefs void it)', () => {
+    const env = { WE_DAEMON_STATE_DIR: mk() };
+    const proofIdentity = { tree: 'a'.repeat(40), relevanceKey: 'e'.repeat(64) };
+    const h = 'f'.repeat(64);
+    writeClosureProofs([{ name: 'dispatch-dry-run', ok: true, closureHash: h }], { identity: proofIdentity, env });
+    const later = { tree: 'b'.repeat(40), relevanceKey: 'e'.repeat(64) };
+    const diff = (out, status = 0) => () => ({ status, stdout: out });
+    const proof = (git) => makeRelevanceProof({ identity: later, git, env })('dispatch-dry-run', h);
+    expect(proof(diff('scripts/lib/util.mjs\ndocs/a.md\n'))).toBe(true);
+    expect(proof(diff('scripts/briefs/review.md\n'))).toBe(false);
+    expect(proof(diff('skills-src/x.mjs\n'))).toBe(false);
+    expect(proof(diff('', 1))).toBe(false);
+    expect(proof(() => { throw new Error('git gone'); })).toBe(false);
+    expect(proof(null)).toBe(false);
+  });
 });
+

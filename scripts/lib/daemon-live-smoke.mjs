@@ -825,11 +825,11 @@ export const SMOKE_CHECKS = Object.freeze([
   { name: 'gh-api-repo', kind: 'env', run: checkGhApiRepo, mayBeTransient: true },
   { name: 'gh-pr-list', kind: 'env', run: checkGhPrList, mayBeTransient: true },
   // x1bppc5/xfwf4zc: `shareable` = relevance-skippable and reusable through the shared per-commit verdict (only these
-  // two dry-runs; the floor in Fork 4 never is); `cloneIndependent` = their verdict is a function of the tree, so the
-  // shared key drops `cloneKind`. A test asserts exactly this set carries each flag.
-  { name: 'reconcile-dry-run', kind: 'code', run: checkReconcileDryRun, mayBeTransient: false, codeEntries: ['scripts/conveyor/reconcile-pass.mjs'], shareable: true, cloneIndependent: true },
+  // two dry-runs; the floor in Fork 4 never is); `cloneIndependent` (default absent) would drop `cloneKind` from the shared key; it stays OFF
+  // because both dry-runs consume the live clone's env (pool root / dispatch root, x5wbsbc). A test asserts the set.
+  { name: 'reconcile-dry-run', kind: 'code', run: checkReconcileDryRun, mayBeTransient: false, codeEntries: ['scripts/conveyor/reconcile-pass.mjs'], shareable: true },
   // xp4lw2v (epic #4075/#3383) — see the two functions' own docblocks just above for what each covers.
-  { name: 'dispatch-dry-run', kind: 'code', run: checkDispatchDryRun, mayBeTransient: false, codeEntries: DISPATCH_DRY_RUN_CODE_ENTRIES, shareable: true, cloneIndependent: true },
+  { name: 'dispatch-dry-run', kind: 'code', run: checkDispatchDryRun, mayBeTransient: false, codeEntries: DISPATCH_DRY_RUN_CODE_ENTRIES, shareable: true },
   // #4468 — actually BOOTS (imports) every standalone daemon entry module on the candidate tree; see
   // `daemon-boot-smoke.mjs`'s own header for the live incident this closes (#2921: a smoke-passing candidate
   // that then crash-looped every daemon at startup, because nothing before this row ever imported an entry file).
