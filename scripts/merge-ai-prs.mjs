@@ -5016,8 +5016,10 @@ async function runCli() {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
         const ensureKey = `${repo || 'cwd'}::${name}`;
         if (ensuredLabels.has(ensureKey)) continue;
-        ensuredLabels.add(ensureKey);
-        labelEnsurer.ensure(memoRepo(repo), name, meta);
+        try {
+          labelEnsurer.ensure(memoRepo(repo), name, meta);
+          ensuredLabels.add(ensureKey);
+        } catch { /* Repository resolution is best effort too; a later pass retries. */ }
       }
     }
     const reconciled = [];
@@ -5807,8 +5809,10 @@ async function runCli() {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
           const ensureKey = `${repo || 'cwd'}::${name}`;
           if (ensuredLabels.has(ensureKey)) continue;
-          ensuredLabels.add(ensureKey);
-          labelEnsurer.ensure(memoRepo(repo), name, meta);
+          try {
+            labelEnsurer.ensure(memoRepo(repo), name, meta);
+            ensuredLabels.add(ensureKey);
+          } catch { /* Repository resolution is best effort too; a later pass retries. */ }
         }
       }
     }

@@ -105,6 +105,32 @@ describe('implicit repository label wiring', () => {
     expect(api.calls.map(c => c.args[0])).toEqual(['repo']);
     expect(api.labelEnsurer.memo).toEqual({});
   });
+
+  it.each(['CI_LIFECYCLE_LABEL_META', 'REVIEW_LABEL_META'])(
+    '%s mint loop contains repository lookup failures and retries on a later pass', (family) => {
+      const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+      const start = src.indexOf(`for (const [name, meta] of Object.entries(${family})) {`);
+      expect(start).toBeGreaterThan(-1);
+      const indent = src.slice(src.lastIndexOf('\n', start) + 1, start);
+      const loop = src.slice(start, src.indexOf(`\n${indent}}`, start) + indent.length + 2);
+      const names = ['first', 'second'];
+      const calls = [];
+      const ensurer = createLabelEnsurer({ path: join(dir, 'memo.json'), run: (args) => calls.push(args[2]) });
+      let failing = true;
+      const mint = runInNewContext(`(repo) => { ${loop} }`, {
+        [family]: Object.fromEntries(names.map((name) => [name, META])),
+        ensuredLabels: new Set(), labelEnsurer: ensurer,
+        memoRepo: () => { if (failing) throw new Error('HTTP 502'); return 'o/r'; },
+      });
+      expect(() => mint(null)).not.toThrow();
+      expect(calls).toEqual([]);
+      expect(ensurer.memo).toEqual({});
+      failing = false;
+      mint(null);
+      expect(calls).toEqual(names);
+      mint(null);
+      expect(calls).toEqual(names);
+    });
 });
 
 describe('label memo — persisted ensure', () => {

@@ -39,8 +39,13 @@ const a = process.argv.slice(2);
 const ji = a.indexOf('--json');
 const fields = ji >= 0 ? String(a[ji + 1] || '') : '';
 function out(o) { fs.writeSync(1, JSON.stringify(o)); process.exit(0); }
+if (a[0] === 'label' && a[1] === 'create' && process.env.GATE_LABEL_LOG) {
+  fs.appendFileSync(process.env.GATE_LABEL_LOG, JSON.stringify(a) + '\\n');
+}
 // Label provisioning resolves gh's effective repository before writing a repo-keyed memo.
 if (a[0] === 'repo' && a[1] === 'view' && fields === 'url' && a[a.indexOf('--jq') + 1] === '.url') {
+  if (fx._repoRead === 'error') { process.stderr.write('HTTP 502\\n'); process.exit(1); }
+  if (fx._repoRead === 'empty') process.exit(0);
   fs.writeSync(1, '${LABEL_REPO_URL}'); process.exit(0);
 }
 // The live head: real GitHub always has one, so a fixture whose commits carry no oid gets a stable per-PR stand-in.
@@ -185,13 +190,20 @@ const BROAD_HUMAN_SURFACES_ENV = { WE_HUMAN_REVIEW_SURFACES: 'broad' };
 
 function runDrain(fixture, args, extraEnv = {}) {
   const fxPath = join(workDir, `fixture-${fixture._id}.json`);
+  const memoPath = `${fxPath}.labels.json`;
+  const memoBefore = existsSync(memoPath) ? readFileSync(memoPath, 'utf8') : undefined;
+  const labelLog = `${fxPath}.label-calls.log`;
+  writeFileSync(labelLog, '');
   writeFileSync(fxPath, JSON.stringify(fixture));
   const stdout = execFileSync('node', [SCRIPT, ...args, '--dry-run', '--this-repo', '--json'], {
     cwd: workDir,                                   // a clean dir — no park-state, no real repo
-    env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, WE_DRAIN_LABEL_MEMO_PATH: `${fxPath}.labels.json` },
+    env: { ...process.env, ...daemonAppEnv(workDir), ...HERMETIC_FREEZE_ENV, ...extraEnv, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, WE_DRAIN_LABEL_MEMO_PATH: memoPath, GATE_LABEL_LOG: labelLog },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  expect(readFileSync(labelLog, 'utf8')).toBe('');
+  if (memoBefore === undefined) expect(existsSync(memoPath)).toBe(false);
+  else expect(readFileSync(memoPath, 'utf8')).toBe(memoBefore);
   const line = stdout.trim().split('\n').filter(Boolean).pop(); // the last line is the JSON result
   return JSON.parse(line);
 }
@@ -221,6 +233,47 @@ function runDrainLive(fixture, args, extraEnv = {}) {
 const nums = (arr) => (arr || []).map((x) => Number(x.num));
 const GREEN = [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }];
 const AI_COMMIT = [{ authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }];
+
+describe('label provisioning through the real drain entrypoint', () => {
+  const fixtureFor = (_id) => ({
+    _id,
+    prs: [{ number: 990, title: 'leaf label fixture', body: 'a real summary', headRefName: 'lane/labels', baseRefName: 'main',
+      mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
+      labels: [{ name: 'ready-to-merge' }], _commits: AI_COMMIT,
+      _files: [{ path: 'backlog/label-fixture.md', additions: 1, deletions: 0 }] }],
+  });
+
+  it.each(['error', 'empty'])('a %s repository read does not abort either label mint loop', (failure) => {
+    for (const reconcile of [true, false]) {
+      const fixture = { ...fixtureFor(`label-repo-${failure}-${reconcile}`), _repoRead: failure };
+      const { result } = runDrainLive(fixture, ['--label=ready-to-merge', ...(reconcile ? [] : ['--no-reconcile-labels'])], { GH_REPO: '' });
+      expect(nums(result.merged)).toContain(990);
+      expect(existsSync(join(workDir, `fixture-${fixture._id}.json.labels.json`))).toBe(false);
+    }
+  });
+
+  it('dry runs never create or update the label memo', () => {
+    const fixture = fixtureFor('label-dry-run');
+    const memoPath = join(workDir, `fixture-${fixture._id}.json.labels.json`);
+    const args = ['--label=ready-to-merge']; // Exercise both CI-lifecycle and review-label mint guards.
+    expect(existsSync(memoPath)).toBe(false);
+    runDrain(fixture, args);
+    expect(existsSync(memoPath)).toBe(false);
+    const seededMemo = JSON.stringify({ labels: { 'other/repo::untouched': 123 } });
+    writeFileSync(memoPath, seededMemo);
+    runDrain(fixture, args);
+    expect(readFileSync(memoPath, 'utf8')).toBe(seededMemo);
+
+    const labelLog = join(workDir, 'label-live-calls.log');
+    writeFileSync(labelLog, '');
+    runDrainLive(fixture, args, { GATE_LABEL_LOG: labelLog, GH_REPO: '' });
+    const calls = readFileSync(labelLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(calls.map((a) => a[2])).toEqual(expect.arrayContaining(['ci:failed', 'review:human']));
+    const memo = JSON.parse(readFileSync(memoPath, 'utf8'));
+    expect(memo.labels[`${LABEL_REPO_URL}::review:human`]).toBeTypeOf('number');
+    expect(memo.labels[`${LABEL_REPO_URL}::ci:failed`]).toBeTypeOf('number');
+  });
+});
 
 describe('the real drain entrypoint consults the gate before merging', () => {
   it('label-scoped drain: a gate-self PR PARKS as review:human and never lands, while a clean leaf PR would merge', () => {
