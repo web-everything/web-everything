@@ -2339,9 +2339,9 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     useParkedCache(key);
     return !itemListings.has(key);
   };
-  /** Prefetch independent card searches concurrently, sharing the tick's budget and cached failures. */
+  /** Prefetch complete active identities before parked ones, sharing the tick's budget and cached failures. */
   async function prefetchItemListings(entries) {
-    const todo = [...new Map(entries.flatMap(e => {
+    const todo = [...new Map([...entries].sort((a, b) => Number(a.parked === true) - Number(b.parked === true)).flatMap(e => {
       const card = tree?.get(normNum(e.num));
       if (!card) return [];
       const stamped = prepareBlobStatuses.get(card.sha);
@@ -2352,14 +2352,20 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
       const query = itemQuery(e.num, bornAs);
       return [[query.key, query]];
     })).values()];
-    let next = 0;
+    let next = 0, pendingCalls = 0;
     const worker = async () => {
       while (next < todo.length) {
         const { key, searches } = todo[next++];
+        // Reserve a whole identity before yielding: per-search admission lets concurrent parked reads
+        // consume the settlement allowance without completing either claim's four-search listing.
+        let remaining = searches.filter(search => !queryResults.has(search)).length;
+        if (listingCalls + pendingCalls + remaining > maxPrListingCalls - reserve) continue;
+        pendingCalls += remaining;
         try {
           const prs = [];
           for (const search of searches) {
             if (!queryResults.has(search)) {
+              remaining--; pendingCalls--;
               reserveListingCall();
               try {
                 const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
@@ -2374,6 +2380,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
           }
           recordListing(key, uniquePrs(prs));
         } catch { /* the lazy read reports the cached component error or exhausted budget */ }
+        finally { pendingCalls -= remaining; } // failures or newly cached shared searches leave unused allowance
       }
     };
     await Promise.all(Array.from({ length: Math.min(prefetchConcurrency, todo.length) }, worker));

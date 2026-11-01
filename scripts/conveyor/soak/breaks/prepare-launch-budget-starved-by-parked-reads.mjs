@@ -24,7 +24,8 @@ export default {
     // Include bornAs aliases: each complete status read needs four searches, not just two.
     for (const prefetch of [false, true]) {
       const claims = ['8300', '8301'].map((num, i) => ({ meta: { num }, bornAs: `xlow00${i}` }));
-      const blobs = claims.map(({ meta: { num }, bornAs }) => {
+      const parked = { num: '8302', bornAs: 'xlow002' };
+      const blobs = [...claims, { meta: { num: parked.num }, bornAs: parked.bornAs }].map(({ meta: { num }, bornAs }) => {
         const body = Buffer.from(`---\nbornAs: ${bornAs}\nstatus: open\n---\nfinished ${num}`);
         const sha = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
         return { num, body, sha };
@@ -55,7 +56,8 @@ export default {
         preparePolicy: () => policy,
         fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], killSwitch: () => ({ engaged: false }),
         listPrepareClaims: () => claims, listPrepareInFlight: () => [],
-        primePrepareStatus: () => r.prime(claims.map(c => ({ num: c.meta.num }))),
+        listHolds: () => [{ num: parked.num, reason: 'prepare-unstamped' }],
+        primePrepareStatus: ({ nums, parked: parkedNums }) => r.prime(nums.map(num => ({ num, parked: parkedNums.includes(num) }))),
         readPrepareStatus: args => r.read(args), listPreparePrs: args => r.listPrs(args),
         releasePrepareClaim: ({ num }) => released.push(num), placePrepareHold: () => {},
         recordPrepareFailure: () => ({ cause: 'infra-transient', retry: true, held: false }),

@@ -4686,6 +4686,57 @@ describe('grouped PREPARE daemon ticks', () => {
 
 
 describe('prepare discovery under repository PR volume', () => {
+  it.each([false, true])('finishes two claimed listings before parked prefetch spends their allowance (parked first=%s)', async parkedFirst => {
+    const nums = ['8300', '8301', '8302'];
+    const cards = Object.fromEntries(nums.map((num, i) => [num, `---\nbornAs: xlow00${i}\nstatus: open\n---\nfinished ${num}`]));
+    const git = prepareGitFixture(cards);
+    const searches = [];
+    const answer = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      const num = nums.find(num => search === `head:lane/${num}`);
+      return JSON.stringify(num ? [{ number: Number(num), state: 'CLOSED', headRefName: `lane/${num}-prepare-x`,
+        createdAt: '2026-11-01T00:00:00Z', isCrossRepository: false }] : []);
+    };
+    const parkedListings = new Map();
+    const claims = nums.slice(0, 2).map(num => ({ num }));
+    const parked = { num: '8302', parked: true };
+    let reader;
+    // A new reader each tick models the repeated starvation seen by settlement.
+    for (let tick = 0; tick < 2; tick++) {
+      searches.length = 0;
+      reader = createPrepareStatusReader({ maxPrListingCalls: 16, launchReserve: 32,
+        parkedCacheMs: 900_000, parkedListings, exec: answer, execAsync: async (...args) => answer(...args) });
+      await reader.prime(parkedFirst ? [parked, ...claims] : [...claims, parked]);
+      expect(claims.map(claim => reader.read(claim).pr.number)).toEqual([8300, 8301]);
+      expect(searches).toHaveLength(8);
+      expect(parkedListings.size).toBe(0);
+      expect(() => reader.read(parked)).toThrow('budget exhausted');
+    }
+    expect(reader.listPrs({ ...parked, forLaunch: true })).toHaveLength(1);
+    expect(searches).toHaveLength(12);
+  });
+
+  it('releases unused prefetch allowance after an async failure so later claims can complete', async () => {
+    const git = prepareGitFixture({ 8310: '---\nbornAs: xerr000\nstatus: open\n---\nfailed', 8311: '---\nbornAs: xerr001\nstatus: open\n---\nfinished' });
+    const searches = [];
+    const answer = (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      const search = args[args.indexOf('--search') + 1];
+      searches.push(search);
+      if (search === 'head:lane/8310') throw new Error('listing unavailable');
+      return '[]';
+    };
+    const reader = createPrepareStatusReader({ maxPrListingCalls: 6, launchReserve: 32, prefetchConcurrency: 1,
+      exec: answer, execAsync: async (...args) => answer(...args) });
+    await reader.prime([{ num: '8310' }, { num: '8311' }]);
+    expect(searches).toHaveLength(5); // the second listing completed during prefetch, without a lazy retry
+    expect(() => reader.read({ num: '8310' })).toThrow('listing unavailable');
+    expect(reader.read({ num: '8311' }).pr).toBeNull();
+    expect(searches).toHaveLength(5);
+  });
+
   it.each([2, 4, 8, 16, 32])('keeps settlement reads available with the default reserve and a %s-call budget', async maxPrListingCalls => {
     const policy = resolvePreparePolicy({ env: { WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK: String(maxPrListingCalls) } });
     const git = prepareGitFixture({ 8300: '---\nstatus: open\n---\nfinished' });
