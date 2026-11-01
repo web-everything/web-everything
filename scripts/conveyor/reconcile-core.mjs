@@ -112,6 +112,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
+import { decideReviewChurn } from './review-churn.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
@@ -297,7 +298,7 @@ export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
-  'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
+  'owed-elsewhere', 'owed-main-rule', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'review-same-tree', 'already-landed',
   // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — a ci-heal already escalated THIS EXACT
   // head (`ci-heal-escalation-mark.mjs`); see that file's own header for the live incident (#2783, three
   // sessions in one evening). `ci-heal-escalated` — a genuine judgment call, terminal until a new push.
@@ -1704,6 +1705,22 @@ function dispatchReviewRow({
       advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
         ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) }, why: advisoryReview.why,
     });
+    return;
+  }
+  // ── R365 fix 4 (`review-churn.mjs`): a head whose tree equals an already-ACCEPTED reviewed head's owes no review, and a
+  // PR that has had `maxLoopsPerPr` reviews of distinct heads is parked for a person instead of another round. Shadow
+  // by default: the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
+  const churn = decideReviewChurn(pr);
+  if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
+  if (churn?.mode === 'on' && churn.kind === 'same-tree') {
+    refuse('review-same-tree', { ...withPhase, ...extra, churn,
+      why: `head \`${churn.head}\` has the identical tree (\`${churn.tree}\`) of already-accepted reviewed head \`${churn.reviewedHead}\` — nothing new to review (review.reviewChurn.sameTree)` });
+    return;
+  }
+  if (churn?.mode === 'on' && churn.kind === 'loop-cap') {
+    refuseCapExhausted({ ...withPhase, attempts: churn.loops, cap: churn.cap, capKind: 'review-churn', ...extra,
+      why: `this PR has had ${churn.loops} reviews of distinct heads against review.reviewChurn.maxLoopsPerPr=${churn.cap} — the fix/review ping-pong is not converging and a person must take it` },
+    { allowTakeover: false });
     return;
   }
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
