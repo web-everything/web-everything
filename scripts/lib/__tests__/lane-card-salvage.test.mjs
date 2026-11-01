@@ -5,7 +5,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, openSync, closeSync, writeSync, fsyncSync, fstatSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { planLaneCardDirt, salvageLaneCards, removeFiledCards, isCardFilePath } from '../lane-card-salvage.mjs';
 import { refreshSalvageIndex } from '../salvage-index.mjs';
 
@@ -189,13 +190,15 @@ describe('salvageLaneCards — real git', () => {
     leaveCards();
     const before = git(['status', '--porcelain', '--untracked-files=all'], lane);
     // Native ESM imports share this patched builtin; no Vitest module-mocking assumptions.
+    // Build a filesystem URL explicitly: Vite rewrites new URL(relative, import.meta.url) to an HTTP asset URL.
+    const moduleUrl = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../lane-card-salvage.mjs')).href;
     const child = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
       let attempts = 0;
       fs.renameSync = () => { attempts++; throw Object.assign(new Error('cross-device link'), { code: 'EXDEV' }); };
       syncBuiltinESMExports();
-      const { salvageLaneCards, removeFiledCards } = await import(${JSON.stringify(new URL('../lane-card-salvage.mjs', import.meta.url).href)});
+      const { salvageLaneCards, removeFiledCards } = await import(${JSON.stringify(moduleUrl)});
       const o = ${JSON.stringify({ dir: lane, lane: 7, salvageRoot })};
       const result = ${JSON.stringify(mode)} === 'salvage' ? salvageLaneCards(o)
         : removeFiledCards({ ...o, expected: new Map([['backlog/raised-by/5360/5771-abc.md', 'raise body\\n']]) });
