@@ -6,8 +6,10 @@ parent: "5467"
 status: open
 blockedBy: ["5469"]
 relatedTo: ["5468", "2979", "3024"]
-scope: ["we:scripts/lib/git-patch-equivalence.mjs", "we:scripts/lib/review-need.mjs", "we:scripts/operations/review-pr.mjs", "we:.github/workflows/review-gate.yml", "we:scripts/conveyor/accept-carry-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/accept-carry-forward.mjs", "we:scripts/lib/merge-gate-inventory.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/review-set-label.mjs", "we:scripts/settings/accept-carry-forward.json", "we:skills-src/conveyor/review-daemon.mjs"]
+scope: ["we:scripts/lib/git-patch-equivalence.mjs", "we:scripts/lib/review-need.mjs", "we:scripts/operations/review-pr.mjs", "we:.github/workflows/review-gate.yml", "we:scripts/conveyor/accept-carry-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/accept-carry-forward.mjs", "we:scripts/lib/merge-gate-inventory.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/review-set-label.mjs", "we:scripts/settings/accept-carry-forward.json", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/review-settings.json"]
 dateOpened: "2026-10-08"
+preparedDate: "2026-11-01"
+preparedAgainstSha: "174220fad20252329d315759de9702bbcc698979"
 tags: [review]
 ---
 
@@ -22,6 +24,46 @@ Live trigger: #4535 was cleared by the operator at fcc29ce1; the merge queue ref
 ## Scope widened (operator 2026-10-11 ~07:50 ET)
 
 Scope grew from operator rulings on PR #4631 (drain-owned mechanical park label; a later native "changes requested" review stops carry-forward). Operator approved widening the declared scope to the 11 code files PR #4631 actually changes.
+
+## Digest (prepared 2026-11-01, R357)
+
+Slice 1 is delivered (equivalent merge-main keeps the accept; `acceptCarryForward`, `we:scripts/lib/accept-carry-forward.mjs:48`).
+What is owed is acceptance [A1] b-d: a heal commit on an accepted PR owes a review of its own delta only, not a full round.
+Scoped delta review already exists as a pure rule: `reviewScope({ priorHead, head, delta })` returns `kind: 'delta'`
+(`we:scripts/lib/review-round-rules.mjs:178-187`), and the shadow journal shows 2520 of 2521 later rounds scoped `delta`
+(`<ops>/ledger-shadow/scoped-rereview.jsonl`), so the delta computation is proven; only its use on a heal is missing.
+The decision is how that use is switched. **Bold default: Fork 1 (a), its own declared setting `healDeltaReview`.**
+
+## Recommended path at a glance
+
+| Fork | Recommended default | Main alternative | Confidence |
+|---|---|---|---|
+| Fork 1 - how the heal delta review is switched | (a) own setting `healDeltaReview` (off/on), built-in off | (b) ride on `scopedRereview: on` | High |
+
+## Fork 1 - own setting, or ride on `scopedRereview`?
+
+*Fork-existence:* the excluded branch is (b): it is blocked while #xl28gd8 (the B1 flip) stays `shadow` - with `scopedRereview`
+at `shadow` or `off`, a heal on an accepted PR would keep paying a full round, so A1 b-d could never ship, and the delta review
+of a heal would be held hostage by an unrelated ruling about later-round findings. Both settings read the same `reviewScope`,
+so they cannot be one switch without coupling two different risks (heal delta: narrow, one commit; scoped re-review: every later round).
+
+- **(a) Own setting `healDeltaReview` (`off` | `on`), built-in `off`, declared in `we:scripts/review-settings.json`.** Reuses `reviewScope`
+  with `priorHead` = `lastReviewedHead(reviewRuns, head)` (we:scripts/lib/review-round-rules.mjs:147, the latest ledger-reviewed head, which is the accept head only when no other head was reviewed since), and `sentBack` empty. A heal is identified by the durable CI-heal comment (`CI_HEAL_COMMENT_MARKER`, we:scripts/conveyor/ci-heal-mark.mjs:42), not by commit authorship (none exists today); the setting must also be added to `BUILT_IN_REVIEW_SETTINGS`/`ALLOWED` in we:scripts/lib/review-settings.mjs:48-54 (scope omits it).
+  A delta finding blocks (A1 c); an unreadable delta falls back to the full review (edge 4).
+- **(b) Ride on `scopedRereview: on`.** Fewer settings, but see fork-existence.
+
+```json
+// we:scripts/review-settings.json (a)
+{ "scopedRereview": "shadow", "healDeltaReview": "on" }
+```
+
+**Rollback:** set `"healDeltaReview": "off"`; the next heal pays a full review, as today.
+**Pre-mortem:** a heal commit changes behaviour outside its delta (a rename that breaks a caller); the delta review misses it.
+Mitigation: v1 does not widen the scope to the changed files' importers; CI and the drain's live check still run (N1), so
+a break is caught there, and the rollback is the setting.
+
+Skeptic: HOLDS - default kept (b is only blocked while B1 stays shadow, no existing setting covers a heal delta; citations and the 2520/2521 journal count verified); corrected how priorHead is derived (last ledger-reviewed head) and how a heal is identified (CI-heal comment marker, not authorship), and noted we:scripts/lib/review-settings.mjs missing from scope.
+Screen: clear
 
 ## Acceptance
 
@@ -45,4 +87,4 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — any error in the range-diff or delta computation falls back to the full re-review.
 5. **Identity scoping** — the accept is bound to the PR's own patch identity, not to the head sha.
 6. **State over time** — n/a: no time rule.
-7. **Who wrote it** — only commits by the heal role count as a heal commit; any other new commit owes a normal review.
+7. **Who wrote it** — only a commit marked by the conveyor CI-heal comment counts as a heal commit; any other new commit owes a normal review.
