@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, readdir, utimes, realpath, stat} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner} from '../forge-exec-run.mjs';
+import {createRunner, uidBusy} from '../forge-exec-run.mjs';
 // R333: the runner reaps leaked reservations/receipts only on proof the owner is gone.
 let root, receipts, probe, calls;
 const nonce = 'a'.repeat(32);
@@ -146,5 +146,9 @@ describe('forge leaked-state reaper', () => {
     probe.start = async () => null;
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(await exists(lock)).toBe(true);
+  });
+  it.runIf(process.platform === 'linux')('sees a live process by its credentials, and a uid with none as idle', async () => {
+    expect(await uidBusy(process.getuid())).toBe(true);
+    expect(await uidBusy(4000000123)).toBe(false);
   });
 });
