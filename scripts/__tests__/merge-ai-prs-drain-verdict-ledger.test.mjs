@@ -156,7 +156,7 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
     expect(site).toBeGreaterThan(-1);
     const guard = src.indexOf('if (!mechanicalPark) {', site);
     const row = src.indexOf('recordDrainVerdict({ repo:', site);
-    const add = src.indexOf("'--add-label', parkDecision.addLabel]", site);
+    const add = src.indexOf("addPrLabel(v.repo, v.num, parkDecision.addLabel)", site);
     expect(guard).toBeGreaterThan(site);
     expect(row).toBeGreaterThan(guard);
     expect(add).toBeGreaterThan(row);
@@ -257,7 +257,7 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
       const at = src.indexOf(marker);
       const guard = src.indexOf('if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {', at);
       const led = src.indexOf('recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel', guard);
-      const gh = src.indexOf("'--add-label', parkDecision.addLabel]", guard);
+      const gh = src.indexOf("addPrLabel(v.repo, v.num, parkDecision.addLabel)", guard);
       expect(guard).toBeGreaterThan(at);
       expect(led).toBeGreaterThan(guard);
       expect(gh).toBeGreaterThan(led);
