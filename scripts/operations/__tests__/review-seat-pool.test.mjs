@@ -2,7 +2,7 @@ import { it, expect, afterEach, beforeEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, linkSync, mkdirSync, renameSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { acquireSeatSlot, pruneSeatPool, slotBusy } from '../../lib/review-seat-pool.mjs';
 import { ownReviewScratch, removeReviewScratch } from '../../lib/review-scratch.mjs';
@@ -26,6 +26,38 @@ beforeEach(() => {
   writeFileSync(join(lane, 'moves.txt'), 'two\n'); git(lane, 'commit', '-qam', 'two'); rev2 = git(lane, 'rev-parse', 'HEAD');
 });
 afterEach(() => { for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); });
+
+// Capture every file, including objects, refs and shallow metadata, rather than just the visible HEAD.
+const treeBytes = dir => readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
+  .map(entry => [entry.name, entry.isDirectory() ? treeBytes(join(dir, entry.name)) : readFileSync(join(dir, entry.name)).toString('hex')]);
+
+it.each(['absolute', 'relative', 'dangling', 'self'])('rejects a regular %s commondir before acquisition can write outside the store', mode => {
+  const store = join(pool, 'repo.git');
+  const victim = join(lane, '..', 'victim.git');
+  mkdirSync(pool, { mode: 0o700 });
+  git(lane, 'init', '--quiet', '--bare', store);
+  git(lane, 'init', '--quiet', '--bare', victim);
+  const target = mode === 'self' ? '.' : mode === 'relative' ? relative(store, victim) : mode === 'dangling' ? join(victim, 'missing') : victim;
+  writeFileSync(join(store, 'commondir'), `${target}\n`);
+  const before = treeBytes(victim);
+  let error;
+  try { acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool, runLsof: () => ({ status: 1, stdout: '' }) }).release(); } catch (e) { error = e; }
+  expect(treeBytes(victim)).toEqual(before);
+  expect(error?.message).toMatch(/commondir/);
+  expect(existsSync(join(store, 'FETCH_HEAD'))).toBe(false);
+});
+
+it.each(['external', 'self'])('prune refuses a regular %s commondir before removing a slot or changing an external repository', mode => {
+  const seat = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); seat.release();
+  const victim = join(lane, '..', 'victim.git');
+  git(lane, 'init', '--quiet', '--bare', victim);
+  writeFileSync(join(pool, 'repo.git', 'commondir'), `${mode === 'self' ? '.' : victim}\n`);
+  const before = treeBytes(victim);
+  expect(pruneSeatPool({ poolDir: pool, keep: 0 })).toEqual([]);
+  expect(treeBytes(victim)).toEqual(before);
+  expect(existsSync(seat.slotDir)).toBe(true);
+  expect(existsSync(join(pool, 'state', 'slot-1.rev'))).toBe(true);
+});
 
 it('gives two concurrent seats on one commit separate slots, then reuses a released one without rewriting files', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
@@ -414,6 +446,7 @@ for (const [mode, title] of Object.entries({
   private: 'explicit private checkout bypasses the pool',
   'red-team': 'private re-check requests a standalone checkout',
   'probe-failure': 'makeScratch falls back to a standalone checkout when lsof is unavailable',
+  'commondir': 'makeScratch falls back without writing to a repository redirected by commondir',
 })) {
   it(title, () => {
     const url = pathToFileURL(resolve('scripts/operations/review-extra-seats.mjs')).href;
@@ -421,7 +454,7 @@ for (const [mode, title] of Object.entries({
       import { lstatSync, existsSync, renameSync } from 'node:fs';
       const check = d => {
         if (lstatSync(d).isSymbolicLink() || !lstatSync(d + '/.git').isDirectory()) throw new Error('not a standalone checkout');
-        if (existsSync(process.env.WE_REVIEW_SEAT_POOL_DIR)) throw new Error('pool must not be acquired');
+        if (${mode !== 'commondir'} && existsSync(process.env.WE_REVIEW_SEAT_POOL_DIR)) throw new Error('pool must not be acquired');
       };
       ${mode === 'red-team' ? `
       let called = false, dir;
@@ -441,13 +474,25 @@ for (const [mode, title] of Object.entries({
     // A missing host lsof must not make a bypass regression pass by falling back before the pool is created.
     const bin = join(scratchTmp, 'bin'); mkdirSync(bin);
     writeFileSync(join(bin, 'lsof'), `#!/bin/sh\nexit ${mode === 'probe-failure' ? 2 : 1}\n`, { mode: 0o755 });
+    const victim = join(lane, '..', 'victim.git');
+    let before;
+    if (mode === 'commondir') {
+      mkdirSync(pool, { mode: 0o700 });
+      git(lane, 'init', '--quiet', '--bare', join(pool, 'repo.git'));
+      git(lane, 'init', '--quiet', '--bare', victim);
+      writeFileSync(join(pool, 'repo.git', 'commondir'), `${victim}\n`);
+      before = treeBytes(victim);
+    }
     const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_REVIEW_SEAT_POOL: mode === 'opt-out' ? '0' : '1', WE_REVIEW_SEAT_POOL_DIR: pool, TMPDIR: scratchTmp },
       encoding: 'utf8', timeout: 30000,
     });
     expect(r.status, r.stderr).toBe(0);
     if (mode === 'probe-failure') expect(r.stderr).toMatch(/review seat pool unavailable.*lsof unavailable/);
-    expect(existsSync(pool)).toBe(false);
+    if (mode === 'commondir') {
+      expect(treeBytes(victim)).toEqual(before);
+      expect(r.stderr).toMatch(/review seat pool unavailable.*commondir/);
+    } else expect(existsSync(pool)).toBe(false);
     expect(readdirSync(scratchTmp).filter(name => name.startsWith('we-review-seat-') || name.startsWith('we-red-team-recheck-'))).toEqual([]);
   });
 }

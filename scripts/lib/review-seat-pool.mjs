@@ -36,6 +36,15 @@ function assertNoLinks(dir) {
   }
 }
 
+/** A standalone store must not redirect Git's shared writes via even a regular commondir file. */
+function assertNoCommonDir(repo) {
+  try { lstatSync(join(repo, 'commondir')); } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error; // unreadable state is not evidence that redirection is absent
+  }
+  throw new Error('seat pool store must not contain commondir');
+}
+
 /** Is any process's working directory inside `dir`? Unknown disables pooling, rather than allocating more slots. */
 export function slotBusy(dir, run = spawnSync) {
   let real;
@@ -149,6 +158,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
   if (lstatOrNull(p.repo)) ownPrivateDir(p.repo);
   else git(['init', '--quiet', '--bare', p.repo]);
   ownPrivateDir(p.repo);
+  assertNoCommonDir(p.repo); // before config replacement, fetch or any other store writes
   if (!existsSync(join(p.repo, 'HEAD')) || lstatOrNull(join(p.repo, '.git'))) throw new Error('seat pool store is not a bare repository');
   const cfgTmp = join(p.repo, `config.${process.pid}.${randomUUID()}.tmp`); // rename, never write through a planted link
   writeFileSync(cfgTmp, STORE_CONFIG, { flag: 'wx' });
@@ -237,6 +247,7 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
     if (!lstatOrNull(poolDir)) return removed;
     // Same trust as acquisition, before anything is deleted through these parents.
     for (const d of [poolDir, p.slots, p.locks, p.state, p.views, p.repo]) { if (lstatOrNull(d)) ownPrivateDir(d); }
+    assertNoCommonDir(p.repo); // worktree remove/prune also write shared repository state
     if (lstatOrNull(p.repo)) assertNoLinks(p.repo);
     const slots = slotNumbers(p).map((n) => {
       let mtime = 0;
