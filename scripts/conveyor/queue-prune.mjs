@@ -22,6 +22,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normNum, bornAsIndexFromItems, readQueueFile, writeQueueFile, removeFromQueue, resolveBornAsRefs } from './queue-store.mjs';
 import { idFromName } from '../backlog/id.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 export const AUTO_CLASSES = Object.freeze(['resolved', 'closed', 'duplicate', 'missing-card']);
 /** A cleared id with no card yet is kept this long (its card may still be in an open lane PR). */
@@ -140,7 +141,7 @@ export function makeConfirmMissingOnMain({ exec = execFileSync, cwd = resolve(di
     if (unavailable) return false;
     try {
       if (!names) {
-        retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
+        retryTransientGit(() => fetchFresh({ cwd, branches: ['main'], run: (args) => exec('git', args, opts) }));
         // `-z` + quotePath off: a non-ASCII filename must not be quoted into an unparseable token.
         names = new Set(exec('git', ['-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--name-only', 'origin/main', '--', 'backlog/'], opts)
           .split('\0').map((f) => normNum(idFromName(f.replace(/^backlog\//, '')) || '')).filter(Boolean));

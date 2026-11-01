@@ -35,6 +35,7 @@ import { isValidHoldNum } from '../conveyor/build-dispatch-hold-router.mjs';
 import { normNum } from '../conveyor/queue-store.mjs';
 
 import { findUnmarkedLocusRefs } from '../check-standards-rules.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(HERE, '..', '..');
@@ -349,7 +350,7 @@ export function landOne({ num, route, commit = null, reason = null, citation = '
       //      commit never does.
       // A failure on ANY check refuses the auto-resolve entirely — no partial edit, no PR — rather than
       // closing an unbuilt card as done on an unverified claim.
-      retryTransientGit(() => runFn('git', ['fetch', 'origin', 'main'], lane));
+      retryTransientGit(() => fetchFresh({ cwd: lane, branches: ['main'], run: (args, dir) => runFn('git', args, dir) }));
       try {
         runFn('git', ['merge-base', '--is-ancestor', commit, 'origin/main'], lane);
       } catch {

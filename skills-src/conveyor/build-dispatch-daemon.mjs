@@ -100,6 +100,7 @@ import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFai
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
+import { fetchFresh } from '../../scripts/lib/git-fetch-fresh.mjs';
 
 /** Prepare outcomes the runner already handled (a verified already-done resolve PR; a needs-you hold): never failures. */
 const PREPARE_HANDLED_OUTCOMES = ['prepare-already-done', 'prepare-needs-you'];
@@ -2251,7 +2252,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     else parkedListings.delete(key);
   }
   function readTree() {
-    retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
+    retryTransientGit(() => fetchFresh({ cwd: opts.cwd, branches: ['main'], run: (args) => exec('git', args, opts) }));
     const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
     const cards = new Map();
     for (const line of output.trim().split('\n')) {

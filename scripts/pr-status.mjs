@@ -142,6 +142,7 @@ import { DEFAULT_REPO_KEY, CONSTELLATION_REPOS } from './lib/constellation-repos
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readPrFacts, stripTerminal } from './lib/pr-state-io.mjs';
 import { derivePrState, settingsFromEnv } from './lib/pr-state-core.mjs';
+import { fetchFresh } from './lib/git-fetch-fresh.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** The checkout this script lives in — the default root for the per-checkout `.conveyor/jury` ledger. */
@@ -856,7 +857,7 @@ async function main(argv) {
 
   // Ancestry is only as truthful as the refs behind it: a stale `origin/<branch>` makes a lane that HAS the work
   // look like a stranger. Fetch first unless told not to.
-  if (!flags['no-fetch']) sh('git', ['-C', gitRoot, 'fetch', '--quiet', 'origin']);
+  if (!flags['no-fetch']) fetchFresh({ cwd: gitRoot, branches: null, run: (args) => sh('git', ['-C', gitRoot, ...args]) });
 
   const lanes = listLanes(lanesRoot);
   // One configured-store read shared by every row. On failure, rounds come from the jury ledger only.

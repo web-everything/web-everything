@@ -120,6 +120,7 @@ import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
 import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, publishCoronerFailure, coronerNightDue } from './nightly-coroner-job.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -500,7 +501,7 @@ export function probeSelfSync(dir) {
  */
 export function probeCloneLag({ roots = daemonCloneRoots(workspaceOf(REPO_ROOT)), exec = run, fetch = true, timeoutMs = 20_000, repo = REPO_ROOT } = {}) {
   const git = (args, cwd = repo) => String(exec('git', ['-C', cwd, ...args], { timeoutMs }) || '').trim();
-  if (fetch) { try { git(['fetch', '--quiet', 'origin', 'main']); } catch { /* use the ref we have */ } }
+  if (fetch) { try { fetchFresh({ cwd: repo, branches: ['main'], run: (args) => git(args) }); } catch { /* use the ref we have */ } }
   const tip = git(['rev-parse', 'origin/main']);
   const out = [];
   for (const cloneRoot of roots) {

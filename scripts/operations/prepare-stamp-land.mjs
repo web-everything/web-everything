@@ -9,6 +9,7 @@ import { prepareCardStatus } from '../conveyor/prepare-result.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
 import { releaseHoldRoute, isValidHoldNum } from '../conveyor/build-dispatch-hold-router.mjs';
 import { acquireLane, releaseLane, runCmd, parseOpenPrResult } from './build-dispatch-hold-route-land.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 export async function landPrepareStamp({ num }, {
   run = runCmd, acquire = acquireLane, release = releaseLane,
@@ -28,17 +29,18 @@ export async function landPrepareStamp({ num }, {
     // Preserve the original PR's entire tree when repairing its head; otherwise start from fresh main.
     const path = status.path;
     if (!new RegExp(`^backlog/${num}-[^/]+\\.md$`).test(path ?? '')) throw new Error('invalid prepare card path');
-    retryTransientGit(() => run('git', ['fetch', 'origin', 'main'], cwd));
-    retryTransientGit(() => run('git', ['fetch', 'origin', source ? source.headRefName : 'main'], cwd));
-    if (source && run('git', ['rev-parse', 'FETCH_HEAD'], cwd).trim() !== source.headRefOid) {
+    // One narrow fetch of main (+ the PR head). A skipped fetch leaves FETCH_HEAD alone, so read the tracking ref.
+    retryTransientGit(() => fetchFresh({ cwd, branches: source ? ['main', source.headRefName] : ['main'], run: (args, dir) => run('git', args, dir) }));
+    const headRef = source ? `origin/${source.headRefName}` : null;
+    if (source && run('git', ['rev-parse', headRef], cwd).trim() !== source.headRefOid) {
       throw new Error('prepare PR changed during recovery; retry observation');
     }
     // Trust boundary: the daemon runs this tree's scripts with its own credentials, so a PR head may change only its card.
     if (source) {
-      const changed = run('git', ['diff', '--name-only', 'origin/main...FETCH_HEAD'], cwd).split('\n').map((f) => f.trim()).filter(Boolean);
+      const changed = run('git', ['diff', '--name-only', `origin/main...${headRef}`], cwd).split('\n').map((f) => f.trim()).filter(Boolean);
       if (changed.some((f) => f !== path)) throw new Error('prepare-unstamped: PR changes files beyond the card');
     }
-    run('git', ['checkout', '--detach', 'FETCH_HEAD'], cwd);
+    run('git', ['checkout', '--detach', source ? source.headRefOid : 'origin/main'], cwd);
     const before = read(join(cwd, path), 'utf8');
     const card = prepareCardStatus(before);
     if (card.preparedDate) return { status: 'already-stamped' };
