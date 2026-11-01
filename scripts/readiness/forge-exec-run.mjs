@@ -703,18 +703,19 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       if(!slotNumber)continue; // a slotless lock has no UID to prove its descendants gone: never reaped
       const lockPath=join(receipts,lock);
       const reservation=await readRecord(join(lockPath,'reservation.json'));
-      if(reservation===undefined)continue;
+      // Empty, malformed or pre-lease (no writerGuard) reservations stay for operator cleanup, as the pruner does.
+      if(!reservation||reservation.writerGuard!==1||reservation.slot!=='forge-exec-'+slotNumber||!runName(reservation.run)||!nonceOK(reservation.nonce))continue;
       const entries=reservation?found.filter(e=>e.run===reservation.run):[];
       const decide=async()=>{
         if(entries.length>1)return false;
         if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:true});}
-        const age=await lstat(reservation?join(lockPath,'reservation.json'):lockPath).then(st=>clock()-st.mtimeMs,()=>0);
+        const age=await lstat(join(lockPath,'reservation.json')).then(st=>clock()-st.mtimeMs,()=>0);
         return age>=REAP_GRACE_MS;
       };
       if(!await decide())continue;
       await withWorkerExclusive(lock,async()=>{
         const again=await readRecord(join(lockPath,'reservation.json'));
-        if(again?.run!==reservation?.run||again?.nonce!==reservation?.nonce)return;
+        if(again?.run!==reservation.run||again?.nonce!==reservation.nonce||again?.writerGuard!==1)return;
         if(slotNumber&&await reapProbe.uidBusy((await identity('forge-exec-'+slotNumber)).uid))return;
         if(!await decide())return;
         await tombstone(lockPath);

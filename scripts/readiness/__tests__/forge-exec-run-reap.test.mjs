@@ -151,4 +151,15 @@ describe('forge leaked-state reaper', () => {
     expect(await uidBusy(process.getuid())).toBe(true);
     expect(await uidBusy(4000000123)).toBe(false);
   });
+  it('keeps empty, malformed and pre-lease reservations even when old and idle', async () => {
+    const old = new Date(Date.now() - 3600e3);
+    const empty = join(receipts, 'worker-active-1'), preLease = join(receipts, 'worker-active-2');
+    await mkdir(empty, {mode: 0o700});
+    await mkdir(preLease, {mode: 0o700});
+    await writeFile(join(preLease, 'reservation.json'), JSON.stringify({run: runId(14), nonce, slot: 'forge-exec-2'}));
+    for (const path of [join(preLease, 'reservation.json'), empty, preLease]) await utimes(path, old, old);
+    await makeRunner().telemetry();
+    expect(await exists(empty)).toBe(true);
+    expect(await exists(preLease)).toBe(true);
+  });
 });
