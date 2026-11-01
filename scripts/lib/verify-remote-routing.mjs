@@ -1,4 +1,5 @@
-import { existsSync, openSync, fstatSync, readSync, closeSync, readFileSync, statSync, constants } from 'node:fs';
+import { existsSync, openSync, fstatSync, readSync, closeSync, readFileSync, constants } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { cpus, loadavg } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
@@ -22,42 +23,45 @@ const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR']);
 const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*npx vitest(?=\s|$)/;
 
-// Vitest's config lookup order for the lane's default (`npm run test:unit`) config.
-const VITEST_CONFIG_NAMES = Object.freeze(['vitest.config', 'vite.config'].flatMap(base =>
-  ['.ts', '.mts', '.cts', '.js', '.mjs', '.cjs'].map(ext => `${base}${ext}`)));
-const WORKSPACE_FILES = Object.freeze(['vitest.workspace', 'vitest.projects'].flatMap(base =>
-  ['.ts', '.mts', '.js', '.mjs', '.json'].map(ext => `${base}${ext}`)));
-const TIMEOUT_KEY = /(?<![-\w])(?:testTimeout|hookTimeout)\b/;
-const RELATIVE_IMPORT = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g;
-
-// Dropping `--testTimeout=`/`--hookTimeout=` is only stricter when the lane's config does not set a longer
-// timeout of its own: a CLI flag overrides the config, so stripping it would let the config's value win.
-// Fail closed: true unless the lane's default config and every file it imports by relative path are
-// readable and none of them names either key.
-export function laneConfigMaySetTimeouts(cwd) {
-  try {
-    if (WORKSPACE_FILES.some(name => existsSync(join(cwd, name)))) return true;
-    const config = VITEST_CONFIG_NAMES.find(name => existsSync(join(cwd, name)));
-    if (!config) return true;
-    const seen = new Set();
-    const stack = [join(cwd, config)];
-    while (stack.length) {
-      const file = stack.pop();
-      if (seen.has(file)) continue;
-      seen.add(file);
-      if (seen.size > 500) return true;
-      const source = readFileSync(file, 'utf8');
-      if (TIMEOUT_KEY.test(source)) return true;
-      for (const [, spec] of source.matchAll(RELATIVE_IMPORT)) {
-        const base = resolve(dirname(file), spec);
-        const found = [base, ...['.ts', '.mts', '.cts', '.js', '.mjs', '.cjs', '.json'].map(ext => base + ext)]
-          .find(candidate => existsSync(candidate) && statSync(candidate).isFile());
-        if (!found) return true;
-        stack.push(found);
-      }
-    }
-    return false;
-  } catch { return true; }
+// Dropping `--testTimeout=`/`--hookTimeout=` is only stricter when the lane's own config resolves to timeouts
+// no longer than the flags: a CLI flag overrides the config, so stripping it lets the config's value win.
+// The lane's config is arbitrary code, so it is RESOLVED by the lane's own Vitest (config only: no tests,
+// no globalSetup), under the local env and under minimal envs standing in for Forge's. Any probe that fails,
+// times out, or yields a non-integer counts as a longer timeout. Memoized per checkout for this process.
+const TIMEOUT_PROBE = `import { createVitest } from 'vitest/node';
+const v = await createVitest('test', { watch: false, run: true, reporters: [] }, {}, {});
+try {
+  const projects = (v.projects?.length ? v.projects : [{ config: v.config }]).map(p => [p.config.testTimeout, p.config.hookTimeout]);
+  process.stdout.write('\\n' + JSON.stringify([[v.config.testTimeout, v.config.hookTimeout], ...projects]) + '\\n');
+} finally { await v.close(); }`;
+const resolvedTimeoutsCache = new Map();
+export function resolvedLaneTimeouts(cwd, { env = process.env, run = spawnSync } = {}) {
+  const key = resolve(cwd);
+  if (resolvedTimeoutsCache.has(key)) return resolvedTimeoutsCache.get(key);
+  const minimal = { PATH: env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: env.HOME ?? '/nonexistent', LANG: 'C' };
+  const envs = [env, minimal, { ...minimal, CI: 'true' }];
+  let pairs = [];
+  for (const probeEnv of envs) {
+    let parsed = null;
+    try {
+      const child = run(process.execPath, ['--input-type=module', '-e', TIMEOUT_PROBE], {
+        cwd: key, env: probeEnv, encoding: 'utf8', timeout: 60_000, maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+      if (child.status === 0 && !child.signal) parsed = JSON.parse(String(child.stdout).trim().split('\n').at(-1));
+    } catch { parsed = null; }
+    if (!Array.isArray(parsed) || !parsed.length || !parsed.every(pair => Array.isArray(pair) && pair.length === 2
+      && pair.every(n => Number.isSafeInteger(n) && n > 0))) { pairs = null; break; }
+    pairs.push(...parsed);
+  }
+  resolvedTimeoutsCache.set(key, pairs);
+  return pairs;
+}
+function strippedTimeoutsStricter(cwd, stripped) {
+  const flag = name => { const hit = stripped.find(arg => arg.startsWith(`${name}=`)); return hit ? Number(hit.slice(name.length + 1)) : null; };
+  const testTimeout = flag('--testTimeout');
+  const hookTimeout = flag('--hookTimeout');
+  if (testTimeout === null && hookTimeout === null) return true;
+  const pairs = resolvedLaneTimeouts(cwd);
+  return !!pairs && pairs.every(([test, hook]) => (testTimeout === null || test <= testTimeout) && (hookTimeout === null || hook <= hookTimeout));
 }
 
 // #6154 taught the lane's own heavy-admission to drop the gate-only options from the Forge argv only, keeping
@@ -84,12 +88,11 @@ function wrappedVitestCommand(command, cwd) {
   const args = words.slice(start + 3);
   // Only the trailing gate-only options (stripGateOnlyOptions) are dropped, in their exact `=` spellings;
   // anything else stays in place and Forge's allowlist keeps the command local. A stripped form is stricter
-  // (no passWithNoTests; vitest's default timeouts, unless the lane config sets its own: then stay local).
+  // (no passWithNoTests; the lane config's resolved timeouts, kept local unless no longer than the flags).
   const remoteArgs = stripGateOnlyOptions(args);
   if (!remoteArgs || !args.length || !remoteArgs.length) return null;
   if (!allowedCommand(['npx', 'vitest', 'run', ...remoteArgs.map(unquote)])) return null;
-  const strippedTimeout = args.slice(remoteArgs.length).some(arg => /^--(?:test|hook)Timeout=/.test(arg));
-  if (strippedTimeout && laneConfigMaySetTimeouts(cwd)) return null;
+  if (!strippedTimeoutsStricter(cwd, args.slice(remoteArgs.length).map(unquote))) return null;
   // A #6154+ lane wrapper strips for Forge and falls back locally with every original option. Any other lane
   // gets the stripped command from this (the daemon's) side, so Forge accepts it whatever the lane's version;
   // its nested local fallback then runs the stricter form, and its red stands (shouldConfirmRemoteRed).

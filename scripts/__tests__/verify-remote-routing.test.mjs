@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { stripGateOnlyOptions, GATE_TIMEOUT_FLOORS } from '../readiness/forge-gate-options.mjs';
-import { phaseAdmissionPlan, laneConfigMaySetTimeouts, laneWrapperStripsGateOptions, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
+import { phaseAdmissionPlan, resolvedLaneTimeouts, laneWrapperStripsGateOptions, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
 
@@ -100,8 +100,9 @@ describe('timeout preservation', () => {
 });
 
 // A lane checkout that predates #6154: its wrapper forwards every option to Forge, which rejects them.
-function oldLane({ config = "export default { test: {} };\n", files = {} } = {}) {
+function oldLane({ config = "export default { test: {} };\n", files = {}, modules = true } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'verify-old-lane-'));
+  if (modules) symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'));
   mkdirSync(join(root, 'scripts/readiness'), { recursive: true });
   writeFileSync(join(root, 'scripts/readiness/heavy-admission.mjs'), 'export const remoteArgv = requested => requested;\n');
   if (config !== null) writeFileSync(join(root, 'vitest.config.ts'), config);
@@ -113,9 +114,11 @@ describe('daemon-side gate option stripping (lanes without #6154)', () => {
   const gate = "npx vitest run 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000"
     + " && TZ=UTC npx vitest run 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000";
 
-  it('detects which wrapper the lane carries, and this repo (the daemon snapshot) sets no config timeout', () => {
+  it('detects which wrapper the lane carries, and resolves this repo\'s config to vitest\'s defaults', () => {
     expect(laneWrapperStripsGateOptions(repo)).toBe(true);
-    expect(laneConfigMaySetTimeouts(repo)).toBe(false);
+    const pairs = resolvedLaneTimeouts(repo);
+    expect(pairs.length).toBeGreaterThan(0);
+    for (const pair of pairs) expect(pair).toEqual([GATE_TIMEOUT_FLOORS['--testTimeout'], GATE_TIMEOUT_FLOORS['--hookTimeout']]);
     const root = oldLane();
     try { expect(laneWrapperStripsGateOptions(root)).toBe(false); } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -139,16 +142,32 @@ describe('daemon-side gate option stripping (lanes without #6154)', () => {
     });
   });
 
+  it('a lane config with timeouts no longer than the flags still strips', () => {
+    const root = oldLane({ config: 'export default { test: { testTimeout: 15000, hookTimeout: 20000 } };\n' });
+    try {
+      expect(phaseAdmissionPlan({ command: gate, cwd: root, decision: { remote: true } }).stripped).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a timeout probe that fails or answers garbage counts as a longer timeout', () => {
+    for (const child of [{ status: 1, stdout: '' }, { status: 0, stdout: 'not json' }, { status: 0, stdout: '[[5000,"x"]]' },
+      { status: 0, stdout: '[]' }, { status: null, signal: 'SIGTERM', stdout: '[[5000,10000]]' }]) {
+      expect(resolvedLaneTimeouts(join(tmpdir(), `probe-${Math.random()}`), { run: () => child })).toBeNull();
+    }
+    expect(resolvedLaneTimeouts(join(tmpdir(), `probe-${Math.random()}`), { run: () => { throw new Error('spawn'); } })).toBeNull();
+  });
+
   it.each([
     ['config sets testTimeout', { config: 'export default { test: { testTimeout: 60000 } };\n' }],
     ['imported shared config sets hookTimeout', { config: "import s from './shared';\nexport default s;\n", files: { 'shared.ts': 'export default { test: { hookTimeout: 60000 } };\n' } }],
-    ['config imports a file that cannot be resolved', { config: "import s from './missing';\nexport default s;\n" }],
-    ['no config file at all', { config: null }],
-    ['a workspace file exists', { files: { 'vitest.workspace.ts': 'export default [];\n' } }],
+    ['computed key', { config: "export default { test: { ['test' + 'Timeout']: 60000 } };\n" }],
+    ['env-dependent timeout (Forge-like env)', { config: 'export default { test: { testTimeout: process.env.CI ? 60000 : 5000 } };\n' }],
+    ['workspace project sets testTimeout', { files: { 'vitest.workspace.ts': "export default [{ test: { name: 'p', testTimeout: 60000 } }];\n" } }],
+    ['config fails to load', { config: "throw new Error('boom');\n" }],
+    ['lane has no vitest installed', { modules: false }],
   ])('a stripped timeout would let the lane config win, so the command stays local and intact: %s', (_label, shape) => {
     const root = oldLane(shape);
     try {
-      expect(laneConfigMaySetTimeouts(root)).toBe(true);
       expect(phaseAdmissionPlan({ command: gate, cwd: root, decision: { remote: true } })).toEqual({ command: gate, takeLocalSlot: true, setHeld: true });
       // Dropping only --passWithNoTests never depends on the config.
       expect(phaseAdmissionPlan({ command: 'npx vitest run a.test.mjs --passWithNoTests', cwd: root, decision: { remote: true } }))
@@ -577,6 +596,7 @@ describe('verify-lane remote phase spawn', () => {
       execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'fixture'], { cwd: root });
       // The fixture lane carries no heavy-admission of its own (a pre-#6154 lane) and a config without timeouts.
       writeFileSync(join(root, 'vitest.config.ts'), 'export default { test: {} };\n');
+      symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'));
       const events = join(root, 'events.jsonl');
       const heavy = pathToFileURL(resolve(repo, 'scripts/readiness/heavy-admission.mjs')).href;
       const routing = pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href;
