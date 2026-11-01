@@ -20,7 +20,7 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
-const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control' };
+const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control', waitAdoptionMs: 30 };
 const settings = {
   daemons: { control: { label: 'com.we.control', clone: 'wev-control' }, review: { label: 'com.we.review-daemon' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } },
   workspaceRoot: '~/workspace', launchAgentsDir: '~/Library/LaunchAgents', recordPath: '~/records', readyRecordPath: '~/ready',
@@ -219,7 +219,7 @@ function fixture(options = {}) {
   if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
-  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
   return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
@@ -1205,14 +1205,14 @@ describe('prototype-load', () => {
   it.each([
     ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
     ['refusal event', { events: refusedAlert }, 'adoption-refused'],
-    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['timeout', { timeout: true }, null],
     ['probe error 128', { adoptionError: 128 }, 'check-unverifiable'],
     ['probe error -1', { adoptionError: -1 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
   ])('retains every clean prior registration until the replacement is adopted: %s', async (_, options, stopReason) => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(r).toMatchObject({ ok: stopReason === null, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
   });
@@ -1220,13 +1220,13 @@ describe('prototype-load', () => {
   it.each([
     ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
     ['refusal event', { events: refusedAlert }, 'adoption-refused'],
-    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['timeout', { timeout: true }, null],
     ['probe error', { adoptionError: 128 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
   ])('retains stale and clean registrations through failed adoption: %s', async (_, options, stopReason) => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'], ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(r).toMatchObject({ ok: stopReason === null, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
     expect(r.staleChecks['lane/old']).toEqual({ skipped: 'contained', included: true, landed: false });
@@ -1324,14 +1324,34 @@ describe('prototype-load', () => {
     const r = await f.run(); expect(r.stopReason).toBe('swap-remove-failed'); expect(r.registered).toBe(true); expect(r.adopted).toBe(true); expect(r.removed).toEqual([]); expect(r.swap.retained).toEqual(['lane/a', 'lane/b', 'lane/c']); expect(mutations(f, 'remove')).toHaveLength(0);
   });
   it('adoption-timeout bounds injected polling and retains registration', async () => {
-    const f = fixture({ timeout: true }); const r = await f.run(); expect(r.stopReason).toBe('adoption-timeout'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+    const f = fixture({ timeout: true }); const r = await f.run(); expect(r.result).toBe('registered-pending'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+  });
+  it('returns registered-pending at once by default: ok, not adopted, no polling, no FAIL', async () => {
+    const f = fixture({ timeout: true }); const r = await f.run({ waitAdoptionMs: undefined });
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false, stopReason: null });
+    expect(r.message).toContain('overlay-adopted');
+    expect(f.sleeps).toEqual([]);
+  });
+  it('--wait-adoption-ms opts into a bounded wait and is capped under 170 s', async () => {
+    const f = fixture({ timeout: true, settings: { adoption: { timeoutMs: 600000, pollMs: 50000 } } });
+    const r = await f.run({ waitAdoptionMs: 900000 });
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending' });
+    expect(f.sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(160000);
+    expect(f.sleeps.length).toBeGreaterThan(0);
+  });
+  it('explains refusals in plain words', async () => {
+    expect(await fixture({}).run({ sha: 'abc1234' })).toMatchObject({ stopReason: 'bad-input', fallback: expect.stringContaining('full 40-character sha') });
+    const noReady = await fixture({ ready: '' }).run();
+    expect(noReady.stopReason).toBe('no-ready'); expect(noReady.fallback).toMatch(/fix-ready record.*"tests":"green".*"audit":"NOT WEAKENED"/);
+    const moved = await fixture({ tip: 'e'.repeat(40) }).run();
+    expect(moved).toMatchObject({ stopReason: 'no-ready', fallback: expect.stringContaining(`branch tip is ${'e'.repeat(40)}`) });
   });
   it.each([undefined, '/custom/rebuild-state'])('adoption timeout reports the active build from the daemon state directory: %s', async (directory) => {
     const target = 'd'.repeat(40), startedAt = '2026-10-26T11:59:00.000Z';
     const f = fixture({ timeout: true, env: directory ? { WE_DAEMON_STATE_DIR: directory } : {},
       rebuildState: { building: { target, startedAt, pid: 123 } } });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'rebuild-building' } });
     expect(r.fallback).toContain(target.slice(0, 7));
     expect(r.fallback).toContain(startedAt);
@@ -1343,7 +1363,7 @@ describe('prototype-load', () => {
     const adoptedAt = '2026-10-26T11:00:00.000Z';
     const f = fixture({ timeout: true, rebuildState: { ...state, adopted: { at: adoptedAt, head: TREE } } });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'daemon-not-refreshing' } });
     expect(r.fallback).toContain('catch-up');
     expect(r.fallback).toContain(adoptedAt);
@@ -1356,7 +1376,7 @@ describe('prototype-load', () => {
   ])('adoption timeout reports unreadable rebuild evidence: %s', async (_, options) => {
     const f = fixture({ timeout: true, ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'rebuild-state-unreadable' } });
     expect(r.fallback).toMatch(/rebuild.state.*unreadable|unreadable.*rebuild.state/i);
     expect(f.reads).toContain('/home/test/.claude/daemon-self-sync-state/test-clone-key.rebuild.json');
@@ -1368,7 +1388,7 @@ describe('prototype-load', () => {
   });
   it('a missing daemon commit remains pending until the adoption deadline', async () => {
     const f = fixture({ missingCandidate: true, missingForever: true });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+    expect(await f.run()).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false });
     expect(f.sleeps).toEqual([10, 10, 10]);
   });
   it.each([false, true])('real Git keeps a fresh origin commit pending until daemon fetch/adoption or deadline (adopts: %s)', async (adopts) => {
@@ -1383,7 +1403,7 @@ describe('prototype-load', () => {
       });
       expect(await f.run()).toMatchObject(adopts
         ? { ok: true, registered: true, adopted: true }
-        : { ok: false, registered: true, adopted: false, stopReason: 'adoption-timeout' });
+        : { ok: true, registered: true, adopted: false, result: 'registered-pending' });
       expect(f.sleeps).toEqual(adopts ? [10] : [10, 10, 10]);
     });
   });
@@ -1403,7 +1423,7 @@ describe('prototype-load', () => {
     } });
     expect(await f.run()).toMatchObject(retryCode === 0
       ? { ok: true, registered: true, adopted: true }
-      : { ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+      : { ok: true, result: 'registered-pending', registered: true, adopted: false });
     expect(probes).toBe(retryCode === 0 ? 2 : 5);
     expect(f.sleeps).toEqual(retryCode === 0 ? [] : [10, 10, 10]);
   });
