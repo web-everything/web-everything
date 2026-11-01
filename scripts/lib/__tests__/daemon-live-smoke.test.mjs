@@ -71,6 +71,17 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(releases[0][1]).toEqual(expect.arrayContaining(['release', '--lane=4']));
   });
 
+  it('reports lane-pool\'s own ✗ reason, not its first progress line (live 2026-11-01 lane-33 reclaim listing)', async () => {
+    const stderr = '  lane-33: reclaiming 127 local commit(s), already patch-equivalent to work pushed elsewhere (no unique content — safe to drop):\n'
+      + '    bcba4d2c72 Merge\n  lane-33: reset REFUSED — lane-hold: a fixer is parked\n'
+      + '✗ no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision\n';
+    const runChild = vi.fn().mockRejectedValue(exit(1, { message: 'exited 1:   lane-33: reclaiming 127 local commit(s)', stderr }));
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.detail).toBe('lane-pool acquire --purpose=smoke failed: exited 1: no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision');
+    expect(row.detail).not.toContain('reclaiming');
+  });
+
   it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {
     const runChild = vi.fn().mockRejectedValue(exit(75));
     const row = await check.run(context(runChild));
