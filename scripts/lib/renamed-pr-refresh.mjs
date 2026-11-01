@@ -196,7 +196,7 @@ export async function runRenamedPrRefresh({ prs, slug, root = process.cwd(), set
     let accepts = false;
     if (lanes.length) {
       // A failed fetch cannot establish either the current main contract or a current conflict verdict.
-      fetchFresh({ cwd: root, branches: ['main'], run: successful });
+      fetchFresh({ cwd: root, branches: ['main'], maxAgeMs: 0, run: successful });
       accepts = typeof mainAccepts === 'function' ? mainAccepts({ cwd: root }) : mainAccepts;
       if (enabled(settings.refreshEvidenceOnlyConflicts)) {
         const missing = lanes.filter(pr => { try { return successful(['rev-parse', `origin/${pr.headRefName}`]) !== pr.headRefOid; } catch { return true; } });

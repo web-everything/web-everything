@@ -492,7 +492,7 @@ export function realIo({ session, env = process.env, run = trySh } = {}) {
       return { state: 'unknown', reason: r.out.trim() || 'remote probe did not establish presence or absence' };
     },
     rebaseOntoMain: (dir) => {
-      try { fetchFresh({ cwd: dir, branches: ['main'], run: (args) => sh('git', ['-C', dir, ...args], { env: laneEnv }) }); } catch { return false; }
+      try { fetchFresh({ cwd: dir, branches: ['main'], maxAgeMs: 0, run: (args) => sh('git', ['-C', dir, ...args], { env: laneEnv }) }); } catch { return false; }
       if (trySh('git', ['-C', dir, 'rebase', 'origin/main'], { env: laneEnv }).ok) return true;
       trySh('git', ['-C', dir, 'rebase', '--abort'], { env: laneEnv });
       return false;

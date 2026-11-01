@@ -362,7 +362,6 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs",
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot",
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath",
-      "helper:../lib/git-fetch-fresh.mjs#fetchFresh:fetchFresh",
       "helper:../lib/github-app-auth-env.mjs#defaultCachePath:defaultCachePath",
       "helper:../lib/github-app-auth-env.mjs#readGithubAppStatus:readGithubAppStatus",
       "helper:../lib/lane-history.mjs#laneJournalPath:laneJournalPath",
@@ -480,7 +479,6 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs": 2,
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot": 3,
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath": 2,
-      "helper:../lib/git-fetch-fresh.mjs#fetchFresh:fetchFresh": 1,
       "helper:../lib/github-app-auth-env.mjs#defaultCachePath:defaultCachePath": 1,
       "helper:../lib/github-app-auth-env.mjs#readGithubAppStatus:readGithubAppStatus": 1,
       "helper:../lib/lane-history.mjs#laneJournalPath:laneJournalPath": 1,
@@ -647,7 +645,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     const allowedWatch = [
       'execFileSync(cmd, args)',
       "exec('git', ['-C', cwd, ...args])",
-      'git(args)', // the shared fetchFresh helper's runner: a main-only fetch, never a lane mutation
+      "git(['fetch', '--quiet', 'origin', 'main'])",
       "git(['rev-parse', 'origin/main'])",
       "git(['rev-parse', 'HEAD'])",
       "git(['merge-base', '--is-ancestor', head, tip])",

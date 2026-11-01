@@ -350,7 +350,7 @@ export function landOne({ num, route, commit = null, reason = null, citation = '
       //      commit never does.
       // A failure on ANY check refuses the auto-resolve entirely — no partial edit, no PR — rather than
       // closing an unbuilt card as done on an unverified claim.
-      retryTransientGit(() => fetchFresh({ cwd: lane, branches: ['main'], run: (args, dir) => runFn('git', args, dir) }));
+      retryTransientGit(() => fetchFresh({ cwd: lane, branches: ['main'], maxAgeMs: 0, run: (args, dir) => runFn('git', args, dir) }));
       try {
         runFn('git', ['merge-base', '--is-ancestor', commit, 'origin/main'], lane);
       } catch {
