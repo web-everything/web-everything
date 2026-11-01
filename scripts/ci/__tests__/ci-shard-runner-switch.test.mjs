@@ -1,6 +1,6 @@
 // @vitest-environment node
 // #5027 — pins the Arm-runner experiment switch in ci.yml: ONLY `test-shard` reads `vars.WE_SHARD_RUNNER`
-// (falling back to x86), every other job stays on `ubuntu-latest`, and the matrix stays single-axis so
+// (falling back to x86), smoke pins a Playwright-supported OS, and the matrix stays single-axis so
 // the coverage divisor remains matrix length minus the no-coverage group.
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -20,9 +20,13 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
     expect(raw.split('\n').filter((l) => /^ {4}runs-on: .*vars\.WE_SHARD_RUNNER/.test(l))).toHaveLength(1);
   });
 
+  it('smoke pins Ubuntu 24.04 for Playwright 1.58.1 browser installation', () => {
+    expect(jobs.smoke['runs-on']).toBe('ubuntu-24.04');
+  });
+
   it('every other job stays on ubuntu-latest (the switch must not widen)', () => {
     for (const [name, j] of Object.entries(jobs)) {
-      if (name === 'test-shard') continue;
+      if (name === 'test-shard' || name === 'smoke') continue;
       expect(j['runs-on'], `${name} must not follow the Arm switch`).toBe('ubuntu-latest');
     }
     for (const name of ['test', 'changes', 'daemon-soak-scope', 'soak-shard']) expect(jobs[name]).toBeDefined();
