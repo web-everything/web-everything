@@ -2,10 +2,11 @@
 bornAs: xoi0zbm
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/__tests__/heavy-admission-remote.test.mjs"]
 scopeRationale: "we:scripts/readiness/remote-exec.mjs and we:scripts/readiness/forge-remote-health.mjs are named only as non-goals and as the out-of-scope finding; they are not changed"
 dateOpened: "2026-10-31"
+dateResolved: "2026-11-01"
 tags: []
 ---
 
