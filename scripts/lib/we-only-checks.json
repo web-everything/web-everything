@@ -22,5 +22,9 @@
   {
     "file": "scripts/operations/land-advance-io.mjs",
     "reason": "The three flagged `gh`/reconcile-pass reads (a fix plan's PR-diff fallback scope, its itemless-PR diff-path resolution, and the cached reconcile-pass read) are all reached only for a `we` PR: `planFixesFromReconcile` is called only after `p.repo !== 'we'` is refused upstream as `unsupported-repo`, and `readReconcile`'s own docblock (`reconcile-pass owns what a PR is owed`) already states it is read once for `we`, the only repo it plans today."
+  },
+  {
+    "file": "scripts/lib/repo-slug.mjs",
+    "reason": "Names the one renamed repository (old owner to current owner) so a ruling written under the old slug matches its referral record; it is a fixed rename table for this repo, not a per-repo check."
   }
 ]

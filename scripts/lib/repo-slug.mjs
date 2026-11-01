@@ -6,9 +6,7 @@
  * 2026-11-01, #6170). Only a listed rename aliases; any other slug compares as itself, so two different repos never merge.
  * Pure.
  */
-// Built from parts: a bare slug literal in source is a repo-explicit-scan finding (multi-repo-checks).
-const slug = (owner, name) => `${owner}/${name}`;
-const RENAMED = new Map([[slug('chalbert', 'web-everything'), slug('web-everything', 'web-everything')]]);
+const RENAMED = new Map([['chalbert/web-everything', 'web-everything/web-everything']]);
 /** @param {unknown} slug @returns {unknown} the canonical `owner/name` (lower-cased, renames followed); a non-string is returned as is. */
 export function canonicalRepoSlug(slug) {
   if (typeof slug !== 'string') return slug;
