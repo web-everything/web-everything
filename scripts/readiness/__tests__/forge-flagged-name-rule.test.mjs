@@ -91,6 +91,21 @@ describe('credential-name rule (R321)',()=>{
     await git(['add','.']);await commit();await write('notes/token.txt','local');
     expect(names((await buildManifest({cwd,exec})).excluded)).toContain('notes/token.txt');
   });
+  it.each(['token.json.','token.json ','token.ｊｓｏｎ','TOKEN.JSON'])('scans %s with the structural JSON scanner',name=>{
+    const secret=Buffer.from('{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}');
+    expect(credentialContentFinding(Buffer.from('a/'+name),secret)).toBe('high-entropy-password');
+  });
+  it('refuses a tracked name-flagged JSON secret under a normalized-extension name',async()=>{
+    await write('a/token.json.','{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}');await git(['add','.']);await commit();
+    const manifest=await buildManifest({cwd,exec}).catch(error=>error);
+    if(manifest instanceof Error)expect(manifest).toMatchObject({code:'excluded-source-file'});
+    else expect(names(manifest.entries)).not.toContain('a/token.json.');
+  });
+  it('does not ship a name-flagged JSON file through the agent-memory bridge',async()=>{
+    await write('agent-memory-src/token.json',tokens);await fs.mkdir(join(cwd,'.claude'),{recursive:true});
+    await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+  });
   it('scans non-JSON content with the raw secret patterns',()=>{
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('AKIAABCDEFGHIJKLMNOP'))).toBe('aws-access-key');
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('plain text'))).toBe(null);

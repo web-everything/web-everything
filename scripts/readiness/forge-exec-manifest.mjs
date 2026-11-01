@@ -115,9 +115,11 @@ function entropy(text) {
 // R321. Every other type gets the raw token patterns, minus the PEM markers that
 // ordinary prose and code mention. Returns the first finding or null when clean.
 export function credentialContentFinding(path,content) {
-  const leaf=pathParts(path).at(-1).toString('latin1');
-  if(/\.json$/i.test(leaf))return designTokenSecretFinding(content);
-  if(sourceExtension.test(leaf.toLowerCase()))return null;
+  // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
+  // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
+  const leaf=classifyManifestPath(path).names.at(-1);
+  if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
+  if(sourceExtension.test(leaf))return null;
   const text=Buffer.from(content).toString('utf8');
   return secretText.filter(([,name])=>name!=='pem-header'&&name!=='private-key').find(([pattern])=>pattern.test(text))?.[1]??null;
 }

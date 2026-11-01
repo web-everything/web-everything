@@ -566,7 +566,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // A credential-named alias is refused unless it is the memory bridge's exact
       // image of a tracked agent-memory-src/ source that itself passed the public-blob check above.
       const sourcePath=entry.sourcePath??entry.path,memoryRoot=Buffer.from('agent-memory-src/');
-      const verifiedMemory=bridge==='.claude/agent-memory/'&&policy.credentialSource
+      // The memory-bridge alias exception stays limited to source/docs files, as before R321:
+      // a symlink-reached file never ships under the broader name-flagged rule.
+      const verifiedMemory=bridge==='.claude/agent-memory/'&&policy.credentialSource&&sourceExtension.test(policy.names.at(-1))
         &&sourcePath.subarray(0,memoryRoot.length).equals(memoryRoot)
         &&sourcePath.subarray(memoryRoot.length).equals(path.subarray(bridge.length))
         &&indexBlobs.has(sourcePath.toString('base64'))&&classifyManifestPath(sourcePath).credentialSource
