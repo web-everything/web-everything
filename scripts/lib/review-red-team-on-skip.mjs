@@ -82,16 +82,6 @@ export function staleRedTeamSpent(key) {
   return staleRedTeamRedispatch(key).count === MAX_STALE_REDISPATCHES;
 }
 
-function claimStaleNoRestart({ count, ...key }) {
-  const marker = `${staleStatusPath(key)}.stale-norestart-${count}`;
-  try {
-    closeSync(openSync(marker, 'wx'));
-    return { ok: true, release: () => {
-      try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    } };
-  } catch { return { ok: false }; }
-}
-
 function isRedispatchedRun(status, firstMarkerMtimeMs) {
   const started = Date.parse(status?.pidStart);
   return status?.status === 'running' && status.result == null
@@ -405,7 +395,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   staleSpent = key => staleRedTeamSpent({ ...key, env }),
   staleRedispatch = key => staleRedTeamRedispatch({ ...key, env }),
   recoverPayload = recoverStaleRunPayload, abandonStale = abandonStaleRedTeamRun,
-  claimNoRestart = claimStaleNoRestart,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviews = ({ repo, pr }) => JSON.parse(runGhSync([
@@ -485,7 +474,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           || (capacity.remainingStarts != null && !(capacity.remainingStarts > 0))) row.why = 'no review capacity left';
         else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
         else {
-          let abandonment, noRestart;
+          let abandonment;
           if (row.abandonStale) {
             try {
               if (!recoverPayload({ repo, pr: row.prNumber, head: row.head, env })) {
@@ -503,19 +492,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               continue;
             }
           }
-          if (row.abandonStale === false) {
-            try {
-              const key = { repo, pr: row.prNumber, head: row.head };
-              noRestart = claimNoRestart({ ...key, env, count: staleRedispatch(key).count });
-            } catch { /* Unknown claim evidence must keep dispatch closed. */ }
-            if (noRestart?.ok !== true) {
-              row.action = 'skip';
-              row.why = 'stale red team no-restart re-dispatch already spent; inspect review run';
-              notStarted.push({ prNumber: row.prNumber, reason: row.why });
-              note(`review-daemon: ${repo}#${row.prNumber}: ${row.why}`);
-              continue;
-            }
-          }
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
@@ -528,7 +504,6 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               if (reserved && refundable) budget.left++;
               row.why = result?.skipped ?? 'job did not start';
               abandonment?.release?.();
-              noRestart?.release?.();
             } else {
               capacity.lanes--;
               if (capacity.remainingStarts != null) capacity.remainingStarts--;
