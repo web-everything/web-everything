@@ -80,4 +80,12 @@ describe('operator ruling repo spelling (#6170)', () => {
     const both = [comments[0], post(renderReferralRecord({ ...rec, repo: OLD_REPO }), 'web-everything'), comments[1]];
     expect(readOperatorRulings(both).rulings.map(r => r.repo)).toEqual([OLD_REPO]);
   });
+  it('a block ruling never adopts the record spelling, so a mismatch can only ever hold, never hide, a block', () => {
+    const { referral } = world();
+    const run = 'review-pr-ddbf3105-8ecb-4f6e-b25e-fb5173fa3a1c';
+    const block = buildOperatorRulingComment({ version: 1, repo: OLD_REPO, pr: 6170, head: HEAD, actor: 'chalbert', channel: 'c',
+      reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x', rulings: [{ runId: run, key: referral.key, result: 'block' }] });
+    const { comments } = world();
+    expect(readOperatorRulings([comments[0], post(block, 'chalbert')]).rulings.map(r => r.repo)).toEqual([OLD_REPO]);
+  });
 });

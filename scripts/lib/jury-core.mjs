@@ -3874,8 +3874,9 @@ export function readOperatorRulings(comments, { head } = {}) {
   // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
   // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
   let recordRepos;
-  const spellingOf = (repo, pr, head, runId, key) => {
-    if (canonicalRepoSlug(repo) === repo) return repo;
+  const spellingOf = (repo, pr, head, runId, key, result) => {
+    // A `block` never adopts: only a clearing ruling is made MORE visible, so a spelling mismatch can never hide a hold.
+    if (result === 'block' || canonicalRepoSlug(repo) === repo) return repo;
     recordRepos ??= readReferralRecords(comments).records;
     // Only a record that names THIS finding counts, and only when every such record agrees on one spelling: an
     // ambiguous match keeps the ruling's own spelling, so it can never attach to a record it does not rule.
@@ -3890,7 +3891,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key, x.result), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
