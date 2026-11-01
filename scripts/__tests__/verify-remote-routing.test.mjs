@@ -827,6 +827,28 @@ process.exit(again?0:1);`);
 describe('R332: scan phases and whole-gate chains route to Forge', () => {
   const scan = (files = ['scripts/a.mjs', 'dir/b-c.mjs']) => `VERIFY_SCAN_FILES='${JSON.stringify(files).replaceAll("'", "'\\''")}'`;
   const remote = { remote: true };
+  it('bounds classification of repeated quoted assignments without losing local refusals or remote routing', () => {
+    const prefix = "TZ='UTC' ".repeat(40);
+    const cases = [
+      { command: `${prefix}node scripts/x.mjs`, remote: true, local: true },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs`, remote: true, local: false },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs`, remote: false, local: true },
+      { command: `${prefix}' npx vitest run scripts/x.test.mjs`, remote: true, local: true },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs && node scripts/x.mjs`, remote: true, local: true },
+    ];
+    // A child timeout bounds even synchronous regexp backtracking; a Vitest timeout cannot interrupt it.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { phaseAdmissionPlan } from ${JSON.stringify(pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href)};
+      const plans = ${JSON.stringify(cases)}.map(({ command, remote }) => phaseAdmissionPlan({ command, decision: { remote } }));
+      process.stdout.write(JSON.stringify(plans));
+    `], { encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(cases.map(({ command, local }) => ({
+      command: local ? command : command.replace('npx vitest run', 'npm run test:unit --'),
+      takeLocalSlot: local, setHeld: local,
+    })));
+  }, 10000);
   it('routes a repo-scan command whose changed-file JSON is single-quoted', () => {
     const prefix = scan();
     const command = `${prefix} npx vitest run 'scripts/lib/__tests__/lane-git-diet.test.mjs' scripts/x.test.mjs --testTimeout=15000 --hookTimeout=30000`;

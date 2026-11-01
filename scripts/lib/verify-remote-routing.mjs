@@ -23,7 +23,14 @@ const unquoteValue = raw => raw.startsWith("'") ? raw.slice(1, -1).replaceAll("'
 // Keys that change neither the nested wrapper's admission (CI bypasses it) nor its routing. Each must
 // also pass Forge's env allowlist, so the remote run sees the same value.
 const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR', 'VERIFY_SCAN_FILES']);
-const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^'\r\n]|'\\'')*'|\S*)[ \t]+)*npx vitest(?=\s|$)/;
+
+function isVitestSegment(command) {
+  // Consume one assignment at a time. Repeating quoted/unquoted alternatives in one regexp
+  // backtracks exponentially on quoted assignments followed by a non-Vitest command.
+  let rest = command;
+  for (let m; (m = ASSIGNMENT_PREFIX.exec(rest)); ) rest = rest.slice(m[0].length);
+  return /^npx vitest(?=\s|$)/.test(rest);
+}
 
 // Splits a segment into its leading allowlisted assignments (kept as original text) and plain words.
 function segmentParts(command) {
@@ -74,9 +81,9 @@ function wrappedChain(command) {
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
-  if (command.split(' && ').every(segment => VITEST_SEGMENT.test(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
+  if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
     const wrapped = decision?.remote === true ? wrappedChain(command) : null;
-    if (wrapped || command.split(' && ').some(segment => VITEST_SEGMENT.test(segment))) {
+    if (wrapped || command.split(' && ').some(isVitestSegment)) {
       return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
     }
   }
