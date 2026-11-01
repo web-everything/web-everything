@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { createSharedReconcile } from '../shared-reconcile.mjs';
+import { createSharedReconcile, stepMayHaveMutated } from '../shared-reconcile.mjs';
 
-// A deterministic stand-in for the real planner: a pure function of the PR rows it reads plus the live claim
-// table (the "state a step mutates"). Same shape as the real plan: {dispatch, refusals, notes}.
+// A deterministic stand-in for the real planner: a pure function of the live PR rows and the live claim table
+// (the state a step mutates). Same plan shape as the real one: {dispatch, refusals, notes}.
 const FIXTURE = [
   { number: 1, isDraft: false, red: true },
   { number: 2, isDraft: false, red: true },
@@ -14,158 +14,148 @@ function world() {
   const calls = [];
   const rows = structuredClone(FIXTURE); // live PR evidence: a test may change it between planner reads
   const readPrs = () => structuredClone(rows);
-  const run = ({ repo, readPrs: read = readPrs, excuseMergeGateHolds = (p) => p, enrichCodeQL = (p) => p }) => {
-    const rows = enrichCodeQL(excuseMergeGateHolds(read({ repo })));
-    calls.push(rows.map((r) => r.number));
+  const run = ({ repo, readPrs: read = readPrs }) => {
+    const seen = read({ repo });
+    calls.push(seen.map((r) => r.number));
     const dispatch = [];
     const refusals = [];
     const notes = [];
-    for (const pr of rows) {
+    for (const pr of seen) {
       if (pr.isDraft) dispatch.push({ kind: 'promote-draft', prNumber: pr.number });
       else if (pr.red && !claims.has(pr.number)) dispatch.push({ kind: pr.number === 1 ? 'fix' : 'ci-heal', prNumber: pr.number });
       else if (pr.red) refusals.push({ kind: 'claimed', prNumber: pr.number });
       if (pr.capped) notes.push({ kind: 'round-cap-exhausted', prNumber: pr.number });
     }
-    return { dispatch, refusals, notes, prs: rows.length, openPrFiles: [] };
+    return { dispatch, refusals, notes, prs: seen.length };
   };
   return { claims, calls, run, readPrs, rows };
 }
-// The four step decisions, each only reading the plan it is given.
+// The step decisions, each reading only the plan it is given.
 const decide = {
   fix: (plan) => plan.dispatch.filter((e) => e.kind === 'fix').map((e) => e.prNumber),
   ciHeal: (plan) => plan.dispatch.filter((e) => e.kind === 'ci-heal').map((e) => e.prNumber),
   promote: (plan) => plan.dispatch.filter((e) => e.kind === 'promote-draft').map((e) => e.prNumber),
-  notes: (plan) => plan.notes.map((n) => n.prNumber),
 };
+const make = (w) => createSharedReconcile({ run: w.run, readPrs: w.readPrs });
 
-function runOld(w) {
+// OLD path: every step runs the planner itself. NEW path: fix keeps its own run; ci-heal and promote-draft share one.
+function runOld(w, { ciHealMutates }) {
   const out = {};
-  out.fix = decide.fix(w.run({ repo: 'r' }));
+  out.fix = decide.fix(w.run({ repo: 'we' }));
   for (const n of out.fix) w.claims.add(n);
-  out.ciHeal = decide.ciHeal(w.run({ repo: 'r' }));
+  out.ciHeal = decide.ciHeal(w.run({ repo: 'we' }));
   for (const n of out.ciHeal) w.claims.add(n);
-  out.promote = decide.promote(w.run({ repo: 'r' }));
-  out.notes = decide.notes(w.run({ repo: 'r' }));
+  if (ciHealMutates) w.rows.find((p) => p.number === 3).isDraft = false; // e.g. something promoted #3 meanwhile
+  out.promote = decide.promote(w.run({ repo: 'we' }));
   return out;
 }
-function runNew(w) {
-  const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
+function runNew(w, { ciHealMutates }) {
+  const s = make(w);
   const out = {};
-  out.fix = decide.fix(s.reconcile({ repo: 'r', allowStandDownAutoProceed: true }));
+  out.fix = decide.fix(w.run({ repo: 'we' }));
   for (const n of out.fix) w.claims.add(n);
-  s.invalidate('r', out.fix);
-  out.ciHeal = decide.ciHeal(s.reconcile({ repo: 'r' }));
+  out.ciHeal = decide.ciHeal(s.reconcile({ repo: 'we' }));
   for (const n of out.ciHeal) w.claims.add(n);
-  s.invalidate('r', out.ciHeal);
-  out.promote = decide.promote(s.reconcile({ repo: 'r' }));
-  out.notes = s.readNotes({ repo: 'r' }).notes.map((n) => n.prNumber);
+  const result = { dispatched: out.ciHeal.map((pr) => ({ repo: 'we', pr })), refusals: [] };
+  if (ciHealMutates) w.rows.find((p) => p.number === 3).isDraft = false;
+  if (stepMayHaveMutated(result) || ciHealMutates) s.invalidate('we');
+  out.promote = decide.promote(s.reconcile({ repo: 'we' }));
   return { out, s };
 }
 
-describe('createSharedReconcile', () => {
-  it('every step decides exactly what the old per-step planner run decided (same fixtures)', () => {
-    const old = runOld(world());
+describe('createSharedReconcile — decision equivalence with the old per-step planner run', () => {
+  for (const ciHealMutates of [false, true]) {
+    it(`every step decides what it decided before (same fixtures, ci-heal ${ciHealMutates ? 'mutates a PR' : 'quiet'})`, () => {
+      const old = runOld(world(), { ciHealMutates });
+      const { out } = runNew(world(), { ciHealMutates });
+      expect(out).toEqual(old);
+    });
+  }
+
+  it('serves the second consumer from the first run when nothing mutated', () => {
     const w = world();
-    const { out } = runNew(w);
-    expect(out).toEqual(old);
-    expect(old.ciHeal).toEqual([2]); // the fix step claimed #1 first, so ci-heal sees only #2
+    const s = make(w);
+    s.reconcile({ repo: 'we' });
+    const second = s.reconcile({ repo: 'we' });
+    expect(w.calls.length).toBe(1);
+    expect(decide.promote(second)).toEqual([3]);
   });
 
-  it('runs the planner once in full; later steps only re-plan the PRs an earlier step acted on', () => {
+  it('an invalidated repo is re-planned in full from fresh reads (never a stale or partial plan)', () => {
     const w = world();
-    runNew(w);
-    expect(w.calls[0]).toEqual([1, 2, 3, 4]);
-    expect(w.calls.slice(1)).toEqual([[1], [2]]); // refresh after fix (#1), refresh after ci-heal (#2)
-    expect(w.calls.length).toBeLessThan(4);
+    const s = make(w);
+    expect(decide.ciHeal(s.reconcile({ repo: 'we' }))).toEqual([2]);
+    w.claims.add(2);
+    w.rows.find((p) => p.number === 4).headRefOid = 'new';
+    s.invalidate('we');
+    expect(decide.ciHeal(s.reconcile({ repo: 'we' }))).toEqual([]);
+    expect(w.calls[1]).toEqual([1, 2, 3, 4]); // every PR re-read: cross-PR context intact
   });
 
   it('without invalidation the snapshot would be stale (the test can tell)', () => {
-    const w2 = world();
-    const s = createSharedReconcile({ run: w2.run, readPrs: w2.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    s.reconcile({ repo: 'r' });
-    w2.claims.add(2);
-    expect(decide.ciHeal(s.reconcile({ repo: 'r' }))).toEqual([2]); // stale: still offers the claimed PR
-    s.invalidate('r', [2]);
-    expect(decide.ciHeal(s.reconcile({ repo: 'r' }))).toEqual([]); // refreshed: claim honoured
+    const w = world();
+    const s = make(w);
+    s.reconcile({ repo: 'we' });
+    w.claims.add(2);
+    expect(decide.ciHeal(s.reconcile({ repo: 'we' }))).toEqual([2]);
   });
 
   it('serves each consumer an independent copy', () => {
     const w = world();
-    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    s.reconcile({ repo: 'r' }).dispatch.length = 0;
-    expect(s.reconcile({ repo: 'r' }).dispatch.length).toBeGreaterThan(0);
-  });
-
-  it('notes view returns the shared notes plus the final PR rows keyed by number', () => {
-    const w = world();
-    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    const view = s.readNotes({ repo: 'r' });
-    expect(view.notes).toEqual([{ kind: 'round-cap-exhausted', prNumber: 4 }]);
-    expect([...view.prsByNumber.keys()]).toEqual([1, 2, 3, 4]);
-  });
-
-  it('a re-plan reads the touched PR fresh (head, labels, draft state), not the cached row', () => {
-    const w = world();
-    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    expect(decide.promote(s.reconcile({ repo: 'r' }))).toEqual([3]);
-    w.rows.find((p) => p.number === 3).isDraft = false; // a step promoted it
-    w.rows.find((p) => p.number === 3).headRefOid = 'new';
-    s.invalidate('r', [3]);
-    expect(decide.promote(s.reconcile({ repo: 'r' }))).toEqual([]);
-    expect(s.readNotes({ repo: 'r' }).prsByNumber.get(3)).toMatchObject({ isDraft: false, headRefOid: 'new' });
-  });
-
-  it('a failed refresh never serves the stale plan: it re-plans in full on the next request', () => {
-    const w = world();
-    let failNext = false;
-    const run = (input) => {
-      if (failNext) { failNext = false; throw new Error('planner blew up'); }
-      return w.run(input);
-    };
-    const s = createSharedReconcile({ run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    expect(decide.ciHeal(s.reconcile({ repo: 'r' }))).toEqual([2]);
-    w.claims.add(2);
-    s.invalidate('r', [2]);
-    failNext = true;
-    expect(decide.ciHeal(s.reconcile({ repo: 'r' }))).toEqual([]); // fell back to a full re-plan, claim honoured
-  });
-
-  it('a refresh plans with the snapshot flag, not the requester flag', () => {
-    const seen = [];
-    const run = ({ allowStandDownAutoProceed }) => { seen.push(allowStandDownAutoProceed); return { dispatch: [], refusals: [], notes: [] }; };
-    const s = createSharedReconcile({ run, readPrs: () => [{ number: 1 }], excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    s.reconcile({ repo: 'r' });
-    s.invalidate('r', [1]);
-    s.reconcile({ repo: 'r' });
-    expect(seen).toEqual([false, false]);
+    const s = make(w);
+    s.reconcile({ repo: 'we' }).dispatch.length = 0;
+    expect(s.reconcile({ repo: 'we' }).dispatch.length).toBeGreaterThan(0);
   });
 
   it('bypasses the cache for any input beyond repo + allowStandDownAutoProceed', () => {
     const w = world();
-    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs });
-    s.reconcile({ repo: 'r' });
-    s.reconcile({ repo: 'r', readPrs: () => [] });
+    const s = make(w);
+    s.reconcile({ repo: 'we' });
+    s.reconcile({ repo: 'we', readPrs: () => [] });
     expect(w.calls.length).toBe(2);
   });
 
   it('a true-flag snapshot serves a false request; a true request after a false one recomputes', () => {
     const w = world();
-    const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    s.reconcile({ repo: 'r', allowStandDownAutoProceed: true });
-    s.reconcile({ repo: 'r' });
+    const s = make(w);
+    s.reconcile({ repo: 'we', allowStandDownAutoProceed: true });
+    s.reconcile({ repo: 'we' });
     expect(w.calls.length).toBe(1);
-    const s2 = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
-    s2.reconcile({ repo: 'r' });
-    s2.reconcile({ repo: 'r', allowStandDownAutoProceed: true });
+    const s2 = make(w);
+    s2.reconcile({ repo: 'we' });
+    s2.reconcile({ repo: 'we', allowStandDownAutoProceed: true });
     expect(w.calls.length).toBe(3);
   });
 
-  it('never caches a deferred (non-array) read: the next step retries', () => {
+  it('never caches a deferred or incomplete read: the next step retries', () => {
     let n = 0;
-    const run = ({ readPrs }) => { readPrs({ repo: 'r' }); n += 1; return { dispatch: [], refusals: [], notes: [] }; };
-    const s = createSharedReconcile({ run, readPrs: () => ({ deferred: true }) });
-    s.reconcile({ repo: 'r' });
-    s.reconcile({ repo: 'r' });
-    expect(n).toBe(2);
+    const incomplete = Object.assign([{ number: 1 }], { discoveryIncomplete: true });
+    for (const rows of [{ deferred: true }, incomplete]) {
+      n = 0;
+      const run = ({ readPrs }) => { readPrs({ repo: 'we' }); n += 1; return { dispatch: [], refusals: [], notes: [] }; };
+      const s = createSharedReconcile({ run, readPrs: () => rows });
+      s.reconcile({ repo: 'we' });
+      s.reconcile({ repo: 'we' });
+      expect(n).toBe(2);
+    }
+  });
+
+  it('a planner error is not cached', () => {
+    let fail = true;
+    const run = ({ readPrs }) => { readPrs({ repo: 'we' }); if (fail) throw new Error('boom'); return { dispatch: [], refusals: [], notes: [] }; };
+    const s = createSharedReconcile({ run, readPrs: () => [{ number: 1 }] });
+    expect(() => s.reconcile({ repo: 'we' })).toThrow('boom');
+    fail = false;
+    expect(s.reconcile({ repo: 'we' }).dispatch).toEqual([]);
+  });
+});
+
+describe('stepMayHaveMutated', () => {
+  it('a dispatch, a park or a failed tick may have mutated PRs; read-only refusals may not', () => {
+    expect(stepMayHaveMutated({ dispatched: [{ pr: 1 }] })).toBe(true);
+    expect(stepMayHaveMutated({ refusals: [{ kind: 'fix-loop-parked' }] })).toBe(true);
+    expect(stepMayHaveMutated({ refusals: [{ kind: 'tick-failed' }] })).toBe(true);
+    expect(stepMayHaveMutated({ refusals: [{ kind: 'queue-cap' }, { kind: 'no-lane' }] })).toBe(false);
+    expect(stepMayHaveMutated({})).toBe(false);
   });
 });
