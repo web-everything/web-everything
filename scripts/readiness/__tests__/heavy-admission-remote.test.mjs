@@ -2,7 +2,7 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
@@ -682,6 +682,30 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0, remoteResult: { mode: 'remote', code: 0 } });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('waiting for a remote slot instead of deferring locally');
+  });
+
+  it('reaps a dead client\'s stale marker and runs on the idle Forge instead of remote-full (perf10)', async () => {
+    const f = await overloadFixture({ overloaded: false, freeAtMs: null });
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1 }) + '\n');
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    // An earlier client already saw this exact marker's owner dead long ago (the persisted stamp).
+    const st = statSync(marker);
+    writeFileSync(marker + '.dead', JSON.stringify({ key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000 }));
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('reaped stale remote slot marker');
+  });
+
+  it('never reaps a live client\'s marker while Forge is idle', async () => {
+    const f = await overloadFixture({ overloaded: false, freeAtMs: null });
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: 1 }) + '\n');
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(existsSync(marker)).toBe(true);
+    expect(f.remoteExec).not.toHaveBeenCalled();
   });
 
   it('keeps the 30s remote-full fallback when the host is not overloaded', async () => {
