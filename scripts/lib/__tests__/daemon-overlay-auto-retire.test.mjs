@@ -641,6 +641,22 @@ describe('real Git retirement evidence', () => {
     expect((await retire([{ ref: 'deleted', [field]: sha }])).retired[0]).toMatchObject({ class: 'landed', sha });
   });
 
+  it.each(['sha', 'headSha', 'tipSha'])('re-registration drops the old registration\'s recorded %s, so a deleted branch is never retired on it', async (field) => {
+    const sha = commit('landed', 'landed');
+    track('main');
+    register([{ ref: 'lane/reused', pr: 11, [field]: sha, registrationId: 'pr-11' }]);
+    addOverlay(root, { ref: 'lane/reused', pr: 12, now: 'again' }, { env });
+    const [replacement] = readOverlayState(root, { env }).overlays;
+    expect(replacement).toMatchObject({ ref: 'lane/reused', pr: 12 });
+    expect(replacement.registrationId).not.toBe('pr-11');
+    for (const stale of ['sha', 'headSha', 'tipSha']) expect(replacement).not.toHaveProperty(stale);
+    const result = await autoRetireOverlays({ root, env, overlays: [replacement], git, mainSha: 'origin/main',
+      refEvidence: new Map([['lane/reused', 'missing']]) });
+    expect(result.retired).toEqual([]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
+    expectNoRetirement();
+  });
+
   it('prefers the live tip to an old recorded main SHA', () => {
     branch('feature');
     commit('feature', 'feature');

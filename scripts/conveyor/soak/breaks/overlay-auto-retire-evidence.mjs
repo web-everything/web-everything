@@ -25,6 +25,7 @@ export default {
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('plan = unavailablePinned ??')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
+        && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('REGISTRATION_TIP_FIELDS')
         && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
     } catch { return false; }
   },
@@ -158,12 +159,16 @@ export default {
       for (const mode of ['off', 'shadow', 'on']) {
         env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
         writeOverlays(root, stale, { env });
-        const stored = readFileSync(overlayFilePath(root, env), 'utf8');
+        // Preparation stamps registration ids on legacy entries first; every registered field must survive.
+        const registrations = () => JSON.stringify(readOverlayState(root, { env }).overlays
+          .map(({ registrationId, ...o }) => (void registrationId, o)));
+        const stored = registrations();
         const unknown = await prepare();
         if (!unknown.terminal || unknown.result?.moved !== false || unknown.result?.reason !== 'pinned-overlay-unavailable'
           || unknown.result?.detail?.ref !== 'missing-no-sha' || unknown.result?.detail?.pinnedBy !== 'unknown'
           || ok('rev-parse', 'HEAD') !== initial
-          || readFileSync(overlayFilePath(root, env), 'utf8') !== stored) {
+          || registrations() !== stored
+          || readOverlayState(root, { env }).overlays.some((o) => typeof o.registrationId !== 'string')) {
           violation('unknown-pin-evidence-does-not-hold', `${mode}: unknown overlay tips must preserve the running tree and registry (${unknown.result?.reason ?? 'non-terminal plan'})`);
         }
         // An operator restores recorded tips proving no mechanism changes. The healthy overlay
@@ -251,7 +256,21 @@ export async function registrationEvidenceReplay() {
     check('replacement-rejects-old-refresh', persisted.written === 0 && entries()[0].tipSha === undefined, { persisted, entry: entries()[0] });
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
     const retired = await autoRetireOverlays({ root, env, overlays: entries(), git, refEvidence: new Map([['feature', 'missing']]) });
-    check('missing-replacement-stays-registered', retired.retired.length === 0 && entries()[0]?.sha === needed, { retired: retired.retired, entries: entries() });
+    check('missing-replacement-stays-registered', retired.retired.length === 0 && entries()[0]?.ref === 'feature'
+      && entries()[0]?.sha === undefined, { retired: retired.retired, entries: entries() });
+    // PR #6033 red team: the old registration's legacy sha/headSha already on main must not retire the
+    // replacement registration once its branch is confirmed missing.
+    for (const field of ['sha', 'headSha', 'tipSha']) {
+      writeOverlays(root, [{ ref: 'lane/reused', pr: 11, [field]: landed, registrationId: 'pr-11' }], { env });
+      addOverlay(root, { ref: 'lane/reused', pr: 12 }, { env });
+      const reused = entries().find((o) => o.ref === 'lane/reused');
+      const reusedRetired = await autoRetireOverlays({ root, env, overlays: [reused], git,
+        refEvidence: new Map([['lane/reused', 'missing']]) });
+      check(`reregistration-drops-inherited-${field}`, reused?.registrationId !== 'pr-11' && !(field in reused)
+        && reusedRetired.retired.length === 0 && entries().some((o) => o.ref === 'lane/reused' && o.pr === 12),
+      { reused, retired: reusedRetired.retired, entries: entries() });
+      removeOverlay(root, 'lane/reused', { env });
+    }
 
     const input = { ref: 'same', now: '2026-10-27T12:00:00Z' };
     const first = addOverlay(root, input, { env }).find((o) => o.ref === 'same');

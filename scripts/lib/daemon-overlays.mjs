@@ -293,6 +293,9 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
+/** Recorded branch tips an entry may carry; each describes one registration's branch, never a re-registration's. */
+export const REGISTRATION_TIP_FIELDS = Object.freeze(['tipSha', 'sha', 'headSha']);
+
 /** Registration intent excludes the rebuild's own caches: base chain, last refreshed tip, retired sources. */
 export function registrationIdentity(entry) {
   if (entry == null) return entry;
@@ -327,7 +330,9 @@ export function addOverlay(root, {
       });
     } else {
       const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
-      delete next.tipSha;
+      // Every recorded tip (legacy `sha`/`headSha`, refreshed `tipSha`) is evidence about the OLD registration's
+      // branch. Carried into the new id it would let auto-retirement remove the replacement on a stale tip.
+      for (const field of REGISTRATION_TIP_FIELDS) delete next[field];
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
