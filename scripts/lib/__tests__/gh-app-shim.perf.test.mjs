@@ -5,12 +5,12 @@
  * Counting is real: a --require preload logs every child process any node process in the chain spawns.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, mkdirSync, realpathSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { renderGhShimScript } from '../gh-app-shim.mjs';
+import { renderGhShimScript, defaultGhThrottleCliPath } from '../gh-app-shim.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
 
 const CLEAN = {
@@ -47,7 +47,7 @@ for (let i = 0; i < ${CALLS}; i++) { const r = spawnSync(${JSON.stringify(shimPa
   env: Object.assign({}, process.env, { NODE_OPTIONS: '--require ' + ${JSON.stringify(preload)} }) });
   if (r.status !== 0 || r.stdout.trim() !== 'ok') { console.error(r.stderr, r.stdout); process.exit(1); } }
 `);
-  return { dir, driver, log, repo, real: realGh, cachePath };
+  return { dir, driver, log, preload, repo, real: realGh, cachePath };
 }
 
 describe('gh shim process fan-out (R320 #1)', () => {
@@ -79,18 +79,57 @@ describe('gh shim process fan-out (R320 #1)', () => {
 });
 
 describe('in-process throttle load failures', () => {
-  it('loads the baked module URL with quotes, spaces, hash and percent characters in its path', () => {
+  it.each(['export comment', 'actual export', 'symlink to relay', 'unresolvable realpath'])('runs a look-alike relay with %s as a child exactly once, without importing it', (variant) => {
+    const f = fixture();
+    try {
+      const relay = join(f.dir, 'gh-throttle.mjs');
+      const cli = variant === 'symlink to relay' ? join(f.dir, 'alias.mjs') : relay;
+      const executions = join(f.dir, 'relay-executions.jsonl');
+      writeFileSync(relay, `${variant === 'actual export' ? 'export function runGhCliPassthrough() { throw new Error("relay imported"); }' : '// export function runGhCliPassthrough('}
+import { appendFileSync } from 'node:fs';
+appendFileSync(${JSON.stringify(executions)}, JSON.stringify({ entry: process.argv[1] }) + '\\n');
+console.log('relay child');
+`);
+      if (cli !== relay) symlinkSync(relay, cli);
+      const shim = join(f.dir, 'gh-look-alike');
+      writeFileSync(shim, renderGhShimScript({ realGhPath: f.real, cachePath: f.cachePath, ghThrottleCliPath: cli }));
+      if (variant === 'unresolvable realpath') {
+        writeFileSync(f.preload, `{
+const fs = require('node:fs'); const realpath = fs.realpathSync;
+fs.realpathSync = function (path, ...args) {
+  if (process.argv[1] === ${JSON.stringify(shim)} && path === ${JSON.stringify(cli)}) {
+    const error = new Error('unreadable throttle path'); error.code = 'EACCES'; throw error;
+  }
+  return realpath.call(this, path, ...args);
+};
+}\n`, { flag: 'a' });
+      }
+      const env = { ...process.env, ...CLEAN, NODE_OPTIONS: '--require ' + f.preload,
+        WE_GH_THROTTLE_LOCK_ROOT: join(f.dir, 'locks'), LANE_POOL_ROOT: undefined };
+      const result = spawnSync(process.execPath, [shim, 'api', 'ping'], { cwd: f.repo, env, encoding: 'utf8', timeout: 10000 });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('relay child\n');
+      expect(result.stderr).toBe('');
+      expect(readFileSync(executions, 'utf8').trim().split('\n').map(JSON.parse)).toEqual([{ entry: cli }]);
+      const spawns = readFileSync(f.log, 'utf8').trim().split('\n');
+      expect(spawns.filter((name) => /^node/.test(name))).toHaveLength(1);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('runs a symlink to the canonical throttle in process with quotes, spaces, hash and percent in its path', () => {
     const f = fixture();
     try {
       const cli = join(f.dir, 'throttle "quoted" \'single\' # %.mjs');
-      writeFileSync(cli, 'export function runGhCliPassthrough() { return { status: 0, stdout: Buffer.from("literal target\\n"), stderr: Buffer.alloc(0) }; }\n');
+      symlinkSync(defaultGhThrottleCliPath(), cli);
       const shim = join(f.dir, 'gh-literal-target');
       writeFileSync(shim, renderGhShimScript({ realGhPath: f.real, cachePath: f.cachePath, ghThrottleCliPath: cli }));
-      const env = { ...process.env, ...CLEAN, WE_GH_THROTTLE_LOCK_ROOT: join(f.dir, 'locks'), LANE_POOL_ROOT: undefined };
+      const env = { ...process.env, ...CLEAN, NODE_OPTIONS: '--require ' + f.preload,
+        WE_GH_THROTTLE_LOCK_ROOT: join(f.dir, 'locks'), LANE_POOL_ROOT: undefined };
       const result = spawnSync(process.execPath, [shim, 'api', 'ping'], { cwd: f.repo, env, encoding: 'utf8', timeout: 10000 });
       expect(result.status).toBe(0);
-      expect(result.stdout).toBe('literal target\n');
+      expect(result.stdout).toBe('ok\n');
       expect(result.stderr).toBe('');
+      expect(readFileSync(f.log, 'utf8').trim().split('\n').filter((name) => /^node/.test(name))).toEqual([]);
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 
