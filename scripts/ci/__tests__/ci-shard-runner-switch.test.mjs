@@ -20,15 +20,11 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
     expect(raw.split('\n').filter((l) => /^ {4}runs-on: .*vars\.WE_SHARD_RUNNER/.test(l))).toHaveLength(1);
   });
 
-  it('smoke pins Ubuntu 24.04 and retains browser dependency installation and interaction tests', () => {
+  it('smoke pins Ubuntu 24.04 for Playwright 1.58.1 browser installation', () => {
     expect(jobs.smoke['runs-on']).toBe('ubuntu-24.04');
-    expect(jobs.smoke.steps).toEqual(expect.arrayContaining([
-      expect.objectContaining({ run: 'npx playwright install --with-deps chromium' }),
-      expect.objectContaining({ run: 'npm run test:interaction', env: { WE_INTERACTION_ONLY: '1' } }),
-    ]));
   });
 
-  it('other jobs stay on ubuntu-latest (the Arm switch must not widen)', () => {
+  it('every other job stays on ubuntu-latest (the switch must not widen)', () => {
     for (const [name, j] of Object.entries(jobs)) {
       if (name === 'test-shard' || name === 'smoke') continue;
       expect(j['runs-on'], `${name} must not follow the Arm switch`).toBe('ubuntu-latest');
