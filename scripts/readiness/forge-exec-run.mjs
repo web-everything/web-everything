@@ -497,10 +497,10 @@ export async function uidBusy(uid) {
         // Credentials come from status (world-readable even for non-dumpable processes), never from
         // the /proc/<pid> owner, which flips to root when a worker clears its dumpable flag.
         const status=(await filesystem.readFile('/proc/'+entry+'/status')).toString('latin1');
-        const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status),state=/^State:\s+(\S)/m.exec(status);
-        if(!ids||!state)return true; // credentials undeterminable: keep the reservation
+        const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
+        if(!ids)return true; // credentials undeterminable: keep the reservation
         if(!ids.slice(1).some(id=>Number(id)===uid))continue;
-        if(state[1]!=='Z')return true;
+        return true; // any matching entry, even a zombie leader whose threads may live, keeps the slot
       } catch(error) {if(error.code!=='ENOENT')return true; vanished=true;}
     }
     if(!vanished)return false;
