@@ -120,7 +120,7 @@ export function isDataRegistryPath(path) {
     &&!excludedComponent(leaf,true,true);
 }
 const isStrictJsonPath=path=>isDesignTokenPath(path)||isDataRegistryPath(path);
-const secretField=/key|secret|token|passw(?:or)?d|credential/i;
+const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 const secretText=[
   [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
   [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/sk-[A-Za-z0-9_-]{16,}/,'sk-token'],
@@ -152,6 +152,8 @@ export function designTokenSecretFinding(content) {
     }
     const value=JSON.parse(literal),decoded=textFinding(value);
     if(decoded)return decoded;
+    // Under a tainted container, property names are secret candidates too.
+    if(colon&&stack.at(-1)&&value.length>=20&&entropy(value)>=3.5)return 'high-entropy-nested-key';
     if(colon) {field=value;continue;}
     const name=field!==undefined&&secretField.test(field)?field:stack.at(-1)?'nested':null;
     if(name&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${name}`;
