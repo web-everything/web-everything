@@ -38,6 +38,12 @@ Growth only when Forge is idle; at most `maxSlots` (3) slots per job; `remote.el
 - [A5] **Executable** - env-layer: a `WE_*` env value cannot set `remote.elastic.*`; invalid leaf values fall back to standard and log.
 - [A6] **Executable** - runner render test: N-slot slice CPUQuota/MemoryMax never exceeds the parent; worker env above N is rejected; a multi-slot marker is reaped as one owner of N tokens.
 - [A7] **Executable** - live before/after attached (wall time, CPU and memory peak, pass/fail) before `enabled` flips.
+- [A8] **Ratification gap: values** - confirm `maxSlots` 3 and idle = at least 4 of 8 slots free (R354 flag 1).
+- [A9] **Ratification gap: anchor amendment 0** - anchor statute amendment 0 to its exact text location (R354 flag 2).
+- [A10] **Ratification gap: amendment 3 second insertion** - anchor amendment 3's second insertion (R354 flag 3).
+- [A11] **Ratification gap: "as they already are"** - make amendment 3's "as they already are" verifiable or reword it (R354 flag 4).
+- [A12] **Ratification gap: re-entrance note** - amend the re-entrance "one slot, not two" note (R354 flag 5).
+- [A13] **Ratification gap: waiting-marker token** - decide the waiting-marker token semantics in the build (R354 flag 6).
 
 ## Non-goals
 

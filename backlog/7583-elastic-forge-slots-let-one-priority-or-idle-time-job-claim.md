@@ -61,3 +61,20 @@ Unchanged: clause 3 (waiting-for-capacity tick). Consistent with, not amended: "
 5. **Identity scoping** - n/a: policy only; see xzzsdv9.
 6. **State over time** - n/a: policy only; see xzzsdv9.
 7. **Who wrote it** - n/a: policy only; admission decides, never the requester.
+
+## Ratified — 2026-11-01 (R354)
+
+Operator chalbert, 2026-11-01 17:34 ET: "\"Ratify as is\" for xjba691."
+
+Statute amendments 0–5 to `#heavy-command-admission-queue` are ratified as written. The statute text change itself lands with the build (xzzsdv9).
+
+## Known gaps (close in build xzzsdv9)
+
+Six second-screen flags, recorded at ratification and carried into the build story as acceptance items:
+
+1. Values: `maxSlots` 3; idle = at least 4 of 8 slots free.
+2. Anchor amendment 0.
+3. Anchor amendment 3's second insertion.
+4. Amendment 3's unverifiable "as they already are".
+5. Amend the re-entrance "one slot, not two" note.
+6. Waiting-marker token semantics, to be decided in the build.
