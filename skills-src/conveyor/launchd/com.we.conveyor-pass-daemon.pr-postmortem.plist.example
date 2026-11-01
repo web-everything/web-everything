@@ -10,6 +10,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key><string>120000</string>
+    <key>PASS_DAEMON_SELF_SYNC</key><string>1</string>
     <key>PATH</key><string>&lt;node-bin-directory&gt;:/usr/bin:/bin</string>
     <key>WE_GITHUB_APP_ID</key><string>&lt;app-id&gt;</string>
     <key>WE_GITHUB_APP_INSTALLATION_ID</key><string>&lt;installation-id&gt;</string>
