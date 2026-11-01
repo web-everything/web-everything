@@ -122,4 +122,29 @@ describe('forge leaked-state reaper', () => {
     expect(await exists(join(receipts, fresh.run + '.prepared'))).toBe(true);
     expect((await runner.telemetry()).activeRuns).toBe(1);
   });
+  it('reaps an orphan record with no reservation, but keeps it when the reservation is unreadable or the slot is busy', async () => {
+    const orphan = join(receipts, runId(12) + '.running');
+    await writeFile(orphan, JSON.stringify({v: 1, nonce, run: runId(12), slot: 'forge-exec-1', owner}));
+    probe.start = async () => null;
+    probe.uidBusy = async () => true;
+    await makeRunner().telemetry();
+    expect(await exists(orphan)).toBe(true); // slot uid busy: keep
+    probe.uidBusy = async () => false;
+    await mkdir(join(receipts, 'worker-active-1'), {mode: 0o700});
+    await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), '{not json');
+    await makeRunner().telemetry();
+    expect(await exists(orphan)).toBe(true); // unreadable reservation: keep
+    await rm(join(receipts, 'worker-active-1'), {recursive: true});
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(await exists(orphan)).toBe(false);
+  });
+  it('never reaps a slotless lock: a dead owner does not prove its descendants gone', async () => {
+    const lock = join(receipts, 'worker-active');
+    await mkdir(lock, {mode: 0o700});
+    await writeFile(join(lock, 'reservation.json'), JSON.stringify({run: runId(13), nonce, writerGuard: 1}));
+    await writeFile(join(receipts, runId(13) + '.running'), JSON.stringify({v: 1, nonce, run: runId(13), owner}));
+    probe.start = async () => null;
+    expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+    expect(await exists(lock)).toBe(true);
+  });
 });
