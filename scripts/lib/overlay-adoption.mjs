@@ -68,7 +68,7 @@ export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOStr
 }
 
 const defaultIsAncestor = (root, sha) =>
-  spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', sha, 'HEAD'], { encoding: 'utf8', timeout: 20000 }).status === 0;
+  spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', sha, 'HEAD'], { encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024 }).status === 0;
 
 /**
  * Called from the rebuild path after every pass. Emits overlay-adopted when a pending sha is an ancestor of
