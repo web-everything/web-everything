@@ -892,6 +892,16 @@ export function checkClosureHash({ check, root, closureOf = collectImportClosure
   } catch { return null; }
 }
 
+/** PURE: is the diff since the last live-verified build made only of plain code (.mjs/.cjs/.js outside the
+ *  runtime-read trees) or repo docs/backlog text? Anything else (manifest, lockfile, config, markdown briefs,
+ *  skills-src, .claude, shell/yaml/html...) is read or run at runtime and can break a dry-run without being imported,
+ *  so it never allows a relevance skip. An unknown diff is not safe. */
+export function relevanceDiffSafe(changedFiles) {
+  return Array.isArray(changedFiles) && changedFiles.every((f) => typeof f === 'string'
+    && !/^(skills-src|\.claude|scripts\/settings)\//.test(f)
+    && (/\.(mjs|cjs|js)$/.test(f) || /^(backlog|docs)\/.+\.md$/.test(f)) && !/(^|\/)package(-lock)?\.json$/.test(f));
+}
+
 /**
  * Fork 1: is `check` relevant to the daemon whose entry modules are `daemonEntries`? A daemon is relevant when its
  * import closure contains one of the check's own `codeEntries` (it actually imports that machinery). Unknown daemon
@@ -985,7 +995,7 @@ export async function runLiveSmoke({
       let result;
       // Fork 1: a shareable dry-run the daemon never imports is `skipped:relevance` — only when a prior live pass of
       // the same check on a closure-identical tree is on record; otherwise it runs (fail closed).
-      if (check.shareable && !reuseCode && !checkRelevantToDaemon({ check, daemonEntries, root, closureOf })) {
+      if (check.shareable && !reuseCode && relevanceDiffSafe(changedFiles) && !checkRelevantToDaemon({ check, daemonEntries, root, closureOf })) {
         const closureHash = checkClosureHash({ check, root, closureOf });
         if (closureHash && typeof relevanceProof === 'function' && relevanceProof(check.name, closureHash) === true) {
           results.push({ name: check.name, ms: 0, ok: true, skipped: true, skipReason: 'relevance', closureHash,

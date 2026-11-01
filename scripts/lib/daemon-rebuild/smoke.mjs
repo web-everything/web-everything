@@ -619,7 +619,7 @@ export async function smokeAndAdopt({
     if (!threw && smokeResult?.verdict === 'pass' && !smokeResult.disabled && !smokeResult.cached && (!dispatch || dispatch.result.ok)) {
       writeClosureProofs(smokeResult?.smoke?.results, { identity, env: stEnv, now });
     }
-    if (!threw && !proven && completeSmokePass(smokeResult, { relevanceProof }) && changedFiles === null && (!dispatch || dispatch.result.ok)
+    if (!threw && !proven && completeSmokePass(smokeResult) && changedFiles === null && (!dispatch || dispatch.result.ok)
       && !smokeResult.cached && !busyPoolSkippedChecks(smokeResult).length && label !== 'confirm') {
       if (identity) {
         writeSharedVerdict(identity, { env: stEnv, now });

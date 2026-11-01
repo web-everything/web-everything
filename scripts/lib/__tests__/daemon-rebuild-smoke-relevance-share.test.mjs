@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
-  SMOKE_CHECKS, SHAREABLE_CHECK_NAMES, runLiveSmoke, checkRelevantToDaemon, checkClosureHash, DISPATCH_DRY_RUN_CODE_ENTRIES,
+  SMOKE_CHECKS, SHAREABLE_CHECK_NAMES, runLiveSmoke, checkRelevantToDaemon, checkClosureHash, relevanceDiffSafe, DISPATCH_DRY_RUN_CODE_ENTRIES,
 } from '../daemon-live-smoke.mjs';
 import {
   completeSmokePass, makeRelevanceProof, readSharedVerdict, writeSharedVerdict, writeClosureProofs, smokePassIdentity, smokeHarnessHash,
@@ -74,17 +74,17 @@ describe('Fork 1: per-daemon relevance by import closure', () => {
     const without = await runLiveSmoke(opts(root, { daemonEntries, relevanceProof: () => false }));
     expect(without.results.find((r) => r.name === 'dispatch-dry-run').skipReason).toBeUndefined();
     const proof = vi.fn((name, h) => (name === 'dispatch-dry-run' || name === 'reconcile-dry-run') && /^[0-9a-f]{64}$/.test(h));
-    const withProof = await runLiveSmoke(opts(root, { daemonEntries, relevanceProof: proof }));
+    const withProof = await runLiveSmoke(opts(root, { daemonEntries, changedFiles: ['scripts/lib/util.mjs'], relevanceProof: proof }));
     const row = withProof.results.find((r) => r.name === 'dispatch-dry-run');
     expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'relevance' });
     expect(row.closureHash).toBe(hash);
     // relevant daemon: never relevance-skipped
-    const relevant = await runLiveSmoke(opts(root, { daemonEntries: ['skills-src/conveyor/review-daemon.mjs'], relevanceProof: proof }));
+    const relevant = await runLiveSmoke(opts(root, { daemonEntries: ['skills-src/conveyor/review-daemon.mjs'], changedFiles: ['scripts/lib/util.mjs'], relevanceProof: proof }));
     expect(relevant.results.find((r) => r.name === 'dispatch-dry-run').skipReason).toBeUndefined();
   });
   it('the floor rows are still present and run when everything shareable is skipped', async () => {
     const root = fixture();
-    const out = await runLiveSmoke(opts(root, { daemonEntries: ['skills-src/conveyor/verify-daemon.mjs'], relevanceProof: () => true }));
+    const out = await runLiveSmoke(opts(root, { daemonEntries: ['skills-src/conveyor/verify-daemon.mjs'], changedFiles: ['scripts/lib/util.mjs'], relevanceProof: () => true }));
     for (const n of ['gh-api-repo', 'gh-pr-list', 'daemon-entries-boot', 'tree-stays-clean']) {
       const r = out.results.find((x) => x.name === n);
       expect(r, n).toBeTruthy();
@@ -301,5 +301,16 @@ describe('audit findings (xfwf4zc)', () => {
     }
     expect(parse([{ ...good, skipped: true }]).ran).toBe(false);
   });
+  it('a relevance skip needs a known, plain-code diff: markdown briefs, config, skills, unknown diff all run the check', async () => {
+    expect(relevanceDiffSafe(['scripts/a.mjs', 'docs/x.md'])).toBe(true);
+    for (const bad of [null, undefined, ['scripts/briefs/review.md'], ['skills-src/x/brief.md'], ['package.json'], ['scripts/x.sh'], ['scripts/settings/a.json'], ['.claude/s.md']]) {
+      expect(relevanceDiffSafe(bad), JSON.stringify(bad)).toBe(false);
+    }
+    const root = fixture();
+    const base = { daemonEntries: ['skills-src/conveyor/verify-daemon.mjs'], relevanceProof: () => true };
+    for (const changedFiles of [null, ['scripts/briefs/review.md']]) {
+      const out = await runLiveSmoke(opts(root, { ...base, changedFiles }));
+      expect(out.results.find((r) => r.name === 'dispatch-dry-run').skipReason, JSON.stringify(changedFiles)).toBeUndefined();
+    }
+  });
 });
-
