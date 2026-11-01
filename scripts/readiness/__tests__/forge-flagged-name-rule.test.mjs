@@ -1,13 +1,14 @@
 // @vitest-environment node
 // Ruling R321: a credential-NAMED file ships to Forge only if tracked, identical to
-// origin/main (not a symlink nor reached through one) and clean of secret content.
+// origin/main and clean of secret content. The established memory bridge may
+// project a verified regular source; other credential-named aliases are refused.
 import {afterEach,beforeEach,describe,expect,it} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {buildManifest} from '../remote-exec.mjs';
-import {classifyManifestPath,designTokenSecretFinding,credentialContentFinding,isTestFile} from '../forge-exec-manifest.mjs';
+import {classifyManifestPath,designTokenSecretFinding,credentialContentFinding,isTestFile,manifestEntry} from '../forge-exec-manifest.mjs';
 let cwd;
 const exec=async ({file,args,cwd,input})=>{
   const result=spawnSync(file,args,{cwd,input,maxBuffer:4*1024*1024});
@@ -39,6 +40,32 @@ const shipped=['design-systems/acme.tokens.json','src/_data/protocols/credential
   'docs/password-policy.md'];
 const content=p=>p.endsWith('.njk')||p.endsWith('.md')?njk:tokens;
 describe('credential-name rule (R321)',()=>{
+  it('buildManifest projects the actual tracked repo memory bridge with public evidence pinned to HEAD',async()=>{
+    const repo=fileURLToPath(new URL('../../../',import.meta.url));
+    // Exercise the real bridge corpus, rather than a hand-picked flat inventory.
+    // Only this corpus is copied: the full repo intentionally contains excluded
+    // test fixtures and optional sibling dependencies unrelated to projection.
+    const inventory=await exec({file:'git',args:['ls-files','-z','--','.claude/agent-memory','agent-memory-src/'],cwd:repo});
+    expect(inventory.code).toBe(0);
+    const paths=inventory.stdout.toString().split('\0').filter(Boolean);
+    expect(paths).toContain('.claude/agent-memory');
+    expect(paths).toContain('agent-memory-src/8-project_theme_tokens_js_first.md');
+    expect(paths).toContain('agent-memory-src/never-touch-secrets-even-filenames.md');
+    for(const path of paths){
+      const source=join(repo,path);
+      if((await fs.lstat(source)).isSymbolicLink()){
+        await fs.mkdir(join(cwd,path,'..'),{recursive:true});
+        await fs.symlink(await fs.readlink(source),join(cwd,path));
+      }else await write(path,await fs.readFile(source));
+    }
+    await git(['add','.']);await commit();
+    const manifest=await buildManifest({cwd,exec});
+    for(const path of paths.filter(p=>p.startsWith('agent-memory-src/'))){
+      const source=manifest.entries.find(entry=>entry.path.toString()===path);
+      const alias=manifest.entries.find(entry=>entry.path.toString()==='.claude/agent-memory/'+path.slice('agent-memory-src/'.length));
+      expect(source,path).toBeDefined();expect(alias,path).toMatchObject({sha256:source.sha256,tracked:false,sourcePath:Buffer.from(path)});
+    }
+  },30000);
   it('excludes real tracked pattern-spelling files individually and retains the missing-test fallback',async()=>{
     const repo=fileURLToPath(new URL('../../../',import.meta.url));
     const inventory=await exec({file:'git',args:['ls-files','-z'],cwd:repo});
@@ -146,10 +173,10 @@ describe('credential-name rule (R321)',()=>{
     await write('a/token.json.','{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}');await git(['add','.']);await commit();
     await expectExcluded('a/token.json.');
   });
-  it('does not ship a name-flagged JSON file through the agent-memory bridge',async()=>{
+  it('projects a verified name-flagged JSON file through the established agent-memory bridge',async()=>{
     await write('agent-memory-src/token.json',tokens);await fs.mkdir(join(cwd,'.claude'),{recursive:true});
     await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+    expect(names((await buildManifest({cwd,exec})).entries)).toContain('.claude/agent-memory/token.json');
   });
   it.each(['lib/token-scrub.mjs','docs/token-notes.md','src/credential-view.ts'])('excludes a tracked flagged %s containing a fake secret (R323, no type skip)',async p=>{
     await write(p,'const x = "ghp_abcdefghijklmnopqrstuvwxyz0123";\n');await git(['add','.']);await commit();
@@ -162,10 +189,10 @@ describe('credential-name rule (R321)',()=>{
     await write('lib/token-util.mjs','export const ok = 1;\n');await git(['add','.']);await commit();
     expect(names((await buildManifest({cwd,exec})).entries)).toContain('lib/token-util.mjs');
   });
-  it('never ships a flagged file through the agent-memory bridge alias, clean or not (R321 symlink rule)',async()=>{
+  it('projects clean verified memory but refuses secret-like memory content',async()=>{
     await write('agent-memory-src/token-note.md','clean notes');await fs.mkdir(join(cwd,'.claude'),{recursive:true});
     await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+    expect(names((await buildManifest({cwd,exec})).entries)).toContain('.claude/agent-memory/token-note.md');
     await write('agent-memory-src/token-note.md','ghp_abcdefghijklmnopqrstuvwxyz0123');await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
@@ -177,6 +204,20 @@ describe('credential-name rule (R321)',()=>{
   it('scans non-JSON content with the raw secret patterns',()=>{
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('AKIAABCDEFGHIJKLMNOP'))).toBe('aws-access-key');
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('plain text'))).toBe(null);
+  });
+});
+
+describe('manifestEntry fail-closed leaf guard',()=>{
+  it.each([
+    ['untracked clean file',tokens,false],
+    ['tracked content finding','{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}',true],
+    ['untracked content finding','{"password":"q8Zr2LmX9vT4pW7kJ1nB5cY3!"}',false],
+  ])('manifestEntry rejects %s directly',(_label,content,tracked)=>{
+    expect(()=>manifestEntry(Buffer.from('a/token.json'),Buffer.from(content),false,tracked))
+      .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+  it('manifestEntry admits tracked scan-clean content directly',()=>{
+    expect(manifestEntry(Buffer.from('a/token.json'),Buffer.from(tokens),false,true)).toMatchObject({tracked:true});
   });
 });
 

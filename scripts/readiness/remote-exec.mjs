@@ -567,10 +567,17 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
       const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
-      // R321/R323: a name-flagged file reached through a symlink (including the agent-memory
-      // bridge) never ships: the alias is not itself tracked-and-identical, so the run falls back.
-      // The source path's own flags count too: a flagged real directory behind the bridge prefix must not launder them away.
-      if(policy.excluded||classifyManifestPath(entry.sourcePath??entry.path).excluded||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
+      const sourcePath=entry.sourcePath??entry.path,sourcePolicy=classifyManifestPath(sourcePath);
+      // Preserve the established memory bridge's exact image of verified regular
+      // sources. Credential-named source entries already passed public-blob identity
+      // and content checks above. Nested links and other alias roots never qualify.
+      const verifiedMemory=link.linkPath.equals(Buffer.from('.claude/agent-memory'))
+        &&link.targetPath.equals(Buffer.from('agent-memory-src'))
+        &&entry.tracked&&!entry.sourcePath&&!entry.links?.length
+        &&policy.credentialSource&&sourcePolicy.credentialSource;
+      // Source flags still count: a credential-named real directory behind another
+      // bridge cannot launder them away, even when the alias suffix looks clean.
+      if(((policy.excluded||sourcePolicy.excluded)&&!verifiedMemory)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }

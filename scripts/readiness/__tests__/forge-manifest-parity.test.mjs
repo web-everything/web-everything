@@ -278,18 +278,48 @@ it.each(['other-src','vendor-src'])
     await expect(build()).rejects.toMatchObject({code:'unshipped-symlink',detail:'.claude/agent-memory'});
 });
 
-it.each(['x-tokens.md','id_rsa','secret.pem'])
-('memory bridge refuses name-flagged files in full and delta manifests: %s',async name=>{
+it('projects verified credential-named memory in full and delta manifests without reusing aliases',async()=>{
   await write('agent-memory-src/x-tokens.md','# Tokens\n');
-  if(name!=='x-tokens.md')await write('agent-memory-src/'+name,'private fixture');
+  await fs.mkdir(join(cwd,'.claude'));
+  await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));commit();
+  git(['update-ref','refs/remotes/origin/main','HEAD']);
+  const full=await buildManifest({cwd,env});
+  const warm={sha:git(['rev-parse','HEAD']).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
+  const delta=await buildDeltaManifest({cwd,env,base:warm});
+  expect(manifestWire(delta)).toEqual(manifestWire(full));
+  for(const manifest of [full,delta]){
+    expect(manifest.entries.find(entry=>entry.path.toString()==='.claude/agent-memory/x-tokens.md'))
+      .toMatchObject({sha256:sha('# Tokens\n'),tracked:false,sourcePath:Buffer.from('agent-memory-src/x-tokens.md')});
+  }
+  expect(delta.deltaPaths).toContainEqual(Buffer.from('.claude/agent-memory/x-tokens.md'));
+});
+
+it.each(['id_rsa','secret.pem'])
+('memory bridge refuses key files in full and delta manifests: %s',async name=>{
+  await write('agent-memory-src/x-tokens.md','# Tokens\n');
+  await write('agent-memory-src/'+name,'private fixture');
   await fs.mkdir(join(cwd,'.claude'));
   await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));commit();
   git(['update-ref','refs/remotes/origin/main','HEAD']);
   for(const delta of [false,true]) {
     const build=()=>delta?buildDeltaManifest({cwd,env,base}):buildManifest({cwd,env});
-    // R321/R323: a name-flagged file reached through the memory bridge never ships.
+    // Credential-only names may project; private-key exclusions never qualify.
     await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
   }
+});
+
+it.each(['nested link','other alias root','secret content'])
+('memory bridge exception still refuses %s in full and delta manifests',async fault=>{
+  const dir=fault==='nested link'?'other-src':'agent-memory-src';
+  await write(dir+'/token-note.md',fault==='secret content'?'ghp_abcdefghijklmnopqrstuvwxyz0123':'clean notes');
+  await write('agent-memory-src/MEMORY.md','# Memory\n');
+  await fs.mkdir(join(cwd,'.claude'));
+  await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));
+  if(fault==='nested link')await fs.symlink('../other-src',join(cwd,'agent-memory-src/nested'));
+  if(fault==='other alias root')await fs.symlink('agent-memory-src',join(cwd,'other-memory'));
+  commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+  for(const build of [()=>buildManifest({cwd,env}),()=>buildDeltaManifest({cwd,env,base})])
+    await expect(build()).rejects.toMatchObject({code:'unshipped-symlink'});
 });
 
 it.each(['untracked source','missing public blob','index differs from public','working bytes differ','deleted source'])

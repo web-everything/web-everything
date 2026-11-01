@@ -89,9 +89,10 @@ function excludedComponent(name, leaf, allowCredential = false) {
 // Ruling R321 (replaces the per-folder exceptions of R312/R316). A file whose
 // NAME alone trips credentialComponent ships to Forge only when ALL hold:
 //   1. it is git-tracked;
-//   2. its bytes equal origin/main and it is not a symlink nor reached through
-//      one (remote-exec compares the index blob to the origin/main blob, and
-//      the symlink/alias checks refuse the rest);
+//   2. it is a regular source whose bytes equal origin/main (remote-exec compares
+//      index/public blobs and hashes worktree bytes). Only the established
+//      .claude/agent-memory -> agent-memory-src bridge may project that verified
+//      source; credential-named aliases through other links are refused;
 //   3. it passes the content secret scan below.
 // Why this leaks nothing: a tracked file identical to origin/main is already
 // public, so shipping it to our own Forge reveals nothing new. Anything
