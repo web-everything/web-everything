@@ -39,8 +39,9 @@ function rejectionDetail(row) {
 }
 
 /** Identity of a proven tree and the dependencies of its full smoke. */
-export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon' }) {
-  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash, cloneKind }));
+export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon', envBinding }) {
+  // `envBinding` is omitted from the JSON when absent, so pre-existing per-clone keys are unchanged.
+  return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash, cloneKind, envBinding }));
 }
 
 /** Reuse policy and per-leaf provenance through the shared settings cascade. */
@@ -182,7 +183,7 @@ export function smokeHarnessHash(options) {
 
 /** Read the candidate's content identity and the RUNNING harness; failures cannot prove a tree.
  *  `sharedKey` drops `cloneKind` (the shareable checks are `cloneIndependent`); `key` keeps it. */
-export function smokePassIdentity(git, sha, cloneKind = 'daemon', { harnessHash = smokeHarnessHash(), nodeVersion = process.version } = {}) {
+export function smokePassIdentity(git, sha, cloneKind = 'daemon', { harnessHash = smokeHarnessHash(), nodeVersion = process.version, smokeEnv = null } = {}) {
   try {
     if (typeof harnessHash !== 'string' || !harnessHash || typeof nodeVersion !== 'string' || !nodeVersion) return null;
     const tree = verifyRev(git, `${sha}^{tree}`);
@@ -194,9 +195,15 @@ export function smokePassIdentity(git, sha, cloneKind = 'daemon', { harnessHash 
       if (listed.status !== 0 || String(listed.stdout ?? '').trim()) return null;
     }
     const lockHash = lock.status === 0 ? sha256(lock.stdout ?? '') : '';
-    const execution = { lockHash, nodeVersion, harnessHash };
-    const base = { tree, ...execution };
-    return { tree, key: smokePassKey({ ...base, cloneKind }), sharedKey: smokePassKey({ ...base, cloneKind: SMOKE_CHECKS.filter((c) => c.shareable).every((c) => c.cloneIndependent === true) ? '*' : cloneKind }),
+    // The dry-runs consume the live clone's pool root / dispatch root / origin (candidateSmokeEnv): a verdict or proof
+    // from another clone environment, or another daemon kind, is not evidence for this one. No env -> no binding
+    // possible -> no shared identity (the local `key` is per clone already).
+    const envBinding = smokeEnv ? sha256(JSON.stringify(['LANE_POOL_ROOT', 'LANE_POOL_CANONICAL_ORIGIN', 'WE_DISPATCH_CWD_ROOT', 'WE_SMOKE_LIVE_CLONE']
+      .map((k) => [k, String(smokeEnv[k] ?? '')]))) : null;
+    if (!envBinding) return { tree, key: smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind }), sharedKey: null, relevanceKey: null };
+    const execution = { lockHash, nodeVersion, harnessHash, cloneKind, envBinding };
+    const base = { tree, lockHash, nodeVersion, harnessHash, envBinding };
+    return { tree, key: smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind }), sharedKey: smokePassKey({ ...base, cloneKind: SMOKE_CHECKS.filter((c) => c.shareable).every((c) => c.cloneIndependent === true) ? '*' : cloneKind }),
       relevanceKey: sha256(JSON.stringify(execution)) };
   } catch {
     return null;
@@ -561,7 +568,7 @@ export async function smokeAndAdopt({
     // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
     const freshComparison = label != null;
     if (freshComparison) changedFiles = null;
-    const identity = smokePassIdentity(git, sha, cloneKind);
+    const identity = smokePassIdentity(git, sha, cloneKind, { smokeEnv });
     const passes = readRebuildState(root, stEnv).smokePassed;
     const localProof = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);

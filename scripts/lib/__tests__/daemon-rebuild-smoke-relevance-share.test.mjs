@@ -172,6 +172,7 @@ describe('Fork 2: the shared host store', () => {
   });
 });
 
+const SENV = { LANE_POOL_ROOT: '/pool-a', LANE_POOL_CANONICAL_ORIGIN: 'o', WE_DISPATCH_CWD_ROOT: '/d-a', WE_SMOKE_LIVE_CLONE: '/clone-a' };
 describe('identity and harness hash', () => {
   const git = (tree, lock = 'L') => (args) => {
     if (args[0] === 'rev-parse') return { status: 0, stdout: `${tree}\n` };
@@ -183,7 +184,7 @@ describe('identity and harness hash', () => {
     const env = { WE_DAEMON_STATE_DIR: mk() };
     const check = dryRun('dispatch-dry-run');
     const closureHash = checkClosureHash({ check, root });
-    const baseline = smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1', nodeVersion: 'v1' });
+    const baseline = smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1', nodeVersion: 'v1', smokeEnv: SENV });
     writeClosureProofs([{ name: check.name, ok: true, closureHash }], { identity: baseline, env });
     const options = { daemonEntries: ['skills-src/conveyor/verify-daemon.mjs'], changedFiles: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] };
     const before = await runLiveSmoke(opts(root, { ...options, relevanceProof: makeRelevanceProof({ identity: baseline, git: git('a'.repeat(40)), env }) }));
@@ -200,12 +201,12 @@ describe('identity and harness hash', () => {
     expect(child.mock.calls.some(([cmd, argv]) => cmd === 'node' && argv.includes('--input-type=module'))).toBe(true);
   });
   it('key parts: tree, lockfile, harness change the key; cloneKind changes both `key` and `sharedKey` while no check is cloneIndependent', () => {
-    const base = smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1' });
-    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1' }).sharedKey);
-    expect(base.key).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1' }).key);
-    expect(base.sharedKey).not.toBe(smokePassIdentity(git('b'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1' }).sharedKey);
-    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40), 'L2'), 'sha', 'drain', { harnessHash: 'h1' }).sharedKey);
-    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h2' }).sharedKey);
+    const base = smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1', smokeEnv: SENV });
+    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1', smokeEnv: SENV }).sharedKey);
+    expect(base.key).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'review', { harnessHash: 'h1', smokeEnv: SENV }).key);
+    expect(base.sharedKey).not.toBe(smokePassIdentity(git('b'.repeat(40)), 'sha', 'drain', { harnessHash: 'h1', smokeEnv: SENV }).sharedKey);
+    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40), 'L2'), 'sha', 'drain', { harnessHash: 'h1', smokeEnv: SENV }).sharedKey);
+    expect(base.sharedKey).not.toBe(smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: 'h2', smokeEnv: SENV }).sharedKey);
   });
   it('no harness hash means no identity (nothing is reused)', () => {
     expect(smokePassIdentity(git('a'.repeat(40)), 'sha', 'drain', { harnessHash: null })).toBeNull();
@@ -328,6 +329,21 @@ describe('audit findings (xfwf4zc)', () => {
     expect(proof(diff('', 1))).toBe(false);
     expect(proof(() => { throw new Error('git gone'); })).toBe(false);
     expect(proof(null)).toBe(false);
+  });
+  it('shared identity and relevance key bind daemon kind and the clone environment (pool root, dispatch root, origin, clone)', () => {
+    const g = (args) => (args[0] === 'rev-parse' ? { status: 0, stdout: `${'a'.repeat(40)}\n` } : args[0] === 'show' ? { status: 0, stdout: 'L' } : { status: 1, stdout: '' });
+    const id = (kind, smokeEnv) => smokePassIdentity(g, 'sha', kind, { harnessHash: 'h1', smokeEnv });
+    const base = id('drain', SENV);
+    expect(id('review', SENV).relevanceKey).not.toBe(base.relevanceKey);
+    for (const k of Object.keys(SENV)) {
+      const other = id('drain', { ...SENV, [k]: 'different' });
+      expect(other.sharedKey, k).not.toBe(base.sharedKey);
+      expect(other.relevanceKey, k).not.toBe(base.relevanceKey);
+    }
+    const none = id('drain', null);
+    expect(none.sharedKey).toBeNull();
+    expect(none.relevanceKey).toBeNull();
+    expect(none.key).toBe(base.key); // the local per-clone key is unchanged by the environment
   });
 });
 
