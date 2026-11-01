@@ -688,7 +688,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     const f = await overloadFixture({ overloaded: false, freeAtMs: null });
     const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
     const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
-    writeFileSync(marker, JSON.stringify({ v: 1, owner: 'dead', pid: Number(child.stdout.toString()), at: 1 }) + '\n');
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1 }) + '\n');
     const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
     // An earlier client already saw this exact marker's owner dead long ago (the persisted stamp).
     const st = statSync(marker);
@@ -701,7 +701,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
   it('never reaps a live client\'s marker while Forge is idle', async () => {
     const f = await overloadFixture({ overloaded: false, freeAtMs: null });
     const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
-    writeFileSync(marker, JSON.stringify({ v: 1, owner: 'live', pid: process.pid, at: 1 }) + '\n');
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: 1 }) + '\n');
     const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
     expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
     expect(existsSync(marker)).toBe(true);

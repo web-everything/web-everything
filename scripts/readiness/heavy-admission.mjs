@@ -806,7 +806,7 @@ export async function runWithRemoteDecision({
   let slot;
   let healthAt = waitAt;
   let reapedAt = -Infinity;
-  const markerReaper = createMarkerReaper({root:remoteRoot,clock,log});
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log});
   let overloadWaitLogged = false;
   try {
     for (;;) {
@@ -869,7 +869,7 @@ export async function runWithRemoteDecision({
     try {
       // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
       if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
-      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock()}),{flag:'wx',mode:0o600});
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
       // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
       // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
       if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}

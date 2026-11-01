@@ -17,8 +17,8 @@ const NAME = /^slot-(\d+)\.unconfirmed$/;
 const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
 
 /** New markers carry their owner pid so a later client can prove the owner is dead. */
-export function markerContent({owner, pid, nowMs}) {
-  return JSON.stringify({v: 1, note: 'remote termination unconfirmed', owner, pid, at: nowMs}) + '\n';
+export function markerContent({owner, pid, nowMs, host}) {
+  return JSON.stringify({v: 1, note: 'remote termination unconfirmed', host, owner, pid, at: nowMs}) + '\n';
 }
 
 /**
@@ -51,6 +51,10 @@ export function heldTombstone(root, index, readdir = readdirSync) {
   catch { return true; }
 }
 
+function markerHost(file) {
+  try { const marker = JSON.parse(readFileSync(file, 'utf8')); return typeof marker?.host === 'string' ? marker.host : undefined; } catch { return undefined; }
+}
+
 function ownerPid(root, index, file) {
   try {
     const marker = JSON.parse(readFileSync(file, 'utf8'));
@@ -67,7 +71,7 @@ function ownerPid(root, index, file) {
  * runs. Telemetry is only a count and cannot say WHICH marker's run is still going, so any active run keeps every
  * dead-owner marker (never guess by age). Leaked Forge receipts therefore keep markers, never the other way round.
  */
-export function createMarkerReaper({root, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
+export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
   const firstDead = new Map();
   const sidecar = file => file + '.dead';
@@ -107,6 +111,8 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
         const file = join(root, name);
         let mtimeMs, ino;
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
+        // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.
+        if (markerHost(file) !== host || host === undefined) continue;
         const pid = ownerPid(root, Number(m[1]), file);
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (liveness(pid, selfPid) !== 'dead') { forget(file, key); continue; }
