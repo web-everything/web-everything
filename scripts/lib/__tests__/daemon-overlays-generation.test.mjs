@@ -381,6 +381,24 @@ describe('overlay registration generations', () => {
     }
   });
 
+  it.each(['own-harmless-tip', 'harmless-duplicate-row-first'])('T11 running mechanism row still holds: %s', async (kind) => {
+    const f = gitFixture();
+    const replacement = f.add();
+    const mechanismRow = f.adopted.applied[0];
+    if (kind === 'own-harmless-tip') {
+      // The replacement refreshed to a tip with no mechanism change, then its branch went missing again.
+      f.seed(f.list().map(o => (o.ref === REF ? { ...o, tipSha: f.adopted.mainSha } : o)));
+    } else {
+      f.save({ ...f.adopted, applied: [{ ...mechanismRow, sha: f.adopted.mainSha }, mechanismRow] });
+    }
+    const result = await f.prepare();
+    expectNoBorrowedPin(result);
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'pinned-overlay-unbound',
+      detail: { ref: REF, registrationId: replacement.registrationId, sha: f.adopted.head, pinnedBy: 'mechanism' } } });
+    expect(result.alerts.map(a => a.kind)).not.toContain('overlay-fetch-unverifiable');
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'pinned-overlay-unbound', lastGood: f.adopted.head });
+  });
+
   it.each(['already-adopted', 'moved'])('T10 adopt CAS: %s strips replaced ids and preserves matching evidence', async (branch) => {
     const f = gitFixture();
     const kept = overlays.addOverlay(f.root, { ref: 'lane/kept' }, { env: f.env }).find(o => o.ref === 'lane/kept');

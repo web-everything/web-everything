@@ -384,19 +384,24 @@ export async function prepareRebuild({
         ? state.adopted.applied : null;
       const pinMain = state.adopted?.mainSha ?? fetchedMainSha;
       const adopted = adoptedRows ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
-      const unboundRow = adopted ? null : adoptedRows?.find((row) => row?.ref === raw.ref) ?? null;
+      // Every running row for this ref not bound to this registration (duplicates included): the replacement's
+      // own tip says nothing about what is RUNNING, so these rows are checked even when that tip is harmless.
+      const unboundRows = adoptedRows ? adoptedRows.filter((row) => row?.ref === raw.ref && row !== adopted) : [];
       const tipSha = adopted?.sha ?? validTipSha(raw);
       let reason = 'pinned-overlay-unavailable';
       let detailSha = tipSha ?? null;
-      let pin;
+      let pin = { pinned: false };
       if (tipSha || raw.pinned === true) pin = pinnedStatus(git, raw, pinMain, tipSha);
-      else if (!unboundRow) pin = { pinned: true, why: 'unknown' };
-      else {
+      else if (!unboundRows.length) pin = { pinned: true, why: 'unknown' };
+      for (const row of pin.pinned ? [] : unboundRows) {
         // Unparseable running evidence cannot prove the running content is harmless: fail closed.
-        pin = FULL_SHA_RE.test(unboundRow.sha ?? '') ? pinnedStatus(git, raw, pinMain, unboundRow.sha)
-          : { pinned: true, why: 'unknown' };
+        const rowSha = FULL_SHA_RE.test(row?.sha ?? '') ? row.sha : null;
+        const rowPin = rowSha ? pinnedStatus(git, raw, pinMain, rowSha) : { pinned: true, why: 'unknown' };
+        if (!rowPin.pinned) continue;
+        pin = rowPin;
         reason = 'pinned-overlay-unbound';
-        detailSha = FULL_SHA_RE.test(unboundRow.sha ?? '') ? unboundRow.sha : null;
+        detailSha = rowSha;
+        break;
       }
       // pinnedStatus runs Git; the list may be re-registered meanwhile. Never refuse for a replaced registration.
       if (!snapshotHolds()) return registrationChanged();
