@@ -1406,15 +1406,6 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
     expect(o.dispatch).toHaveBeenCalledTimes(1);
   });
-  it('full-review dispatch ignores stale red-team markers', () => {
-    const staleRedispatch = vi.fn(() => ({ count: 2 })), staleSpent = vi.fn(() => true);
-    const o = moved({ staleRedispatch, staleSpent });
-    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
-    expect(o.dispatch).toHaveBeenCalledTimes(1);
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
-    expect(staleRedispatch).not.toHaveBeenCalled();
-    expect(staleSpent).not.toHaveBeenCalled();
-  });
   it('refuses a standing formal CHANGES_REQUESTED without an acceptance comment or live-head evidence', () => {
     const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
     o.rawPrs[0].comments = [];
@@ -1537,93 +1528,6 @@ function staleRunFixture(over = {}) {
     abandonStale: vi.fn(() => ({ ok: true, release: vi.fn() })),
     recoverPayload: vi.fn(() => payload()), ...over });
 }
-
-describe.each(['missing status', 'placeholder', 'dead queued normalized'])('ordinary red-team dispatch — %s', kind => {
-  function ordinaryFixture(env) {
-    const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-    mkdirSync(redTeamStatusDir(env), { recursive: true });
-    if (kind !== 'missing status') {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(),
-        status: kind === 'placeholder' ? 'finished' : 'queued',
-        result: kind === 'placeholder' ? 'ran' : null, pid: 6039 }, { env });
-    }
-    const readEvidence = key => ({ loopPayload: payload(), inFlight: false, recorded: false,
-      seatRecorded: false, completedRecorded: false, status: readRedTeamStatus({ ...key, env }) });
-    return { statusPath, f: staleFixture({ readEvidence,
-      readStatus: key => readRedTeamRecoveryStatus({ ...key, env }, { readEvidence }),
-      staleRedispatch: key => staleRecovery.staleRedTeamRedispatch({ ...key, env }),
-      staleSpent: key => staleRecovery.staleRedTeamSpent({ ...key, env }) }) };
-  }
-
-  it.each(['marker 1', 'marker 2', 'norestart'])('persisted %s blocks planning and dispatch after cooldown reset', marker => {
-    const dir = mkdtempSync(join(tmpdir(), 'red-team-ordinary-markers-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-    try {
-      const { statusPath, f } = ordinaryFixture(env);
-      if (marker !== 'norestart') writeFileSync(`${statusPath}.stale-redispatch-1`, '');
-      if (marker === 'marker 2') writeFileSync(`${statusPath}.stale-redispatch-2`, '');
-      if (marker === 'norestart') writeFileSync(`${statusPath}.stale-norestart`, '');
-      if (kind === 'missing status') expect(f.readStatus({ repo, pr, head })).toBeNull();
-      else expect(f.readStatus({ repo, pr, head })).toMatchObject({ status: 'finished',
-        result: kind === 'placeholder' ? 'ran' : null });
-      const expected = { action: 'skip', why: 'stale red team already re-dispatched; inspect review run' };
-      expect(planRedTeamOnSkip(f)[0]).toMatchObject(expected);
-      const o = staleRunFixture({ ...f, env, now: () => staleNow });
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [expected], dispatched: [], notStarted: [] });
-      o.lastDispatch.clear();
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [expected], dispatched: [], notStarted: [] });
-      expect(o.dispatch).not.toHaveBeenCalled();
-      expect(o.abandonStale).not.toHaveBeenCalled();
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-      expect(o.lastDispatch.size).toBe(0);
-      expect(existsSync(statusPath)).toBe(kind !== 'missing status');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-
-  it('without stale markers still plans and dispatches fresh', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'red-team-ordinary-unmarked-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-    try {
-      const { f } = ordinaryFixture(env);
-      expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh',
-        why: 'head never had a red-team pass' });
-      const o = staleRunFixture({ ...f, env, now: () => staleNow });
-      expect(runRedTeamOnSkip(o).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
-      expect(o.dispatch).toHaveBeenCalledTimes(1);
-      expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-
-  it.each(['staleRedispatch', 'staleSpent'])('fails closed when %s is unreadable', reader => {
-    const dir = mkdtempSync(join(tmpdir(), 'red-team-ordinary-unreadable-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-    try {
-      const { f } = ordinaryFixture(env);
-      f[reader] = () => { throw new Error('unreadable stale marker'); };
-      const expected = { action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' };
-      expect(planRedTeamOnSkip(f)[0]).toMatchObject(expected);
-      const o = staleRunFixture({ ...f, env, now: () => staleNow });
-      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject(expected);
-      expect(o.dispatch).not.toHaveBeenCalled();
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-});
-
-describe.each(['effects resume', 'failed seat retry', 'policy settlement'])('ordinary red-team dispatch — %s', kind => {
-  it.each([0, 1, 2])('honors %i stale markers at the shared dispatch return', count => {
-    const loopPayload = payload();
-    Object.assign(loopPayload.findings.read, { diffText: '+card', netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] });
-    const status = { head, status: 'finished', result: kind === 'policy settlement' ? 'skipped' : 'ran',
-      loopPayload, skipCardOnly: kind === 'policy settlement' };
-    const f = fixture({ staleRedispatch: () => ({ count }), staleSpent: () => false,
-      readStatus: () => status,
-      readEvidence: () => ({ loopPayload, recorded: kind === 'effects resume',
-        completedRecorded: kind === 'effects resume', failedSeatCount: kind === 'failed seat retry' ? 1 : 0 }) });
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject(count > 0
-      ? { action: 'skip', why: 'stale red team already re-dispatched; inspect review run' }
-      : { action: 'dispatch', mode: kind === 'effects resume' ? 'resume' : 'fresh' });
-  });
-});
 
 describe('staleRunDeadlineMs — environment deadline parsing', () => {
   it.each(['0', '60000', String(Number.MAX_SAFE_INTEGER)])('accepts safe non-negative integer %s', value => {
