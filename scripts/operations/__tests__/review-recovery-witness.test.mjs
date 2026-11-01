@@ -69,6 +69,38 @@ function fixture({ status = 'running', foreign = false, seats = [], ageMs } = {}
   return { dir, env, key, path, run, seats, probe, readWitness, decide, abandon, io, admit };
 }
 
+it.each([null, undefined].flatMap(result => [undefined, 0].map(retryCount => ({ result, retryCount }))))(
+  'dead running writer with one failed seat recovers its one retry (result=$result, retryCount=$retryCount)', ({ result, retryCount }) => {
+    const f = fixture({ seats: [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }] });
+    const raw = { ...f.readWitness().rawWriter.parsed, result, retryCount };
+    writeFileSync(f.path, JSON.stringify(raw));
+    expect(f.decide()).toMatchObject({ mode: 'fresh', retry: true, abandon: true,
+      executionPrior: { status: 'finished', result: 'failed' } });
+    expect(f.readWitness().rawWriter.parsed.status).toBe('running');
+    expect(f.abandon().ok).toBe(true);
+    expect(f.admit().redTeamAdmission).toMatchObject({ prior: { status: 'finished', result: 'failed' },
+      queued: { status: 'queued', retryCount: 1 } });
+    expect(f.decide().mode).toBe('skip');
+  },
+);
+
+it.each([
+  { name: 'retry spent', retryCount: 1, failedSeatCount: 1, result: null },
+  { name: 'two failed seats', failedSeatCount: 2, result: null },
+  { name: 'comment posted', failedSeatCount: 1, result: { status: 'failed', comment: { status: 'posted' } } },
+])('dead running writer still refuses with $name', ({ retryCount, failedSeatCount, result }) => {
+  const f = fixture({ seats: Array.from({ length: failedSeatCount }, () =>
+    ({ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' })) });
+  writeFileSync(f.path, JSON.stringify({ ...f.readWitness().rawWriter.parsed, retryCount, result }));
+  expect(f.decide()).toMatchObject({ mode: 'skip', why: 'prior pass cannot restart' });
+  expect(f.abandon().ok).toBe(false);
+});
+
+it('dead running writer with no seat keeps fresh recovery without a retry', () => {
+  const f = fixture();
+  expect(f.decide()).toMatchObject({ mode: 'fresh', retry: false, executionPrior: null, abandon: true });
+});
+
 it('default recovery witness reads the writer run store when OPERATION_RUNS_DIR overrides the shared store', () => {
   const f = fixture({ status: 'queued' });
   const canonical = join(f.dir, 'canonical', 'runs');

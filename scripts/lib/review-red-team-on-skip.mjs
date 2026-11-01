@@ -70,8 +70,15 @@ export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
   if (marker && active && !raw?.staleAbandoned && !pendingAbandonment(w)) return reject('stale re-dispatch already spent');
   const completed = w.seats.some(completedRedTeamSeat);
   const resumable = ['ran', 'resumed'].includes(normalizeRedTeamResult(raw?.result).priorResult);
-  if (active && dead) executionPrior = completed || resumable ? { ...raw, status: 'finished', result: resumable ? raw.result : 'ran' } : null;
-  const retry = failedRedTeamRetry(executionPrior, { failedSeatCount: w.seats.filter(r => !completedRedTeamSeat(r)).length, completedRecorded: completed });
+  const failedSeatCount = w.seats.filter(r => !completedRedTeamSeat(r)).length;
+  if (active && dead) {
+    // A crash after the failed seat append can precede the finished/failed status write.
+    const interruptedFailure = failedSeatCount === 1 && raw.result == null
+      && (raw.retryCount === undefined || raw.retryCount === 0);
+    executionPrior = completed || resumable ? { ...raw, status: 'finished', result: resumable ? raw.result : 'ran' }
+      : interruptedFailure ? { ...raw, status: 'finished', result: 'failed' } : null;
+  }
+  const retry = failedRedTeamRetry(executionPrior, { failedSeatCount, completedRecorded: completed });
   const priorResult = normalizeRedTeamResult(executionPrior?.result).priorResult;
   const mode = completed ? 'resume' : 'fresh';
   if (mode === 'resume' && (executionPrior?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult)
