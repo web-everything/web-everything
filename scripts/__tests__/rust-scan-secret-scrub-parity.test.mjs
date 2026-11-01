@@ -18,6 +18,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { pemHeader, ghTokenDigits, awsDigits } from './fixtures/sample-strings.mjs';
 import { scanPublishSecrets } from '../check-standards-rules.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -70,8 +71,8 @@ describe.skipIf(!hasCargo)('we-scan secret-scrub — cross-language parity with 
     mkdirSync(memory, { recursive: true });
 
     const files = {
-      'backlog/001-pem.md': 'Found a leaked key: -----BEGIN RSA PRIVATE KEY-----\n',
-      'backlog/002-ghtoken.md': 'Rotate this: ghp_1234567890ABCDEFabcdef1234567890AB\n',
+      'backlog/001-pem.md': `Found a leaked key: ${pemHeader()}\n`,
+      'backlog/002-ghtoken.md': `Rotate this: ${ghTokenDigits()}\n`,
       'backlog/003-labeled-quoted.md': 'password: "hunter2Trombone"\n',
       // Mismatched quote — must NOT flag (the manual \1 replication, the whole point of this fixture).
       'backlog/004-labeled-mismatched-quote.md': "password: \"hunter2Trombone'\n",
@@ -83,7 +84,7 @@ describe.skipIf(!hasCargo)('we-scan secret-scrub — cross-language parity with 
       'backlog/010-ipv6.md': 'Address: 2001:0db8:85a3:0000:8a2e\n',
       'backlog/011-git-sha-passes.md': 'commit 2acf9e283e0eb72837964d9c58d049789a19dde3 landed\n',
       'backlog/012-hyphen-prose-passes.md': 'the UTF-16-code-unit boundary and JS-first-vs-CSS-first debate\n',
-      'agent-memory-src/mem-001.md': 'AWS key AKIA1234567890ABCDEF leaked in logs.\n',
+      'agent-memory-src/mem-001.md': `AWS key ${awsDigits()} leaked in logs.\n`,
     };
     for (const [rel, content] of Object.entries(files)) writeFileSync(join(dir, rel), content);
 
