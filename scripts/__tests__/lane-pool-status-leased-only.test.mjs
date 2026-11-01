@@ -48,7 +48,7 @@ function git(args, cwd) {
 function runPool(args, extraEnv = {}) {
   // LANE_POOL_ROOT MUST be this test's private tmp dir — without it every command falls back to the real
   // default pool root (~/workspace/.lanes), colliding with the LIVE pool this very task runs under.
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv } });
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_STATUS_MAX_AGE_MS: '0', ...extraEnv } });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -113,7 +113,7 @@ describe('status --leased-only (#4345)', () => {
 
     // Match the existing spawn observer: count pool-lane probes, excluding repo discovery at startup.
     const laneSpawns = () => readFileSync(spawnLog, 'utf8').split('\n').filter((line) => line.startsWith(join(poolRoot, 'leasedonly') + '/'));
-    const env = { PATH: `${shimDir}:${process.env.PATH}`, WE_LANE_STATUS_MAX_AGE_MS: '' };
+    const env = { PATH: `${shimDir}:${process.env.PATH}`, WE_LANE_STATUS_MAX_AGE_MS: '0' };
     for (const extra of [[], ['--max-age-ms=60000']]) {
       writeFileSync(spawnLog, '');
       const result = runPool(['status', ...poolArgs(), '--json', '--lane=3', ...extra], env);
