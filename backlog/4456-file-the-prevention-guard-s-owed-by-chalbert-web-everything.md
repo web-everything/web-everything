@@ -39,6 +39,7 @@ The changed default is that previously tolerated `workItem` now fails standards 
 1. Reject authored `workItem` for legacy-only and mixed-field cards, including empty/null/false values and resolved cards, with an actionable named error.
 2. Call the rule from the real standards gate before scope filtering; preserve canonical-kind and malformed-YAML failures; report an unreadable card as a named finding (blocking in full mode, a printed note for an unselected card under `--local`) instead of skipping it or crashing.
 3. Remove the known redundant corpus field and add isolated pure and real-gate regression fixtures. Test-design constraint (not a runtime guarantee): fixtures live only in disposable checkouts, and A4 reads the production card without writing it.
+4. Planned check-standards regression: `unreadable card fails closed in full and local gates` in we:scripts/__tests__/check-standards-backlog-schema.test.mjs (A5) covers a directory named as a card (EISDIR) and a dangling symlink (ENOENT). Each unreadable card must fail the full gate with a named diagnostic; when unselected under `--local`, it must produce a named note.
 
 ## Acceptance
 
