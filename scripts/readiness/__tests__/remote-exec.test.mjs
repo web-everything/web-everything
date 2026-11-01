@@ -19,6 +19,8 @@ import {materializeWorktree} from '../forge-exec-bases.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
 import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 import {scanDiffBranchCoverage} from '../../lib/diff-branch-coverage.mjs';
+import {scanScope} from '../../lib/repo-scan-tests.mjs';
+import {findUnboundedExecReads} from '../../lib/exec-output-guard.mjs';
 
 vi.mock('../forge-telemetry.mjs', async importOriginal => {
   const actual=await importOriginal();
@@ -514,7 +516,7 @@ describe('isAllowedCommand', () => {
   });
 
   it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
-    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
+    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']).filter(arg => arg !== '--passWithNoTests'))
   ('rejects arguments outside the allowlist: %s on both sides before transport', async arg => {
     const command = ['npm','run','test:unit','--','a.test.mjs',arg];
     expect(isAllowedCommand(command)).toBe(false);
@@ -772,6 +774,30 @@ describe('standards input parity', () => {
 });
 
 describe('filterEnv', () => {
+  it.each([
+    ['scripts/readiness/remote-exec.mjs', ['scripts/readiness/remote-exec.mjs']],
+    ['scripts/a.mjs,src/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['scripts/a.mjs\nsrc/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['scripts/a.mjs,src/b.ts\nREADME.md', ['scripts/a.mjs', 'src/b.ts', 'README.md']],
+    ['[ "scripts/a.mjs", "src/b.ts" ]', ['scripts/a.mjs', 'src/b.ts']],
+    ['["\\u0073cripts/a.mjs"]', ['scripts/a.mjs']],
+    ['[]', []],
+  ])('normalizes accepted scan list %j for the actual scanner', (value, paths) => {
+    const input = {VERIFY_SCAN_FILES:value};
+    const env = filterEnv(input);
+    expect([...scanScope(env)]).toEqual(paths);
+    expect(env.VERIFY_SCAN_FILES).toBe(JSON.stringify(paths));
+    expect(forgeManifestAPI.allowedEnv(env)).toBe(true);
+    expect(filterEnv(env)).toEqual(env);
+    expect(input.VERIFY_SCAN_FILES).toBe(value);
+  });
+  it('forwards a valid VERIFY_SCAN_FILES and refuses an unsafe one with a local fallback reason (R309)', () => {
+    const value = '["scripts/a.mjs","src/b.ts"]';
+    expect(filterEnv({VERIFY_SCAN_FILES:value, OTHER:'x'})).toEqual({VERIFY_SCAN_FILES:value});
+    for (const bad of ['/etc/passwd', '../x', 'a;rm', 'a,,b', 'a\r\nb', 'a\u2028b', '\uff41', 'a\u200bb', '["a",1]',
+      Array(1024).fill('a'.repeat(62)).join(','), Array(4097).fill('a').join(',')])
+      expect(() => filterEnv({VERIFY_SCAN_FILES:bad})).toThrow('Invalid VERIFY_SCAN_FILES: use local fallback');
+  });
   it.each(['HEAD', 'origin/main', 'refs/heads/fix.v1', 'a'.repeat(40)])('accepts safe coverage base %s for local commit resolution', base => {
     const env = filterEnv({DIFF_COVERAGE_BASE:base});
     expect(env).toEqual({DIFF_COVERAGE_BASE:base});
@@ -1060,6 +1086,58 @@ describe('runRemote', () => {
     });
     expect(result).toEqual({handled:false});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each([
+    ['scripts/.private-helper.mjs', 'listed'],
+    ['scripts/.private/helper.mjs', 'listed'],
+    ['scripts/ignored-helper.mjs', 'ignored'],
+    ['scripts/missing-helper.mjs', 'missing'],
+  ])('keeps a scoped scan local when its source is absent from the manifest: %s (%s)', async (name, kind) => {
+    const f = fixture();
+    const files = ['package-lock.json', 'a.test.mjs'];
+    mkdirSync(join(cwd, ...name.split('/').slice(0, -1)), {recursive:true});
+    if (kind !== 'missing') writeFileSync(join(cwd, name), "execFileSync('gh', ['api'], {encoding:'utf8'});");
+    if (kind === 'listed') files.push(name);
+    const transport = f.exec;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'git' && call.args.includes('-i') && kind === 'ignored')
+        return {code:0, stdout:Buffer.from(name + '\0')};
+      if (call.file === 'git' && call.args.includes('--stage')) return {code:0, stdout:Buffer.from(files.map(path => {
+        const content = readFileSync(join(cwd, path));
+        const oid = createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
+        return `100644 ${oid} 0\t${path}`;
+      }).join('\0') + '\0')};
+      return transport(call);
+    });
+    f.listFiles.mockResolvedValue(files);
+    f.argv = ['npx', 'vitest', 'run', 'scripts/lib/__tests__/exec-output-guard.test.mjs'];
+    // Include a shipped file too: partial scope coverage must still refuse.
+    f.env.VERIFY_SCAN_FILES = JSON.stringify(['a.test.mjs', name]);
+    const manifest = await remoteManifestAPI.buildManifest(f);
+    expect(manifest.entries.some(entry => entry.path.equals(Buffer.from(name)))).toBe(false);
+    if (kind !== 'missing') {
+      expect(findUnboundedExecReads(readFileSync(join(cwd, name), 'utf8'))).toHaveLength(1);
+    }
+    expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'unshipped-scan-file', detail:name});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    const log = vi.fn();
+    expect(await runWithRemoteDecision({
+      argv:f.argv, cwd, env:f.env, lockRoot:f.lockRoot, log, loadPerCore:() => 0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
+      remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
+    })).toEqual({handled:false});
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unshipped-scan-file'));
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each(['[]', '["a.test.mjs"]', 'a.test.mjs', 'a.test.mjs,package-lock.json'])
+  ('forwards a fully shipped or empty scan scope without widening it: %s', async value => {
+    const f = fixture();
+    f.env.VERIFY_SCAN_FILES = value;
+    expect(await runRemote(f)).toMatchObject({mode:'remote', code:0});
+    const request = JSON.parse(callsOf(f.exec).find(isRun).input);
+    expect(request.env.VERIFY_SCAN_FILES).toBe(filterEnv({VERIFY_SCAN_FILES:value}).VERIFY_SCAN_FILES);
   });
 
   it('never transmits unlisted children when a validated file becomes a directory during prepare', async () => {
