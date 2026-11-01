@@ -67,6 +67,7 @@ describe('git-bounded', () => {
     const cmd = boundedGitCommand([], 1000);
     const res = spawnSync(process.execPath, [cmd.args[0], '--timeout-ms=1000', '--', 'sh', '-c', script], { encoding: 'utf8' });
     expect(res.status).toBe(124);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800); // the reaper fires 300ms after the leader exits
     const pid = Number(readFileSync(marker, 'utf8').trim());
     let alive = true;
     try { process.kill(pid, 0); } catch { alive = false; }
@@ -125,4 +126,20 @@ it('refuses a reference whose .git/objects is a symlink into a lane', () => {
   const ref = join(root, 'ref'); mkdirSync(join(ref, '.git'), { recursive: true });
   symlinkSync(join(victim, '.git', 'objects'), join(ref, '.git', 'objects'));
   expect(ensureLaneAlternates({ laneDir: lane, referencePath: ref }).status).toBe('skipped');
+});
+
+describe('git-bounded survives a SIGKILL of its supervisor', () => {
+  it('kills the grandchild group when the supervisor itself is killed', async () => {
+    const marker = join(root, 'gc2.pid');
+    const cmd = boundedGitCommand([], 60000);
+    const { spawn } = await import('node:child_process');
+    const sup = spawn(process.execPath, [cmd.args[0], '--timeout-ms=60000', '--', 'sh', '-c', `sleep 300 & echo $! > ${marker}; wait`], { stdio: 'ignore' });
+    for (let i = 0; i < 50 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 100));
+    const pid = Number(readFileSync(marker, 'utf8').trim());
+    process.kill(sup.pid, 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 2500));
+    let alive = true;
+    try { process.kill(pid, 0); } catch { alive = false; }
+    expect(alive).toBe(false);
+  });
 });

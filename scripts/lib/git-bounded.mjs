@@ -24,7 +24,12 @@ export function killGroup(pid, signal = 'SIGKILL') {
   try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* already gone */ } }
 }
 
-function main(argv) {
+/**
+ * Two levels, so that NO single kill orphans git: the supervisor (this process, in the caller's group) starts a LEADER in a
+ * new process group; the leader runs git in that group and kills the whole group when its own parent (the supervisor)
+ * disappears, on timeout, or on a stop signal. The supervisor forwards timeout/stop to the leader and watches ITS parent.
+ */
+function parse(argv) {
   const sep = argv.indexOf('--');
   const timeoutArg = argv.slice(0, sep < 0 ? argv.length : sep).find((a) => a.startsWith('--timeout-ms='));
   const timeoutMs = Number(timeoutArg?.slice('--timeout-ms='.length));
@@ -33,20 +38,39 @@ function main(argv) {
     process.stderr.write('usage: git-bounded.mjs --timeout-ms=N -- git <args…>\n');
     process.exit(2);
   }
-  const child = spawn(cmd[0], cmd.slice(1), { stdio: ['ignore', 'inherit', 'inherit'], detached: true });
-  const startPpid = process.ppid;
-  let timedOut = false;
-  const stop = (code) => { killGroup(child.pid); process.exit(code); };
-  const timer = setTimeout(() => { timedOut = true; process.stderr.write(`git-bounded: timed out after ${timeoutMs}ms; killing process group\n`); stop(124); }, timeoutMs);
-  const watch = setInterval(() => { if (process.ppid !== startPpid) stop(143); }, 2_000);
+  return { timeoutMs, cmd };
+}
+
+function leader(argv) {
+  const { timeoutMs, cmd } = parse(argv);
+  const parentPid = process.ppid;
+  const child = spawn(cmd[0], cmd.slice(1), { stdio: ['ignore', 'inherit', 'inherit'] }); // same group as this leader
+  // The leader is in the group it must kill: a detached reaper kills the group a moment after the leader has exited with
+  // its real status, so the supervisor still reads a meaningful code.
+  const reapGroup = () => spawn('sh', ['-c', `sleep 0.3; kill -9 -- -${process.pid} 2>/dev/null`], { detached: true, stdio: 'ignore' }).unref();
+  const stop = (code) => { reapGroup(); process.exit(code); };
+  setTimeout(() => { process.stderr.write(`git-bounded: timed out after ${timeoutMs}ms; killing process group\n`); stop(124); }, timeoutMs);
+  setInterval(() => { if (process.ppid !== parentPid) stop(143); }, 1_000);
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => stop(143));
   child.on('error', (e) => { process.stderr.write(`git-bounded: ${e.message}\n`); stop(127); });
   child.on('exit', (code, signal) => {
-    clearTimeout(timer); clearInterval(watch);
-    // Reap any grandchild the finished command left behind in its group.
-    if (!timedOut) killGroup(child.pid);
+    // Reap any descendant the finished command left in the group, then report its status.
+    reapGroup();
     process.exit(code ?? (signal ? 128 : 1));
   });
+}
+
+function main(argv) {
+  if (argv[0] === '--leader') return leader(argv.slice(1));
+  const { timeoutMs, cmd } = parse(argv);
+  const startPpid = process.ppid;
+  const lead = spawn(process.execPath, [fileURLToPath(import.meta.url), '--leader', `--timeout-ms=${timeoutMs}`, '--', ...cmd],
+    { stdio: ['ignore', 'inherit', 'inherit'], detached: true });
+  const stop = (code) => { killGroup(lead.pid); process.exit(code); };
+  setInterval(() => { if (process.ppid !== startPpid) stop(143); }, 1_000);
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => stop(143));
+  lead.on('error', (e) => { process.stderr.write(`git-bounded: ${e.message}\n`); stop(127); });
+  lead.on('exit', (code, signal) => process.exit(code ?? (signal ? 128 : 1)));
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main(process.argv.slice(2));
