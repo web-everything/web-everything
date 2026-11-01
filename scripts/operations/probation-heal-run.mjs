@@ -54,6 +54,7 @@ import { withCompletionLock, newCompletionRecord, applyCompletionUpdate, writeCo
 import { releaseFixDispatchClaim } from '../conveyor/fix-dispatch-claim.mjs';
 import { buildCiHealComment, handBackCiHealReview, redactSecrets } from '../conveyor/ci-heal-mark.mjs';
 import { recordOwedWrite, clearOwedWrite, owedWriteAlreadyLive, postPrComment } from '../conveyor/ci-heal-owed.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60_000;
 /** The slowest honest attempt: lane acquire (15m) + gate (20m) + worker (70m) + a margin. Past it no liveness probe is trusted. */
@@ -491,7 +492,7 @@ export function realIo({ session, env = process.env, run = trySh } = {}) {
       return { state: 'unknown', reason: r.out.trim() || 'remote probe did not establish presence or absence' };
     },
     rebaseOntoMain: (dir) => {
-      if (!trySh('git', ['-C', dir, 'fetch', 'origin', 'main'], { env: laneEnv }).ok) return false;
+      try { fetchFresh({ cwd: dir, branches: ['main'], maxAgeMs: 0, run: (args) => sh('git', ['-C', dir, ...args], { env: laneEnv }) }); } catch { return false; }
       if (trySh('git', ['-C', dir, 'rebase', 'origin/main'], { env: laneEnv }).ok) return true;
       trySh('git', ['-C', dir, 'rebase', '--abort'], { env: laneEnv });
       return false;
