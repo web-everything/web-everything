@@ -565,7 +565,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
       // R321/R323: a name-flagged file reached through a symlink (including the agent-memory
       // bridge) never ships: the alias is not itself tracked-and-identical, so the run falls back.
-      if(policy.excluded||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
+      // The source path's own flags count too: a flagged real directory behind the bridge prefix must not launder them away.
+      if(policy.excluded||classifyManifestPath(entry.sourcePath??entry.path).excluded||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }

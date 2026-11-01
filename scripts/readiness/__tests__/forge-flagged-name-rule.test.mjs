@@ -124,6 +124,11 @@ describe('credential-name rule (R321)',()=>{
     await write('agent-memory-src/token-note.md','ghp_abcdefghijklmnopqrstuvwxyz0123');await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('agent-memory-src/token-note.md')});
   });
+  it('refuses a bridge alias whose real source directory is name-flagged (token-src)',async()=>{
+    await write('token-src/note.md','clean notes');await fs.mkdir(join(cwd,'.claude'),{recursive:true});
+    await fs.symlink('../token-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
+  });
   it('scans non-JSON content with the raw secret patterns',()=>{
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('AKIAABCDEFGHIJKLMNOP'))).toBe('aws-access-key');
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('plain text'))).toBe(null);
