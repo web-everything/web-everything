@@ -81,9 +81,19 @@ describe('real Git retirement evidence', () => {
     const needed = commit('needed', 'unmerged replacement');
     register([{ ...old, sha: needed }]);
     addOverlay(root, { ref: 'feature' }, { env });
-    const replacement = readOverlayState(root, { env }).overlays[0];
-    expect(replacement.tipSha).toBeUndefined();
+    const fresh = readOverlayState(root, { env }).overlays[0];
+    // The old registration's tips (refreshed `initial`, legacy `sha`) never carry into the replacement.
+    for (const field of ['tipSha', 'sha', 'headSha']) expect(fresh).not.toHaveProperty(field);
     expect(persistTipShas(root, refreshedTips, { env })).toEqual({ written: 0 });
+    // The replacement's own refresh records its own tip; that, not inherited evidence, classifies it.
+    track('feature', needed);
+    let ownTips;
+    await autoRetireOverlays({ root, env: { ...env, WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow' },
+      overlays: [fresh], git, refEvidence: new Map([['feature', 'refreshed']]),
+      persistTipShas: (_root, tips) => { ownTips = tips; } });
+    expect(persistTipShas(root, ownTips, { env })).toEqual({ written: 1 });
+    const replacement = readOverlayState(root, { env }).overlays[0];
+    expect(replacement).toEqual({ ...fresh, tipSha: needed });
     ok('update-ref', '-d', 'refs/remotes/origin/feature');
     const result = await autoRetireOverlays({ root, env, overlays: [replacement], git,
       refEvidence: new Map([['feature', 'missing']]) });

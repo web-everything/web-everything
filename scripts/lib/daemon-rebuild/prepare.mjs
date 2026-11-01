@@ -373,13 +373,21 @@ export async function prepareRebuild({
       if (!snapshotHolds()) return registrationChanged();
       // Fetch cleanup may have deleted the tracking ref, and rebuild state may have been lost. Adopted
       // inputs (bound to this registration) or a recorded full tip identify pins only, never fresh
-      // build/retirement inputs. Without either, pin status is unknown: refuse rather than silently
-      // dropping a possible mechanism overlay.
-      const adopted = state.adopted?.head === prevHead
-        ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
+      // build/retirement inputs. When the running build's adopted record carries a row for this ref that is
+      // NOT bound to this registration (a re-registered overlay, or an unprovable legacy row), that row is
+      // another registration's evidence: this registration inherits no pin from it. With no row at all, or
+      // lost/mismatched rebuild state, the pin is unknown: refuse rather than silently dropping a possible
+      // mechanism overlay.
+      const adoptedRows = state.adopted?.head === prevHead && Array.isArray(state.adopted?.applied)
+        ? state.adopted.applied : null;
+      const adopted = adoptedRows ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
+      const unboundRow = !adopted && !!adoptedRows?.some((row) => row?.ref === raw.ref);
       const tipSha = adopted?.sha ?? validTipSha(raw);
-      const pin = !tipSha && raw.pinned !== true ? { pinned: true, why: 'unknown' }
-        : pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, tipSha);
+      const pin = tipSha || raw.pinned === true
+        ? pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, tipSha)
+        : unboundRow ? { pinned: false } : { pinned: true, why: 'unknown' };
+      // pinnedStatus runs Git; the list may be re-registered meanwhile. Never refuse for a replaced registration.
+      if (!snapshotHolds()) return registrationChanged();
       if (!pin.pinned) continue;
       unavailablePinned = {
         ok: false, reason: 'pinned-overlay-unavailable',
@@ -389,6 +397,7 @@ export async function prepareRebuild({
       break;
     }
   }
+  if (!snapshotHolds()) return registrationChanged();
   if (!mainOnly && unverified.length && !unavailablePinned) {
     const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
     alert('overlay-fetch-unverifiable', detail);
@@ -415,6 +424,8 @@ export async function prepareRebuild({
   // not merely a registered ref. Each retry adds a previously absent source; no-progress refuses the build.
   for (;;) {
     chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
+    // The refusal names a registration; sidecar pruning and status reads ran Git since it was built.
+    if (unavailablePinned && !snapshotHolds()) return registrationChanged();
     plan = unavailablePinned ?? await planRebuild({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
       entries: runtimeEntries, env, closureScopeMode,
