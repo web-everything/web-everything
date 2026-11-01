@@ -148,7 +148,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
         if (line.startsWith('- ')) matched.add(line.slice(2).trim());
       }
       return ahead.filter(sha => !matched.has(sha)
-        && !git(dir, ['for-each-ref', '--contains', sha, 'refs/remotes/origin', '--count=1']));
+        && !git(dir, ['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', sha, 'refs/remotes/origin', '--count=1']));
     },
     push: (dir, ref, sha) => {
       transportGit(dir, 'push', '--recurse-submodules=no', origin, `${sha}:refs/heads/${ref}`);

@@ -512,7 +512,7 @@ describe('real salvage preservation and transport', () => {
     expect(runGit.mock.calls.filter(([, args]) => args.includes('cherry')).map(([, args]) => args))
       .toEqual([['cherry', 'origin/main', 'HEAD']]);
     expect(runGit.mock.calls.filter(([, args]) => args.includes('for-each-ref')).map(([, args]) => args))
-      .toEqual([['for-each-ref', '--contains', older, 'refs/remotes/origin', '--count=1']]);
+      .toEqual([['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', older, 'refs/remotes/origin', '--count=1']]);
   });
 
   it('returns matched without pushing when the exact SHAs are reachable from remote branches', async () => {
@@ -547,3 +547,4 @@ describe('real salvage preservation and transport', () => {
     expect(runGit).not.toHaveBeenCalled();
   });
 });
+
