@@ -129,8 +129,8 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     if (preflightError) throw preflightError;
     checkTransportConfig(dir);
     // A fetch into a lane without alternates re-downloads the repository; repair them first (best effort, add-only).
-    if (command === 'fetch' && (repo.alternatesReferencePath || repo.referencePath)) {
-      try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.alternatesReferencePath || repo.referencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
+    if (command === 'fetch' && repo.alternatesReferencePath) {
+      try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.alternatesReferencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
     }
     return git(dir, transportArgs, 120_000, true);
   };

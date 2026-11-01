@@ -386,6 +386,7 @@ function resolveRepo(repoFlags = flags) {
   let canonicalOrigin = true;
   let smokeOrigin = null;
   let discoveredPrimaryPath = null;
+  let referenceValidated = false; // true only when the ownership scan above proved the reference is not a lane
   let originBase = topLevel;
   if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
@@ -438,6 +439,8 @@ function resolveRepo(repoFlags = flags) {
       }
       canonicalOrigin = !!smokeOrigin;
       if (!canonicalOrigin && needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
+    } else {
+      referenceValidated = true;
     }
   }
   const rawOrigin = repoFlags.origin || smokeOrigin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
@@ -471,7 +474,7 @@ function resolveRepo(repoFlags = flags) {
   const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
   // alternatesReferencePath: the object store lanes may borrow. A primary found by name replaces the invoking lane.
-  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath: discoveredPrimaryPath || topLevel, branch, poolDir: join(POOL_ROOT, name) };
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath: discoveredPrimaryPath || (referenceValidated ? topLevel : null), branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -1037,9 +1040,10 @@ function healSharedStoreFor(repo, err) {
 // any lane fetch; best effort, a failure here never blocks the fetch itself.
 function ensureAlternatesFor(repo, n) {
   const dir = laneDir(repo, n);
+  if (!repo.alternatesReferencePath) return { status: 'skipped', reason: 'no ownership-validated reference' }; // an explicit/inherited origin never validated the reference
   try {
     const result = ensureLaneAlternates({
-      laneDir: dir, referencePath: repo.alternatesReferencePath || repo.referencePath, laneOrigin: tryGit(['remote', 'get-url', 'origin'], dir), referenceOrigin: repo.originUrl,
+      laneDir: dir, referencePath: repo.alternatesReferencePath, laneOrigin: tryGit(['remote', 'get-url', 'origin'], dir), referenceOrigin: repo.originUrl,
     });
     if (result.status === 'added') log(`  lane-${n}: repaired missing alternates → ${repo.referencePath}`);
     else if (result.status === 'skipped') log(`  ⚠ lane-${n}: alternates not set (${result.reason})`);
