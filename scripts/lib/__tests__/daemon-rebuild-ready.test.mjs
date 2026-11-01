@@ -24,6 +24,7 @@ import {
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
+import * as preparation from '../daemon-rebuild/prepare.mjs';
 
 const tempDirs = [];
 function mktemp(prefix) {
@@ -103,6 +104,107 @@ beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
+});
+
+describe('the Git proof of omitted content in the candidate build', () => {
+  it('accepts equivalent content without requiring overlay ancestry, but rejects extra merged content', () => {
+    const { originDir, cloneDir } = makeFixture();
+    const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, 'overlay.txt', 'overlay\n'));
+    const absent = advanceMain(originDir, (dir) => writeFile(dir, 'candidate.txt', 'candidate\n'));
+    const contained = advanceMain(originDir, (dir) => writeFile(dir, 'overlay.txt', 'overlay\n'));
+    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    const realGit = (args) => git(cloneDir, args);
+    expect(realGit(['merge-base', '--is-ancestor', overlay, contained]).status).toBe(1);
+    expect(preparation.contentContainedInBuild(realGit, overlay, contained)).toBe(true);
+    expect(preparation.contentContainedInBuild(realGit, overlay, absent)).toBe(false);
+  });
+
+  it('rejects a real merge conflict and an unavailable merge-tree command', () => {
+    const { originDir, cloneDir } = makeFixture();
+    const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, 'README.md', 'overlay\n'));
+    const build = advanceMain(originDir, (dir) => writeFile(dir, 'README.md', 'candidate\n'));
+    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    const realGit = (args) => git(cloneDir, args);
+    const conflict = realGit(['merge-tree', '--write-tree', '--no-messages', build, overlay]);
+    expect(conflict.status).toBe(1);
+    expect(conflict.stdout.trim()).not.toBe(''); // Git prints a tree even on conflict.
+    expect(preparation.contentContainedInBuild(realGit, overlay, build)).toBe(false);
+    expect(preparation.contentContainedInBuild((args) => (
+      args[0] === 'merge-tree' ? { status: 129, stdout: '', stderr: 'unsupported option' } : realGit(args)
+    ), overlay, build)).toBe(false);
+  });
+
+  it('rejects a failed merge-tree even if its output names the candidate tree', () => {
+    const { cloneDir } = makeFixture();
+    const build = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const tree = gitOk(cloneDir, ['rev-parse', `${build}^{tree}`]).trim();
+    expect(preparation.contentContainedInBuild((args) => (
+      args[0] === 'merge-tree' ? { status: 1, stdout: `${tree}\n` } : git(cloneDir, args)
+    ), build, build)).toBe(false);
+  });
+
+  it.each([
+    { shape: 'contained', name: 'adopts omitted content already present in the candidate tree' },
+    { shape: 'only in current main', name: 'rejects omitted content present only in current main' },
+    { shape: 'conflicting', name: 'rejects omitted content that conflicts with the candidate tree' },
+  ])(
+    '$name', async ({ shape }) => {
+      const { originDir, cloneDir, env } = makeFixture();
+      env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+      env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+      const file = shape === 'conflicting' ? 'README.md' : 'overlay.txt';
+      const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, file, 'overlay\n'));
+      addOverlay(cloneDir, { ref: 'lane/omitted', pr: 99 }, { env });
+      expect(await rebuildClone({
+        root: cloneDir, env, runSmoke: async () => PASS, prState: async () => 'OPEN', lockOpts: LOCK_OPTS,
+      })).toMatchObject({ adopted: true });
+
+      const candidate = advanceMain(originDir, (dir) => {
+        writeFile(dir, 'candidate.txt', 'candidate\n');
+        if (shape === 'contained') writeFile(dir, file, 'overlay\n');
+        if (shape === 'conflicting') writeFile(dir, file, 'candidate\n');
+      });
+      const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+      try {
+        // A main-only candidate omits the running overlay while retaining its registration. The next
+        // normal prepare tick sees its PR merge and must prove containment in this older candidate.
+        const blocked = await rebuildClone({
+          root: cloneDir, env, runSmoke, mainOnly: true, prState: async () => 'OPEN', lockOpts: LOCK_OPTS,
+        });
+        expect(blocked.reason).toBe('tick-in-progress');
+        expect(readReadyCandidate(cloneDir, env)?.adopt).toMatchObject({ finalSha: candidate, applied: [] });
+        expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/omitted']);
+      } finally { endTick(); }
+
+      const main = advanceMain(originDir, (dir) => {
+        writeFile(dir, file, 'overlay\n');
+        writeFile(dir, 'later.txt', 'later\n');
+      });
+      const smoke = vi.fn(async () => PASS);
+      const result = await rebuildClone({
+        root: cloneDir, env, runSmoke: smoke, prState: async () => 'MERGED', lockOpts: LOCK_OPTS,
+      });
+      expect(git(cloneDir, ['merge-base', '--is-ancestor', overlay, candidate]).status).toBe(1);
+      expect(gitOk(cloneDir, ['show', `${main}:${file}`])).toBe('overlay\n');
+      expect(result.alerts).toContainEqual(expect.objectContaining({
+        kind: 'overlay-auto-dropped', detail: { ref: 'lane/omitted', reason: 'pr-merged' },
+      }));
+      expect(readOverlays(cloneDir, { env })).toEqual([]);
+      if (shape === 'contained') {
+        expect(result).toMatchObject({ adopted: true, reason: 'ready-adopted', readyMatch: 'superseded' });
+        expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(candidate);
+        expect(smoke).not.toHaveBeenCalled();
+      } else {
+        expect(result.alerts).toContainEqual(expect.objectContaining({
+          kind: 'ready-candidate-discarded',
+          detail: expect.objectContaining({ reason: expect.stringContaining('superseded-omits-live-overlay: lane/omitted') }),
+        }));
+        expect(result.reason).not.toBe('ready-adopted');
+        expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(main);
+        expect(smoke).toHaveBeenCalledTimes(1);
+      }
+    }, 20_000,
+  );
 });
 
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
