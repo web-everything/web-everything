@@ -641,6 +641,24 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     const result=testRoot?await testOwnershipExec(call):await execute(call.file,call.args,{env:{PATH:path,LANG:'C'}});
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
+  // R335: the widened flags name paths; refuse any whose existing components are links (checked after
+  // install, immediately before the test command). A missing tail is fine: vitest creates real dirs.
+  async function assertContained(work,argv) {
+    const paths=[];
+    for(let i=0;i<argv.length;i++) {
+      if(argv[i]==='--config'&&argv[0]==='npx')paths.push(argv[++i]);
+      else if(argv[i].startsWith('--outputFile.json='))paths.push(argv[i].slice('--outputFile.json='.length));
+    }
+    for(const rel of paths) {
+      let at=work;
+      for(const part of rel.split('/')) {
+        at=join(at,part);
+        const info=await lstat(at).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+        if(!info)break;
+        if(info.isSymbolicLink())throw new Error('Path escapes the run work directory');
+      }
+    }
+  }
   async function pinBase(run,baseSha) {
     // Pool metadata runs as root, but the anonymous warmer runs as ops and
     // must read every active pin before deciding which public bases to prune.
@@ -804,6 +822,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     return result;
   }
   return {
+    assertContained,
     async telemetry() {
       // Idle hosts and fresh installs have no background sampler. Sample the
       // actual host on every SSH request; the Mac health cache bounds reads.
@@ -1004,6 +1023,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         runAt=clock();
         await update();
         if(telemetryError)throw telemetryError;
+        await assertContained(work,request.argv);
         const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
         if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
           executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
