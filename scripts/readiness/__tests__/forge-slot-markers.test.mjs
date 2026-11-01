@@ -35,6 +35,18 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(swapped)).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
+  it('does not let a replacement marker inherit its predecessor\'s death stamp', async () => {
+    const root = setup({0: {pid: 111}});
+    const file = join(root, 'slot-0.unconfirmed');
+    let clockNow = NOW;
+    const reaper = createMarkerReaper({root, clock: () => clockNow, liveness: liveness([111])});
+    expect(await reaper.step(tel(0, NOW - 4_000))).toEqual([]);
+    rmSync(file); writeFileSync(file, markerContent({owner: 'new', pid: 111, nowMs: NOW}));
+    const t = (NOW - 600_000) / 1000; utimesSync(file, t + 7, t + 7);
+    clockNow = NOW + 10_000;
+    expect(await reaper.step(tel(0, NOW + 1_000))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
   it('creates a marker exclusively under the shared mutex', async () => {
     const root = setup({});
     const file = join(root, 'slot-1.unconfirmed');

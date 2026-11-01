@@ -18,6 +18,9 @@ export function markerContent({owner, pid, nowMs}) {
 }
 
 const LOCK_KEY = 'marker-mutation';
+// The critical section is a stat plus an unlink (milliseconds); a long lease makes takeover of a live holder implausible.
+const LOCK_LEASE_MINUTES = 10;
+const holds = (root, owner) => readLockEntry(root, LOCK_KEY)?.owner === owner;
 /** Marker creation and reaping share one short mutex, so a reaper can never remove a marker it did not judge. */
 async function withMarkerLock(root, work, {clock = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms))} = {}) {
   const owner = 'marker-' + randomBytes(12).toString('hex'), start = clock();
@@ -25,15 +28,15 @@ async function withMarkerLock(root, work, {clock = Date.now, sleep = ms => new P
     // Never hand `reserve` a liveness verdict read earlier: it rereads the holder itself, so a stale `dead` could
     // reclaim a live holder's lock. A crashed holder is reclaimed by its 1-minute lease instead.
     const now = clock();
-    if (reserve(root, LOCK_KEY, owner, now, new Date(now).toISOString(), process.pid, 'unknown', 1, null, true).ok) break;
+    if (reserve(root, LOCK_KEY, owner, now, new Date(now).toISOString(), process.pid, 'unknown', LOCK_LEASE_MINUTES, null, true).ok) break;
     if (clock() - start >= 3000) throw new Error('remote-marker-busy');
     await sleep(25);
   }
-  try { return await work(); } finally { releaseLockDir(root, LOCK_KEY); }
+  try { return await work(() => holds(root, owner)); } finally { if (holds(root, owner)) releaseLockDir(root, LOCK_KEY); }
 }
 /** Exclusive create of a dispatch marker under the mutex; throws if one already exists. */
 export function writeMarkerExclusive(root, file, content, opts) {
-  return withMarkerLock(root, () => writeFileSync(file, content, {flag: 'wx', mode: 0o600}), opts);
+  return withMarkerLock(root, still => { if (!still()) throw new Error('remote-marker-lock-lost'); writeFileSync(file, content, {flag: 'wx', mode: 0o600}); }, opts);
 }
 
 function ownerPid(root, index, file) {
@@ -67,9 +70,10 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
         let mtimeMs, ino;
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const pid = ownerPid(root, Number(m[1]), file);
-        if (liveness(pid, selfPid) !== 'dead') { firstDead.delete(name); continue; }
-        if (!firstDead.has(name)) firstDead.set(name, clock()); // stamped after the death probe
-        dead.push({name, file, mtimeMs, ino, index: Number(m[1])});
+        const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
+        if (liveness(pid, selfPid) !== 'dead') { firstDead.delete(key); continue; }
+        if (!firstDead.has(key)) firstDead.set(key, clock()); // stamped after the death probe
+        dead.push({name, key, file, mtimeMs, ino, index: Number(m[1])});
       }
       if (!dead.length) return [];
       const telemetry = await getTelemetry();
@@ -79,10 +83,11 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
       if (active !== 0) return [];
       const reaped = [];
       for (const entry of dead) {
-        if (now - entry.mtimeMs < graceMs || firstDead.get(entry.name) > sampledAt) continue;
+        if (now - entry.mtimeMs < graceMs || firstDead.get(entry.key) > sampledAt) continue;
         // Re-judge under the mutex: the marker must be the very file we judged and its owner still provably dead.
-        const removed = await withMarkerLock(root, () => {
+        const removed = await withMarkerLock(root, still => {
           try {
+            if (!still()) return false;
             const seen = fs.statSync(entry.file);
             if (seen.ino !== entry.ino || seen.mtimeMs !== entry.mtimeMs) return false;
             if (liveness(ownerPid(root, entry.index, entry.file), selfPid) !== 'dead') return false;
@@ -91,7 +96,7 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
           } catch { return false; }
         }).catch(() => false);
         if (!removed) continue;
-        firstDead.delete(entry.name);
+        firstDead.delete(entry.key);
         reaped.push(entry.name);
       }
       if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; Forge reports ${active} active run(s))\n`);
