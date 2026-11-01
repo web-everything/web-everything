@@ -73,6 +73,7 @@ describe('overlay adoption events', () => {
     expect(await checkPendingAdoptions({ root, env, emit: () => { throw new Error('x'); } })).toEqual([]);
     recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString() }, { env });
     await expect(checkPendingAdoptions({ root, env, emit: () => { throw new Error('x'); }, isAncestor: () => { throw new Error('git'); }, now: () => t0 })).resolves.toEqual([]);
-    expect(pendingAdoptionPath(root, env)).toContain('.adoption-pending.json');
+    expect(pendingAdoptionPath(root, env)).toMatch(/adoption-pending\/[0-9a-f]+\.pending$/);
+    expect(pendingAdoptionPath(root, env)).not.toMatch(/\.json/); // the overlay registry scans <key>.json* in the overlay dir
   });
 });

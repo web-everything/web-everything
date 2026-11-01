@@ -6,13 +6,18 @@
  */
 import { spawnSync } from 'node:child_process';
 import nodeFs from 'node:fs';
-import { dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { overlayFilePath } from './daemon-overlays.mjs';
 
 export const OVERLAY_ADOPTION_OVERDUE_MS = 15 * 60 * 1000;
 const FULL_SHA = /^[a-f0-9]{40}$/i;
-export const pendingAdoptionPath = (root, env = process.env) => `${overlayFilePath(root, env)}.adoption-pending.json`;
+// Kept in its own subdirectory with a non-.json name: the overlay registry treats every <key>.json* file in the
+// overlay dir as clone state and drops the ones it cannot read (seen live: pending records were deleted as 'stale').
+export const pendingAdoptionPath = (root, env = process.env) => {
+  const state = overlayFilePath(root, env);
+  return join(dirname(state), 'adoption-pending', `${basename(state, '.json')}.pending`);
+};
 
 /** Strict read for read-modify-write: a missing file is empty, any other read/parse failure throws (never overwrite). */
 function readPendingStrict(root, env, fs) {
