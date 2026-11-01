@@ -49,6 +49,7 @@ function fixture(options = {}) {
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
       if (p.endsWith('.events.jsonl')) return options.events || '';
+      if (p.endsWith('.drop-pending') && options.pendingDrops) return options.pendingDrops;
       if (p.endsWith('.rebuild.json')) {
         if (options.rebuildStateReadError) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
         if (options.rebuildStateRaw !== undefined) return options.rebuildStateRaw;
@@ -70,6 +71,25 @@ function fixture(options = {}) {
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
       if (action === 'list') return options.listRaw ?? JSON.stringify({ list: [...registrations.values()] });
+      if (action === 'recover-drops') return options.recoverRaw ?? JSON.stringify({ settled: [{ ref: 'lane/x', outcome: 'restored' }], pending: [] });
+      if (action === 'retire') {
+        if (options.retireRefuses === ref) return fail(3, JSON.stringify({ retired: false, refused: 'tip-moved' }));
+        registrations.delete(ref);
+        return JSON.stringify({ retired: true, refused: null });
+      }
+      if (action === 'replace') {
+        const old = args.find((a) => a.startsWith('--replaces='))?.slice(11);
+        const contained = (options.contained || []).includes(old);
+        const check = { ok: true, clean: true, candSha: remoteTip };
+        if (args.includes('--check')) {
+          return contained ? JSON.stringify({ check, containment: { ok: true, contained: true }, wouldReplace: true, refused: null })
+            : fail(3, JSON.stringify({ check: null, containment: { ok: true, contained: false }, wouldReplace: false, refused: 'not-contained' }));
+        }
+        admitted.push({ ref, replaces: old });
+        registrations.delete(old);
+        registrations.set(ref, { ref });
+        return JSON.stringify({ replaced: true, registered: true, conflictCheck: check, list: [...registrations.values()] });
+      }
       if (action === 'add' && overlaySafetySettings(config.env, { readSettings: () => options.safetySettings || {} }).noPr === 'refuse') {
         return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
       }
@@ -197,10 +217,12 @@ function fixture(options = {}) {
     ? options.combinedTest(input)
     : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
   if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
-  const load = createPrototypeLoader({ exec, fs, env, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
+  // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
+  const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('default combined-tree test proof', () => {
@@ -1438,6 +1460,92 @@ describe('prototype-load', () => {
   });
   it('ignores old refusals and unrelated events', async () => {
     const f = fixture({ events: JSON.stringify({ at: new Date(-1).toISOString(), ref: BASE.branch, event: 'removed' }), alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: 'lane/else', event: 'refused' }) }); expect((await f.run()).ok).toBe(true);
+  });
+  // R310 (incident 2026-11-01): a superseded registration and old tops froze two daemons for hours.
+  describe('auto-retire and replace (R310)', () => {
+    const retireOld = (extra = {}) => ({ retirePlan: ({ rows }) => rows.map((row) => (row.ref === 'lane/old'
+      ? { ref: 'lane/old', action: 'retire', reason: 'superseded', tip: TREE, pr: 6056, evidence: { supersededBy: 6132 }, ...extra }
+      : { ref: row.ref, action: 'keep', reason: 'unique-commits-not-on-main' })) });
+    it('retires a proved registration before staleness checks, so it no longer blocks the load', async () => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': 'M\0x\0' }, ...retireOld() });
+      const r = await f.run();
+      expect(r).toMatchObject({ ok: true, adopted: true, retired: [{ ref: 'lane/old', reason: 'superseded', tip: TREE, pr: 6056 }], stale: [] });
+      expect(f.retirePlanner).toHaveBeenCalledWith(expect.objectContaining({ rows: [{ ref: 'lane/old' }] }));
+      const [call] = mutations(f, 'retire');
+      expect(call.args).toEqual(expect.arrayContaining(['--ref=lane/old', `--expected-tip=${TREE}`, `--expected-entry=${JSON.stringify({ ref: 'lane/old' })}`, '--reason=superseded']));
+      expect(r.staleChecks).toEqual({});
+    });
+    it('the same blocked load without a proved retirement still stops on the stale registration', async () => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': 'M\0x\0' } });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', retired: [] });
+      expect(mutations(f, 'retire')).toEqual([]);
+    });
+    it('settles drop intents left by an interrupted retire before planning', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], pendingDrops: '{"pending":[{"ref":"lane/x"}]}' });
+      await f.run();
+      expect(f.reads).toContain('/home/test/.claude/daemon-overlays/test-clone-key.json.drop-pending');
+      expect(mutations(f, 'recover-drops')).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ dropRecovery: { settled: [{ ref: 'lane/x', outcome: 'restored' }] } });
+      // The settle runs before the listing, so a restored registration takes part in every later check.
+      const settleAt = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'recover-drops');
+      expect(settleAt).toBeLessThan(f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'list'));
+      const quiet = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      await quiet.run();
+      expect(mutations(quiet, 'recover-drops')).toEqual([]);
+    });
+    it('stops before planning or registering when drop intents stay unsettled', async () => {
+      const f = fixture({ list: ['lane/old'], pendingDrops: '{"pending":[{"ref":"lane/x"}]}', recoverRaw: JSON.stringify({ settled: [], pending: [{ ref: 'lane/x' }] }), ...retireOld() });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'drop-recovery-failed', registered: false });
+      expect(f.retirePlanner).not.toHaveBeenCalled();
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('dry-run reports wouldRetire and retires nothing', async () => {
+      const f = fixture({ list: ['lane/old'], ...retireOld() });
+      expect(await f.run({ dryRun: true })).toMatchObject({ ok: true, wouldRetire: [{ ref: 'lane/old', reason: 'superseded', tip: TREE }] });
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.registrations.has('lane/old')).toBe(true);
+    });
+    it('stops without registering when the loader refuses a proved retirement', async () => {
+      const f = fixture({ list: ['lane/old'], retireRefuses: 'lane/old', ...retireOld() });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'retire-refused', retireRefused: [{ ref: 'lane/old', refused: 'tip-moved' }], registered: false });
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('ignores planner decisions for unlisted refs, the candidate itself, or without a full tip', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], retirePlan: () => [
+        { ref: 'lane/ghost', action: 'retire', reason: 'in-main', tip: TREE },
+        { ref: 'lane/old', action: 'retire', reason: 'in-main', tip: 'short' },
+      ] });
+      await f.run();
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.retirePlanner.mock.calls[0][0].rows.map((row) => row.ref)).not.toContain(BASE.branch);
+    });
+    it('retire-only mode drops proved registrations with no candidate and no ready record', async () => {
+      const f = fixture({ list: ['lane/old', 'lane/live'], ready: '', ...retireOld() });
+      const r = await f.run({ branch: '', sha: '', retire: true });
+      expect(r).toMatchObject({ ok: true, retired: [{ ref: 'lane/old' }], registered: false });
+      expect([...f.registrations.keys()]).toEqual(['lane/live']);
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('replace swaps a contained old top in one loader command, with no retained-registration stop', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      const r = await f.run({ replace: 'lane/old' });
+      expect(r).toMatchObject({ ok: true, adopted: true, replaced: 'lane/old', registered: true, stopReason: null });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(mutations(f, 'replace')[0].args).toEqual(expect.arrayContaining(['--ref=lane/new', '--replaces=lane/old', `--expected-sha=${SHA}`]));
+      expect([...f.registrations.keys()]).toEqual(['lane/new']);
+    });
+    it('replace refuses an old top whose commits the new top lacks, and changes nothing', async () => {
+      const f = fixture({ list: ['lane/old'] });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, stopReason: 'replace-not-contained', registered: false });
+      expect(mutations(f, 'replace')).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual(['lane/old']);
+    });
+    it('replace refuses an unregistered old ref', async () => {
+      const f = fixture({ list: [] });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, stopReason: 'bad-input' });
+      expect(mutations(f, 'replace')).toEqual([]);
+    });
   });
   it('happy path pins full command sequence, safe env and recorded provenance', async () => {
     const f = fixture(); const r = await f.run({ why: 'load tested patch' }); expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, cloneSource: 'settings:prototype-load.json#daemons.control.clone' });

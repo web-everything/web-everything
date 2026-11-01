@@ -79,3 +79,9 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
     } else state.failures=0;
   },host);
 }
+
+/** Latest persisted Forge telemetry sample (read-only; null when absent or unreadable). */
+export function peekRemoteTelemetry({root,host='forge'}) {
+  const key=host==='forge'?'health':'health-'+createHash('sha256').update(host).digest('hex');
+  try{return readState(join(root,key+'.json')).telemetry;}catch{return null;}
+}

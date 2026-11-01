@@ -24,6 +24,8 @@ import {
   mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -46,30 +48,21 @@ const DENY = ['/Users/x/workspace/webeverything/**'];
  * instead of the old synchronous `execFileSync`. Its own injectable seam is therefore `spawnFn` (a
  * `child_process.spawn`-shaped function returning an EventEmitter-ish `ChildProcess`), not the old bare
  * `exec` (an `execFileSync`-shaped function returning a plain string synchronously). This fakes JUST enough
- * of a real `ChildProcess` for `spawnToCompletion` to drive to completion: `stdout`/`stderr` streams that
- * replay their buffered chunks on `.on('data', …)`, an `'exit'` event fired on the next microtask (mirroring
- * a real child's async exit), and a real-shaped `resourceUsage()`.
+ * of a real `ChildProcess` for `spawnToCompletion` to drive to completion: `stdout`/`stderr` streams,
+ * an async `'exit'` followed by the final output and `'close'`, and a real-shaped `resourceUsage()`.
  */
 function fakeChildProcess({ stdout = '', stderr = '', code = 0, signal = null, resourceUsage = { userCPUTime: 1000, systemCPUTime: 500 } } = {}) {
-  const dataHandlers = { stdout: [], stderr: [] };
-  const exitHandlers = [];
-  const errorHandlers = [];
-  const makeStream = (key) => ({ on(ev, cb) { if (ev === 'data') dataHandlers[key].push(cb); return this; } });
-  const child = {
-    stdout: makeStream('stdout'),
-    stderr: makeStream('stderr'),
-    on(ev, cb) {
-      if (ev === 'exit') exitHandlers.push(cb);
-      if (ev === 'error') errorHandlers.push(cb);
-      return child;
-    },
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
     kill: vi.fn(),
     resourceUsage: () => resourceUsage,
-  };
+  });
   queueMicrotask(() => {
-    if (stdout) dataHandlers.stdout.forEach((cb) => cb(Buffer.from(stdout)));
-    if (stderr) dataHandlers.stderr.forEach((cb) => cb(Buffer.from(stderr)));
-    exitHandlers.forEach((cb) => cb(code, signal));
+    child.emit('exit', code, signal);
+    child.stdout.end(stdout);
+    child.stderr.end(stderr);
+    child.emit('close', code, signal);
   });
   return child;
 }

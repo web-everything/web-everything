@@ -35,6 +35,9 @@
  *      `ready-to-merge` on green. The resident drain daemon lands it; this process never merges.
  *   7. `lane-pool.mjs release` — the lane clone itself is no longer needed once its content is pushed to the
  *      `lane/*` ref (`pr-land`, underneath `open-pr`, publishes HEAD there) — releasing frees the pool slot.
+ *      R310: before releasing, the lane is left CLEAN on every exit path — the filing's own copies are removed once
+ *      durable (PR / batch / spool), and any other card file left (a failed step) is saved first
+ *      (`we:scripts/lib/lane-card-salvage.mjs`). A dirty-with-cards released lane starved the pool (75 of 90).
  *
  * EVERY OPERATION CALL (2, 5, 6) RUNS THE ACQUIRED LANE'S OWN `run.mjs`, NEVER THIS SCRIPT'S OWN
  * (codex plan review, 2026-09-28 — a real, live-caught defect in this file's first cut): `file-item`'s IO shell
@@ -106,6 +109,8 @@ import {
 } from '../lib/card-dedupe.mjs';
 
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
+import { removeFiledCards, salvageLaneCards } from '../lib/lane-card-salvage.mjs';
+import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
 export const REPO_ROOT = resolve(HERE, '..', '..');
@@ -482,12 +487,30 @@ export async function landPreventionCard(input, {
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
   sleep: wait = sleep,
+  removeCards = removeFiledCards,
+  salvageCards = salvageLaneCards,
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
   let scratch = null;
   const scratchFile = (name) => join(scratch ??= mkTmp(), name);
   let laneNum = null; // set once acquired; the `finally` releases it on every exit path
+  // R310 — the `finally` also leaves the lane CLEAN before releasing it. `durable` is set only on an exit whose cards
+  // are safe elsewhere (pushed in a PR, admitted to a batch, spooled); then the lane's copies are just removed. On
+  // every other exit (a failed step, a timeout, a throw) whatever card files are left are SAVED first, then removed.
+  let laneDir = null;
+  let laneHolder = null;
+  // The acquisition's minted holder distinguishes reacquisitions even within the same session.
+  // Read afresh at every cleanup mutation; missing or unreadable evidence never authorizes cleanup.
+  const isLeaseCurrent = () => {
+    if (!laneDir || !laneHolder) return false;
+    try {
+      const lease = JSON.parse(readFileSync(join(laneDir, '.git', LEASE_FILENAME), 'utf8'));
+      return lease?.holder === laneHolder && lease?.session === input.session;
+    } catch { return false; }
+  };
+  const handedOn = new Map(); // card path → the exact text admitted to the batch or spooled
+  let durable = false;
   const fail = (step, reason, extra = {}) => {
     write(`land-prevention-card: FAILED at ${step} — ${reason}\n`);
     return { ok: false, step, num: extra.num ?? null, rel: extra.rel ?? null, pr: extra.pr ?? null, url: extra.url ?? null, reason };
@@ -531,6 +554,8 @@ export async function landPreventionCard(input, {
     }
     const lane = acquired?.path ?? null;
     laneNum = acquired?.lane ?? null;
+    laneDir = lane;
+    laneHolder = typeof acquired?.holder === 'string' && acquired.holder ? acquired.holder : null;
     if (!lane) return fail('acquire', 'lane-pool acquire produced no usable lane path');
     // THE #4317-REVIEW FIX (codex plan review, 2026-09-28): every operation from here on must run the ACQUIRED
     // LANE's OWN `run.mjs`, never a `run.mjs` resolved from wherever THIS script itself lives (the checkout that
@@ -619,6 +644,7 @@ export async function landPreventionCard(input, {
     } else if (!mentioned.length) {
       // Every finding is already recorded (on an open PR's card, or verbatim on the card from a retried filing).
       write('land-prevention-card: every finding is already on an open card — nothing to file or land\n');
+      durable = true;
       return { ok: true, step: 'mentioned', num: null, rel: null, pr: null, url: null, reason: null, mentions: recorded.length };
     }
 
@@ -633,13 +659,14 @@ export async function landPreventionCard(input, {
       const source = { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
         note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title };
       let result;
+      const text = readFileSafe(readFile, join(lane, cardPath));
       try {
         const preventionSettings = loadBatchSettings();
         const retries = Math.ceil(preventionSettings.batchLeaseWaitMinutes * 60 / 30);
         result = await batch({ laneDir: lane, cardPath, kind: 'prevention', actor: 'mechanical', idemKey, source },
           { preventionSettings, retries, pause: () => wait(30_000) });
       } catch (error) { result = { batched: false, reason: `admission failed: ${errorReason(error)}` }; }
-      outcomes.push({ cardId, cardPath, idemKey, source, result });
+      outcomes.push({ cardId, cardPath, idemKey, source, result, text });
     }
     // Only an explicit opt-out for every member takes the ordinary PR path. Once any
     // member reaches the collector, retain all outstanding files there, even if a
@@ -647,18 +674,24 @@ export async function landPreventionCard(input, {
     if (outcomes.some(({ result }) => result?.batched || result?.disabled !== true)) {
       let heldReason = null;
       let batchRef = null;
-      for (const { cardId, cardPath, idemKey, source, result } of outcomes) {
+      for (const { cardId, cardPath, idemKey, source, result, text } of outcomes) {
         if (result?.batched) {
           batchRef = result.batchRef;
+          if (!result.deduped) handedOn.set(cardPath, text);
           write(`land-prevention-card: batched ${cardPath} into ${batchRef}\n`);
           continue;
         }
         const reason = result?.reason ?? 'admission returned no result';
-        spoolPrevention({ cardId, rel: cardPath, content: readFile(join(lane, cardPath)), idemKey, source, num,
+        const content = readFile(join(lane, cardPath));
+        spoolPrevention({ cardId, rel: cardPath, content, idemKey, source, num,
           title: input.title, spooledAt: new Date().toISOString(), reason }, pendingDir);
+        handedOn.set(cardPath, content);
         heldReason ??= reason;
         write(`land-prevention-card: held ${cardPath} for the next batch window — ${reason}\n`);
       }
+      // Every member is admitted or spooled above; `handedOn` holds the exact text of each. A `deduped` admission
+      // matched an existing member by identity only, never by bytes, so its lane copy is left to the salvage pass.
+      durable = true;
       return { ok: true, step: heldReason === null ? 'batched' : 'held', num, rel, pr: null, url: null,
         reason: heldReason, ...(batchRef ? { batchRef } : {}), ...(recorded.length ? { mentions: recorded.length } : {}) };
     }
@@ -718,6 +751,7 @@ export async function landPreventionCard(input, {
       exec('gh', ['pr', 'edit', String(submit.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane });
     } catch (error) { write(`land-prevention-card: review:pending label failed (non-fatal) — ${errorReason(error)}\n`); }
     write(`land-prevention-card: landed — PR #${submit.pr} (${submit.url})\n`);
+    durable = true;
     return {
       ok: true, step: 'done', num, rel, pr: submit.pr ?? null, url: submit.url ?? null, reason: null,
       ...(recorded.length ? { mentions: recorded.length } : {}),
@@ -725,12 +759,28 @@ export async function landPreventionCard(input, {
   } catch (e) {
     return fail('unexpected', String(e?.message || e));
   } finally {
-    if (laneNum != null) {
+    if (laneDir) {
       try {
-        exec('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${input.session}`], { cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS });
+        const removed = durable ? removeCards({ dir: laneDir, expected: handedOn, isLeaseCurrent }) : [];
+        if (removed.length) write(`land-prevention-card: removed ${removed.length} filed card copy(ies) from the lane — ${removed.join(', ')}\n`);
+        const saved = salvageCards({ dir: laneDir, lane: laneNum ?? 0, isLeaseCurrent, reason: `land-prevention-card ${input.session}: card files left after ${durable ? 'a landed' : 'an unlanded'} filing` });
+        if (saved.status === 'salvaged') write(`land-prevention-card: saved ${saved.removed.length} card file(s) to ${saved.outDir}, lane cleaned — ${saved.removed.join(', ')}\n`);
+        else if (saved.status === 'failed') write(`land-prevention-card: lane card salvage FAILED (lane-pool release retries it) — ${saved.reason}\n`);
+        else if (saved.status === 'unknown') write(`land-prevention-card: lane card salvage skipped (status unreadable; lane-pool release retries it) — ${saved.reason}\n`);
+        else if (saved.status === 'mixed') write(`land-prevention-card: lane holds non-card changes too; card files left for release to judge — ${saved.other.join(', ')}\n`);
+      } catch (e) { write(`land-prevention-card: lane cleanup failed (non-fatal; lane-pool release retries it) — ${errorReason(e)}\n`); }
+    }
+    if (laneNum != null && laneHolder) {
+      try {
+        // Assert only this acquisition's holder; the ambient ownerSession fallback cannot prove it.
+        exec('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${laneHolder}`], {
+          cwd: REPO_ROOT, timeout: ACQUIRE_TIMEOUT_MS, env: { ...process.env, CLAUDE_CODE_SESSION_ID: '' },
+        });
       } catch (e) {
         write(`land-prevention-card: lane-${laneNum} release failed (non-fatal, will age out on its own TTL) — ${String(e?.message || e)}\n`);
       }
+    } else if (laneNum != null) {
+      write(`land-prevention-card: lane-${laneNum} release skipped (acquire returned no holder proof; lease will age out)\n`);
     }
     if (scratch) {
       try { rmTmp(scratch); } catch (e) { write(`land-prevention-card: scratch cleanup failed (non-fatal) — ${String(e?.message || e)}\n`); }

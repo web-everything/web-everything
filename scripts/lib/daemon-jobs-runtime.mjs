@@ -22,7 +22,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -183,7 +183,83 @@ export function createJobStore(dir) {
       }
       return { records, corrupt };
     },
+    /**
+     * {@link list} without re-reading history. Returns `{ live, done, corrupt, ordered }` (`ordered` is both lists interleaved in `list()`'s order): `live` is every NON-terminal job
+     * record in full (fresh from disk, same objects `list()` would give); `done` is `project(record)` for every
+     * TERMINAL one; `corrupt` is exactly `list().corrupt`. A terminal record is parsed once per process: a cached
+     * projection is reused only while the file's inode, size, mtime and ctime are unchanged, and a record write is
+     * always temp-file + rename (new inode), so a changed record can never be served stale (each file is judged as of its stat, the same per-file, non-atomic view `list()` has as of its read: a write that lands between a file's check and the caller's use is invisible to both, and the next call sees it); a file touched in the last 2 s is never trusted from cache (coarse timestamps). Corrupt or foreign
+     * files are never cached and are re-judged on every call, and a file that vanishes mid-scan is skipped, as in
+     * `list()`. `project` must be pure and return read-only data; `projectKey` names it for the cache.
+     */
+    scan(project, projectKey = 'default', { racyWindowMs = SCAN_RACY_WINDOW_MS } = {}) {
+      return scanJobStore(dir, project, projectKey, racyWindowMs);
+    },
   };
+}
+
+const scanCaches = new Map();
+/** A file younger than this is never trusted from the cache: filesystem timestamps are coarse, so an in-place rewrite inside one tick could keep the same signature. */
+const SCAN_RACY_WINDOW_MS = 2_000;
+function scanJobStore(dir, project, projectKey, racyWindowMs) {
+  const cacheKey = `${dir}\0${projectKey}`;
+  let cache = scanCaches.get(cacheKey);
+  if (!cache) scanCaches.set(cacheKey, cache = new Map());
+  const startedMs = Date.now();
+  const live = [];
+  const done = [];
+  const corrupt = [];
+  const ordered = []; // listing order (sorted filename), live and finished interleaved — what list() would walk
+  const seen = new Set();
+  for (const id of listRunIds(dir)) {
+    const path = runPath(id, dir);
+    let sig = null;
+    let racy = true;
+    try {
+      const st = statSync(path, { bigint: true });
+      sig = `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+      racy = startedMs - Number(st.mtimeNs / 1_000_000n) < racyWindowMs || startedMs - Number(st.ctimeNs / 1_000_000n) < racyWindowMs;
+    } catch (e) {
+      // Only a confirmed absence skips the record (as tryReadRun's null does); any other stat failure goes to the
+      // read below, which judges it exactly as list() would.
+      if (e && e.code === 'ENOENT') { cache.delete(id); continue; }
+    }
+    seen.add(id);
+    const hit = cache.get(id);
+    if (sig && hit && hit.sig === sig && !racy) { done.push(hit.projected); ordered.push({ id, done: hit.projected }); continue; }
+    cache.delete(id);
+    try {
+      const r = tryReadRun(id, dir); // the signature was taken BEFORE this read, so a newer file only costs a re-read
+      if (!r || !isJobRecord(r)) continue;
+      if (TERMINAL_JOB_STATUSES.includes(r.job.status)) {
+        const projected = project(r);
+        if (sig && !racy) cache.set(id, { sig, projected });
+        done.push(projected);
+        ordered.push({ id, done: projected });
+      } else { live.push(r); ordered.push({ id, live: r }); }
+    } catch {
+      if (!isForeignJson(path)) corrupt.push(id);
+    }
+  }
+  for (const id of cache.keys()) if (!seen.has(id)) cache.delete(id);
+  return { live, done, corrupt, ordered };
+}
+
+/**
+ * {@link createJobStore}'s `scan`, falling back to `list()` for a store without one (test doubles), with the
+ * same `{ live, done, corrupt, ordered }` result.
+ */
+export function scanStore(store, project, projectKey) {
+  if (typeof store.scan === 'function') return store.scan(project, projectKey);
+  const { records, corrupt } = store.list();
+  const live = [];
+  const done = [];
+  const ordered = [];
+  for (const r of records) {
+    if (TERMINAL_JOB_STATUSES.includes(r.job.status)) { const projected = project(r); done.push(projected); ordered.push({ id: r.id, done: projected }); }
+    else { live.push(r); ordered.push({ id: r.id, live: r }); }
+  }
+  return { live, done, corrupt, ordered };
 }
 
 /**
@@ -271,13 +347,11 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
   // Housekeeping runs only after the child exists and its pid is durable: a recursive snapshot delete
   // can outlast the tick watchdog, but must never strand a launching record without a spawned child.
   try {
-    const { records, corrupt } = store.list();
+    const { live: records, corrupt } = scanStore(store, () => null, 'live-only');
     // An unreadable record may belong to a live child whose snapshot references are unknown.
     // Fail closed until the record is repaired; the new child is already durably spawned.
     if (corrupt.length > 0) return spawned;
-    const referenced = records
-      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
-      .flatMap((r) => r.job.snapshotKeys);
+    const referenced = records.flatMap((r) => r.job.snapshotKeys);
     evict({ jobsDir: store.dir, referenced });
   } catch { /* Snapshot cleanup is best-effort; the child is already spawned and recorded. */ }
   return spawned;

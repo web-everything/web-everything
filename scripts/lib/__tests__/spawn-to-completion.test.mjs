@@ -3,9 +3,8 @@
  * `child_process.spawn()`-based replacement for the dispatch wrappers' old blocking `execFileSync` agent spawn
  * (#3383 mechanical-dispatcher follow-up).
  *
- * DELIBERATELY REAL PROCESSES, not a mocked `child_process.spawn`. Every test below spawns a REAL `node`
- * subprocess (`process.execPath -e '<script>'`), so the assertions are grounded in what the real Node
- * child_process API actually returns, not in an assumption about its shape.
+ * Real processes exercise the public contract. The event-order regressions also
+ * inject a child so exit-before-pipe-drain is deterministic on every platform.
  *
  * ON `resourceUsage` SPECIFICALLY: this module's own header documents a finding worth restating here, since it
  * is exactly the kind of thing a REAL-process test (rather than a fake spawn) catches. `ChildProcess` has NO
@@ -15,10 +14,51 @@
  * IS the correct, honest behavior, not a bug to fix.
  */
 import { describe, it, expect } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { spawnToCompletion } from '../spawn-to-completion.mjs';
 import { keepAliveScript } from '../test-keepalive.mjs';
 
 const NODE = process.execPath;
+
+describe('spawnToCompletion — output drains after exit', () => {
+  it.each([0, 7])('captures both streams before settling exit %s', async code => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    let settled = false;
+    const outcome = spawnToCompletion(NODE, [], {}, { spawnFn: () => child })
+      .then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+    child.emit('exit', code, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    child.stdout.emit('data', Buffer.from('complete output'));
+    child.stderr.emit('data', Buffer.from('complete diagnostic'));
+    child.emit('close', code, null);
+    const result = await outcome;
+    expect(code === 0 ? result.value : result.error).toMatchObject({
+      stdout: 'complete output', stderr: 'complete diagnostic', resourceUsage: null,
+      ...(code === 0 ? {} : { status: code }),
+    });
+  });
+  it.each(['timeout', 'stdout overflow', 'stderr overflow'])('bounds pipes retained after exit: %s', async mode => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => true;
+    let closed = 0;
+    for (const stream of [child.stdout, child.stderr]) stream.once('close', () => {
+      if (++closed === 2) child.emit('close', 0, null);
+    });
+    const result = spawnToCompletion(NODE, [], { timeout: 50, maxBuffer: 20 }, { spawnFn: () => child })
+      .catch(error => error);
+    child.emit('exit', 0, null);
+    child.stdout.write('partial output');
+    if (mode !== 'timeout') child[mode.startsWith('stdout') ? 'stdout' : 'stderr'].write('x'.repeat(21));
+    const error = await result;
+    expect(error).toMatchObject({ status: null, signal: 'SIGKILL', killed: true, stdout: 'partial output' });
+    if (mode !== 'timeout') expect(error.message).toContain('maxBuffer exceeded');
+    expect(child.stdout.destroyed && child.stderr.destroyed).toBe(true);
+  });
+});
 
 describe('spawnToCompletion — success path', () => {
   it('resolves {stdout, stderr, resourceUsage} for a clean exit — resourceUsage is honestly null (see file header)', async () => {

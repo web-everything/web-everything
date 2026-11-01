@@ -161,6 +161,7 @@ import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict
 // the acquire-time twin of `cleanLaneLitter`'s release-time cleanup — same allowlist, same verdict, never a
 // second hand-rolled classifier.
 import { cleanLaneLitter, planLitterCleanup } from './lib/lane-litter.mjs';
+import { salvageLaneCards } from './lib/lane-card-salvage.mjs';
 import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // #3383 gap 2 (auto-reclaim) — the SAME preservation primitives `lane-whois.mjs` itself uses to prove a lane's
 // uncommitted/ahead content is provably preserved (identical blob in origin, or a pushed/patch-equivalent
@@ -1513,6 +1514,13 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
 }
 
 // ── output ──────────────────────────────────────────────────────────────────────────────────────────
+// Smoke-acquire fix: on macOS a piped stdout/stderr is ASYNC, so `fail()`'s `process.exit()` dropped every
+// still-queued line once a long log (a 127-commit reclaim listing) filled the pipe under a slow, loaded reader —
+// the live rebuild smoke then saw only the listing and never the `✗` reason. Blocking pipes make every line
+// reach the reader before exit. Best-effort: a TTY/file is already synchronous and has no `setBlocking`.
+for (const stream of [process.stdout, process.stderr]) {
+  try { stream._handle?.setBlocking?.(true); } catch { /* keep the default stream mode */ }
+}
 const log = (m) => process.stderr.write(m + '\n');
 function fail(m, code = 1) {
   process.stderr.write(`✗ ${m}\n`);
@@ -2021,6 +2029,7 @@ function restoreLeaseAfterRefusedClaim(dir, preExisting) {
  * @param {string} branch
  * @param {number} n
  */
+const RECLAIM_LOG_MAX_COMMITS = 20;
 function logReclaimedAheadCommits(dir, branch, n) {
   const out = tryGit(['log', '--oneline', `origin/${branch}..HEAD`], dir);
   const lines = out ? out.split('\n').filter(Boolean) : [];
@@ -2029,7 +2038,12 @@ function logReclaimedAheadCommits(dir, branch, n) {
     `  lane-${n}: reclaiming ${lines.length} local commit(s), already patch-equivalent to work pushed elsewhere ` +
       `(no unique content — safe to drop):`,
   );
-  for (const line of lines) log(`    ${line}`);
+  // Bounded listing: the journal's `headBefore` (and the line below) keep the whole set recoverable.
+  for (const line of lines.slice(0, RECLAIM_LOG_MAX_COMMITS)) log(`    ${line}`);
+  if (lines.length > RECLAIM_LOG_MAX_COMMITS) {
+    const head = tryGit(['rev-parse', 'HEAD'], dir) || 'HEAD';
+    log(`    … and ${lines.length - RECLAIM_LOG_MAX_COMMITS} more (full list: git log --oneline origin/${branch}..${head})`);
+  }
 }
 
 /**
@@ -2094,6 +2108,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     // (the merge-base fan-out, the O_EXCL claim, the fetch just above). A `lane/*` ref deleted or force-pushed
     // on origin inside that window means the earlier proof no longer holds. Network-free: the fetch above
     // refreshed eligible tracking refs; `localRemoteShas` checks the mapping before using local state.
+    let reclaimAhead = false;
     if (!flags.force) {
       const { uncommitted, ahead } = laneDirtyOrAhead(dir, repo.branch);
       // #3383 — re-apply the SAME litter relaxation auto-pick's earlier cached-scan candidate check already
@@ -2117,8 +2132,10 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
       // commits, even though none of them carry unique content. Log exactly what is being dropped, same spirit
       // as every other destructive step in this file, so the reclaim is auditable after the fact rather than a
       // silent disappearance — shared by BOTH claim routes (explicit `--lane=N` and auto-pick), since both
-      // funnel through this one reset.
-      if (ahead > 0) logReclaimedAheadCommits(dir, repo.branch, chosen);
+      // funnel through this one reset. Logged only AFTER every refusal below (bad --base, lane-hold) has passed,
+      // right before the reset: a held lane that is then NOT reset must never print "reclaiming … safe to drop"
+      // (live 2026-11-01: that line was all the rebuild smoke saw of a hold refusal on lane-33).
+      reclaimAhead = ahead > 0;
     }
     const baseRef = flags.base ? resolveBaseRef(dir, flags.base, chosen) : `origin/${repo.branch}`;
     // #2419 — `checkout -B <branch> <baseRef>`, NOT `reset --hard <baseRef>`. A bare reset moves whatever
@@ -2142,6 +2159,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     const held = laneHoldRefuses(dir, 'reset', { unpushed: before.unpushed ?? undefined });
     if (held) throw Object.assign(new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`), { laneHoldRefusal: true });
     acquireResetSnapshots.set(chosen, before);
+    if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
       return { before, baseRef };
@@ -2986,6 +3004,16 @@ async function cmdRelease(repo) {
         unpushed: Number.isFinite(beforeLitter.unpushedCommits) ? beforeLitter.unpushedCommits > 0 : undefined,
       });
     }
+    // R310 — a lane dirty ONLY with leftover backlog card files is saved, then cleaned; never handed back dirty.
+    if (!sameLease(readLease(dir), lease)) { log(`  lane-${n}: lease changed since it was read — not releasing; re-run if lane-${n} still looks wrong`); continue; }
+    const cards = salvageLaneCards({ dir, lane: n, pool: basename(repo.poolDir), reason: `release of lane-${n} (${lease.purpose || 'no purpose'})`,
+      isLeaseCurrent: () => sameLease(readLease(dir), lease) });
+    if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); releasing without cleaning — inspect the lane before reuse`);
+    if (cards.status === 'failed') { log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`); continue; }
+    if (cards.status === 'salvaged') {
+      log(`  lane-${n}: saved ${cards.removed.length} leftover card file(s) to ${cards.outDir} and cleaned them`);
+      journalLaneEvent(dir, { action: 'card-salvage', before: beforeLitter, removed: cards.removed, salvagedTo: cards.outDir, reason: 'release saved and cleaned leftover backlog card files' });
+    }
     // #x96v5hl — was an unconditional `rmSync` right after the ownership/contested decision above, which was
     // made against `lease` as read at the TOP of this loop iteration — `cleanLaneLitter` and every check since
     // ran real fs/git calls in between, real wall-clock time during which the ACTUAL holder could legitimately
@@ -3044,11 +3072,9 @@ function printStatus(repo) {
   // consumes leased rows, e.g. conveyor-state.mjs / scope-lease-collect.mjs). A leased lane's row is byte-for-
   // byte identical to a full `status` call; an unleased lane's row just omits the git-derived fields.
   const leasedOnly = !!flags['leased-only'];
-  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 0 = always probe
-  // fresh, today's behaviour) lets a display-only reader reuse a recent, signature-matched probe.
+  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 45000; 0 = always probe fresh) lets a display-only reader reuse a recent, signature-matched probe.
   const maxAgeMs = resolveStatusMaxAgeMs(flags['max-age-ms']);
-  // Only an opted-in call reads OR writes the cache: a default `status` stays strictly read-only (stale-state and
-  // other readers pin "writes no state"), so the cache is shared among the opted-in display readers only.
+  // perf #3 — shared by every status reader (wip, health-watch, review); `--max-age-ms=0` neither reads nor writes it.
   const statusCache = maxAgeMs > 0 ? { maxAgeMs, cache: readStatusCache(repo.poolDir), updates: {} } : null;
   // Filter before probing: a single-lane reader must never spawn git in another lane.
   const lanes = existingLanes(repo).filter((n) => flags.lane === undefined || n === Number(flags.lane));

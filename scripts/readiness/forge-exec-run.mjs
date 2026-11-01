@@ -28,9 +28,21 @@ export const sameSiblingShas = (actual, expected) => expected !== undefined && a
 // Shared by the client and fixed wrapper through allowedCommand. Match spellings exactly.
 export const VITEST_ALLOWED_OPTIONS = Object.freeze([
   '--run', '--silent', '--no-color',
-  '--reporter=default', '--reporter=dot', '--reporter=verbose', '--reporter=basic', '--reporter=tap',
+  '--reporter=default', '--reporter=dot', '--reporter=verbose', '--reporter=basic', '--reporter=tap', '--reporter=json',
   '-t', '--testNamePattern=',
+  '--passWithNoTests',
 ]);
+// R314: the verify gate's load-scaled timeouts, `=` spelling only, digits only, 1..MAX_GATE_TIMEOUT_MS.
+export const MAX_GATE_TIMEOUT_MS = 3_600_000;
+export function gateTimeoutOption(arg) {
+  const match = /^--(?:testTimeout|hookTimeout)=([1-9]\d{0,6})$/.exec(arg);
+  return match !== null && Number(match[1]) <= MAX_GATE_TIMEOUT_MS;
+}
+// R335: narrow widening. `--config <path>` (two argv tokens, npx class only) and `--outputFile.json=<path>`
+// accept only plain repo-relative paths: no absolute, backslash, dot or `..` segment, no leading dash, no .git.
+const SAFE_REL_PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/;
+const safeRelPath = value => SAFE_REL_PATH.test(value) && !value.split('/').some(part => part === '.git' || part === '..' || part === '.');
+const safeConfigPath = value => value === 'vitest.soak.config.ts';
 export function allowedCommand(argv) {
   if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0')))) return false;
   if(argv[0]==='npm' && argv[1]==='run' && argv[2]==='check:standards')
@@ -52,14 +64,25 @@ export function allowedCommand(argv) {
       } catch { return false; }
       continue;
     }
+    if (npx && arg === '--config') {
+      if (++i >= argv.length || !safeConfigPath(argv[i])) return false;
+      continue;
+    }
+    if (arg.startsWith('--outputFile.json=')) {
+      if (!npx || !safeRelPath(arg.slice('--outputFile.json='.length))) return false;
+      continue;
+    }
+    if (arg === '--reporter=json' && !npx) return false; // the json report is the guard's (npx class) only
     const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
-    if (!VITEST_ALLOWED_OPTIONS.includes(option)) return false;
+    if (!VITEST_ALLOWED_OPTIONS.includes(option) && !gateTimeoutOption(arg)) return false;
     // Vitest consumes a following boolean-looking token as the flag's value,
     // even when that token could also be a valid positional file filter.
-    if (['--run','--silent','--no-color'].includes(arg) && /^(?:true|false)/i.test(argv[i+1] ?? '')) return false;
+    if (['--run','--silent','--no-color','--passWithNoTests'].includes(arg) && /^(?:true|false)/i.test(argv[i+1] ?? '')) return false;
     // Vitest reparses dash-prefixed -t values as options (including --help).
     if (arg === '-t' && (++i >= argv.length || argv[i].startsWith('-'))) return false;
   }
+  // Exactly two forms: soak's config alone, or the guard's work-relative json report without a config.
+  if (argv.includes('--config') && (argv.includes('--reporter=json') || argv.some(a => a.startsWith('--outputFile')))) return false;
   try { validateTestNames(files); } catch { return false; }
   if (npx && (!files.length || (argv[2] === 'related' && !argv.includes('--run')))) return false;
   return true;
@@ -104,12 +127,36 @@ export function formatTelemetry(value,host='forge') {
   const last=v.recent.find(r=>r.code!==null);
   return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
 }
-const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS'];
+const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE','WE_VITEST_MAX_WORKERS','VERIFY_SCAN_FILES'];
+// R309: the repo-scanning tests' changed-file list. verify-lane sends a JSON array of repo-relative
+// paths; a newline- or comma-separated list is also accepted. Every entry is a plain repo-relative
+// path: no absolute path, no `.`/`..` segment, no empty segment, no shell metacharacter.
+const SCAN_FILES_MAX = 65536;
+const scanPath = path => typeof path === 'string' && path.length > 0 && path.length <= 4096
+  && /^[A-Za-z0-9_@+.][A-Za-z0-9_@+.\/-]*$/.test(path) && !path.includes('..')
+  && path.split('/').every(part => part !== '' && part !== '.' && part !== '..');
+// Scanners consume JSON only. Bound both the incoming and canonical representations so
+// client normalization never produces a value the runner would reject as oversized.
+export function normalizeScanFilesValue(value) {
+  if (typeof value !== 'string' || value.length > SCAN_FILES_MAX) return null;
+  let paths;
+  if (value.startsWith('[')) {
+    try { paths = JSON.parse(value); } catch { return null; }
+    if (!Array.isArray(paths)) return null;
+  } else paths = value.split(/\n|,/);
+  if (paths.length > 4096 || !paths.every(scanPath)) return null;
+  const normalized = JSON.stringify(paths);
+  return normalized.length <= SCAN_FILES_MAX ? normalized : null;
+}
+export function scanFilesValue(value) {
+  return normalizeScanFilesValue(value) !== null;
+}
 export function allowedEnv(env) {
   return env && typeof env === 'object' && !Array.isArray(env) && Object.entries(env).every(([key,value]) =>
     ENV_KEYS.includes(key) && !/secret|token|password|credential|auth|key/i.test(key)
     && typeof value === 'string' && !value.includes('\0')
     && (key !== 'WE_VITEST_MAX_WORKERS' || /^[1-9]\d*$/.test(value))
+    && (key !== 'VERIFY_SCAN_FILES' || scanFilesValue(value))
     && (key !== 'DIFF_COVERAGE_BASE' || (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)
       && !/\s/.test(value) && !value.includes('..') && !value.includes('//') && !/(?:^|\/)\.|\.lock(?:\/|$)|[/.]$/.test(value))));
 }
@@ -597,6 +644,25 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     const result=testRoot?await testOwnershipExec(call):await execute(call.file,call.args,{env:{PATH:path,LANG:'C'}});
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
+  // R335: the widened flags name paths; refuse any whose existing components are links (checked after
+  // install, immediately before the test command). Writes later still run as the slot's own worker uid,
+  // which can touch nothing beyond what test code could already write. A missing tail is fine: vitest creates real dirs.
+  async function assertContained(work,argv) {
+    const paths=[];
+    for(let i=0;i<argv.length;i++) {
+      if(argv[i]==='--config'&&argv[0]==='npx')paths.push(argv[++i]);
+      else if(argv[i].startsWith('--outputFile.json='))paths.push(argv[i].slice('--outputFile.json='.length));
+    }
+    for(const rel of paths) {
+      let at=work;
+      for(const part of rel.split('/')) {
+        at=join(at,part);
+        const info=await lstat(at).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+        if(!info)break;
+        if(info.isSymbolicLink())throw new Error('Path escapes the run work directory');
+      }
+    }
+  }
   async function pinBase(run,baseSha) {
     // Pool metadata runs as root, but the anonymous warmer runs as ops and
     // must read every active pin before deciding which public bases to prune.
@@ -760,6 +826,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     return result;
   }
   return {
+    assertContained,
     async telemetry() {
       // Idle hosts and fresh installs have no background sampler. Sample the
       // actual host on every SSH request; the Mac health cache bounds reads.
@@ -960,7 +1027,14 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         runAt=clock();
         await update();
         if(telemetryError)throw telemetryError;
-        result=await command(executionArgv(request.argv),work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
+        await assertContained(work,request.argv);
+        const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
+        if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
+          executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
+        // Anchor the report in the work dir so a config root cannot redirect it; re-check links after the run.
+        const planned=executionArgv(request.argv).map(a=>a.startsWith('--outputFile.json=')?'--outputFile.json='+join(work,a.slice('--outputFile.json='.length)):a);
+        result=await command(planned,work,executionEnv);
+        await assertContained(work,request.argv);
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));

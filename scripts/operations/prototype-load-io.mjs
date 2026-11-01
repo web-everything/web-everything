@@ -2,6 +2,9 @@
  * @file Injected prototype admission transaction.
  * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and retain mutable
  * registrations even after adoption: a containment snapshot cannot authorize deleting a moving ref.
+ * R310 (incident 2026-11-01): two daemons froze for hours on a superseded registration and old tops.
+ * `--replace=<old>` swaps an old top for a new one that contains all its commits, in one loader command, and
+ * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
 import { execFileSync } from 'node:child_process';
@@ -14,6 +17,7 @@ import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
+import { planRetirements } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -160,12 +164,23 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
   }
 }
 
+/** Real retirement proof: refresh each registered ref's tracking ref, then decide with git and GitHub evidence. */
+function defaultRetirePlanner({ rows, git, gh }) {
+  const fetched = rows.filter((row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0);
+  const unfetched = rows.filter((row) => !fetched.includes(row)).map((row) => ({ ref: row.ref, action: 'keep', reason: 'fetch-failed' }));
+  if (!fetched.length) return unfetched;
+  const repoName = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+  return [...planRetirements({ rows: fetched, git, gh, repo: repoName.code === 0 ? repoName.stdout.trim() : '' }), ...unfetched];
+}
+
 /** The sole real IO binding; constructing an injected loader performs no ambient reads. */
 export function defaultDeps() {
   return { exec: execFileSync, fs: nodeFs, now: () => Date.now(), sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
-    env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest };
+    env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest,
+    retirePlanner: defaultRetirePlanner };
 }
-export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey }) {
+export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
+  retirePlanner = defaultRetirePlanner }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -208,6 +223,19 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   };
   const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])]);
   const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
+  // A replace check proves containment and checks the new ref against the list without the replaced one.
+  const replaceCheck = (clone, ref, expectedSha, old) => {
+    const result = loader('replace', clone, ref, ['--check', `--replaces=${old}`, `--expected-sha=${expectedSha}`]);
+    const data = lastJson(result);
+    if (result.code === 0 && data?.wouldReplace === true && data.check?.ok === true && data.check.clean === true
+      && data.check.candSha === expectedSha && data.containment?.contained === true) {
+      return { files: [], conflicting: [], ...data.check, exit: 0, wouldRegister: true, containment: data.containment };
+    }
+    if (data?.refused === 'conflict' && data.check?.ok === true && data.check.clean === false) {
+      return { files: [], conflicting: [], ...data.check, exit: result.code, containment: data.containment };
+    }
+    return { ok: false, ...result, reason: data?.refused || 'incomplete loader check', containment: data?.containment ?? null };
+  };
   const check = (clone, ref, expectedSha) => {
     const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
     const data = lastJson(result);
@@ -226,6 +254,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
     const out = { ok: false, daemon: input.daemon, clone: null, cloneSource: null, registered: false, adopted: false,
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
+      retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
@@ -234,6 +263,42 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!out.registered) return '';
       const kept = (out.contained || []).filter((ref) => !out.removed.includes(ref));
       return kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '';
+    };
+    const listRows = () => {
+      const listing = loader('list', out.clone);
+      const rows = lastJson(listing)?.list;
+      if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return { ok: false, listing };
+      return { ok: true, rows };
+    };
+    let stateBase = null;
+    const cloneState = () => (stateBase ??= join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone)));
+    // R310: retire registrations proved merged, in main, or superseded. Never one with work not on main.
+    // An interrupted retire/replace leaves a drop intent; settle it BEFORE listing (restored entries must be listed).
+    const settleIntents = () => {
+      if (input.dryRun || !read(`${cloneState()}.json.drop-pending`)) return true;
+      const settled = loader('recover-drops', out.clone);
+      out.dropRecovery = lastJson(settled) ?? { code: settled.code, error: settled.error };
+      return settled.code === 0 && Array.isArray(out.dropRecovery?.pending) && out.dropRecovery.pending.length === 0;
+    };
+    const retireStep = (rows, exclude) => {
+      const candidates = rows.filter((row) => !exclude.includes(row.ref));
+      if (!candidates.length) { out.retirePlan = []; return []; }
+      const plan = retirePlanner({ rows: candidates, git: (args) => git(...args), gh: (args) => execute('gh', args) });
+      if (!Array.isArray(plan)) throw new Error('retirement plan unreadable');
+      out.retirePlan = plan;
+      // Only a decision for a listed candidate with a full tip can retire anything.
+      const proved = plan.filter((d) => d?.action === 'retire' && candidates.some((row) => row.ref === d.ref) && validSha(d.tip));
+      if (input.dryRun) { out.wouldRetire = proved.map(({ ref, reason, tip, pr }) => ({ ref, reason, tip, pr })); return proved.map((d) => d.ref); }
+      for (const d of proved) {
+        // The CLI re-proves retirement itself and refuses unless the entry is still the one planned here.
+        const row = candidates.find((candidate) => candidate.ref === d.ref);
+        const result = loader('retire', out.clone, d.ref, [`--expected-tip=${d.tip}`, `--expected-entry=${JSON.stringify(row)}`,
+          `--reason=${d.reason}`, '--by=prototype-load']);
+        const data = lastJson(result);
+        if (result.code === 0 && data?.retired === true) out.retired.push({ ref: d.ref, reason: d.reason, tip: d.tip, pr: d.pr ?? null });
+        else out.retireRefused.push({ ref: d.ref, refused: data?.refused || result.error || `exit ${result.code}` });
+      }
+      return out.retired.map((r) => r.ref);
     };
     try {
       const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;
@@ -248,6 +313,19 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (typeof wd !== 'string' || !wd.startsWith('/')) return stop('bad-input', { resolution: 'missing absolute WorkingDirectory' });
         out.clone = wd; out.cloneSource = `plist:${daemon.label}`;
       }
+      if (input.retire) {
+        // Retire-only: no candidate, only the registrations proved retired are dropped.
+        stage = 'check-unverifiable';
+        out.branch = null; out.sha = null; out.effectiveRef = null; out.effectiveSha = null;
+        requireGit('fetch', 'origin', 'main');
+        if (!settleIntents()) return stop('drop-recovery-failed', { fallback: 'Drop intents are unsettled; run daemon-overlay.mjs recover-drops and inspect them.' });
+        const listed = listRows();
+        if (!listed.ok) return stop('check-unverifiable', { listing: listed.listing });
+        retireStep(listed.rows, []);
+        if (out.retireRefused.length) return stop('retire-refused');
+        out.ok = true; return out;
+      }
+      if (input.replace !== undefined && input.replace !== '' && (!safeRegistrationRef(input.replace) || input.replace === input.branch)) return stop('bad-input', { detail: 'invalid --replace ref' });
       if (!safeRef(input.branch) || !validSha(input.sha) || !Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input');
       stage = 'no-ready';
@@ -286,11 +364,23 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         requireGit('push', 'origin', `${commit}:refs/heads/${out.wouldMerge.ref}`);
         out.effectiveRef = out.wouldMerge.ref; out.effectiveSha = commit;
       }
-      out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
-      const listing = loader('list', out.clone);
-      const rows = lastJson(listing)?.list;
-      if (listing.code !== 0 || !Array.isArray(rows) || rows.some((r) => !safeRegistrationRef(r?.ref))) return stop('check-unverifiable', { listing });
-      const established = [...new Set(rows.map((r) => r.ref))];
+      if (!input.replace) out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
+      if (!settleIntents()) return stop('drop-recovery-failed', { fallback: 'Drop intents are unsettled; run daemon-overlay.mjs recover-drops and inspect them.' });
+      const listed = listRows();
+      if (!listed.ok) return stop('check-unverifiable', { listing: listed.listing });
+      const retiredRefs = retireStep(listed.rows, [out.effectiveRef, input.replace].filter(Boolean));
+      if (out.retireRefused.length) return stop('retire-refused', { fallback: 'A proved retirement was refused by the loader (tip moved or entry changed); rerun to re-prove it.' });
+      const rows = listed.rows.filter((r) => !retiredRefs.includes(r.ref));
+      if (input.replace) {
+        if (!rows.some((r) => r.ref === input.replace)) return stop('bad-input', { detail: `replaced ref ${input.replace} is not registered` });
+        requireGit('fetch', 'origin', `+refs/heads/${input.replace}:refs/remotes/origin/${input.replace}`);
+        if (!ancestor(`origin/${input.replace}`, out.effectiveSha)) {
+          return stop('replace-not-contained', { fallback: `${input.replace} has commits that ${out.effectiveRef} lacks. Include its current tip in a tested replacement and retry.` });
+        }
+        out.check = replaceCheck(out.clone, out.effectiveRef, out.effectiveSha, input.replace);
+        if (out.check.ok === false && out.check.reason === 'not-contained') return stop('replace-not-contained');
+      }
+      const established = [...new Set(rows.map((r) => r.ref))].filter((ref) => ref !== input.replace);
       const contained = [], blocking = [];
       const overlapping = [], combinedChanged = new Set(effectivePaths);
       const blockingReasons = Object.create(null);
@@ -389,6 +479,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (rows.some((row) => row.ref === out.effectiveRef)) out.registered = 'already';
       if (input.dryRun) {
         out.wouldRegister = out.registered !== 'already'; out.wouldRemove = []; out.wouldRetain = contained;
+        if (input.replace) out.wouldReplace = input.replace;
         if (contained.length) out.wouldStopReason = 'swap-remove-failed';
         out.ok = true; return out;
       }
@@ -399,7 +490,22 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
       if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
       stage = 'register-failed';
-      if (out.registered !== 'already') {
+      if (input.replace) {
+        const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
+          `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
+        out.registration = result;
+        const data = lastJson(result);
+        if (data?.registered === true) out.registered = true;
+        if (result.code !== 0 || data?.replaced !== true) {
+          return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
+            fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
+        }
+        const evidence = data.conflictCheck;
+        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
+        }
+        out.replaced = input.replace;
+      } else if (out.registered !== 'already') {
         const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
         out.registration = result;
         if (result.code !== 0) return stop('register-failed');
@@ -437,7 +543,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // A stale preview is not proof that the replacement can pass live smoke. Keep every prior
       // registration until adoption; a blocked rebuild times out with recovery guidance below.
       stage = 'check-unverifiable';
-      const state = join(expand(env.WE_DAEMON_OVERLAY_DIR || join(env.HOME, '.claude/daemon-overlays')), keyForClone(out.clone));
+      const state = cloneState();
       const deadline = registeredAt + config.adoption.timeoutMs;
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.

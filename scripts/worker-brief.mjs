@@ -1,9 +1,11 @@
 import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
 import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
+import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
- * drifting rules. Encodes operator handoff rules 20, 21, 23, 26 and "no pkill".
+ * drifting rules. Encodes operator handoff rules 20, 21, 23, 26, "no pkill" and the R302 speed rules
+ * (live Forge run early, one verify at the end, small fixes by hand, `--resume` for Codex follow-ups).
  * The renderer resolves the shared build and tests-first policies, including the living checklist,
  * for the injectable CLI and in-process callers.
  */
@@ -36,9 +38,10 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  * @param {number} [params.reportLines]
  * @param {string} [params.owner] Registry owner token; the default is minted per call (per dispatch), which is what
  *   keeps a re-dispatch or a generic slug from colliding with another live worker's registration.
+ * @param {object} [params.freeScope] Resolved shared free-scope settings; defaults to the registry's platform/env cascade.
  * @returns {string} Markdown with a trailing newline.
  */
-export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }) } = {}) {
+export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }), freeScope = resolveFreeScopeSettings({ log: line => console.error(line) }) } = {}) {
   if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) throw new Error('--owner must be an alphanumeric token.');
   if (typeof purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(purpose)) {
     throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
@@ -54,6 +57,13 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
   if (edgeClone !== undefined && (typeof edgeClone !== 'string' || !SAFE.test(edgeClone))) throw new Error('--edge-clone has unsafe characters.');
   const qualified = paths.map(path => path.trim()).map(path => path.includes(':') ? path : `${repo}:${path}`);
   const commaList = qualified.join(',');
+  const { staleAfterMinutes } = freeScope;
+  const heartbeatMinutes = Math.min(20, staleAfterMinutes / 2);
+  // Registry ISO timestamps have millisecond precision: reserve at least two ticks
+  // so the half-window heartbeat can advance lastSeenAt before the entry expires.
+  if (!Number.isFinite(staleAfterMinutes) || !(heartbeatMinutes >= 1 / 60e3)) {
+    throw new Error('Invalid staleAfterMinutes: the stale window must be at least 2 milliseconds for a heartbeat cadence of at least 1 millisecond; correct the free-scope setting and regenerate the brief.');
+  }
   const laneRepo = repo === 'plateau-app' ? ' --repo=<plateau-app checkout>' : '';
   // Codex's full and related gates need WE's scripts/verify-lane.mjs; a plateau-app lane has only its own standards.
   const codexGate = repo === 'plateau-app' && policy.finalGate !== 'none' ? 'standards' : policy.finalGate;
@@ -69,14 +79,35 @@ Anything else is out of scope: stop and report.
 The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
 cannot collide, and free-scope never counts other PRs' new cards against \`backlog/\`. List an existing card only if you edit it.
 
+**Speed.** These four rules keep a worker fast:
+- For Forge/remote work, do a real live Forge run in the first 15 minutes.
+- Narrow tests while iterating; ONE full verify at the end (re-run only if code changed after it).
+- Make small fixes (a few lines, a known finding) yourself; send Codex only larger builds.
+- For a Codex follow-up fix, pass \`--resume=<threadId>\` from its previous run, with the exact file, line range and finding in the task.
+
 1. **Free-scope pre-check.** Before editing, run
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
    If the verdict is UNKNOWN (exit 2: a PR list was cut off or unreadable), the scope is NOT proven free: stop and report it. Do not start.
-2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList}\`.
+2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList} --heartbeat\`.
    If register exits non-zero (the scope is occupied or the registry refused), stop and report; do not edit anything.
-   The \`--owner\` token is yours alone: if register refuses because the name is held by a different owner, another live worker
+   The \`--owner\` token \`${owner}\` was generated once for you: reuse exactly this token in every register, heartbeat, recheck
+   and release below; never mint a new one. If register refuses because the name is held by a different owner, another live worker
    shares your slug. Stop and report; never release or overwrite their entry.
+   **Heartbeat.** \`--heartbeat\` makes the reservation go stale about ${staleAfterMinutes} minutes after the owner was last seen, so a killed worker
+   does not block its own restart. To keep the reservation alive, re-run this owner-tokened check at least every ${heartbeatMinutes} minutes of
+   work (for example after each Codex round, after each narrow-test round, and before verify):
+   \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
+   This cadence is half the configured stale window, capped at 20 minutes. Use the same free-scope settings when registering;
+   if they change, regenerate the brief. Keep this cadence during long commands too; if you cannot, stop work and release the scope.
+   Each check refreshes \`lastSeenAt\` only while your reservation exists; it never extends the four-hour TTL.
+   If it reports OCCUPIED or UNKNOWN (exit 2), stop and report.
+   If stderr says "reservation is gone", stop editing even if the check exits 0; a free verdict does not reserve your files.
+   Resume only after the exact register command above succeeds with the same owner token and \`--heartbeat\`;
+   if it refuses, stop and report. Never release another owner's entry.
+   After every successful heartbeat check, re-run the exact register command above before continuing work.
+   This renewal resets the four-hour TTL before it expires, using the same token, files and \`--heartbeat\`.
+   If renewal exits non-zero, stop and report; do not continue editing on the check's free verdict.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
    Base the lane on origin/main (what acquire gives you). Do not base it on another open PR.
@@ -85,8 +116,10 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Never stack just to get edge-loaded: daemon-overlay add is stack-aware and a main-based lane loads on its own.
    Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
-4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
-   acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
+4. **Codex for larger builds.** Larger coding sub-tasks (a new feature, a multi-file change, a test suite) go to Codex:
+   \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
+   Do small fixes (a few lines, a known finding) yourself. For a follow-up fix on the same work, add
+   \`--resume=<threadId>\` (the \`threadId\` from the previous run's report) so Codex keeps its context instead of re-reading files.
    It is SYNCHRONOUS: run it as a normal Bash call with \`timeout: 600000\`, never wrapped in a wait; don't poll it and
    don't start a second copy. If the harness moves a call running over ~180s to the background it is harness-tracked
    and wakes you when done, so you may end your turn on it. A job you detach yourself (\`&\`, \`nohup\`, \`setsid\`) or an
@@ -101,13 +134,14 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    If over the limit, stop and propose a split plan instead of finishing the build.
    If unreadable, stop, restore readable git diff evidence, and retry before verify/converge.
 
-6. **One PR.** Commit with a tight pathspec (your files only), verify with
-   \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
+6. **One PR.** Commit with a tight pathspec (your files only), verify ONCE at the end with
+   \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it), then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.
+   Apply step 2's lost-reservation warning and renewal rules before proceeding, even if this check exits 0.
 ${edge}
 ${renderProofStep(proof)}
 

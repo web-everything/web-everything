@@ -37,7 +37,7 @@ export const FAILURE_REASONS = new Set([
   'pinned-overlay-conflict', 'pinned-overlay-unavailable', 'pinned-overlay-unbound',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
-  'reader-wait-timeout', 'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
+  'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
   'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
   'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',

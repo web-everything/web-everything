@@ -16,7 +16,7 @@ afterBuildPolicy(() => buildPolicyVi.unstubAllEnvs());
  * assumed) verification trail behind the swap — a `--safe-mode` swap was tried FIRST and independently
  * REJECTED after a real smoke test showed a `--settings=<hooks file>` layered on top of it never fires.
  */
-import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll, onTestFinished } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -4239,7 +4239,16 @@ describe('deliverItem (#4349 — settles its run-store effect + releases/holds t
     telemetryFaults.failures = [];
     const real = await vi.importActual('node:child_process');
     const git = (args) => real.execFileSync('git', args, { cwd: lane, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-    git(['clone', '--shared', '--no-checkout', process.cwd(), '.']);
+    // Clone a hermetic two-commit source repo (the keep-ref check below resets to HEAD~1), never process.cwd():
+    // a remote runner's work tree (Forge /srv/forge-exec/slot-N/.../work) is a file copy without .git.
+    const source = mkdtempSync(join(tmpdir(), 'deliver-item-wrapper-source-'));
+    onTestFinished(() => rmSync(source, { recursive: true, force: true }));
+    real.execFileSync('git', ['init', '-q'], { cwd: source, stdio: 'ignore' });
+    for (const message of ['base', 'head']) {
+      real.execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false',
+        'commit', '--allow-empty', '-qm', message], { cwd: source, stdio: 'ignore' });
+    }
+    git(['clone', '--shared', '--no-checkout', source, '.']);
     const sha = git(['rev-parse', 'HEAD']);
     const store = seedInFlightRun('refusal-4357');
     acquireBuildDispatchClaim({ num: '9001', scope: [] });

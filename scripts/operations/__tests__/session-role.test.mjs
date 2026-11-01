@@ -67,7 +67,10 @@ describe('every claude spawn site sets the marker', () => {
     const spawnFn = (_cmd, _argv, opts) => {
       seen = opts;
       const child = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), kill() {} });
-      queueMicrotask(() => child.emit('exit', 0, null));
+      queueMicrotask(() => {
+        child.emit('exit', 0, null);
+        child.emit('close', 0, null);
+      });
       return child;
     };
     await spawnAgentToCompletion(['-p', 'x'], {}, { spawnFn });

@@ -618,6 +618,19 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Stale abandonment publishes a complete marker before replacing the writer, under the shared status
+claim. Its intent binds the old writer digest, evidence digest, timestamp and the exact JSON bytes
+of the abandoned writer. Recovery may finish that intent only while those inputs still match;
+admission still requires the completed writer binding. Keep the atomic JSON rendering and digest
+in agreement. The persistence-boundary matrix in `review-recovery-witness.test.mjs` interrupts
+before/after each rename for queued/running owners and fresh/resume modes, then attempts admission
+twice. The dead-owner soak also interrupts after marker publication and requires one dispatch.
+Keep a named mutation row for each intent binding: old writer, evidence, expected writer and
+abandonment timestamp. Change the timestamp alone to exercise its digest binding; for a non-string
+timestamp, recompute the expected writer digest so the type guard is tested independently.
+The same suite exercises production carry-conflict selection and isolates each admission codec
+field and rollback identity check. Exact-head panel evidence takes precedence over a carry journal.
+
 The status writer may repair truncated JSON, null JSON or a mismatched identity only when no retry
 marker exists; readers still reject that evidence. The writer-contract table in
 `drain-red-team-evidence.test.mjs` covers queued, running, finished, fresh-retry and refund writes,
@@ -839,6 +852,14 @@ For filesystem settings and plain Node child imports, resolve paths with
 as browser asset URLs, which can become HTTP URLs under Vitest's DOM environment.
 Node's ESM loader refuses those URLs, and a settings read can silently fall back instead.
 Assert tool-layer provenance when testing a real default settings path.
+
+Async child output is complete at `close`; `exit` can precede the final stdout/stderr
+chunks. Exercise that ordering for success and failure with an injected child, alongside
+real-process tests. Keep timeout and output bounds active while draining pipes retained
+by descendants; reaching either bound must still reject the result.
+When updating the shared spawn wrapper, check every caller's injected child fixture:
+emit `close` after `exit` and the final output, and use real streams when the wrapper
+can destroy retained pipes. An exit-only fixture leaves the completion promise pending.
 
 `redTeam.statusLabels` defaults true through the same cascade as the probe controls, with
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
@@ -2250,6 +2271,53 @@ Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial compl
 separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
+
+For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
+arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
+or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
+Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-report guards,
+isolated retries and unsupported shell syntax stay local. Keep both planning and actual
+spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
+When a phase planned without a local slot exits non-zero without proven local execution,
+confirm it once locally through normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
+local timeout flags). Log the confirmation and use its result and failure details for the
+phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
+A valid `local-fallback` report already supplies the local verdict: preserve its exit code and
+failure details without another confirmation, including for edited tests and with isolated retry off.
+Untouched failing files remain eligible for the existing one-time isolated retry, which acquires
+its own local slot. The nested wrapper must report a local completion even when its policy/load
+decision changes after verify's remote preflight, or admission takes a bypass branch.
+The `proven local fallback verdict` regressions execute production `timedRunGate` with injected
+child IO for Vitest and standards under both admission modes, offering a passing second child
+to catch an unconditional retry into green.
+Only a remote-planned first attempt sets `WE_FORGE_GATE_DISPATCH`, without a held local slot.
+Local phases and confirmation clear even an inherited dispatch flag so nested wrappers cannot
+dispatch remotely while the local slot is held. Pin both environment shapes in the spawn fixture.
+Each attempt retains its own phase timeout and admission heartbeat. Remote green never
+reruns; watchdog timeouts and signal failures (including shell-inferred signals) retain their
+infrastructure verdict without local confirmation. Exit 124 never reruns and remains
+infrastructure/unconfirmed until an operator confirms remote termination. Cover green,
+red, 75 deferral, 124, watchdog timeouts, signals and local-planned red,
+including local confirmation failure and restoration of stripped flags in the spawn fixture.
+Set `WE_VERIFY_PHASE_ADMISSION` to `0`/`1` in fixtures and assert the recorded admission mode;
+`false`/`true` strings are ignored and can silently exercise the default twice.
+Wrapper eligibility checks the entire command: compound commands, redirections and shell
+expansions retain a local slot and `WE_HEAVY_ADMISSION_HELD` for their full execution scope.
+Direct wrapper paths must resolve to `scripts/readiness/heavy-admission.mjs` in the target
+checkout; foreign directories with the same suffix retain local admission.
+Keep the compound-wrapper table for both npm scripts and the direct heavy-admission wrapper,
+plus the native spawn regression that observes HELD on both the wrapper and following scanner.
+Plan each phase's own command even when admission spans the whole gate; never reuse an
+earlier phase's rewrite for standards, scanners or guards. Check all original arguments with
+Forge's existing `allowedCommand` guard. Unsupported flags, including `--passWithNoTests`,
+`--testTimeout` and `--hookTimeout`, keep the original command and local admission. Never strip
+flags to qualify a command for Forge: its nested wrapper may fall back locally, where losing
+the requested timeouts or empty-match behavior changes the verdict. Keep the timeout-preservation
+regression for both whole-gate and per-phase admission, including quoted flags. Remote location evidence
+requires a non-empty receipt ID and an integer exit code; a dispatched attempt with an incomplete or missing report is location `unknown` (never local), and any unknown phase makes the overall location unknown.
+Observe report reads in tests: reject an already oversized file before reading content, and
+request at most 65,537 bytes even if a regular file grows after its size check.
+Keep allowlisted reporters; unknown options retain the original local command and admission.
 
 The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
 without `telemetry.json`; it never returns a saved timestamp as evidence of current health.
@@ -4052,6 +4120,23 @@ indeterminate run must be inspected before starting a new pass. Focused proof li
 map coverage live in `runner-freshness.test.mjs` and `http-adapter.test.mjs`. `scripts/codemap.mjs`
 discovers script modules dynamically and has no hand-maintained operation list.
 
+## Raw red-team recovery witnesses (#7537)
+
+Recovery fixtures persist the panel read as a `review-pr` run and inject the scorecard store;
+`status.loopPayload` is deliberately truncated. Bind abandonment to raw writer bytes and seat/run
+evidence, then test mutations before queued admission. Never normalize the status in a reader.
+Inject raw witness/probe failures directly for liveness refusals; do not infer them from normalized drain flags.
+Only a raw `running` writer can infer an interrupted failure from a single failed seat and no result.
+A dead `queued` writer with an existing failed seat and no result must refuse planning, abandonment and admission
+without spending either marker; test null/missing results and zero/missing retry counts alongside running recovery.
+The dead-owner and skip-settlement breaks are discovered from disk and run with `vitest.soak.config.ts` using the shared repo registry.
+Status-write claims record the holder's PID, birth time, host and PID namespace. The recovery-witness
+fixtures cover reused PIDs in abandonment and every ordinary status write, live and unreadable
+identities, initialization grace, legacy numeric claims, and post-move identity verification.
+The dead-owner soak includes a 24-hour-old claim whose numeric PID is alive but whose birth time
+belongs to a dead owner; recovery must dispatch and publish exactly once. Preserve the numeric
+first line for older writers. Legacy claims with a live PID and no birth time remain protected;
+inspect the owner before manually removing such a claim, since age alone cannot prove it dead.
 ## Forge coverage timestamp parity
 
 Remote transport stubs must answer the worktree-binding probe before inventory or SSH;
@@ -4116,3 +4201,41 @@ projections: a non-test source can become a test under `tests/`, or acquire an
 excluded component. Rows 26–30 pin those refusals and benign nested omissions for
 full and delta manifests. Alias expansion shares the filesystem walk's limits and
 refuses with `manifest-walk-limit` (local fallback) when that budget is exhausted.
+
+
+## Forge ignored test discovery
+
+Git ignores and Vitest discovery do not establish that a file is unused. A selected
+`a.test.mjs` can import an ignored `b.test.mjs` even when filename filters, config excludes,
+workspace selection or include patterns omit `b.test.mjs` from `globTestFiles(filters)`.
+Static imports, re-exports, dynamic imports and imports through helpers all need the
+dependency bytes at execution time. Discovery alone is insufficient evidence for omission.
+
+Full and delta manifest admission therefore retain `ignored-test-file` local fallback for
+every ignored test-shaped file outside dependency/Git internals. The independent filesystem
+walk also refuses unshipped tests (`unshipped-test-file`) and ignored leaves projected into
+test paths by tracked directory aliases (`unshipped-symlink`), including nested aliases.
+No discovery result, argv, environment, warm base or retry exempts those checks. Until
+dependency inclusion can be established, use local execution through heavy admission.
+The refusal names the path; no remote prepare, transfer or execution follows it.
+
+`forge-test-selection.mjs` remains a bounded diagnostic of test entry points, separate from
+manifest admission. Its native child resolves the lane's Vitest and physical cwd, mirrors the
+CLI environment prelude and closes discovery without running tests. Its 60-second SIGKILL
+deadline, 4 MiB output bound and conservative error handling do not prove dependency closure.
+Keep the real-Vitest regression showing that an ignored dependency executes despite being
+absent from discovery, along with full/delta and pre-transport refusal tests for all import
+shapes and the filesystem/alias checks. Invalid environments continue to retain manifest
+refusal without launching discovery. Warm bases export tracked Git entries only, and policy
+exclusions still refuse test-shaped entries.
+
+A credential-named alias is refused like any excluded path. The one exemption is the
+`.claude/agent-memory/` bridge's exact image of a tracked `agent-memory-src/` source-extension
+file that itself passed the public-blob check; any other credential-named alias still refuses.
+Full/delta memory-bridge regressions also require index membership, matching public and index
+blobs, and matching working bytes. A deleted source contributes neither a source entry nor an alias.
+Review each exemption conjunct against a named fixture or an explicit upstream invariant.
+The projection's index, source-classification and source-entry checks repeat source-admission
+invariants: a credential source must pass the public-blob checks before entering the projection
+corpus. Do not claim independent mutation coverage for those redundant checks from a test
+that already refuses at source admission.

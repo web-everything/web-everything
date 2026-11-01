@@ -5,10 +5,11 @@
  * Admission runs against a REAL bare origin; only the detached seal launch is recorded.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cardIdOf, decideBatchFiling, fileIntoBatch, launchSealJob, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
+import { cardIdOf, decideBatchFiling, fileIntoBatch, freshMainBase, launchSealJob, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
 import { AI_TRAILER } from '../card-batch-io.mjs';
 import { sealDueBatches } from '../card-batch-seal-io.mjs';
 import { effectiveCardBatchPolicy, resolvePreventionBatchSettings, resolveCardBatchSettings } from '../../lib/card-batch-settings.mjs';
@@ -101,6 +102,121 @@ describe('fileIntoBatch against a real origin', () => {
       expect([ra.batched, rb.batched]).toEqual([true, true]);
       const tree = ctx.git(['--git-dir', ctx.origin, 'ls-tree', '-r', '--name-only', 'lane/card-batch-filing-1', 'backlog/']).trim().split('\n');
       expect(tree.sort()).toEqual([a, b].sort());
+    });
+  }, 60_000);
+
+  it('a run of admissions in one lane fetches origin/main once per freshness window, not once per card', async () => {
+    await withNarrowClone(async (ctx) => {
+      const trace = join(tempDir(), 'trace2.jsonl');
+      const prior = process.env.GIT_TRACE2_EVENT;
+      process.env.GIT_TRACE2_EVENT = trace;
+      const fetchesOfMain = () => {
+        let text = '';
+        try { text = readFileSync(trace, 'utf8'); } catch { return 0; }
+        return text.split('\n').filter((l) => l.includes('"event":"start"'))
+          .filter((l) => JSON.parse(l).argv.slice(1).join(' ') === 'fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main').length;
+      };
+      const bases = [];
+      const admit = async (input) => { bases.push(input.baseSha); return { action: 'refuse', reason: 'head-mismatch' }; };
+      const deps = { admit, launch: () => {}, stateDir: tempDir(), log: () => {}, settings: settingsWith() };
+      try {
+        for (const id of ['xfffff1', 'xfffff2', 'xfffff3', 'xfffff4']) {
+          await fileIntoBatch({ laneDir: ctx.clone, cardPath: writeCard(ctx.clone, id), source: { repo: 'org/repo' } }, deps);
+        }
+      } finally {
+        if (prior === undefined) delete process.env.GIT_TRACE2_EVENT; else process.env.GIT_TRACE2_EVENT = prior;
+      }
+      expect(bases).toHaveLength(4);
+      expect(new Set(bases)).toEqual(new Set([ctx.git(['rev-parse', 'origin/main']).trim()]));
+      expect(fetchesOfMain()).toBe(1);
+    });
+  }, 60_000);
+
+  it('freshMainBase invalidates its caller cache when effective Git configuration changes', async () => {
+    await withNarrowClone(async (ctx) => {
+      const mirror = join(tempDir(), 'mirror');
+      ctx.git(['clone', '-q', ctx.origin, mirror]);
+      const file = join(mirror, 'mirror-only');
+      writeFileSync(file, 'mirror');
+      ctx.git(['-C', mirror, 'add', 'mirror-only']);
+      ctx.git(['-C', mirror, 'commit', '-qm', 'mirror']);
+      const mirrorSha = ctx.git(['-C', mirror, 'rev-parse', 'main']).trim();
+      let overrides = {};
+      const run = (cwd, args) => execFileSync('git', args, {
+        cwd, env: { ...process.env, ...overrides }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      const opts = { run, now: () => 1000, cache: new Map(), maxAgeMs: 60_000 };
+      expect(freshMainBase(ctx.clone, opts)).not.toBe(mirrorSha);
+      overrides = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${mirror}.insteadOf`, GIT_CONFIG_VALUE_0: ctx.origin };
+      expect(run(ctx.clone, ['remote', 'get-url', 'origin'])).toBe(mirror);
+      expect(freshMainBase(ctx.clone, opts)).toBe(mirrorSha);
+      overrides = {};
+      expect(freshMainBase(ctx.clone, opts)).toBe(ctx.git(['rev-parse', 'HEAD']).trim());
+    });
+  }, 60_000);
+
+  it('freshMainBase refetches once the window passes, and never caches a failed fetch', async () => {
+    await withNarrowClone(async (ctx) => {
+      let t = 0;
+      const calls = [];
+      let failFetch = false;
+      let sha = 'a'.repeat(40);
+      const run = (cwd, args) => {
+        calls.push(`${cwd}:${args[0]}`);
+        if (args[0] === 'fetch' && failFetch) throw new Error('offline');
+        if (args[0] === 'remote') return ctx.origin;
+        if (args[0] === 'config') return `remote.origin.url\n${ctx.origin}\0`;
+        return args[0] === 'rev-parse' ? sha : '';
+      };
+      const opts = { run, now: () => t, cache: new Map(), maxAgeMs: 1000 };
+      const fetches = () => calls.filter((c) => c.endsWith(':fetch')).length;
+      expect(freshMainBase(ctx.clone, opts)).toBe(sha);
+      t = 999; sha = 'b'.repeat(40);
+      expect(freshMainBase(ctx.clone, opts)).toBe('a'.repeat(40));
+      expect(fetches()).toBe(1);
+      t = 1000;
+      expect(freshMainBase(ctx.clone, opts)).toBe('b'.repeat(40));
+      expect(fetches()).toBe(2);
+      expect(freshMainBase('/lane-b', opts)).toBe('b'.repeat(40));
+      expect(fetches()).toBe(3);
+      failFetch = true; t = 5000;
+      expect(freshMainBase(ctx.clone, opts)).toBe('b'.repeat(40));
+      expect(freshMainBase(ctx.clone, opts)).toBe('b'.repeat(40));
+      expect(fetches()).toBe(5);
+      failFetch = false;
+      freshMainBase(ctx.clone, opts); freshMainBase(ctx.clone, opts);
+      expect(fetches()).toBe(6);
+    });
+  }, 60_000);
+
+  it.each(['throw', 'empty', 'legacy'])('freshMainBase refuses unproved caller-cache identity: %s', async (mode) => {
+    await withNarrowClone(async (ctx) => {
+      const oldSha = 'a'.repeat(40);
+      const newSha = 'b'.repeat(40);
+      const cache = new Map();
+      let sha = oldSha;
+      let unprovable = false;
+      let fetches = 0;
+      const run = (cwd, args) => {
+        if (args[0] === 'remote') {
+          if (unprovable && mode === 'throw') throw new Error('URL unreadable');
+          return unprovable && mode === 'empty' ? '' : ctx.origin;
+        }
+        if (args[0] === 'fetch') fetches += 1;
+        if (args[0] === 'config') return `remote.origin.url\n${ctx.origin}\0`;
+        return args[0] === 'rev-parse' ? sha : '';
+      };
+      const opts = { run, now: () => 1000, cache, maxAgeMs: 60_000 };
+      expect(freshMainBase(ctx.clone, opts)).toBe(oldSha);
+      if (mode === 'legacy') cache.set(ctx.clone, { at: 1000, sha: oldSha });
+      unprovable = true; sha = newSha; fetches = 0;
+      expect(freshMainBase(ctx.clone, opts)).toBe(newSha);
+      expect(fetches).toBe(1);
+      if (mode !== 'legacy') {
+        expect(cache.has(ctx.clone)).toBe(false);
+        expect(freshMainBase(ctx.clone, opts)).toBe(newSha);
+        expect(fetches).toBe(2);
+      }
     });
   }, 60_000);
 
