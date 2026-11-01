@@ -1,9 +1,9 @@
 ---
 kind: story
 size: 8
-parent: "xjba691"
+parent: "7583"
 status: open
-blockedBy: ["xjba691"]
+blockedBy: ["7583"]
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/forge-gate-options.mjs"]
 dateOpened: "2026-11-01"
 tags: []
