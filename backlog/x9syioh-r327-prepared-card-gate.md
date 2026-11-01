@@ -5,8 +5,6 @@ status: active
 scaffoldedBy: "r327-cards-ab-lane-26-fb353f00"
 dateScaffolded: "2026-11-01"
 dateOpened: "2026-11-01"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "efcde8598ff71c020c47fa7eba2ae2471d35dd6f"
 tags: []
 ---
 
