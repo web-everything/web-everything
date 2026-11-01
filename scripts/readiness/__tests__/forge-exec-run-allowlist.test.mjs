@@ -41,4 +41,7 @@ describe('runner allowlist widening', () => {
       await expect(runner.assertContained(work, ['npx','vitest','run','--outputFile.json=new/r.json','a.test.mjs'])).resolves.toBeUndefined();
     } finally { await rm(root, {recursive: true, force: true}); }
   });
+  it('refuses a config together with a report path, since a config can move the reporter root', () => {
+    expect(allowedCommand(['npx','vitest','run','--config','vitest.soak.config.ts','a.test.mjs','--reporter=json','--outputFile.json=r.json'])).toBe(false);
+  });
 });

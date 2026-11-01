@@ -73,6 +73,8 @@ export function allowedCommand(argv) {
     // Vitest reparses dash-prefixed -t values as options (including --help).
     if (arg === '-t' && (++i >= argv.length || argv[i].startsWith('-'))) return false;
   }
+  // A config can move vitest's root, so a report path is only trustworthy without one.
+  if (argv.includes('--config') && argv.some(a => a.startsWith('--outputFile.json='))) return false;
   try { validateTestNames(files); } catch { return false; }
   if (npx && (!files.length || (argv[2] === 'related' && !argv.includes('--run')))) return false;
   return true;
@@ -732,7 +734,8 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
   // R335: the widened flags name paths; refuse any whose existing components are links (checked after
-  // install, immediately before the test command). A missing tail is fine: vitest creates real dirs.
+  // install, immediately before the test command). Writes later still run as the slot's own worker uid,
+  // which can touch nothing beyond what test code could already write. A missing tail is fine: vitest creates real dirs.
   async function assertContained(work,argv) {
     const paths=[];
     for(let i=0;i<argv.length;i++) {
