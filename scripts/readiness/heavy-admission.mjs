@@ -895,6 +895,8 @@ export async function runWithRemoteDecision({
     });
     const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
     const result = await Promise.race([remote, timeout, signalPromise]);
+    // A kill that lands while the result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
+    const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
       let cancelTimer;
@@ -924,15 +926,17 @@ export async function runWithRemoteDecision({
       if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
         await record({mode:'unconfirmed'});
-        return refuseLocal('remote-timeout');
+        return killedExit() ?? refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
       terminated = true;
       await record(termination);
+      if (killedExit()) return killedExit();
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
       await record(result);
+      if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.

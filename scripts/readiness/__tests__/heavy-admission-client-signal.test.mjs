@@ -91,3 +91,11 @@ describe('heavy-admission client signals during the timeout grace', () => {
     expect(existsSync(marker(f.cwd))).toBe(false);
   });
 });
+
+describe('heavy-admission client signals racing completion', () => {
+  it('a kill racing a finished remote run exits with the signal code and clears the finished marker', async () => {
+    const f = fixture(vi.fn(async () => { process.emit('SIGTERM'); return {mode: 'cancelled', terminated: true, reason: 'x'}; }));
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 143, signal: 'SIGTERM'});
+    expect(existsSync(marker(f.cwd))).toBe(false);
+  });
+});
