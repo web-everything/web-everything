@@ -51,13 +51,16 @@ function ghStub({ heads = {}, views = {}, xrefs = {}, fail = false } = {}) {
 
 /** A merged cross-referencing PR of this repo, merged into main at `mergeCommit`. */
 const src = (number, body, mergeCommit) => ({ number, merged: true, body, baseRefName: 'main',
+  author: { login: 'web-everything' }, mergedAt: '2026-11-01T01:00:00Z', lastEditedAt: null, editor: null,
   repository: { nameWithOwner: 'web-everything/web-everything' }, mergeCommit: { oid: mergeCommit } });
 const plan = (r, rows, gh) => planRetirements({ rows, git: r.git, gh, repo: 'web-everything/web-everything' });
 
 describe('declaresSupersedes / mergeRefBase', () => {
   it('matches only an explicit Supersedes line for the exact PR number', () => {
     expect(declaresSupersedes('Body\nSupersedes #6056 (close after this lands).', 6056)).toBe(true);
-    expect(declaresSupersedes('- supersedes: #12, #6056', 6056)).toBe(true);
+    expect(declaresSupersedes('**Supersedes:** #12, #6056', 6056)).toBe(true);
+    // Share the conveyor's explicit, case-sensitive declaration grammar.
+    expect(declaresSupersedes('- supersedes: #12, #6056', 6056)).toBe(false);
     expect(declaresSupersedes('Supersedes #60561', 6056)).toBe(false);
     expect(declaresSupersedes('no port of #6056 diff', 6056)).toBe(false);
     expect(declaresSupersedes('This is not superseding anything. See #6056', 6056)).toBe(false);
@@ -65,6 +68,28 @@ describe('declaresSupersedes / mergeRefBase', () => {
   it('maps loader merge refs to their branch', () => {
     expect(mergeRefBase('lane/x-m12')).toBe('lane/x');
     expect(mergeRefBase('lane/x')).toBe(null);
+  });
+  it.each([
+    'Supersedes #10 (does not supersede #9)',
+    'Supersedes #10, #11 and #12; excludes #9',
+    '```md\nSupersedes #9\n```',
+    '~~~\nSupersedes #9\n~~~',
+    '    Supersedes #9',
+    '`example\nSupersedes #9\n`',
+    '<!--\nSupersedes #9\n-->',
+    '<pre>\nSupersedes #9\n</pre>',
+    '~~Supersedes #9~~',
+    '> Supersedes #9',
+    'Supersedes #90',
+    'Supersedes #9x',
+    'Supersedes #10\u2028Supersedes #9',
+    'Supersedes #10\u200b #9',
+    'Ｓupersedes #9',
+    'Supersedes -- #9',
+    'Supersedes "#9"',
+    'Supersedes ../#9',
+  ])('ignores a target outside an actual visible declaration: %s', (body) => {
+    expect(declaresSupersedes(body, 9)).toBe(false);
   });
 });
 
@@ -158,6 +183,16 @@ describe('planRetirements', () => {
     ['another repository', { repository: { nameWithOwner: 'someone/fork' } }],
     ['a non-main base', { baseRefName: 'lane/x' }],
     ['a merge commit not on main', { mergeCommit: { oid: 'e'.repeat(40) } }],
+    ['an explicitly excluded target', { body: 'Supersedes #10 (does not supersede #9)' }],
+    ['a fenced example', { body: '```md\nSupersedes #9\n```' }],
+    ['an outside contributor', { author: { login: 'outside-contributor' } }],
+    ['a missing author', { author: undefined }],
+    ['a deleted author', { author: null }],
+    ['a malformed author', { author: { login: 7 } }],
+    ['a forged app operator', { author: { login: 'app/chalbert', is_bot: true } }],
+    ['an outside post-merge editor', { lastEditedAt: '2026-11-01T02:00:00Z', editor: { login: 'outside-contributor' } }],
+    ['an unknown post-merge editor', { lastEditedAt: '2026-11-01T02:00:00Z', editor: null }],
+    ['an unreadable edit timestamp', { lastEditedAt: 'unknown' }],
   ])('never retires on a Supersedes line from %s', (_label, override) => {
     const r = repo();
     const base = r.ok('rev-parse', 'HEAD');
@@ -173,6 +208,29 @@ describe('planRetirements', () => {
       xrefs: { 9: [{ ...src(12, 'Supersedes #9', main), ...override }] },
     });
     expect(plan(r, [{ ref: 'lane/old', pr: null }], gh)[0]).toMatchObject({ action: 'keep', reason: 'unique-commits-not-on-main' });
+  });
+
+  it.each([
+    [{ login: 'web-everything' }, null, null],
+    [{ login: 'chalbert' }, '2026-11-01T02:00:00Z', { login: 'chalbert' }],
+    [{ login: 'web-everything[bot]' }, '2026-11-01T00:00:00Z', { login: 'outside-contributor' }],
+  ])('accepts trusted superseders and reads GitHub authorship and edit evidence (%j)', (author, lastEditedAt, editor) => {
+    const r = repo();
+    const base = r.ok('rev-parse', 'HEAD');
+    const tip = r.commit('x.txt', 'unmerged work\n');
+    r.setRemote('main', base);
+    r.setRemote('lane/old', tip);
+    const { gh, calls } = ghStub({
+      heads: { 'lane/old': { number: 9, state: 'CLOSED' } },
+      views: { 9: { commits: [{ oid: tip }] } },
+      xrefs: { 9: [{ ...src(12, '### **Supersedes:** #10, #9 and #11 (replacement)', base), author, lastEditedAt, editor }] },
+    });
+    expect(plan(r, [{ ref: 'lane/old', pr: null }], gh)[0]).toMatchObject({ action: 'retire', reason: 'superseded' });
+    const query = calls.find((args) => args[0] === 'api').find((arg) => arg.startsWith('query='));
+    expect(query).toMatch(/author\s*\{\s*login\s*\}/);
+    expect(query).toMatch(/editor\s*\{\s*login\s*\}/);
+    expect(query).toContain('mergedAt');
+    expect(query).toContain('lastEditedAt');
   });
 
   it('never retires a commit that only looks patch-equivalent to main', () => {

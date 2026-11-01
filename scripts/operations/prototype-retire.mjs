@@ -9,7 +9,8 @@
  *   - `in-main` / `pr-merged`: merging it onto main changes nothing (exact tree compare, so any history shape:
  *     merged, squash-merged, or a loader `-m<N>` merge ref of a merged branch).
  *   - `superseded`: its PR is CLOSED unmerged, a MERGED PR of the same repository, merged into main and reachable
- *     from main, cross-references it and says `Supersedes #N` in its body, and every non-merge commit the
+ *     from main, cross-references it and declares `Supersedes #N` in visible prose. Its author and any post-merge
+ *     body editor must be trusted (supersede-rule.mjs). Every non-merge commit the
  *     registration carries beyond main is one of that closed PR's own commits (merges must be clean or the PR's own).
  *     Those commits are not on main, but the merged superseder replaced them on main: that is the declared exception.
  * A flag-pinned registration of a CLOSED PR is kept (as in the rebuild), and so is one with an approved edge
@@ -17,14 +18,15 @@
  * never dropped. An unreadable git or GitHub answer keeps it too.
  * All IO is injected: `git(args)` and `gh(args)` return `{ code, stdout }`.
  */
+import { parseSupersedes, isTrustedSupersedeAuthor, isBodyEditedAfterMergeByUntrusted } from '../conveyor/supersede-rule.mjs';
 
 const SHA = /^[a-f0-9]{40}$/;
 const lines = (text) => String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
-/** Supersession line in a merged PR body: `Supersedes #N`, optionally among other numbers on the same line. */
+/** Use the same visible declaration target list as the conveyor; code and trailing prose confer no authority. */
 export function declaresSupersedes(body, pr) {
   if (!Number.isInteger(pr)) return false;
-  return new RegExp(String.raw`^[\s>*_-]*supersedes\b:?[^\n]*#${pr}(?!\d)`, 'im').test(String(body || ''));
+  return parseSupersedes(body).includes(pr);
 }
 
 /** The branch a loader merge ref (`<branch>-m<N>`) was built from, or null. */
@@ -90,18 +92,20 @@ function findPr({ gh, row, repo }) {
   return { ok: true, pr: null };
 }
 
-/** A MERGED PR of this repo, merged into main and on `mainRef`, that cross-references `pr` and says `Supersedes #pr`. */
+/** A trusted MERGED PR of this repo, on `mainRef`, that cross-references `pr` and declares `Supersedes #pr`. */
 function findSuperseder({ gh, git, pr, repo, mainRef }) {
   const [owner, name] = String(repo || '').split('/');
   if (!owner || !name) return { ok: false };
   const query = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){'
     + 'timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){nodes{... on CrossReferencedEvent{source{'
-    + '... on PullRequest{number merged body baseRefName repository{nameWithOwner} mergeCommit{oid}}}}}}}}}';
+    + '... on PullRequest{number merged body author{login} mergedAt lastEditedAt editor{login} '
+    + 'baseRefName repository{nameWithOwner} mergeCommit{oid}}}}}}}}}';
   const refs = ghJson(gh, ['api', 'graphql', '-f', `query=${query}`, '-F', `o=${owner}`, '-F', `r=${name}`, '-F', `n=${pr}`]);
   const nodes = refs.ok ? refs.value?.data?.repository?.pullRequest?.timelineItems?.nodes : null;
   if (!Array.isArray(nodes)) return { ok: false };
   const mainBranch = mainRef.replace(/^origin\//, '');
   const hit = nodes.map((node) => node?.source).find((src) => src?.merged === true && Number.isInteger(src.number)
+    && isTrustedSupersedeAuthor(src) && !isBodyEditedAfterMergeByUntrusted(src)
     && src.number !== pr && declaresSupersedes(src.body, pr)
     // `#N` in another repository's PR names that repository's PR N, not this one.
     && String(src.repository?.nameWithOwner || '').toLowerCase() === String(repo).toLowerCase()

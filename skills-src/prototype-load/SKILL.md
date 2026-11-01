@@ -20,7 +20,7 @@ node scripts/operations/run.mjs prototype-load --daemon=<name> --retire --dry-ru
 ```
 
 - `--replace` registers the new top and drops the old one in one loader command (`daemon-overlay.mjs replace`), only when every commit of the old ref is an ancestor of the new tip. Otherwise it stops as `replace-not-contained` and changes nothing. This is the only safe way to take an old top out before adoption.
-- Every run first retires registrations proved dead (`prototype-retire.mjs`): `in-main`/`pr-merged` (everything it carries is already on main) or `superseded` (its PR is closed, a merged PR says `Supersedes #N`, and it carries only that PR's commits). Each one leaves an `auto-retired` event. A registration with work that is not on main, and not replaced by a merged superseder, is never dropped.
+- Every run first retires registrations proved dead (`prototype-retire.mjs`): `in-main`/`pr-merged` (everything it carries is already on main) or `superseded` (its PR is closed, a merged PR from a trusted author declares `Supersedes #N` in visible prose, and it carries only that PR's commits). Declaration parsing and post-merge body editor checks follow `supersede-rule.mjs`; code examples and PR numbers in trailing prose do not count. Each one leaves an `auto-retired` event. A registration with work that is not on main, and not replaced by a merged superseder, is never dropped.
 
 If there is no ready record for the sha (`~/workspace/.operations/coordination/fix-ready.jsonl`), pass `--tests-run=<id> --audit="NOT WEAKENED"` instead.
 
