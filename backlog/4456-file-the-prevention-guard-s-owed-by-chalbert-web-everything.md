@@ -4,65 +4,61 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules*.test.mjs", "we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs"]
+scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-10-08"
-preparedAgainstSha: "873a1869f903e11c1581cb21e74d0619136c7adb"
+preparedDate: "2026-11-01"
+preparedAgainstSha: "7a8f51570435bc14cb2e13114cb1c7484119daf4"
 tags: []
 ---
 
 # File the prevention guard(s) owed by chalbert/web-everything#2871's independent review
 
-Close the frontmatter-prevention debt recorded on approval of #2871: require points on childless epics and reject obsolete classification fields using the current canonical `kind` schema. Extend the existing standards validators and add regression coverage; the two reviewed cards are provenance, not the implementation scope.
+Close the remaining frontmatter-prevention debt from #2871: reject the retired `workItem` field using the canonical `kind` schema. Add a raw-frontmatter standards guard, regression coverage, and remove the redundant legacy field from the one remaining card. Epic sizing is excluded by the recorded operator ruling.
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2871@4fc1a8ca300c9f3e20d92ae2ed704339ef026ff2
 
 ## Progress
 
-- Prepare-validation repair: the previous scope included the frontmatter regression home but omitted the required matching rules-test pattern. Added we:scripts/__tests__/check-standards-rules*.test.mjs; the existing we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs:7 imports the validator, and :34 covers kind/size behavior. The implementation goal and size 3 remain unchanged.
-- Original premise: the approval requested a missing-size guard for childless epics and a validator requiring `workItem` while rejecting `kind`. Original scope contained only we:backlog/4376-delivery-policy-as-configurable-dimensions-product-shape.md and we:backlog/4375-capture-github-cost-headers-on-the-daemons-own-gh-calls.md; their cited lines 1 and 2 identify frontmatter, not validator implementation.
-- Corrected premise: `kind` is canonical, so the second guard must require `kind` and reject retired `workItem`, not reverse the migration. Evidence: we:scripts/backlog/migrate-kind.mjs:5 documents the conversion; we:scripts/check-standards-rules.mjs:375 already requires `kind`, and :386 validates its enum. The current classification requirement is therefore partly delivered, not an outstanding schema replacement.
-- Remaining sizing gap: we:scripts/check-standards-rules.mjs:454 validates Fibonacci values and requires story sizes, but does not require a childless epic's size. The settled two-state rule is in we:docs/agent/backlog-workflow.md:178; any child, including a task, makes an epic sliced. The collection context already exposes parent edges at we:scripts/check-standards.mjs:848. Determine children from those edges, never prose or an invented child-list field.
-- Corrected scope: the two validator source files and their matching tests listed in frontmatter. Existing pure regression home: we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs:24. Planned gate integration home: we:scripts/__tests__/check-standards-backlog-schema.test.mjs. Raw YAML is already available in the standards gate at we:scripts/check-standards.mjs:1039, allowing obsolete-field checks before loader normalization can hide them.
-- Size retained at 3: bounded validation, gate wiring, and fixture coverage at the seams above. No schema-policy reversal, corpus point estimation, or runtime changes are part of this item. Preparation is source inspection; no implementation or test result is claimed.
+- Original premise/scope: require childless-epic points and reverse the classification migration; the original touch set named only the two reviewed provenance cards. The previous preparation corrected the canonical axis but retained conflicting epic-size requirements, broad test paths, and a proposal to run the old migration script.
+- Recorded operator ruling (2026-10-13): drop the epic-size guard and retain only the `workItem` guard. This preparation applies that ruling consistently; no sizing policy is being chosen or changed.
+- Current evidence: we:scripts/check-standards-rules.mjs:505 already requires `kind`, and we:scripts/check-standards-rules.mjs:516 rejects invalid values. Searching both standards source files finds no authored-`workItem` rejection. The raw parse seam is now we:scripts/check-standards.mjs:1060 (previously cited as line 1039); its scope-absent early exit at we:scripts/check-standards.mjs:1067 makes placement before that exit essential. Malformed YAML is independently reported at we:scripts/check-standards.mjs:1000.
+- Corpus correction: the remaining occurrence is we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md:3, immediately after canonical `kind: epic` on line 2. It is resolved, so the new guard must cover resolved cards too. Remove only its redundant field during implementation. Do not run we:scripts/backlog/migrate-kind.mjs:70: its anchor/drop logic retains an existing `kind` line while emitting another, creating duplicate keys for this mixed-field input.
+- Corrected scope: two validator sources, two planned matching regression files, and that one corpus repair. Existing we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs:5 and we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs:34 remain unchanged compatibility checks. The disposable real-gate pattern exists at we:scripts/__tests__/check-standards.test.mjs:639; the new integration file is not yet present.
+- Size remains 3: approximately 20–35 changed lines in the pure rule, 10–20 in gate wiring, 70–100 in pure regressions, 100–150 in disposable gate regressions, and one removed corpus line (five-file touch set, about 201–306 lines). Integration setup and full/local gate coverage dominate the estimate. This is a story; no estimatedLoc is added. Preparation stamps are left to the runner. No implementation or passing regression is claimed.
 
 ## Design
 
-Extend the existing pure validation surface in we:scripts/check-standards-rules.mjs, rather than introducing a second YAML parser or a general schema framework. Keep the existing required-`kind` and enum checks. Add a raw-frontmatter check that rejects an authored `workItem` key even alongside a valid `kind`; use own-key presence so empty/null values cannot evade detection. Run it over successfully parsed YAML in we:scripts/check-standards.mjs. Preserve existing malformed-YAML diagnostics.
+Add a pure retired-field validator in we:scripts/check-standards-rules.mjs accepting parsed raw frontmatter. Detect own-key presence of `workItem`, regardless of value or accompanying `kind`. Emit an error with the card path, field, and a stable `backlog-retired-field` descriptor; explain that the author must retain or supply canonical `kind` and remove `workItem`. Do not infer a new classification from conflicting fields.
 
-For an epic, derive child existence from the complete collection's `parent` edges, normalizing IDs to strings. Require an existing allowed Fibonacci size when there are no children. Enforce the complementary documented rule that an epic with any child has no size. Do not infer children from narrative promises, count only open children, or exempt resolved children. Leave other kinds' sizing rules intact. Diagnostics identify the card and offending field and explain the structural correction; they must not choose a point estimate for an author.
+Wire it into the existing raw-frontmatter loop in we:scripts/check-standards.mjs before any scope-related early return. Apply to all successfully parsed cards, including resolved cards and cards without scope, consistent with that loop's existing full-collection behavior even under local mode. Keep existing required-kind/enum checks and parse-error reporting. Malformed YAML must still fail the gate rather than being treated as evidence of valid schema; unreadable files must not silently become a clean retired-field result. Avoid adding another catch-and-continue read path.
 
-## Operator ruling (2026-10-13 ~13:40 ET): re-scoped to the retired-field guard only
-
-The prepare was blocked as a spec-defect. The operator said "ok" to re-scoping: **drop the epic-size guard entirely and keep only the `workItem` guard.**
-
-- The "sliced epic has no size" half is already enforced by the standards gate.
-- The "childless epic must have a size" half reverses the slicing rule. A sub-epic slice is deliberately scaffolded with no size, because an epic is decomposed, never built directly (we:skills-src/split-backlog-item/SKILL.md, "Sub-epic slice").
-- Every epic-size item in Design, Test plan and Done when below is therefore out of scope. Only the `workItem` parts remain.
+The changed default is that previously tolerated `workItem` now fails standards validation. Remove only that field from we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md. Preserve its canonical classification and all other content. No new runtime settings, parser, epic sizing rule, or broad obsolete-field policy is introduced.
 
 ## MVP
 
-1. **Must 1 (was Must 2):** The standards gate rejects an authored retired `workItem` key, including when a valid `kind` coexists. Required-`kind` and enum checks and malformed-YAML handling keep their behaviour. The one card on main that still carries `workItem` is migrated in the same change, using we:scripts/backlog/migrate-kind.mjs.
-2. **Must 2 (was Must 3):** Pure fixtures and one gate integration regression cover the guard, with a named diagnostic and a failing exit status. Tests mutate no production backlog cards.
+1. Reject authored `workItem` for legacy-only and mixed-field cards, including empty/null/false values and resolved cards, with an actionable named error.
+2. Call the rule from the real standards gate before scope filtering; preserve canonical-kind and malformed-YAML failures.
+3. Remove the known redundant corpus field and add isolated pure and real-gate regression fixtures. Production cards are never mutated by tests.
+
+## Acceptance
+
+- [A1] Executable — planned `rejects every authored workItem value` test in we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs fails against the old validator and passes with the guard. Table cases cover legacy-only, mixed fields, null, empty string, false, object, and resolved status; paired canonical-only controls stay clean.
+- [A2] Executable — planned `enforces retired fields before scope exits in full and local gates` test in we:scripts/__tests__/check-standards-backlog-schema.test.mjs fails before wiring and passes after. Real CLI runs cover a scope-less resolved card and a scoped open card, assert nonzero exit plus `backlog-retired-field` and the fixture path, then remove only the legacy key and assert that finding disappears. Include an unselected legacy card in local mode to pin the existing collection-wide loop behavior.
+- [A3] Executable — planned `legacy rejection preserves classification and parse failures` test in we:scripts/__tests__/check-standards-backlog-schema.test.mjs fails before the guard because mixed-field rejection is absent, and passes after. In the same regression matrix, missing/invalid kind and malformed YAML retain their specific failures; duplicate-key input remains a parse failure. This pins fail-closed parsing and the unchanged callers' diagnostics together with the new guarantee.
+- [A4] Executable — planned `canonical corpus card has no retired field` test in we:scripts/__tests__/check-standards-backlog-schema.test.mjs parses we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md and asserts exactly one `kind: epic`, absent own `workItem`, and resolved status. It fails on the current card and passes after the one-line migration.
 
 ## Test plan
 
-- Extend the matching rules suite under we:scripts/__tests__/check-standards-rules*.test.mjs for kind/size regressions, including we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs; retain its existing investigation-without-size acceptance case.
-- Extend we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs for the rules source: childless epic missing/valid/non-Fibonacci size; sized and unsized epics with story or task children; resolved children still counted; numeric/string parent IDs; unrelated parents; unchanged story/task/decision/feature/investigation behavior.
-- In the same existing test file cover missing/invalid/valid `kind`, legacy-only `workItem`, both fields, and null/empty legacy values. Keep malformed-YAML cases passing.
-- Add we:scripts/__tests__/check-standards-backlog-schema.test.mjs for we:scripts/check-standards.mjs: run the real gate in a disposable fixture checkout, verify invalid fixtures produce the specific diagnostic and nonzero exit, then correct only the offending fields and verify those diagnostics disappear. Isolate unrelated baseline failures; a nonzero exit alone is not evidence of this guard.
-- Run focused Vitest files and `npm run check:standards` only through the host heavy-run queue, via we:scripts/readiness/heavy-admission.mjs. The runner owns preparation-time checks; these are implementation acceptance checks.
+Implement the named A1–A4 tests in the two new scoped files. Use the disposable checkout approach from we:scripts/__tests__/check-standards.test.mjs; copy the working validator sources into the checkout so tests exercise uncommitted implementation rather than only HEAD. Use task-provided temporary storage, bounded child-process output/timeouts, and cleanup in finally. Run actual gate producers, not source-text matching or fabricated diagnostics. Keep fixture runs sequential under the outer heavy admission.
+
+Run the two new suites plus unchanged we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs and we:scripts/__tests__/check-standards-rules-kind-axis.test.mjs through we:scripts/readiness/heavy-admission.mjs using its `run --wait-ms=60000 --` arguments followed by `npx vitest run` and those paths with the `we:` locus stripped at execution. Then run `npm run check:standards` through the same queue. Wait once if busy and report the queue outcome; do not poll. The runner owns preparation-time checks; these are build acceptance commands.
 
 ## Proof plan
 
-Record red/green output for each new regression: run the added tests against the pre-change validator/gate, then the implementation. Temporarily remove each new guard independently in a disposable checkout and demonstrate that its matching test fails; restoring it must pass. For the gate integration, retain the fixture frontmatter, exit code, and named diagnostic before/after correction. Run the full standards gate through the heavy queue and report any pre-existing corpus violations separately, without assigning arbitrary sizes or broadening this card into backlog cleanup.
-
-## Done when
-
-1. **Executable — Must 1 and Must 2:** The queued focused suite exercises the invalid and valid shapes in the Test plan, and the real gate emits the expected diagnostics for invalid fixtures.
-2. **Executable — Must 3:** The queued integration regression and independent guard-removal checks prove both guards are wired into the gate; the full standards check result is recorded with any unrelated baseline failures explicitly identified.
+Save red/green output for A1–A4 using the added tests first with the pre-build sources/corpus and then with the implementation. Prove wiring by removing only the new gate call in a disposable checkout: A2 must fail while pure A1 remains green. Restore it and record passing focused results. For each real-gate fixture retain argv, exit status, card text, and the specific diagnostic before/after correction. A nonzero exit alone proves nothing; unrelated baseline findings must be reported separately. Record the queued standards result and confirm the final implementation diff touches only its declared scope.
 
 ## Follow-ups
 
-- If the full-corpus run reveals unsized childless epics, report their IDs for author sizing or slicing in a separate cleanup item; this preparation does not choose their estimates or alter the two historical review cards.
-- Broader schema-framework adoption and scoped-linter parity are separate work. This item's acceptance remains the approval's standards-gate prevention debt, translated to the current schema.
+- Epic sizing is outside this item under the recorded ruling; do not file speculative sizing cleanup as a condition of completion.
+- Broader retired-field policy, scoped-linter parity, and repair of the old migration utility are separate work. This implementation uses a one-line corpus edit and does not depend on that utility.
+- Report any newly discovered corpus occurrences for explicit scope adjustment; do not silently migrate unrelated cards or choose their classifications.
