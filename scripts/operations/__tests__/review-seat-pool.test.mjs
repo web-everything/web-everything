@@ -1,5 +1,5 @@
 import { it, expect, afterEach, beforeEach } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, renameSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -163,6 +163,21 @@ it('refuses a store whose objects are redirected or borrowed, and never fetches 
   const moved = join(pool, 'objects.real'); renameSync(objects, moved); symlinkSync(join(lane, '.git', 'objects'), objects);
   expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow(/private directory/);
   expect(readdirSync(join(lane, '.git', 'objects')).length).toBeGreaterThan(0);
+});
+
+it('skips a released slot a surviving process still sits in, and rejects links inside object storage', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const sitter = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 30000)'], { cwd: a.slotDir, stdio: 'ignore' });
+  try {
+    const b = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
+    expect(b.slotDir).not.toBe(a.slotDir);
+    expect(existsSync(join(pool, 'locks', 'slot-1'))).toBe(false);
+    b.release();
+  } finally { sitter.kill(); }
+  const fan = readdirSync(join(pool, 'repo.git', 'objects')).find((n) => /^[0-9a-f]{2}$/.test(n));
+  const real = join(pool, 'fan.real'); renameSync(join(pool, 'repo.git', 'objects', fan), real);
+  symlinkSync(real, join(pool, 'repo.git', 'objects', fan));
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool })).toThrow(/contains a link/);
 });
 
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
