@@ -180,6 +180,26 @@ it('skips a released slot a surviving process still sits in, and rejects links i
   expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool })).toThrow(/contains a link/);
 });
 
+it('refuses a planted worktrees admin link before git writes, and ignores injected GIT_CONFIG_* env', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  const wt = join(pool, 'repo.git', 'worktrees');
+  rmSync(wt, { recursive: true, force: true }); symlinkSync(join(lane, '.git'), wt);
+  rmSync(a.slotDir, { recursive: true, force: true });
+  const before = readdirSync(join(lane, '.git')).sort();
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev2, poolDir: pool })).toThrow();
+  expect(readdirSync(join(lane, '.git')).sort()).toEqual(before);
+  rmSync(wt);
+  const marker = join(lane, 'smudge-ran'); const old = { ...process.env };
+  process.env.GIT_CONFIG_COUNT = '1'; process.env.GIT_CONFIG_KEY_0 = 'filter.x.smudge'; process.env.GIT_CONFIG_VALUE_0 = `touch ${marker}`;
+  try { writeFileSync(join(lane, '.gitattributes'), '* filter=x\n'); git(lane, 'add', '.gitattributes'); git(lane, 'commit', '-qm', 'attrs'); }
+  finally { for (const k of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']) delete process.env[k]; Object.assign(process.env, old); }
+  const rev3 = git(lane, 'rev-parse', 'HEAD');
+  process.env.GIT_CONFIG_COUNT = '1'; process.env.GIT_CONFIG_KEY_0 = 'filter.x.smudge'; process.env.GIT_CONFIG_VALUE_0 = `touch ${marker}`;
+  try { const b = acquireSeatSlot({ lanePath: lane, rev: rev3, poolDir: pool }); b.release(); }
+  finally { delete process.env.GIT_CONFIG_COUNT; delete process.env.GIT_CONFIG_KEY_0; delete process.env.GIT_CONFIG_VALUE_0; }
+  expect(existsSync(marker)).toBe(false);
+});
+
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
   const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool });
   const stable = statSync(join(a.dir, 'stable.txt')).ino; a.release();

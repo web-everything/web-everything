@@ -19,8 +19,8 @@ export const defaultPoolDir = (env = process.env) => env.WE_REVIEW_SEAT_POOL_DIR
 
 // Pool git calls run with no hooks, no user/system config and no replace refs: a seat or a stale file in the shared
 // store can then never cause code to run, or a pinned commit to mean something else, during slot setup.
-const GIT_REDIRECTS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_REPLACE_REF_BASE'];
-const GIT_ENV = { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !GIT_REDIRECTS.includes(k))), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+const gitEnv = () => ({ ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_'))), // no inherited repo/config/object redirection of any kind
+  GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
 const STORE_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n';
 
 /** No symlink anywhere under `dir` (object storage: fanout dirs, packs, info). Bounded by the store's own size. */
@@ -41,9 +41,17 @@ export function slotBusy(dir, run = spawnSync) {
   return String(r.stdout).split('\n').some((l) => l.startsWith('n') && (l.slice(1) === real || l.slice(1).startsWith(`${real}/`)));
 }
 
+/** `repo.git/worktrees`, when present, must be a real owned directory holding no links, before git writes into it. */
+function checkAdminRoot(p) {
+  const root = join(p.repo, 'worktrees');
+  if (!lstatOrNull(root)) return;
+  ownPrivateDir(root);
+  assertNoLinks(root);
+}
+
 function git(args, { allowFail = false } = {}) {
   const r = spawnSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], {
-    env: GIT_ENV,  // a replace ref in the shared store must never change what a pinned commit means
+    env: gitEnv(),  // a replace ref in the shared store must never change what a pinned commit means
      encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
   if (r.status !== 0 && !allowFail) throw new Error(`git ${args.join(' ')} failed: ${String(r.stderr).trim().slice(0, 300)}`);
   return r;
@@ -179,6 +187,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
         if (tags.length || git(['-C', dir, 'status', '--porcelain', '--untracked-files=all']).stdout.trim()) throw new Error(`seat slot is not exactly ${rev}`);
       } else {
         rmSync(dir, { recursive: true, force: true });
+        checkAdminRoot(p); // before prune/add write anything under it
         git(['-C', p.repo, 'worktree', 'prune'], { allowFail: true });
         git(['-C', p.repo, 'worktree', 'add', '--quiet', '--detach', '--force', dir, rev]);
       }
@@ -213,6 +222,7 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
       if (!tryLock(lockDir, now, undefined, undefined, () => slotBusy(join(p.slots, `slot-${n}`)))) return;
       try {
         if (slotBusy(join(p.slots, `slot-${n}`))) return;
+        checkAdminRoot(p);
         git(['-C', p.repo, 'worktree', 'remove', '--force', join(p.slots, `slot-${n}`)], { allowFail: true });
         rmSync(join(p.slots, `slot-${n}`), { recursive: true, force: true });
         rmSync(join(p.state, `slot-${n}.rev`), { force: true });
@@ -224,7 +234,7 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
       if (name.endsWith('.input')) { if (!existsSync(v.slice(0, -6)) && !lstatOrNull(v.slice(0, -6))) rmSync(v, { recursive: true, force: true }); continue; }
       if (!existsSync(v)) rmSync(v, { force: true });
     }
-    if (removed.length) git(['-C', p.repo, 'worktree', 'prune'], { allowFail: true });
+    if (removed.length) { checkAdminRoot(p); git(['-C', p.repo, 'worktree', 'prune'], { allowFail: true }); }
   } catch { /* pruning is housekeeping */ }
   return removed;
 }
