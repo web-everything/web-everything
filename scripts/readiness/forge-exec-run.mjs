@@ -1030,7 +1030,10 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         const executionEnv={PATH:path,HOME:join(work,'.forge-home'),...request.env};
         if(Object.hasOwn(executionEnv,'VERIFY_SCAN_FILES'))
           executionEnv.VERIFY_SCAN_FILES=normalizeScanFilesValue(executionEnv.VERIFY_SCAN_FILES);
-        result=await command(executionArgv(request.argv),work,executionEnv);
+        // Anchor the report in the work dir so a config root cannot redirect it; re-check links after the run.
+        const planned=executionArgv(request.argv).map(a=>a.startsWith('--outputFile.json=')?'--outputFile.json='+join(work,a.slice('--outputFile.json='.length)):a);
+        result=await command(planned,work,executionEnv);
+        await assertContained(work,request.argv);
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
