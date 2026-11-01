@@ -6,6 +6,8 @@ status: open
 parent: "5467"
 scope: ["we:scripts/lib/lane-lease.mjs", "we:scripts/lib/lane-hold-io.mjs", "we:scripts/lane-pool.mjs", "we:scripts/conveyor/lease-reaper.mjs"]
 dateOpened: "2026-10-08"
+preparedDate: "2026-11-01"
+preparedAgainstSha: "1f6513e4d6fd3877d23b5b9fb57956d6186079ec"
 tags: []
 ---
 
@@ -85,3 +87,9 @@ Screen: flagged(residue) -> R2 rewrites the Done-when bar (0 becomes "salvage re
 5. **Identity scoping** — only the lease holder's own `release` bypasses the rule; `--force` and `--override` do not.
 6. **State over time** — every hold expires after `holdMinutes` (150), after which salvage may take the work.
 7. **Who wrote it** — refusals are journalled as `hold-refused` with the actor, once per unchanged state.
+
+## Ratified — 2026-11-01 (R360)
+
+Operator chalbert, 2026-11-01 18:05 ET, verbatim: "Ratify all three".
+
+Decision: keep the hold narrow; add a salvage push before an acquire-reset over unpushed commits; measure "no salvage branch or remote copy" instead of "no unpushed releases". The lowered done-when bar is ratified. Open as a build-ready story.

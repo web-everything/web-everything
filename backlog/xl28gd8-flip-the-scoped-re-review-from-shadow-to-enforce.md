@@ -1,12 +1,14 @@
 ---
 kind: decision
 parent: "5467"
-status: active
+status: resolved
 scaffoldedBy: "prepare-round-stories"
 dateScaffolded: "2026-11-01"
 scope: ["we:scripts/review-settings.json"]
 relatedTo: ["5469", "5470", "5471", "5472"]
 dateOpened: "2026-11-01"
+dateResolved: "2026-11-01"
+codifiedIn: one-off
 preparedDate: "2026-11-01"
 preparedAgainstSha: "174220fad20252329d315759de9702bbcc698979"
 tags: [review, conveyor]
@@ -126,3 +128,9 @@ Existing replay fixtures cover both modes (`we:scripts/lib/__tests__/review-loop
 ## Proof plan
 
 Count `we.scoped-rereview-shadow` rows with `roundAvoided` and later rounds per week from the journal path above, before and after the ruling.
+
+## Ratified — 2026-11-01 (R360)
+
+Operator chalbert, 2026-11-01 18:05 ET, verbatim: "Ratify all three".
+
+Decision: `scopedRereview` STAYS shadow. Re-decide when the avoidable share at rounds 2-3 reaches 10% of blocked later rounds (currently 3.6%), or once a care field is journalled.

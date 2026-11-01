@@ -88,3 +88,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — the accept is bound to the PR's own patch identity, not to the head sha.
 6. **State over time** — n/a: no time rule.
 7. **Who wrote it** — only a commit marked by the conveyor CI-heal comment counts as a heal commit; any other new commit owes a normal review.
+
+## Ratified — 2026-11-01 (R360)
+
+Operator chalbert, 2026-11-01 18:05 ET, verbatim: "Ratify all three".
+
+Decision: its own setting `healDeltaReview`, default off, independent of the B1 flip (xl28gd8). Open as a build-ready story.
