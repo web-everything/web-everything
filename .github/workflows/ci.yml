@@ -632,7 +632,8 @@ jobs:
   smoke:
     needs: changes
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    # Playwright 1.58.1 supports Ubuntu 24.04; ubuntu-latest can select unsupported 26.04.
+    runs-on: ubuntu-24.04
     # xd1sfms (#4075/#3383) — same measurement pass: 15 successful runs sampled 2026-09-25 gave this job
     # (docs build + Playwright install + the interaction lane) min=129s max=146s p50=135s p95=146s —
     # 3x146s≈7.3min, rounded up to 10min.
