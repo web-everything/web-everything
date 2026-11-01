@@ -79,3 +79,15 @@ process.exit(result.exitCode);
     expect((await run).code).not.toBe(0);
   });
 });
+
+describe('heavy-admission client signals during the timeout grace', () => {
+  it('a kill during the timeout grace period still cancels and exits with the signal code', async () => {
+    const f = fixture(vi.fn(({signal}) => new Promise((resolve) => signal.addEventListener('abort', () => {
+      setTimeout(() => resolve({mode: 'cancelled', terminated: true}), 100);
+      setTimeout(() => process.emit('SIGTERM'), 10);
+    }, {once: true}))));
+    f.timeoutMs = 50;
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 143});
+    expect(existsSync(marker(f.cwd))).toBe(false);
+  });
+});

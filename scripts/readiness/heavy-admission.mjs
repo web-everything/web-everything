@@ -895,8 +895,7 @@ export async function runWithRemoteDecision({
     });
     const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
     const result = await Promise.race([remote, timeout, signalPromise]);
-    if (typeof result?.clientSignal === 'string') {
-      const signalName = result.clientSignal;
+    const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
       let cancelTimer;
       const termination = await Promise.race([
@@ -911,14 +910,18 @@ export async function runWithRemoteDecision({
         ? `heavy-admission: ${signalName} received; remote run cancelled and slot-${slot.slot} released\n`
         : `heavy-admission: ${signalName} received; remote termination unconfirmed (${oneLine(termination?.reason ?? termination?.mode ?? 'no answer')}) - slot-${slot.slot} marker left for the reaper\n`);
       return { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalName], signal: signalName };
-    }
+    };
+    if (typeof result?.clientSignal === 'string') return await cancelOnClientSignal(result.clientSignal);
     if (result === timedOut) {
       const termination = await Promise.race([
         remote.catch(() => null),
         new Promise((resolve) => {
           timer = setTimeout(() => resolve(null), 1000);
         }),
+        signalPromise,
       ]);
+      // A client kill during the timeout grace period still cancels and exits with the signal code.
+      if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
         await record({mode:'unconfirmed'});
         return refuseLocal('remote-timeout');
