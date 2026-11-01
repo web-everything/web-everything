@@ -12,6 +12,7 @@ import { readReadyCandidate } from '../../../lib/daemon-rebuild/state.mjs';
 /** No subprocesses or Git writes: only registration/state sidecars live in a disposable directory. */
 export async function archiveSmokeProbe({
   carried = false, attributed = false, mode = 'shadow', unavailable = false, nested = false, readyOnly = false,
+  retireDuringFallback = false, fallbackAlreadyHead = false,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'archive-smoke-'));
   const env = {
@@ -92,10 +93,13 @@ export async function archiveSmokeProbe({
   try {
     const overlays = [{ ref: 'lower', sha: lower }, { ref: 'top', sha: top }, ...(attributed ? [{ ref: 'healthy', sha: healthy }] : [])];
     writeOverlays(root, overlays, { env });
-    const retirement = await autoRetireOverlays({ root, env, overlays, git: run,
-      refEvidence: new Map(overlays.map(o => [o.ref, 'refreshed'])), appendDaemonEvent: () => {} });
-    if (!retirement.retired.some(row => row.ref === 'lower')) throw new Error('fixture did not retire lower');
-    refs.delete('refs/remotes/origin/lower');
+    const retire = async () => {
+      const retirement = await autoRetireOverlays({ root, env, overlays: readOverlays(root, { env }), git: run,
+        refEvidence: new Map(overlays.map(o => [o.ref, 'refreshed'])), appendDaemonEvent: () => {} });
+      if (!retirement.retired.some(row => row.ref === 'lower')) throw new Error('fixture did not retire lower');
+      refs.delete('refs/remotes/origin/lower');
+    };
+    if (!retireDuringFallback) await retire();
     if (carried) main = commit(carried === 'tree' ? [base] : [lower], ['base', 'lower', 'main']);
     // Production prepare stamps registration ids before planning; removals are CAS-bound to them.
     migrateRegistrationIds(root, { env });
@@ -120,6 +124,12 @@ export async function archiveSmokeProbe({
       runSmoke: async () => {
         smoked.push(candidate);
         const bad = objects.get(candidate).files.includes('broken.mjs');
+        // A sibling tick archives lower while the plain-main fallback smokes unlocked. It may also
+        // have moved HEAD to that target; the already-adopted return still runs suspect removals.
+        if (retireDuringFallback && candidate === base) {
+          await retire();
+          if (fallbackAlreadyHead) head = base;
+        }
         return { verdict: bad ? 'code' : 'pass', smoke: { results: bad
           ? [{ name: 'daemon-entries-boot', ok: false, mayBeTransient: false,
             detail: 'code failure', entries: [{ files: ['broken.mjs'] }] }] : [] } };
@@ -127,6 +137,7 @@ export async function archiveSmokeProbe({
     });
     return { adopted: !!result.adopted, moved: result.moved, reason: result.reason, alerts: result.alerts,
       refs: readOverlays(root, { env }).map(o => o.ref), headUnchanged: head === lower,
+      archivedSources: readOverlays(root, { env }).find(o => o.ref === 'top')?.retiredSources?.length ?? 0,
       lowerCarried: objects.get(head).files.includes('lower'), ready: !!readReadyCandidate(root, env),
       smoked: smoked.length, lowerDeleted: !refs.has('refs/remotes/origin/lower') };
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -134,7 +145,8 @@ export async function archiveSmokeProbe({
 
 export default {
   id: 'archive-source-smoke-fallback', title: 'smoke fallbacks preserve deleted retired sources', card: 'PR #6023',
-  fixedBy: { sha: 'pr-6023-archive-smoke', where: 'lane/r171-closure-scope', paths: ['scripts/lib/daemon-rebuild/smoke.mjs'] },
+  fixedBy: { sha: 'pr-6023-archive-smoke', where: 'lane/r171-closure-scope',
+    paths: ['scripts/lib/daemon-rebuild/smoke.mjs', 'scripts/lib/daemon-rebuild/adopt.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/lib/daemon-rebuild/smoke.mjs'), 'utf8').includes('archive-source-uncovered:'); },
   async run() {
     const probes = [];
@@ -145,6 +157,15 @@ export default {
       if (probe.adopted || !probe.headUnchanged || !probe.refs.includes('top') || probe.ready
         || !probe.alerts.some(a => a.kind === 'overlay-source-unavailable')) {
         violations.push({ invariant: 'archived-source-lost', detail: JSON.stringify({ options, ...probe }) });
+      }
+    }
+    for (const fallbackAlreadyHead of [false, true]) {
+      const options = { retireDuringFallback: true, fallbackAlreadyHead };
+      const probe = await archiveSmokeProbe(options);
+      probes.push({ options, ...probe });
+      if (probe.adopted || probe.archivedSources !== 1 || !probe.refs.includes('top')
+        || !probe.alerts.some(a => a.kind === 'overlay-source-unavailable')) {
+        violations.push({ invariant: 'archive-lost-during-fallback-smoke', detail: JSON.stringify({ options, ...probe }) });
       }
     }
     return { probes, violations };

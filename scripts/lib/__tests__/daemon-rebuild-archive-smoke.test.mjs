@@ -1,6 +1,16 @@
 import { expect, it } from 'vitest';
 import { archiveSmokeProbe } from '../../conveyor/soak/breaks/archive-source-smoke-fallback.mjs';
 
+it.each([false, true])('preserves a new archive when fallback finalizes (already HEAD: %s)', async fallbackAlreadyHead => {
+  const result = await archiveSmokeProbe({ retireDuringFallback: true, fallbackAlreadyHead });
+  expect(result.lowerDeleted).toBe(true);
+  expect(result.adopted).toBe(false);
+  expect(result.refs).toEqual(['top']);
+  expect(result.archivedSources).toBe(1);
+  expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-source-unavailable',
+    detail: expect.objectContaining({ failed: 'archive-source-uncovered: top' }) }));
+});
+
 it.each(['off', 'shadow'])('refuses plain main losing a deleted retired lower in %s mode', async mode => {
   const result = await archiveSmokeProbe({ mode });
   expect(result.lowerDeleted).toBe(true);

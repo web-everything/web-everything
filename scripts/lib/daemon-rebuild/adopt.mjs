@@ -282,44 +282,14 @@ export async function finalizeRebuild({
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
   const headNow = verifyRev(git, 'HEAD');
-  if (headNow === plan.finalSha) {
-    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
-      state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
-      };
-      state.rejected = null;
-      state.held = null;
-      writeState();
-    }
-    return terminal({
-      moved: false, adopted: true, reason: 'already-adopted', head: plan.finalSha, plan,
-    });
-  }
-  if (headNow !== prevHead) {
+  if (headNow !== prevHead && headNow !== plan.finalSha) {
     alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
     return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
   }
 
-  // Re-run the same safety gate `prepareRebuild` already passed — the tree could, in principle, have picked up
-  // new dirt during the unlocked smoke window (see {@link ensureSafeToMove}'s docblock).
-  const unsafe = ensureSafeToMove({
-    git, root, env, stEnv, alert, knownInputs: knownInputsOf(state),
-  });
-  if (!unsafe.safe) {
-    alert(unsafe.reason, unsafe.detail);
-    return terminal({ moved: false, reason: unsafe.reason, plan });
-  }
-  if (unsafe.untracked.length > 0) {
-    const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${plan.finalSha}:${p}`]).status === 0);
-    if (colliding.length > 0) {
-      alert('untracked-collision', { paths: colliding });
-      return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
-    }
-  }
-
-  // PR #6033 red team — a sibling tick may have archived a source into a carrier while this build smoked
-  // unlocked. Re-read the registry under this lock and refuse a target that drops archived content; unreadable
-  // evidence refuses too. A mainOnly rebuild never edits the overlay list, so it skips this (as its planning does).
+  // A sibling tick may archive a source while this build smokes unlocked. Check the current registry
+  // before EVERY adoption, including already-adopted: its onAdopted callback can still drop carriers.
+  // A mainOnly rebuild never edits the overlay list, so it skips this (as its planning does).
   if (archiveGuard) {
     const registry = readOverlayState(root, { env });
     let uncovered = [];
@@ -336,6 +306,37 @@ export async function finalizeRebuild({
         ...(error ? { error } : {}),
         message: 'Finalize cannot prove archived content is preserved; keeping the running build and overlay registrations.' });
       return terminal({ moved: false, reason: error ? 'overlay-source-unverifiable' : 'overlay-source-unavailable', plan });
+    }
+  }
+
+  if (headNow === plan.finalSha) {
+    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
+      state.adopted = {
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
+      };
+      state.rejected = null;
+      state.held = null;
+      writeState();
+    }
+    return terminal({
+      moved: false, adopted: true, reason: 'already-adopted', head: plan.finalSha, plan,
+    });
+  }
+
+  // Re-run the same safety gate `prepareRebuild` already passed — the tree could, in principle, have picked up
+  // new dirt during the unlocked smoke window (see {@link ensureSafeToMove}'s docblock).
+  const unsafe = ensureSafeToMove({
+    git, root, env, stEnv, alert, knownInputs: knownInputsOf(state),
+  });
+  if (!unsafe.safe) {
+    alert(unsafe.reason, unsafe.detail);
+    return terminal({ moved: false, reason: unsafe.reason, plan });
+  }
+  if (unsafe.untracked.length > 0) {
+    const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${plan.finalSha}:${p}`]).status === 0);
+    if (colliding.length > 0) {
+      alert('untracked-collision', { paths: colliding });
+      return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
     }
   }
 
