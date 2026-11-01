@@ -10,6 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cardIdOf, decideBatchFiling, fileIntoBatch, freshMainBase, launchSealJob, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
+import { budgetError, STEP_MIN_MS } from '../../lib/tick-deadline.mjs';
 import { AI_TRAILER } from '../card-batch-io.mjs';
 import { sealDueBatches } from '../card-batch-seal-io.mjs';
 import { effectiveCardBatchPolicy, resolvePreventionBatchSettings, resolveCardBatchSettings } from '../../lib/card-batch-settings.mjs';
@@ -219,6 +220,84 @@ describe('fileIntoBatch against a real origin', () => {
       }
     });
   }, 60_000);
+
+  it.each([60_000, 20_000])('freshMainBase caps fetch at min(30s, %i ms left) and rev-parse at the remaining budget', (left) => {
+    let remaining = left;
+    const run = vi.fn((cwd, args) => {
+      if (args[0] === 'fetch') remaining = 4_000;
+      return args[0] === 'rev-parse' ? 'sha' : '';
+    });
+    expect(freshMainBase('/lane', { run, cache: new Map(), deadline: { left: () => remaining } })).toBe('sha');
+    expect(run.mock.calls.map(call => call[2])).toEqual([Math.min(30_000, left), 4_000]);
+  });
+
+  it('freshMainBase returns a fresh cached hit even with no budget and no git calls', () => {
+    // A cached hit needs a knowable remote identity (a real .git/config plus url/config answers from the runner).
+    const lane = mkdtempSync(join(tmpdir(), 'fmb-cached-'));
+    try {
+      mkdirSync(join(lane, '.git'));
+      writeFileSync(join(lane, '.git', 'config'), '[remote "origin"]\n\turl = /remote.git\n');
+      const run = vi.fn((cwd, args) => (args[0] === 'remote' ? '/remote.git' : args[0] === 'config' ? 'a=b\0' : 'sha'));
+      const opts = { run, cache: new Map(), now: () => 0 };
+      freshMainBase(lane, opts);
+      run.mockClear();
+      // With no budget left even the identity reads refuse (budget error); with budget, a hit makes no fetch or rev-parse.
+      expect(freshMainBase(lane, { ...opts, deadline: { left: () => 20_000 } })).toBe('sha');
+      expect(run.mock.calls.filter(call => call[1][0] === 'fetch' || call[1][0] === 'rev-parse')).toEqual([]);
+      expect(run.mock.calls.every(call => call[2] > 0 && call[2] <= 10_000)).toBe(true);
+      expect(() => freshMainBase(lane, { ...opts, deadline: { left: () => 0 } })).toThrow(/tick budget/);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+
+  it('freshMainBase rethrows a budget-failed fetch without fallback or caching, then retries', () => {
+    const error = budgetError('git');
+    const run = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValue('sha');
+    const opts = { run, cache: new Map(), deadline: { left: () => 20_000 } };
+    expect(() => freshMainBase('/lane', opts)).toThrow(error);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(opts.cache.size).toBe(0);
+    expect(freshMainBase('/lane', opts)).toBe('sha');
+    expect(run.mock.calls.map(call => call[1][0])).toEqual(['fetch', 'fetch', 'rev-parse']);
+  });
+
+  it('freshMainBase refuses fetch below 1000ms and refuses rev-parse if fetch consumes the budget', () => {
+    let left = 999;
+    const run = vi.fn(() => { left = 999; return ''; });
+    const opts = { run, cache: new Map(), deadline: { left: () => left } };
+    expect(() => freshMainBase('/lane', opts)).toThrow(/tick budget exhausted before git/);
+    expect(run).not.toHaveBeenCalled();
+    left = 20_000;
+    expect(() => freshMainBase('/lane', opts)).toThrow(/tick budget exhausted before git/);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(opts.cache.size).toBe(0);
+  });
+
+  it('freshMainBase propagates rev-parse budget errors without caching', () => {
+    const error = budgetError('git');
+    const run = vi.fn().mockReturnValueOnce('').mockImplementationOnce(() => { throw error; });
+    const cache = new Map();
+    expect(() => freshMainBase('/lane', { run, cache, deadline: { left: () => 20_000 } })).toThrow(error);
+    expect(cache.size).toBe(0);
+  });
+
+  it('fileIntoBatch forwards deadline to mainBase and refuses a budget error without admitting', async () => {
+    const error = budgetError('git');
+    const mainBase = vi.fn(() => { throw error; });
+    const admit = vi.fn();
+    const deadline = { left: () => 20_000 };
+    const card = { laneDir: '/lane', cardPath: 'backlog/xccccc1-card.md' };
+    const opts = { settings: settingsWith(), mainBase, admit, deadline, log: () => {} };
+    const refused = await fileIntoBatch(card, opts);
+    expect(refused.batched).toBe(false);
+    expect(refused.reason).toMatch(/^admission failed: .*tick budget exhausted before git/);
+    expect(mainBase).toHaveBeenCalledWith('/lane', { deadline });
+    expect(admit).not.toHaveBeenCalled();
+    deadline.left = () => STEP_MIN_MS.admit - 1;
+    mainBase.mockClear();
+    expect(await fileIntoBatch(card, opts)).toEqual({ batched: false, retryable: true, reason: 'tick budget exhausted before admission' });
+    expect(mainBase).not.toHaveBeenCalled();
+    expect(admit).not.toHaveBeenCalled();
+  });
 
   it('opt-out, interactive actor and a disabled setting never touch the coordinator', async () => {
     const admit = vi.fn();

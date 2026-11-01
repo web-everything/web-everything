@@ -8,21 +8,18 @@
  * The clone is then fast-moved to the target (see `prepareRebuild`) without the ~100-140s smoke.
  * Applies to EVERY daemon that uses daemon-self-sync (drain, review, fix, ...), not only the drain.
  */
+import { daemonRebuildSettingsPath } from './closure-scope-settings.mjs';
+export { daemonRebuildSettingsPath, resolveClosureScopeMode } from './closure-scope-settings.mjs';
 import { isCodePath } from '../main-staleness.mjs';
-import { closureHits, collectImportClosure } from '../import-closure.mjs';
+import { closureHits, collectImportClosure, MAX_SPAWN_HOPS, PARSEABLE_CODE_RE } from '../import-closure.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { DAEMON_ENTRY_MODULES, resolveDaemonEntries } from '../daemon-boot-smoke.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 
 /** Env override: `0`/`false` turns the skip off, `1`/`true` on. Unset = the settings file (default on). */
 export const SKIP_UNRELATED_ENV = 'WE_DAEMON_REBUILD_SKIP_UNRELATED';
-
-export function daemonRebuildSettingsPath() {
-  return join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
-}
 
 /** `daemonRebuild.skipUnrelated` — default ON; env beats file; anything malformed keeps the default. */
 export function resolveSkipUnrelated(env = process.env, { path = daemonRebuildSettingsPath() } = {}) {
@@ -36,13 +33,13 @@ export function resolveSkipUnrelated(env = process.env, { path = daemonRebuildSe
   return true;
 }
 
-const MANIFEST_RE = /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
-const CONFIG_RE = /(^|\/)(\.nvmrc|\.node-version|\.npmrc|daemon-[a-z-]*settings\.json)$/;
+export const MANIFEST_RE = /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
+export const CONFIG_RE = /(^|\/)(\.nvmrc|\.node-version|\.npmrc|daemon-[a-z-]*settings\.json)$/;
 // A file a daemon can RUN or READ without statically importing it: a spawned shell/python/etc. script, a
 // workflow/config file, anything under the skill/prompt trees (read at runtime). None is in an import closure, so
 // "not in the closure" must never be read as "cannot change what runs" for these — they always take the smoke.
-const EXECUTABLE_RE = /\.(sh|bash|zsh|py|rb|pl|ya?ml|toml|html?|ts|mts|cts|tsx|jsx)$/i;
-const RUNTIME_READ_RE = /^(skills-src|\.claude)\//;
+export const EXECUTABLE_RE = /\.(sh|bash|zsh|py|rb|pl|ya?ml|toml|html?|ts|mts|cts|tsx|jsx)$/i;
+export const RUNTIME_READ_RE = /^(skills-src|\.claude)\//;
 
 /**
  * The files the candidate smoke itself exercises, beyond the calling daemon's own entries: every
@@ -54,7 +51,9 @@ const RUNTIME_READ_RE = /^(skills-src|\.claude)\//;
  */
 export function smokeSurfaceEntries(env = process.env) {
   const out = new Set(['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-boot-smoke.mjs', ...DAEMON_ENTRY_MODULES]);
-  for (const e of resolveDaemonEntries(env).entries) out.add(e);
+  // Runtime entries are supplied by the closure caller. The legacy skip surface
+  // must stay fixed even when the live smoke environment names a clone.
+  for (const e of resolveDaemonEntries(env, { fixedEntriesOnly: true }).entries) out.add(e);
   for (const check of SMOKE_CHECKS) for (const e of check.codeEntries || []) out.add(e);
   return [...out];
 }
@@ -66,7 +65,69 @@ export function smokeSurfaceEntries(env = process.env) {
 const STRING_RE = /(['"`])([^'"`\n]*)\1/g;
 const SCRIPT_TOKEN_RE = /[^\s'"`()<>|;&=,]*\.(?:mjs|cjs|js|ts)(?=$|[\s?#:])/g;
 const NOT_WALKED_RE = /(^|\/)(node_modules|__tests__)\/|\.(test|spec)\.[cm]?[jt]s$/;
-const MAX_SPAWN_HOPS = 64;
+
+/** Read-only commit snapshot. `git(argv, options)` must forward input/encoding/maxBuffer.
+ * Throws on unknown trees, malformed/truncated object data or missing reads. Blobs are
+ * cached in bounded batches, never checked out; paths with tabs/newlines stay intact. */
+export function treeReader(git, sha) {
+  if (typeof sha !== 'string' || !sha || sha.startsWith('-')) throw new Error('invalid tree');
+  const result = git(['ls-tree', '-r', '-z', sha], { maxBuffer: 64 * 1024 * 1024 });
+  if (result.error || result.status !== 0) throw new Error('tree listing unreadable');
+  const listing = String(result.stdout ?? '');
+  if (listing && !listing.endsWith('\0')) throw new Error('tree listing truncated');
+  const objects = new Map();
+  let regularFilesOnly = true;
+  for (const record of listing.split('\0').filter(Boolean)) {
+    const match = /^(\d{6}) (blob|commit) ([a-f0-9]{40,64})\t([\s\S]+)$/.exec(record);
+    if (!match) throw new Error('tree listing malformed');
+    // Symlinks and submodules are not readable source files in this snapshot.
+    if (match[2] === 'blob' && /^100/.test(match[1])) objects.set(match[4], match[3]);
+    else regularFilesOnly = false;
+  }
+  const root = resolvePath('virtual-daemon-tree');
+  const key = path => relative(root, resolvePath(root, path));
+  const cache = new Map();
+  const scripts = [...objects.keys()].filter(p => /\.[cm]?[jt]s$/.test(p));
+  const byNameIndex = new Map();
+  for (const p of scripts) {
+    const name = norm(basename(p));
+    (byNameIndex.get(name) || byNameIndex.set(name, []).get(name)).push(p);
+  }
+  const readFile = path => {
+    const name = key(path);
+    if (!objects.has(name)) throw new Error('tree file unreadable');
+    if (!cache.has(name)) {
+      const batch = [name, ...scripts.filter(p => p !== name && !cache.has(p)).slice(0, 31)];
+      const res = git(['cat-file', '--batch'], { input: batch.map(p => objects.get(p)).join('\n') + '\n',
+        encoding: null, maxBuffer: 64 * 1024 * 1024 });
+      if (res.error || res.status !== 0) throw new Error('tree blobs unreadable');
+      const data = Buffer.from(res.stdout ?? '');
+      let offset = 0;
+      for (const p of batch) {
+        const end = data.indexOf(10, offset);
+        const header = data.subarray(offset, end).toString('ascii');
+        const match = /^([a-f0-9]{40,64}) blob (\d+)$/.exec(header);
+        if (end < 0 || !match || match[1] !== objects.get(p)) throw new Error('tree blob header invalid');
+        const size = Number(match[2]);
+        offset = end + 1;
+        if (!Number.isSafeInteger(size) || offset + size >= data.length || data[offset + size] !== 10) {
+          throw new Error('tree blob truncated');
+        }
+        cache.set(p, data.subarray(offset, offset + size).toString('utf8'));
+        offset += size + 1;
+      }
+      if (offset !== data.length) throw new Error('tree blob trailing data');
+    }
+    return cache.get(name);
+  };
+  return { root, readFile, exists: path => objects.has(key(path)),
+    assertRegularFiles() {
+      // Symlink targets and submodule contents are outside this blob-only reader's evidence.
+      // Scope callers retain the entire conflict rather than exclude either link or target.
+      if (!regularFilesOnly) throw new Error('tree contains non-regular entries');
+    },
+    listFiles: () => [...objects.keys()], byName: name => byNameIndex.get(norm(name)) || [] };
+}
 
 /** One comparison form for a name/path: git reports NFC-or-not, the clone's filesystem may be case-insensitive. */
 const norm = (s) => s.normalize('NFC').toLowerCase();
@@ -99,18 +160,29 @@ function trackedScriptIndex(root) {
  * pre-move tree (a spawned script the move itself adds): a changed code file with that basename is relevant.
  * `unreadable` = a file could not be read (the closure must then be reported incomplete).
  */
-function collectSpawnedScripts({ root, files, readFile, exists, byName }) {
+function collectSpawnedScripts({ root, files, readFile, exists, byName, strict, referenceTexts, candidates }) {
   const targets = new Set();
   const names = new Set();
   let unreadable = false;
   const accept = (rel) => {
-    if (rel.startsWith('..') || isAbsolute(rel) || NOT_WALKED_RE.test(rel)) return false;
+    if (rel.startsWith('..') || isAbsolute(rel) || (!strict && NOT_WALKED_RE.test(rel))) return false;
     targets.add(rel);
     return true;
   };
   for (const file of files) {
     let src;
     try { src = readFile(join(root, file)); } catch { unreadable = true; continue; }
+    if (strict) {
+      const text = referenceTexts?.get(file) ?? (file === 'package.json' ? src : undefined);
+      if (text === undefined) { unreadable = true; continue; }
+      // A basename is deliberately sufficient, even in prose or an interpolated template.
+      // Walk every matching code file, including tests, so its own references are protected too.
+      const folded = norm(text);
+      for (const [name, paths] of candidates) if (folded.includes(name)) {
+        names.add(name);
+        for (const path of paths) accept(path);
+      }
+    }
     for (const line of src.split('\n')) {
       // Drop a leading block comment, then a line that is wholly prose; code after `/* x */` still counts.
       const t = line.replace(/^\s*\/\*.*?\*\//, '').trim();
@@ -133,26 +205,42 @@ function collectSpawnedScripts({ root, files, readFile, exists, byName }) {
 }
 
 /**
- * The import closure of `entries` PLUS every script those files spawn by path, to a fixed point (each file is
- * scanned once; the walk ends when no new script appears, bounded by `MAX_SPAWN_HOPS` — past it the closure is
- * reported incomplete so the caller falls back to "any code file"). Returns the closure with `spawnedNames`
+ * The import closure of `entries` PLUS every non-import dependency, to a fixed point (each file is scanned
+ * once). Every generation discovering new launch, require, basename or string-path targets costs one shared
+ * hop, bounded by `MAX_SPAWN_HOPS`. Further discoveries report incomplete: strict scoping retains the conflict
+ * for full merge/manual rebase; the skip check falls back to "any code file". Returns `spawnedNames`
  * (see {@link collectSpawnedScripts}), or `null` when the walk has no usable entry.
  * `stopWhenIncomplete` avoids further spawn scans when only that conservative decision is needed:
  * decideSkipRebuild ignores members and spawned names for an incomplete closure.
+ * `strictExtensions:false` restores the legacy import parser, string-path launch scan and
+ * spawn-generation counting while preserving `strict` import checks and the caller's bounds.
+ * `legacyRequires:true` supplements that walk with single-target require edges only. Callers
+ * must also retain the original legacy refusal: even these edges can shorten its chains.
  */
 export function collectRunClosure({
-  root, entries, importClosure = collectImportClosure,
-  readFile = (p) => readFileSync(p, 'utf8'),
-  exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
-  byName = trackedScriptIndex(resolvePath(root)),
-  stopWhenIncomplete = false,
+  root, entries, reader, importClosure = collectImportClosure,
+  readFile = reader?.readFile ?? ((p) => readFileSync(p, 'utf8')),
+  exists = reader?.exists ?? ((p) => { try { return statSync(p).isFile(); } catch { return false; } }),
+  byName = reader?.byName ?? trackedScriptIndex(resolvePath(root)),
+  maxFiles = Infinity, strict = false, strictExtensions = true,
+  stopWhenIncomplete = false, legacyRequires = false,
 }) {
+  const extended = strict && strictExtensions;
   const absRoot = resolvePath(root);
-  // Each spawn hop re-walks the growing import graph. Reuse this walk's filesystem reads across
-  // hops and the spawn scan; a new invocation gets fresh caches so later tree moves remain visible.
+  // Each expansion hop re-walks the growing import graph. Reuse this walk's filesystem reads across
+  // hops and reference scans; a new invocation gets fresh caches so later tree moves remain visible.
   const sources = new Map();
   const presence = new Map();
   const parsed = new Map();
+  const candidates = new Map();
+  if (extended) {
+    // Strict scoping needs the complete snapshot; an absent listing is incomplete evidence.
+    if (!reader?.listFiles) return { files: new Set(), complete: false, jsonNames: new Set() };
+    for (const path of reader.listFiles()) if (PARSEABLE_CODE_RE.test(path)) {
+      const name = norm(basename(path));
+      (candidates.get(name) || candidates.set(name, []).get(name)).push(path);
+    }
+  }
   const readOnce = (path) => {
     if (!sources.has(path)) sources.set(path, readFile(path));
     return sources.get(path);
@@ -161,7 +249,10 @@ export function collectRunClosure({
     if (!presence.has(path)) presence.set(path, exists(path));
     return presence.get(path);
   };
-  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce, parsed });
+  // Only imports may expand inside this walk. ALL other edges are returned as targets and pass
+  // through the fresh-target check below before becoming roots for the next generation.
+  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce,
+    parsed, maxFiles, strict, strictExtensions, legacyRequires, followNonImports: false });
   const walked = new Set(entries);
   let closure = imports();
   if (!closure) return null;
@@ -174,15 +265,19 @@ export function collectRunClosure({
     const unscanned = [...closure.files, ...(hop === 0 && existsOnce(join(absRoot, 'package.json')) ? ['package.json'] : [])]
       .filter((f) => !scanned.has(f));
     for (const f of unscanned) scanned.add(f);
-    const { targets, names, unreadable: bad } = collectSpawnedScripts({ root: absRoot, files: unscanned, readFile: readOnce, exists: existsOnce, byName });
+    const { targets, names, unreadable: bad } = collectSpawnedScripts({ root: absRoot, files: unscanned,
+      readFile: readOnce, exists: existsOnce, byName, strict: extended, referenceTexts: closure.referenceTexts, candidates });
     unreadable ||= bad;
     for (const n of names) spawnedNames.add(n);
     if (stopWhenIncomplete && unreadable) break;
+    if (extended || legacyRequires) for (const target of closure.nonImportTargets || []) targets.add(target);
     const fresh = [...targets].filter((t) => !closure.files.has(t) && !walked.has(t));
     if (!fresh.length) break;
     if (hop >= MAX_SPAWN_HOPS) { closure = { ...closure, complete: false }; break; }
     for (const t of fresh) walked.add(t);
-    closure = imports() || closure;
+    const next = imports();
+    // Expanded walks preserve earlier refusals; compatibility retains the legacy assignment.
+    if (next) closure = strictExtensions ? { ...next, complete: closure.complete && next.complete } : next;
   }
   return { ...closure, complete: closure.complete && !unreadable, spawnedNames };
 }

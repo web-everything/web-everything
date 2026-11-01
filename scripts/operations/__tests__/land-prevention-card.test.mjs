@@ -9,7 +9,11 @@
  * Every subprocess call is a scripted stub (`exec`) — no real `node`, `git`, `lane-pool.mjs` or `gh` runs
  * here, matching the no-fs/no-subprocess convention every sibling operation test already uses.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Exercise the enabled filer explicitly; the prototype's declared repo setting deliberately pauses it.
+beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { readRaisedBy, raisedByFile } from '../../lib/raised-by.mjs';
 import * as raisedBy from '../../lib/raised-by.mjs';
@@ -301,13 +305,22 @@ describe('landPreventionCard — dedupe before filing', () => {
     } finally { cleanup(); }
   });
 
-  it('lands a mention-only filing through the ordinary PR path when every member has batching disabled', async () => {
+  it.each(['off', 'shadow', 'on', 'load-error', 'write-error'])('lands a mention-only filing through the ordinary PR path with widening %s', async mode => {
     const acquire = setup();
     try {
       const { exec, calls } = scriptedExec([acquire, 'staged', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const batch = vi.fn(async () => ({ batched: false, disabled: true }));
+      const logs = [];
       const result = await realLandPreventionCard(input(), {
-        exec, dedupe, batch, pendingDir: join(lane, 'pending'), write: () => {},
+        exec, dedupe, batch, pendingDir: join(lane, 'pending'),
+        loadWidenMode: () => {
+          if (mode === 'load-error') throw new Error('settings unreadable');
+          return { mode: mode === 'write-error' ? 'shadow' : mode, source: 'test', invalid: [] };
+        },
+        write: line => {
+          if (mode === 'write-error' && line.includes('card-batch-widen')) throw new Error('output unavailable');
+          logs.push(line);
+        },
       });
 
       expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
@@ -318,6 +331,8 @@ describe('landPreventionCard — dedupe before filing', () => {
         .toEqual(['commit', 'verify', 'open-pr']);
       expect(calls.some(({ args }) => args.includes('file-item'))).toBe(false);
       expect(calls.at(-1).args).toContain('release');
+      expect(logs.filter(line => line.includes('card-batch-widen'))).toHaveLength(['shadow', 'on'].includes(mode) ? 1 : 0);
+      if (['shadow', 'on'].includes(mode)) expect(logs.join('')).toContain('would batch #4706');
     } finally { cleanup(); }
   });
 
@@ -467,6 +482,32 @@ describe('landPreventionCard — dedupe before filing', () => {
       expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('open'));
       expect(readRaisedBy('4706', lane)).toEqual([]);
     } finally { cleanup(); }
+  });
+
+  it('a dry run never files, even when an owed-filing obligation exists or the filer is paused', async () => {
+    setup();
+    const stateDir = mkdtempSync(join(tmpdir(), 'owed-dry-run-'));
+    vi.stubEnv('WE_CARD_BATCH_STATE_DIR', stateDir);
+    try {
+      const { owePreventionFiling, owedPreventionRecord } = await import('../../lib/prevention-filing-owed.mjs');
+      owePreventionFiling(input(), { stateDir });
+      const exec = vi.fn();
+      const result = await landPreventionCard({ ...input(), dryRun: true, root: lane }, { exec, write: () => {}, dedupe });
+      expect(result).toMatchObject({ ok: true, step: 'dry-run' });
+      expect(exec).not.toHaveBeenCalled();
+      expect(owedPreventionRecord(input(), { stateDir })).toMatchObject({ status: 'owed' });
+      expect(readRaisedBy('4706', lane)).toEqual([]);
+
+      const pausedDir = mkdtempSync(join(tmpdir(), 'owed-dry-run-paused-'));
+      vi.stubEnv('WE_CARD_BATCH_STATE_DIR', pausedDir);
+      const paused = await landPreventionCard({ ...input(), dryRun: true, root: lane }, {
+        exec, write: () => {}, dedupe, loadFilingSettings: () => ({ filingEnabled: false }),
+      });
+      expect(paused.ok === false && paused.step === 'paused' || paused.step === 'dry-run').toBe(true);
+      expect(exec).not.toHaveBeenCalled();
+      expect(owedPreventionRecord(input(), { stateDir: pausedDir })).toBeNull();
+      rmSync(pausedDir, { recursive: true, force: true });
+    } finally { rmSync(stateDir, { recursive: true, force: true }); cleanup(); }
   });
 
   it('a partial dedupe admits the new card and the lane-local mention to the collector together', async () => {

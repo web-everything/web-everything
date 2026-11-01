@@ -64,10 +64,13 @@ export function planLaneCardDirt(porcelain) {
   return { cards, litter, other, cardOnly: cards.length > 0 && other.length === 0 };
 }
 
-const git = (dir, args) => readGit(args, {
-  cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000,
+/** The lane git runner with a per-call timeout; `timeoutMs` may be a function so a caller can cap each call at the time it has left. */
+export const cappedLaneGit = (timeoutMs = 60_000) => (dir, args) => readGit(args, {
+  cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], timeout: typeof timeoutMs === 'function' ? timeoutMs() : timeoutMs,
+  killSignal: 'SIGKILL',
   env: laneGitHardeningEnv({ ...process.env, GIT_OPTIONAL_LOCKS: '0' }),
 });
+const git = cappedLaneGit();
 
 const cardIdOfPath = (path) => /^backlog\/raised-by\/([^/]+)\//.exec(path)?.[1] ?? /^backlog\/([^/-]+)-/.exec(path)?.[1] ?? null;
 
