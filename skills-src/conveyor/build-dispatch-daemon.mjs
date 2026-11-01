@@ -2208,8 +2208,10 @@ const parkedPrepareListings = new Map();
 /**
  * Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw.
  * `launchReserve` calls of `maxPrListingCalls` are spendable only by `listPrs({ forLaunch: true })`; every other read
- * stops at `max - reserve`. `parkedCacheMs` lets a card primed `parked: true` reuse a complete listing younger than the
- * TTL; a launch read never uses that cache and always lists afresh.
+ * stops at `max - reserve`. The reserve leaves up to eight ordinary calls for settling two claims (four identity
+ * searches each); budgets of eight or less retain their full ordinary allowance. `parkedCacheMs` lets a card
+ * primed `parked: true` reuse a complete listing younger than the TTL; a launch read never uses that cache and
+ * always lists afresh.
  */
 export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAsync = null, prefetchConcurrency = 8, maxPrListingCalls = 128,
   launchReserve = 0, parkedCacheMs = 0, now = Date.now, parkedListings = parkedPrepareListings } = {}) {
@@ -2219,7 +2221,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
   let tree, treeError;
   let listingCalls = 0;
   const queryResults = new Map();
-  const reserve = Math.min(Math.max(0, Number.isInteger(launchReserve) ? launchReserve : 0), maxPrListingCalls);
+  const reserve = Math.min(Math.max(0, Number.isInteger(launchReserve) ? launchReserve : 0), Math.max(0, maxPrListingCalls - 8));
   function reserveListingCall(forLaunch = false) {
     const cap = forLaunch ? maxPrListingCalls : maxPrListingCalls - reserve;
     if (listingCalls >= cap) throw new Error(`prepare PR listing call budget exhausted (${cap} of ${maxPrListingCalls}${forLaunch ? '' : `, ${reserve} reserved for launch checks`})`);

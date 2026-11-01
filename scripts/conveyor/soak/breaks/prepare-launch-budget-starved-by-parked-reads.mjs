@@ -1,5 +1,6 @@
 /** 2026-10-30 → 11-01: prepare launched 0 times; parked-card status reads spent the whole PR-listing budget. */
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -17,7 +18,52 @@ export default {
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { runBuildDispatchTick, createPrepareStatusReader } = await import(pathToFileURL(join(root, DAEMON)).href);
+    const { resolvePreparePolicy } = await import(pathToFileURL(join(root, 'scripts/conveyor/prepare-policy-settings.mjs')).href);
     const violations = [];
+    // PR #6148 send-back: the default reserve must not prevent two finished claims from settling.
+    // Include bornAs aliases: each complete status read needs four searches, not just two.
+    for (const prefetch of [false, true]) {
+      const claims = ['8300', '8301'].map((num, i) => ({ meta: { num }, bornAs: `xlow00${i}` }));
+      const blobs = claims.map(({ meta: { num }, bornAs }) => {
+        const body = Buffer.from(`---\nbornAs: ${bornAs}\nstatus: open\n---\nfinished ${num}`);
+        const sha = createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
+        return { num, body, sha };
+      });
+      let calls = 0;
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'git' && args[0] === 'fetch') return '';
+        if (cmd === 'git' && args[0] === 'ls-tree') return blobs.map(b => `100644 blob ${b.sha}\tbacklog/${b.num}-card.md\n`).join('');
+        if (cmd === 'git' && args[0] === 'cat-file') return Buffer.concat(String(opts.input).trim().split('\n').map(sha => {
+          const b = blobs.find(b => b.sha === sha);
+          return Buffer.concat([Buffer.from(`${sha} blob ${b.body.length}\n`), b.body, Buffer.from('\n')]);
+        }));
+        if (cmd === 'gh' && args[0] === 'pr') {
+          calls++;
+          const search = args[args.indexOf('--search') + 1];
+          const claim = claims.find(c => search === `head:lane/${c.meta.num}`);
+          return JSON.stringify(claim ? [{ number: Number(claim.meta.num), state: 'CLOSED',
+            headRefName: `lane/${claim.meta.num}-prepare-x`, createdAt: '2026-11-01T00:00:00Z', isCrossRepository: false }] : []);
+        }
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      };
+      const policy = resolvePreparePolicy({ env: { WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK: '16' } });
+      const r = createPrepareStatusReader({ maxPrListingCalls: policy.maxPrListingCallsPerTick,
+        launchReserve: policy.launchPrListingReserve, exec, ...(prefetch ? { execAsync: async (...args) => exec(...args) } : {}) });
+      const released = [];
+      const tick = await runBuildDispatchTick({ live: true, effects: {
+        planTick: () => ({ decisions: { itemPrepareSpawns: [] }, nextState: {} }),
+        preparePolicy: () => policy,
+        fetchOpenPrs: () => [], listClaims: () => [], listRunStoreInFlight: () => [], killSwitch: () => ({ engaged: false }),
+        listPrepareClaims: () => claims, listPrepareInFlight: () => [],
+        primePrepareStatus: () => r.prime(claims.map(c => ({ num: c.meta.num }))),
+        readPrepareStatus: args => r.read(args), listPreparePrs: args => r.listPrs(args),
+        releasePrepareClaim: ({ num }) => released.push(num), placePrepareHold: () => {},
+        recordPrepareFailure: () => ({ cause: 'infra-transient', retry: true, held: false }),
+      } });
+      if (released.sort().join() !== '8300,8301' || tick.prepare.inFlight.length || calls !== 8) {
+        violations.push(`small-budget settlement (prefetch=${prefetch}): released [${released}], busy [${tick.prepare.inFlight}], calls=${calls}, failures=${JSON.stringify(tick.prepare.failures)}`);
+      }
+    }
     const searches = [];
     const parkedListings = new Map();
     let clock = Date.parse('2026-11-01T04:00:00Z');

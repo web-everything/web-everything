@@ -4686,6 +4686,44 @@ describe('grouped PREPARE daemon ticks', () => {
 
 
 describe('prepare discovery under repository PR volume', () => {
+  it.each([2, 4, 8, 16, 32])('keeps settlement reads available with the default reserve and a %s-call budget', async maxPrListingCalls => {
+    const policy = resolvePreparePolicy({ env: { WE_PREPARE_MAX_PR_LISTING_CALLS_PER_TICK: String(maxPrListingCalls) } });
+    const git = prepareGitFixture({ 8300: '---\nstatus: open\n---\nfinished' });
+    const closed = { number: 9301, state: 'CLOSED', headRefName: 'lane/8300-prepare-x', isCrossRepository: false };
+    const searches = [];
+    const reader = createPrepareStatusReader({ maxPrListingCalls: policy.maxPrListingCallsPerTick,
+      launchReserve: policy.launchPrListingReserve, exec: (cmd, args, opts) => {
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1];
+        searches.push(search);
+        return JSON.stringify(search === 'head:lane/8300' ? [closed] : []);
+      } });
+    expect(reader.listPrs({ num: '8300' })).toEqual([closed]);
+    expect(searches).toHaveLength(2);
+  });
+
+  it.each([
+    [0, 32, 0], [1, 32, 1], [4, 32, 4], [8, 32, 8], [9, 32, 8],
+    [16, 32, 8], [32, 32, 8], [33, 32, 8], [40, 32, 8], [128, 32, 96],
+    [16, 1000, 8], [16, 0, 16],
+  ])('bounds ordinary and launch reads at total=%s reserve=%s (ordinary=%s)', (maxPrListingCalls, launchReserve, ordinary) => {
+    let calls = 0;
+    const reader = createPrepareStatusReader({ maxPrListingCalls, launchReserve, exec: () => { calls++; return '[]'; } });
+    // Distinct two-search identities spend exactly the ordinary share, including odd caps.
+    for (let i = 0; i < Math.ceil(ordinary / 2); i++) {
+      try { reader.listPrs({ num: String(8400 + i), bornAs: '' }); } catch { /* partial last identity fails closed */ }
+    }
+    expect(calls).toBe(ordinary);
+    expect(() => reader.listPrs({ num: '8600', bornAs: '' })).toThrow('budget exhausted');
+    expect(calls).toBe(ordinary);
+    // Launch may spend the rest, but never exceed the total, even on an incomplete listing.
+    for (let i = 0; i <= maxPrListingCalls; i++) {
+      try { reader.listPrs({ num: String(8700 + i), bornAs: '', forLaunch: true }); } catch { /* exhausted */ }
+    }
+    expect(calls).toBe(maxPrListingCalls);
+    expect(() => reader.listPrs({ num: '8900', bornAs: '', forLaunch: true })).toThrow('budget exhausted');
+  });
+
   it.each([false, true])('is complete above 500 PRs and bounds all listing calls (async=%s)', async prefetch => {
     const nums = ['5694', '5919', '5745', '5940'];
     const cards = Object.fromEntries(nums.map(num => [num, `---\nbornAs: xabc${num.slice(-3)}\nstatus: open\n---\nvolume ${num}`]));
