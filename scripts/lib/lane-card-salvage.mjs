@@ -19,10 +19,10 @@
  * Callers: the filer's own `finally` (before it releases) and `lane-pool.mjs release` (the backstop for a filer
  * that was killed before its `finally` ran). A lane with any OTHER dirt is never touched here (`mixed`).
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   copyFileSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync,
-  rmdirSync, rmSync,
+  rmdirSync, rmSync, mkdtempSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { laneGitHardeningEnv } from './lane-git-hardening.mjs';
@@ -131,6 +131,7 @@ export function salvageLaneCards({
     return { status: 'failed', reason: `salvage copy failed, lane untouched: ${String(e?.message || e).split('\n')[0]}`, outDir, removed: [] };
   }
   const removed = [];
+  const expected = new Map();
   try {
     // Re-check right before the first delete: the lane must be exactly as classified. Anything that changed since
     // (a new edit, a new holder's work) stops the clean; the copies stay.
@@ -138,15 +139,16 @@ export function salvageLaneCards({
     if (again !== porcelain) throw new Error('lane changed after the save; not cleaning');
     checkLease();
     for (const { rel, dest } of copies) {
-      if (!retireIfUnchanged(dir, rel, readFileSync(dest), join(outDir, 'retired'), isLeaseCurrent)) throw new Error(`${rel} changed after the save; left in the lane`);
+      expected.set(rel, readFileSync(dest));
+      if (!retireIfUnchanged(dir, rel, expected.get(rel), join(outDir, 'retired'), isLeaseCurrent)) throw new Error(`${rel} changed after the save; left in the lane`);
       removed.push(rel);
     }
     checkLease();
-    unstage(dir, plan.cards, removed, gitRun, isLeaseCurrent);
+    unstage(dir, plan.cards, removed, gitRun, isLeaseCurrent, expected, outDir);
     const left = planLaneCardDirt(gitRun(dir, ['status', '--porcelain', '--untracked-files=all'])).cards;
     if (left.length) throw new Error(`still present: ${left.map(({ path }) => path).join(', ')}`);
   } catch (e) {
-    try { if (isLeaseCurrent()) unstage(dir, plan.cards, removed, gitRun, isLeaseCurrent); } catch { /* a replacement holder owns its index; saved bytes stay */ }
+    try { if (isLeaseCurrent()) unstage(dir, plan.cards, removed, gitRun, isLeaseCurrent, expected, outDir); } catch { /* changed index entries stay staged; saved bytes stay */ }
     return { status: 'failed', reason: `clean after salvage incomplete (copies kept in ${outDir}): ${String(e?.message || e).split('\n')[0]}`, outDir, removed };
   }
   return { status: 'salvaged', outDir, removed };
@@ -168,13 +170,37 @@ function retireIfUnchanged(dir, rel, expected, trashDir, isLeaseCurrent) {
   return true;
 }
 
-/** Drop the index entries of the staged cards whose bytes were deleted (their saved copy holds the same bytes). */
-function unstage(dir, cards, removed, gitRun, isLeaseCurrent) {
+/**
+ * Delete only index blobs equal to the saved bytes. A binary deletion patch carries the full old object ID;
+ * `git apply --cached` validates it while holding Git's index lock, then writes the index atomically. Unlike
+ * `rm --cached` after retirement, it cannot discard a concurrently staged version just because the file is absent.
+ * Text patches are insufficient here: whitespace settings can relax their comparisons. Keep this binary even
+ * for text cards, and pin the bytes compared BEFORE retirement (an open descriptor can still change the inode).
+ */
+function unstage(dir, cards, removed, gitRun, isLeaseCurrent, expected, scratchRoot) {
   const done = new Set(removed);
   const staged = cards.filter(({ status, path }) => status !== '??' && done.has(path) && !existsSync(join(dir, path)));
   if (staged.length) {
     if (!isLeaseCurrent()) throw new Error('lease changed before unstaging cards; index untouched');
-    gitRun(dir, ['rm', '--cached', '--quiet', '--ignore-unmatch', '--', ...staged.map(({ path }) => `:(literal)${path}`)]);
+    const format = gitRun(dir, ['rev-parse', '--show-object-format']).trim();
+    if (!['sha1', 'sha256'].includes(format)) throw new Error('unknown Git object format; index untouched');
+    const patch = staged.map(({ path }) => {
+      const bytes = expected.get(path);
+      if (!Buffer.isBuffer(bytes)) throw new Error(`missing saved bytes for ${path}; index untouched`);
+      const oid = createHash(format).update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+      // Git's quoted path syntax handles spaces, quotes and backslashes without pathspec interpretation.
+      return `diff --git ${JSON.stringify(`a/${path}`)} ${JSON.stringify(`b/${path}`)}\n`
+        + `deleted file mode 100644\nindex ${oid}..${'0'.repeat(oid.length)}\n`
+        + 'GIT binary patch\nliteral 0\nHcmV?d00001\n\n';
+    }).join('');
+    mkdirSync(scratchRoot, { recursive: true });
+    const scratch = mkdtempSync(join(scratchRoot, 'unstage-'));
+    try {
+      const patchFile = join(scratch, 'cards.patch');
+      writeFileSync(patchFile, patch, { flag: 'wx' });
+      if (!isLeaseCurrent()) throw new Error('lease changed before unstaging cards; index untouched');
+      gitRun(dir, ['apply', '--cached', '--binary', '--', patchFile]);
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
   }
 }
 
@@ -199,6 +225,7 @@ export function removeFiledCards({ dir, expected, pool = 'web-everything', salva
   try {
     for (const { path } of mine) if (retireIfUnchanged(dir, path, Buffer.from(wanted.get(path), 'utf8'), join(salvageRoot, pool, 'retired-cards'), isLeaseCurrent)) removed.push(path);
   } catch { /* the salvage pass that follows saves whatever is left */ }
-  unstage(dir, mine, removed, gitRun, isLeaseCurrent);
+  unstage(dir, mine, removed, gitRun, isLeaseCurrent,
+    new Map([...wanted].map(([path, text]) => [path, Buffer.from(text, 'utf8')])), join(salvageRoot, pool, 'retired-cards'));
   return removed;
 }

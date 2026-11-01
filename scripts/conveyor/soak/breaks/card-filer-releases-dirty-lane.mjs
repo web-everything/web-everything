@@ -12,6 +12,7 @@
  * must not become a known card-save failure that strands its lease. A replaced lease during filing must keep
  * the replacement holder's untracked cards, staged index and lease, including a same-session reacquisition.
  * An index lock after batch admission must retain the lease when retirement leaves a staged deletion.
+ * A concurrent index-only card replacement at the deletion boundary must also retain its blob and lease.
  * GREEN = clean, card saved, unknown released, replacement holder untouched, incomplete unstaging held.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -160,6 +161,37 @@ export default {
       rmSync(join(lockedLane, '.git', 'index.lock'));
       git(['rm', '--cached', '--quiet', '--', CARD], lockedLane);
       cli(['release', `--lane=${lockedNumber}`, '--session=soak-index-lock']);
+      const stagedRace = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-index-race', '--json']));
+      const stagedLeasePath = join(stagedRace.path, '.git', '.lane-lease');
+      const stagedLease = readFileSync(stagedLeasePath);
+      writeFileSync(join(stagedRace.path, CARD), 'A\n');
+      git(['add', '--', CARD], stagedRace.path);
+      const blobFile = join(base, 'index-replacement');
+      writeFileSync(blobFile, 'B\n');
+      const blob = git(['hash-object', '-w', '--no-filters', blobFile], stagedRace.path);
+      const indexHook = join(base, 'replace-index.mjs');
+      writeFileSync(indexHook, `import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const original = cp.execFileSync;
+let replaced = false;
+cp.execFileSync = function(cmd, args, opts) {
+  if (!replaced && cmd === 'git' && opts?.cwd === ${JSON.stringify(stagedRace.path)}
+      && ['rm', 'apply'].includes(args[0]) && args.includes('--cached')) {
+    replaced = true;
+    original.call(this, 'git', ['update-index', '--cacheinfo', '100644', ${JSON.stringify(blob)}, ${JSON.stringify(CARD)}], opts);
+  }
+  return original.call(this, cmd, args, opts);
+};
+syncBuiltinESMExports();\n`);
+      const stagedRelease = JSON.parse(execRead('node', ['--import', indexHook, join(ROOT, 'scripts/lane-pool.mjs'),
+        'release', `--lane=${stagedRace.lane}`, '--session=soak-index-race', '--json', ...pool], { env, stdio: ['ignore', 'pipe', 'pipe'] }));
+      if (stagedRelease.released !== 0 || git(['ls-files', '--stage', '--', CARD], stagedRace.path).split(/\s+/)[1] !== blob
+        || !existsSync(stagedLeasePath) || !readFileSync(stagedLeasePath).equals(stagedLease)) {
+        violations.push({ invariant: 'concurrent-staging-keeps-blob-and-lease', detail: 'index-only version B must remain staged when only version A was salvaged' });
+      }
+      // Resolve the retained index version only after checking the release result.
+      git(['rm', '--cached', '--quiet', '--ignore-unmatch', '--', CARD], stagedRace.path);
+      cli(['release', `--lane=${stagedRace.lane}`, '--session=soak-index-race']);
       const unknown = JSON.parse(cli(['acquire', '--no-reset', '--session=soak-unknown', '--json']));
       const hook = join(base, 'unreadable-status.mjs');
       writeFileSync(hook, `import cp from 'node:child_process';
