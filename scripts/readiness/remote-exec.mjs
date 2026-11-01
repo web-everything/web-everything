@@ -1044,7 +1044,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, signal, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -1062,12 +1062,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   // All speculative children are drained and all rejections observed before fallback.
   if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
   const unwrap=result=>{if(result.status==='rejected')throw result.reason;return result.value;};
-  // x40a9dk: only a client kill (abort reason code 'client-signal') cancels the run; a timeout abort never does.
-  const cancel = new AbortController();
-  if (signal) {
-    const forward = () => { if (signal.reason?.code === 'client-signal') cancel.abort(); };
-    if (signal.aborted) forward(); else signal.addEventListener('abort', forward, { once: true });
-  }
+  // x40a9dk: only the client-kill `cancelSignal` cancels the run; the timeout `signal` never does.
+  const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
   let incompleteStandards = false;
@@ -1229,7 +1225,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,signal,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1262,7 +1258,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,signal,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }

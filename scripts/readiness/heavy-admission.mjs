@@ -866,9 +866,12 @@ export async function runWithRemoteDecision({
   const controller = new AbortController();
   // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
   // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
+  const cancelController = new AbortController();
   let signalled = null; let onSignal;
-  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve({ clientSignal: name }); controller.abort(Object.assign(new Error(`client ${name}`), { code: 'client-signal' })); }; });
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
   let signalHandlers = [];
+  // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
+  const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
@@ -893,10 +896,8 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal }));
     const result = await Promise.race([remote, timeout, signalPromise]);
-    // A kill that lands while the result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
-    const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
     const cancelOnClientSignal = async (signalName) => {
       clearTimeout(timer);
       let cancelTimer;
@@ -940,11 +941,11 @@ export async function runWithRemoteDecision({
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
-      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
-  } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
+  } catch (error) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(error?.message ?? error); }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
     for (const [name, h] of signalHandlers) process.removeListener(name, h);

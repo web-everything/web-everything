@@ -767,9 +767,9 @@ describe('standards input parity', () => {
 
   it.each([['a null finish (run killed before a receipt)', 'null', 'cancelled'], ['a finish that failed to parse', 'untrusted', 'unconfirmed']])(
     'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
-    const controller = new AbortController(), abort = () => controller.abort(Object.assign(new Error('client'), {code: 'client-signal'}));
+    const controller = new AbortController(), abort = () => controller.abort();
     const f = fixture({receipt}), original = f.exec;
-    f.signal = controller.signal;
+    f.cancelSignal = controller.signal;
     f.exec = vi.fn(async call => {
       if (isRun(call)) { abort(); expect(call.signal.aborted).toBe(true); return {code: 143, stdout: ''}; }
       return original(call);
