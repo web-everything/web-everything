@@ -16,7 +16,7 @@ function simpleShellWords(command) {
 }
 const unquote = arg => arg.replaceAll("'", '');
 
-// A leading `KEY=value` is a plain word or one shell single-quoted string (`'\'''` encodes an apostrophe).
+// A leading `KEY=value` is a plain word or one shell single-quoted string (`'\''` encodes an apostrophe).
 // The quoted form carries repo-scan's changed-file JSON; its content is checked by Forge's own env allowlist.
 const ASSIGNMENT_PREFIX = /^([A-Za-z_][A-Za-z0-9_]*)=('(?:[^'\r\n]|'\\'')*'|[a-zA-Z0-9_./:=@%+,\-]*)(?:[ \t]+|$)/;
 const unquoteValue = raw => raw.startsWith("'") ? raw.slice(1, -1).replaceAll("'\\''", "'") : raw;
