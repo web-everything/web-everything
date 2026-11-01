@@ -232,12 +232,18 @@ describe('fileIntoBatch against a real origin', () => {
   });
 
   it('freshMainBase returns a fresh cached hit even with no budget and no git calls', () => {
-    const run = vi.fn(() => 'sha');
-    const opts = { run, cache: new Map(), now: () => 0 };
-    freshMainBase('/lane', opts);
-    run.mockClear();
-    expect(freshMainBase('/lane', { ...opts, deadline: { left: () => 0 } })).toBe('sha');
-    expect(run).not.toHaveBeenCalled();
+    // A cached hit needs a knowable remote identity (a real .git/config plus url/config answers from the runner).
+    const lane = mkdtempSync(join(tmpdir(), 'fmb-cached-'));
+    try {
+      mkdirSync(join(lane, '.git'));
+      writeFileSync(join(lane, '.git', 'config'), '[remote "origin"]\n\turl = /remote.git\n');
+      const run = vi.fn((cwd, args) => (args[0] === 'remote' ? '/remote.git' : args[0] === 'config' ? 'a=b\0' : 'sha'));
+      const opts = { run, cache: new Map(), now: () => 0 };
+      freshMainBase(lane, opts);
+      run.mockClear();
+      expect(freshMainBase(lane, { ...opts, deadline: { left: () => 0 } })).toBe('sha');
+      expect(run.mock.calls.filter(call => call[1][0] === 'fetch' || call[1][0] === 'rev-parse')).toEqual([]);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
   });
 
   it('freshMainBase rethrows a budget-failed fetch without fallback or caching, then retries', () => {
