@@ -2071,8 +2071,19 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({code:'excluded-source-file'});
   });
 
-  it.each(['secrets.json', 'credentials.yaml', 'secret.pem', 'credentials', '.secrets/safe.md', 'secret.key/safe.md'])
-  ('keeps public tracked non-source or forbidden-component path %s excluded', async name => {
+  // R321: a name-only credential match ships when tracked, identical to origin/main and clean.
+  it.each(['secrets.json', 'credentials.yaml', 'credentials'])
+  ('ships public tracked name-flagged path %s', async name => {
+    const data = name.endsWith('.json') ? '{"a":"public"}' : 'public';
+    writeFileSync(join(cwd,name),data);
+    const paths = [Buffer.from(name)];
+    const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, data), {code:0, stdout:treeRecord(name, data)})});
+    expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
+    expect(manifest.excluded).toEqual([]);
+  });
+
+  it.each(['secret.pem', '.secrets/safe.md', 'secret.key/safe.md'])
+  ('keeps public tracked forbidden-component path %s excluded', async name => {
     mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'public');
     const paths = [Buffer.from(name)];
     const exec = gitInventory(paths, indexRecord(name, 'public'), {code:0, stdout:treeRecord(name, 'public')});

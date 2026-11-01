@@ -86,40 +86,17 @@ function excludedComponent(name, leaf, allowCredential = false) {
     || keyComponent.test(name) || (!allowCredential && credentialComponent.test(name));
 }
 
-// Ruling R312: the ONLY exception to credentialComponent. A top-level, ASCII
-// design-systems/<stem>.tokens.json (stem itself credential-free) stays excluded
-// by path but joins the credentialSource channel: it ships only when its index
-// blob equals origin/main and the worktree bytes match (remote-exec), is never
-// reused unscanned, is refused as an alias, and manifestEntry requires tracking
-// plus a clean secret scan, refusing the manifest (local fallback) otherwise.
-const designTokenLeaf=/^[a-z0-9][a-z0-9-]*\.tokens\.json$/;
-export function isDesignTokenPath(path) {
-  const parts=pathParts(path);
-  if(parts.length!==2||!parts[0].equals(Buffer.from('design-systems')))return false;
-  const leaf=parts[1].toString('latin1');
-  return designTokenLeaf.test(leaf)&&!credentialComponent.test(leaf.slice(0,-'.tokens.json'.length))
-    &&!excludedComponent(leaf,true,true);
-}
-// Ruling R316: the SAME strict channel for tracked JSON directly inside four
-// public data registries (src/_data/<dir>/<stem>.json, one level, no nesting).
-// The stem must be credential-named by token/credential only; any other
-// credential word (secret, password, oauth, api-key, ...) stays excluded.
-const dataRegistryDirs=['protocols','intents','semantics','researchTopics'].map(dir=>Buffer.from(dir));
-const dataRegistryLeaf=/^[a-z0-9][a-z0-9-]*\.json$/;
-// credentialComponent minus token|credential: tested on the raw stem, never on
-// an edited copy, so no overlap (e.g. "secretoken") can hide a match.
-const otherCredentialWord=/secret|creds|passwd|password|oauth|api[-_ .]?key|^id_/;
-export function isDataRegistryPath(path) {
-  const parts=pathParts(path);
-  if(parts.length!==4||!parts[0].equals(Buffer.from('src'))||!parts[1].equals(Buffer.from('_data'))
-    ||!dataRegistryDirs.some(dir=>parts[2].equals(dir)))return false;
-  const leaf=parts[3].toString('latin1'),stem=leaf.slice(0,-'.json'.length);
-  // Only stems the credential regex would exclude join the channel; ordinary
-  // registry JSON keeps its unchanged path (tracked or not).
-  return dataRegistryLeaf.test(leaf)&&/token|credential/.test(stem)&&!otherCredentialWord.test(stem)
-    &&!excludedComponent(leaf,true,true);
-}
-const isStrictJsonPath=path=>isDesignTokenPath(path)||isDataRegistryPath(path);
+// Ruling R321 (replaces the per-folder exceptions of R312/R316). A file whose
+// NAME alone trips credentialComponent ships to Forge only when ALL hold:
+//   1. it is git-tracked;
+//   2. its bytes equal origin/main and it is not a symlink nor reached through
+//      one (remote-exec compares the index blob to the origin/main blob, and
+//      the symlink/alias checks refuse the rest);
+//   3. it passes the content secret scan below.
+// Why this leaks nothing: a tracked file identical to origin/main is already
+// public, so shipping it to our own Forge reveals nothing new. Anything
+// untracked, modified versus main, or local-only stays excluded. Names that are
+// unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
 const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
 const secretText=[
   [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
@@ -131,6 +108,18 @@ function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
   return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
+}
+// Content scan for a name-flagged file. JSON gets the full structural scan. Source
+// and docs files (sourceExtension) are public code that legitimately spells out
+// secret patterns (scrubbers, PEM docs): they are unscanned, exactly as before
+// R321. Every other type gets the raw token patterns, minus the PEM markers that
+// ordinary prose and code mention. Returns the first finding or null when clean.
+export function credentialContentFinding(path,content) {
+  const leaf=pathParts(path).at(-1).toString('latin1');
+  if(/\.json$/i.test(leaf))return designTokenSecretFinding(content);
+  if(sourceExtension.test(leaf.toLowerCase()))return null;
+  const text=Buffer.from(content).toString('utf8');
+  return secretText.filter(([,name])=>name!=='pem-header'&&name!=='private-key').find(([pattern])=>pattern.test(text))?.[1]??null;
 }
 // Returns the first secret-like finding, or null when the content is clean.
 export function designTokenSecretFinding(content) {
@@ -166,16 +155,16 @@ export function designTokenSecretFinding(content) {
 export function classifyManifestPath(path) {
   const parts=pathParts(path),names=parts.map(normalizedComponent);
   const excluded=names.some((name,i)=>excludedComponent(name,i===names.length-1));
-  const credentialSource=excluded && (isStrictJsonPath(path) || (sourceExtension.test(names.at(-1))
-    && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true))));
+  // Excluded ONLY because of a credential-looking name (see R321 above).
+  const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
 export function manifestEntry(path,content,executable,tracked) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
-  if(isStrictJsonPath(path)) {
-    const finding=tracked?designTokenSecretFinding(content):'untracked';
-    if(finding)throw Object.assign(new Error(`Excluded credential-named JSON file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
+  if(classifyManifestPath(path).credentialSource) {
+    const finding=tracked?credentialContentFinding(path,content):'untracked';
+    if(finding)throw Object.assign(new Error(`Excluded credential-named file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   return {path,sha256:sha(content),executable,tracked};
 }

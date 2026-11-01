@@ -450,7 +450,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
       publicOid = await publicBlob(key);
-      if (!indexedOid || indexedOid !== publicOid) throw excludedSource();
+      if (!indexedOid || indexedOid !== publicOid) {
+        // Not tracked-and-identical to origin/main: never ships. Source files
+        // refuse the manifest (local fallback); other types stay excluded as before.
+        if (sourceExtension.test(names.at(-1))) throw excludedSource();
+        publicOid = undefined;
+      }
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
       const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
