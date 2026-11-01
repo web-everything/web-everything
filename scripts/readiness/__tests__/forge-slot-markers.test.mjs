@@ -18,7 +18,7 @@ function setup(markers) {
   }
   return root;
 }
-const tel = (activeRuns, sampledMs = NOW + 5_000) => async () => ({sampledAtET: iso(sampledMs), activeRuns});
+const tel = (activeRuns, sampledMs = NOW + 120_000) => async () => ({sampledAtET: iso(sampledMs), activeRuns});
 const liveness = dead => pid => (dead.includes(pid) ? 'dead' : 'alive');
 const names = root => ['0', '1', '2'].filter(i => existsSync(join(root, `slot-${i}.unconfirmed`)));
 
@@ -40,11 +40,11 @@ describe('stale remote slot markers (perf10)', () => {
     const file = join(root, 'slot-0.unconfirmed');
     let clockNow = NOW;
     const reaper = createMarkerReaper({root, clock: () => clockNow, liveness: liveness([111])});
-    expect(await reaper.step(tel(0, NOW - 4_000))).toEqual([]);
+    expect(await reaper.step(tel(0, NOW + 30_000))).toEqual([]);
     rmSync(file); writeFileSync(file, markerContent({owner: 'new', pid: 111, nowMs: NOW}));
     const t = (NOW - 600_000) / 1000; utimesSync(file, t + 7, t + 7);
     clockNow = NOW + 10_000;
-    expect(await reaper.step(tel(0, NOW + 1_000))).toEqual([]);
+    expect(await reaper.step(tel(0, NOW + 95_000))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
   it('creates a marker exclusively under the shared mutex', async () => {
@@ -87,8 +87,8 @@ describe('stale remote slot markers (perf10)', () => {
   it('waits for a Forge sample taken after the owner was first seen dead', async () => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, clock: () => NOW, liveness: liveness([111])});
-    expect(await reaper.step(tel(0, NOW - 4_000))).toEqual([]);
-    expect(await reaper.step(tel(0, NOW + 1_000))).toEqual(['slot-0.unconfirmed']);
+    expect(await reaper.step(tel(0, NOW + 30_000))).toEqual([]);
+    expect(await reaper.step(tel(0, NOW + 100_000))).toEqual(['slot-0.unconfirmed']);
   });
   it('refuses to reap without usable Forge telemetry', async () => {
     const root = setup({0: {pid: 111}});

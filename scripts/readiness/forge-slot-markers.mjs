@@ -10,6 +10,9 @@ import {readLockEntry, reserve, releaseLockDir} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
 export const MARKER_GRACE_MS = 120_000;
+// The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
+// a receipt created between Forge's receipt listing and its timestamp, so a sample can never predate a surviving run.
+export const DEATH_SAMPLE_MARGIN_MS = 90_000;
 const NAME = /^slot-(\d+)\.unconfirmed$/;
 
 /** New markers carry their owner pid so a later client can prove the owner is dead. */
@@ -50,14 +53,27 @@ function ownerPid(root, index, file) {
 /**
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
- * A dead owner is reaped only when (1) it was first observed dead no later than the telemetry sample, so any Forge
- * receipt it created is already counted, (2) the marker is past the grace window, and (3) Forge reports ZERO active
+ * A dead owner is reaped only when (1) the telemetry sample was taken at least DEATH_SAMPLE_MARGIN_MS after the owner
+ * was first seen dead (the stamp persists in a sidecar, so a later client completes what an earlier one began), (2) the marker is past the grace window, and (3) Forge reports ZERO active
  * runs. Telemetry is only a count and cannot say WHICH marker's run is still going, so any active run keeps every
  * dead-owner marker (never guess by age). Leaked Forge receipts therefore keep markers, never the other way round.
  */
 export function createMarkerReaper({root, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
   const firstDead = new Map();
+  const sidecar = file => file + '.dead';
+  function stampFor(file, key) {
+    if (firstDead.has(key)) return firstDead.get(key);
+    let at;
+    try { const saved = JSON.parse(readFileSync(sidecar(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.at)) at = saved.at; } catch { /* none yet */ }
+    if (at === undefined) {
+      at = clock(); // stamped after the death probe
+      try { writeFileSync(sidecar(file), JSON.stringify({key, at}), {mode: 0o600}); } catch { /* memory stamp still applies */ }
+    }
+    firstDead.set(key, at);
+    return at;
+  }
+  const forget = (file, key) => { firstDead.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } };
   return {
     async step(getTelemetry, now = clock()) {
       let names;
@@ -71,8 +87,8 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const pid = ownerPid(root, Number(m[1]), file);
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
-        if (liveness(pid, selfPid) !== 'dead') { firstDead.delete(key); continue; }
-        if (!firstDead.has(key)) firstDead.set(key, clock()); // stamped after the death probe
+        if (liveness(pid, selfPid) !== 'dead') { forget(file, key); continue; }
+        stampFor(file, key);
         dead.push({name, key, file, mtimeMs, ino, index: Number(m[1])});
       }
       if (!dead.length) return [];
@@ -83,7 +99,7 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
       if (active !== 0) return [];
       const reaped = [];
       for (const entry of dead) {
-        if (now - entry.mtimeMs < graceMs || firstDead.get(entry.key) > sampledAt) continue;
+        if (now - entry.mtimeMs < graceMs || sampledAt < firstDead.get(entry.key) + DEATH_SAMPLE_MARGIN_MS) continue;
         // Re-judge under the mutex: the marker must be the very file we judged and its owner still provably dead.
         const removed = await withMarkerLock(root, still => {
           try {
@@ -96,7 +112,7 @@ export function createMarkerReaper({root, clock = Date.now, liveness = probePidL
           } catch { return false; }
         }).catch(() => false);
         if (!removed) continue;
-        firstDead.delete(entry.key);
+        forget(entry.file, entry.key);
         reaped.push(entry.name);
       }
       if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; Forge reports ${active} active run(s))\n`);
