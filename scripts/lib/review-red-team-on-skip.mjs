@@ -116,8 +116,9 @@ export function verifiedStaleRedTeamAbandonment(key, status) {
   } catch { return false; } // Unreadable/inconsistent claims require operator inspection, never a fresh call.
 }
 
-function claimStaleRecovery(key, suffix) {
-  const marker = `${staleStatusPath(key)}.${suffix}`;
+function claimStaleNoRestart({ count, ...key }) {
+  if (count !== 1) return { ok: false };
+  const marker = `${staleStatusPath(key)}.stale-norestart`;
   let claimed = false;
   const release = () => {
     try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -129,10 +130,6 @@ function claimStaleRecovery(key, suffix) {
     }
     return { ok: true, release };
   } catch { if (claimed) { try { release(); } catch { /* keep closed */ } } return { ok: false }; }
-}
-
-function claimStaleNoRestart({ count, ...key }) {
-  return count === 1 ? claimStaleRecovery(key, 'stale-norestart') : { ok: false };
 }
 
 function isRedispatchedRun(status, firstMarkerMtimeMs) {
@@ -148,28 +145,32 @@ function isRedispatchedRun(status, firstMarkerMtimeMs) {
 export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.env, now = Date.now(),
   clock = Date.now, probe = {} }) {
   const key = { repo, pr, head, env }, path = staleStatusPath(key);
-  let claim;
+  let claimed = false, marker;
+  const release = () => { try { unlinkSync(marker); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
   try {
     const current = JSON.parse(readFileSync(path, 'utf8'));
     if (current.repo !== repo || Number(current.pr) !== Number(pr) || current.head !== head
       || current.status !== 'running' || current.result != null
       || current.pid !== status?.pid || current.pidStart !== status?.pidStart
       || current.host !== status?.host || current.pidNamespace !== status?.pidNamespace) return { ok: false };
-    if (staleRedTeamRun({ status: current, now, probe, deadlineMs: staleRunDeadlineMs(env) }).stale !== true) return { ok: false };
+    if (staleRedTeamRun({ status: current, now, probe }).stale !== true) return { ok: false };
     const { nextOrdinal: attempt, firstMarkerMtimeMs } = staleRedTeamRedispatch(key);
     if (attempt == null || (attempt === 2 && (!isRedispatchedRun(current, firstMarkerMtimeMs)
       || !Number.isFinite(now) || now - firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS))) return { ok: false };
-    claim = claimStaleRecovery(key, `stale-redispatch-${attempt}`);
-    if (!claim.ok) return claim;
+    marker = `${path}.stale-redispatch-${attempt}`;
+    closeSync(openSync(marker, 'wx')); claimed = true;
     const at = new Date(clock()).toISOString();
+    if (readStaleRedispatchMarkers(key).filter(Boolean).length > MAX_STALE_REDISPATCHES) {
+      throw new Error('combined stale recovery cap exceeded');
+    }
     const reason = 'running red team owner is dead or exceeded stale deadline';
     writeJsonAtomic(path, { ...current, staleAbandoned: { at, pid: status.pid, reason } });
     const events = daemonEventsPath({ env });
     mkdirSync(dirname(events), { recursive: true });
     appendFileSync(events, `${JSON.stringify({ at, kind: 'red-team-stale-run-abandoned', repo, pr,
       daemon: 'review', detail: { head, pid: status.pid, reason, attempt } })}\n`);
-    return claim;
-  } catch { if (claim?.ok) { try { claim.release(); } catch { /* keep closed */ } } return { ok: false }; }
+    return { ok: true, release };
+  } catch { if (claimed) { try { release(); } catch { /* keep closed */ } } return { ok: false }; }
 }
 
 /** Runs are updated in place: the newest matching review by file mtime decides whether recovery is owed. */
@@ -436,11 +437,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       // Even a policy-settlement fallback must not turn a spent retry into fresh provider work.
       if (mode === 'fresh' && status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
-      // Stale recovery markers survive status cleanup and daemon restarts. Ordinary
-      // provider-calling dispatches must honor them; resume only settles a recorded pass.
-      // staleOwed above owns its bounded recovery logic.
+      // Stale recovery markers survive status cleanup and daemon restarts. Every ordinary
+      // red-team dispatch must honor them; staleOwed above owns its bounded recovery logic.
       const key = { repo, pr, head };
-      if (mode !== 'resume' && (staleRedispatch(key).count > 0 || staleSpent(key))) {
+      if (staleRedispatch(key).count > 0 || staleSpent(key)) {
         return skip('stale red team already re-dispatched; inspect review run');
       }
       return dispatchDecision({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
@@ -580,10 +580,10 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 || (row.abandonStale === false && noRestart?.ok === true) ? { redTeamStaleRecovery: true } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
-              const confirmedNonStart = typeof result?.skipped === 'string' && result.skipped.length > 0
+              const confirmedNonStart = result != null && typeof result === 'object'
                 && result.skipped !== 'live-job' && !Number.isInteger(result.jobPid);
-              const refundable = result?.skipped !== 'live-job'
-                || (budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
+              const refundable = confirmedNonStart || (result?.skipped === 'live-job'
+                && budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
               if (reserved && refundable) budget.left++;
               row.why = result?.skipped ?? 'job did not start';
               // An existing job (even one already budgeted) or an unknown outcome

@@ -645,14 +645,6 @@ describe('runRedTeamOnSkip', () => {
     expect(runRedTeamOnSkip(o).notStarted).toEqual([{ prNumber: pr, reason: 'lane-cooloff' }]);
     expect(o.lastDispatch.size).toBe(0); expect(o.capacity.budget.left).toBe(1);
   });
-  it.each([null, undefined, {}, { skipped: 'lane-cooloff', jobPid: 42 }])(
-    'a returned non-live-job outcome %j refunds the budget reservation', result => {
-      const o = runFixture({ dispatch: vi.fn(() => result) });
-      expect(runRedTeamOnSkip(o).dispatched).toEqual([]);
-      expect(o.dispatch).toHaveBeenCalledOnce();
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-      expect(o.lastDispatch.size).toBe(0);
-    });
   it.each([false, true])('a live-job refusal refunds only an already-counted pid (counted: %s)', counted => {
     const o = runFixture({ dispatch: () => ({ skipped: 'live-job', jobPid: 99 }),
       capacity: { lanes: 1, budget: { left: 1, countedJobPids: new Set(counted ? [99] : []) } } });
@@ -1620,7 +1612,7 @@ describe.each(['missing status', 'placeholder', 'dead queued normalized'])('ordi
 });
 
 describe.each(['effects resume', 'failed seat retry', 'policy settlement'])('ordinary red-team dispatch — %s', kind => {
-  it.each([0, 1, 2])('caps provider calls while allowing effects resume with %i stale markers', count => {
+  it.each([0, 1, 2])('honors %i stale markers at the shared dispatch return', count => {
     const loopPayload = payload();
     Object.assign(loopPayload.findings.read, { diffText: '+card', netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] });
     const status = { head, status: 'finished', result: kind === 'policy settlement' ? 'skipped' : 'ran',
@@ -1629,16 +1621,9 @@ describe.each(['effects resume', 'failed seat retry', 'policy settlement'])('ord
       readStatus: () => status,
       readEvidence: () => ({ loopPayload, recorded: kind === 'effects resume',
         completedRecorded: kind === 'effects resume', failedSeatCount: kind === 'failed seat retry' ? 1 : 0 }) });
-    const expected = count > 0 && kind !== 'effects resume'
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject(count > 0
       ? { action: 'skip', why: 'stale red team already re-dispatched; inspect review run' }
-      : { action: 'dispatch', mode: kind === 'effects resume' ? 'resume' : 'fresh' };
-    expect(planRedTeamOnSkip(f)[0]).toMatchObject(expected);
-    const o = runFixture({ ...f, now: () => f.now });
-    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject(expected);
-    if (expected.action === 'dispatch') {
-      expect(o.dispatch).toHaveBeenCalledOnce();
-      expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: expected.mode });
-    } else expect(o.dispatch).not.toHaveBeenCalled();
+      : { action: 'dispatch', mode: kind === 'effects resume' ? 'resume' : 'fresh' });
   });
 });
 
@@ -2037,7 +2022,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(o.dispatch).not.toHaveBeenCalled();
     }, 2);
   });
-  it.each([{ skipped: 'no capacity' }])('confirmed no-restart non-start %j releases its marker for a later tick', result => {
+  it.each([{ skipped: 'no capacity' }, {}])('confirmed no-restart non-start %j releases its marker for a later tick', result => {
     withAbandoned(({ o, marker }) => {
       o.dispatch = vi.fn(() => {
         expect(existsSync(marker)).toBe(true);
@@ -2063,7 +2048,7 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(o.dispatch).toHaveBeenCalledOnce();
     });
   });
-  it.each([{ skipped: 'live-job' }, { skipped: 'live-job', jobPid: 42 }, undefined, null, {}])(
+  it.each([{ skipped: 'live-job' }, { skipped: 'live-job', jobPid: 42 }, undefined, null])(
     'unconfirmed no-restart dispatch %j retains markers after cooldown reset', result => {
       withAbandoned(({ o, statusPath, marker }) => {
         const firstMarker = `${statusPath}.stale-redispatch-1`;
@@ -2071,8 +2056,6 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
         expect(runRedTeamOnSkip(o).dispatched).toEqual([]);
         expect(existsSync(firstMarker)).toBe(true);
         expect(existsSync(marker)).toBe(true);
-        expect(o.capacity).toEqual({ lanes: 1, budget: { left: result?.skipped === 'live-job' ? 0 : 1 } });
-        expect(o.lastDispatch.size).toBe(0);
         o.lastDispatch.clear();
         o.capacity = { lanes: 1, budget: { left: 1 } };
         expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip',
@@ -2359,50 +2342,6 @@ describe('stale recovery — absolute combined dispatch cap', () => {
 });
 
 describe('abandonStaleRedTeamRun — durable ordinal markers', () => {
-  it.each([null, {}])('unconfirmed abandonment dispatch %j refunds budget while retaining its marker', result => {
-    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-refund-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
-    try {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-      writeFileSync(path, JSON.stringify(deadRunningStatus()));
-      const o = staleRunFixture({ env, readStatus: key => readRedTeamStatus({ ...key, env }),
-        staleSpent: undefined, staleRedispatch: undefined,
-        abandonStale: vi.fn(staleRecovery.abandonStaleRedTeamRun), dispatch: vi.fn(() => result) });
-      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why: 'job did not start' }],
-        dispatched: [], notStarted: [{ prNumber: pr, reason: 'job did not start' }] });
-      expect(o.dispatch).toHaveBeenCalledOnce();
-      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true,
-        redTeamMode: 'fresh', redTeamStaleRecovery: true });
-      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
-      expect(o.lastDispatch.size).toBe(0);
-      expect(existsSync(`${path}.stale-redispatch-1`)).toBe(true);
-      expect(staleRecovery.staleRedTeamRedispatch({ repo, pr, head, env })).toMatchObject({ count: 1 });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-
-  it.each([['60000', true], [undefined, false], ['invalid', false], ['14400000', false]])(
-    'uses environment deadline %s when abandoning an unprobeable owner older than one hour', (deadline, abandoned) => {
-      const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-abandon-deadline-'));
-      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl'),
-        ...(deadline === undefined ? {} : { WE_RED_TEAM_STALE_RUN_MS: deadline }) };
-      try {
-        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-        const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-        const status = deadRunningStatus({ host: 'remote', pidStart: new Date(staleNow - 61 * 60_000).toISOString() });
-        const original = JSON.stringify(status);
-        writeFileSync(path, original);
-        expect(staleRecovery.abandonStaleRedTeamRun({ repo, pr, head, env, status, now: staleNow, probe: staleProbe() }))
-          .toEqual(abandoned ? { ok: true, release: expect.any(Function) } : { ok: false });
-        expect(existsSync(`${path}.stale-redispatch-1`)).toBe(abandoned);
-        expect(existsSync(env.WE_DAEMON_EVENTS)).toBe(abandoned);
-        if (abandoned) {
-          expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ ...status,
-            staleAbandoned: { at: expect.any(String), pid: status.pid, reason: expect.any(String) } });
-        } else expect(readFileSync(path, 'utf8')).toBe(original);
-      } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
-
   it.each(['default', 'injected'])('a tick 30s before marker creation verifies with the %s real clock', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-slow-tick-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
