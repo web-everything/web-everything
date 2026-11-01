@@ -1109,10 +1109,17 @@ describe('R100 recovery regressions', () => {
         expect(o.syncLabels).not.toHaveBeenCalled();
         expect(o.dispatch).not.toHaveBeenCalled();
       });
+    it('finished not-owed clears despite the stale red-team:pending status label (D-R338)', () => {
+      const o = publicationOptions(kind);
+      o.rawPrs[0].labels.push('red-team:pending');
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe(kind === 'carry' ? 'skip' : 'clear');
+    });
     it.each(['red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending',
       'review:held-mechanical', 'review:awaiting-advisory', 'review:prep', 'review:future-hold',
       'review-status:pending', 'review-status:future-hold']
       .flatMap(label => [label, { name: label }]))('refuses a conflicting label %j', label => {
+      // The stale pending status of a finished not-owed head is the state being settled, not a hold (D-R338).
+      if (kind === 'finished/not-owed' && (label === 'red-team:pending' || label?.name === 'red-team:pending')) return;
       const o = publicationOptions(kind);
       o.rawPrs[0].labels.push(label);
       runGhSync.mockClear();
@@ -1195,7 +1202,7 @@ describe('R100 recovery regressions', () => {
       expect(o.syncLabels).not.toHaveBeenCalled();
       expect(o.dispatch).not.toHaveBeenCalled();
     });
-  it.each(['red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending'])(
+  it.each(['red-team:blocked', 'review:changes', 'review:human', 'review:pending'])(
     'refuses clear of an accepting finished/not-owed review carrying %s', label => {
       const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
         status: { status: 'finished', result: 'not-owed' } }),
@@ -1206,6 +1213,14 @@ describe('R100 recovery regressions', () => {
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
       expect(o.syncLabels).not.toHaveBeenCalled();
     });
+  it('clears an accepting finished/not-owed review whose stale status label is red-team:pending (D-R338)', () => {
+    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
+      status: { status: 'finished', result: 'not-owed' } }),
+      readStatus: () => ({ status: 'finished', result: 'not-owed' }) });
+    o.rawPrs[0].labels = ['review:accepted', 'red-team:pending'];
+    o.rawPrs[0].comments = [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)];
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('clear');
+  });
   it('keeps an accepting review with null status owed rather than clearing it', () => {
     const o = runFixture();
     o.rawPrs[0].labels = ['review:accepted'];

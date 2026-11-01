@@ -118,8 +118,10 @@ export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWi
 
 // review-labels.mjs exports names only. Fail closed for every review hold namespace,
 // including future merge holds, rather than maintaining a partial list here.
-function conflictsWithPolicyClear(label) {
+function conflictsWithPolicyClear(label, { settlesPending = false } = {}) {
   const name = typeof label === 'string' ? label : label?.name;
+  // A finished not-owed result settles the stale pending status; blocked and review holds still refuse (D-R338).
+  if (settlesPending && name === 'red-team:pending') return false;
   return typeof name === 'string' && (
     (name.startsWith('review:') && name !== 'review:accepted')
     || name.startsWith('review-status:')
@@ -130,7 +132,7 @@ function conflictsWithPolicyClear(label) {
 /** Live holds supersede both carried and stored policy-clears. PURE.
  * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
  */
-function publishableClearGuard({ labels, acceptance, comments, reviews }) {
+function publishableClearGuard({ labels, acceptance, comments, reviews, settlesPending = false }) {
   if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
     return 'later verdict or hold supersedes acceptance';
   }
@@ -139,7 +141,7 @@ function publishableClearGuard({ labels, acceptance, comments, reviews }) {
   }
   if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
   if (!Array.isArray(labels)) return 'PR labels unreadable';
-  if (labels.some(conflictsWithPolicyClear)) {
+  if (labels.some(label => conflictsWithPolicyClear(label, { settlesPending }))) {
     return 'conflicting label prevents policy-clear';
   }
   // A trusted marker alone is not acceptance provenance. Use numbering's whole-thread
@@ -318,7 +320,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
               && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
           if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews, settlesPending: true });
           if (refusal) return skip(refusal);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
