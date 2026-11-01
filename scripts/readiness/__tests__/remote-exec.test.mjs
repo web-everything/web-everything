@@ -563,7 +563,7 @@ describe('isAllowedCommand', () => {
 
   it.each([
     '--shard=1/2', '--bail=1', '--unknown', '--RUN', '--Silent', '--noColor',
-    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=json', '--reporter=DOT',
+    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=JSON', '--reporter=junit', '--reporter=DOT',
     '--reporter', '--run=true', '--silent=false', '--no-color=true', '-t', '-tcase',
     '--testNamePattern', '--', '--CONFIG=other', '--dangerously-ignore-unhandled-errors',
   ])('fails closed for unsupported option spelling or missing value: %s', async arg => {
