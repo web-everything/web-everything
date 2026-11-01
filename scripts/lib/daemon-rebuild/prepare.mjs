@@ -713,9 +713,23 @@ export async function prepareRebuild({
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
-      if (!m.adopt) {
+      // A saved candidate predates this tick's archives (auto-retirement may have run since it passed).
+      // Hold it to the same rule as a fresh plan: every registered carrier's archived sources must be in
+      // the target. Unreadable evidence discards it too; the fresh plan below then re-checks and smokes.
+      let archiveRefusal = null;
+      if (m.adopt) {
+        try {
+          const uncovered = archiveUncovered(git, overlaysBefore || [], m.adopt.finalSha);
+          if (uncovered.length) archiveRefusal = { refs: uncovered.map((o) => o.ref) };
+        } catch (e) {
+          archiveRefusal = { refs: (overlaysBefore || []).filter((o) => o?.retiredSources?.length).map((o) => o.ref),
+            error: String(e?.message ?? e) };
+        }
+      }
+      if (!m.adopt || archiveRefusal) {
         clearReadyCandidate(root, stEnv);
-        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });
+        alert('ready-candidate-discarded', { target: ready.adopt.finalSha,
+          ...(archiveRefusal ? { reason: 'archive-source-uncovered', ...archiveRefusal } : { reason: m.reason }) });
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {

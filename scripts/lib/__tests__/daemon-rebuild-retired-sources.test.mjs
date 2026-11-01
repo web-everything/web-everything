@@ -6,7 +6,7 @@ import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import { addOverlay, migrateRegistrationIds, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity,
   reinstateOverlaySources, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
-import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidate, writeReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Exercise preparation and real registry storage without network or .git writes.
 vi.mock('../lane-repair.mjs', () => ({ repairCloneRefs: () => ({ ok: true, pruned: [], reportedNew: [] }), holdsCloneWriteLock: () => true }));
@@ -37,7 +37,7 @@ vi.mock('../daemon-rebuild/plan.mjs', async (original) => ({
     model.plans.push(overlays.map((o) => o.ref));
     const applied = overlays.filter((o) => !(model.closed && o.ref === 'top'));
     const carries = applied.some((o) => o.ref === 'lower' || (o.ref === 'top' && !model.rewritten));
-    return { ok: true, upToDate: true, mainSha: '1'.repeat(40), finalSha: (carries ? '4' : '5').repeat(40),
+    return { ok: true, upToDate: model.upToDate ?? true, mainSha: '1'.repeat(40), finalSha: (carries ? '4' : '5').repeat(40),
       applied: applied.map((o) => ({ ref: o.ref, sha: (o.ref === 'lower' ? model.lowerTip : '3').repeat(40) })),
       decisions: overlays.map((o) => ({ ref: o.ref, pr: o.pr,
         action: model.closed && o.ref === 'top' ? 'remove' : 'apply', reason: 'pr-closed' })),
@@ -45,12 +45,22 @@ vi.mock('../daemon-rebuild/plan.mjs', async (original) => ({
   },
 }));
 
+// The saved-candidate matcher and finalize are stubbed per test so preparation's own archive guard is what decides.
+vi.mock('../daemon-rebuild/adopt.mjs', async (original) => {
+  const actual = await original();
+  return { ...actual,
+    matchReadyCandidate: (args) => (model.readyMatch ? model.readyMatch(args) : actual.matchReadyCandidate(args)),
+    finalizeRebuild: (args) => (model.finalize ? model.finalize(args) : actual.finalizeRebuild(args)),
+  };
+});
+
 let root;
 afterEach(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   root = mkdtempSync(join(tmpdir(), 'retired-sources-'));
   Object.assign(model, { plans: [], rewritten: false, closed: false, missing: false, gitError: false,
-    lowerTip: '2', persisted: [], failTips: false, failAudit: false, onPersist: null, onPlan: null });
+    lowerTip: '2', persisted: [], failTips: false, failAudit: false, onPersist: null, onPlan: null,
+    upToDate: undefined, readyMatch: null, finalize: null, gitErrorTarget: null });
   const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'), WE_DAEMON_STATE_DIR: join(root, 'state'),
     WE_DAEMON_EVENTS: join(root, 'events'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'preferences'),
     WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on', WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0' };
@@ -73,9 +83,11 @@ function fixture() {
       if (rest[0] !== '--is-ancestor') return result('1'.repeat(40));
       const [, a, b] = rest;
       if (model.gitError && a === '2'.repeat(40)) return result('', 128);
+      if (model.gitErrorTarget && b === model.gitErrorTarget) return result('', 128);
       return result('', a === b || (a === '2'.repeat(40) && ['3'.repeat(40), '4'.repeat(40)].includes(b)) ? 0 : 1);
     }
     if (cmd === 'diff') return result();
+    if (cmd === 'log') return result();
     if (cmd === 'cherry') return result(`+ ${'2'.repeat(40)}`);
     if (cmd === 'merge-tree') return result('7'.repeat(40));
     throw new Error(`Unexpected Git command: ${args.join(' ')}`);
@@ -374,5 +386,50 @@ describe('archived sources remain represented in preparation', () => {
     expect(restored.reinstated).toEqual(['nested', 'lower']);
     expect(restored.list[1].registeredAt).toBe('latest');
     expect(restored.list[2]).toEqual(carrier);
+  });
+});
+
+describe('a saved ready candidate is held to the archived-source rule (PR #6033 red team)', () => {
+  // Saved before auto-retirement archived lower into top; matchReadyCandidate accepts it as fallback-main-moved.
+  async function readyTick({ target, gitError = false }) {
+    const f = fixture();
+    await f.retire();
+    const top = readOverlayState(root, { env: f.env }).overlays.find((o) => o.ref === 'top');
+    expect(top.retiredSources).toHaveLength(1);
+    model.upToDate = false;
+    // Only the saved target's containment read fails; the fresh plan's own archive check stays readable.
+    model.gitErrorTarget = gitError ? target : null;
+    writeReadyCandidate(root, { kind: 'fallback', prevHead: '1'.repeat(40), passedAt: new Date().toISOString(),
+      adopt: { finalSha: target, mainSha: '1'.repeat(40), applied: [] }, failed: 'top' }, f.env);
+    model.readyMatch = ({ ready }) => ({ adopt: ready.adopt, failed: 'top', match: 'fallback-main-moved',
+      dropRefs: [{ ref: 'top', registrationId: top.registrationId }] });
+    model.finalize = vi.fn(async () => ({ moved: true, adopted: true, head: target }));
+    const next = await f.prepare();
+    return { f, next, discarded: next.alerts.filter((a) => a.kind === 'ready-candidate-discarded') };
+  }
+
+  it('discards a saved plain-main fallback that lacks a registered carrier\'s archived source', async () => {
+    const { f, next, discarded } = await readyTick({ target: '5'.repeat(40) });
+    expect(model.finalize).not.toHaveBeenCalled();
+    expect(next.result?.reason).not.toBe('ready-adopted');
+    expect(discarded).toEqual([expect.objectContaining({ detail: expect.objectContaining({
+      reason: 'archive-source-uncovered', refs: ['top'], target: '5'.repeat(40) }) })]);
+    expect(readReadyCandidate(root, f.env)).toBeNull();
+    expect(readOverlayState(root, { env: f.env }).overlays.find((o) => o.ref === 'top').retiredSources).toHaveLength(1);
+  });
+
+  it('discards a saved candidate when archive containment cannot be verified (fails closed)', async () => {
+    const { f, discarded } = await readyTick({ target: '5'.repeat(40), gitError: true });
+    expect(model.finalize).not.toHaveBeenCalled();
+    expect(discarded).toEqual([expect.objectContaining({ detail: expect.objectContaining({
+      reason: 'archive-source-uncovered', refs: ['top'], error: expect.any(String) }) })]);
+    expect(readReadyCandidate(root, f.env)).toBeNull();
+  });
+
+  it('still adopts a saved candidate whose target carries the archived source', async () => {
+    const { next, discarded } = await readyTick({ target: '4'.repeat(40) });
+    expect(discarded).toEqual([]);
+    expect(model.finalize).toHaveBeenCalledTimes(1);
+    expect(next.result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'fallback-main-moved' });
   });
 });
