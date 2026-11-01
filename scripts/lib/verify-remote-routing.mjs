@@ -175,8 +175,11 @@ export function parseForgeSmokeOutput(text, { expectedTree, allowedChecks = [] }
     if (typeof body?.tree !== 'string' || !/^[0-9a-f]{40,64}$/.test(body.tree) || !Array.isArray(body.rows)) return { ran: false, reason: 'forge-output-invalid' };
     if (!expectedTree || body.tree !== expectedTree) return { ran: false, reason: 'tree-mismatch' };
     const rows = {};
+    // Any anomalous row (failing, skipped, duplicate, unexpected name, bad shape) voids the WHOLE result: partial or
+    // contradictory evidence never replaces a local adopt-gate check.
     for (const r of body.rows) {
-      if (!r || typeof r.name !== 'string' || !FORGE_SMOKE_NAME.test(r.name) || !allowedChecks.includes(r.name) || r.ok !== true || r.name in rows) continue;
+      if (!r || typeof r.name !== 'string' || !FORGE_SMOKE_NAME.test(r.name) || !allowedChecks.includes(r.name)
+        || r.ok !== true || r.skipped || r.skipReason || r.name in rows) return { ran: false, reason: 'forge-output-invalid' };
       rows[r.name] = { name: r.name, ok: true, ms: Number.isFinite(r.ms) && r.ms >= 0 ? r.ms : 0,
         detail: typeof r.detail === 'string' ? r.detail.slice(0, 500) : '',
         ...(typeof r.closureHash === 'string' && /^[0-9a-f]{64}$/.test(r.closureHash) ? { closureHash: r.closureHash } : {}) };

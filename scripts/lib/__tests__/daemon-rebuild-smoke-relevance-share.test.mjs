@@ -259,7 +259,7 @@ describe('Fork 3: Forge routing with Mac fallback', () => {
     expect(parseForgeSmokeOutput('x'.repeat(70_000), { expectedTree: tree, allowedChecks }).ran).toBe(false);
     expect(parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}{nope`, { expectedTree: tree, allowedChecks }).ran).toBe(false);
     const bad = parseForgeSmokeOutput(line({ tree, rows: [{ name: 'dispatch-dry-run', ok: false }, { name: 'gh-pr-list', ok: true }, { name: '../x', ok: true }] }), { expectedTree: tree, allowedChecks });
-    expect(bad.rows).toEqual({});
+    expect(bad.ran).toBe(false);
   });
   it('falls back (ran:false) when Forge is not ready, unconfigured, errors, or returns a wrong tree', async () => {
     const decide = (remote, reason) => async () => ({ remote, reason });
@@ -279,3 +279,27 @@ describe('Fork 3: Forge routing with Mac fallback', () => {
     expect(failed.results.find((r) => r.name === 'dispatch-dry-run').ranOn).toBeUndefined();
   });
 });
+
+describe('audit findings (xfwf4zc)', () => {
+  it('closure hash covers runtime JSON the closure reads by name', () => {
+    const root = fixture();
+    put(root, 'scripts/conveyor/reconcile-pass.mjs', "export const r = 'dispatch-settings.json';\n");
+    put(root, 'scripts/settings/dispatch-settings.json', '{"a":1}');
+    const check = dryRun('reconcile-dry-run');
+    const a = checkClosureHash({ check, root });
+    put(root, 'scripts/settings/dispatch-settings.json', '{"a":2}');
+    expect(checkClosureHash({ check, root })).not.toBe(a);
+    expect(checkClosureHash({ check, root, listDir: () => { throw new Error('unreadable'); } })).toBeNull();
+  });
+  it('Forge output with any failing, skipped, duplicate or unexpected row is void as a whole', () => {
+    const tree = 'a'.repeat(40);
+    const good = { name: 'dispatch-dry-run', ok: true, ms: 1, detail: 'ok' };
+    const parse = (rows) => parseForgeSmokeOutput(`${FORGE_SMOKE_MARKER}${JSON.stringify({ tree, rows })}`, { expectedTree: tree, allowedChecks: SHAREABLE_CHECK_NAMES });
+    expect(parse([good]).ran).toBe(true);
+    for (const extra of [{ name: 'reconcile-dry-run', ok: false }, { ...good, skipped: true }, good, { name: 'gh-pr-list', ok: true }]) {
+      expect(parse([good, extra]).ran, JSON.stringify(extra)).toBe(false);
+    }
+    expect(parse([{ ...good, skipped: true }]).ran).toBe(false);
+  });
+});
+

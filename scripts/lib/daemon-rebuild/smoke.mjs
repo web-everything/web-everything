@@ -575,7 +575,8 @@ export async function smokeAndAdopt({
     let threw = null;
     let dispatch = null;
     const t0 = now();
-    const relevanceProof = makeRelevanceProof({ identity, env: stEnv, now, ttlMs: reuse.reuseHours * 3_600_000 });
+    // Fresh recovery comparisons and a disabled reuse knob demand live evidence: no historical relevance skips.
+    const relevanceProof = (freshComparison || !reuse.reuseEnabled) ? null : makeRelevanceProof({ identity, env: stEnv, now, ttlMs: reuse.reuseHours * 3_600_000 });
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
       // Fork 3: shareable code checks on Forge when an executor is wired and Forge is ready; a Forge result is

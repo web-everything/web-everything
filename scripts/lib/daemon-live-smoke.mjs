@@ -74,7 +74,7 @@
  */
 
 import { randomUUID, createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
@@ -863,12 +863,31 @@ export const SHAREABLE_CHECK_NAMES = Object.freeze(SMOKE_CHECKS.filter((c) => c.
  * Content hash of a check's own import closure (path + file bytes, sorted), or `null` when the closure is unknown or
  * incomplete (fail closed: no proof can be built on it). Two trees with the same hash run byte-identical check code.
  */
-export function checkClosureHash({ check, root, closureOf = collectImportClosure, readFile = (p) => readFileSync(p) }) {
+export function checkClosureHash({ check, root, closureOf = collectImportClosure, readFile = (p) => readFileSync(p), listDir = (d) => readdirSync(d, { withFileTypes: true }) }) {
   try {
     const closure = closureOf({ root, entries: check.codeEntries || [] });
     if (!closure || closure.complete === false || !(closure.files instanceof Set) || !closure.files.size) return null;
+    const files = new Set(closure.files);
+    // Runtime JSON the closure reads by name is part of what the check runs: hash it too (bounded walk; over the
+    // bound or unreadable means no proof).
+    const names = closure.jsonNames instanceof Set ? [...closure.jsonNames].map((n) => String(n).split('/').pop()) : [];
+    if (names.length) {
+      const wanted = new Set(names);
+      let seen = 0;
+      const stack = ['.'];
+      while (stack.length) {
+        const rel = stack.pop();
+        for (const e of listDir(join(root, rel))) {
+          if (++seen > 40000) return null;
+          if (e.name === 'node_modules' || e.name === '.git') continue;
+          const child = rel === '.' ? e.name : `${rel}/${e.name}`;
+          if (e.isDirectory()) stack.push(child);
+          else if (wanted.has(e.name)) files.add(child);
+        }
+      }
+    }
     const h = createHash('sha256');
-    for (const f of [...closure.files].sort()) { h.update(f); h.update('\0'); h.update(readFile(join(root, f))); h.update('\0'); }
+    for (const f of [...files].sort()) { h.update(f); h.update('\0'); h.update(readFile(join(root, f))); h.update('\0'); }
     return h.digest('hex');
   } catch { return null; }
 }
