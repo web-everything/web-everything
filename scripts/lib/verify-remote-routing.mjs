@@ -4,13 +4,13 @@ import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
-import { stripGateOnlyOptions } from '../readiness/forge-gate-options.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
 
 function simpleShellWords(command) {
   if (/[\r\n]/.test(command)) return null;
-  // Plain words and single-quoted segments only; shell operators and expansions stay local.
-  const word = "(?:[a-zA-Z0-9_./:=@%+,\\-]|'[a-zA-Z0-9_./:=@%+, \\-]*')+";
+  // Plain words and single-quoted segments only; shell operators and expansions stay local. A quoted
+  // segment may also hold `"[]`, literal inside single quotes, so a JSON VERIFY_SCAN_FILES list parses.
+  const word = "(?:[a-zA-Z0-9_./:=@%+,\\-]|'[a-zA-Z0-9_./:=@%+, \"\\[\\]\\-]*')+";
   if (!new RegExp(`^${word}(?:[ \\t]+${word})*$`).test(command)) return null;
   return command.match(new RegExp(word, 'g'));
 }
@@ -19,7 +19,7 @@ const unquote = arg => arg.replaceAll("'", '');
 const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 // Keys that change neither the nested wrapper's admission (CI bypasses it) nor its routing. Each must
 // also pass Forge's env allowlist, so the remote run sees the same value.
-const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR']);
+const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR', 'VERIFY_SCAN_FILES']);
 const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*npx vitest(?=\s|$)/;
 
 function wrappedVitestCommand(command) {
@@ -36,12 +36,10 @@ function wrappedVitestCommand(command) {
   }
   if (words[start] !== 'npx' || words[start + 1] !== 'vitest' || words[start + 2] !== 'run') return null;
   const args = words.slice(start + 3);
-  // The nested wrapper can fall back locally, so it receives every original argument. Only the
-  // Forge-dispatched remote argv drops the trailing gate-only options (stripGateOnlyOptions); the
-  // options themselves must be literal words, so a quoted spelling stays local.
-  const remoteArgs = stripGateOnlyOptions(args);
-  if (!remoteArgs || !args.length) return null;
-  if (!allowedCommand(['npx', 'vitest', 'run', ...remoteArgs.map(unquote)])) return null;
+  // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
+  // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
+  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
+  if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
   return [...words.slice(0, start), 'npm run test:unit --', ...args].join(' ');
 }
 

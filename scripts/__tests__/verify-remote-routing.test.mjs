@@ -2,7 +2,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { appendVerifyRemoteReport, heartbeatOwnedSlot } from '../readiness/heavy-admission.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { stripGateOnlyOptions, GATE_TIMEOUT_FLOORS } from '../readiness/forge-gate-options.mjs';
 import { phaseAdmissionPlan, shouldConfirmRemoteRed, readRemoteReport, remoteInfrastructureFailure, phaseRunLocation, overallRunLocation, decidePhaseRemote } from '../lib/verify-remote-routing.mjs';
 import { runInNewContext } from 'node:vm';
 import { fstatSync, readSync } from 'node:fs';
@@ -12,27 +11,15 @@ vi.mock('node:fs', async importOriginal => {
   return { ...fs, fstatSync: vi.fn(fs.fstatSync), readSync: vi.fn(fs.readSync) };
 });
 
-describe('gate-only option stripping', () => {
-  it('drops only the trailing block, once each, at or above vitest defaults', () => {
-    expect(GATE_TIMEOUT_FLOORS).toEqual({ '--testTimeout': 5000, '--hookTimeout': 10000 });
-    expect(stripGateOnlyOptions(['a', '--passWithNoTests', '--testTimeout=15000', '--hookTimeout=30000'])).toEqual(['a']);
-    expect(stripGateOnlyOptions(['a', '--testTimeout=5000', '--hookTimeout=10000'])).toEqual(['a']);
-    expect(stripGateOnlyOptions(['a', '--testTimeout=4999'])).toEqual(['a', '--testTimeout=4999']);
-    expect(stripGateOnlyOptions(['a', '--hookTimeout=9999', '--passWithNoTests'])).toEqual(['a', '--hookTimeout=9999']);
-    expect(stripGateOnlyOptions(['--passWithNoTests', 'a'])).toEqual(['--passWithNoTests', 'a']);
-    expect(stripGateOnlyOptions(['a', '--testTimeout', '15000'])).toEqual(['a', '--testTimeout', '15000']);
-    expect(stripGateOnlyOptions(['a', '--testTimeout=015000'])).toEqual(['a', '--testTimeout=015000']);
-    expect(stripGateOnlyOptions(['a', '--passWithNoTests', '--passWithNoTests'])).toBeNull();
-    expect(stripGateOnlyOptions([])).toEqual([]);
-  });
-});
-
 describe('timeout preservation', () => {
   it.each([
     '--testTimeout=15000 --hookTimeout=30000',
     '--hookTimeout=30000 --testTimeout=15000 --passWithNoTests',
     '--testTimeout=5000 --hookTimeout=10000',
     '--passWithNoTests',
+    '--testTimeout=4999',
+    '--passWithNoTests scripts/other.test.mjs',
+    '--testTimeout=15000 --reporter=dot',
   ])('hands the nested wrapper every gate option under remote policy: %s', flags => {
     const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
@@ -42,8 +29,9 @@ describe('timeout preservation', () => {
     "'--testTimeout=15000' --hookTimeout='30000'",
     "--test'Timeout'=15000",
     '--testTimeout 15000 --hookTimeout 30000',
-    '--testTimeout=15000 --testTimeout=30000',
-    '--testTimeout=15000 --reporter=dot',
+    '--testTimeout=abc',
+    '--testTimeout=3600001',
+    '--reporter=x',
   ])('keeps unsupported gate options intact under remote policy: %s', flags => {
     const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
@@ -369,10 +357,20 @@ describe('verify remote routing', () => {
       .toEqual({ command: `${one} && ${two}`, takeLocalSlot: true, setHeld: true });
   });
   it.each([
-    // Forge drops env keys outside its allowlist, so the scoped scanner would run unscoped there.
-    `npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["x.mjs"]' npx vitest run scan.test.mjs --testTimeout=15000`,
-    'npx vitest run a.test.mjs && VERIFY_SCAN_FILES=x.mjs npx vitest run scan.test.mjs',
-    'VERIFY_SCAN_FILES=x.mjs npx vitest run scan.test.mjs',
+    [`npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["x.mjs","src/y.ts"]' npx vitest run 'scan.test.mjs' --testTimeout=15000`,
+      `npm run test:unit -- a.test.mjs && VERIFY_SCAN_FILES='["x.mjs","src/y.ts"]' npm run test:unit -- 'scan.test.mjs' --testTimeout=15000`],
+    ['VERIFY_SCAN_FILES=x.mjs npx vitest run scan.test.mjs', 'VERIFY_SCAN_FILES=x.mjs npm run test:unit -- scan.test.mjs'],
+    ["VERIFY_SCAN_FILES='[]' npx vitest run scan.test.mjs --passWithNoTests", "VERIFY_SCAN_FILES='[]' npm run test:unit -- scan.test.mjs --passWithNoTests"],
+  ])('a scan segment carrying a safe VERIFY_SCAN_FILES goes to the wrapper with its list (R309): %s', (command, expected) => {
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command: expected, takeLocalSlot: false, setHeld: false });
+  });
+  it.each([
+    // Forge refuses an unsafe scan list, so the scoped scanner stays local.
+    `npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["/etc/passwd"]' npx vitest run scan.test.mjs --testTimeout=15000`,
+    "VERIFY_SCAN_FILES='/etc/passwd' npx vitest run scan.test.mjs",
+    'VERIFY_SCAN_FILES=../x npx vitest run scan.test.mjs',
+    "VERIFY_SCAN_FILES='a;rm' npx vitest run scan.test.mjs",
+    'VERIFY_SCAN_FILES=$(id) npx vitest run scan.test.mjs',
     'WE_VITEST_MAX_WORKERS=0 npx vitest run a.test.mjs',
     // CI bypasses the nested wrapper's admission; with no outer slot it would run unslotted.
     'CI=true npx vitest run a.test.mjs --testTimeout=15000',
@@ -387,8 +385,8 @@ describe('verify remote routing', () => {
     'npx vitest run a.test.mjs && npx vitest run',
     'npx vitest run a.test.mjs &&  npx vitest run b.test.mjs',
     'npx vitest run a.test.mjs && npm run check:standards',
-    'npx vitest run a.test.mjs --passWithNoTests --passWithNoTests',
-    'npx vitest run a.test.mjs --testTimeout=15000 --testTimeout=20000',
+    'npx vitest run a.test.mjs --testTimeout=abc',
+    'npx vitest run a.test.mjs --reporter=x',
   ])('a chain or env segment Forge cannot run as written keeps the whole command local: %s', command => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
@@ -399,7 +397,7 @@ describe('verify remote routing', () => {
   });
   it.each([
     'node scan.mjs',
-    "VERIFY_SCAN_FILES='one.mjs' npx vitest run scan.test.mjs",
+    "VERIFY_SCAN_FILES='../one.mjs' npx vitest run scan.test.mjs",
     'npx vitest run guard.test.mjs --reporter=default --reporter=json --outputFile.json=report.json',
     "npx vitest run guard.test.mjs --reporter json --outputFile 'report.json'",
     'npx vitest run guard.test.mjs --outputFile.json=report.json',
@@ -414,14 +412,11 @@ describe('verify remote routing', () => {
     '--unknown --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
     '--reporter=json --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
     '--testTimeout=fast --passWithNoTests',
-    '--testTimeout=1',
-    '--testTimeout=4999 --hookTimeout=30000 --passWithNoTests',
-    '--hookTimeout=1',
-    '--testTimeout=15000 --hookTimeout=9999 --passWithNoTests',
+    '--testTimeout=0',
+    '--testTimeout=3600001 --hookTimeout=30000 --passWithNoTests',
+    '--hookTimeout=030000',
     '--hookTimeout=30000ms --passWithNoTests',
     '--passWithNoTests=true --testTimeout=15000',
-    '--testTimeout=15000 --reporter=dot',
-    '--passWithNoTests other.test.mjs',
   ])('unknown or non-trailing local flags keep the original command and local admission: %s', flags => {
     const command = `npx vitest run scripts/one.test.mjs ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
@@ -570,7 +565,7 @@ describe('verify-lane remote phase spawn', () => {
       ['vitest', 'run', 'guard.test.mjs', '--reporter=json', '--outputFile.json=report.json']],
     ['raw', 0, 'local', true, 'npx vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism retry.test.mjs',
       ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', 'retry.test.mjs']],
-    ['raw', 0, 'local', true, "VERIFY_SCAN_FILES='one.mjs' npx vitest run scan.test.mjs", ['vitest', 'run', 'scan.test.mjs']],
+    ['raw', 0, 'local', true, "VERIFY_SCAN_FILES='../one.mjs' npx vitest run scan.test.mjs", ['vitest', 'run', 'scan.test.mjs']],
     ...[false, true].map(phaseAdmission => ['remote', 0, 'remote', false,
       "npx vitest run 'one.test.mjs'",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission]),
