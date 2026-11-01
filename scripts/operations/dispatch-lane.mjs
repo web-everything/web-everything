@@ -129,6 +129,10 @@ export const BRIEF_PLACEHOLDERS = Object.freeze([
   // diagnose-only agent investigates, and which smell opened it. Registered here, not in a private list, so a
   // `{{ episode id }}` typo in ANY brief is caught by the same {@link canonicalPlaceholder} scan as every other name.
   'EPISODE_ID', 'SMELL',
+  // bundle-repair (prototype, 2026-10-21) — the BUNDLE-REPAIR-ONLY names (see {@link BUNDLE_REPAIR_KIND}): which held
+  // daemon clone the repair session rebuilds, which hold episode it records against, the refs the hold names, and
+  // the `--by=` identity its registrations carry.
+  'CLONE_ROOT', 'CLONE_NAME', 'HOLD_ID', 'HELD_REFS', 'BOT',
 ]);
 
 /**
@@ -183,7 +187,17 @@ export const BRIEF_REQUIRED_BY_KIND = Object.freeze({
   // #4078 — a health investigation targets an EPISODE, not an item or a PR, and holds no lane: it needs only the
   // episode, its smell, its own session slug and the absolute WE root its declared reads run from.
   'health-investigate': ['EPISODE_ID', 'SMELL', 'SESSION_SLUG', 'WE_ROOT'],
+  // bundle-repair — targets a held daemon CLONE, not an item or a PR; the session acquires its own lane.
+  'bundle-repair': ['CLONE_ROOT', 'CLONE_NAME', 'HOLD_ID', 'HELD_REFS', 'SESSION_SLUG', 'BOT', 'WE_ROOT'],
 });
+
+/**
+ * bundle-repair (prototype, 2026-10-21) — the health watch's supervised overlay-top repair for a daemon clone held
+ * on its last-good build by an overlay conflict (`we:scripts/conveyor/bundle-repair-dispatch.mjs`). Like
+ * {@link HEALTH_INVESTIGATE_KIND}, deliberately NOT a member of {@link LAUNCH_KINDS}: its caller owns its own
+ * budget (one repair per clone, max concurrent, wall time) and it targets no backlog item.
+ */
+export const BUNDLE_REPAIR_KIND = 'bundle-repair';
 
 /**
  * #4078 — THE HEALTH DAEMON'S DIAGNOSE-ONLY INVESTIGATION, a kind on this operation that the TICK never launches.
@@ -499,6 +513,8 @@ export function sessionSlugFor(num, kind = 'build', pr = null, attempt = '', rep
   if (kind === 'investigate') return `investigate-${id}`;
   // #4078 — keyed on the health EPISODE id (`<date>-<smell>-<subject>-<HHMM>`, already slug-safe), never an item.
   if (kind === HEALTH_INVESTIGATE_KIND) return `health-${id}`;
+  // bundle-repair — keyed on the HOLD id (`<clone>-<key8>-<since36>`, already slug-safe).
+  if (kind === 'bundle-repair') return `bundle-repair-${id}`;
   return mintSessionSlug({ kind: kind === 'build' ? 'conveyor' : kind,
     id: PR_KINDS.includes(kind) ? pr ?? num : num, attempt, repo });
 }

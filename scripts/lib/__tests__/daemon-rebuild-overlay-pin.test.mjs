@@ -63,6 +63,8 @@ function fixture() {
     WE_DAEMON_STATE_DIR: mktemp('we-overlay-pin-state-'),
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-overlay-pin-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-overlay-pin-overlay-'),
+    // Exercise pinning with the original registrations, independent of the retirement shadow cutoff.
+    WE_DAEMON_OVERLAY_AUTO_RETIRE: 'off',
   };
   // Two live fixes in the review daemon, plus the moving PR (#5793) that starts on an unrelated file.
   const a = push('lane/fix-a', init, { [DAEMON]: lines({ 2: 'fix a' }) });
