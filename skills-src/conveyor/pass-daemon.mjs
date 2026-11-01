@@ -50,7 +50,7 @@ import { createHash } from 'node:crypto';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { enqueueItemTask } from '../../scripts/lib/daemon-item-tasks.mjs';
 import { defineJobKind, markClaimed, markSucceeded, markFailed, taskDeadlineDecision } from '../../scripts/lib/daemon-jobs.mjs';
-import { createJobStore, launchJob, reattachTick, probeHandle, stopHandle, hostName, localHostAliases, readProcStart, reapDeadGroup } from '../../scripts/lib/daemon-jobs-runtime.mjs';
+import { createJobStore, scanStore, launchJob, reattachTick, probeHandle, stopHandle, hostName, localHostAliases, readProcStart, reapDeadGroup } from '../../scripts/lib/daemon-jobs-runtime.mjs';
 import { daemonJobsDir } from '../../scripts/operations/run-store.mjs';
 import { formatJobHandle, parseJobHandle, TERMINAL_JOB_STATUSES } from '../../scripts/operations/job-record.mjs';
 import { appendDaemonEvent } from '../../scripts/lib/daemon-events.mjs';
@@ -348,6 +348,9 @@ export function runPassAsTimedJob({ passName, repo, entry }, ports = {}) {
   return pending;
 }
 
+// Only what the sequence number reads from a finished record; the store caches it so history is parsed once.
+const passRow = r => Object.freeze({ kind: r.job.kind, repo: r.job.task?.repo, seq: r.job.task?.seq });
+
 async function executeTimedPass({ passName, repo, entry }, ports) {
   const { store, env, root = REPO_ROOT, now = Date.now, host = hostName(), readStart = readProcStart } = ports;
   const aliases = ports.aliases ?? localHostAliases();
@@ -392,9 +395,9 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
   };
   const kindDef = defineJobKind({ kind: `pass-${createHash('sha256').update(passName).digest('hex').slice(0, 24)}`, entry: entry.script,
     codeMode: 'mutates-tree', prepareWorktree: () => root, maxAttempts: 1, resumable: false });
-  const listed = store.list();
+  const listed = scanStore(store, passRow, 'pass-daemon-rows');
   if (listed.corrupt.length) throw new Error(`pass job store corrupt: ${listed.corrupt.join(', ')}; inspect and repair before retrying`);
-  let record = listed.records.find(r => r.job.task?.kind === kindDef.kind && r.job.task.repo === repo &&
+  let record = listed.live.find(r => r.job.task?.kind === kindDef.kind && r.job.task.repo === repo &&
     r.job.task.item === 1 && !TERMINAL_JOB_STATUSES.includes(r.job.status));
   if (record?.job.passQuarantine) {
     let emission;
@@ -460,8 +463,8 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
     if (!cleared) return { outcome: 'quarantined' };
     record = null; // terminal history stays intact; enqueue the next sequence below
   }
-  const seq = listed.records.reduce((latest, r) => r.job.kind === kindDef.kind && r.job.task?.repo === repo
-    ? Math.max(latest, r.job.task.seq) : latest, 0) + 1;
+  const seq = [...listed.live.map(passRow), ...listed.done].reduce((latest, r) => r.kind === kindDef.kind && r.repo === repo
+    ? Math.max(latest, r.seq) : latest, 0) + 1;
   if (!record) record = enqueueItemTask({ store, kindDef, repo, item: 1, seq,
     codeSha: ports.codeSha ?? null, acting: false, resourceKind: 'light', now: now(),
     policyOptions: { env, ...ports.policyOptions } });

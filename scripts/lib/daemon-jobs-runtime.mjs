@@ -22,7 +22,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -183,7 +183,70 @@ export function createJobStore(dir) {
       }
       return { records, corrupt };
     },
+    /**
+     * {@link list} without re-reading history. Returns `{ live, done, corrupt }`: `live` is every NON-terminal job
+     * record in full (fresh from disk, same objects `list()` would give); `done` is `project(record)` for every
+     * TERMINAL one; `corrupt` is exactly `list().corrupt`. A terminal record is parsed once per process: a cached
+     * projection is reused only while the file's inode, size, mtime and ctime are unchanged, and a record write is
+     * always temp-file + rename (new inode), so a changed record can never be served stale. Corrupt or foreign
+     * files are never cached and are re-judged on every call, and a file that vanishes mid-scan is skipped, as in
+     * `list()`. `project` must be pure and return read-only data; `projectKey` names it for the cache.
+     */
+    scan(project, projectKey = 'default') {
+      return scanJobStore(dir, project, projectKey);
+    },
   };
+}
+
+const scanCaches = new Map();
+function scanJobStore(dir, project, projectKey) {
+  const cacheKey = `${dir}\0${projectKey}`;
+  let cache = scanCaches.get(cacheKey);
+  if (!cache) scanCaches.set(cacheKey, cache = new Map());
+  const live = [];
+  const done = [];
+  const corrupt = [];
+  const seen = new Set();
+  for (const id of listRunIds(dir)) {
+    const path = runPath(id, dir);
+    let st;
+    try { st = statSync(path, { bigint: true, throwIfNoEntry: false }); } catch { st = undefined; }
+    if (!st) continue; // gone since the listing: absent, exactly as tryReadRun reports it
+    seen.add(id);
+    const sig = `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+    const hit = cache.get(id);
+    if (hit && hit.sig === sig) { done.push(hit.projected); continue; }
+    cache.delete(id);
+    try {
+      const r = tryReadRun(id, dir); // the signature was taken BEFORE this read, so a newer file only costs a re-read
+      if (!r || !isJobRecord(r)) continue;
+      if (TERMINAL_JOB_STATUSES.includes(r.job.status)) {
+        const projected = project(r);
+        cache.set(id, { sig, projected });
+        done.push(projected);
+      } else live.push(r);
+    } catch {
+      if (!isForeignJson(path)) corrupt.push(id);
+    }
+  }
+  for (const id of cache.keys()) if (!seen.has(id)) cache.delete(id);
+  return { live, done, corrupt };
+}
+
+/**
+ * {@link createJobStore}'s `scan`, falling back to `list()` for a store without one (test doubles), with the
+ * same `{ live, done, corrupt }` result.
+ */
+export function scanStore(store, project, projectKey) {
+  if (typeof store.scan === 'function') return store.scan(project, projectKey);
+  const { records, corrupt } = store.list();
+  const live = [];
+  const done = [];
+  for (const r of records) {
+    if (TERMINAL_JOB_STATUSES.includes(r.job.status)) done.push(project(r));
+    else live.push(r);
+  }
+  return { live, done, corrupt };
 }
 
 /**
@@ -271,13 +334,11 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
   // Housekeeping runs only after the child exists and its pid is durable: a recursive snapshot delete
   // can outlast the tick watchdog, but must never strand a launching record without a spawned child.
   try {
-    const { records, corrupt } = store.list();
+    const { live: records, corrupt } = scanStore(store, () => null, 'live-only');
     // An unreadable record may belong to a live child whose snapshot references are unknown.
     // Fail closed until the record is repaired; the new child is already durably spawned.
     if (corrupt.length > 0) return spawned;
-    const referenced = records
-      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
-      .flatMap((r) => r.job.snapshotKeys);
+    const referenced = records.flatMap((r) => r.job.snapshotKeys);
     evict({ jobsDir: store.dir, referenced });
   } catch { /* Snapshot cleanup is best-effort; the child is already spawned and recorded. */ }
   return spawned;
