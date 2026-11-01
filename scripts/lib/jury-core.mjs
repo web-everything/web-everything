@@ -3758,7 +3758,9 @@ export function readReferralRecords(comments, { head } = {}) {
       } catch { malformed = true; }
     }
   }
-  return { records: [...records.values()], malformed };
+  // Every reader sees the canonical repo spelling (the map key above keeps the stored one for de-duplication), so a record
+  // and an operator ruling (see readOperatorRulings) compare equal at every site, never at some sites only (#6170).
+  return { records: [...records.values()].map(r => ({ ...r, repo: canonicalRepoSlug(r.repo) })), malformed };
 }
 
 /**
@@ -3886,11 +3888,7 @@ export function readOperatorRulings(comments, { head } = {}) {
 
 /** Shared fresh-read acceptance boundary and replay state. */
 export function mandatoryReferralState(comments, context = {}) {
-  // One canonical repo spelling on both sides of every (repo, pr, head, run, key) match: a ruling written under the repo's
-  // old owner still rules the finding a record names under the new one (#6170). Nothing else about the key loosens.
-  const read = readReferralRecords(comments, context);
-  const records = read.records.map(r => ({ ...r, repo: canonicalRepoSlug(r.repo) }));
-  const malformed = read.malformed;
+  const { records, malformed } = readReferralRecords(comments, context);
   const operator = readOperatorRulings(comments, context);
   context = { ...context, ...(context.repo ? { repo: canonicalRepoSlug(context.repo) } : {}), operatorRulings: operator.rulings };
   const pending = malformed ? ['malformed-referral-record'] : [];
