@@ -34,6 +34,25 @@ describe('overlay adoption events', () => {
     await checkPendingAdoptions({ ...args, now: () => t0 + 21 * 60000, isAncestor: () => true });
     expect(events.map((e) => e.kind)).toEqual(['overlay-adoption-overdue', 'overlay-adopted']);
   });
+  it('keeps a registration made while events are being written', async () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    const sha2 = 'b'.repeat(40);
+    await checkPendingAdoptions({ root, env, daemon: 'd', now: () => t0, isAncestor: () => true,
+      emit: async () => { recordPendingAdoption(root, { ref: 'lane/b', sha: sha2 }, { env }); return true; } });
+    expect(readPendingAdoptions(root, { env }).map((r) => r.ref)).toEqual(['lane/b']);
+  });
+  it('keeps the record when the event write fails, and retries next pass', async () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    const args = { root, env, daemon: 'd', now: () => t0 + 20 * 60000 };
+    expect(await checkPendingAdoptions({ ...args, isAncestor: () => false, emit: async () => false })).toEqual([]);
+    expect(readPendingAdoptions(root, { env })[0].overdueSent).toBeUndefined();
+    expect(await checkPendingAdoptions({ ...args, isAncestor: () => true, emit: async () => false })).toEqual([]);
+    expect(readPendingAdoptions(root, { env })).toHaveLength(1);
+    expect((await checkPendingAdoptions({ ...args, isAncestor: () => true, emit: async () => true })).map((e) => e.kind)).toEqual(['overlay-adopted']);
+    expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
   it('is best-effort: bad sha, unreadable file, throwing git or emit never throw', async () => {
     const { root, env } = setup();
     expect(recordPendingAdoption(root, { ref: 'lane/x', sha: 'abc' }, { env })).toBe(false);
