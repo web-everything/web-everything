@@ -98,7 +98,14 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    This cadence is half the configured stale window, capped at 20 minutes. Use the same free-scope settings when registering;
    if they change, regenerate the brief. Keep this cadence during long commands too; if you cannot, stop work and release the scope.
-   Each run refreshes your \`lastSeenAt\`. If it reports OCCUPIED or UNKNOWN (exit 2), stop and report.
+   Each check refreshes \`lastSeenAt\` only while your reservation exists; it never extends the four-hour TTL.
+   If it reports OCCUPIED or UNKNOWN (exit 2), stop and report.
+   If stderr says "reservation is gone", stop editing even if the check exits 0; a free verdict does not reserve your files.
+   Resume only after the exact register command above succeeds with the same owner token and \`--heartbeat\`;
+   if it refuses, stop and report. Never release another owner's entry.
+   After every successful heartbeat check, re-run the exact register command above before continuing work.
+   This renewal resets the four-hour TTL before it expires, using the same token, files and \`--heartbeat\`.
+   If renewal exits non-zero, stop and report; do not continue editing on the check's free verdict.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
    Base the lane on origin/main (what acquire gives you). Do not base it on another open PR.
@@ -132,6 +139,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.
+   Apply step 2's lost-reservation warning and renewal rules before proceeding, even if this check exits 0.
 ${edge}
 ${renderProofStep(proof)}
 

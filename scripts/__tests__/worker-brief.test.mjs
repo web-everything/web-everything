@@ -1,9 +1,12 @@
 /** @file Tests for the generated standard worker rules and injectable CLI. */
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
-import { resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
+import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
+import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
@@ -172,6 +175,75 @@ describe('main', () => {
 });
 
 describe('per-dispatch owner token', () => {
+  // Run the printed commands through the real CLI and registry, with only PR IO and time injected.
+  const withRegistry = (window, check) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-renewal-'));
+    const env = { WE_AGENT_SCOPES_PATH: path.join(root, 'agents.json'), WE_FREE_SCOPE_STALE_AFTER_MINUTES: String(window) };
+    const start = Date.parse('2026-11-01T00:00:00Z');
+    const brief = renderWorkerBrief({ ...params, freeScope: resolveFreeScopeSettings({ env, platform: {} }) });
+    const command = kind => new RegExp('`node scripts/operations/free-scope-cli.mjs (' + kind + '[^`]+)`').exec(brief)[1]
+      .replaceAll('"', '').split(' ');
+    const run = (argv, minute) => {
+      let out = '', err = '';
+      const now = () => start + minute * 60e3;
+      const code = freeScopeMain(argv, { env, now,
+        collect: ({ files }) => ({ files: files.split(','), nowMs: now(), unreadable: [], prs: [], agents: readRegistry(env.WE_AGENT_SCOPES_PATH) }),
+        stdout: { write: text => { out += text; } }, stderr: { write: text => { err += text; } },
+      });
+      return { code, out, err };
+    };
+    try { check({ brief, run, register: command('register'), heartbeat: command('check --files=[^`]+--exclude-agent='),
+      entries: () => readRegistry(env.WE_AGENT_SCOPES_PATH), start }); }
+    finally { fs.rmSync(root, { recursive: true, force: true }); }
+  };
+
+  it.each([45, 10])('printed %s-minute-window workflow renews ownership past the four-hour TTL', window => {
+    withRegistry(window, ({ brief, run, register, heartbeat, entries, start }) => {
+      const cadence = Number(/every ([\d.]+) minutes/.exec(brief)[1]);
+      expect(run(register, 0).code).toBe(0);
+      for (let minute = cadence; minute <= 260; minute += cadence) {
+        expect(partitionRegistry(entries(), start + minute * 60e3).live, `reservation at minute ${minute}`).toHaveLength(1);
+        expect(run(heartbeat, minute)).toMatchObject({ code: 0, err: '' });
+        // Follow the brief's renewal instruction when present, rather than assuming checks renew the TTL.
+        if (brief.includes('After every successful heartbeat check, re-run the exact register command above')) {
+          expect(run(register, minute)).toMatchObject({ code: 0, err: '' });
+        }
+        expect(run(['check', `--files=${files}`, '--exclude-agent=competitor', '--exclude-owner=other'], minute).code).toBe(1);
+      }
+    });
+  });
+
+  it('requires stopping on a lost-reservation warning even when the heartbeat exits zero, then re-registering', () => {
+    withRegistry(45, ({ brief, run, register, heartbeat }) => {
+      expect(run(register, 0).code).toBe(0);
+      for (let minute = 20; minute <= 240; minute += 20) {
+        const result = run(heartbeat, minute);
+        expect(result.code).toBe(0);
+        if (minute === 240) expect(result.err).toContain('reservation is gone');
+      }
+      expect(brief).toContain('reservation is gone');
+      expect(brief).toContain('stop editing even if the check exits 0');
+      expect(brief).toContain('Resume only after the exact register command above succeeds');
+      const prePush = brief.slice(brief.indexOf('7. **Pre-push recheck.**'));
+      expect(prePush).toContain("Apply step 2's lost-reservation warning and renewal rules before proceeding");
+      expect(fs.readFileSync('skills-src/worker-brief/SKILL.md', 'utf8')).toContain('same-owner TTL renewal');
+      expect(run(register, 240)).toMatchObject({ code: 0, err: '' });
+      expect(run(['check', `--files=${files}`], 240).code).toBe(1);
+    });
+  });
+
+  it('keeps renewal subject to owner and occupied-scope refusals after expiry', () => {
+    withRegistry(45, ({ brief, run, register }) => {
+      expect(run(register, 0).code).toBe(0);
+      const competitor = register.map(arg => arg === '--owner=tok12345' ? '--owner=other' : arg);
+      expect(run(competitor, 240).code).toBe(0);
+      expect(run(register, 240).code).toBe(2);
+      const otherSlug = register.map(arg => arg === '--agent=fix-widget' ? '--agent=other-worker' : arg);
+      expect(run(otherSlug, 240).code).toBe(1);
+      expect(brief).toContain('If renewal exits non-zero, stop and report');
+    });
+  });
+
   it('mints a different token per brief by default and rejects a malformed one', () => {
     const { owner, ...rest } = params;
     const token = (brief) => /--owner=(\S+) --purpose/.exec(brief)[1];
