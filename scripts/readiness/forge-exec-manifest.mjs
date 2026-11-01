@@ -86,17 +86,68 @@ function excludedComponent(name, leaf, allowCredential = false) {
     || keyComponent.test(name) || (!allowCredential && credentialComponent.test(name));
 }
 
+// Ruling R312: the ONLY exception to credentialComponent. A top-level, ASCII
+// design-systems/<stem>.tokens.json (stem itself credential-free) stays excluded
+// by path but joins the credentialSource channel: it ships only when its index
+// blob equals origin/main and the worktree bytes match (remote-exec), is never
+// reused unscanned, is refused as an alias, and manifestEntry requires tracking
+// plus a clean secret scan, refusing the manifest (local fallback) otherwise.
+const designTokenLeaf=/^[a-z0-9][a-z0-9-]*\.tokens\.json$/;
+export function isDesignTokenPath(path) {
+  const parts=pathParts(path);
+  if(parts.length!==2||!parts[0].equals(Buffer.from('design-systems')))return false;
+  const leaf=parts[1].toString('latin1');
+  return designTokenLeaf.test(leaf)&&!credentialComponent.test(leaf.slice(0,-'.tokens.json'.length))
+    &&!excludedComponent(leaf,true,true);
+}
+const secretField=/key|secret|token|passw(?:or)?d/i;
+const secretText=[
+  [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
+  [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/sk-[A-Za-z0-9_-]{16,}/,'sk-token'],
+  [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
+];
+const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+function entropy(text) {
+  // Count code points on both sides: UTF-16 length would dilute astral characters.
+  const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
+  return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
+}
+// Returns the first secret-like finding, or null when the content is clean.
+export function designTokenSecretFinding(content) {
+  const text=Buffer.from(content).toString('utf8');
+  const raw=textFinding(text);
+  if(raw)return raw;
+  let json;
+  try {json=JSON.parse(text);} catch {return 'unparseable-json';}
+  if(!json||typeof json!=='object'||Array.isArray(json))return 'non-object-json';
+  // Scan every string literal in the raw bytes, decoded, in order. JSON.parse
+  // keeps only the last duplicate property, so its object view is never used.
+  let field;
+  for(const [,literal,colon] of text.matchAll(/("(?:[^"\\]|\\.)*")(\s*:)?/g)) {
+    const value=JSON.parse(literal),decoded=textFinding(value);
+    if(decoded)return decoded;
+    if(colon) {field=value;continue;}
+    if(field!==undefined&&secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    field=undefined;
+  }
+  return null;
+}
+
 // Pure policy and leaf construction are shared by inventory, warm export and delta.
 export function classifyManifestPath(path) {
   const parts=pathParts(path),names=parts.map(normalizedComponent);
   const excluded=names.some((name,i)=>excludedComponent(name,i===names.length-1));
-  const credentialSource=excluded && sourceExtension.test(names.at(-1))
-    && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
+  const credentialSource=excluded && (isDesignTokenPath(path) || (sourceExtension.test(names.at(-1))
+    && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true))));
   return {parts,names,excluded,credentialSource};
 }
 export function manifestEntry(path,content,executable,tracked) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
+  if(isDesignTokenPath(path)) {
+    const finding=tracked?designTokenSecretFinding(content):'untracked';
+    if(finding)throw Object.assign(new Error(`Excluded design-token file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
+  }
   return {path,sha256:sha(content),executable,tracked};
 }
 export function decodeManifest(manifest) {
