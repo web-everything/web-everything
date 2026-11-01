@@ -270,14 +270,15 @@ const DIAG_LINES = 10;
 const DIAG_LINE_CHARS = 300;
 const DIAG_TOTAL_CHARS = 2400;
 // A gh-throttle slot refusal is the cause of a child's exit 1, but lives only in stderr; the classifier reads detail.
-const GH_THROTTLE_REFUSAL = /gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[^)]*\)/;
-// Only when the refusal is the child's LAST stderr line (what it died on): anything printed after it is the real failure.
+const GH_THROTTLE_REFUSAL = /^(?:✗ reconcile pass could not read state: )?(gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[^)]*\))(?:; retry next tick)?$/;
+// Only the LAST stderr line may be a refusal, bare or echoed by reconcile-pass's CLI catch.
+// Any other prefix/suffix or later failure stays code; the catch itself adds no new failure cause.
 const throttleCause = (e) => {
   // A signal/crash exit, a non-1 exit code, or any Error/crash line anywhere in stderr is a code failure.
   if (e?.signal || e?.status !== 1) return undefined;
   if (/\b[A-Za-z]*Error\b[:\s]|Cannot find module|\bat \S+ \(|\bSIG[A-Z]+\b/.test(String(e?.stderr ?? ''))) return undefined;
   const last = String(e?.stderr ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).pop() ?? '';
-  return GH_THROTTLE_REFUSAL.exec(last)?.[0] === last.replace(/; retry next tick$/, '') ? GH_THROTTLE_REFUSAL.exec(last)[0] : undefined;
+  return GH_THROTTLE_REFUSAL.exec(last)?.[1];
 };
 
 // Diagnostic stderr is separate from detail: classifiers must see only the original summary.

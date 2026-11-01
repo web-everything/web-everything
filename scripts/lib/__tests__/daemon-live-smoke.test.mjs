@@ -375,9 +375,69 @@ describe('runBounded failure details', () => {
     expect(isEnvTimeoutRow({ ...row, ms: 5 })).toBe(false); // no laundering: must really have spent time
   });
 
+  it.each([
+    ['90', '\n', '; retry next tick'], ['90.125', '\r\n', '; retry next tick'], ['90', '\n', ''],
+  ])('classifies the reconcile CLI wrapper around a %ss slot refusal as env (%j, %j)', async (wait, newline, suffix) => {
+    const cause = `gh-throttle: throttled — no gh slot within ${wait}s (class=read)`;
+    const stderr = ['pr-snapshot: smoke sample 12', `${cause}${suffix}`,
+      `✗ reconcile pass could not read state: ${cause}${suffix}`, ''].join(newline);
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: smoke sample 12'), { stderr, status: 1 }));
+    expect(row.ok).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5 })).toBe(false);
+    expect(row.detail).toContain(cause);
+  });
+
+  it.each([
+    ['arbitrary prefix', { prefix: 'unrelated failure: ' }],
+    ['wrapper with extra suffix', { suffix: '; unrelated failure' }],
+    ['later failure', { after: '\nunrelated failure' }],
+    ['earlier Error', { before: 'TypeError: boom\n' }],
+    ['earlier stack', { before: '    at fail (file:///x.mjs:1:1)\n' }],
+    ['signal kill', { signal: 'SIGSEGV' }],
+    ['non-1 exit', { status: 2 }],
+  ])('keeps a wrapped throttle refusal with %s classified as code', async (_name, variant) => {
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
+    const stderr = `${variant.before ?? ''}${cause}\n${variant.prefix ?? '✗ reconcile pass could not read state: '}${cause}${variant.suffix ?? ''}${variant.after ?? ''}\n`;
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
+      stderr, status: variant.status ?? 1, signal: variant.signal,
+    }));
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(false);
+  });
+
+  it('classifies stderr emitted by the shipped reconcile CLI catch for a throttle exception', async () => {
+    const cli = fileURLToPath(new URL('../../conveyor/reconcile-pass.mjs', import.meta.url));
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
+    // Inject the failed state read at the module boundary; execute the actual CLI and its catch unchanged.
+    const snapshot = `export function readSharedOpenPrs() {
+      process.stderr.write(${JSON.stringify(cause + '\n')});
+      throw new Error(${JSON.stringify(cause)});
+    }`;
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && specifier === '../lib/pr-snapshot.mjs') {
+        return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(snapshot)}`)}, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }`;
+    let failure;
+    try {
+      execFileSync(process.execPath, [`--experimental-loader=data:text/javascript,${encodeURIComponent(loader)}`,
+        '--no-warnings', cli, '--repo=we', '--json'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+        env: { ...process.env, WE_RESOURCE_SHADOW: 'off' },
+      });
+    } catch (error) { failure = error; }
+    expect(failure?.status).toBe(1);
+    expect(failure.stderr.trim().split('\n').slice(-2)).toEqual([
+      cause, `✗ reconcile pass could not read state: ${cause}`,
+    ]);
+    const row = await runCheck('reconcile-dry-run', failure);
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(true);
+  }, 35000);
+
   it('a throttled repo plus another repo\'s real code failure stays code', async () => {
     let n = 0;
-    const throttled = Object.assign(new Error('exited 1: a'), { stderr: 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n' });
+    const throttled = Object.assign(new Error('exited 1: a'), { status: 1, stderr: '✗ reconcile pass could not read state: gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n' });
     const real = Object.assign(new Error('exited 1: b'), { stderr: 'Error: boom\n' });
     const res = await SMOKE_CHECKS.find((c) => c.name === 'reconcile-dry-run').run({ root: '/x', repos: ['a/a', 'b/b'], budgets: {}, env: {}, runChild: async () => { throw (n++ ? real : throttled); } });
     expect(isEnvTimeoutRow({ ...res, ms: 120000 })).toBe(false);
