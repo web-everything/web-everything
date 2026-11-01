@@ -30,6 +30,7 @@ import { closeSync, openSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir, sealJobEnv } from './card-batch-io.mjs';
+import { STEP_MIN_MS, budgetError, isBudgetError } from '../lib/tick-deadline.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
 import { raisedByMemberId } from '../lib/raised-by.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -62,7 +63,7 @@ export function cardIdOf(cardPath) {
   return match ? match[1] : null;
 }
 
-const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }).trim();
+const git = (cwd, args, timeout) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...(timeout ? { timeout, killSignal: 'SIGKILL' } : {}) }).trim();
 
 /**
  * How long one `git fetch origin main` in a lane stays fresh enough to be every admission's base. A prevention
@@ -76,16 +77,27 @@ const MAIN_BASE_CACHE = new Map();
 
 /**
  * Resolve `origin/main` for `laneDir`, fetching at most once per `maxAgeMs` per lane. A failed fetch is never
- * cached: the call falls back to the lane's last fetch (as before) and the next call fetches again.
+ * cached: ordinary failures fall back to the lane's last fetch and the next call fetches again.
+ * With a deadline, git calls are capped at the time left and budget errors propagate without falling back.
  */
-export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS } = {}) {
+export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS, deadline } = {}) {
   const key = resolve(laneDir);
   const hit = cache.get(key);
   if (hit && now() - hit.at < maxAgeMs) return hit.sha;
+  const cap = (max) => {
+    if (!deadline) return undefined;
+    const left = deadline.left();
+    if (left < 1_000) throw budgetError('git');
+    return Math.min(max, left);
+  };
   let fetched = true;
   const at = now();
-  try { run(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main']); } catch { fetched = false; /* fall back to the lane's last fetch */ }
-  const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}']);
+  try { run(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main'], cap(30_000)); } catch (error) {
+    cache.delete(key);
+    if (isBudgetError(error)) throw error;
+    fetched = false; /* fall back to the lane's last fetch */
+  }
+  const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}'], cap(Infinity));
   if (fetched) cache.set(key, { at, sha });
   else cache.delete(key);
   return sha;
@@ -113,6 +125,9 @@ export async function fileIntoBatch({
   settings = loadCardBatchSettings(), preventionSettings = loadPreventionBatchSettings(), admit = admitCard, launch = launchSealJob, stateDir = cardBatchStateDir(),
   baseSha, log = (line) => console.error(line), retries = 5, pause = (ms) => new Promise((done) => setTimeout(done, ms)),
   mainBase = freshMainBase,
+  // In-tick callers pass `deadline` ({left()}): the lease wait, the fetch and every git call in the admission are capped at the time
+  // left, and a card the remaining time cannot cover is refused as retryable (the caller keeps it in the spool / owed).
+  deadline,
 } = {}) {
   log(kind === 'prevention' ? formatPreventionBatchSettings(preventionSettings) : formatCardBatchSettings(settings));
   const policy = effectiveCardBatchPolicy(settings, preventionSettings);
@@ -120,9 +135,11 @@ export async function fileIntoBatch({
   if (!decision.batch) return { batched: false, reason: decision.reason, ...(kind === 'prevention' ? { disabled: true } : {}) };
   const cardId = cardIdOf(cardPath);
   if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}`, ...(kind === 'prevention' ? { disabled: true } : {}) };
+  // Checked before ANY git call (fetch / rev-parse included): an expired budget starts nothing.
+  if (deadline && deadline.left() < STEP_MIN_MS.admit) return { batched: false, retryable: true, reason: 'tick budget exhausted before admission' };
   try {
     const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
-    const base = baseSha ?? mainBase(laneDir);
+    const base = baseSha ?? mainBase(laneDir, { deadline });
     const input = {
       kind, cardPath, cardId, idemKey: idemKey ?? `card:${cardId}`, baseSha: base, laneDir,
       source: { repo, pr: source.pr ?? null, head: source.head ?? null, note: source.note ?? null },
@@ -130,10 +147,16 @@ export async function fileIntoBatch({
     // Concurrent filers serialize on the coordinator's lease. An admission or body refresh holds it for seconds,
     // so a contended filer tries again a bounded number of times. A long hold (a seal running verify) outlasts
     // these attempts, and the caller decides how to retain the refused card (prevention filers spool it).
-    let result = await admit(input, { stateDir, policy });
+    if (deadline && deadline.left() < STEP_MIN_MS.admit) return { batched: false, retryable: true, reason: 'tick budget exhausted before admission' };
+    const admitOptions = { stateDir, policy, ...(deadline ? { deadline } : {}) };
+    let result = await admit(input, admitOptions);
     for (let attempt = 1; attempt <= retries && result.action === 'refuse' && RETRYABLE.has(result.reason); attempt += 1) {
+      // The lease wait is min(configured, time left): no further attempt once another one cannot fit.
+      // The gap itself must fit too, so no sleep can run past the deadline however many retries are configured.
+      if (deadline && deadline.left() < STEP_MIN_MS.admit + 2_000 * attempt + 1_000) break;
       await pause(2_000 * attempt);
-      result = await admit(input, { stateDir, policy });
+      if (deadline && deadline.left() < STEP_MIN_MS.admit) break;
+      result = await admit(input, admitOptions);
     }
     if (result.action === 'refuse') return { batched: false, reason: `coordinator refused: ${result.reason}`, ...(kind === 'prevention' ? { retryable: true } : {}) };
     const statePath = join(stateDir, `${repo.replaceAll('/', '-')}-${kind}.json`);

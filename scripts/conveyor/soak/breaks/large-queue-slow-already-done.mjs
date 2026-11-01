@@ -17,6 +17,7 @@ export default {
     const dir = mkdtempSync(join(tmpdir(), 'soak-large-queue-'));
     const violations = [];
     let child;
+    let pausedWorker;
     try {
       const backlog = join(dir, 'backlog'); const bin = join(dir, 'bin');
       mkdirSync(backlog); mkdirSync(bin);
@@ -27,37 +28,67 @@ export default {
         queue.push({ num, addedAt: '2020-01-01T00:00:00Z' });
       }
       writeFileSync(join(dir, 'queue.json'), JSON.stringify(queue));
-      // Every request stays alive until AFTER the planner must have returned, then returns a rate limit.
+      // Release responses only after both ticks return. The test pauses the worker's group once a
+      // request is in flight, keeping it alive across the two ticks instead of racing a 2.5s response.
       writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 fs.appendFileSync(process.env.SOAK_CALLS, JSON.stringify(process.argv.slice(2))+'\\n');
-setTimeout(()=>{process.stderr.write('API rate limit exceeded\\n');process.exit(1)}, 2500);
+const timer = setInterval(()=>{
+  if (!fs.existsSync(process.env.SOAK_RELEASE)) return;
+  clearInterval(timer);
+  process.stderr.write('API rate limit exceeded\\n');
+  process.exitCode = 1;
+}, 25);
 `, { mode: 0o755 });
       execFileSync('git', ['init', '-q'], { cwd: dir });
       execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/soak/fixture.git'], { cwd: dir });
-      const cache = join(dir, 'cache'); const callsPath = join(dir, 'calls');
+      const cache = join(dir, 'cache'); const callsPath = join(dir, 'calls'); const release = join(dir, 'release');
       const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONVEYOR_QUEUE_FILE: join(dir, 'queue.json'),
         WE_DISPATCH_PLAN_ALREADY_DONE_CACHE_FILE: cache, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'),
-        WE_PR_SNAPSHOT_DIR: join(dir, 'snapshot'), SOAK_CALLS: callsPath };
-      const started = Date.now(); let output = ''; let stderr = '';
-      child = spawn(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
-        '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-      child.stdout.on('data', d => { output += d; }); child.stderr.on('data', d => { stderr += d; });
-      const code = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} reject(new Error('planner blocked on slow GitHub')); }, 2000);
-        child.on('error', reject);
-        child.on('close', code => { clearTimeout(timer); resolve(code); });
-      });
+        WE_PR_SNAPSHOT_DIR: join(dir, 'snapshot'), SOAK_CALLS: callsPath, SOAK_RELEASE: release };
+      const runPlanner = () => {
+        let output = ''; let stderr = '';
+        const planner = child = spawn(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
+          '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        planner.stdout.on('data', d => { output += d; }); planner.stderr.on('data', d => { stderr += d; });
+        return new Promise((resolve, reject) => {
+          // This bounds a hung process; the response barrier below proves non-blocking behavior.
+          const timer = setTimeout(() => { try { process.kill(-planner.pid, 'SIGKILL'); } catch {} reject(new Error(`planner blocked on slow GitHub: ${stderr}`)); }, 5000);
+          planner.on('error', e => { clearTimeout(timer); reject(e); });
+          planner.on('close', code => {
+            clearTimeout(timer);
+            if (code !== 0) reject(new Error(`planner exit ${code}: ${stderr}`));
+            else { try { resolve(JSON.parse(output)); } catch (e) { reject(e); } }
+          });
+        });
+      };
+      const started = Date.now();
+      const first = runPlanner();
+      // Observe errors immediately, including while waiting for the worker to reach the fake host.
+      let plannerError;
+      first.catch(e => { plannerError = e; });
+      const requestDeadline = Date.now() + 10000;
+      while (!existsSync(callsPath)) {
+        if (plannerError) throw plannerError;
+        if (Date.now() >= requestDeadline) throw new Error('refresh did not reach fake GitHub');
+        await delay(25);
+      }
+      const { pid } = JSON.parse(readFileSync(`${cache}.refresh-lock`, 'utf8'));
+      // A real request proves the reservation has been handed from planner to detached worker.
+      if (!Number.isInteger(pid) || pid <= 1 || pid === child.pid || pid === process.pid) throw new Error('invalid refresh worker pid');
+      pausedWorker = pid;
+      process.kill(-pausedWorker, 'SIGSTOP');
+      const plan = await first;
       const elapsedMs = Date.now() - started;
-      if (code !== 0) throw new Error(`planner exit ${code}: ${stderr}`);
-      const plan = JSON.parse(output);
       if (plan.groundTruth.pending !== 444) violations.push({ invariant: 'queue-exercised', detail: JSON.stringify(plan.groundTruth) });
       if (plan.groundTruth.refresh.ids.length !== 2) violations.push({ invariant: 'bounded-selection', detail: JSON.stringify(plan.groundTruth) });
       if (!existsSync(`${cache}.refresh-lock`)) violations.push({ invariant: 'not-awaited', detail: 'slow worker did not outlive planner' });
       // A second tick WHILE the first worker is alive must not add any requests.
-      const second = JSON.parse(execFileSync(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
-        '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, encoding: 'utf8', timeout: 2000 }));
+      const second = await runPlanner();
       if (second.groundTruth.refresh.started) violations.push({ invariant: 'single-flight', detail: 'overlapping tick started another worker' });
+      writeFileSync(release, '');
+      process.kill(-pausedWorker, 'SIGCONT');
+      pausedWorker = null;
       const deadline = Date.now() + 18000;
       while (existsSync(`${cache}.refresh-lock`) && Date.now() < deadline) await delay(50);
       if (existsSync(`${cache}.refresh-lock`)) throw new Error('worker did not finish');
@@ -70,6 +101,8 @@ setTimeout(()=>{process.stderr.write('API rate limit exceeded\\n');process.exit(
     } catch (e) { violations.push({ invariant: 'crash', detail: String(e.stack || e) }); return { violations }; }
     finally {
       // Reap any background enrichment before deleting its inputs, including on the pre-fix RED path.
+      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+      try { if (pausedWorker) process.kill(-pausedWorker, 'SIGKILL'); } catch {}
       try { const { pid } = JSON.parse(readFileSync(join(dir, 'cache.refresh-lock'), 'utf8')); process.kill(-pid, 'SIGKILL'); } catch {}
       rmSync(dir, { recursive: true, force: true });
     }
