@@ -71,12 +71,51 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(releases[0][1]).toEqual(expect.arrayContaining(['release', '--lane=4']));
   });
 
+  it('reports lane-pool\'s own ✗ reason, not its first progress line (live 2026-11-01 lane-33 reclaim listing)', async () => {
+    const stderr = '  lane-33: reclaiming 127 local commit(s), already patch-equivalent to work pushed elsewhere (no unique content — safe to drop):\n'
+      + '    bcba4d2c72 Merge\n  lane-33: reset REFUSED — lane-hold: a fixer is parked\n'
+      + '✗ no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision\n';
+    const runChild = vi.fn().mockRejectedValue(exit(1, { message: 'exited 1:   lane-33: reclaiming 127 local commit(s)', stderr }));
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.detail).toBe('lane-pool acquire --purpose=smoke failed: exited 1: no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision');
+    expect(row.detail).not.toContain('reclaiming');
+  });
+
   it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {
     const runChild = vi.fn().mockRejectedValue(exit(75));
     const row = await check.run(context(runChild));
     expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
     expect(acquires(runChild)).toHaveLength(2);
     expect(runChild.mock.calls.some(([, args]) => args.some((a) => /^--lane=/.test(a)))).toBe(false);
+  });
+
+  it.each([
+    ['failed provisioning', '— every candidate this call tried was claimed but failed to provision (see the warnings above); each was released — investigate the underlying failure, or retry', false],
+    ['unknown exhaustion', '— unknown failure', false],
+    ['held or dirty lanes', '(12 all held/dirty) — release one or `provision` more', true],
+  ])('classifies %s after the wait on a busy host using a real child error', async (_name, reason, skipped) => {
+    const stderr = (skipped ? '  waiting for an available lane\n' : '  lane-33: npm ci failed: package-lock.json is out of sync\n')
+      + `✗ no free lane in pool "web-everything" ${reason}\n`;
+    let now = 1000;
+    const runChild = vi.fn(async (_cmd, args) => {
+      if (args[1] === 'release') return '';
+      try {
+        return await runBounded(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 1;`], {
+          timeoutMs: 5000, maxBytes: 1024,
+        });
+      } finally { now += 30_000; }
+    });
+    const row = await check.run({ ...context(runChild), clock: () => now, hostBusy: () => true });
+    expect(row.ok).toBe(skipped);
+    expect(row.skipped === true).toBe(skipped);
+    expect(acquires(runChild)).toHaveLength(1);
+    expect(runChild).toHaveBeenCalledTimes(skipped ? 2 : 1);
+    if (skipped) expect(row.skipReason).toBe('busy-pool');
+    else {
+      expect(row.detail).toContain(`exited 1: no free lane in pool "web-everything" ${reason}`);
+      expect(row.stderrTail).toContain('package-lock.json is out of sync');
+    }
   });
 
   it('classifies real runBounded exits: two 75s skip, while exit 1 fails', async () => {
