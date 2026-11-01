@@ -23,14 +23,14 @@ export function markerContent({owner, pid, nowMs, host, run}) {
 
 const CLOCK_SKEW_MS = 60_000;
 const LEGACY_TEXT = 'remote termination unconfirmed';
-const RUN = /^r-[a-f0-9]{32}$/;
+const RUN = /^r-[a-f0-9]{32}(?![\s\S])/;
 
 /**
  * Record the Forge run id beside this client's marker, in a sidecar bound to the marker's owner. The marker file itself is
  * never rewritten (a reaper may be judging its inode), and a stale sidecar of another owner is ignored.
  */
 export function recordMarkerRun(file, {owner, run}) {
-  if (!RUN.test(run)) return false;
+  if (typeof run !== 'string' || !RUN.test(run)) return false;
   const tmp = `${file}.run-${randomBytes(6).toString('hex')}`;
   try {
     if (JSON.parse(readFileSync(file, 'utf8'))?.owner !== owner) return false;
@@ -49,12 +49,31 @@ function sidecarRun(file, owner) {
 
 /**
  * What Forge's recent-run telemetry says about one run: `finished` (a result code was published), `inflight` (listed
- * without a code) or `absent` (not listed). The caller guarantees the sample postdates the owner's death by a margin.
+ * without a code), `absent` (not listed, with every active run accounted for) or `unknown` (incomplete evidence).
+ * The caller guarantees the sample postdates the owner's death by a margin.
  */
 export function runVerdict(telemetry, run) {
+  const evidence = recentEvidence(telemetry);
+  if (!evidence) return 'unknown';
   const entry = telemetry.recent.find(item => item?.runId === run);
-  if (!entry) return 'absent';
+  if (!entry) return evidence.complete ? 'absent' : 'unknown';
   return Number.isInteger(entry.code) ? 'finished' : 'inflight';
+}
+
+// Forge caps `recent` at the newest 50 receipts (forge-exec-run.mjs#parseTelemetry). An older run can still be
+// executing outside that window. Absence proves completion only when every active run is represented here.
+function recentEvidence(telemetry) {
+  if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0 || !Array.isArray(telemetry.recent)) return null;
+  const runs = new Set();
+  let inflight = 0;
+  for (const item of telemetry.recent) {
+    if (!item || typeof item.runId !== 'string' || !RUN.test(item.runId)
+      || runs.has(item.runId) || typeof item.startedAtET !== 'string' || !Number.isFinite(Date.parse(item.startedAtET))
+      || !(item.code === null || (Number.isInteger(item.code) && item.code >= 0 && item.code <= 255))) return null;
+    runs.add(item.runId);
+    if (item.code === null) inflight++;
+  }
+  return {complete: inflight === telemetry.activeRuns};
 }
 
 /**
@@ -144,12 +163,13 @@ function ownerGone(root, index, file, liveness, selfPid) {
 /**
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
- * Decided PER RUN, never from the global active-run count (which a busy Forge never lets reach zero). A dead-owner,
+ * Decided PER RUN; the active-run count checks whether the recent window accounts for all active runs. A dead-owner,
  * host-bound marker is reaped when it is past the grace window, the telemetry sample was taken at least
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
- * a result keeps the marker. A marker whose run id was never recorded (the client died before prepare returned) is kept
- * while any run started inside its own possible window ([at - skew, first-seen-dead]) is still unfinished.
+ * a result keeps the marker; an absent run is unknown if active runs are missing from the window. A marker whose run id
+ * was never recorded (the client died before prepare returned) is kept while the active-run listing is incomplete or any
+ * run started inside its own possible window ([at - skew, first-seen-dead]) is still unfinished.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run to ask Forge about: it is
  * reaped past the grace window once no live local process holds its slot lock.
  */
@@ -215,13 +235,15 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
       }
       if (dead.length) {
         const telemetry = await getTelemetry();
-        const sampledAt = Date.parse(telemetry?.sampledAtET), active = telemetry?.activeRuns;
-        if (Number.isFinite(sampledAt) && Number.isSafeInteger(active) && active >= 0 && Array.isArray(telemetry.recent)) {
+        const sampledAt = Date.parse(telemetry?.sampledAtET), evidence = recentEvidence(telemetry);
+        if (Number.isFinite(sampledAt) && evidence) {
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
           for (const entry of dead) {
             const diedBy = firstDead.get(entry.key);
             if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) continue;
-            if (entry.run ? runVerdict(telemetry, entry.run) === 'inflight' : maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
+            if (entry.run) {
+              if (!['finished', 'absent'].includes(runVerdict(telemetry, entry.run))) continue;
+            } else if (!evidence.complete || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
             // dispatch marker is ever lost, whatever the timing and without any lease or lock.

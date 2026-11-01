@@ -723,6 +723,26 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(existsSync(marker)).toBe(true);
     expect(f.remoteExec).not.toHaveBeenCalled();
   });
+  it('reaps stale markers before acquiring an available slot', async () => {
+    const f = await overloadFixture({overloaded: false, freeAtMs: null, remote: {mode: 'always', maxConcurrent: 2}});
+    const root = join(f.lockRoot, '..', 'remote'), marker = join(root, 'slot-0.unconfirmed');
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    expect(child.status).toBe(0);
+    writeFileSync(marker, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1}));
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    const st = statSync(marker);
+    writeFileSync(marker + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000}));
+    // Retain the next execution's marker, so cleanup after completion cannot hide the acquisition order.
+    f.remoteExec.mockResolvedValue({mode: 'unconfirmed', reason: 'ambiguous-result'});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 124});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('reaped stale remote slot marker(s) slot-0.unconfirmed');
+    const replacement = JSON.parse(readFileSync(marker, 'utf8'));
+    expect(replacement.owner).not.toBe('dead');
+    expect(replacement.pid).toBe(process.pid);
+    expect(existsSync(join(root, 'slot-1.unconfirmed'))).toBe(false);
+  });
 
   it('keeps the 30s remote-full fallback when the host is not overloaded', async () => {
     const f = await overloadFixture({ overloaded: false });
