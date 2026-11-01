@@ -108,6 +108,49 @@ describe('window policy', () => {
 });
 
 describe('identity is unprovable', () => {
+  it.each([
+    ['environment', ['main']], ['global config', ['main']], ['runner config', ['main']], ['environment', null],
+  ])('does not reuse canonical freshness after a rewrite from %s (branches: %j)', (source, branches) => {
+    const w = world();
+    const mirror = join(w.root, 'mirror');
+    git(w.root, 'clone', '-q', w.origin, mirror);
+    writeFileSync(join(mirror, 'f'), 'mirror');
+    git(mirror, 'commit', '-qam', 'mirror');
+    const mirrorSha = git(mirror, 'rev-parse', 'main');
+    const configKey = `url.${mirror}.insteadOf`;
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(w.root, 'global-config') };
+    writeFileSync(env.GIT_CONFIG_GLOBAL, '');
+    const configArgs = [];
+    const run = counting((args, cwd) => execFileSync('git', [...configArgs, ...args], { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    const o = { cwd: w.a, stampDir: w.stampDir, run, branches, maxAgeMs: 60_000 };
+    expect(fetchFresh(o).fetched).toBe(true);
+    const canonicalSha = git(w.a, 'rev-parse', 'origin/main');
+    if (source === 'environment') Object.assign(env, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: configKey, GIT_CONFIG_VALUE_0: w.origin });
+    else if (source === 'global config') git(w.root, 'config', '--file', env.GIT_CONFIG_GLOBAL, configKey, w.origin);
+    else configArgs.push('-c', `${configKey}=${w.origin}`);
+    // Read-only Git probe proves that the same runner now fetches from the mirror.
+    expect(run(['remote', 'get-url', 'origin'], w.a).trim()).toBe(mirror);
+    expect(mirrorSha).not.toBe(canonicalSha);
+    expect(fetchFresh(o).skipped).toBe(false);
+    expect(git(w.a, 'rev-parse', 'origin/main')).toBe(mirrorSha);
+    expect(run.fetches()).toHaveLength(2);
+  });
+
+  it.each(['throws', 'empty'])('fetches every time when effective URL resolution %s', (failure) => {
+    const w = world();
+    const run = counting((args, cwd) => {
+      if (args[0] === 'remote') {
+        if (failure === 'throws') throw new Error('cannot resolve URL');
+        return '';
+      }
+      return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    });
+    const o = { cwd: w.a, stampDir: w.stampDir, run, maxAgeMs: 60_000 };
+    expect(fetchFresh(o)).toMatchObject({ fetched: true, key: null });
+    expect(fetchFresh(o)).toMatchObject({ fetched: true, key: null });
+    expect(run.fetches()).toHaveLength(2);
+  });
+
   it('a url rewrite (insteadOf) disables sharing: every call fetches', () => {
     const w = world(); const run = counting();
     git(w.a, 'config', 'url.file:///x/.insteadOf', 'file:///y/');

@@ -73,24 +73,17 @@ const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', st
  * most this old), never required to equal main at admission time.
  */
 export const MAIN_BASE_FRESH_MS = 60_000;
-const MAIN_BASE_CACHE = new Map();
 
 /**
- * Resolve `origin/main` for `laneDir`, fetching at most once per `maxAgeMs` per lane. A failed fetch is never
- * cached: the call falls back to the lane's last fetch (as before) and the next call fetches again.
+ * Resolve `origin/main` through the shared freshness cache, which checks the effective remote URL on every
+ * call. A failed fetch falls back to the lane's last fetch (as before) and the next call tries again.
  */
-export function freshMainBase(laneDir, { run = git, now = Date.now, cache = MAIN_BASE_CACHE, maxAgeMs = MAIN_BASE_FRESH_MS } = {}) {
-  const key = resolve(laneDir);
-  const hit = cache.get(key);
-  if (hit && now() - hit.at < Math.min(maxAgeMs, fetchFreshWindowMs())) return hit.sha; // never outlive the shared window
-  let fetched = true;
-  const at = now();
-  let ageMs = 0;
-  try { ({ ageMs } = fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, maxAgeMs, run: (args, cwd) => run(cwd, args) })); } catch { fetched = false; /* fall back to the lane's last fetch */ }
-  const sha = run(laneDir, ['rev-parse', 'origin/main^{commit}']);
-  if (fetched) cache.set(key, { at: at - ageMs, sha }); // the window runs from the real fetch, never from a shared skip
-  else cache.delete(key);
-  return sha;
+export function freshMainBase(laneDir, { run = git, now = Date.now, maxAgeMs = MAIN_BASE_FRESH_MS } = {}) {
+  try {
+    fetchFresh({ cwd: laneDir, branches: ['main'], noTags: true, now,
+      maxAgeMs: Math.min(maxAgeMs, fetchFreshWindowMs()), run: (args, cwd) => run(cwd, args) });
+  } catch { /* fall back to the lane's last fetch */ }
+  return run(laneDir, ['rev-parse', 'origin/main^{commit}']);
 }
 
 /** Start the detached seal worker: it opens/refreshes the batch PR and seals at the count limit. Never waits. */

@@ -131,35 +131,56 @@ describe('fileIntoBatch against a real origin', () => {
     });
   }, 60_000);
 
-  it('freshMainBase refetches once the window passes, and never caches a failed fetch', () => {
-    let t = 0;
-    const calls = [];
-    let failFetch = false;
-    let sha = 'a'.repeat(40);
-    const run = (cwd, args) => {
-      calls.push(`${cwd}:${args[0]}`);
-      if (args[0] === 'fetch' && failFetch) throw new Error('offline');
-      return args[0] === 'rev-parse' ? sha : '';
-    };
-    const opts = { run, now: () => t, cache: new Map(), maxAgeMs: 1000 };
-    const fetches = () => calls.filter((c) => c.endsWith(':fetch')).length;
-    expect(freshMainBase('/lane-a', opts)).toBe(sha);
-    t = 999; sha = 'b'.repeat(40);
-    expect(freshMainBase('/lane-a', opts)).toBe('a'.repeat(40));
-    expect(fetches()).toBe(1);
-    t = 1000;
-    expect(freshMainBase('/lane-a', opts)).toBe('b'.repeat(40));
-    expect(fetches()).toBe(2);
-    expect(freshMainBase('/lane-b', opts)).toBe('b'.repeat(40));
-    expect(fetches()).toBe(3);
-    failFetch = true; t = 5000;
-    expect(freshMainBase('/lane-a', opts)).toBe('b'.repeat(40));
-    expect(freshMainBase('/lane-a', opts)).toBe('b'.repeat(40));
-    expect(fetches()).toBe(5);
-    failFetch = false;
-    freshMainBase('/lane-a', opts); freshMainBase('/lane-a', opts);
-    expect(fetches()).toBe(6);
-  });
+  it('freshMainBase refetches once the window passes, and never caches a failed fetch', async () => {
+    await withNarrowClone(async (ctx) => {
+      let t = 0; let fetches = 0; let failFetch = false;
+      const run = (cwd, args) => {
+        if (args[0] === 'fetch') {
+          fetches += 1;
+          if (failFetch) throw new Error('offline');
+        }
+        return ctx.git(args, { cwd }).trim();
+      };
+      const opts = { run, now: () => t, maxAgeMs: 1000 };
+      const first = freshMainBase(ctx.clone, opts);
+      ctx.seedOriginBranch('main', { 'README.md': 'advanced\n' });
+      const next = ctx.git(['--git-dir', ctx.origin, 'rev-parse', 'main']).trim();
+      expect(next).not.toBe(first);
+      t = 999;
+      expect(freshMainBase(ctx.clone, opts)).toBe(first);
+      expect(fetches).toBe(1);
+      t = 1000;
+      expect(freshMainBase(ctx.clone, opts)).toBe(next);
+      expect(fetches).toBe(2);
+      const other = join(ctx.tmp, 'other');
+      ctx.git(['clone', '-q', ctx.origin, other]);
+      expect(freshMainBase(other, opts)).toBe(next);
+      expect(fetches).toBe(3);
+      failFetch = true; t = 5000;
+      expect(freshMainBase(ctx.clone, opts)).toBe(next);
+      expect(freshMainBase(ctx.clone, opts)).toBe(next);
+      expect(fetches).toBe(5);
+      failFetch = false;
+      freshMainBase(ctx.clone, opts); freshMainBase(ctx.clone, opts);
+      expect(fetches).toBe(6);
+    });
+  }, 60_000);
+
+  it('freshMainBase rechecks the effective destination before returning a cached base', async () => {
+    await withNarrowClone(async (ctx) => {
+      const mirror = join(ctx.tmp, 'mirror');
+      ctx.git(['clone', '-q', ctx.origin, mirror]);
+      const mirrorSha = ctx.commit({ 'README.md': 'mirror\n' }, 'mirror', mirror);
+      const configArgs = [];
+      const run = (cwd, args) => ctx.git([...configArgs, ...args], { cwd }).trim();
+      const opts = { run, maxAgeMs: 60_000 };
+      const canonicalSha = freshMainBase(ctx.clone, opts);
+      expect(canonicalSha).not.toBe(mirrorSha);
+      configArgs.push('-c', `url.${mirror}.insteadOf=${ctx.origin}`);
+      expect(run(ctx.clone, ['remote', 'get-url', 'origin'])).toBe(mirror);
+      expect(freshMainBase(ctx.clone, opts)).toBe(mirrorSha);
+    });
+  }, 60_000);
 
   it('opt-out, interactive actor and a disabled setting never touch the coordinator', async () => {
     const admit = vi.fn();

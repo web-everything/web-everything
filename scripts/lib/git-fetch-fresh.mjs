@@ -76,15 +76,16 @@ export function objectStoreOf(cwd) {
 /** The window (ms) a caller's own cache must not outlive. */
 export const fetchFreshWindowMs = (env = process.env) => defaultMaxAgeMs(env);
 
-/** `remote.<name>.url` read from the clone's config file (no spawn); '' when unreadable. */
-function remoteUrl(cwd, remote) {
+/** Effective fetch URL from the fetch runner's Git configuration; null when unprovable. */
+function remoteUrl(cwd, remote, run) {
   try {
     const git = commonGitDir(cwd);
     const text = readFileSync(join(git, 'config'), 'utf8');
     // Includes and url rewrites change the effective destination: identity cannot be established from this file.
     if (/^\s*\[include|insteadOf/mi.test(text)) return null;
-    const block = text.split(/^\[/m).find((b) => b.startsWith(`remote "${remote}"]`));
-    const url = /^\s*url\s*=\s*(.+)$/m.exec(block ?? '')?.[1]?.trim() ?? '';
+    // Use the same runner as fetch so global/system config, environment overrides,
+    // and injected `git -c` options all participate in the cache identity.
+    const url = String(run(['remote', 'get-url', remote], cwd) ?? '').trim();
     if (!url) return null;
     // A relative url means a different repository per clone location.
     return /^([a-z][a-z0-9+.-]*:\/\/|[^/@:]+@[^/:]+:|\/)/i.test(url) ? url : `${resolve(cwd)}|${url}`;
@@ -138,7 +139,7 @@ export function fetchFresh({
   const window = maxAgeMs ?? defaultMaxAgeMs(env);
   const specs = narrow ? [...new Set(branches)].sort().map((b) => refspecFor(remote, b)) : [];
   const refs = narrow ? [...new Set(branches)].sort().map((b) => trackingRef(remote, b)) : [];
-  const url = remoteUrl(cwd, remote);
+  const url = window > 0 ? remoteUrl(cwd, remote, run) : null;
   const scope = url === null ? null : narrow ? objectStoreOf(cwd) : (commonGitDir(cwd) && resolve(cwd));
   const key = scope ? createHash('sha1').update([scope, remote, url, noTags ? 'nt' : 't', ...specs].join('\n')).digest('hex').slice(0, 24) : null;
   const path = key ? stampPath(stampDir, key) : null;
