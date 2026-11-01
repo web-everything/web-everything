@@ -69,10 +69,10 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 }
 
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
-  // The nested wrapper owns local fallback. Preserve any already-local failure, but a passing
-  // local segment does not confirm a later remote red. Mixed chains need explicit failure evidence.
-  return plan?.takeLocalSlot === false && ranOn?.location !== 'local'
-    && (ranOn?.location !== 'mixed' || ranOn.failureLocation === 'remote')
+  // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
+  // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
+  return plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
+    && ranOn.failureLocation === 'remote'
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }
@@ -115,7 +115,8 @@ export function readRemoteReport(path, read = readBoundedReport) {
     const reports = text.trim().split('\n').map(line => JSON.parse(line));
     if (!reports.length || reports.some(r => !['remote', 'local-fallback'].includes(r?.location)
       || !Number.isInteger(r.exitCode) || r.exitCode < 0 || r.exitCode > 254
-      || (r.location === 'remote' && typeof r.receiptId !== 'string')
+      // The executor also accepts receiptless completions. Receipts are optional metadata, but
+      // when supplied must remain valid; a missing receipt must not discard a sibling local red.
       || (r.receiptId !== undefined && (typeof r.receiptId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(r.receiptId))))) return [];
     return reports;
   } catch { return []; }
@@ -131,8 +132,13 @@ export function phaseRunLocation(reports, { remoteAttempt } = {}) {
   // Even inconsistent reports must preserve a local red rather than let confirmation erase it.
   const failureLocation = reports.some(r => r.location === 'local-fallback' && r.exitCode > 0) ? 'local'
     : reports.some(r => r.location === 'remote' && r.exitCode > 0) ? 'remote' : null;
+  const last = reports.at(-1);
+  // An && chain stops at its first nonzero exit. Only a final local completion after a successful
+  // prefix can explain the overall local exit; an earlier local success cannot explain exit 124.
+  const localExitCode = last.location === 'local-fallback' && reports.slice(0, -1).every(r => r.exitCode === 0)
+    ? last.exitCode : undefined;
   return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}),
-    ...(locations.size > 1 && failureLocation ? { failureLocation } : {}) };
+    ...(failureLocation ? { failureLocation } : {}), ...(localExitCode !== undefined ? { localExitCode } : {}) };
 }
 export function mergeRunLocation(a, b) {
   if (a === 'unknown' || b === 'unknown') return 'unknown';
@@ -145,8 +151,8 @@ export function overallRunLocation(phases) {
 export const REMOTE_TERMINATION_UNCONFIRMED = Object.freeze({ reason: 'remote-termination-unconfirmed',
   detail: 'verification infrastructure failure: remote termination unconfirmed (exit 124); confirm remote termination before retrying; no test verdict.' });
 // Exit 124 means "remote termination unconfirmed" only for an attempt dispatched to the remote wrapper whose report
-// does not prove it finished locally. A local attempt (never dispatched, or a local confirmation) exiting 124 is an
-// ordinary local exit code.
+// does not prove that the failing segment finished locally with 124. A local attempt (never dispatched,
+// or a local confirmation) exiting 124 is an ordinary local exit code.
 export function remoteInfrastructureFailure({ exitCode, remoteAttempt, ranOn } = {}) {
-  return exitCode === 124 && remoteAttempt === true && ranOn?.location !== 'local' ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
+  return exitCode === 124 && remoteAttempt === true && ranOn?.localExitCode !== 124 ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
 }

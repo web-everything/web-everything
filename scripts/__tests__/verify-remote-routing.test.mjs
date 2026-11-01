@@ -100,14 +100,64 @@ describe('timeout preservation', () => {
 });
 
 describe('proven local fallback verdict', () => {
+  it('retains a local red after a receiptless remote completion', () => {
+    const root = mkdtempSync(join(tmpdir(), 'receiptless-chain-'));
+    const report = join(root, 'report.jsonl');
+    try {
+      appendVerifyRemoteReport({ WE_VERIFY_REMOTE_REPORT: report }, { location: 'remote', exitCode: 0 });
+      appendVerifyRemoteReport({ WE_VERIFY_REMOTE_REPORT: report }, { location: 'local-fallback', exitCode: 1 });
+      const ranOn = phaseRunLocation(readRemoteReport(report), { remoteAttempt: true });
+      expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn })).toBe(false);
+      expect(ranOn).toMatchObject({ location: 'mixed', failureLocation: 'local' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    [['local-fallback', 0]],
+    [['remote', 0], ['local-fallback', 0]],
+    [['local-fallback', 0], ['remote', 0]],
+  ])('successful prefix cannot confirm termination of a later segment: %j', (...segments) => {
+    const reports = segments.map(([location, exitCode]) => ({ location, exitCode }));
+    const ranOn = phaseRunLocation(reports, { remoteAttempt: true });
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn }))
+      .toMatchObject({ reason: 'remote-termination-unconfirmed' });
+  });
+
   it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
     const ranOn = phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode })));
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode, ranOn })).toBe(false);
   });
 
-  it.each(['remote', 'unknown', undefined])('preserves confirmation for unproven local execution: %s', location => {
+  it('preserves confirmation for a proven remote failure', () => {
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
-      ...(location ? { ranOn: { location } } : {}) })).toBe(true);
+      ranOn: phaseRunLocation([{ location: 'remote', exitCode: 1 }]) })).toBe(true);
+  });
+
+  it.each(['remote', 'unknown', undefined])('requires failure evidence before confirmation: %s', location => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+      ...(location ? { ranOn: { location } } : {}) })).toBe(false);
+  });
+
+  it.each(['{', '', JSON.stringify({ location: 'remote', receiptId: 'bad receipt', exitCode: 0 })])(
+    'an invalid sibling report cannot authorize retrying away a local failure: %s', invalid => {
+      const reports = readRemoteReport('report', () => `${invalid}\n${JSON.stringify({ location: 'local-fallback', exitCode: 1 })}`);
+      expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+        ranOn: phaseRunLocation(reports, { remoteAttempt: true }) })).toBe(false);
+    });
+
+  it.each([
+    [{ location: 'local-fallback', exitCode: 124 }],
+    [{ location: 'remote', exitCode: 0 }, { location: 'local-fallback', exitCode: 124 }],
+  ])('a terminal local exit 124 remains a test verdict: %j', (...reports) => {
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
+      ranOn: phaseRunLocation(reports, { remoteAttempt: true }) })).toBeNull();
+  });
+
+  it('inconsistent reports do not prove a terminal local exit 124', () => {
+    const reports = [{ location: 'local-fallback', exitCode: 1 }, { location: 'local-fallback', exitCode: 124 }];
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
+      ranOn: phaseRunLocation(reports, { remoteAttempt: true }) }))
+      .toMatchObject({ reason: 'remote-termination-unconfirmed' });
   });
 
   it.each([
@@ -134,26 +184,29 @@ describe('proven local fallback verdict', () => {
 
   // Execute the production orchestration with admission and child IO injected. No fixture Git writes.
   // A second (passing) child is deliberately available to expose an unconditional retry into green.
-  it.each([false, true].flatMap(phaseAdmission => [
+  it.each([false, true].flatMap(phaseAdmission => [false, true].flatMap(withReceipt => [
     ['vitestMs', 'npx vitest run scripts/changed.test.mjs', ['local-fallback']],
     ['standardsMs', 'npm run check:standards', ['local-fallback']],
     ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npx vitest run scripts/changed.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ['remote', 'local-fallback']],
     ['vitestMs', 'npx vitest run a.test.mjs --testTimeout=15000 && npx vitest run scripts/changed.test.mjs --testTimeout=15000', ['local-fallback', 'remote']],
     ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run b.test.mjs && npx vitest run scripts/changed.test.mjs', ['remote', 'local-fallback', 'remote']],
+    ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests && npx vitest run b.test.mjs --passWithNoTests', ['local-fallback', 'unconfirmed']],
+    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run b.test.mjs && npx vitest run c.test.mjs', ['remote', 'local-fallback', 'unconfirmed']],
   ].flatMap(([phase, command, locations]) => {
     const confirm = locations.length > 1 && locations.at(-1) === 'remote';
-    return (confirm ? [0, 1] : [0]).map(confirmationExitCode => ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode }));
-  })))(
-    'preserves local reds and confirms remote reds: $phase, $locations, phaseAdmission=$phaseAdmission, confirmation=$confirmationExitCode', async ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode }) => {
+    return (confirm ? [0, 1] : [0]).map(confirmationExitCode => ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, withReceipt }));
+  }))))(
+    'preserves local reds and confirms remote reds: $phase, $locations, phaseAdmission=$phaseAdmission, confirmation=$confirmationExitCode, receipt=$withReceipt', async ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, withReceipt }) => {
       const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
       const start = source.indexOf('async function timedRunGate(');
       const end = source.indexOf('// runVitestOnBase', start);
       expect(start).toBeGreaterThan(-1);
       expect(end).toBeGreaterThan(start);
-      const failure = { exitCode: 1, remoteAttempt: true,
-        ranOn: phaseRunLocation(readRemoteReport('report', () => locations.map((location, i) => JSON.stringify({
+      const unconfirmed = locations.at(-1) === 'unconfirmed';
+      const failure = { exitCode: unconfirmed ? 124 : 1, remoteAttempt: true,
+        ranOn: phaseRunLocation(readRemoteReport('report', () => locations.filter(location => location !== 'unconfirmed').map((location, i) => JSON.stringify({
           location, exitCode: i === locations.length - 1 ? 1 : 0,
-          ...(location === 'remote' ? { receiptId: 'run-123456' } : {}),
+          ...(location === 'remote' && withReceipt ? { receiptId: 'run-123456' } : {}),
         })).join('\n'))),
         failureDetails: { summary: 'local failure in scripts/changed.test.mjs' },
         output: { stdout: '', stderr: 'FAIL scripts/changed.test.mjs' } };
@@ -197,8 +250,12 @@ describe('proven local fallback verdict', () => {
       expect(runGate).toHaveBeenCalledWith(phaseAdmissionPlan({ command, decision: { remote: true } }).command,
         undefined, { forgeDispatch: true });
       expect(acquireAdmission).not.toHaveBeenCalled();
-      expect(recordOutcome).toHaveBeenCalledWith(phase.replace(/Ms$/, ''), expect.objectContaining({ exitCode: 1,
+      expect(recordOutcome).toHaveBeenCalledWith(phase.replace(/Ms$/, ''), expect.objectContaining({ exitCode: failure.exitCode,
         failureDetails: failure.failureDetails }));
+      expect(context.remoteUnconfirmed).toBe(unconfirmed);
+      if (unconfirmed) expect(recordOutcome).toHaveBeenCalledWith('vitest', expect.objectContaining({
+        reason: 'remote-termination-unconfirmed', infrastructure: expect.objectContaining({ reason: 'remote-termination-unconfirmed' }),
+      }));
       expect(context.ranOnPhases[phase.replace(/Ms$/, '')]).toEqual(failure.ranOn);
       expect(context.process.stderr.write).not.toHaveBeenCalled();
     });
@@ -215,7 +272,8 @@ describe('verify remote routing', () => {
     ['missing exit code never reruns', false, undefined, false],
     ['unreadable exit code never reruns', false, '1', false],
   ])('%s', (_name, takeLocalSlot, exitCode, expected) => {
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot }, exitCode })).toBe(expected);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot }, exitCode,
+      ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(expected);
     if (exitCode === 124) expect(remoteInfrastructureFailure({ exitCode, remoteAttempt: !takeLocalSlot })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
   });
   it.each([
@@ -224,7 +282,8 @@ describe('verify remote routing', () => {
     ['signal normalized to exit 2', { exitCode: 2, signal: 'SIGTERM' }],
     ['shell-inferred signal', { exitCode: 143 }],
   ])('remote infrastructure failure never confirms locally: %s', (_name, result) => {
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, ...result })).toBe(false);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, ...result,
+      ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(false);
   });
   it.each([
     'npm run test:unit',
@@ -388,7 +447,7 @@ describe('verify remote routing', () => {
   });
   it('claims remote only with a completed remote report and preserves the receipt', () => {
     expect(phaseRunLocation([{ location: 'remote', receiptId: 'run-123456', exitCode: 0 }])).toEqual({ location: 'remote', receiptId: 'run-123456' });
-    expect(phaseRunLocation([{ location: 'local-fallback', exitCode: 0 }])).toEqual({ location: 'local' });
+    expect(phaseRunLocation([{ location: 'local-fallback', exitCode: 0 }])).toEqual({ location: 'local', localExitCode: 0 });
     expect(overallRunLocation({ vitest: { location: 'remote' }, scan: { location: 'local' } }).location).toBe('mixed');
   });
   it('an unknown phase location makes the overall location unknown, never mixed or local', () => {
@@ -441,7 +500,6 @@ describe('verify remote routing', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it.each([
-    { location: 'remote', exitCode: 0 },
     ...['', ' ', null, 123].map(receiptId => ({ location: 'remote', receiptId, exitCode: 0 })),
     ...[undefined, null, '0', 0.5, -1, 255].map(exitCode => ({ location: 'remote', receiptId: 'run-123456', exitCode })),
   ])('incomplete remote report fails closed to unknown: %j', report => {
@@ -449,10 +507,10 @@ describe('verify remote routing', () => {
     expect(reports).toEqual([]);
     expect(phaseRunLocation(reports, { remoteAttempt: true })).toEqual({ location: 'unknown' });
   });
-  it('accepts a completed remote report only with receipt and integer exit code', () => {
-    const report = { location: 'remote', receiptId: 'run-123456', exitCode: 0 };
+  it.each([undefined, 'run-123456'])('accepts a completed remote report with integer exit code and optional receipt: %s', receiptId => {
+    const report = { location: 'remote', ...(receiptId ? { receiptId } : {}), exitCode: 0 };
     expect(phaseRunLocation(readRemoteReport('report', () => JSON.stringify(report))))
-      .toEqual({ location: 'remote', receiptId: 'run-123456' });
+      .toEqual({ location: 'remote', ...(receiptId ? { receiptId } : {}) });
   });
   it('exit 124 is infrastructure/unconfirmed rather than a test verdict', () => {
     expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'unknown' } })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
@@ -463,7 +521,8 @@ describe('verify remote routing', () => {
   it('a local exit 124 (never dispatched, a local confirmation, or a proven local fallback) is not remote-unconfirmed', () => {
     expect(remoteInfrastructureFailure({ exitCode: 124 })).toBeNull();
     expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: false, ranOn: { location: 'local', remoteRedConfirmedLocally: true } })).toBeNull();
-    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'local' } })).toBeNull();
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
+      ranOn: phaseRunLocation([{ location: 'local-fallback', exitCode: 124 }]) })).toBeNull();
   });
   it('report writes are best effort and heartbeat of a non-owned slot is harmless', () => {
     const root = mkdtempSync(join(tmpdir(), 'verify-report-'));
@@ -673,7 +732,7 @@ process.exit(again?0:1);`);
           ]);
         expect(marker.ranOn.phases.standards).toEqual(confirmed && !baseCompared
           ? { location: 'local', remoteRedConfirmedLocally: true }
-          : mode === 'local-fallback' ? { location: 'local' } : { location: 'remote', receiptId: 'run-123456' });
+          : mode === 'local-fallback' ? { location: 'local', localExitCode: 0 } : { location: 'remote', receiptId: 'run-123456' });
         if (confirmed) expect(observed.filter(e => e.event === 'acquire').map(e => e.kind)).toEqual(
           baseCompared ? (phaseAdmission ? ['files', 'files', 'files'] : ['selected', 'selected', 'selected'])
             : phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
