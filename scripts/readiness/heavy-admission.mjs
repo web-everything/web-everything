@@ -867,7 +867,7 @@ export async function runWithRemoteDecision({
   // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
   // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
   let signalled = null; let onSignal;
-  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve(name); controller.abort(); }; });
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve({ clientSignal: name }); controller.abort(Object.assign(new Error(`client ${name}`), { code: 'client-signal' })); }; });
   let signalHandlers = [];
   const timedOut = Symbol('remote-timeout');
   try {
@@ -895,7 +895,8 @@ export async function runWithRemoteDecision({
     });
     const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
     const result = await Promise.race([remote, timeout, signalPromise]);
-    if (typeof result === 'string') {
+    if (typeof result?.clientSignal === 'string') {
+      const signalName = result.clientSignal;
       clearTimeout(timer);
       let cancelTimer;
       const termination = await Promise.race([
@@ -907,9 +908,9 @@ export async function runWithRemoteDecision({
         || ((termination?.mode === 'not-started' || termination?.mode === 'cancelled') && termination.terminated === true);
       await record(terminated ? termination : { mode: 'unconfirmed' });
       log(terminated
-        ? `heavy-admission: ${result} received; remote run cancelled and slot-${slot.slot} released\n`
-        : `heavy-admission: ${result} received; remote termination unconfirmed (${oneLine(termination?.reason ?? termination?.mode ?? 'no answer')}) - slot-${slot.slot} marker left for the reaper\n`);
-      return { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[result], signal: result };
+        ? `heavy-admission: ${signalName} received; remote run cancelled and slot-${slot.slot} released\n`
+        : `heavy-admission: ${signalName} received; remote termination unconfirmed (${oneLine(termination?.reason ?? termination?.mode ?? 'no answer')}) - slot-${slot.slot} marker left for the reaper\n`);
+      return { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalName], signal: signalName };
     }
     if (result === timedOut) {
       const termination = await Promise.race([

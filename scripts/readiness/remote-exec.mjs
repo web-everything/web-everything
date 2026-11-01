@@ -1062,6 +1062,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   // All speculative children are drained and all rejections observed before fallback.
   if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
   const unwrap=result=>{if(result.status==='rejected')throw result.reason;return result.value;};
+  // x40a9dk: only a client kill (abort reason code 'client-signal') cancels the run; a timeout abort never does.
+  const cancel = new AbortController();
+  if (signal) {
+    const forward = () => { if (signal.reason?.code === 'client-signal') cancel.abort(); };
+    if (signal.aborted) forward(); else signal.addEventListener('abort', forward, { once: true });
+  }
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
   let incompleteStandards = false;
@@ -1073,7 +1079,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
-    ...(command === 'run' && signal ? {signal} : {}),
+    ...(command === 'run' ? {signal: cancel.signal} : {}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
   let run;
   let staging;
@@ -1223,7 +1229,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,signal,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1235,7 +1241,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const runAt=clock(),runDone=begin('forge-run');
       let result;
       try {
-        if (!signal?.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
+        if (!cancel.signal.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
       } catch { /* Only a protected finish response can resolve lost run output. */ }
       finally {runDone();}
       const receipt = await finish();
@@ -1256,7 +1262,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,signal,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1264,7 +1270,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       }
       // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
       // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
-      if(signal?.aborted && !(result && verifyReceipt(text,expected,result.code))) {
+      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
         return reply === null || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};

@@ -767,16 +767,27 @@ describe('standards input parity', () => {
 
   it.each([['a null finish (run killed before a receipt)', 'null', 'cancelled'], ['a finish that failed to parse', 'untrusted', 'unconfirmed']])(
     'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
-    const controller = new AbortController();
+    const controller = new AbortController(), abort = () => controller.abort(Object.assign(new Error('client'), {code: 'client-signal'}));
     const f = fixture({receipt}), original = f.exec;
     f.signal = controller.signal;
     f.exec = vi.fn(async call => {
-      if (isRun(call)) { controller.abort(); expect(call.signal).toBe(controller.signal); return {code: 143, stdout: ''}; }
+      if (isRun(call)) { abort(); expect(call.signal.aborted).toBe(true); return {code: 143, stdout: ''}; }
       return original(call);
     });
     const result = await runRemote(f);
     expect(callsOf(f.exec).some(isCleanup)).toBe(true);
     expect(result).toEqual(mode === 'cancelled' ? {mode, terminated: true, reason: 'client-signal'} : {mode, reason: 'ambiguous-result'});
+  });
+
+  it('x40a9dk: a timeout abort (no client-signal reason) never cancels or certifies the run', async () => {
+    const controller = new AbortController();
+    const f = fixture({receipt: 'null'}), original = f.exec;
+    f.signal = controller.signal;
+    f.exec = vi.fn(async call => {
+      if (isRun(call)) { controller.abort(); expect(call.signal.aborted).toBe(false); return {code: 143, stdout: ''}; }
+      return original(call);
+    });
+    expect(await runRemote(f)).toEqual({mode: 'unconfirmed', reason: 'ambiguous-result'});
   });
 
   it('keeps skipped standards unconfirmed when the completion receipt is invalid', async () => {
