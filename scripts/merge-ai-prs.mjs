@@ -145,6 +145,8 @@ import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-lab
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { createLabelEnsurer, isLabelNotFoundError } from './lib/label-memo.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from './lib/couple-cascade.mjs';
@@ -1185,12 +1187,17 @@ export async function repollThenCollectContext({ repoll, collect }) {
  * `writeLabelWithHandoff`, so a `ci:failed` written here wakes the fix daemon right after the write lands.
  * Best effort: a failed write is skipped (the next pass retries). Returns whether every write landed.
  */
-export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch }) {
+export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch, onLabelNotFound = null }) {
   const flag = repo ? ['--repo', repo] : [];
   let ok = true;
   for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  const writeOnce = (add) => {
+    const write = () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { return write(); }
+    catch (err) { if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(add)) throw err; return write(); }
+  };
   for (const add of plan.toAdd) {
-    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }, signal); } catch { ok = false; }
+    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => writeOnce(add) }, signal); } catch { ok = false; }
   }
   return ok;
 }
@@ -4415,15 +4422,21 @@ export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, a
  * Apply the park label before releasing a de-escalated human hold, recording the verdict before any add.
  * @returns {{added: boolean, removed: string[]}} Successful label writes only; dry runs never write.
  */
-export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAdd }, { exec = execFileSync } = {}) {
+export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAdd, onLabelNotFound }, { exec = execFileSync } = {}) {
   let added = false;
   if (dryRun || !gate.applyLabel) return { added, removed: [] };
   let applyOk = true; // already present => nothing to add
   if (shouldApplyReviewLabel(gate.applyLabel, labels)) {
     onBeforeAdd?.();
+    const addOnce = () => exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
     try {
-      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
-        { stdio: ['ignore', 'ignore', 'pipe'] });
+      try { addOnce(); }
+      catch (err) {
+        // A memoised label deleted on GitHub: heal (forget + re-mint) and retry once, so no PR goes unlabelled.
+        if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(gate.applyLabel)) throw err;
+        addOnce();
+      }
       added = true;
     } catch { applyOk = false; /* label best-effort */ }
   }
@@ -4586,6 +4599,34 @@ async function runCli() {
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
   const repoFlag = (repo) => (repo ? ['--repo', repo] : []);      // a slug → scope the gh call; null → cwd repo
+  // Provisioning receives the memo identity as --repo. Match implicit PR edits: honour GH_REPO, then
+  // let gh resolve its default remote (which may differ from origin). Resolve once, only when needed;
+  // use the URL so a remote on another GitHub host keeps its identity too. Never guess on a failed read.
+  let implicitLabelRepo;
+  const memoRepo = (repo) => {
+    if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
+    if (!implicitLabelRepo) {
+      implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
+      if (!implicitLabelRepo) throw new Error('Cannot resolve implicit label repository');
+    }
+    return implicitLabelRepo;
+  };
+  const KNOWN_LABEL_META = { ...REVIEW_LABEL_META, ...CI_LIFECYCLE_LABEL_META };
+  // Not-found on a label write: drop the stale memo entries, re-mint, report whether a retry is worthwhile.
+  const healLabelNotFoundIn = (repo) => (name) => {
+    const meta = KNOWN_LABEL_META[name];
+    if (!meta) return false;
+    labelEnsurer.forget(memoRepo(repo), name);
+    ensuredLabels.delete(`${repo || 'cwd'}::${name}`);
+    labelEnsurer.ensure(memoRepo(repo), name, meta);
+    return true;
+  };
+  const addPrLabel = (repo, num, label) => {
+    const add = () => execFileSync('gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { add(); }
+    catch (err) { if (!isLabelNotFoundError(err) || !healLabelNotFoundIn(repo)(label)) throw err; add(); }
+  };
   // #gh-graphql-budget — the merge-candidate list's `--limit`: sized off the shared snapshot's real open count
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
@@ -4597,6 +4638,13 @@ async function runCli() {
   // pairs this process has already ensured exist so a long-lived watch doesn't `gh label create` the same
   // review:* labels every single pass (wasted round-trips on an idempotent one-time mint).
   const ensuredLabels = new Set();
+  // perf item 6 — the in-process memo above dies with each drain process; persist it (keyed by repo, with a TTL)
+  // so a restarted or one-shot drain does not re-mint labels every pass. A not-found on a label write forgets the
+  // entry and re-mints it (`healLabelNotFoundIn`), so a label deleted on GitHub is created again exactly when needed.
+  const labelEnsurer = createLabelEnsurer({
+    path: process.env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
+    run: (args, repo) => execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }),
+  });
 
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
@@ -4968,8 +5016,10 @@ async function runCli() {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
         const ensureKey = `${repo || 'cwd'}::${name}`;
         if (ensuredLabels.has(ensureKey)) continue;
-        ensuredLabels.add(ensureKey);
-        try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+        try {
+          labelEnsurer.ensure(memoRepo(repo), name, meta);
+          ensuredLabels.add(ensureKey);
+        } catch { /* Repository resolution is best effort too; a later pass retries. */ }
       }
     }
     const reconciled = [];
@@ -4996,7 +5046,7 @@ async function runCli() {
       if (greenVerdict.label) {
         if (DRY_RUN) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would label "${label}" (required check green, was unlabelled)\n`); }
         else {
-          try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] }); touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} labelled "${label}" (post-CI reconcile — required check went green after a label-on-green timeout)\n`); }
+          try { addPrLabel(repo, p.number, label); touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} labelled "${label}" (post-CI reconcile — required check went green after a label-on-green timeout)\n`); }
           catch { /* a label race/permission miss is non-fatal — the next pass retries */ }
         }
       } else if (greenVerdict.reason === 'held') {
@@ -5043,7 +5093,7 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would reconcile ci-lifecycle → "${desired}"${plan.toRemove.length ? ` (drop ${plan.toRemove.join(', ')})` : ''}\n`);
           } else {
             // Best effort — a label race/permission miss is non-fatal; the next pass retries.
-            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug });
+            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug, onLabelNotFound: healLabelNotFoundIn(repo) });
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -5759,8 +5809,10 @@ async function runCli() {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
           const ensureKey = `${repo || 'cwd'}::${name}`;
           if (ensuredLabels.has(ensureKey)) continue;
-          ensuredLabels.add(ensureKey);
-          try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+          try {
+            labelEnsurer.ensure(memoRepo(repo), name, meta);
+            ensuredLabels.add(ensureKey);
+          } catch { /* Repository resolution is best effort too; a later pass retries. */ }
         }
       }
     }
@@ -5915,7 +5967,7 @@ async function runCli() {
             // is reported and never changes the label write below.
             const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
@@ -5924,7 +5976,7 @@ async function runCli() {
           // diff either; carry review:awaiting-advisory alongside it so "not yet advised" stays a label even on
           // a re-park, not just a fresh park (review-pr.mjs's `advise` step clears it once it posts, #xlw02hw).
           if (shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #2832 / #984 F2 — this park CREATES a hold (review:human) on a PR that, being in the
           // `--label ready-to-merge` candidate set, carries the go-ahead. Strip it in the same operation, through
@@ -6036,7 +6088,7 @@ async function runCli() {
               const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
               if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
             }
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
@@ -6046,7 +6098,7 @@ async function runCli() {
           // mechanical park: the advisory runs for `review:human` PRs only, so the label would never be cleared; the
           // carry sweep adds it if it hands the hold to the operator (`review-set-label.mjs --to=restamp`).
           if (!mechanicalPark && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #2832 / #984 F2 — same as the manifest-tamper park above: this site CREATES a review hold on
           // a go-ahead-carrying candidate and `continue`s, so it must strip through the shared seam here.
@@ -6140,7 +6192,7 @@ async function runCli() {
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
         if (gate.applyLabel && !candidateDryRun) {
-          applyDrainParkLabel({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, onBeforeAdd: () => {
+          applyDrainParkLabel({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, onLabelNotFound: healLabelNotFoundIn(v.repo), onBeforeAdd: () => {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
             // final), so a `gh` failure below must not un-form it — only the durable record of it. Fail-soft:
@@ -6152,7 +6204,7 @@ async function runCli() {
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #xmnl36p — A CLEARANCE REVOCATION IS NEVER SILENT, and this is the ONE path that guarantees it.
           // It sits AHEAD of `shouldPostParkReasonComment` (which returns false for every human park, routing
