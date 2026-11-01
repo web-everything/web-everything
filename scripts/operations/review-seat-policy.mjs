@@ -2,7 +2,7 @@
  * review-label → review-extra-seats → review-dispatch → review-label initialization cycle.
  */
 import { REFERRAL_SEAT_PROVIDERS } from '../lib/jury-core.mjs';
-import { antigravityReviewFromEnv } from './review-pr.mjs';
+import { antigravityReviewFromEnv } from './review-antigravity-policy.mjs';
 
 import { PROVIDER_CAP_ENV, resolveProviderCap } from '../lib/review-seat-caps.mjs';
 export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,

@@ -18,16 +18,28 @@ export function recordedEdgeSha(entry) {
 
 /** Fetch `origin/main` + every (safe-named) overlay ref via explicit refspecs. A batched fetch failure refetches
  *  `main` alone; if THAT also fails the caller gets `{ok:false, reason:'fetch-failed'}` (transient — main itself
- *  is unreachable). Otherwise each overlay ref is fetched individually and a failure there is `ref-gone` (its
- *  stale remote-tracking ref is deleted so a later `--not --remotes=origin`/`refs/remotes/origin/<ref>` read
- *  never sees stale data for it). */
+ *  is unreachable). Otherwise each overlay ref is fetched individually; a failure is listed in `goneRefs`
+ *  and its stale remote-tracking ref is deleted best-effort. Callers must not infer freshness from a cached
+ *  tracking ref. `refEvidence` distinguishes refreshed refs, remotely confirmed missing
+ *  branches and unverifiable fetch failures. A failed fetch alone never proves remote absence. */
 export function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
+  // Malformed records are invalid registry evidence, not merely unavailable branch names. Refuse the
+  // whole preparation before fetching or retiring anything; the operator must repair the stored list.
+  if (overlays.some((o) => !o || typeof o !== 'object' || Array.isArray(o)
+    || typeof o.ref !== 'string' || !o.ref)) return { ok: false, reason: 'fetch-failed' };
   const safeOverlays = overlays.filter((o) => isSafeBranchName(o?.ref));
+  const refEvidence = new Map();
+  const attempt = (args) => {
+    try {
+      const r = git(args);
+      return r && !r.error ? r : { status: null };
+    } catch { return { status: null }; }
+  };
   const refspecs = [
     '+refs/heads/main:refs/remotes/origin/main',
     ...safeOverlays.map((o) => `+refs/heads/${o.ref}:refs/remotes/origin/${o.ref}`),
   ];
-  const batch = git(['fetch', '--quiet', '--prune', 'origin', ...refspecs]);
+  const batch = attempt(['fetch', '--quiet', '--prune', 'origin', ...refspecs]);
   // FAIL CLOSED. An edge ref is usable only if THIS run re-confirmed it: every cached `origin/edge/<ref>` is
   // deleted first, so a failed `ls-remote`/`fetch`, a deleted remote branch, or a thrown git call leaves it
   // unavailable (the conflict then drops visibly) instead of resolving against a stale branch from an earlier
@@ -72,23 +84,27 @@ export function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
     } catch { dropCached(); /* edge discovery must never block a rebuild */ }
   };
   if (batch.status === 0) {
+    for (const { ref } of safeOverlays) refEvidence.set(ref, 'refreshed');
     fetchEdges();
-    return { ok: true, goneRefs: [] };
+    return { ok: true, goneRefs: [], refEvidence };
   }
 
-  const mainOnlyFetch = git(['fetch', '--quiet', '--prune', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+  const mainOnlyFetch = attempt(['fetch', '--quiet', '--prune', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
   if (mainOnlyFetch.status !== 0) return { ok: false, reason: 'fetch-failed' };
 
   const goneRefs = [];
   for (const o of safeOverlays) {
-    const one = git(['fetch', '--quiet', 'origin', `+refs/heads/${o.ref}:refs/remotes/origin/${o.ref}`]);
+    const one = attempt(['fetch', '--quiet', 'origin', `+refs/heads/${o.ref}:refs/remotes/origin/${o.ref}`]);
+    refEvidence.set(o.ref, one.status === 0 ? 'refreshed' : 'unverifiable');
     if (one.status !== 0) {
-      git(['update-ref', '-d', `refs/remotes/origin/${o.ref}`]);
+      const listed = attempt(['ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${o.ref}`]);
+      if (listed.status === 2 && String(listed.stdout ?? '').trim() === '') refEvidence.set(o.ref, 'missing');
+      attempt(['update-ref', '-d', `refs/remotes/origin/${o.ref}`]);
       goneRefs.push(o.ref);
     }
   }
   fetchEdges();
-  return { ok: true, goneRefs };
+  return { ok: true, goneRefs, refEvidence };
 }
 
 // ── defaultPrState — the CLI's real PR-state lookup ─────────────────────────────────────────────────────────
