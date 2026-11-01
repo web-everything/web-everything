@@ -4,7 +4,7 @@ import {spawn} from 'node:child_process';
 import {readLimits, slotCpus, scopeLauncherArgv} from './forge-exec-limits.mjs';
 import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
-import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
+import {open, mkdir, readdir, writeFile, appendFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -495,7 +495,31 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
 }
 // testRoot/testPath/testCleanupExec/testIdExec are explicit dependency injection only. CLI never reads them
 // from its environment, nor transports them in requests.
-export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+// R333: leaked reservations/receipts are reaped only on proof the owner is gone.
+const REAP_GRACE_MS = 15*60*1000;
+async function procStart(pid) {
+  // string = start ticks of a live pid, null = provably no such pid, undefined = cannot tell (fail closed)
+  try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
+  catch(error) {if(error.code!=='ENOENT')return undefined; return filesystem.access('/proc/self/stat').then(()=>null,()=>undefined);}
+}
+async function uidBusy(uid) {
+  for(const entry of await readdir('/proc')) {
+    if(!/^\d+$/.test(entry))continue;
+    try {
+      if((await filesystem.stat('/proc/'+entry)).uid!==uid)continue;
+      const data=(await filesystem.readFile('/proc/'+entry+'/stat')).toString('latin1');
+      if(data.slice(data.lastIndexOf(')')+2,data.lastIndexOf(')')+3)!=='Z')return true;
+    } catch(error) {if(error.code!=='ENOENT')return true;}
+  }
+  return false;
+}
+async function unitActive(unit) {
+  const result=await execute('/usr/bin/systemctl',['is-active',unit]);
+  const word=result.stdout.trim();
+  if(['inactive','failed'].includes(word))return false;
+  return ['active','activating','deactivating','reloading'].includes(word)?true:undefined;
+}
+export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
@@ -606,6 +630,87 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     await atomicJSON(join(receipts,'telemetry.json'),value);
     return value;
   }
+  const reapProbe={start:procStart,uidBusy,unitActive,...testReapProbe};
+  async function reapLog(line) {
+    const text='forge-exec-run: reaped '+line;
+    process.stderr.write(text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
+    await appendFile(join(receipts,'reap-audit.log'),new Date(clock()).toISOString()+' '+text.replace(/[\x00-\x1f\x7f]/g,' ')+'\n',{mode:0o600}).catch(()=>{});
+  }
+  // Atomic rename to a tombstone, then remove: a path is never half-deleted.
+  async function tombstone(path) {
+    const tomb=path+'.tomb-'+randomBytes(8).toString('hex');
+    await rename(path,tomb);
+    await rm(tomb,{recursive:true,force:true});
+  }
+  // True only on proof the owner is gone: dead pid, reused pid (other start time), or inactive
+  // unit when the pid cannot be read. Without an owner record only age counts (never for slotless).
+  async function ownerGone(record,file,{allowAge}) {
+    const owner=record.owner;
+    if(owner&&Number.isSafeInteger(owner.pid)&&typeof owner.start==='string') {
+      const start=await reapProbe.start(owner.pid);
+      if(start!==undefined)return start===null||start!==owner.start;
+      return typeof owner.unit==='string'&&await reapProbe.unitActive(owner.unit)===false;
+    }
+    return allowAge&&clock()-(await lstat(file)).mtimeMs>=REAP_GRACE_MS;
+  }
+  async function withWorkerExclusive(name,action) {
+    const guard=await open(join(receipts,'.'+name+'.writer'),constants.O_RDWR|constants.O_CREAT|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
+    try {
+      const st=await guard.stat();
+      if(!st.isFile()||st.nlink!==1||(st.mode&0o077)||![0,operator.uid].includes(st.uid))return;
+      const locked=await execute('/usr/bin/python3',['-I','-c','import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],{passFd:guard.fd});
+      if(locked.code)return; // a live run or reservation holds the lease: keep
+      return await action();
+    }finally{await guard.close();}
+  }
+  async function readRecord(file) {try{return JSON.parse(await readPinned(file));}catch{return null;}}
+  async function reapLeaked() {
+    const names=await readdir(receipts);
+    const found=names.map(n=>/^(r-[a-f0-9]{32})\.(prepared|running)$/.exec(n)).filter(Boolean).map(m=>({run:m[1],phase:m[2],file:join(receipts,m[0])}));
+    const taken=new Set();
+    const dropRecords=async run=>{
+      for(const phase of ['prepared','running'])await tombstone(statePath(run,phase)).catch(error=>{if(error.code!=='ENOENT')throw error;});
+      await rm(join(bases,'active',run),{force:true});
+    };
+    for(const lock of names.filter(n=>/^worker-active(?:-[1-9]\d*)?$/.test(n))) {
+      const slotNumber=/^worker-active-([1-9]\d*)$/.exec(lock)?.[1];
+      if(!slotNumber&&!testRoot)continue; // slotless lock exists only in the legacy harness
+      const lockPath=join(receipts,lock);
+      const reservation=await readRecord(join(lockPath,'reservation.json'));
+      const entries=reservation?found.filter(e=>e.run===reservation.run):[];
+      const decide=async()=>{
+        if(entries.length>1)return false;
+        if(entries.length){const record=await readRecord(entries[0].file);return !!record&&await ownerGone(record,entries[0].file,{allowAge:!!slotNumber});}
+        const age=await lstat(reservation?join(lockPath,'reservation.json'):lockPath).then(st=>clock()-st.mtimeMs,()=>0);
+        return !!slotNumber&&age>=REAP_GRACE_MS;
+      };
+      if(!await decide())continue;
+      await withWorkerExclusive(lock,async()=>{
+        const again=await readRecord(join(lockPath,'reservation.json'));
+        if(again?.run!==reservation?.run||again?.nonce!==reservation?.nonce)return;
+        if(slotNumber&&await reapProbe.uidBusy((await identity('forge-exec-'+slotNumber)).uid))return;
+        if(!await decide())return;
+        await tombstone(lockPath);
+        if(reservation?.run){await dropRecords(reservation.run);taken.add(reservation.run);}
+        await reapLog(`${lock} run=${reservation?.run??'none'} reason=owner-gone`);
+      }).catch(error=>process.stderr.write('forge-exec-run: reap skipped '+lock+': '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'));
+    }
+    // Records whose own reservation is gone can no longer own a run.
+    for(const entry of found) {
+      if(taken.has(entry.run))continue;
+      const record=await readRecord(entry.file);
+      if(!record?.slot)continue;
+      const reservation=await readRecord(join(receipts,writerName(record),'reservation.json'));
+      if(reservation?.run===entry.run)continue;
+      if(!await ownerGone(record,entry.file,{allowAge:true}))continue;
+      await dropRecords(entry.run);
+      await reapLog(`${entry.run}.${entry.phase} slot=${record.slot} reason=no-reservation`);
+    }
+  }
+  async function reap() {
+    try {await reapLeaked();}
+    catch(error) {process.stderr.write('forge-exec-run: reap failed: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');}
+  }
   async function init() {
     if(!testRoot&&process.getuid()===0)operator=await identity('ops');
     if(testRoot) for(const dir of [runs,receipts,cache]) await mkdir(dir,{recursive:true,mode:0o700});
@@ -647,7 +752,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     const usage=status+'.usage';
     const name=writerName(worker.reservation),writer={...worker.reservation,guard:join(receipts,'.'+name+'.writer'),reservation:join(receipts,name,'reservation.json')};
     try {
-      const launcher=scopeLauncherArgv({slot,unit:'forge-exec-run-'+randomBytes(16).toString('hex'),sudo:false,source:supervisorSource,
+      const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
+      if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
+      const launcher=scopeLauncherArgv({slot,unit,sudo:false,source:supervisorSource,
         json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
@@ -795,6 +902,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       // Idle hosts and fresh installs have no background sampler. Sample the
       // actual host on every SSH request; the Mac health cache bounds reads.
       await init();
+      await reap();
       return publishTelemetry();
     },
     async bases() {
@@ -842,6 +950,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     },
     async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
       await init();
+      await reap();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
       const run='r-'+randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(worker.active?{slot:worker.user}:{})};
@@ -878,6 +987,8 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       return worker.active?withWorkerWriter(writerName(record),prepare):prepare();
     },
     async run(request) {
+      await init();
+      await reap();
       const prepared=await state(request,'prepared');
       try {
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
@@ -969,6 +1080,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
         } catch(error) {throw Object.assign(error,{code:error.code==='diff-coverage-base-unavailable'?error.code:'git-head-unavailable'});}
       }
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
+      // Owner evidence for the reaper: this process (pid + start time) outlives no live run.
+      const ownerStart=await reapProbe.start(process.pid);
+      if(typeof ownerStart==='string')await atomicJSON(statePath(request.run,'running'),{...prepared,owner:{pid:process.pid,start:ownerStart}});
       let phase='install',result={code:97,stdout:'',stderr:''};
       const installAt=clock();let installMs=0,runMs=0,runAt;
       const startedAtET=easternTimestamp(installAt);
