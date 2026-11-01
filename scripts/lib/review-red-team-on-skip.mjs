@@ -387,14 +387,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         mode = 'resume';
       } else if (redTeamSkipNeedsSettlement(status)) mode = 'fresh';
       else if (placeholder && (evidence.seatRecorded === false
-        || (evidence.seatRecorded === undefined && evidence.recorded === false))) {
-        // A dead queued recovery is still a spent stale dispatch after normalization.
-        const key = { repo, pr, head };
-        if (staleRedispatch(key).count > 0 || staleSpent(key)) {
-          return skip('stale red team already re-dispatched; inspect review run');
-        }
-        mode = 'fresh';
-      }
+        || (evidence.seatRecorded === undefined && evidence.recorded === false))) mode = 'fresh';
       else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
       // Even a policy-settlement fallback must not turn a spent retry into fresh provider work.
