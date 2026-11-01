@@ -885,16 +885,15 @@ export async function runTickAllRepos({
   // R242: share discovery only. Do not speculatively reconcile/hydrate active
   // PRs: their owners still need those reads, and notes needs post-dispatch evidence.
   const snapshots = new Map();
-  // R365 (perf D fix #3) — ONE planner run per repo per pass, shared by fix, ci-heal, promote-draft and notes.
-  // Each step keeps its own decision logic; a step that acted on PRs invalidates just those PRs, so the next step
-  // re-plans only them (see scripts/conveyor/shared-reconcile.mjs). Real passes only: any injected tick keeps the
-  // historical per-step planner run. Raw rows come from the discovery snapshot when there is one.
-  const shared = realTick && !promoteDraftTick && !notesTick
-    ? createSharedReconcile({ readPrs: (o) => (snapshots.has(o.repo) ? structuredClone(snapshots.get(o.repo).rows) : defaultReadPrs(o)) })
-    : null;
-  const invalidateDispatched = (result, patch = null) => {
+  // R365 (perf D fix #3) — ONE planner run per repo shared by ci-heal, promote-draft and notes (fix keeps its own:
+  // it applies stand-down auto-proceed writes, and ci-heal's run comes after its own pre-plan flushes, so it is the
+  // freshest). Each step keeps its own decision logic; a step that acted on PRs invalidates just those PRs, so the
+  // next step re-plans only them from a fresh read (see scripts/conveyor/shared-reconcile.mjs). Real passes only:
+  // any injected tick keeps the historical per-step planner run.
+  const shared = realTick && !ciHealTick && !promoteDraftTick && !notesTick ? createSharedReconcile() : null;
+  const invalidateDispatched = (result) => {
     if (!shared) return;
-    for (const d of (result?.dispatched ?? [])) shared.invalidate(d.repo, [d.pr ?? d.prNumber], patch);
+    for (const d of (result?.dispatched ?? [])) shared.invalidate(d.repo, [d.pr ?? d.prNumber]);
   };
   const skipEmptySteps = fixSettings.skipEmptySteps ?? resolveFixDispatchSettings().skipEmptySteps;
   if (skipEmptySteps && (readPrs || realTick)) {
@@ -947,7 +946,7 @@ export async function runTickAllRepos({
     const reconcile = input => runReconcilePass({ ...input, readPrs: sharedRead });
     if (step === 'fix' && tick === runReconcileFixDispatch) {
       // Preserve reconcile's identity: fix uses it to enable net-scope and stack IO.
-      return tick({ ...options, ...(shared ? { reconcile: shared.reconcile } : { readPrs: sharedRead }) });
+      return tick({ ...options, readPrs: sharedRead });
     }
     const readOpenPrs = input => {
       const fields = input?.extraFields ?? [];
@@ -960,7 +959,6 @@ export async function runTickAllRepos({
     : runReconcileFixDispatchAllRepos({ repos: stepRepos.get('fix'), allowStandDownAutoProceed,
       tick: sharedTick('fix', fixTick ?? runReconcileFixDispatch),
       ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
-  invalidateDispatched(fix);
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
@@ -969,20 +967,23 @@ export async function runTickAllRepos({
   invalidateDispatched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
+  invalidateDispatched(hungCi);
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
   const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  invalidateDispatched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
   const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
+  invalidateDispatched(missingRun);
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
   const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: stepRepos.get('promote-draft'), tick: sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch) }));
-  invalidateDispatched(promoteDraft, { isDraft: false });
+  invalidateDispatched(promoteDraft);
   // #4191: surface notes using fresh evidence after the dispatch/promote steps.
   const notes = timed('notes', () => runReconcileNotesAllRepos({
     repos, ...(notesTick ? { tick: notesTick } : (shared ? { tick: shared.readNotes } : {})), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),

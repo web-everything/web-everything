@@ -12,7 +12,8 @@ const FIXTURE = [
 function world() {
   const claims = new Set();
   const calls = [];
-  const readPrs = () => structuredClone(FIXTURE);
+  const rows = structuredClone(FIXTURE); // live PR evidence: a test may change it between planner reads
+  const readPrs = () => structuredClone(rows);
   const run = ({ repo, readPrs: read = readPrs, excuseMergeGateHolds = (p) => p, enrichCodeQL = (p) => p }) => {
     const rows = enrichCodeQL(excuseMergeGateHolds(read({ repo })));
     calls.push(rows.map((r) => r.number));
@@ -27,7 +28,7 @@ function world() {
     }
     return { dispatch, refusals, notes, prs: rows.length, openPrFiles: [] };
   };
-  return { claims, calls, run, readPrs };
+  return { claims, calls, run, readPrs, rows };
 }
 // The four step decisions, each only reading the plan it is given.
 const decide = {
@@ -103,13 +104,40 @@ describe('createSharedReconcile', () => {
     expect([...view.prsByNumber.keys()]).toEqual([1, 2, 3, 4]);
   });
 
-  it('a patch (promote-draft -> ready) is applied to the re-planned row', () => {
+  it('a re-plan reads the touched PR fresh (head, labels, draft state), not the cached row', () => {
     const w = world();
     const s = createSharedReconcile({ run: w.run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
     expect(decide.promote(s.reconcile({ repo: 'r' }))).toEqual([3]);
-    s.invalidate('r', [3], { isDraft: false });
+    w.rows.find((p) => p.number === 3).isDraft = false; // a step promoted it
+    w.rows.find((p) => p.number === 3).headRefOid = 'new';
+    s.invalidate('r', [3]);
     expect(decide.promote(s.reconcile({ repo: 'r' }))).toEqual([]);
-    expect(s.readNotes({ repo: 'r' }).prsByNumber.get(3).isDraft).toBe(false);
+    expect(s.readNotes({ repo: 'r' }).prsByNumber.get(3)).toMatchObject({ isDraft: false, headRefOid: 'new' });
+  });
+
+  it('a failed refresh never serves the stale plan: it re-plans in full on the next request', () => {
+    const w = world();
+    let failNext = false;
+    const run = (input) => {
+      if (failNext) { failNext = false; throw new Error('planner blew up'); }
+      return w.run(input);
+    };
+    const s = createSharedReconcile({ run, readPrs: w.readPrs, excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
+    expect(decide.ciHeal(s.reconcile({ repo: 'r' }))).toEqual([2]);
+    w.claims.add(2);
+    s.invalidate('r', [2]);
+    failNext = true;
+    expect(decide.ciHeal(s.reconcile({ repo: 'r' }))).toEqual([]); // fell back to a full re-plan, claim honoured
+  });
+
+  it('a refresh plans with the snapshot flag, not the requester flag', () => {
+    const seen = [];
+    const run = ({ allowStandDownAutoProceed }) => { seen.push(allowStandDownAutoProceed); return { dispatch: [], refusals: [], notes: [] }; };
+    const s = createSharedReconcile({ run, readPrs: () => [{ number: 1 }], excuseMergeGateHolds: (p) => p, enrichCodeQL: (p) => p });
+    s.reconcile({ repo: 'r' });
+    s.invalidate('r', [1]);
+    s.reconcile({ repo: 'r' });
+    expect(seen).toEqual([false, false]);
   });
 
   it('bypasses the cache for any input beyond repo + allowStandDownAutoProceed', () => {

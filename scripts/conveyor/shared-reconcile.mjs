@@ -1,20 +1,21 @@
 /**
  * @file scripts/conveyor/shared-reconcile.mjs
- * R365 (perf D fix #3): ONE planner run (`runReconcilePass`) per repo per fix-daemon pass, handed to every
- * step that used to re-run it (fix, ci-heal, promote-draft, notes). Each step keeps its own decision logic;
- * only the planner read is shared.
+ * R365 (perf D fix #3): ONE planner run (`runReconcilePass`) per repo, handed to every later fix-daemon step
+ * that used to re-run it. In the daemon this serves ci-heal, promote-draft and notes: the fix half keeps its own
+ * planner run (it applies stand-down auto-proceed writes), and ci-heal's run happens AFTER its own pre-plan
+ * flushes (attempt polling, owed comments, timeout follow-ups), so it is the freshest snapshot the later steps
+ * could have had before. Each step keeps its own decision logic; only the planner read is shared.
  *
- * Staleness rule: a step that mutated a PR (dispatched a fix / ci-heal / promotion) calls
- * {@link createSharedReconcile}'s `invalidate(repo, prNumbers)`. The next consumer gets the shared snapshot
- * with ONLY those PRs re-planned (the planner re-run on just those raw rows; its per-PR enrichers — fix claims,
- * live agents, timeouts — read fresh), merged over the base entries keyed by PR number. Untouched PRs are never
- * re-planned and a touched PR is never served stale. Known bound: the re-plan of a touched PR does not see the
- * other PRs' rows, so cross-PR scope fences for it are not recomputed (the next pass recomputes them).
+ * Staleness rule: every step that acted on PRs (a dispatch, resume, salvage, timeout rerun, promotion, ...)
+ * calls `invalidate(repo, prNumbers)`. The next consumer gets the shared snapshot with ONLY those PRs re-planned
+ * from a FRESH read (labels, comments, head sha, open/closed all re-read), merged over the base entries keyed by
+ * PR number. If that refresh fails, the cached snapshot is dropped and the next request re-plans in full: a
+ * failed refresh never falls back to the stale plan. Known bound: the re-plan of a touched PR does not see the
+ * other PRs' rows, so cross-PR scope fences for it are not recomputed until the next pass.
  *
  * Callers passing anything beyond `{repo, allowStandDownAutoProceed}` (a prs-file, hooks) bypass the cache.
- * A snapshot computed with allowStandDownAutoProceed=true serves callers asking for false (the old ci-heal /
- * promote-draft / notes halves ran after the fix half had already applied those effects); a true request after
- * a false snapshot recomputes.
+ * A snapshot computed with allowStandDownAutoProceed=true serves callers asking for false; a true request after
+ * a false snapshot recomputes. A refresh always plans with the snapshot's own flag.
  */
 import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL, REAL_RECONCILE } from './reconcile-pass.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
@@ -31,32 +32,31 @@ export function createSharedReconcile({
   run = runReconcilePass, readPrs = defaultReadPrs, excuseMergeGateHolds = excusePrMergeGateHolds,
   enrichCodeQL = enrichPrsWithCodeQL, clone = structuredClone,
 } = {}) {
-  const cache = new Map(); // repo -> {plan, raw, final:Map, allow, dirty:Set, patch:Map}
+  const cache = new Map(); // repo -> {plan, raw, final:Map, allow, dirty:Set}
   const stats = { computed: 0, served: 0, refreshed: 0 };
 
-  function compute(repo, allow, rawOverride = null) {
+  function compute(repo, allow, readOverride = null) {
     let raw = [];
     let final = [];
     const plan = run({
       repo, allowStandDownAutoProceed: allow,
       readPrs: (o) => {
-        raw = rawOverride ?? readPrs({ ...o, attributionRepo: o?.attributionRepo ?? o?.repo ?? repo });
+        const read = readOverride ?? readPrs;
+        raw = read({ ...o, attributionRepo: o?.attributionRepo ?? o?.repo ?? repo });
         final = Array.isArray(raw) ? raw : [];
         return raw;
       },
       excuseMergeGateHolds: (prs, options) => { final = excuseMergeGateHolds(prs, options); return final; },
       enrichCodeQL: (prs, options) => { final = enrichCodeQL(prs, options); return final; },
     });
-    // Keep a pristine copy of the raw rows: the planner's enrichers may touch the originals, and a per-PR
-    // re-plan must start from the same raw input the first plan did.
-    return { plan, raw: Array.isArray(raw) && !rawOverride ? clone(raw) : (Array.isArray(raw) ? raw : null), final: Array.isArray(final) ? final : [] };
+    return { plan, raw: Array.isArray(raw) ? raw : null, final: Array.isArray(final) ? final : [] };
   }
 
   function entryFor(repo, allow) {
     const hit = cache.get(repo);
     if (hit && (hit.allow || !allow)) return hit;
     const c = compute(repo, allow);
-    const entry = { plan: c.plan, raw: c.raw, final: new Map(c.final.map((p) => [p.number, p])), allow, dirty: new Set(), patch: new Map() };
+    const entry = { plan: c.plan, final: new Map(c.final.map((p) => [p.number, p])), allow, dirty: new Set() };
     if (c.raw) cache.set(repo, entry); // a deferred/non-array read is never cached: the next step retries it
     stats.computed += 1;
     return entry;
@@ -66,23 +66,30 @@ export function createSharedReconcile({
     if (!entry.dirty.size) return entry;
     const dirty = new Set(entry.dirty);
     entry.dirty.clear();
-    // Only a deferred/error plan or missing raw rows cannot be patched: recompute in full.
-    if (!entry.raw || !Array.isArray(entry.plan?.dispatch)) { cache.delete(repo); return entryFor(repo, entry.allow); }
-    const rows = entry.raw.filter((p) => dirty.has(p.number)).map((p) => clone({ ...p, ...(entry.patch.get(p.number) ?? {}) }));
-    const c = compute(repo, entry.allow, rows);
-    const plan = entry.plan;
-    entry.plan = {
-      ...plan,
-      dispatch: mergeArray(plan.dispatch, c.plan?.dispatch, dirty),
-      refusals: mergeArray(plan.refusals, c.plan?.refusals, dirty),
-      notes: mergeArray(plan.notes, c.plan?.notes, dirty),
-      owedTriggers: Array.isArray(plan.owedTriggers) ? mergeArray(plan.owedTriggers, c.plan?.owedTriggers, dirty) : plan.owedTriggers,
-    };
-    for (const p of rows) entry.final.delete(p.number);
-    for (const p of c.final) entry.final.set(p.number, p);
-    entry.raw = entry.raw.map((p) => rows.find((r) => r.number === p.number) ?? p);
-    stats.refreshed += dirty.size;
-    return entry;
+    try {
+      // Fresh read of just the touched PRs: the base rows may predate the step's own effects.
+      const c = compute(repo, entry.allow, (o) => {
+        const rows = readPrs(o);
+        return Array.isArray(rows) ? rows.filter((p) => dirty.has(p.number)) : rows;
+      });
+      if (!c.raw) throw new Error('shared-reconcile: refresh read was deferred');
+      const plan = entry.plan;
+      entry.plan = {
+        ...plan,
+        dispatch: mergeArray(plan.dispatch, c.plan?.dispatch, dirty),
+        refusals: mergeArray(plan.refusals, c.plan?.refusals, dirty),
+        notes: mergeArray(plan.notes, c.plan?.notes, dirty),
+        owedTriggers: Array.isArray(plan.owedTriggers) ? mergeArray(plan.owedTriggers, c.plan?.owedTriggers, dirty) : plan.owedTriggers,
+      };
+      for (const n of dirty) entry.final.delete(n);
+      for (const p of c.final) entry.final.set(p.number, p);
+      stats.refreshed += dirty.size;
+      return entry;
+    } catch {
+      // Never serve the stale plan after a failed refresh: drop it and re-plan in full.
+      cache.delete(repo);
+      return entryFor(repo, entry.allow);
+    }
   }
 
   /** Drop-in for `runReconcilePass` in the step ticks' `reconcile` option. */
@@ -102,15 +109,11 @@ export function createSharedReconcile({
     return { notes: Array.isArray(entry.plan?.notes) ? clone(entry.plan.notes) : [], prsByNumber: new Map(entry.final) };
   }
 
-  /** Mark PRs a step just acted on. `patch` is applied to their raw rows on re-plan (e.g. {isDraft:false}). */
-  function invalidate(repo, prNumbers, patch = null) {
+  /** Mark PRs a step just acted on: the next consumer re-plans them from a fresh read. */
+  function invalidate(repo, prNumbers) {
     const entry = cache.get(repo);
     if (!entry) return;
-    for (const n of prNumbers ?? []) {
-      if (n == null) continue;
-      entry.dirty.add(n);
-      if (patch) entry.patch.set(n, { ...(entry.patch.get(n) ?? {}), ...patch });
-    }
+    for (const n of prNumbers ?? []) if (n != null) entry.dirty.add(n);
   }
 
   return { reconcile, readNotes, invalidate, stats };
