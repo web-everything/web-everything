@@ -1,3 +1,4 @@
+import { sameRepoUrl } from './lane-alternates.mjs';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -104,7 +105,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       // dot because a remote subsection can itself contain dots or line separators.
       const remoteName = /^remote\./i.test(key) ? key.slice(7, key.lastIndexOf('.')) : null;
       const unsafeRemote = remoteName !== null && (remoteName !== 'origin'
-        || (origin && normalizeRemoteName(remoteName) === normalizeRemoteName(origin)));
+        || (origin && (normalizeRemoteName(remoteName) === normalizeRemoteName(origin) || sameRepoUrl(remoteName, origin))));
       if (['local', 'worktree'].includes(scope)
         && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
