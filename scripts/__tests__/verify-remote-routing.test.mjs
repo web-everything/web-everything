@@ -111,15 +111,25 @@ describe('proven local fallback verdict', () => {
   });
 
   it.each([
-    [['remote', 0], ['local-fallback', 1]],
-    [['local-fallback', 0], ['remote', 1]],
-    [['remote', 0], ['local-fallback', 0], ['local-fallback', 1]],
-  ])('never confirms a mixed chain verdict: %j', (...segments) => {
+    { segments: [['remote', 0], ['local-fallback', 1]], confirm: false },
+    { segments: [['local-fallback', 0], ['remote', 1]], confirm: true },
+    { segments: [['remote', 0], ['local-fallback', 0], ['local-fallback', 1]], confirm: false },
+    { segments: [['remote', 0], ['local-fallback', 0], ['remote', 1]], confirm: true },
+    // Inconsistent reports must never permit a retry to erase a reported local red.
+    { segments: [['local-fallback', 1], ['remote', 1]], confirm: false },
+    { segments: [['remote', 1], ['local-fallback', 1]], confirm: false },
+    { segments: [['local-fallback', 0], ['remote', 0]], confirm: false },
+  ])('confirms a mixed chain only when its failure is remote: $segments', ({ segments, confirm }) => {
     const reports = readRemoteReport('report', () => segments.map(([location, exitCode]) =>
       JSON.stringify({ location, exitCode, ...(location === 'remote' ? { receiptId: 'run-123456' } : {}) })).join('\n'));
     const ranOn = phaseRunLocation(reports, { remoteAttempt: true });
     expect(ranOn.location).toBe('mixed');
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn })).toBe(false);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn })).toBe(confirm);
+  });
+
+  it('retains an ambiguous mixed verdict without failure evidence', () => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+      ranOn: { location: 'mixed' } })).toBe(false);
   });
 
   // Execute the production orchestration with admission and child IO injected. No fixture Git writes.
@@ -128,9 +138,13 @@ describe('proven local fallback verdict', () => {
     ['vitestMs', 'npx vitest run scripts/changed.test.mjs', ['local-fallback']],
     ['standardsMs', 'npm run check:standards', ['local-fallback']],
     ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npx vitest run scripts/changed.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ['remote', 'local-fallback']],
-    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run scripts/changed.test.mjs', ['local-fallback', 'remote']],
-  ].map(([phase, command, locations]) => ({ phaseAdmission, phase, command, locations }))))(
-    'retains the failed child and its evidence: $phase, $locations, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command, locations }) => {
+    ['vitestMs', 'npx vitest run a.test.mjs --testTimeout=15000 && npx vitest run scripts/changed.test.mjs --testTimeout=15000', ['local-fallback', 'remote']],
+    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run b.test.mjs && npx vitest run scripts/changed.test.mjs', ['remote', 'local-fallback', 'remote']],
+  ].flatMap(([phase, command, locations]) => {
+    const confirm = locations.length > 1 && locations.at(-1) === 'remote';
+    return (confirm ? [0, 1] : [0]).map(confirmationExitCode => ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode }));
+  })))(
+    'preserves local reds and confirms remote reds: $phase, $locations, phaseAdmission=$phaseAdmission, confirmation=$confirmationExitCode', async ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode }) => {
       const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
       const start = source.indexOf('async function timedRunGate(');
       const end = source.indexOf('// runVitestOnBase', start);
@@ -143,7 +157,8 @@ describe('proven local fallback verdict', () => {
         })).join('\n'))),
         failureDetails: { summary: 'local failure in scripts/changed.test.mjs' },
         output: { stdout: '', stderr: 'FAIL scripts/changed.test.mjs' } };
-      const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: 0, ranOn: { location: 'local' } });
+      const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: confirmationExitCode,
+        failureDetails: { summary: 'local confirmation evidence' }, ranOn: { location: 'local' } });
       const acquireAdmission = vi.fn(async () => ({ ok: true }));
       const recordOutcome = vi.fn();
       const context = {
@@ -160,6 +175,23 @@ describe('proven local fallback verdict', () => {
       };
       const timedRunGate = runInNewContext(`${source.slice(start, end)}; timedRunGate`, context);
       const result = await timedRunGate(phase, command);
+      if (confirm) {
+        expect(runGate).toHaveBeenCalledTimes(2);
+        expect(runGate).toHaveBeenNthCalledWith(1, phaseAdmissionPlan({ command, decision: { remote: true } }).command,
+          undefined, { forgeDispatch: true });
+        expect(runGate).toHaveBeenNthCalledWith(2, command, undefined);
+        expect(acquireAdmission).toHaveBeenCalledTimes(1);
+        expect(acquireAdmission).toHaveBeenCalledWith('vitest', command, { forceLocal: true });
+        expect(result.exitCode).toBe(confirmationExitCode);
+        expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+        expect(result.failureDetails).toEqual({ summary: 'local confirmation evidence' });
+        expect(recordOutcome).toHaveBeenCalledWith('vitest', expect.objectContaining({ exitCode: confirmationExitCode,
+          failureDetails: result.failureDetails }));
+        expect(context.vitestAdmittedLocally).toBe(true);
+        expect(context.ranOnPhases.vitest).toEqual(result.ranOn);
+        expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+        return;
+      }
       expect(result).toBe(failure);
       expect(runGate).toHaveBeenCalledTimes(1);
       expect(runGate).toHaveBeenCalledWith(phaseAdmissionPlan({ command, decision: { remote: true } }).command,

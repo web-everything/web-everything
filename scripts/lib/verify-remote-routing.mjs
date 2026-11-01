@@ -69,9 +69,10 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 }
 
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
-  // The nested wrapper owns local fallback. A local or mixed phase has already run locally;
-  // confirming the whole chain again could discard a failure before isolated-retry safeguards run.
-  return plan?.takeLocalSlot === false && !['local', 'mixed'].includes(ranOn?.location)
+  // The nested wrapper owns local fallback. Preserve any already-local failure, but a passing
+  // local segment does not confirm a later remote red. Mixed chains need explicit failure evidence.
+  return plan?.takeLocalSlot === false && ranOn?.location !== 'local'
+    && (ranOn?.location !== 'mixed' || ranOn.failureLocation === 'remote')
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
 }
@@ -126,7 +127,12 @@ export function phaseRunLocation(reports, { remoteAttempt } = {}) {
   if (!reports.length) return { location: remoteAttempt === false ? 'local' : 'unknown' };
   const locations = new Set(reports.map(r => r.location === 'remote' ? 'remote' : 'local'));
   const receiptId = reports.find(r => r.location === 'remote' && r.receiptId)?.receiptId;
-  return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}) };
+  // A successful local segment in an && chain says nothing about a later remote failure.
+  // Even inconsistent reports must preserve a local red rather than let confirmation erase it.
+  const failureLocation = reports.some(r => r.location === 'local-fallback' && r.exitCode > 0) ? 'local'
+    : reports.some(r => r.location === 'remote' && r.exitCode > 0) ? 'remote' : null;
+  return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}),
+    ...(locations.size > 1 && failureLocation ? { failureLocation } : {}) };
 }
 export function mergeRunLocation(a, b) {
   if (a === 'unknown' || b === 'unknown') return 'unknown';
