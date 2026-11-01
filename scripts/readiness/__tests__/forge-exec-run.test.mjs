@@ -150,6 +150,42 @@ describe('sibling root snapshot acceptance', () => {
   });
 });
 
+describe('gate option and scan-file allowlist (R314, R309)', () => {
+  const unit = (...args) => ['npm','run','test:unit','--','a.test.mjs',...args];
+  it.each([
+    ['--passWithNoTests'], ['--testTimeout=15000'], ['--hookTimeout=30000'], ['--testTimeout=1'], ['--hookTimeout=3600000'],
+    ['--passWithNoTests','--testTimeout=15000','--hookTimeout=30000'],
+  ])('accepts the gate options %j', (...args) => {
+    expect(manifestAPI.allowedCommand(unit(...args))).toBe(true);
+    expect(manifestAPI.allowedCommand(['npx','vitest','run','a.test.mjs',...args])).toBe(true);
+  });
+  it.each([
+    '--testTimeout=abc', '--testTimeout=', '--testTimeout', '--testTimeout=0', '--testTimeout=015000', '--testTimeout=-1',
+    '--testTimeout=1.5', '--testTimeout=3600001', '--testTimeout=99999999', '--hookTimeout=1e3', '--hookTimeout=abc',
+    '--test-timeout=15000', '--TestTimeout=15000', '--testTimeout=15000 ', '--passWithNoTests=true', '--pass-with-no-tests',
+    '--reporter=x', '--maxWorkers=1', '--teardownTimeout=1000',
+  ])('rejects %s', arg => {
+    expect(manifestAPI.allowedCommand(unit(arg))).toBe(false);
+  });
+  it('rejects a separated value after --testTimeout and a boolean after --passWithNoTests', () => {
+    expect(manifestAPI.allowedCommand(unit('--testTimeout','15000'))).toBe(false);
+    expect(manifestAPI.allowedCommand(['npx','vitest','run','a.test.mjs','--passWithNoTests','false'])).toBe(false);
+  });
+  it.each([
+    '["scripts/a.mjs","scripts/b.test.mjs"]', '[]', 'scripts/a.mjs', 'scripts/a.mjs,scripts/b.mjs', 'scripts/a.mjs\nsrc/b.ts',
+    '[".github/workflows/ci.yml"]', '["a/@scope/b+c-d_e.mjs"]',
+  ])('accepts VERIFY_SCAN_FILES=%j', value => {
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:value})).toBe(true);
+  });
+  it.each([
+    '/etc/passwd', '["/etc/passwd"]', '../x', '["../x"]', 'a/../b', 'a..b', '..', '["a/./b"]', './a', 'a;rm', '["a;rm -rf /"]', 'a b', '$(id)',
+    '`id`', 'a|b', 'a&b', 'a>b', "a'b", 'a"b', 'a\\b', '-rf', '', 'a,,b', 'a//b', 'a/', '["a",1]', '{"a":1}', '[', '["a"',
+    'a\0b', 'x'.repeat(65537),
+  ])('rejects VERIFY_SCAN_FILES=%j', value => {
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:value})).toBe(false);
+  });
+});
+
 describe('fixed wrapper security boundary', () => {
   it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
     const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
@@ -196,7 +232,7 @@ test('executes probe', () => {writeFileSync('executed', 'yes'); expect(true).toB
   }, 65000);
 
   it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
-    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
+    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']).filter(arg => arg !== '--passWithNoTests'))
   ('rejects arguments outside the allowlist: %s before installing or executing', async arg => {
     const command = ['npm','run','test:unit','--','a.test.mjs',arg];
     expect(manifestAPI.allowedCommand(command)).toBe(false);

@@ -52,6 +52,9 @@ export function isAllowedCommand(argv) {
 export function filterEnv(env = {}) {
   if (Object.hasOwn(env, 'DIFF_COVERAGE_BASE') && !allowedEnv({DIFF_COVERAGE_BASE:env.DIFF_COVERAGE_BASE}))
     throw Object.assign(new Error('Invalid DIFF_COVERAGE_BASE: use local fallback'), {code:'invalid-diff-coverage-base'});
+  // A dropped scan list would widen the remote scan; refuse it so the run stays local instead.
+  if (Object.hasOwn(env, 'VERIFY_SCAN_FILES') && !allowedEnv({VERIFY_SCAN_FILES:env.VERIFY_SCAN_FILES}))
+    throw Object.assign(new Error('Invalid VERIFY_SCAN_FILES: use local fallback'), {code:'invalid-scan-files'});
   return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value})));
 }
 

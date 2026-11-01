@@ -514,7 +514,7 @@ describe('isAllowedCommand', () => {
   });
 
   it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
-    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
+    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']).filter(arg => arg !== '--passWithNoTests'))
   ('rejects arguments outside the allowlist: %s on both sides before transport', async arg => {
     const command = ['npm','run','test:unit','--','a.test.mjs',arg];
     expect(isAllowedCommand(command)).toBe(false);
@@ -772,6 +772,12 @@ describe('standards input parity', () => {
 });
 
 describe('filterEnv', () => {
+  it('forwards a valid VERIFY_SCAN_FILES and refuses an unsafe one with a local fallback reason (R309)', () => {
+    const value = '["scripts/a.mjs","src/b.ts"]';
+    expect(filterEnv({VERIFY_SCAN_FILES:value, OTHER:'x'})).toEqual({VERIFY_SCAN_FILES:value});
+    for (const bad of ['/etc/passwd', '../x', 'a;rm'])
+      expect(() => filterEnv({VERIFY_SCAN_FILES:bad})).toThrow('Invalid VERIFY_SCAN_FILES: use local fallback');
+  });
   it.each(['HEAD', 'origin/main', 'refs/heads/fix.v1', 'a'.repeat(40)])('accepts safe coverage base %s for local commit resolution', base => {
     const env = filterEnv({DIFF_COVERAGE_BASE:base});
     expect(env).toEqual({DIFF_COVERAGE_BASE:base});
