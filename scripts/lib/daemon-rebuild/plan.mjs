@@ -6,6 +6,7 @@ import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from '
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { computeClosureScope, fixpointExtend, finalClosureScope, isExcludable } from './closure-scope.mjs';
 import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { createHash } from 'node:crypto';
 
@@ -334,7 +335,7 @@ export async function planOverlayStacks({
  * Replan at most three times; exhaustion or incomplete evidence retains the ordinary conflict path. */
 export async function planRebuild(options) {
   const { git, entries = [], env = process.env } = options;
-  const mode = options.closureScopeMode ?? resolveClosureScopeMode(env).mode;
+  const mode = lockClosureScopeMode(options.closureScopeMode ?? resolveClosureScopeMode(env).mode);
   let initialEntries = entries;
   if (mode === 'on') {
     try {

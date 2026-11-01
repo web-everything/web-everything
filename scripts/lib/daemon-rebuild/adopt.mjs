@@ -13,6 +13,7 @@ import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -104,10 +105,11 @@ export function matchReadyCandidate({
 export function readyBuildVerified({
   git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
+  const mode = lockClosureScopeMode(closureScopeMode ?? resolveClosureScopeMode(env).mode);
   const applied = Array.isArray(adopt?.applied) ? adopt.applied : [];
   const scoped = applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined);
   // Persisted scoped builds still need runtime evidence after the strategy is disabled.
-  if (scoped || (closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
+  if (scoped || mode === 'on') {
     try {
       entries = typeof entries === 'function' ? entries() : entries;
       if (!Array.isArray(entries) || !entries.length) return false;

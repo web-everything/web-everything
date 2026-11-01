@@ -94,6 +94,7 @@ describe('rebuildClone coordination events', () => {
 
   it.each(['quarantined', 'established-overlay-conflict', 'still-rejected',
     'overlay-source-unavailable', 'overlay-source-unverifiable',
+    'overlay-state-malformed', 'overlay-state-malformed: invalid registration',
     'error: build unavailable', 'established-overlay-conflict: lane/example'])(
     'emits rebuild-failed once for a prepare refusal: %s', async (reason) => {
       terminal({ moved: false, reason });

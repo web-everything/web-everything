@@ -70,7 +70,9 @@ export default {
       ok('init', '-q', '-b', 'main');
       const initial = commit('base');
       ok('update-ref', 'refs/remotes/origin/main', initial);
-      const overlays = [{ ref: 'deleted', sha: initial }];
+      // Recorded tips let preparation verify that unavailable overlays are not mechanism pins.
+      // Legacy sha alone is retirement evidence, but does not establish pin status.
+      const overlays = [{ ref: 'deleted', sha: initial, tipSha: initial }];
       writeOverlays(root, overlays, { env });
       const refEvidence = new Map([['deleted', 'missing']]);
       const defaultEnv = { ...env };
@@ -113,7 +115,7 @@ export default {
       ok('push', '-q', 'origin', 'feature');
       ok('checkout', '-q', 'main');
       ok('update-ref', 'refs/remotes/origin/feature', initial);
-      const uncertain = [{ ref: 'feature', sha: initial }];
+      const uncertain = [{ ref: 'feature', sha: initial, tipSha: initial }];
       writeOverlays(root, uncertain, { env });
       const held = await prepare((args) => args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/feature:'))
         ? { status: 1, stderr: 'transient fetch error' } : git(args));
@@ -127,7 +129,7 @@ export default {
       ok('update-ref', 'refs/remotes/origin/lower', lower);
       const top = commit('top');
       ok('update-ref', 'refs/remotes/origin/top', top);
-      const stack = [{ ref: 'lower', sha: lower }, { ref: 'top', sha: top }];
+      const stack = [{ ref: 'lower', sha: lower, tipSha: lower }, { ref: 'top', sha: top, tipSha: top }];
       writeOverlays(root, stack, { env });
       const replaced = await autoRetireOverlays({ root, env, overlays: stack, git,
         refEvidence: new Map(stack.map((o) => [o.ref, 'refreshed'])),
@@ -153,11 +155,28 @@ export default {
       ok('push', '-q', 'origin', 'main');
       ok('reset', '--hard', initial);
       const stale = [{ ref: 'missing-no-sha' }, { ref: 'unsafe@name' }, { ref: 'feature' }];
-      writeOverlays(root, stale, { env });
-      const healthy = await prepare();
-      if (healthy.terminal || healthy.plan?.mainSha !== nextMain || healthy.plan?.applied.map((o) => o.ref).join(',') !== 'feature'
-        || readOverlayState(root, { env }).overlays.length !== stale.length) {
-        violation('single-stale-registration-blocks-healthy-overlay', `a deleted no-sha or unsafe registration stopped the healthy overlay plan (${healthy.result?.reason ?? 'non-terminal plan'})`);
+      for (const mode of ['off', 'shadow', 'on']) {
+        env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+        writeOverlays(root, stale, { env });
+        const stored = readFileSync(overlayFilePath(root, env), 'utf8');
+        const unknown = await prepare();
+        if (!unknown.terminal || unknown.result?.moved !== false || unknown.result?.reason !== 'pinned-overlay-unavailable'
+          || unknown.result?.detail?.ref !== 'missing-no-sha' || unknown.result?.detail?.pinnedBy !== 'unknown'
+          || ok('rev-parse', 'HEAD') !== initial
+          || readFileSync(overlayFilePath(root, env), 'utf8') !== stored) {
+          violation('unknown-pin-evidence-does-not-hold', `${mode}: unknown overlay tips must preserve the running tree and registry (${unknown.result?.reason ?? 'non-terminal plan'})`);
+        }
+        // An operator restores recorded tips proving no mechanism changes. The healthy overlay
+        // builds in every mode; on also retires the confirmed missing tip already landed on main.
+        // The unsafe name has no remote absence evidence and must remain registered in every mode.
+        writeOverlays(root, stale.map((o) => o.ref === 'feature' ? o : { ...o, tipSha: initial }), { env });
+        const healthy = await prepare();
+        const expectedRefs = mode === 'on' ? 'unsafe@name,feature' : stale.map((o) => o.ref).join(',');
+        const actualRefs = readOverlayState(root, { env }).overlays.map((o) => o.ref).join(',');
+        if (healthy.terminal || healthy.plan?.mainSha !== nextMain || healthy.plan?.applied.map((o) => o.ref).join(',') !== 'feature'
+          || actualRefs !== expectedRefs) {
+          violation('single-stale-registration-blocks-healthy-overlay', `${mode}: an unavailable registration with recorded non-mechanism evidence stopped the healthy overlay plan or changed the wrong registrations (${healthy.result?.reason ?? 'non-terminal plan'}; refs=${actualRefs}, expected=${expectedRefs})`);
+        }
       }
       // Adopt a pinned feature, then lose only its refresh while main advances. The running
       // feature must survive the outage, and the next healthy tick must catch up with main.

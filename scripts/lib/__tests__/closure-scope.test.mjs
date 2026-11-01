@@ -617,6 +617,15 @@ it.each([
   expect(compute({ 'entry.mjs': source })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
 });
 
+// createRequire is an opaque loader capability even with a literal target; A1 needs analyzer work.
+it.todo('A1: literal-resolvable createRequire protects only its target while unrelated files stay excludable');
+
+it('retains the full conflict for a literal-resolvable createRequire target pending A1', () => {
+  expect(compute({ 'entry.mjs': "import { createRequire } from 'node:module'; createRequire(import.meta.url)('./target.mjs');",
+    'target.mjs': 'export {};', 'unrelated.mjs': 'export {};' }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
 it('R210 protects explicitly spawned tests and their dependencies', () => {
   const result = compute({ 'entry.mjs': "spawn('node', ['scripts/__tests__/worker.test.mjs']);",
     'scripts/__tests__/worker.test.mjs': "import './test-helper.mjs';", 'scripts/__tests__/test-helper.mjs': '' });

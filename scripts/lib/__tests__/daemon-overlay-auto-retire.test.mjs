@@ -243,7 +243,8 @@ describe('real Git retirement evidence', () => {
       const missing = shape === 'missing-above-live-top' ? 'missing'
         : shape.startsWith('missing-') ? 'top' : null;
       if (missing) ok('push', '-q', 'origin', '--delete', missing);
-      register(overlays);
+      // These cases exercise carrier selection with known non-mechanism tips, not missing pin evidence.
+      register(overlays.map((o) => ({ ...o, tipSha: o.sha })));
 
       const prepared = await prepare();
       const carrier = ['missing-top', 'missing-equal'].includes(shape) ? 'lower' : 'top';
@@ -275,7 +276,7 @@ describe('real Git retirement evidence', () => {
     expect(rows[0]).toMatchObject({ ref: 'lower', class: 'needed', reason: 'unmerged-content' });
   });
 
-  it.each(['off', 'shadow', 'on'])('%s preparation proceeds past a squash-landed deleted branch', async (mode) => {
+  it.each(['off', 'shadow', 'on'])('%s preparation preserves legacy SHA-only evidence until retirement or pin verification', async (mode) => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     branch('deleted');
     const sha = commit('landed', 'overlay content');
@@ -289,10 +290,17 @@ describe('real Git retirement evidence', () => {
     const result = await prepare();
     expect(result.result?.reason).not.toBe('fetch-failed');
     expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(mode === 'on' ? [] : ['deleted']);
-    expect((result.plan ?? result.result.plan).decisions.some((d) => d.ref === 'deleted')).toBe(false);
+    if (mode === 'on') {
+      expect((result.plan ?? result.result.plan).decisions.some((d) => d.ref === 'deleted')).toBe(false);
+    } else {
+      // Legacy `sha` is retirement evidence, but is not the recorded `tipSha` pin fallback.
+      expect(result).toMatchObject({ terminal: true, result: {
+        moved: false, reason: 'pinned-overlay-unavailable', detail: { ref: 'deleted', pinnedBy: 'unknown' },
+      } });
+    }
   });
 
-  it.each(['off', 'shadow', 'on'])('%s preparation isolates unavailable registrations from a healthy overlay', async (mode) => {
+  it.each(['off', 'shadow', 'on'])('%s preparation refuses unavailable registrations without pin evidence beside a healthy overlay', async (mode) => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     branch('healthy');
     commit('healthy', 'healthy');
@@ -302,10 +310,12 @@ describe('real Git retirement evidence', () => {
     const overlays = [{ ref: 'deleted' }, { ref: 'unsafe@name' }, { ref: 'healthy' }];
     register(overlays);
     const result = await prepare();
-    expect(result.terminal).not.toBe(true);
-    expect(result.plan.decisions.map((d) => d.ref)).toEqual(['healthy']);
+    expect(result).toMatchObject({ terminal: true, result: {
+      moved: false, reason: 'pinned-overlay-unavailable', detail: { ref: 'deleted', pinnedBy: 'unknown' },
+    } });
     expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(overlays.map((o) => o.ref));
-    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable' }));
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'pinned-overlay-unavailable' }));
+    expectNoRetirement();
   });
 
   it('deduplicates shadow audit entries across calls while reporting every observation', async () => {
@@ -366,7 +376,7 @@ describe('real Git retirement evidence', () => {
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toContain('overlay-retired');
   });
 
-  it.each(['failure', 'throw', 'malformed', 'fetch-throw', 'fetch-error'])('failed overlay fetch preserves cached landed registrations after successful main fetch (%s)', async (kind) => {
+  it.each(['failure', 'throw', 'malformed', 'fetch-throw', 'fetch-error'])('failed overlay fetch refuses missing pin evidence and preserves cached landed registrations (%s)', async (kind) => {
     branch('feature');
     commit('feature', 'live unmerged content');
     localOrigin();
@@ -390,9 +400,10 @@ describe('real Git retirement evidence', () => {
       return result;
     } });
     expect(mainFetched).toBe(true);
-    expect(prepared.result.reason).toBe('up-to-date');
-    expect(prepared.result.plan.decisions).toEqual([]);
-    expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable' }));
+    expect(prepared).toMatchObject({ terminal: true, result: {
+      moved: false, reason: 'pinned-overlay-unavailable', detail: { ref: 'feature', pinnedBy: 'unknown' },
+    } });
+    expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'pinned-overlay-unavailable' }));
     expect(readOverlayState(root, { env }).overlays).toEqual(overlays.map(o => ({ ...o, registrationId: expect.any(String) })));
     expectNoRetirement();
   });
@@ -481,9 +492,12 @@ describe('real Git retirement evidence', () => {
       if (args[0] === 'fetch') fetches.push(args);
       return git(args);
     } });
-    expect(prepared.result.reason).toBe('fetch-failed');
-    expect(fetches).toEqual([]);
-    expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'fetch-failed' }));
+    expect(prepared.result).toMatchObject({ moved: false, reason: 'overlay-state-malformed' });
+    expect(fetches).toEqual([['fetch', '--quiet', '--prune', 'origin',
+      '+refs/heads/main:refs/remotes/origin/main', '+refs/heads/main:refs/remotes/origin/main']]);
+    expect(prepared.alerts).toContainEqual(expect.objectContaining({
+      kind: 'overlay-state-malformed', detail: expect.objectContaining({ malformed: [0] }),
+    }));
     expect(readFileSync(overlayFilePath(root, env), 'utf8')).toBe(stored);
     expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
     expectNoRetirement();

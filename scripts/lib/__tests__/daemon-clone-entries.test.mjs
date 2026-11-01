@@ -137,19 +137,99 @@ it('refuses an unknown pass for this clone', () => {
   }) })).toThrow();
 });
 
-it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner'])(
-  'R230 refuses a relative LaunchAgent entrypoint: %s', entry => {
+it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner', '.', '..',
+  'daemon.mts', 'daemon.py', 'daemon.cts', 'daemon.tsx', '--import=./x', '--import=package',
+  '--require=./x', '--loader=./x', '--experimental-loader=./x',
+  '--import', '--require', '--loader', '--experimental-loader', '-r./relative-module.cjs', '-rpackage', '-r'])(
+  'refuses an unsupported LaunchAgent entrypoint/module argument: %s', entry => {
     const f = fixture();
     writeFileSync(join(f.launchAgentsDir, 'com.we.relative.plist'), 'plist');
     expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
       stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', entry] }),
-    }) })).toThrow('LaunchAgents relative entrypoint refused: com.we.relative.plist');
+    }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.relative.plist: ${entry}`);
   });
+
+it.each(['runner', 'daemon.mts', 'daemon.py'])('refuses an existing unsupported clone file: %s', entry => {
+  const f = fixture();
+  writeFileSync(join(f.root, entry), 'entrypoint');
+  writeFileSync(join(f.launchAgentsDir, 'com.we.file.plist'), 'plist');
+  const alias = join(f.dir, 'alias');
+  symlinkSync(f.root, alias);
+  for (const arg of [entry, join(realpathSync(f.root), entry)]) {
+    expect(() => cloneRuntimeEntries({ ...f, root: alias, run: () => ({ status: 0,
+      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', arg] }),
+    }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.file.plist: ${arg}`);
+  }
+});
+
+it.each([
+  ['worker.mjs', 'worker.py'],
+  ['worker.py', 'worker.mjs'],
+])('refuses an absolute clone symlink with an unsupported argument or target extension: %s -> %s', (entry, target) => {
+  const f = fixture();
+  writeFileSync(join(f.root, target), 'entrypoint');
+  const arg = join(f.root, entry);
+  symlinkSync(target, arg);
+  writeFileSync(join(f.launchAgentsDir, 'com.we.symlink.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', arg] }),
+  }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.symlink.plist: ${arg}`);
+});
+
+it('refuses --import=./x even when its target exists in the clone', () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'x'), 'export {};');
+  writeFileSync(join(f.launchAgentsDir, 'com.we.loader.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', '--import=./x'] }),
+  }) })).toThrow('LaunchAgents unsupported entrypoint/module argument refused: com.we.loader.plist: --import=./x');
+});
+
+it('fails closed on non-ENOENT filesystem errors for a bare argument', () => {
+  const f = fixture();
+  symlinkSync('runner', join(f.root, 'runner'));
+  writeFileSync(join(f.launchAgentsDir, 'com.we.cycle.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', 'runner'] }),
+  }) })).toThrow(expect.objectContaining({ code: 'ELOOP' }));
+});
 
 it('R230 permits bare interpreters, option flags and numeric argument tokens', () => {
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
   expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--pass=x', '--path=relative/file.js', '42'] }),
+    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--pass=x', '--pass=',
+      '--repo=owner/repo', '--path=relative/file.js', '42'] }),
   }) }))).toEqual(new Set(DAEMON_ENTRY_MODULES));
+});
+
+it('permits --repo=owner/repo on a LaunchAgent with an absolute entrypoint', () => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.postmortem.plist'), 'plist');
+  const entry = 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs';
+  expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, entry), '--repo=owner/repo', '--watch'] }),
+  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, entry]));
+});
+
+it('permits node paths, absolute scripts, plain flags, pass names and numeric argument tokens', () => {
+  const f = fixture();
+  for (const entry of ['worker.mjs', 'worker.js', 'worker.cjs']) writeFileSync(join(f.root, entry), 'export {};');
+  writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
+  expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '/usr/bin/node',
+      join(f.root, 'worker.mjs'), join(f.root, 'worker.js'), join(f.root, 'worker.cjs'), '-e', '--no-warnings', '--pass=NAME', '42'] }),
+  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs', 'worker.js', 'worker.cjs']));
+});
+
+it('refuses an extensionless in-clone LaunchAgent script entry instead of silently omitting it', () => {
+  const f = fixture();
+  mkdirSync(join(f.root, 'scripts'));
+  writeFileSync(join(f.root, 'scripts', 'some-daemon'), 'entrypoint');
+  writeFileSync(join(f.launchAgentsDir, 'com.we.ext.plist'), 'plist');
+  for (const arg of [join(realpathSync(f.root), 'scripts/some-daemon'), 'scripts/some-daemon']) {
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/node', arg] }),
+    }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.ext.plist: ${arg}`);
+  }
 });

@@ -1,4 +1,4 @@
-/** PR #6023: aliased LaunchAgents must feed both boot smoke and closure scoping. */
+/** Aliased entry discovery remains covered directly; boot on requests now exercise the R284 locked fallback. */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -39,15 +39,21 @@ export default {
         run: (_bin, args) => ({ status: 0,
           stdout: JSON.stringify({ ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) }),
       });
-      const boot = resolveDaemonEntries({ WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: alias }, { root, runtimeEntries });
-      for (const p of ['scripts/extra-daemon.mjs', 'scripts/conveyor/branch-drift.mjs']) {
-        if (!boot.entries.includes(p)) violations.push(`boot omitted aliased entry: ${p}`);
+      let bootDiscovered = false;
+      const boot = resolveDaemonEntries({ WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: alias }, { root,
+        runtimeEntries(options) { bootDiscovered = true; return runtimeEntries(options); } });
+      if (bootDiscovered || JSON.stringify(boot.entries) !== JSON.stringify(DAEMON_ENTRY_MODULES)) {
+        violations.push('locked on changed the fixed boot entries or discovered aliased entries');
       }
-      if (boot.entries.some(p => p.includes('foreign'))) violations.push('boot included an external entry');
+      const discovered = runtimeEntries({ root, env: {} });
+      for (const p of ['scripts/extra-daemon.mjs', 'scripts/conveyor/branch-drift.mjs']) {
+        if (!discovered.includes(p)) violations.push(`discovery omitted aliased entry: ${p}`);
+      }
+      if (discovered.some(p => p.includes('foreign'))) violations.push('discovery included an external entry');
       const key = p => relative(root, resolve(root, p));
       const reader = { root, listFiles: () => [...files.keys()], exists: p => files.has(key(p)),
         readFile: p => { if (!files.has(key(p))) throw new Error('unreadable'); return files.get(key(p)); } };
-      const scope = computeClosureScope({ reader, entries: runtimeEntries({ root, env: {} }), env: {} });
+      const scope = computeClosureScope({ reader, entries: discovered, env: {} });
       for (const p of ['scripts/daemon-dependency.mjs', 'scripts/conveyor/pass-dependency.mjs']) {
         if (!scope.ok || isExcludable(p, scope.scope)) violations.push(`scope missed aliased runtime dependency: ${p}`);
       }
