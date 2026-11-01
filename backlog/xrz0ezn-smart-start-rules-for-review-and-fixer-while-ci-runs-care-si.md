@@ -2,9 +2,11 @@
 kind: decision
 size: 5
 parent: "5467"
-status: open
+status: resolved
 scope: ["we:scripts/lib/review-timing.mjs", "we:scripts/lib/review-timing-settings.mjs", "we:scripts/operations/fix-run.mjs"]
 dateOpened: "2026-11-01"
+dateResolved: "2026-11-01"
+codifiedIn: "docs/agent/platform-decisions.md#review-fixer-early-start-rules"
 preparedDate: "2026-11-01"
 preparedAgainstSha: "174220fad20252329d315759de9702bbcc698979"
 tags: []
@@ -79,3 +81,18 @@ It is three weeks later and the change was a mistake. Most likely stories:
 ## Trust boundary and threat model
 
 Nothing new is trusted: the early start reads the same verify ledger and check states the daemons already read, and acts only on records naming the exact head sha. Threat: a PR author who controls the diff forges a small, low-care shape to get an early start. Effect is bounded to earlier review; merge still needs green CI and the full review verdict. Care level comes from the existing derivation, not author text.
+
+## Ratified — 2026-11-01 (R359)
+
+Operator chalbert, 2026-11-01 17:46 ET, verbatim: "Ratify xrz0ezn".
+
+Fork 1 ruled at the bold default **(b)**: the fixer starts on confirmed findings while CI runs, holds the push until the previous head's CI is complete, then folds CI findings into the same push. It never pushes into a running CI. Confirmed = red-team confirmed, or at least two review seats agree, each naming the exact head sha.
+
+Settled list ratified with it:
+1. Merge never happens before CI is green; a head change voids any early review or fix.
+2. A started review keeps its findings when CI goes red and joins them into one fix round; cancel-on-red stays off.
+3. Fail closed: missing or unreadable care, size, kind, verify record or CI state means wait for CI; docs, config and data diffs wait.
+4. Eligibility is a cascade setting with care, size and kind limits; default eligible care band is `none` or `low`.
+5. Shadow first with an end rule (10% wasted-start rate, 7 days, 30 PRs, whichever first); the flip is a human settings change.
+
+Codified in we:docs/agent/platform-decisions.md#review-fixer-early-start-rules. Build stories filed under parent #5467.
