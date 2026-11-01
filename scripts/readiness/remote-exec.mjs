@@ -108,7 +108,7 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
       cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
@@ -129,6 +129,9 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
         if (stream === child.stdout) stdout.push(chunk);
       });
     }
+    // x40a9dk: an aborted client stops the local ssh; the Forge side is then ended by the protected finish.
+    const stop = () => { child.kill('SIGTERM'); };
+    if (signal) { if (signal.aborted) stop(); else { signal.addEventListener('abort', stop, { once: true }); child.once('close', () => signal.removeEventListener('abort', stop)); } }
     child.on('error', reject);
     child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
       : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
@@ -1041,7 +1044,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, signal, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -1070,6 +1073,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
+    ...(command === 'run' && signal ? {signal} : {}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
   let run;
   let staging;
@@ -1231,7 +1235,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const runAt=clock(),runDone=begin('forge-run');
       let result;
       try {
-        result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
+        if (!signal?.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
       } catch { /* Only a protected finish response can resolve lost run output. */ }
       finally {runDone();}
       const receipt = await finish();
@@ -1257,6 +1261,11 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           return retried;
         }
         return {mode:'not-started',terminated:true,reason:'forge-rejected:'+reply.reason};
+      }
+      // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
+      // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
+      if(signal?.aborted && !(result && verifyReceipt(text,expected,result.code))) {
+        return reply === null || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {

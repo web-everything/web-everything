@@ -765,6 +765,20 @@ describe('standards input parity', () => {
     expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
   });
 
+  it.each([['a null finish (run killed before a receipt)', 'null', 'cancelled'], ['a finish that failed to parse', 'untrusted', 'unconfirmed']])(
+    'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
+    const controller = new AbortController();
+    const f = fixture({receipt}), original = f.exec;
+    f.signal = controller.signal;
+    f.exec = vi.fn(async call => {
+      if (isRun(call)) { controller.abort(); expect(call.signal).toBe(controller.signal); return {code: 143, stdout: ''}; }
+      return original(call);
+    });
+    const result = await runRemote(f);
+    expect(callsOf(f.exec).some(isCleanup)).toBe(true);
+    expect(result).toEqual(mode === 'cancelled' ? {mode, terminated: true, reason: 'client-signal'} : {mode, reason: 'ambiguous-result'});
+  });
+
   it('keeps skipped standards unconfirmed when the completion receipt is invalid', async () => {
     const f = fixture({receipt:'untrusted completion'}), original = f.exec;
     f.argv = ['npm','run','check:standards'];

@@ -759,6 +759,13 @@ export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmis
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
  * Everything else (including legacy fallback, throws, malformed results and unacknowledged
  * timeouts) refuses local reruns with exit 124. */
+const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+/** x40a9dk: how long a killed client waits for its remote cancel to be confirmed (default 90s; the protected finish took 14s live). */
+function resolveSignalCancelWaitMs(env) {
+  const n = Number((env ?? {}).WE_HEAVY_SIGNAL_CANCEL_WAIT_MS);
+  return Number.isInteger(n) && n >= 0 ? n : 90000;
+}
+
 export async function runWithRemoteDecision({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
@@ -857,6 +864,11 @@ export async function runWithRemoteDecision({
   };
   let reason; let detail; let timer;
   const controller = new AbortController();
+  // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
+  // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
+  let signalled = null; let onSignal;
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve(name); controller.abort(); }; });
+  let signalHandlers = [];
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
@@ -874,6 +886,7 @@ export async function runWithRemoteDecision({
       if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
+    signalHandlers = Object.keys(CLIENT_SIGNAL_NUMBERS).map((name) => { const h = () => onSignal(name); process.on(name, h); return [name, h]; });
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => {
         resolve(timedOut);
@@ -881,7 +894,23 @@ export async function runWithRemoteDecision({
       }, timeoutMs);
     });
     const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
-    const result = await Promise.race([remote, timeout]);
+    const result = await Promise.race([remote, timeout, signalPromise]);
+    if (typeof result === 'string') {
+      clearTimeout(timer);
+      let cancelTimer;
+      const termination = await Promise.race([
+        remote.catch(() => null),
+        new Promise((resolve) => { cancelTimer = setTimeout(() => resolve(null), resolveSignalCancelWaitMs(env)); }),
+      ]);
+      clearTimeout(cancelTimer);
+      terminated = (termination?.mode === 'remote' && Number.isInteger(termination.code) && termination.code >= 0 && termination.code <= 254)
+        || ((termination?.mode === 'not-started' || termination?.mode === 'cancelled') && termination.terminated === true);
+      await record(terminated ? termination : { mode: 'unconfirmed' });
+      log(terminated
+        ? `heavy-admission: ${result} received; remote run cancelled and slot-${slot.slot} released\n`
+        : `heavy-admission: ${result} received; remote termination unconfirmed (${oneLine(termination?.reason ?? termination?.mode ?? 'no answer')}) - slot-${slot.slot} marker left for the reaper\n`);
+      return { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[result], signal: result };
+    }
     if (result === timedOut) {
       const termination = await Promise.race([
         remote.catch(() => null),
@@ -910,6 +939,7 @@ export async function runWithRemoteDecision({
   } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
+    for (const [name, h] of signalHandlers) process.removeListener(name, h);
     if(!outstanding) releaseOwnedSlot({...slotOptions,fastSlots:0});
     else if(terminated) {
       // Unconfirmed results, throws and client death leave the pre-dispatch
