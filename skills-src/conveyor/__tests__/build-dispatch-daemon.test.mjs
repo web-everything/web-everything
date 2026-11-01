@@ -1873,6 +1873,27 @@ describe('automatic item preparation', () => {
     expect(searches).toHaveLength(8);
     expect(effects.dispatch).toHaveBeenCalledTimes(2);
   });
+  it('launch checks keep their reserved listing budget when pre-launch reads would exhaust it', async () => {
+    const effects = fixture();
+    const parked = Array.from({ length: 20 }, (_, i) => String(8200 + i));
+    const git = prepareGitFixture(Object.fromEntries([...parked, '4501', '4502'].map(num => [num, `---\nstatus: open\n---\ncard ${num}`])));
+    const searches = [];
+    const reader = createPrepareStatusReader({ maxPrListingCalls: 16, launchReserve: 4, exec: (cmd, args, opts) => {
+      if (cmd !== 'gh') return git(cmd, args, opts);
+      searches.push(args[args.indexOf('--search') + 1]);
+      return '[]';
+    } });
+    // Pre-launch status reads of parked cards (2 searches each) would spend the whole budget on their own.
+    effects.primePrepareStatus = () => { for (const num of parked) try { reader.listPrs({ num }); } catch { /* exhausted */ } };
+    effects.listPreparePrs = args => reader.listPrs(args);
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(tick.prepare.refused).toEqual([]);
+    expect(tick.prepare.launched.map(row => row.num)).toEqual(['4501', '4502']);
+    expect(searches).toHaveLength(16);
+    expect(searches.slice(12)).toEqual(['head:lane/4501', 'in:title "prepare" "4501"', 'head:lane/4502', 'in:title "prepare" "4502"']);
+    // Fail closed: once the reserve too is spent, a launch read still refuses.
+    expect(() => reader.listPrs({ num: '8219', forLaunch: true })).toThrow('budget exhausted');
+  });
   it.each([3, 60])('bounds replanning through %s consecutive guarded picks and still evaluates the final pick', async guardedCount => {
     const effects = fixture();
     effects.now = () => Date.parse('2026-10-16T23:00:00Z');
@@ -4695,6 +4716,79 @@ describe('prepare discovery under repository PR volume', () => {
     for (const num of nums) reader.listPrs({ num });
     expect(() => reader.listPrs({ num: nums[0], bornAs: 'xother1' })).toThrow('budget exhausted');
     expect(searches).toHaveLength(16);
+  });
+
+  describe('parked prepare listing cache', () => {
+    const setup = () => {
+      let open = false;
+      const searches = [];
+      const pr = { number: 9301, state: 'OPEN', headRefName: 'lane/8300-prepare-x', headRefOid: 'a'.repeat(40), createdAt: '2026-10-31', isCrossRepository: false };
+      const git = prepareGitFixture({ 8300: '---\nstatus: open\n---\nparked', 8301: '---\nstatus: open\n---\nactive' });
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'gh' && args[0] === 'api') return JSON.stringify({ content: Buffer.from('---\nstatus: open\n---\nx').toString('base64') });
+        if (cmd !== 'gh') return git(cmd, args, opts);
+        const search = args[args.indexOf('--search') + 1];
+        searches.push(search);
+        return JSON.stringify(open && search === 'head:lane/8300' ? [pr] : []);
+      };
+      const clock = { t: Date.parse('2026-11-01T04:00:00Z') };
+      const parkedListings = new Map();
+      const reader = () => createPrepareStatusReader({ exec, parkedCacheMs: 15 * 60_000, now: () => clock.t, parkedListings });
+      return { searches, clock, reader, openPr: () => { open = true; }, pr };
+    };
+    it('serves a parked card from the cache within the TTL and re-reads it once stale', async () => {
+      const { searches, clock, reader } = setup();
+      const tick = async () => {
+        const r = reader();
+        await r.prime([{ num: 8300, parked: true }, { num: 8301 }]);
+        r.read({ num: 8300 });
+        r.read({ num: 8301 });
+      };
+      await tick();
+      expect(searches).toHaveLength(4);
+      clock.t += 5 * 60_000;
+      await tick();
+      // Only the active (non-parked) card spends searches on the second tick.
+      expect(searches.slice(4)).toEqual(['head:lane/8301', 'in:title "prepare" "8301"']);
+      clock.t += 11 * 60_000;
+      await tick();
+      expect(searches.slice(6)).toEqual(['head:lane/8300', 'in:title "prepare" "8300"', 'head:lane/8301', 'in:title "prepare" "8301"']);
+    });
+    it('re-reads a cached listing that expires during the tick that loaded it', async () => {
+      const { searches, clock, reader } = setup();
+      const first = reader();
+      await first.prime([{ num: 8300, parked: true }]);
+      first.listPrs({ num: 8300 });
+      clock.t += 14 * 60_000;
+      const second = reader();
+      await second.prime([{ num: 8300, parked: true }]);
+      second.listPrs({ num: 8300 });
+      expect(searches).toHaveLength(2);
+      clock.t += 60_000; // the cached entry is now exactly at the TTL
+      second.listPrs({ num: 8300 });
+      expect(searches).toHaveLength(4);
+    });
+    it('a launch check never trusts a cached listing: it re-reads and sees a PR opened since', async () => {
+      const { searches, clock, reader, openPr, pr } = setup();
+      const first = reader();
+      await first.prime([{ num: 8300, parked: true }]);
+      expect(first.listPrs({ num: 8300 })).toEqual([]);
+      openPr();
+      clock.t += 60_000;
+      const second = reader();
+      await second.prime([{ num: 8300, parked: true }]);
+      expect(second.listPrs({ num: 8300 })).toEqual([]); // the cached "no PR", within the TTL
+      expect(searches).toHaveLength(2);
+      expect(second.listPrs({ num: 8300, forLaunch: true })).toEqual([pr]);
+      expect(searches).toHaveLength(4);
+      // The fresh launch listing also refreshes the cache for later pre-launch reads.
+      expect(second.listPrs({ num: 8300 })).toEqual([pr]);
+      clock.t += 60_000;
+      const third = reader();
+      await third.prime([{ num: 8300, parked: true }]);
+      expect(third.listPrs({ num: 8300 })).toEqual([pr]);
+      expect(searches).toHaveLength(4);
+    });
   });
 
   it('resolves #4413 as a WE card and refuses unknown ids before dispatch', async () => {
