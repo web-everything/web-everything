@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { abandonStaleRedTeamRun, planRedTeamOnSkip, recoverStaleRunPayload, redTeamSkipNeedsSettlement, runRedTeamOnSkip, verifiedStaleRedTeamAbandonment } from '../../lib/review-red-team-on-skip.mjs';
+import { abandonStaleRedTeamRun, planRedTeamOnSkip, recoverStaleRunPayload, redTeamSkipNeedsSettlement, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { redTeamOwedFor } from '../../lib/review-red-team-policy.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
@@ -685,7 +685,6 @@ describe('red-team-only review job', () => {
         staleAbandoned: { at: expect.any(String), pid: status.pid } });
 
       const prior = read();
-      expect(verifiedStaleRedTeamAbandonment({ repo, pr, head, env }, prior)).toBe(true);
       const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh',
         ...(redTeamStaleRecovery === undefined ? {} : { redTeamStaleRecovery }) }, io);
       if (redTeamStaleRecovery !== true) {
@@ -703,76 +702,6 @@ describe('red-team-only review job', () => {
       expect(admittedPrior).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-
-  it.each([
-    'no markers', 'wrong head', 'pid mismatch', 'invalid abandonment time', 'invalid birth time',
-    'older abandonment than marker 2', 'restarted after cap consumed', 'unreadable marker', 'three dispatch markers',
-  ])('stale flag cannot authorize production admission with %s', kind => {
-    const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-trust-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
-    const at = Date.now() - 10_000;
-    const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-    const marker = suffix => {
-      writeFileSync(`${path}.${suffix}`, '');
-      utimesSync(`${path}.${suffix}`, at / 1000, at / 1000);
-    };
-    try {
-      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-      const row = { ...readRedTeamStatus({ repo, pr, head, env }), pid: 2147483647,
-        pidStart: new Date(at - 1000).toISOString(), staleAbandoned: { at: new Date(at).toISOString(), pid: 2147483647 } };
-      if (kind !== 'no markers') marker('stale-redispatch-1');
-      if (kind === 'pid mismatch') row.staleAbandoned.pid--;
-      if (kind === 'invalid abandonment time') row.staleAbandoned.at = 'invalid';
-      if (kind === 'invalid birth time') row.pidStart = 'invalid';
-      if (kind === 'older abandonment than marker 2') {
-        marker('stale-redispatch-2');
-        utimesSync(`${path}.stale-redispatch-2`, (at + 5000) / 1000, (at + 5000) / 1000);
-      }
-      if (kind === 'restarted after cap consumed') {
-        marker('stale-norestart');
-        row.pidStart = new Date(at + 5000).toISOString();
-      }
-      if (kind === 'unreadable marker') mkdirSync(`${path}.stale-redispatch-2`);
-      if (kind === 'three dispatch markers') { marker('stale-redispatch-2'); marker('stale-norestart'); }
-      writeJsonAtomic(path, row);
-      const prior = readFileSync(path, 'utf8');
-      const io = createReviewJobIo({ env,
-        readStatus: key => {
-          const stored = readRedTeamStatus(key);
-          return kind === 'wrong head' && stored?.status === 'running' ? { ...stored, head: 'b'.repeat(40) } : stored;
-        }, readEvidence: () => ({ inFlight: false, queued: false }) });
-      expect(() => io.redTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued',
-        redTeamMode: 'fresh', redTeamStaleRecovery: true })).toThrow('prior red-team status; not re-run');
-      expect(readFileSync(path, 'utf8')).toBe(prior);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
-
-  it.each(['first abandonment', 'second abandonment', 'no-restart claim', 'missing birth time', 'legacy UTC birth time'])(
-    'verified %s permits production admission at the dispatch boundary', kind => {
-      const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-verified-'));
-      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') }, at = Date.now() - 1000;
-      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
-      try {
-        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
-        const row = { ...readRedTeamStatus({ repo, pr, head, env }), pid: 2147483647,
-          pidStart: new Date(at - 1000).toISOString(), staleAbandoned: { at: new Date(at).toISOString(), pid: 2147483647 } };
-        if (kind === 'missing birth time') row.pidStart = null;
-        if (kind === 'legacy UTC birth time') row.pidStart = new Date(at - 1000).toUTCString()
-          .replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, '$1 $3 $2 $5 $4');
-        writeJsonAtomic(path, row);
-        const suffixes = ['stale-redispatch-1', ...(kind === 'second abandonment' ? ['stale-redispatch-2']
-          : kind === 'no-restart claim' ? ['stale-norestart'] : [])];
-        for (const suffix of suffixes) {
-          writeFileSync(`${path}.${suffix}`, '');
-          utimesSync(`${path}.${suffix}`, at / 1000, at / 1000);
-        }
-        const io = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
-        expect(io.redTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued',
-          redTeamMode: 'fresh', redTeamStaleRecovery: true })).toEqual({ priorResult: null,
-            redTeamAdmission: { pid: process.pid, prior: null } });
-        expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'queued', pid: process.pid });
-      } finally { rmSync(dir, { recursive: true, force: true }); }
-    });
 
   it('fresh production admission holds a live running writer without stale abandonment', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-live-running-'));

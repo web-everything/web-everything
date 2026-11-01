@@ -1545,14 +1545,14 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
  * This sequential entry runs both back to back, exactly as before the split.
  * @param {ReturnType<typeof createRedTeamIo>} io
  */
-export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false, redTeamMode, redTeamAdmission } = {}, io = createRedTeamIo({ env })) {
+export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true, resumeOnly = false, redTeamMode, redTeamAdmission, redTeamStaleRecovery } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
     if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     let recovery;
     if (redTeamMode !== undefined) {
-      recovery = redTeamRecoveryGuard({ pr, repo, head: read?.netBasis?.rev, redTeamMode, redTeamAdmission }, io);
+      recovery = redTeamRecoveryGuard({ pr, repo, head: read?.netBasis?.rev, redTeamMode, redTeamAdmission, redTeamStaleRecovery }, io);
       if (recovery.status) return recovery;
     }
     const recording = record !== false && loopPayload?.replay !== true;
@@ -1566,7 +1566,7 @@ export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = proces
 }
 
 /** Recovery alone requires complete evidence. Normal full reviews retain their existing policy. */
-function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission }, io) {
+function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission, redTeamStaleRecovery }, io) {
   const refuse = (reason, terminal = false) => ({ status: 'not-owed', ...(!terminal ? { deferredByGuard: true } : {}),
     reason: `${reason}; inspect stored evidence before retrying — no call launched` });
   if (!['fresh', 'resume'].includes(redTeamMode) || typeof repo !== 'string' || !repo.trim()
@@ -1608,7 +1608,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     // The status reader folds a surviving retry marker into retryCount. Check the admitted record too:
     // admission may have replaced a restored placeholder prior with null while the marker still stands.
     if (!retry && [status, admittedStatus].some(row => row?.retryCount !== undefined && row.retryCount !== 0)) return refuse('red-team retry already spent');
-    if (!retry && status != null && !redTeamStatusWithoutRun(status)) return refuse('prior red-team status; not re-run');
+    if (!retry && status != null && !redTeamStatusWithoutRun(status, { allowAbandonedRunning: redTeamStaleRecovery === true })) return refuse('prior red-team status; not re-run');
     if (!retry && rows.length > 0) return refuse('prior red-team seat row; not re-run');
     if (retry) {
       // Spend before any provider work. A missing seat row can never restore this allowance.

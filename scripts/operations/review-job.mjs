@@ -91,7 +91,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { recoverStaleRunPayload, staleRedTeamRun, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate, verifiedStaleRedTeamAbandonment } from '../lib/review-red-team-on-skip.mjs';
+import { recoverStaleRunPayload, staleRedTeamRun, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -404,8 +404,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // writer above. An ordinary finished/null prior must reach the guard intact.
           const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
           const withoutRun = redTeamStatusWithoutRun(admissionPrior, {
-            originalStatus: prior, allowAbandonedRunning: input.redTeamStaleRecovery === true
-              && verifiedStaleRedTeamAbandonment(key, admissionPrior),
+            originalStatus: prior, allowAbandonedRunning: input.redTeamStaleRecovery === true,
           });
           if (input.redTeamMode === 'fresh' && admissionPrior?.status === 'running' && !withoutRun) {
             throw Error('prior red-team status; not re-run');

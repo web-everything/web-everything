@@ -563,11 +563,6 @@ and a parseable `pidStart` strictly later than marker 1's mtime. It waits at lea
 `STALE_REDISPATCH_BACKOFF_MS` (15 minutes) from that mtime, independently of the retry cooldown.
 The abandonment function rechecks these conditions against disk and emits `detail.attempt`.
 Confirmed non-starts release only the marker they claimed; unknown dispatch outcomes retain it.
-`live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
-that budget refund proves no new start, not that the existing job cannot run. Null/undefined
-dispatch outcomes also keep claims and their budget reservation. The stale planner bypasses
-only the in-flight refusal: non-owed verdicts and all accepted-head publication guards still apply,
-including when the status re-read observes a completed decision after selecting a stale owner.
 Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
 review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
 markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
@@ -580,14 +575,6 @@ in `review-red-team-resume-only.test.mjs` pins that closed path. The regressions
 **fresh production admission holds a live running writer without stale abandonment**, and
 **fresh production admission and shared guard never rerun a finished ran result with a posted comment**
 pin that boundary; `red-team-run-result.test.mjs` covers malformed abandonment and spent retry evidence.
-The stale-recovery flag is only a hint: production admission independently reads the head's
-redispatch/spent/no-restart markers and binds the running row's head, PID and abandonment time
-to the latest abandonment claim (allowing 1 second for timestamp precision). A no-restart claim
-uses marker 1's original abandonment; a later process start or more than two claims refuses
-admission. Missing, unreadable or inconsistent claims preserve the row and require operator
-inspection. `stale flag cannot authorize production admission with %s` covers those refusals;
-`verified %s permits production admission at the dispatch boundary` covers both dispatch ordinals
-and the no-restart handoff. Direct seat calls still refuse every running prior, regardless of flags.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness

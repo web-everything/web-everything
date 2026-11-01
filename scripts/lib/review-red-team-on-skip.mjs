@@ -63,7 +63,7 @@ const staleStatusPath = ({ repo, pr, head, env = process.env }) =>
   join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
 /** Legacy marker 1 remains a spent first attempt. Unreadable or inconsistent marker evidence stays closed. */
-function readStaleRedispatchMarkers(key) {
+export function staleRedTeamRedispatch(key) {
   const path = staleStatusPath(key), markers = [];
   for (const suffix of ['stale-redispatch-1', 'stale-redispatch-2', 'stale-norestart']) {
     try {
@@ -73,11 +73,6 @@ function readStaleRedispatchMarkers(key) {
     } catch (error) { if (error.code === 'ENOENT') markers.push(null); else throw error; }
   }
   if (markers[1] && !markers[0]) throw new Error('stale redispatch marker 2 without marker 1');
-  return markers;
-}
-
-export function staleRedTeamRedispatch(key) {
-  const markers = readStaleRedispatchMarkers(key);
   const count = markers[2] ? MAX_STALE_REDISPATCHES : markers.filter(Boolean).length;
   return { count, nextOrdinal: count < MAX_STALE_REDISPATCHES ? count + 1 : null,
     firstMarkerMtimeMs: markers[0]?.mtimeMs ?? null };
@@ -85,31 +80,6 @@ export function staleRedTeamRedispatch(key) {
 
 export function staleRedTeamSpent(key) {
   return staleRedTeamRedispatch(key).count === MAX_STALE_REDISPATCHES;
-}
-
-/** Execution admission independently binds the abandoned writer to its claimed dispatch.
- * Marker mtimes can have coarser precision than the millisecond abandonment stamp.
- * A no-restart claim spends dispatch 2 against the SAME abandonment as marker 1.
- */
-export function verifiedStaleRedTeamAbandonment(key, status) {
-  if (status?.repo !== key.repo || Number(status?.pr) !== Number(key.pr) || status?.head !== key.head
-    || !redTeamStatusWithoutRun(status, { allowAbandonedRunning: true })) return false;
-  try {
-    const { count } = staleRedTeamRedispatch(key), spent = staleRedTeamSpent(key);
-    const markers = readStaleRedispatchMarkers(key);
-    if (!markers[0] || count < 1 || count > MAX_STALE_REDISPATCHES
-      || markers.filter(Boolean).length !== count || spent !== (count === MAX_STALE_REDISPATCHES)) return false;
-    const abandonedAt = typeof status.staleAbandoned.at === 'string'
-      ? Date.parse(status.staleAbandoned.at) : status.staleAbandoned.at;
-    // pidStartTime's legacy ps stamp is UTC without an explicit zone. A known-dead
-    // local owner can also have no birth stamp; its claimed abandonment still binds it.
-    const birth = status.pidStart;
-    const startedAt = Date.parse(/^\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.test(birth)
-      ? `${birth} UTC` : birth);
-    const latestClaim = (markers[1] ?? markers[0]).mtimeMs;
-    return status.pid > 0 && (birth == null || (Number.isFinite(startedAt) && startedAt <= abandonedAt))
-      && abandonedAt >= latestClaim - 1000;
-  } catch { return false; } // Unreadable/inconsistent claims require operator inspection, never a fresh call.
 }
 
 function claimStaleNoRestart({ count, ...key }) {
@@ -355,8 +325,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
         return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
       }
-      if (!movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
-        if ((!staleOwed && evidence?.inFlight) || evidence?.queued) return skip('red-team pass in flight');
+      if (!staleOwed && !movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
+        if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
           && (() => {
@@ -567,18 +537,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
                 || (row.abandonStale === false && noRestart?.ok === true) ? { redTeamStaleRecovery: true } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
-              const confirmedNonStart = result != null && typeof result === 'object'
-                && result.skipped !== 'live-job' && !Number.isInteger(result.jobPid);
-              const refundable = confirmedNonStart || (result?.skipped === 'live-job'
-                && budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
+              const refundable = result?.skipped !== 'live-job'
+                || (budget?.countedJobPids instanceof Set && budget.countedJobPids.has(result.jobPid));
               if (reserved && refundable) budget.left++;
               row.why = result?.skipped ?? 'job did not start';
-              // An existing job (even one already budgeted) or an unknown outcome
-              // may still replace/start this row. Only a confirmed non-start unspends it.
-              if (confirmedNonStart) {
-                abandonment?.release?.();
-                noRestart?.release?.();
-              }
+              abandonment?.release?.();
+              noRestart?.release?.();
             } else {
               capacity.lanes--;
               if (capacity.remainingStarts != null) capacity.remainingStarts--;

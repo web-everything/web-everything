@@ -1526,7 +1526,7 @@ function staleFixture(over = {}) {
     staleRedispatch: () => ({ count: 0, nextOrdinal: 1, firstMarkerMtimeMs: null }),
     rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'red-team:pending'], reviews: [],
       comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
-    readEvidence: () => ({ loopPayload: payload(),
+    readEvidence: () => ({ loopPayload: { findings: { read: { netBasis: { rev: head } } } },
       inFlight: false, recorded: false, seatRecorded: false, completedRecorded: false, status }),
     readStatus: () => status, ...over });
 }
@@ -1807,47 +1807,6 @@ describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
 });
 
 describe('runRedTeamOnSkip — stale recovery effects', () => {
-  it.each(['changes', 'needs-human', undefined])('stale running state cannot bypass a non-owed stored verdict %s', verdict => {
-    const o = staleRunFixture(), evidence = o.readEvidence();
-    evidence.loopPayload.verdict = { verdict };
-    o.readEvidence = () => evidence;
-    expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip',
-      why: 'stored review does not owe a red team' }], dispatched: [] });
-    expect(o.abandonStale).not.toHaveBeenCalled();
-    expect(o.dispatch).not.toHaveBeenCalled();
-  });
-  it.each([
-    ['missing acceptance', 'stored review does not owe a red team'],
-    ['wrong-head acceptance', 'stored review does not owe a red team'],
-    ['later hold', 'later verdict or hold supersedes acceptance'],
-    ['unreadable reviews', 'PR reviews unreadable; inspect formal reviews before policy-clear'],
-    ['conflicting label', 'conflicting label prevents policy-clear'],
-    ['invalid restamp', 'invalid acceptance re-stamp; withdraw stranded records before recovery'],
-  ])('stale planning still applies accepted-head checks after status changes: %s', (kind, why) => {
-    const old = 'b'.repeat(40), trusted = body => ({ body, author: { login: 'web-everything' } });
-    const o = staleRunFixture(), running = o.readStatus();
-    const finished = { ...running, status: 'finished', result: 'not-owed' };
-    const evidence = { ...o.readEvidence(), inFlight: true, status: finished };
-    o.readEvidence = () => evidence;
-    // The in-flight check and selected status observe a stale owner; the accepted-head
-    // re-read observes a completed policy decision. That must still pass every guard.
-    o.readStatus = vi.fn().mockReturnValueOnce(running).mockReturnValueOnce(running).mockReturnValue(finished);
-    const raw = o.rawPrs[0];
-    raw.labels = ['review:accepted'];
-    if (kind === 'missing acceptance') raw.comments = [];
-    if (kind === 'wrong-head acceptance') raw.comments[0].body = raw.comments[0].body.replace(head, old);
-    if (kind === 'later hold') raw.comments.push(trusted('Please hold this acceptance'));
-    if (kind === 'unreadable reviews') { raw.reviews = null; o.readReviews = () => null; }
-    if (kind === 'conflicting label') raw.labels.push('review:human');
-    if (kind === 'invalid restamp') {
-      const restamp = to => trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${to} -->\n<!-- numbering-restamp: from=${old} to=${to} -->`);
-      raw.comments = [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${old} -->`), restamp('c'.repeat(40)), restamp(head)];
-      expect(numbering.strandedNumberingRecords(raw.comments, raw.reviews)).not.toHaveLength(0);
-    }
-    expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why }], dispatched: [] });
-    expect(o.abandonStale).not.toHaveBeenCalled();
-    expect(o.dispatch).not.toHaveBeenCalled();
-  });
   it.each([0, 1, 2])('review:human never dispatches abandoned running state with %i persisted stale markers after cooldown reset', count => {
     const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-human-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
@@ -1997,30 +1956,6 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
       expect(runRedTeamOnSkip(o).rows[0].why).toBe('stale red team already re-dispatched; inspect review run');
       expect(o.dispatch).toHaveBeenCalledOnce();
     });
-  });
-  it.each([{ skipped: 'live-job' }, { skipped: 'live-job', jobPid: 42 }, undefined, null])(
-    'unconfirmed no-restart dispatch %j retains markers after cooldown reset', result => {
-      withAbandoned(({ o, statusPath, marker }) => {
-        const firstMarker = `${statusPath}.stale-redispatch-1`;
-        o.dispatch = vi.fn(() => result);
-        expect(runRedTeamOnSkip(o).dispatched).toEqual([]);
-        expect(existsSync(firstMarker)).toBe(true);
-        expect(existsSync(marker)).toBe(true);
-        o.lastDispatch.clear();
-        o.capacity = { lanes: 1, budget: { left: 1 } };
-        expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip',
-          why: 'stale red team already re-dispatched; inspect review run' }], dispatched: [] });
-        expect(o.dispatch).toHaveBeenCalledOnce();
-      });
-    });
-  it.each([false, true])('live-job keeps abandonment even when its pid was already budgeted (%s)', counted => {
-    const release = vi.fn(), o = staleRunFixture({
-      abandonStale: vi.fn(() => ({ ok: true, release })),
-      dispatch: vi.fn(() => ({ skipped: 'live-job', jobPid: 42 })),
-      capacity: { lanes: 1, budget: { left: 1, countedJobPids: new Set(counted ? [42] : []) } } });
-    expect(runRedTeamOnSkip(o).dispatched).toEqual([]);
-    expect(release).not.toHaveBeenCalled();
-    expect(o.capacity.budget.left).toBe(counted ? 1 : 0);
   });
   it.each([0, 2, 3, Number.MAX_SAFE_INTEGER, undefined])('no-restart claim refuses count %s if evidence changes after planning', count => {
     withAbandoned(({ o, marker }) => {

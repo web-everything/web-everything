@@ -210,12 +210,12 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
   it.each(['finished', 'queued', 'running', 'error', 'unknown'])('refuses fresh recovery with prior %s status and zero model calls', async status => {
     await refused('fresh', fakeIo('fresh', { readRedTeamStatus: () => ({ ...finished({ status: 'ran' }), status }) }), 'prior red-team status; not re-run');
   });
-  it.each([undefined, true])('refuses direct fresh recovery without admission for an abandoned running live writer with zero calls (stale flag=%s)', async redTeamStaleRecovery => {
+  it('refuses direct fresh recovery without admission for an abandoned running live writer with zero calls', async () => {
     const status = { repo, pr, head: rev, status: 'running', result: null, pid: process.pid,
       staleAbandoned: { at: '2026-01-01T00:00:00.000Z', pid: process.pid } };
     expect(() => process.kill(status.pid, 0)).not.toThrow();
     const io = fakeIo('fresh', { readRedTeamStatus: () => status });
-    await refused('fresh', io, 'prior red-team status; not re-run', { redTeamStaleRecovery });
+    await refused('fresh', io, 'prior red-team status; not re-run');
   });
   it.each(['ran', 'resumed', { status: 'resumed' }])('a finished placeholder %j without a seat reaches fresh dispatch', async result => {
     const io = fakeIo('fresh', { readRedTeamStatus: () => finished(result) });
