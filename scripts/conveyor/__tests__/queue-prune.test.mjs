@@ -23,6 +23,8 @@ const items = [
 ];
 const q = (...nums) => nums.map((num) => ({ num, addedAt: OLD }));
 
+// The shared fetch stamp lives outside the test; window 0 keeps every confirm on its own fetch path.
+process.env.WE_GIT_FETCH_FRESH_SECONDS = '0';
 describe('planPrune', () => {
   it('drops resolved, missing-card and duplicate alias; renames a landed hash; keeps live cards', () => {
     const p = planPrune({ queue: q('10', '11', '12', 'xaaaaaa', 'xbbbbbb', 'x999999'), items });
