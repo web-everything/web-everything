@@ -4,129 +4,59 @@ size: 8
 status: open
 scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/forge-gate-options.mjs"]
 dateOpened: "2026-11-01"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "7a8f51570435bc14cb2e13114cb1c7484119daf4"
 tags: []
 ---
 
 # Elastic Forge slots: let one priority or idle-time job claim N slots before slots shrink
 
-R324 (2026-11-01 09:44 ET): "Before adding smaller slots, we need to allow priority work or when forge is idle to use multiple slots for a single job". 09:45 ET: "If we have cases we need more cpu and memory, accelerate some urgent tasks". Decision-first: six forks, then a build story. Smaller, more numerous slots (about 16) come only AFTER this lands.
+R324 (2026-11-01 09:44 ET): "Before adding smaller slots, we need to allow priority work or when forge is idle to use multiple slots for a single job". 09:45 ET: "If we have cases we need more cpu and memory, accelerate some urgent tasks". Decision-first: no fork survived the screen, so it is a set of rulings, then a build story. Smaller, more numerous slots (about 16) come only AFTER this lands.
 
 ## The axis
 
-Grounded facts (read-only):
-- Forge has 32 CPUs and 62G RAM. The runner (the Forge runner on Forge) gives every slot the same systemd slice: `slot` = CPUQuota 800%, MemoryMax 12G, TasksMax 2048; `parent` (`forge-exec.slice`) = CPUQuota 2800%, MemoryMax 56G. A per-slot override map `slots.K` already exists in the limits file, and `systemd-run --scope --slice=forge-exec-K.slice` launches each job into its slot slice.
-- Mac side: `heavyAdmission.remote` in the platform preferences is `enabled: true, mode: always, maxConcurrent: 8`. The schema lives at we:scripts/readiness/heavy-admission.mjs (the `remote.*` leaves, about lines 243-277; remote has no env mapping). Gate-only vitest options are stripped for Forge by we:scripts/readiness/forge-gate-options.mjs, so the worker count is fixed by Forge's wrapper today.
-- 8 slots x 800% = 6400% is already more than the 2800% parent ceiling. Slots are a fairness lane, not a hard partition. The parent ceiling is the real cap, so a "bigger share" is cheap to grant when other slots are idle and dangerous when they are busy.
-- Known occurrences of the pattern: Kubernetes burstable QoS (request vs limit), systemd `CPUWeight` vs `CPUQuota`, GitHub Actions larger runners per job, Bazel `--local_cpu_resources` per action, make `-jN` job tokens (the GNU make jobserver, where a job borrows tokens only while others idle).
+Grounded facts (read-only; checked against the code and the Forge runner):
+- Forge has 32 CPUs and 62G RAM. The runner gives every slot the same systemd slice: `slot` = CPUQuota 800%, MemoryMax 12G, TasksMax 2048; `parent` (`forge-exec.slice`) = CPUQuota 2800%, MemoryMax 56G. The `slots.K` override map exists in the limits file but is empty and static (root-written config, not per-job).
+- The runner, not the Mac, picks the slot: `reserveWorker` takes the first free `slot-K`; a caller-supplied `slot` is only validated. Each slot has its own user, run directory and writer guard. The Mac side only counts `remote.maxConcurrent` (8) local tokens, so it does not know Forge slot ids. A job runs in the static `forge-exec-K.slice`, so it can never exceed that slice's 800% quota whatever N is.
+- Vitest worker count: the runner sets `WE_VITEST_MAX_WORKERS` from the slot's CPUs, and a request env value overrides it (the variable is already in the runner's env allowlist, checked only as digits, with no upper bound). So no new `--maxWorkers` flag is needed; an upper bound on Forge is.
+- Mac side: `heavyAdmission.remote` standard is `enabled: false, mode: above-threshold, maxConcurrent: 8`; the platform preferences override it to `enabled: true, mode: always`. The schema is at we:scripts/readiness/heavy-admission.mjs (`remote.*` leaves, about lines 243-277; remote has no env mapping, so layers are standard -> platform preferences only for these leaves, plus tool for non-clientPath). Gate-only vitest options stripped for Forge: we:scripts/readiness/forge-gate-options.mjs (it strips `--passWithNoTests` and timeout flags, not a worker count).
+- Priority today: admission has a red-main repair class (P0, from `priority.repairPatterns` matched on purpose / session / holder) plus a P1 tier (an `unblock-` purpose prefix or `WE_HEAVY_UNBLOCK=1`, both requester-set strings) (we:scripts/readiness/heavy-repair-priority.mjs). The delivery scale `deliveryPriority` (P0 incident, P1 unblocks, P2 operator asked, P3 normal, P4 low, with operator overrides and aging) lives in we:scripts/lib/delivery-priority.mjs. Statute `#heavy-command-admission-queue` ratified "v1 equal-cost named set, not weighted"; N-slot grants amend that, and this card is the amendment.
+- 8 slots x 800% = 6400% already exceeds the 2800% parent; likewise 8 x 12G = 96G exceeds the 56G parent MemoryMax. Slots are a fairness lane, not a hard partition. The parent ceiling is the real cap, in CPU and in memory.
+- Known occurrences of the pattern: Kubernetes burstable QoS (request vs limit), systemd `CPUWeight` vs `CPUQuota`, GitHub Actions larger runners per job, Bazel `--local_cpu_resources` per action, make `-jN` job tokens (a job borrows tokens only while others idle).
 
 ### Recommended path at a glance
 
-| Fork | Question | Default |
-|---|---|---|
-| 1 | How a job asks for N slots, and who decides priority | **Job states a need (`--slots=N`); the admission layer decides the grant from a priority class it computes itself** |
-| 2 | Idle rule: threshold, pre-empt or grow at start | **Grow at start only, never pre-empt; idle = free slots >= 4 of 8** |
-| 3 | How the runner applies a bigger share | **Multi-slot lease on the Mac side; runner gets one per-job slice sized N x slot** |
-| 4 | Fairness and starvation | **Waiting priority job always wins the next free slots; elastic grants cap at 3 and drain-down by never refilling** |
-| 5 | Fail-closed fallback and settings | **Any doubt = grant 1 slot; settings via the policy cascade under `heavyAdmission.remote.elastic.*`** |
-| 6 | Ordering with the later slot shrink | **Elastic first; shrink is a separate later card that depends on this one** |
+No real fork survives the screen (see the rulings below). The call to ratify is the set of rulings as a whole, including the amendment of statute `#heavy-command-admission-queue`.
 
-## Fork 1 - how a job asks for N slots, and who decides priority
+## Rulings to ratify (none is a fork)
+- **Fairness (was Fork 1).** A lower class never takes slots a higher-class waiter needs; a higher-class job is served first and idle growth stops while one waits (weighted share was considered and rejected: it lets a normal job grow while a priority job waits, the slowdown R324 removes). Starvation of normal jobs needs a HARD bound, not just aging: `deliveryPriority` aging moves a waiter up only one class and only when `agingHours` is set (default null), so a P3 waiter still sits behind a P0-P2 stream. Therefore the wait limit is its own cascade leaf (`remote.elastic.normalMaxWaitMinutes`): after it, no grant above 1 slot is made to anyone while that waiter is queued. The hold a priority job keeps on freed slots is bounded by `reserveHoldSeconds`. Reservations are granted strictly in queue order, so there is no circular wait.
+  Skeptic: SURVIVES-WITH-AMENDMENT (independent skeptic): reuse the delivery aging, bound the hold. Screen: the fresh screen found the fork was a tuning setting and an existing rule in costume, so it is a ruling with two cascade leaves.
 
-Fork-existence: a self-declared priority is broken (every worker would claim it), so the grant cannot be decided by the requester alone; the two coherent branches (requester decides vs admission decides) cannot both be the authority.
-
-- Option A: the job's own flag decides (`--priority`). Excluded: unauthenticated, any lane can inflate itself, starvation of honest jobs.
-- Option B: admission derives a priority class from facts it can check (branch name pattern for main-fix, backlog `priority:now` / focus membership, the verify gate blocking an open PR) and grants N from the job's stated need. **Default.**
-- Option C: a central scheduler daemon assigns slots. Excluded for now: a new single point of failure for a gain B gets with existing signals.
-
-**Default: B.** The job passes `--slots=N` (a need, capped by the cascade); we:scripts/readiness/heavy-admission.mjs already carries `priority.mode` and `repairPatterns`, which is the seed for the class. Class order: main-fix / repair > PR-blocking verify > priority:now or focus > normal. Only the top three may exceed 1 slot while others wait.
-
-Skeptic: SURVIVES. The attack "derived signals are spoofable (a branch name is free text)" is answered by deriving from the lane lease and backlog state, not the branch string alone; branch pattern is only one of three signals and the cascade can narrow it.
-Screen: clear
-
-## Fork 2 - the idle rule
-
-Fork-existence: pre-empting a running job would kill or throttle work already admitted (a running vitest cannot change worker count in flight), so grow-at-start and pre-empt are not both safe to default.
-
-- Option A: grow at start only. A job starts with N slots if enough are free (or it is priority). **Default.**
-- Option B: also pre-empt/shrink others to feed a priority job. Excluded: the runner would need live cgroup resizing of other tenants' jobs and the tests inside would have been sized by worker count at launch.
-- Option C: grow mid-run (raise CPUQuota of a running job). Possible later because `systemctl set-property` is live, but vitest's worker count is fixed at launch, so the extra quota is wasted. Deferred.
-
-**Default: A.** Idle means free slots >= 4 of 8 for a normal job (grant up to the free count, max 3 (the cascade cap)), and any free count for a priority job. Priority waiting stops idle growth immediately (Fork 4). Pre-emption stays out of scope.
-
-Skeptic: SURVIVES-WITH-AMENDMENT. Attack: "a long grown job then blocks a new priority arrival for many minutes". Amendment folded in: grown idle jobs have a wall-clock cap (cascade, default 15 min) after which the next launch is back to 1 slot; and Fork 4 forbids refilling while a priority job waits.
-Screen: clear
-
-## Fork 3 - how the runner applies the bigger share
-
-Fork-existence: the runner has one slice per slot; either a job gets a per-job slice sized to N, or it holds N slot leases, and holding N leases while running in one slice would not give it N x quota. The two cannot coexist as the single mechanism.
-
-- Option A: slice size per job only (the runner resizes one slot's quota to N x 800%). Excluded alone: the other N-1 slots still look free and get double-booked.
-- Option B: multi-slot lease on the Mac side (admission reserves N slot tokens, so the other tenants see them taken) plus the runner places the job in a slice sized for N slots (cpuQuota = N x slot, memoryMax = N x slot, capped by the parent). **Default.** The existing `slots.K` override map in the limits file shows the runner already reads per-slot limits; a lease lists the slot ids it holds and the runner uses the first as the slice.
-- Option C: both done in the runner with no Mac-side change. Excluded: admission lives on the Mac (we:scripts/readiness/heavy-admission.mjs), so the reservation must live there.
-
-**Default: B.** Vitest worker count = N x the per-slot default, passed through the Forge wrapper (the wrapper must accept a bounded `--maxWorkers`; this is part of the build story and is the one change on Forge, done through its sanctioned overlay, not here). Memory scales with workers, so MemoryMax scales with N.
-
-Skeptic: SURVIVES. Attack "4 x 800% = 3200% exceeds the 2800% parent". Answer: the parent ceiling clamps the grant (N is capped at floor(parent / slot) = 3 on today's limits), so the realistic cap is 3, not 4. The default cap is therefore 3.
-Screen: flagged(impl) -> fixed: the Mac side only sees a slot count N; slice mechanics stay inside the runner contract.
-
-## Fork 4 - fairness and starvation
-
-Fork-existence: letting a grown job refill its slots on finish would let a stream of idle-time growers starve a waiting priority job, so "never block a waiting priority job" has one correct branch.
-
-- Option A: priority waiter holds a reservation; growers are not admitted while any priority waiter exists. **Default.**
-- Option B: weighted fair share (priority gets weight 3). Excluded: still lets a normal job grow while a priority job waits.
-- Option C: aging (a waiting job gains priority over time). Kept as a safety net for normal jobs only: after the cascade wait limit a normal waiter becomes the next to be admitted, so growers cannot starve normal single-slot jobs either.
-
-**Default: A + the aging net from C.** A grower never takes slots that a queued job of equal or higher class is waiting for; a priority job that needs N slots holds the freed slots until it has N (no partial grants, but a bounded hold, then it falls back to what is free).
-
-Skeptic: SURVIVES. Attack: "reservation deadlock when two priority jobs each need 3". Answer: reservations are granted strictly in queue order, one at a time, so no circular wait.
-Screen: clear
-
-## Fork 5 - fail-closed fallback and settings
-
-Fork-existence: when Forge load, queue state or the grant cannot be read, an elastic grant on a guess can overload the box; the alternative (grant anyway) is broken, so only one branch is right.
-
-- Option A: any doubt (unreadable load, queue file corrupt, remote client error, N over cap, unknown priority) grants exactly 1 slot, i.e. today's behaviour. **Default.**
-- Option B: deny the run. Excluded: turns an optimisation failure into an outage.
-
-**Default: A.** Settings via the policy cascade (standard -> platform preferences -> tool), new leaves next to the existing `remote.*` ones: `remote.elastic.enabled` (default **false** until the live proof, then true), `remote.elastic.maxSlots` (3), `remote.elastic.idleFreeSlots` (4), `remote.elastic.maxWallMinutes` (15), `remote.elastic.priorityClasses` (list). All validated like the existing leaves; an invalid value falls back to the standard value and logs.
-
-Skeptic: SURVIVES. Citation-scope check: the existing `remote.*` validators are the authority for the shape of the new leaves only, not for the semantics.
-Screen: clear
-
-## Fork 6 - ordering with the later slot shrink
-
-Fork-existence: shrinking to about 16 smaller slots first would make every normal job smaller and priority jobs unable to grow, the exact failure R324 names; so elastic must land first.
-
-- Option A: elastic first, then shrink as its own card that depends on this one. **Default.**
-- Option B: shrink first. Excluded by R324 itself.
-- Option C: both in one change. Excluded: two risky changes with one proof; a regression could not be attributed.
-
-**Default: A.** After this lands, 16 slots of 400% each make "N slots" a finer dial: a priority job asks for 4-6 of the small slots. The shrink card records that dependency and re-derives the cap (floor(parent / slot)).
-
-Skeptic: SURVIVES.
-Screen: clear
+- **Who decides the grant (was Fork 1).** Admission decides, never the requester: the job only states a need (`--slots=N`, capped); a self-declared priority is unauthenticated and broken. The class reuses the existing `deliveryPriority` scale (P0 to P4), not a second order. Only P0 to P2 may exceed 1 slot while others wait; P3 and P4 may exceed 1 slot only through the idle rule. The signals admission checks today are the lane lease and purpose/session (`repairPatterns`); backlog-state and open-PR-blocking signals are NOT read yet and are build work (slice b), and a signal admission cannot verify counts as normal class. The amendment to statute `#heavy-command-admission-queue` ("v1 equal-cost named set, not weighted") is this card. A central slot-scheduler daemon is a non-goal (N4).
+  Skeptic: SURVIVES-WITH-AMENDMENT (independent skeptic): reuse `deliveryPriority`, unbuilt signals grant nothing, name the statute amendment. Screen: re-screen flagged it prio (self-declared priority is a strawman), so it is a ruling, not a fork.
+- **No pre-emption (was Fork 2).** The grant is fixed at admission; admission never takes capacity from an admitted job (a running vitest cannot change its worker count in flight; the existing rule is already "a running holder is never preempted"). Mid-run growth is out of scope (N2). Idle growth thresholds (free slots >= 4 of 8 for a normal job, cap 3, wall cap 15 min) are cascade values below. Capacity ceilings (parent CPU and MemoryMax, N x 12G beside busy slots) are enforced by the runner, which clamps or refuses a request; the Mac only passes the requested N.
+  Skeptic: SURVIVES-WITH-AMENDMENT (independent skeptic): thresholds are tuning, memory oversubscription (8 x 12G vs 56G) added. Screen: re-screen flagged it (existing ruling, and the memory guard belongs on the runner side), so it is a ruling and the guard moved to the runner.
+- **End-to-end grant contract (was Fork 3; the first card's mechanism was wrong).** A grant of N is honoured end to end: the Mac counts N tokens and the runner gives that job N slots' worth of CPU and memory, never above the parent ceiling. The mechanism lives in the build story, not on the Mac side: the runner reserves N workers itself (it picks slots), places the job in a per-job slice or scope sized N x slot (a static `forge-exec-K.slice` cannot exceed 800%), and bounds the worker-count env (`WE_VITEST_MAX_WORKERS`) at or below the granted N x per-slot default. That is a runner change done through the sanctioned Forge overlay in the build story.
+- **Fail closed (was Fork 5).** Any doubt (unreadable load, corrupt queue file, remote client error, N over cap, unknown priority) grants exactly 1 slot, today's behaviour; denying the run would turn an optimisation failure into an outage. This matches the existing `localFallback` pattern.
+- **Settings.** New leaves next to the `remote.*` ones, validated like them, an invalid value falls back to the standard value and logs; layers are standard then platform preferences (remote has no env mapping): `remote.elastic.enabled` (default **false** until the live proof, then true), `maxSlots` (3: the cap is floor(parent / slot) = 3 on today's limits), `idleFreeSlots` (4), `maxWallMinutes` (15), `reserveHoldSeconds` (bounded), `priorityClasses` (list of classes allowed to exceed 1 slot), `normalMaxWaitMinutes` (hard starvation bound).
+- **Ordering with the slot shrink (was Fork 6).** R324 already rules it: elastic lands first, the shrink to about 16 smaller slots is a separate later card that depends on this one and re-derives the cap (floor(parent / slot)); 16 x 400% is still above the 2800% parent.
 
 ## Pre-mortem
 
 It is three weeks later and elastic slots made the gate worse. Likely reasons:
-1. A grown job ate the parent ceiling and a priority job waited behind it. Mitigation: Fork 4 reservation, wall cap, grow only at start.
-2. Priority was spoofed or too broad, so everything grew and the host throttled. Mitigation: priority derived from lease/backlog state; cap 3; metric of grants per class in the heavy queue status.
-3. More workers raised flakiness (memory pressure, shared ports). Mitigation: MemoryMax scales with N; the first proof compares pass/fail, not only time.
-4. The Forge wrapper does not accept a worker count, so the grant gives quota but no speed. Mitigation: discovered in the proof; the build story's first step is the wrapper change.
-5. A crash leaves a multi-slot lease held. Mitigation: leases carry the same TTL/reaper as single slots (state over time).
+1. A grown job ate the parent ceiling and a priority job waited behind it. Mitigation: the fairness ruling, wall cap, grow only at start.
+2. Priority was spoofed or too broad, so everything grew and the host throttled. Mitigation: unverifiable signals grant nothing; cap 3; grants per class shown in the heavy queue status.
+3. More workers raised flakiness or hit parent memory OOM (8 x 12G exceeds 56G). Mitigation: memory guard on the grant; the first proof compares pass/fail, not only time.
+4. The Forge side gave quota but the tests ran with the old worker count, or the slot was double-booked because the runner picks slots itself. Mitigation: the build story's first slice is the runner change (N-worker reservation, per-job slice, bounded worker env); nothing is enabled before it.
+5. A crash leaves a multi-slot lease held. Mitigation: leases carry the same TTL/reaper as single slots.
 
 ## Test and proof plan
 
-- Unit (scoped, via heavy-admission): grant function table - idle/priority/normal x free slots x cap; fail-closed on each bad input; no grant when a priority waiter exists; reservation order; cascade validation of the new leaves.
-- Runner: a limits-file render test that an N-slot slice has the expected CPUQuota/MemoryMax and never exceeds the parent.
-- Live before/after (required by the operator's failure rule): pick one real priority job (a main-fix verify of a fixed scoped test set). Run it once on 1 slot and once with `--slots=3` on an otherwise idle Forge, same commit and same files; record wall time, CPU peak and memory peak from systemd accounting, and pass/fail. Then repeat once with Forge busy to prove it falls back to 1 slot and a waiting priority job is not delayed. Proof goes in the card's resolve note.
+- Unit (scoped, via heavy-admission): grant function table - idle/priority/normal x free slots x cap x memory room; fail-closed on each bad input; no grant when a higher-class waiter exists; reservation order; cascade validation of the new leaves.
+- Runner: a render test that an N-slot slice has the expected CPUQuota/MemoryMax and never exceeds the parent; the worker env above N is rejected.
+- Live before/after (required by the operator's failure rule): pick one real priority job (a main-fix verify of a fixed scoped test set). Run it once on 1 slot and once with `--slots=3` on an otherwise idle Forge, same commit and files; record wall time, CPU peak and memory peak from systemd accounting, and pass/fail. Repeat once with Forge busy to prove it falls back to 1 slot and a waiting priority job is not delayed. Proof goes in the card's resolve note.
 
 ## Build story (after ratify)
 
-Size 8 as a whole; slice at ratify: (a) pure grant function + cascade leaves in we:scripts/readiness/heavy-admission.mjs, (b) multi-slot lease in the queue state, (c) Forge wrapper worker-count + per-job slice (via the sanctioned Forge overlay, not by hand), (d) live proof. Scopes: we:scripts/readiness/heavy-admission.mjs, we:scripts/readiness/forge-gate-options.mjs.
+Size 8 as a whole; slice at ratify: (a) pure grant function + cascade leaves in we:scripts/readiness/heavy-admission.mjs, (b) multi-slot lease in the queue state plus the missing admission signals (backlog state, PR-blocking verify), (c) Forge runner change (N-worker reservation, per-job slice, bounded worker env) via the sanctioned Forge overlay, not by hand, (d) live proof. Scopes: we:scripts/readiness/heavy-admission.mjs, we:scripts/readiness/forge-gate-options.mjs.
 
 ## Acceptance
 
@@ -136,15 +66,16 @@ Size 8 as a whole; slice at ratify: (a) pure grant function + cascade leaves in 
 ## Non-goals
 
 - [N1] Not adding the smaller slots (about 16); that is a later card gated on this one.
-- [N2] No pre-emption or live resize of running jobs.
-- [N3] No change to the Forge runner in this card; this card only prepares the decision.
+- [N2] No pre-emption, mid-run growth or live resize of running jobs.
+- [N3] This card is decision-only: no runner or admission code changes here (the runner change is build slice c).
+- [N4] No central slot-scheduler daemon.
 
 ## Edge cases this change must handle
 
-1. **Untrusted text** - priority is derived from lease and backlog state, never a free-text flag alone; a branch name is one signal of three.
+1. **Untrusted text** - priority is derived from lease and backlog state, never a free-text flag alone; unverifiable signals grant nothing.
 2. **Truncated reads** - a partial queue or load read counts as unreadable and grants 1 slot.
 3. **Shared state files** - the multi-slot lease uses the same atomic lock files as single slots; a half-written lease is reaped.
-4. **Fail closed** - Fork 5: any doubt grants exactly 1 slot.
+4. **Fail closed** - any doubt grants exactly 1 slot.
 5. **Identity scoping** - a lease is owned by the lane/session that took it; only that owner releases it.
 6. **State over time** - leases carry a TTL and the reaper; grown jobs have a wall-clock cap.
 7. **Who wrote it** - the grant is decided by admission, not by the requesting worker or the Forge side.
