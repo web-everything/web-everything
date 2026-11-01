@@ -60,6 +60,13 @@ describe('overlay adoption events', () => {
     expect(recordPendingAdoption(root, { ref: 'lane/b', sha: 'b'.repeat(40) }, { env, fs })).toBe(false);
     expect(readPendingAdoptions(root, { env }).map((r) => r.ref)).toEqual(['lane/a']);
   });
+  it('a refreshed registration of the same ref and sha survives an older check', async () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    await checkPendingAdoptions({ root, env, daemon: 'd', now: () => t0, isAncestor: () => true,
+      emit: async () => { recordPendingAdoption(root, { ref: 'lane/a', sha: SHA, at: new Date(t0 + 1000).toISOString() }, { env }); return true; } });
+    expect(readPendingAdoptions(root, { env })).toHaveLength(1);
+  });
   it('is best-effort: bad sha, unreadable file, throwing git or emit never throw', async () => {
     const { root, env } = setup();
     expect(recordPendingAdoption(root, { ref: 'lane/x', sha: 'abc' }, { env })).toBe(false);

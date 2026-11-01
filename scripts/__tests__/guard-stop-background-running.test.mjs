@@ -25,7 +25,7 @@ describe('guard-stop-background-running', () => {
   it('ignores foreground Bash and finished or stopped tasks', () => {
     expect(findRunningBackgroundTask([use('toolu_f', 'Bash', { command: 'ls' }), ack('toolu_f', 'ok')])).toBeNull();
     expect(findRunningBackgroundTask([...bg, note('toolu_1', 'completed')])).toBeNull();
-    expect(findRunningBackgroundTask([...bg, use('toolu_s', 'TaskStop', { task_id: 'bk12345xy' })])).toBeNull();
+    expect(findRunningBackgroundTask([...bg, use('toolu_s', 'TaskStop', { task_id: 'bk12345xy' }), ack('toolu_s', 'stopped')])).toBeNull();
   });
   it('still reports a task whose notice is for a different tool use', () => {
     expect(findRunningBackgroundTask([...bg, note('toolu_other', 'completed')])).not.toBeNull();
@@ -40,6 +40,12 @@ describe('guard-stop-background-running', () => {
     writeFileSync(file, [...bg, refusal, refusal, refusal].map((e) => JSON.stringify(e)).join('\n'));
     expect(spawnSync('node', [resolve(import.meta.dirname, '../guard-stop-background-running.mjs')], { input: JSON.stringify({ hook_event_name: 'SubagentStop', agent_transcript_path: file }), encoding: 'utf8' }).status).toBe(0);
     expect(stopReason(findRunningBackgroundTask(bg))).toContain(GUARD_MARKER);
+  });
+  it('a failed TaskStop does not count, and a harness-backgrounded Bash does', () => {
+    const failedStop = [use('toolu_s', 'TaskStop', { task_id: 'bk12345xy' }), { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_s', is_error: true, content: 'no such task' }] } }];
+    expect(findRunningBackgroundTask([...bg, ...failedStop])).not.toBeNull();
+    const auto = [use('toolu_a', 'Bash', { command: 'sleep 999' }), ack('toolu_a', 'Command running in background with ID: auto777abc. Output is being written to /tmp/y')];
+    expect(findRunningBackgroundTask(auto)).toMatchObject({ taskId: 'auto777abc' });
   });
   it('fails open on junk input', () => {
     expect(findRunningBackgroundTask(null)).toBeNull();

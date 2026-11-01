@@ -48,7 +48,7 @@ function updatePending(root, env, fs, change, { staleMs = 10000, waitMs = 3000 }
       if (e?.code !== 'EEXIST') throw e;
       let age = 0;
       try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { age = 0; }
-      if (age > staleMs) { try { fs.rmdirSync(lock); } catch { /* raced */ } continue; }
+      if (age > staleMs) { try { fs.rmdirSync(lock); continue; } catch { /* could not break it: fall through to the deadline */ } }
       if (Date.now() - start > waitMs) throw new Error('adoption-pending lock busy');
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
@@ -98,7 +98,7 @@ export async function checkPendingAdoptions({ root, env = process.env, fs = node
     }
     if (sent.length) {
       // Reconcile against FRESH state under the lock: a registration made while we emitted must survive.
-      const same = (list, r) => list.some((x) => x.ref === r.ref && x.sha === r.sha);
+      const same = (list, r) => list.some((x) => x.ref === r.ref && x.sha === r.sha && x.at === r.at);
       updatePending(root, env, fs, (fresh) => fresh.filter((r) => !same(adoptedDone, r))
         .map((r) => (same(overdueDone, r) ? { ...r, overdueSent: true } : r)));
     }
