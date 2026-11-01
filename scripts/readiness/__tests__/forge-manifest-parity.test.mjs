@@ -585,7 +585,7 @@ it.each(rows)('row %i: %s',async row=>{
   if(refuse) {
     calls.length=0;
     const result=await runRemote({cwd,env:hostile,exec,disableDelta:true,argv:['npm','run','test:unit','--','a.test.mjs'],log:()=>{}});
-    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:[7,25,33,34].includes(row)?'ignored-test-file':[6,8].includes(row)?'unshipped-test-file':'unshipped-symlink'});
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:[7,25,32,33,34].includes(row)?'ignored-test-file':[6,8].includes(row)?'unshipped-test-file':'unshipped-symlink'});
     expect(calls.some(call=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
   }
   if(row===3) {
