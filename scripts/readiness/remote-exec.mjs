@@ -108,7 +108,7 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
       cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
@@ -129,6 +129,9 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
         if (stream === child.stdout) stdout.push(chunk);
       });
     }
+    // x40a9dk: an aborted client stops the local ssh; the Forge side is then ended by the protected finish.
+    const stop = () => { child.kill('SIGTERM'); };
+    if (signal) { if (signal.aborted) stop(); else { signal.addEventListener('abort', stop, { once: true }); child.once('close', () => signal.removeEventListener('abort', stop)); } }
     child.on('error', reject);
     child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
       : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
@@ -1041,7 +1044,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -1059,6 +1062,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   // All speculative children are drained and all rejections observed before fallback.
   if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
   const unwrap=result=>{if(result.status==='rejected')throw result.reason;return result.value;};
+  // x40a9dk: only the client-kill `cancelSignal` cancels the run; the timeout `signal` never does.
+  const cancel = { signal: cancelSignal ?? new AbortController().signal };
   const nonce = randomBytes(16).toString('hex');
   const tails = {stdout:'',stderr:''};
   let incompleteStandards = false;
@@ -1070,6 +1075,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
+    ...(command === 'run' ? {signal: cancel.signal} : {}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
   let run;
   let staging;
@@ -1078,7 +1084,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     if (!run || finished) return null;
     finished = true;
     const done=begin('finish-receipt');
-    try{return await ssh('finish', {nonce,run});}finally{done();}
+    try{return await ssh('finish', {nonce,run,...(cancel.signal.aborted?{cancel:true}:{})});}finally{done();}
   };
   try {
     let expected, expectedManifest, delta, transferBytes=0, transferCount=0;
@@ -1219,7 +1225,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1231,7 +1237,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const runAt=clock(),runDone=begin('forge-run');
       let result;
       try {
-        result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
+        if (!cancel.signal.aborted) result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
       } catch { /* Only a protected finish response can resolve lost run output. */ }
       finally {runDone();}
       const receipt = await finish();
@@ -1252,11 +1258,16 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
         return {mode:'not-started',terminated:true,reason:'forge-rejected:'+reply.reason};
+      }
+      // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
+      // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
+      if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
+        return reply === null || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {

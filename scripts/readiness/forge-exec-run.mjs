@@ -405,6 +405,10 @@ with os.fdopen(fd) as stream:
     reservation = json.load(stream)
 if any(reservation.get(key) != writer.get(key) for key in ('run', 'nonce', 'slot')):
     raise RuntimeError('Reservation mismatch; use local fallback')
+# The cancellation path is root/ops-owned and unique to this run, so a late
+# cancellation cannot stop a replacement reservation on the same worker UID.
+def cancelled():
+    return bool(cfg.get('cancel')) and os.path.lexists(cfg['cancel'])
 # Keep the lease in a root child even if the supervisor is killed mid-fork.
 # Close its copy only AFTER UID drop, before exposing any task-controlled code.
 writer_fds = (writer_fd,)
@@ -417,16 +421,33 @@ def drop():
     elif os.getuid() != uid or os.getgid() != gid:
         raise RuntimeError('cannot drop identity')
     os.close(writer_fd)
-if 'archive' in cfg:
-    # Only the fixed cache-extraction command receives an archive descriptor.
-    # It runs as the worker; neither tar nor the task can write the cache.
-    archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
-    finally: os.close(archive)
+if cancelled():
+    code = 255
 else:
-    child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
-code = child.wait()
+    if 'archive' in cfg:
+        # Only the fixed cache-extraction command receives an archive descriptor.
+        # It runs as the worker; neither tar nor the task can write the cache.
+        archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
+        finally: os.close(archive)
+    else:
+        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
+    if cfg.get('cancel'):
+        while True:
+            if cancelled():
+                # Stop the direct child even on a host with no readable proc entry;
+                # the existing descendant/UID sweep below proves full termination.
+                try: child.kill()
+                except ProcessLookupError: pass
+                code = 255
+                break
+            try:
+                code = child.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired: pass
+    else:
+        code = child.wait()
 # All descendants run as the dedicated uid. Include live descendants before
 # killing their parents, then reap orphans adopted by this subreaper.
 def children():
@@ -668,7 +689,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     // must read every active pin before deciding which public bases to prune.
     await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
-  async function workCommand(worker,argv,work,env,archive) {
+  async function workCommand(worker,argv,work,env,archive,{cleanup=false}={}) {
     const slot=Number(/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1]??(testRoot?1:NaN));
     if(!testRoot && process.getuid()!==0) throw new Error('Scoped execution requires the root wrapper; use local fallback');
     if(!Number.isSafeInteger(slot)||slot<1) throw new Error('Scoped execution requires a numbered slot; rerun Forge setup or use local fallback');
@@ -676,14 +697,16 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
     for(const warning of warnings) process.stderr.write('forge-exec-run: '+warning.replace(/[\x00-\x1f\x7f]/g,' ')+'\n');
     const cpus=slotCpus(limits,slot);
     env={WE_VITEST_MAX_WORKERS:String(cpus),...env,FORGE_SLOT_CPUS:String(cpus)};
-    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
+    const cancel=!cleanup&&worker.reservation?statePath(worker.reservation.run,'cancel'):undefined;
+    if(cancel&&await lstat(cancel).catch(error=>{if(error.code!=='ENOENT')throw error;}))return {code:255,stdout:'',stderr:'Run cancelled before worker launch',slotCpus:cpus};
+    if(testRoot) return {...await (testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive,cancel}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true})),slotCpus:cpus};
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     const usage=status+'.usage';
     const name=writerName(worker.reservation),writer={...worker.reservation,guard:join(receipts,'.'+name+'.writer'),reservation:join(receipts,name,'reservation.json')};
     try {
       const launcher=scopeLauncherArgv({slot,unit:'forge-exec-run-'+randomBytes(16).toString('hex'),sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
@@ -1062,6 +1085,18 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       let phase='running',record;
       try{record=await state(request,phase);}catch{record=await state(request,'prepared');}
       return withWorkerWriter(writerName(record),async()=>{
+      if(request.cancel===true) {
+        const worker=await workerFor(record,request);
+        if(!worker.active)throw new Error('Cancellation requires a numbered worker; operator must stop the reserved UID');
+        // Do not bypass executing: ask the supervisor to reap its UID, then
+        // let the active controller settle before any filesystem cleanup.
+        await writeFile(statePath(request.run,'cancel'),'',{flag:'wx',mode:0o600}).catch(error=>{if(error.code!=='EEXIST')throw error;});
+        const deadline=process.hrtime.bigint()+45000000000n;
+        while(await lstat(join(worker.active,'executing')).catch(error=>{if(error.code!=='ENOENT')throw error;})) {
+          if(process.hrtime.bigint()>=deadline)throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+          await new Promise(resolve=>setTimeout(resolve,50));
+        }
+      }
       let finishingWorker,settled=true;
       try {
       // Only the protected state is evidence; receipt-like files in work are data.
@@ -1079,7 +1114,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       if(worker.active){
         // Includes cancelled rsync and children left before task execution.
         settled=false;
-        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'});
+        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
         if(reaped.code!==0)throw new Error('Worker cleanup unconfirmed');
         settled=true;
       }
@@ -1101,6 +1136,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, t
       await rm(join(bases,'active',request.run),{force:true});
       await rm(statePath(request.run,'base'),{force:true});
       if(worker.active){await rmdir(join(worker.active,'executing'));finishingWorker=undefined;await releaseWorker(record);}
+      await rm(statePath(request.run,'cancel'),{force:true});
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.

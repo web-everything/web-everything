@@ -759,6 +759,13 @@ export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmis
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
  * Everything else (including legacy fallback, throws, malformed results and unacknowledged
  * timeouts) refuses local reruns with exit 124. */
+const CLIENT_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+/** x40a9dk: how long a killed client waits for its remote cancel to be confirmed (default 90s; the protected finish took 14s live). */
+function resolveSignalCancelWaitMs(env) {
+  const n = Number((env ?? {}).WE_HEAVY_SIGNAL_CANCEL_WAIT_MS);
+  return Number.isInteger(n) && n >= 0 ? n : 90000;
+}
+
 export async function runWithRemoteDecision({
   argv, policy, cwd, env, host = 'forge', clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
@@ -857,6 +864,14 @@ export async function runWithRemoteDecision({
   };
   let reason; let detail; let timer;
   const controller = new AbortController();
+  // x40a9dk: a killed client (SIGTERM/SIGINT/SIGHUP) cancels its own remote run and clears its marker only on
+  // confirmed termination; otherwise the marker stays for the reaper. Installed only while a marker is outstanding.
+  const cancelController = new AbortController();
+  let signalled = null; let onSignal;
+  const signalPromise = new Promise((resolve) => { onSignal = (name) => { if (signalled) return; signalled = name; resolve({ clientSignal: name }); cancelController.abort(); controller.abort(); }; });
+  let signalHandlers = [];
+  // A kill that lands while a result is being recorded is honoured: exit with the signal code, keeping `terminated` as is.
+  const killedExit = () => signalled ? { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalled], signal: signalled } : null;
   const timedOut = Symbol('remote-timeout');
   try {
     // Waiting for a remote slot can outlive the cached sample. Recheck before dispatch.
@@ -874,42 +889,66 @@ export async function runWithRemoteDecision({
       if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
+    signalHandlers = Object.keys(CLIENT_SIGNAL_NUMBERS).map((name) => { const h = () => onSignal(name); process.on(name, h); return [name, h]; });
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => {
         resolve(timedOut);
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
-    const result = await Promise.race([remote, timeout]);
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal }));
+    const result = await Promise.race([remote, timeout, signalPromise]);
+    const cancelOnClientSignal = async (signalName) => {
+      clearTimeout(timer);
+      let cancelTimer;
+      const termination = await Promise.race([
+        remote.catch(() => null),
+        new Promise((resolve) => { cancelTimer = setTimeout(() => resolve(null), resolveSignalCancelWaitMs(env)); }),
+      ]);
+      clearTimeout(cancelTimer);
+      terminated = (termination?.mode === 'remote' && Number.isInteger(termination.code) && termination.code >= 0 && termination.code <= 254)
+        || ((termination?.mode === 'not-started' || termination?.mode === 'cancelled') && termination.terminated === true);
+      await record(terminated ? termination : { mode: 'unconfirmed' });
+      log(terminated
+        ? `heavy-admission: ${signalName} received; remote run cancelled and slot-${slot.slot} released\n`
+        : `heavy-admission: ${signalName} received; remote termination unconfirmed (${oneLine(termination?.reason ?? termination?.mode ?? 'no answer')}) - slot-${slot.slot} marker left for the reaper\n`);
+      return { handled: true, exitCode: 128 + CLIENT_SIGNAL_NUMBERS[signalName], signal: signalName };
+    };
+    if (typeof result?.clientSignal === 'string') return await cancelOnClientSignal(result.clientSignal);
     if (result === timedOut) {
       const termination = await Promise.race([
         remote.catch(() => null),
         new Promise((resolve) => {
           timer = setTimeout(() => resolve(null), 1000);
         }),
+        signalPromise,
       ]);
+      // A client kill during the timeout grace period still cancels and exits with the signal code.
+      if (typeof termination?.clientSignal === 'string') return await cancelOnClientSignal(termination.clientSignal);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
         await record({mode:'unconfirmed'});
-        return refuseLocal('remote-timeout');
+        return killedExit() ?? refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
       terminated = true;
       await record(termination);
+      if (killedExit()) return killedExit();
     } else {
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
       await record(result);
+      if (killedExit()) return killedExit();
       if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
-      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
       detail = result?.detail;
     }
-  } catch (error) { await record({mode:'unconfirmed'}); return refuseLocal(error?.message ?? error); }
+  } catch (error) { await record({mode:'unconfirmed'}); return killedExit() ?? refuseLocal(error?.message ?? error); }
   finally {
     clearTimeout(timer); clearInterval(heartbeat);
+    for (const [name, h] of signalHandlers) process.removeListener(name, h);
     if(!outstanding) releaseOwnedSlot({...slotOptions,fastSlots:0});
     else if(terminated) {
       // Unconfirmed results, throws and client death leave the pre-dispatch
