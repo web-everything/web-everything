@@ -250,6 +250,12 @@ describe('proven local fallback verdict', () => {
 });
 
 describe('verify remote routing', () => {
+  it('pins heavy-admission wrappers for the npm scripts accepted by wrappedNpmScript', () => {
+    const { scripts } = JSON.parse(readFileSync(resolve(repo, 'package.json'), 'utf8'));
+    for (const name of ['test:unit', 'check:standards']) {
+      expect(scripts[name]).toMatch(/^node scripts\/readiness\/heavy-admission\.mjs run --/);
+    }
+  });
   it.each([
     ['remote green never reruns', false, 0, false],
     ['remote red confirms locally', false, 1, true],
@@ -384,7 +390,6 @@ describe('verify remote routing', () => {
     'npx vitest run a.test.mjs && npx vitest run b.test.mjs --unknown',
     'npx vitest run a.test.mjs && npx vitest run',
     'npx vitest run a.test.mjs &&  npx vitest run b.test.mjs',
-    'npx vitest run a.test.mjs && npm run check:standards',
     'npx vitest run a.test.mjs --testTimeout=abc',
     'npx vitest run a.test.mjs --reporter=x',
   ])('a chain or env segment Forge cannot run as written keeps the whole command local: %s', command => {
@@ -422,7 +427,6 @@ describe('verify remote routing', () => {
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
   it.each([
-    "'one.test.mjs' && npm run check:standards",
     'one.test.mjs && node scripts/readiness/heavy-admission.mjs run -- vitest run two.test.mjs',
     'one.test.mjs | tee output',
     'one.test.mjs; echo done',
@@ -817,5 +821,95 @@ process.exit(again?0:1);`);
   }, 20000);
   it('local confirmation killed by a signal is a local verify-signal, never remote-unconfirmed', () => {
     verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'signal');
+  });
+});
+
+describe('R332: scan phases and whole-gate chains route to Forge', () => {
+  const scan = (files = ['scripts/a.mjs', 'dir/b-c.mjs']) => `VERIFY_SCAN_FILES='${JSON.stringify(files).replaceAll("'", "'\\''")}'`;
+  const remote = { remote: true };
+  it('bounds classification of repeated quoted assignments without losing local refusals or remote routing', () => {
+    const prefix = "TZ='UTC' ".repeat(40);
+    const cases = [
+      { command: `${prefix}node scripts/x.mjs`, remote: true, local: true },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs`, remote: true, local: false },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs`, remote: false, local: true },
+      { command: `${prefix}' npx vitest run scripts/x.test.mjs`, remote: true, local: true },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs && node scripts/x.mjs`, remote: true, local: true },
+    ];
+    // A child timeout bounds even synchronous regexp backtracking; a Vitest timeout cannot interrupt it.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { phaseAdmissionPlan } from ${JSON.stringify(pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href)};
+      const plans = ${JSON.stringify(cases)}.map(({ command, remote }) => phaseAdmissionPlan({ command, decision: { remote } }));
+      process.stdout.write(JSON.stringify(plans));
+    `], { encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(cases.map(({ command, local }) => ({
+      command: local ? command : command.replace('npx vitest run', 'npm run test:unit --'),
+      takeLocalSlot: local, setHeld: local,
+    })));
+  }, 10000);
+  it('routes a repo-scan command whose changed-file JSON is single-quoted', () => {
+    const prefix = scan();
+    const command = `${prefix} npx vitest run 'scripts/lib/__tests__/lane-git-diet.test.mjs' scripts/x.test.mjs --testTimeout=15000 --hookTimeout=30000`;
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({
+      command: `${prefix} npm run test:unit -- 'scripts/lib/__tests__/lane-git-diet.test.mjs' scripts/x.test.mjs --testTimeout=15000 --hookTimeout=30000`,
+      takeLocalSlot: false, setHeld: false });
+    expect(phaseAdmissionPlan({ command, decision: { remote: false } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([
+    ["VERIFY_SCAN_FILES='{\"a\":1}'", 'non-array JSON'],
+    ["VERIFY_SCAN_FILES='[\"/etc/passwd\"]'", 'absolute path'],
+    ["VERIFY_SCAN_FILES='[\"a\"]' VERIFY_SCAN_ROOT=/tmp/x", 'unlisted env key'],
+    ["SECRET_TOKEN='x'", 'secret-shaped env key'],
+    ["VERIFY_SCAN_FILES='[\"a\"]\ntouch /tmp/pwn'", 'newline in value'],
+  ])('keeps a scan command with %s local (%s)', (prefix) => {
+    const command = `${prefix} npx vitest run scripts/x.test.mjs`;
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([['dir/b c.mjs'], ["d'e.mjs"]])('keeps a scan command naming a path Forge refuses local: %s', path => {
+    const command = `${scan([path])} npx vitest run scripts/x.test.mjs`;
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it('keeps a scan command with a stray quote or trailing shell syntax local', () => {
+    for (const command of [`${scan()}' npx vitest run x.test.mjs`, `${scan()} npx vitest run x.test.mjs; rm -rf x`,
+      `${scan()} node scripts/x.mjs`]) {
+      expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+    }
+  });
+  it('routes the whole verify gate chain and keeps its original text', () => {
+    for (const command of ['npm run test:unit && npm run check:standards', 'npm run test:unit',
+      'npm test && npm run check:standards'.replace('npm test', 'npm run test:unit -- scripts/a.test.mjs'),
+      'npm run test:unit && npm run check:standards -- --local --files=a.md,b.mjs']) {
+      expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: false, setHeld: false });
+      expect(phaseAdmissionPlan({ command, decision: { remote: false } }).takeLocalSlot).toBe(true);
+    }
+  });
+  it('wraps vitest segments of a mixed chain and leaves npm segments alone', () => {
+    const command = 'npx vitest run scripts/a.test.mjs && npm run check:standards';
+    expect(phaseAdmissionPlan({ command, decision: remote }))
+      .toEqual({ command: 'npm run test:unit -- scripts/a.test.mjs && npm run check:standards', takeLocalSlot: false, setHeld: false });
+  });
+  it('a quoted vitest file in a mixed chain is wrapped like an unquoted one (formerly a keep-local case)', () => {
+    expect(phaseAdmissionPlan({ command: "npx vitest run 'one.test.mjs' && npm run check:standards", decision: { remote: true } }))
+      .toEqual({ command: "npm run test:unit -- 'one.test.mjs' && npm run check:standards", takeLocalSlot: false, setHeld: false });
+  });
+  it.each([
+    'npm run test:unit && node scripts/x.mjs',
+    'npm run test:unit && npm run build',
+    'npm run test:unit || npm run check:standards',
+    'npm run test:unit; npm run check:standards',
+    'npm run test:unit && npm run check:standards -- --bogus',
+    'npm run test:unit && npm run check:standards && echo done',
+    'npm run test:unit -- --coverage && npm run check:standards',
+    'npm run check:standards -- --files=a$(id)',
+  ])('keeps a chain with an ineligible segment local: %s', command => {
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it('keeps the always-run guard (json report read locally) and soak (--config) local', () => {
+    for (const command of [
+      "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
+      'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
+    ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
 });

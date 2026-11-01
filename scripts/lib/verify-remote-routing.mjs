@@ -16,45 +16,76 @@ function simpleShellWords(command) {
 }
 const unquote = arg => arg.replaceAll("'", '');
 
-const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+// A leading `KEY=value` is a plain word or one shell single-quoted string (`'\''` encodes an apostrophe).
+// The quoted form carries repo-scan's changed-file JSON; its content is checked by Forge's own env allowlist.
+const ASSIGNMENT_PREFIX = /^([A-Za-z_][A-Za-z0-9_]*)=('(?:[^'\r\n]|'\\'')*'|[a-zA-Z0-9_./:=@%+,\-]*)(?:[ \t]+|$)/;
+const unquoteValue = raw => raw.startsWith("'") ? raw.slice(1, -1).replaceAll("'\\''", "'") : raw;
 // Keys that change neither the nested wrapper's admission (CI bypasses it) nor its routing. Each must
 // also pass Forge's env allowlist, so the remote run sees the same value.
 const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR', 'VERIFY_SCAN_FILES']);
-const VITEST_SEGMENT = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*npx vitest(?=\s|$)/;
+
+function isVitestSegment(command) {
+  // Consume one assignment at a time. Repeating quoted/unquoted alternatives in one regexp
+  // backtracks exponentially on quoted assignments followed by a non-Vitest command.
+  let rest = command;
+  for (let m; (m = ASSIGNMENT_PREFIX.exec(rest)); ) rest = rest.slice(m[0].length);
+  return /^npx vitest(?=\s|$)/.test(rest);
+}
+
+// Splits a segment into its leading allowlisted assignments (kept as original text) and plain words.
+function segmentParts(command) {
+  if (/[\r\n]/.test(command)) return null;
+  let rest = command;
+  let prefix = '';
+  for (let m; (m = ASSIGNMENT_PREFIX.exec(rest)); ) {
+    // Leading assignments run with the nested wrapper, so they apply locally and reach Forge only
+    // through its env allowlist. Any other key keeps the segment local.
+    if (!SEGMENT_ENV_KEYS.includes(m[1]) || !allowedEnv({ [m[1]]: unquoteValue(m[2]) })) return null;
+    prefix += m[0];
+    rest = rest.slice(m[0].length);
+  }
+  const words = simpleShellWords(rest);
+  return words ? { prefix, words } : null;
+}
 
 function wrappedVitestCommand(command) {
-  if (/[\r\n]/.test(command)) return null;
-  const words = simpleShellWords(command);
-  if (!words) return null;
-  // Leading assignments run with the nested wrapper, so they apply locally and reach Forge only
-  // through its env allowlist. Any other key keeps the segment local.
-  let start = 0;
-  for (; start < words.length; start++) {
-    const assignment = ENV_ASSIGNMENT.exec(words[start]);
-    if (!assignment) break;
-    if (!SEGMENT_ENV_KEYS.includes(assignment[1]) || !allowedEnv({ [assignment[1]]: unquote(assignment[2]) })) return null;
-  }
-  if (words[start] !== 'npx' || words[start + 1] !== 'vitest' || words[start + 2] !== 'run') return null;
-  const args = words.slice(start + 3);
+  const parts = segmentParts(command);
+  if (!parts) return null;
+  const { prefix, words } = parts;
+  if (words[0] !== 'npx' || words[1] !== 'vitest' || words[2] !== 'run') return null;
+  const args = words.slice(3);
   // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
   // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
   if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'")))) return null;
   if (!allowedCommand(['npx', 'vitest', 'run', ...args.map(unquote)])) return null;
-  return [...words.slice(0, start), 'npm run test:unit --', ...args].join(' ');
+  return `${prefix}npm run test:unit -- ${args.join(' ')}`;
 }
 
-// A gate built as `vitest run … && VAR=… vitest run …` is remote-eligible only when EVERY top-level
-// segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its own fallback.
-function wrappedVitestChain(command) {
-  const segments = command.split(' && ');
-  const wrapped = segments.map(wrappedVitestCommand);
+// A package script that already wraps itself in heavy-admission (`npm run test:unit|check:standards`):
+// the nested wrapper owns remote dispatch and local fallback, so the segment is passed through verbatim.
+function wrappedNpmScript(command) {
+  const words = simpleShellWords(command)?.map(unquote);
+  if (!words || words[0] !== 'npm' || words[1] !== 'run' || !['test:unit', 'check:standards'].includes(words[2])) return null;
+  if (words.length > 3 && words[3] !== '--') return null;
+  if (words[2] === 'test:unit' && words.slice(4).some(arg => arg.startsWith('-') && !allowedCommand(['npm', 'run', 'test:unit', '--', arg]))) return null;
+  return allowedCommand(words) ? command : null;
+}
+
+// A gate built as `vitest run … && npm run check:standards && …` (the scan phase, the default gate's
+// phases, the whole `verify` gate `npm run test:unit && npm run check:standards`) is remote-eligible only
+// when EVERY top-level segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its
+// own fallback.
+function wrappedChain(command) {
+  const wrapped = command.split(' && ').map(segment => wrappedVitestCommand(segment) ?? wrappedNpmScript(segment));
   return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
-  if (command.split(' && ').every(segment => VITEST_SEGMENT.test(segment))) {
-    const wrapped = decision?.remote === true ? wrappedVitestChain(command) : null;
-    return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
+  if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
+    const wrapped = decision?.remote === true ? wrappedChain(command) : null;
+    if (wrapped || command.split(' && ').some(isVitestSegment)) {
+      return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
+    }
   }
   const words = simpleShellWords(command)?.map(unquote);
   const eligible = !!words && (
