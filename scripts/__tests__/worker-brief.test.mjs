@@ -17,6 +17,13 @@ describe('renderWorkerBrief', () => {
       'ONLY when your declared files overlap', 'No overlap', '--files']) expect(lane).toContain(text);
   });
 
+  it('states the harness-tracked background rule in step 4', () => {
+    const brief = renderWorkerBrief(params);
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    for (const text of ['timeout: 600000', "don't start a second copy", 'harness-tracked', '~180s',
+      'nohup', 'setsid', 'SYNCHRONOUS']) expect(codex).toContain(text);
+  });
+
   it('renders every standard section in order and the qualified scope in commands under the standard policy', () => {
     // Pin the standard: the live platform preference deliberately selects related tests.
     const policy = resolveBuildPolicy({ env: {}, tool: {}, platform: {} });

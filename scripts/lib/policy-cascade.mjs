@@ -25,7 +25,8 @@
  *   Never throws. A missing platform file is "layer not set"; an unreadable one is skipped and named in `errors`.
  */
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isUnderTest } from './under-test.mjs';
 
@@ -34,6 +35,10 @@ export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferenc
 /** The older platform-layer file (deliveryPriority). Read under the main file; the main file wins per key. */
 export const LEGACY_PLATFORM_PREFERENCES_PATHS = Object.freeze([join(HERE, 'delivery-priority-settings.json')]);
 export const PLATFORM_PREFERENCES_ENV = 'WE_PLATFORM_PREFERENCES_FILE';
+/** Operator-owned final platform layer; never written inside a checkout. */
+export function operatorPreferencesPath(env = process.env) {
+  return String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim() || join(homedir(), '.claude', 'platform-preferences.json');
+}
 export const POLICY_CASCADE_LOG_ENV = 'WE_POLICY_CASCADE_LOG';
 export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env']);
 
@@ -41,19 +46,27 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
- * IO: every platform preference, keyed by policy. Never throws.
+ * IO: every platform preference, keyed by policy. routingOverrides is operator-only;
+ * repo platform copies are ignored with a warning. Never throws.
  * @returns {{prefs:object, errors:string[]}}
  */
-export function readPlatformPreferences({ env = process.env, readFile = readFileSync } = {}) {
+export function readPlatformPreferences({ env = process.env, readFile = readFileSync, warn = message => console.error(message) } = {}) {
   const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
-  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH];
+  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(env)];
   const prefs = {};
   const errors = [];
   for (const path of paths) {
     try {
       const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
-      for (const [k, v] of Object.entries(data)) if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = v;
+      for (const [k, v] of Object.entries(data)) {
+        if (k === 'routingOverrides' && (path !== operatorPreferencesPath(env)
+          || [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH].some(repoPath => resolve(repoPath) === resolve(path)))) {
+          warn(`policy-cascade: ${path}: ignoring routingOverrides; only the operator-owned preferences file may set it`);
+          continue;
+        }
+        if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = v;
+      }
     } catch (e) {
       if (e?.code !== 'ENOENT') errors.push(`${path}: ${String(e?.message ?? e).split('\n')[0]}`);
     }

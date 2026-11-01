@@ -293,6 +293,9 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
+/** Recorded branch tips an entry may carry; each describes one registration's branch, never a re-registration's. */
+export const REGISTRATION_TIP_FIELDS = Object.freeze(['tipSha', 'sha', 'headSha']);
+
 /** Registration intent excludes the rebuild's own caches: base chain, last refreshed tip, retired sources. */
 export function registrationIdentity(entry) {
   if (entry == null) return entry;
@@ -327,7 +330,12 @@ export function addOverlay(root, {
       });
     } else {
       const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
-      delete next.tipSha;
+      // Every recorded tip (legacy `sha`/`headSha`, refreshed `tipSha`) is evidence about the OLD registration's
+      // branch. Carried into the new id it would let auto-retirement remove the replacement on a stale tip.
+      for (const field of REGISTRATION_TIP_FIELDS) delete next[field];
+      // An edge approval vouches for the OLD registration's conflict resolution. If the new head is an ancestor
+      // of that edge tip, the rebuild would otherwise build the old PR's resolution for the new registration.
+      delete next.edgeResolution;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
@@ -344,7 +352,7 @@ export function addOverlay(root, {
  * equals this sha (`daemon-rebuild.mjs#recordedEdgeSha`), so a branch anyone pushed under `edge/` is never run.
  * `sha` must be a full lowercase 40-hex sha and `by` a non-empty actor; the overlay must already be registered
  * (an approval for an unregistered ref would sit unused and misleading). Re-recording replaces the previous
- * approval; removing the overlay drops it with the entry. Leaves an audit event.
+ * approval; removing or re-registering the overlay (`addOverlay` on its ref) drops it. Leaves an audit event.
  * @param {string} root
  * @param {string} ref
  * @param {{sha:string, by:string, reason?:string|null, now?:string}} approval

@@ -64,7 +64,10 @@ export default {
         const main = commit({ [scenario.path]: scenario.main }, 'main');
         const options = { git, headSha: main, mainRef: 'origin/main', overlays: [{ ref: 'lane/runtime' }],
           entries: ['entry.mjs'], env: {}, stackMode: 'independent', edgeResolve: false };
+        // on now exercises the R284 locked full-merge fallback; shadow still probes the scanner.
         const on = await planRebuild({ ...options, closureScopeMode: 'on' });
+        const off = await planRebuild({ ...options, closureScopeMode: 'off' });
+        if (JSON.stringify(on) !== JSON.stringify(off)) violations.push(`${scenario.path}: locked on differed from off`);
         if (on.applied.length || !on.decisions.some(d => d.action === 'drop' && d.reason === 'conflict')) {
           violations.push(`${scenario.path}: scope discarded a dependency required by the overlay tick`);
         }

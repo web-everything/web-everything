@@ -7,12 +7,13 @@ import { dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { readOverlayState, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
-import { verifyRev, makeGit } from './shared.mjs';
+import { verifyRev, makeGit, archiveUncovered } from './shared.mjs';
 import { finalClosureScope, isExcludable } from './closure-scope.mjs';
 import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -104,10 +105,11 @@ export function matchReadyCandidate({
 export function readyBuildVerified({
   git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
+  const mode = lockClosureScopeMode(closureScopeMode ?? resolveClosureScopeMode(env).mode);
   const applied = Array.isArray(adopt?.applied) ? adopt.applied : [];
   const scoped = applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined);
   // Persisted scoped builds still need runtime evidence after the strategy is disabled.
-  if (scoped || (closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
+  if (scoped || mode === 'on') {
     try {
       entries = typeof entries === 'function' ? entries() : entries;
       if (!Array.isArray(entries) || !entries.length) return false;
@@ -232,7 +234,7 @@ export function staleAlertDetail(result, state) {
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
 export async function finalizeRebuild({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, archiveGuard = true,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -280,6 +282,33 @@ export async function finalizeRebuild({
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
   const headNow = verifyRev(git, 'HEAD');
+  if (headNow !== prevHead && headNow !== plan.finalSha) {
+    alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
+    return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
+  }
+
+  // A sibling tick may archive a source while this build smokes unlocked. Check the current registry
+  // before EVERY adoption, including already-adopted: its onAdopted callback can still drop carriers.
+  // A mainOnly rebuild never edits the overlay list, so it skips this (as its planning does).
+  if (archiveGuard) {
+    const registry = readOverlayState(root, { env });
+    let uncovered = [];
+    let error = null;
+    if (registry.corrupt) error = 'overlay registry unreadable';
+    else {
+      try { uncovered = archiveUncovered(git, registry.overlays, plan.finalSha); }
+      catch (e) { error = String(e?.message ?? e); }
+    }
+    if (error) uncovered = (registry.overlays ?? []).filter((o) => o?.retiredSources?.length);
+    if (error || uncovered.length) {
+      const refs = uncovered.map((o) => o.ref);
+      alert('overlay-source-unavailable', { refs, failed: `archive-source-uncovered: ${refs.join(', ')}`, target: plan.finalSha,
+        ...(error ? { error } : {}),
+        message: 'Finalize cannot prove archived content is preserved; keeping the running build and overlay registrations.' });
+      return terminal({ moved: false, reason: error ? 'overlay-source-unverifiable' : 'overlay-source-unavailable', plan });
+    }
+  }
+
   if (headNow === plan.finalSha) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
@@ -292,10 +321,6 @@ export async function finalizeRebuild({
     return terminal({
       moved: false, adopted: true, reason: 'already-adopted', head: plan.finalSha, plan,
     });
-  }
-  if (headNow !== prevHead) {
-    alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
-    return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
   }
 
   // Re-run the same safety gate `prepareRebuild` already passed — the tree could, in principle, have picked up

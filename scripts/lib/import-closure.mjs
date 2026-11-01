@@ -27,12 +27,19 @@ const capabilityModule = spec => CAPABILITY_MODULES.has(spec.replace(/^node:/, '
 // A loader capability's reach is opaque as soon as it is referenced, before aliases,
 // destructuring or inherited process settings can hide the eventual execution edge.
 // Strict scoping refuses the whole closure; the legacy walks remain independent.
-const OPAQUE_LOADER_NAMES = new Set(['module', 'createRequire', 'eval', 'Function', 'mainModule',
+const OPAQUE_LOADER_NAMES = new Set(['module', 'createRequire', 'eval', 'Function', 'constructor',
+  'Reflect', 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'mainModule',
   '_load', '_resolveFilename', 'getBuiltinModule', 'binding', '_linkedBinding', 'dlopen',
   'loadEnvFile', 'execArgv', 'NODE_OPTIONS']);
 const opaqueLoaderReference = node => (ts.isIdentifier(node) && OPAQUE_LOADER_NAMES.has(node.text))
   || (literal(node) && (OPAQUE_LOADER_NAMES.has(node.text)
     || /--(?:require|import|loader|experimental-loader)\b/.test(node.text)))
+  // Any function exposes an executable constructor, including async/generator functions.
+  // Refuse unknown keys at reference time: an alias can hide the later invocation.
+  || (ts.isElementAccessExpression(node) && !literal(node.argumentExpression)
+    && !ts.isNumericLiteral(node.argumentExpression))
+  || (ts.isComputedPropertyName(node) && !literal(node.expression)
+    && !ts.isNumericLiteral(node.expression))
   || (ts.isNewExpression(node) && callName(node.expression) === 'Function');
 const opaqueLoaderSpecifier = spec => /^(?:(?:data|file|https?):|(?:node:)?(?:module|vm|test)$)/i.test(spec);
 

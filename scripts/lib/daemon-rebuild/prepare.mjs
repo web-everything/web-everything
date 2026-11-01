@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { makeGit, verifyRev, archiveUncovered, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
@@ -34,6 +34,10 @@ import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } f
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
+
+function validTipSha(raw) {
+  return typeof raw?.tipSha === 'string' && FULL_SHA_RE.test(raw.tipSha) ? raw.tipSha : null;
+}
 
 /**
  * Phase 1 (LOCKED, fast — no smoke): recovery, safety, fetch, `planRebuild`, overlay-list
@@ -264,6 +268,21 @@ export async function prepareRebuild({
   let overlaysBefore = overlayState.overlays;
   let snapshotGeneration = overlayState.generation;
   if (!mainOnly && !overlayState.corrupt) {
+    // A ref-keyed snapshot cannot represent duplicate registrations, even with identical ids.
+    // Refuse before migration so legacy duplicates and their adopted evidence remain untouched
+    // for operator repair. Repeated ticks report the same registry defect, not a writer race.
+    const seenRefs = new Set();
+    const duplicateRefs = new Set();
+    for (const entry of overlaysBefore) {
+      if (typeof entry?.ref !== 'string' || !entry.ref) continue;
+      if (seenRefs.has(entry.ref)) duplicateRefs.add(entry.ref);
+      seenRefs.add(entry.ref);
+    }
+    if (duplicateRefs.size) {
+      const detail = { refs: [...duplicateRefs].sort() };
+      alert('overlay-registration-duplicate', detail);
+      return terminal({ moved: false, reason: 'overlay-registration-duplicate', detail });
+    }
     const migrated = migrateRegistrationIds(root, { env, adopted: state.adopted });
     if (migrated.adopted !== state.adopted) { state.adopted = migrated.adopted; writeState(); }
     for (const detail of migrated.unprovable) alert('overlay-registration-unprovable', detail);
@@ -323,6 +342,13 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
   }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
+  if (fetchResult.malformed?.length) {
+    alert('overlay-state-malformed', { file: overlayFilePath(root, env), malformed: fetchResult.malformed,
+      message: 'Repair the overlay registry before rebuilding with overlays; mainOnly recovery remains available.' });
+    if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-malformed' });
+    // Recovery ignores these entries in memory and leaves the stored registry untouched for repair.
+    overlaysBefore = overlaysBefore.filter((_, index) => !fetchResult.malformed.includes(index));
+  }
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });
     alert('fetch-failed');
@@ -388,20 +414,53 @@ export async function prepareRebuild({
   if (!mainOnly) {
     for (const raw of unverified) {
       if (!snapshotHolds()) return registrationChanged();
-      // Fetch cleanup may have deleted the tracking ref. The last adopted inputs still identify the
-      // mechanism this clone runs; use them only to refuse a loss, never as fresh build/retirement inputs.
-      const adopted = state.adopted?.head === prevHead
-        ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
-      const pin = pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, adopted?.sha);
+      // Fetch cleanup may have deleted the tracking ref, and rebuild state may have been lost. Adopted
+      // inputs (bound to this registration) or a recorded full tip identify pins only, never fresh
+      // build/retirement inputs. When the running build's adopted record carries a row for this ref that is
+      // NOT bound to this registration (a re-registered overlay, or an unprovable legacy row), that row is
+      // another registration's evidence: this registration inherits no pin from it. The row still states
+      // what is RUNNING, though: if that content changes the mechanism, building without it would revert
+      // the live daemon, so hold under a distinct reason that claims nothing about this registration.
+      // With no row at all, or lost/mismatched rebuild state, the pin is unknown: refuse rather than
+      // silently dropping a possible mechanism overlay.
+      const adoptedRows = state.adopted?.head === prevHead && Array.isArray(state.adopted?.applied)
+        ? state.adopted.applied : null;
+      const pinMain = state.adopted?.mainSha ?? fetchedMainSha;
+      const adopted = adoptedRows ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
+      // Every running row for this ref not bound to this registration (duplicates included): the replacement's
+      // own tip says nothing about what is RUNNING, so these rows are checked even when that tip is harmless.
+      const unboundRows = adoptedRows ? adoptedRows.filter((row) => row?.ref === raw.ref && row !== adopted) : [];
+      const tipSha = adopted?.sha ?? validTipSha(raw);
+      let reason = 'pinned-overlay-unavailable';
+      let detailSha = tipSha ?? null;
+      let pin = { pinned: false };
+      if (tipSha || raw.pinned === true) pin = pinnedStatus(git, raw, pinMain, tipSha);
+      else if (!unboundRows.length) pin = { pinned: true, why: 'unknown' };
+      for (const row of pin.pinned ? [] : unboundRows) {
+        // Unparseable running evidence cannot prove the running content is harmless: fail closed.
+        const rowSha = FULL_SHA_RE.test(row?.sha ?? '') ? row.sha : null;
+        const rowPin = rowSha ? pinnedStatus(git, raw, pinMain, rowSha) : { pinned: true, why: 'unknown' };
+        if (!rowPin.pinned) continue;
+        pin = rowPin;
+        reason = 'pinned-overlay-unbound';
+        detailSha = rowSha;
+        break;
+      }
+      // pinnedStatus runs Git; the list may be re-registered meanwhile. Never refuse for a replaced registration.
+      if (!snapshotHolds()) return registrationChanged();
       if (!pin.pinned) continue;
       unavailablePinned = {
-        ok: false, reason: 'pinned-overlay-unavailable',
-        detail: { ref: raw.ref, pr: raw.pr ?? null, sha: adopted?.sha ?? null,
-          dropReason: 'ref-unavailable', pinnedBy: pin.why, message: PINNED_OVERLAY_GONE_MESSAGE },
+        ok: false, reason,
+        detail: { ref: raw.ref, pr: raw.pr ?? null, registrationId: snap.get(raw.ref) ?? null, sha: detailSha,
+          dropReason: 'ref-unavailable', pinnedBy: pin.why,
+          message: reason === 'pinned-overlay-unbound'
+            ? 'the running build carries mechanism changes for this ref under an earlier registration, and the branch is unavailable — restore the branch, or remove the overlay to drop that content deliberately'
+            : PINNED_OVERLAY_GONE_MESSAGE },
       };
       break;
     }
   }
+  if (!snapshotHolds()) return registrationChanged();
   if (!mainOnly && unverified.length && !unavailablePinned) {
     const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
     alert('overlay-fetch-unverifiable', detail);
@@ -431,48 +490,18 @@ export async function prepareRebuild({
   // not merely a registered ref. Each retry adds a previously absent source; no-progress refuses the build.
   for (;;) {
     chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
+    // The refusal names a registration; sidecar pruning and status reads ran Git since it was built.
+    if (unavailablePinned && !snapshotHolds()) return registrationChanged();
     plan = unavailablePinned ?? await planRebuild({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
       entries: runtimeEntries, env, closureScopeMode,
+      adopted: state.adopted,
       stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
       prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
     });
     if (!plan.ok || mainOnly) break;
-    const uncovered = [];
     try {
-      const covered = new Map();
-      const carries = (sha) => {
-        if (!FULL_SHA_RE.test(sha ?? '') || !FULL_SHA_RE.test(plan.finalSha ?? '')) throw new Error('invalid archived commit');
-        if (covered.has(sha)) return covered.get(sha);
-        // A restored source may have advanced beyond its archived SHA. Prove the archive is in the
-        // proposed build by ancestry; requiring equality with the live tip would hold recovery forever.
-        const ancestor = git(['merge-base', '--is-ancestor', sha, plan.finalSha]);
-        if (ancestor.error || ![0, 1].includes(ancestor.status)) throw new Error('archive ancestry unavailable');
-        let present = ancestor.status === 0;
-        if (!present) {
-          // Squash-landed/rebased content is safe only with whole-tree equivalence, as in retirement.
-          const merged = git(['merge-tree', '--write-tree', '--no-messages', plan.finalSha, sha]);
-          if (merged.error || ![0, 1].includes(merged.status)) throw new Error('archive content unavailable');
-          if (merged.status === 0) {
-            const tree = verifyRev(git, `${plan.finalSha}^{tree}`);
-            const mergedTree = String(merged.stdout ?? '').split('\n')[0].trim();
-            if (!FULL_SHA_RE.test(tree ?? '') || !FULL_SHA_RE.test(mergedTree)) throw new Error('archive tree unavailable');
-            present = tree === mergedTree;
-          }
-        }
-        covered.set(sha, present);
-        return present;
-      };
-      for (const carrier of overlaysBefore) {
-        const pending = [...(carrier.retiredSources ?? [])];
-        let missing = false;
-        while (pending.length) {
-          const source = pending.pop();
-          if (!carries(source?.sha)) missing = true;
-          pending.push(...(source.entry?.retiredSources ?? []));
-        }
-        if (missing) uncovered.push(carrier);
-      }
+      const uncovered = archiveUncovered(git, overlaysBefore, plan.finalSha);
       if (!uncovered.length) break;
       const restored = [];
       for (const carrier of uncovered) {
@@ -492,6 +521,11 @@ export async function prepareRebuild({
       }
       const required = new Set([...restored, ...overlaysForPlan.map((o) => o.ref)]);
       const refreshed = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
+      if (refreshed.malformed?.length) {
+        alert('overlay-state-malformed', { file: overlayFilePath(root, env), malformed: refreshed.malformed,
+          message: 'Repair the overlay registry before rebuilding with overlays; mainOnly recovery remains available.' });
+        return terminal({ moved: false, reason: 'overlay-state-malformed' });
+      }
       if (!refreshed.ok || [...required].some((ref) => refreshed.refEvidence.get(ref) !== 'refreshed')) {
         alert('overlay-source-unavailable', { refs: uncovered.map((o) => o.ref), message: 'Restored sources could not be refreshed; retrying next tick.' });
         return terminal({ moved: false, reason: 'overlay-source-unavailable' });
@@ -555,6 +589,8 @@ export async function prepareRebuild({
   }
   if (!plan.ok) {
     // A pinned refusal keeps the current tree AND the overlay list untouched (no decisions were applied).
+    // An unavailable-pin refusal names a registration; never alert or hold for one replaced since it was built.
+    if (plan === unavailablePinned && !snapshotHolds()) return registrationChanged();
     alert(plan.reason, plan.detail);
     // xpinskip — a pinned refusal that still stands (explicit pin, or main lacks the mechanism) must not freeze
     // dispatch either: when the clone sits on its last smoke-verified build, record it as HELD there, so
@@ -725,9 +761,24 @@ export async function prepareRebuild({
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
-      if (!m.adopt) {
+      // A saved candidate predates this tick's archives (auto-retirement may have run since it passed).
+      // Hold it to the same rule as a fresh plan: every registered carrier's archived sources must be in
+      // the target. Unreadable evidence discards it too; the fresh plan below then re-checks and smokes.
+      // A mainOnly rebuild skips archives everywhere (its planning and smoke fallbacks never edit the list).
+      let archiveRefusal = null;
+      if (m.adopt && !mainOnly) {
+        try {
+          const uncovered = archiveUncovered(git, overlaysBefore || [], m.adopt.finalSha);
+          if (uncovered.length) archiveRefusal = { refs: uncovered.map((o) => o.ref) };
+        } catch (e) {
+          archiveRefusal = { refs: (overlaysBefore || []).filter((o) => o?.retiredSources?.length).map((o) => o.ref),
+            error: String(e?.message ?? e) };
+        }
+      }
+      if (!m.adopt || archiveRefusal) {
         clearReadyCandidate(root, stEnv);
-        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });
+        alert('ready-candidate-discarded', { target: ready.adopt.finalSha,
+          ...(archiveRefusal ? { reason: 'archive-source-uncovered', ...archiveRefusal } : { reason: m.reason }) });
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {
@@ -750,6 +801,7 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          archiveGuard: !mainOnly,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -819,7 +871,7 @@ export async function prepareRebuild({
       if (readyOnly) return mutationDue('skip-unrelated-adopt');
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
-        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null }, archiveGuard: !mainOnly,
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
       return {

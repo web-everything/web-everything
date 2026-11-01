@@ -8,6 +8,7 @@ import * as overlays from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { finalizeRebuild, dropSuspectOverlays } from '../daemon-rebuild/adopt.mjs';
 import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 
 // Spy after initialization: a partial importOriginal mock loads prepare through the
 // overlays → self-sync → rebuild cycle before that mock exists, bypassing its read seam.
@@ -38,7 +39,7 @@ afterEach(() => {
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function fixture() {
+function fixture(ref = REF) {
   const root = mkdtempSync(join(tmpdir(), 'overlay-generation-'));
   temps.push(root);
   const env = {
@@ -57,7 +58,7 @@ function fixture() {
   };
   const file = overlays.overlayFilePath(root, env);
   const list = () => overlays.readOverlays(root, { env });
-  const add = () => overlays.addOverlay(root, { ref: REF, pr: 17, now: NOW }, { env })[0];
+  const add = () => overlays.addOverlay(root, { ref, pr: 17, now: NOW }, { env })[0];
   const seed = (entries) => {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify({ clone: root, overlays: entries }));
@@ -66,8 +67,8 @@ function fixture() {
   return { root, env, file, list, add, seed, bytes };
 }
 
-function gitFixture() {
-  const f = fixture();
+function gitFixture(ref = REF) {
+  const f = fixture(ref);
   const git = (args, options = {}) => spawnSync('git', args, {
     cwd: f.root, env: f.env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     ...options,
@@ -88,9 +89,9 @@ function gitFixture() {
   ok(['add', 'scripts']);
   ok(['commit', '-qm', 'overlay mechanism']);
   const head = ok(['rev-parse', 'HEAD']);
-  ok(['update-ref', `refs/remotes/origin/${REF}`, head]);
+  ok(['update-ref', `refs/remotes/origin/${ref}`, head]);
   const old = f.add();
-  const adopted = { head, mainSha, applied: [{ ref: REF, pr: 17, sha: head, registrationId: old.registrationId }], at: NOW };
+  const adopted = { head, mainSha, applied: [{ ref, pr: 17, sha: head, registrationId: old.registrationId }], at: NOW };
   const save = (value = adopted) => writeRebuildState(f.root, { adopted: value }, f.env);
   save();
   const prepare = async ({ available = false, now = Date.parse(NOW), visit = () => {} } = {}) => {
@@ -103,7 +104,7 @@ function gitFixture() {
           // All remote IO is injected; no fetch, push, or network subprocess is launched.
           let result;
           if (args[0] === 'fetch') {
-            result = { status: available || !args.some(a => a.includes(`heads/${REF}:`)) ? 0 : 1, stdout: '', stderr: '' };
+            result = { status: available || !args.some(a => a.includes(`heads/${ref}:`)) ? 0 : 1, stdout: '', stderr: '' };
           } else if (args[0] === 'ls-remote') result = { status: 2, stdout: '', stderr: '' };
           else result = git(args, options);
           visit(`git:${args[0]}:after`);
@@ -124,7 +125,7 @@ function gitFixture() {
       });
     } finally { seams.visit = null; }
   };
-  return { ...f, old, adopted, save, prepare };
+  return { ...f, old, adopted, save, prepare, git, ok };
 }
 
 function expectNoBorrowedPin(result) {
@@ -134,6 +135,67 @@ function expectNoBorrowedPin(result) {
 }
 
 describe('overlay registration generations', () => {
+  it.each([false, true])('T12 historical pin belongs only to its registration (replaced=%s)', async (replaced) => {
+    const ref = 'lane/reused';
+    const f = gitFixture(ref);
+    const b = f.adopted.head;
+    // Main and rewritten C conflict, while the already adopted B still merges cleanly.
+    f.ok(['reset', '--hard', f.adopted.mainSha]);
+    writeFileSync(join(f.root, 'README.md'), 'main change\n');
+    f.ok(['add', 'README.md']);
+    f.ok(['commit', '-qm', 'main advances']);
+    const mainSha = f.ok(['rev-parse', 'HEAD']);
+    f.ok(['update-ref', 'refs/remotes/origin/main', mainSha]);
+    const merged = f.git(['merge', '--no-ff', b, '-m', `daemon-rebuild: merge overlay ${ref} (PR #17) onto ${mainSha}`],
+      { env: { ...f.env, ...REBUILD_IDENTITY_ENV } });
+    expect(merged.status).toBe(0);
+    const running = f.ok(['rev-parse', 'HEAD']);
+    const adopted = { ...f.adopted, head: running, mainSha };
+    f.save(adopted);
+    f.ok(['reset', '--hard', b]);
+    writeFileSync(join(f.root, 'README.md'), 'rewritten conflicting C\n');
+    f.ok(['add', 'README.md']);
+    f.ok(['commit', '-qm', 'rewrite reused branch']);
+    const c = f.ok(['rev-parse', 'HEAD']);
+    f.ok(['update-ref', `refs/remotes/origin/${ref}`, c]);
+    f.ok(['reset', '--hard', running]);
+    const registration = replaced ? f.add() : f.old;
+    expect(registration.registrationId === f.old.registrationId).toBe(!replaced);
+
+    const result = await f.prepare({ available: true });
+    const persisted = readRebuildState(f.root, f.env).adopted.applied;
+    if (replaced) {
+      expect(persisted).not.toContainEqual(expect.objectContaining({ sha: b, registrationId: registration.registrationId }));
+      expect(result.plan?.applied ?? result.result?.plan?.applied ?? []).not.toContainEqual(
+        expect.objectContaining({ sha: b, registrationId: registration.registrationId }));
+      expect(result.alerts.map(a => a.kind)).not.toContain('overlay-pinned');
+      expect(persisted).toEqual(adopted.applied);
+    } else {
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-pinned');
+      expect(persisted).toContainEqual(expect.objectContaining({ ref, sha: b, registrationId: f.old.registrationId }));
+    }
+    expect(f.list()).toEqual([expect.objectContaining({ ref, registrationId: registration.registrationId })]);
+  });
+
+  it.each(['distinct-ids', 'same-id', 'legacy'])('T13 duplicate refs refuse deterministically across ticks: %s', async (kind) => {
+    const f = gitFixture();
+    const first = kind === 'legacy' ? { ref: REF, pr: 17 } : f.old;
+    const second = kind === 'legacy' ? { ref: REF, pr: 18 }
+      : { ...first, registrationId: kind === 'same-id' ? first.registrationId : 'another-registration' };
+    f.seed([first, second]);
+    const before = f.bytes();
+    for (let tick = 0; tick < 2; tick++) {
+      const visits = [];
+      const result = await f.prepare({ available: true, visit: point => visits.push(point) });
+      expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'overlay-registration-duplicate' } });
+      expect(result.alerts).toContainEqual({ kind: 'overlay-registration-duplicate', detail: { refs: [REF] } });
+      expect(result.alerts.map(a => a.kind)).not.toContain('overlay-registration-changed');
+      expect(visits).not.toContain('git:fetch:before');
+      expect(f.bytes()).toBe(before);
+      expect(readRebuildState(f.root, f.env).adopted).toEqual(f.adopted);
+    }
+  });
+
   it('T1 property: inject addOverlay(root,{ref}) at each point prepareRebuild reads the list or awaits', async () => {
     // Discover every read/run/await boundary on both the unavailable-pin and refreshed-plan paths.
     // Each replay starts from the same old evidence; never reuse a mutated fixture between points.
@@ -281,12 +343,18 @@ describe('overlay registration generations', () => {
     expect(migrated.adopted.applied[0].registrationId).toBeUndefined();
     expect(new Set(migrated.list.map(o => o.registrationId)).size).toBe(entries.length);
     for (const entry of migrated.list) expect(entry.registrationId).toMatch(UUID);
-    // Replay the legacy input through preparation itself, so migration alerts cannot be bypassed.
+    // Preparation refuses ambiguous registries before migration; unique entries still report
+    // unprovable legacy adopted evidence through the migration path.
     f.seed(entries);
     f.save(adopted);
     const result = await f.prepare();
     expectNoBorrowedPin(result);
-    expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-unprovable');
+    if (kind === 'duplicate-ref') {
+      expect(result).toMatchObject({ terminal: true, result: { reason: 'overlay-registration-duplicate' } });
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-duplicate');
+      expect(f.list()).toEqual(entries);
+      expect(readRebuildState(f.root, f.env).adopted).toEqual(adopted);
+    } else expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-unprovable');
     expect(f.list()).toHaveLength(entries.length);
   });
 
@@ -349,6 +417,56 @@ describe('overlay registration generations', () => {
     expect(f.list()[0].registrationId).toBe(migrated.list[0].registrationId);
   });
 
+  it('T11 a re-registered ref whose RUNNING content changes the mechanism holds as pinned-overlay-unbound when its branch is missing', async () => {
+    const f = gitFixture();
+    const replacement = f.add();
+    const result = await f.prepare();
+    // No borrowed pin: the refusal names the running row's content, never the old registration's evidence.
+    expectNoBorrowedPin(result);
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'pinned-overlay-unbound',
+      detail: { ref: REF, registrationId: replacement.registrationId, sha: f.adopted.head, pinnedBy: 'mechanism' } } });
+    expect(result.alerts.map(a => a.kind)).toContain('pinned-overlay-unbound');
+    expect(f.list()).toEqual([expect.objectContaining({ ref: REF, registrationId: replacement.registrationId })]);
+    expect(f.list()[0].tipSha).toBeUndefined();
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'pinned-overlay-unbound', lastGood: f.adopted.head });
+  });
+
+  it.each(['main-content', 'malformed-sha'])('T11 unbound running row: %s', async (kind) => {
+    const f = gitFixture();
+    f.add();
+    const sha = kind === 'main-content' ? f.adopted.mainSha : 'not-a-sha';
+    f.save({ ...f.adopted, applied: [{ ...f.adopted.applied[0], sha }] });
+    const result = await f.prepare();
+    expectNoBorrowedPin(result);
+    if (kind === 'main-content') {
+      // Running content main already has changes no mechanism: the replacement is skipped, never held.
+      expect(result.result?.reason).not.toBe('pinned-overlay-unbound');
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-fetch-unverifiable');
+    } else {
+      // Unreadable running evidence cannot prove the content harmless: fail closed.
+      expect(result).toMatchObject({ terminal: true, result: { reason: 'pinned-overlay-unbound',
+        detail: { sha: null, pinnedBy: 'unknown' } } });
+    }
+  });
+
+  it.each(['own-harmless-tip', 'harmless-duplicate-row-first'])('T11 running mechanism row still holds: %s', async (kind) => {
+    const f = gitFixture();
+    const replacement = f.add();
+    const mechanismRow = f.adopted.applied[0];
+    if (kind === 'own-harmless-tip') {
+      // The replacement refreshed to a tip with no mechanism change, then its branch went missing again.
+      f.seed(f.list().map(o => (o.ref === REF ? { ...o, tipSha: f.adopted.mainSha } : o)));
+    } else {
+      f.save({ ...f.adopted, applied: [{ ...mechanismRow, sha: f.adopted.mainSha }, mechanismRow] });
+    }
+    const result = await f.prepare();
+    expectNoBorrowedPin(result);
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'pinned-overlay-unbound',
+      detail: { ref: REF, registrationId: replacement.registrationId, sha: f.adopted.head, pinnedBy: 'mechanism' } } });
+    expect(result.alerts.map(a => a.kind)).not.toContain('overlay-fetch-unverifiable');
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'pinned-overlay-unbound', lastGood: f.adopted.head });
+  });
+
   it.each(['already-adopted', 'moved'])('T10 adopt CAS: %s strips replaced ids and preserves matching evidence', async (branch) => {
     const f = gitFixture();
     const kept = overlays.addOverlay(f.root, { ref: 'lane/kept' }, { env: f.env }).find(o => o.ref === 'lane/kept');
@@ -369,10 +487,34 @@ describe('overlay registration generations', () => {
     expect(f.list()).toContainEqual(replacement);
   });
 
-  it('T10 adopt CAS: unreadable registry cannot establish registration evidence', async () => {
+  it.each(['already-adopted', 'moved'])('T10 archive guard: unreadable registry refuses %s without changing adopted evidence', async (branch) => {
+    const f = gitFixture();
+    const before = readRebuildState(f.root, f.env).adopted;
+    writeFileSync(f.file, '{broken');
+    const onAdopted = vi.fn();
+    const run = vi.fn((args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }));
+    const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      lease: { token: 'cas-test' }, prevHead: f.adopted.head,
+      plan: { finalSha: branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha,
+        mainSha: f.adopted.mainSha, inputsKey: 'unreadable', applied: f.adopted.applied },
+      run, onAdopted,
+    });
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-source-unverifiable' });
+    expect(result.adopted).not.toBe(true);
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-source-unavailable',
+      detail: expect.objectContaining({ error: 'overlay registry unreadable' }) }));
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(onAdopted).not.toHaveBeenCalled();
+    expect(readRebuildState(f.root, f.env).adopted).toEqual(before);
+    expect(f.bytes()).toBe('{broken');
+  });
+
+  it('T10 adopt CAS: mainOnly unreadable registry cannot establish registration evidence', async () => {
     const f = gitFixture();
     writeFileSync(f.file, '{broken');
+    // mainOnly deliberately skips archive checks; its adoption CAS must still strip unprovable ids.
     const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      archiveGuard: false,
       lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha: f.adopted.head, mainSha: f.adopted.mainSha,
         inputsKey: 'unreadable', applied: f.adopted.applied },
       run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),
