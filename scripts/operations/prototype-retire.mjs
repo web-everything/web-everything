@@ -74,14 +74,14 @@ function ghJson(gh, args) {
 }
 
 /** The registration's PR: its recorded number, else a PR whose head is the ref, else (for `-m<N>`) its base branch. */
-function findPr({ gh, row }) {
+function findPr({ gh, row, repo }) {
   if (Number.isInteger(row.pr)) {
-    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--json', 'number,state,headRefName']);
+    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--repo', repo, '--json', 'number,state,headRefName']);
     return view.ok && view.value ? { ok: true, pr: view.value, via: 'registration' } : { ok: false };
   }
   for (const [head, via] of [[row.ref, 'head'], [mergeRefBase(row.ref), 'merge-ref-base']]) {
     if (!head) continue;
-    const list = ghJson(gh, ['pr', 'list', '--head', head, '--state', 'all', '--json', 'number,state,headRefName', '--limit', '5']);
+    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', head, '--state', 'all', '--json', 'number,state,headRefName', '--limit', '5']);
     if (!list.ok || !Array.isArray(list.value)) return { ok: false };
     const exact = list.value.filter((pr) => pr?.headRefName === head);
     if (exact.length > 1) return { ok: false, ambiguous: true };
@@ -112,8 +112,8 @@ function findSuperseder({ gh, git, pr, repo, mainRef }) {
 }
 
 /** The commit shas of `pr`, or null when unreadable. */
-function prCommits({ gh, pr }) {
-  const view = ghJson(gh, ['pr', 'view', String(pr), '--json', 'commits']);
+function prCommits({ gh, pr, repo }) {
+  const view = ghJson(gh, ['pr', 'view', String(pr), '--repo', repo, '--json', 'commits']);
   const commits = view.ok && Array.isArray(view.value?.commits) ? view.value.commits.map((c) => c?.oid) : null;
   return commits && commits.every((sha) => SHA.test(sha || '')) ? new Set(commits) : null;
 }
@@ -131,7 +131,9 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     const { tip } = carried;
     const evidence = { unique: carried.unique.length, merges: carried.merges.length, cleanMerges: carried.cleanMerges,
       contentInMain: carried.contentInMain };
-    const found = findPr({ gh, row });
+    // Every GitHub question names the repository; an unknown one keeps the registration.
+    if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo || ''))) return keep('repo-unknown', { tip, evidence });
+    const found = findPr({ gh, row, repo });
     if (!found.ok) return keep(found.ambiguous ? 'pr-ambiguous' : 'pr-state-unknown', { tip, evidence });
     const pr = found.pr;
     const prNumber = pr ? pr.number : null;
@@ -150,7 +152,7 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
       const sup = findSuperseder({ gh, git, pr: prNumber, repo, mainRef });
       if (!sup.ok) return keep('superseder-unknown', { tip, pr: prNumber, evidence });
       if (sup.supersededBy == null) return keep('unique-commits-not-on-main', { tip, pr: prNumber, evidence });
-      const own = prCommits({ gh, pr: prNumber });
+      const own = prCommits({ gh, pr: prNumber, repo });
       if (!own) return keep('pr-commits-unknown', { tip, pr: prNumber, evidence });
       // The closed PR's own commits (merges included) are what the superseder replaced. Anything else must be a
       // clean merge, or the registration carries work that nothing on main replaced.

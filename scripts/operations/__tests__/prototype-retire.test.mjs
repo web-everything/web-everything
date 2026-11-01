@@ -38,6 +38,7 @@ function ghStub({ heads = {}, views = {}, xrefs = {}, fail = false } = {}) {
       const head = args[args.indexOf('--head') + 1];
       return { code: 0, stdout: JSON.stringify(heads[head] ? [{ headRefName: head, ...heads[head] }] : []) };
     }
+    if (args[0] === 'pr' && args[args.indexOf('--repo') + 1] !== 'web-everything/web-everything') return { code: 1, stdout: '' };
     if (args[0] === 'pr' && args[1] === 'view' && views[args[2]]) return { code: 0, stdout: JSON.stringify(views[args[2]]) };
     if (args[0] === 'api' && args[1] === 'graphql') {
       const n = Number(args.find((a) => a.startsWith('n=')).slice(2));
@@ -240,6 +241,7 @@ describe('planRetirements', () => {
       .toMatchObject({ action: 'keep', reason: 'pr-open' });
     expect(plan(r, [{ ref: 'lane/open', pr: null }], ghStub({ fail: true }).gh)[0]).toMatchObject({ action: 'keep', reason: 'pr-state-unknown' });
     expect(plan(r, [{ ref: 'lane/missing', pr: null }], ghStub().gh)[0]).toMatchObject({ action: 'keep', reason: 'tip-unresolved' });
+    expect(planRetirements({ rows: [{ ref: 'lane/open', pr: null }], git: r.git, gh: ghStub().gh, repo: '' })[0]).toMatchObject({ action: 'keep', reason: 'repo-unknown' });
   });
 
   it('does not count a merge with hidden edits as clean', () => {
