@@ -49,6 +49,7 @@
 | **Where does X live? / a placement, naming, monetization, or WE↔FUI-boundary question** — the standing cross-cutting rulings (the "statute" promoted from ratified decisions). **This doc is the SINGLE source of truth for settled orientation: read & cite its named anchor — do NOT reason from or cite the `backlog/` `#NNN` decision chain unless you need the _history_ (the chain is an archive, not the reference). A missing/stale rule here is a codification gap to fix, not a licence to cite the work item.** | [docs/agent/platform-decisions.md](docs/agent/platform-decisions.md) |
 | Naming, glossary, code style, icons | [docs/agent/conventions.md](docs/agent/conventions.md) |
 | Writing/changing tests, web cases | [docs/agent/testing.md](docs/agent/testing.md) |
+| Preparing build/fix agent dispatches and PR bodies (R282 prep gate) | [docs/agent/prep-gate.md](docs/agent/prep-gate.md) |
 | Plugs/blocks, injectors, registries, parsers, debugging | [docs/agent/architecture.md](docs/agent/architecture.md) |
 | Adding a block/plug/intent/adapter, doc requirements, the standard-authoring method | [docs/agent/design-first.md](docs/agent/design-first.md) (Claude: `/new-standard` triggers it) |
 | Processing `plans/` → research pages, reports | [docs/agent/research-workflow.md](docs/agent/research-workflow.md) |

@@ -1,7 +1,13 @@
 import { expect, it } from 'vitest';
-import { relative, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { computeClosureScope, isExcludable } from '../daemon-rebuild/closure-scope.mjs';
 import { smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
+import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 function compute(source, files = {}, options = {}) {
   const root = resolve('virtual-failclosed');
@@ -25,6 +31,105 @@ function protectedPaths(result, paths) {
     else expect(result.reason).toMatch(/closure-|unreadable/);
   }
 }
+
+const constructorAliases = [
+  'const compile = (() => {}).constructor;',
+  'const compile = (function () {}).constructor;',
+  'const compile = (async () => {}).constructor;',
+  'const compile = (function* () {}).constructor;',
+  'const compile = (async function* () {}).constructor;',
+  "const compile = (() => {})['constructor'];",
+  'const compile = (() => {})[`constructor`];',
+  'const compile = (() => {}).constr\\u0075ctor;',
+  "const compile = (() => {})['constr\\u0075ctor'];",
+  'const { constructor: compile } = () => {};',
+  "const { ['con' + 'structor']: compile } = () => {};",
+  "const compile = (() => {})['con' + 'structor'];",
+  "const key = ['con', 'structor'].join(''); const compile = (() => {})[key];",
+  'const compile = Reflect.get(() => {}, process.argv[3]);',
+  'const compile = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(() => {}), process.argv[3]).value;',
+];
+
+it.each(constructorAliases)('constructor aliases cannot authorize runtime exclusions: %s', alias => {
+  const result = compute(`${alias} await compile(process.argv[2])();`, { 'unmentioned.mjs': '' });
+  expect(result).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  expect(isExcludable('unmentioned.mjs', result.scope)).toBe(false);
+});
+
+it('keeps literal numeric indexing eligible for strict closure proof', () => {
+  const result = compute('export const argument = process.argv[2];', { 'unmentioned.mjs': '' });
+  expect(result.ok).toBe(true);
+  expect(isExcludable('unmentioned.mjs', result.scope)).toBe(true);
+});
+
+it('preserves non-strict and legacy import walks for constructor references', () => {
+  const root = resolve('virtual-legacy-constructor');
+  for (const options of [{ strict: false }, { strict: true, strictExtensions: false }]) {
+    const closure = collectImportClosure({ root, entries: ['entry.mjs'],
+      exists: path => path === resolve(root, 'entry.mjs'),
+      readFile: () => 'const compile = (() => {}).constructor;', ...options });
+    expect(closure.complete).toBe(true);
+    expect(closure.files).toEqual(new Set(['entry.mjs']));
+  }
+});
+
+it('executes the reported constructor alias importing a module absent from static imports', () => {
+  const root = mkdtempSync(join(tmpdir(), 'constructor-alias-'));
+  try {
+    const source = 'const compile = (() => {}).constructor; await compile(process.argv[2])();';
+    writeFileSync(join(root, 'entry.mjs'), source);
+    writeFileSync(join(root, 'payload.mjs'), "console.log('runtime-import-reached');");
+    const body = `return import(${JSON.stringify(pathToFileURL(join(root, 'payload.mjs')).href)})`;
+    const run = spawnSync(process.execPath, [join(root, 'entry.mjs'), body], {
+      encoding: 'utf8', timeout: 5000, maxBuffer: 65536,
+    });
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.stdout.trim()).toBe('runtime-import-reached');
+    expect(compute(source, { 'payload.mjs': '' })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Model Git object reads and merge reconstruction without writing a repository/index.
+function savedCandidateGit(source) {
+  const sha = digit => digit.repeat(40);
+  const main = sha('1'), overlay = sha('2'), final = sha('3'), tree = sha('4');
+  const files = Object.entries({
+    ...Object.fromEntries(smokeSurfaceEntries({}).map(path => [path, 'export {};'])),
+    'entry.mjs': source, 'unmentioned.mjs': '',
+  }).map(([path, body], i) => ({ path, body, oid: (i + 16).toString(16).padStart(40, '0') }));
+  const git = (args, options = {}) => {
+    const ok = stdout => ({ status: 0, stdout });
+    switch (args[0]) {
+      case 'ls-tree': return ok(files.map(f => `100644 blob ${f.oid}\t${f.path}\0`).join(''));
+      case 'cat-file': return ok(Buffer.concat(options.input.trim().split('\n').map(oid => {
+        const file = files.find(f => f.oid === oid);
+        return Buffer.from(`${oid} blob ${Buffer.byteLength(file.body)}\n${file.body}\n`);
+      })));
+      case 'merge-base': return ok(main);
+      case 'rev-list': return ok(`${final} ${main} ${overlay}`);
+      case 'rev-parse': return ok(args.at(-1).endsWith('^{tree}') ? tree
+        : args.at(-1).startsWith('refs/') ? overlay : main);
+      case 'merge-tree': return args.includes('--name-only')
+        ? { status: 1, stdout: `${tree}\0unmentioned.mjs\0` } : ok(tree);
+      case '--literal-pathspecs': return ok('');
+      case 'read-tree': case 'update-index': return ok('');
+      case 'write-tree': case 'commit-tree': return ok(tree);
+      case 'log': return ok('1700000000');
+      default: throw new Error(`Unexpected fixture Git command: ${args.join(' ')}`);
+    }
+  };
+  return { git, mainTip: main, prevHead: main, entries: ['entry.mjs'], env: {},
+    adopt: { mainSha: main, finalSha: final, applied: [{ ref: 'lane/alias', sha: overlay,
+      resolvedVia: 'closure-scope', excluded: ['unmentioned.mjs'] }] } };
+}
+
+it.each(['off', 'shadow', 'on'])('saved candidates reject constructor exclusions in %s mode', closureScopeMode => {
+  expect(readyBuildVerified({ ...savedCandidateGit('export {};'), closureScopeMode })).toBe(true);
+  for (const alias of constructorAliases) {
+    expect(readyBuildVerified({ ...savedCandidateGit(`${alias} await compile(process.argv[2])();`),
+      closureScopeMode }), alias).toBe(false);
+  }
+});
 
 it.each(["import(/* selected at runtime */ './payload.mjs');",
   "import('./payload.mjs' /* trailing */);", "require(// selected\n'./payload.mjs');"])(

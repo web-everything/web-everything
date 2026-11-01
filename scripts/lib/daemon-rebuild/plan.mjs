@@ -6,6 +6,7 @@ import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from '
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { computeClosureScope, fixpointExtend, finalClosureScope, isExcludable } from './closure-scope.mjs';
 import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { createHash } from 'node:crypto';
 
@@ -320,7 +321,8 @@ export async function planOverlayStacks({
  * as `pinned-contained-in-applied` if carried by the applied top, rather than removed as `in-main`), and an overlay
  * already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
- *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
+ *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null, registrationId?:string}>,
+ *   adopted?:{head:string, applied:Array<{ref:string, pr?:number|null, sha:string, registrationId?:string}>}|null,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
  *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
  *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
@@ -334,7 +336,7 @@ export async function planOverlayStacks({
  * Replan at most three times; exhaustion or incomplete evidence retains the ordinary conflict path. */
 export async function planRebuild(options) {
   const { git, entries = [], env = process.env } = options;
-  const mode = options.closureScopeMode ?? resolveClosureScopeMode(env).mode;
+  const mode = lockClosureScopeMode(options.closureScopeMode ?? resolveClosureScopeMode(env).mode);
   let initialEntries = entries;
   if (mode === 'on') {
     try {
@@ -402,7 +404,7 @@ export async function planRebuild(options) {
 async function planRebuildPass({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(), scopeContext = { mode: 'off' },
+  noPin = new Set(), scopeContext = { mode: 'off' }, adopted = null,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -700,7 +702,14 @@ async function planRebuildPass({
         // content is exactly what already passed smoke here, and the build it lands in is still smoked as usual.
         // A ref with no adopted head (a brand-new registration) falls through to the plain drop below, as before.
         const adoptedTip = adoptedTips.get(ref);
-        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
+        // Merge subjects prove content was carried, but contain no registration identity. For a
+        // stamped registration, only the running build's matching adopted row can authorize a pin.
+        // Keep ref/PR history for loss protection even when it cannot authorize reusing that content.
+        const boundRows = adopted?.head === headSha && Array.isArray(adopted.applied)
+          ? adopted.applied.filter((row) => row?.ref === ref && row.registrationId === raw?.registrationId) : [];
+        const pinRegistrationMatches = !raw?.registrationId
+          || (boundRows.length === 1 && boundRows[0].sha === adoptedTip);
+        if (adoptedTip && pinRegistrationMatches && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
           const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
           const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
           // Adopted content already carried by another overlay (merge changes nothing): no pin — a pin that applies
@@ -849,7 +858,7 @@ async function planRebuildPass({
   if (lostBases.length > 0) {
     return planRebuildPass({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, scopeContext,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, scopeContext, adopted,
     });
   }
 
@@ -950,7 +959,7 @@ async function planRebuildPass({
       for (const refs of retryPinGroups()) {
         const alt = await planRebuildPass({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs), scopeContext,
+          keepIndependent, noPin: new Set(refs), scopeContext, adopted,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));

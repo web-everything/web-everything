@@ -191,11 +191,10 @@ describe('removeOverlay', () => {
 describe('recordEdgeResolution', () => {
   const SHA = 'a'.repeat(40);
 
-  it('records actor + sha on a registered overlay, keeps it across a re-add, and leaves an audit event', () => {
+  it('records actor + sha on a registered overlay and leaves an audit event', () => {
     addOverlay(cloneRoot, { ref: 'lane/a' }, { env: env() });
     const list = recordEdgeResolution(cloneRoot, 'lane/a', { sha: SHA, by: ' operator ', reason: 'reviewed', now: '2026-10-05T00:00:00Z' }, { env: env() });
     expect(list[0].edgeResolution).toEqual({ sha: SHA, by: 'operator', at: '2026-10-05T00:00:00Z', reason: 'reviewed' });
-    addOverlay(cloneRoot, { ref: 'lane/a', pr: 9 }, { env: env() });
     expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution.sha).toBe(SHA);
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneRoot)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events.at(-1)).toMatchObject({ kind: 'edge-resolution-recorded', ref: 'lane/a', sha: SHA, by: 'operator' });
@@ -208,6 +207,16 @@ describe('recordEdgeResolution', () => {
     }
     expect(() => recordEdgeResolution(cloneRoot, 'lane/nope', { sha: SHA, by: 'op' }, { env: env() })).toThrow(/not registered/);
     expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution).toBeUndefined();
+  });
+
+  it.each([null, 9])('is dropped by a re-add (a new registration, pr %s) so the old approval never vouches for it', (pr) => {
+    addOverlay(cloneRoot, { ref: 'lane/a', pr: 9 }, { env: env() });
+    recordEdgeResolution(cloneRoot, 'lane/a', { sha: SHA, by: 'op' }, { env: env() });
+    const before = readOverlays(cloneRoot, { env: env() })[0];
+    addOverlay(cloneRoot, { ref: 'lane/a', pr }, { env: env() });
+    const after = readOverlays(cloneRoot, { env: env() })[0];
+    expect(after.registrationId).not.toBe(before.registrationId);
+    expect(after).not.toHaveProperty('edgeResolution');
   });
 
   it('is dropped together with the overlay entry', () => {

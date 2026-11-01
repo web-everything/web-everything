@@ -32,8 +32,9 @@ export const FAILURE_REASONS = new Set([
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-source-unavailable', 'overlay-source-unverifiable', 'overlay-state-corrupt',
-  'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'overlay-registration-duplicate', // Invalid registry state requires operator repair, unlike a retryable CAS race.
+  'overlay-source-unavailable', 'overlay-source-unverifiable', 'overlay-state-corrupt', 'overlay-state-malformed',
+  'pinned-overlay-conflict', 'pinned-overlay-unavailable', 'pinned-overlay-unbound',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'reader-wait-timeout', 'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
@@ -197,7 +198,7 @@ async function rebuildCloneInternal({
   try {
     return await smokeAndAdopt({
       root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly, entries,
     });
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.

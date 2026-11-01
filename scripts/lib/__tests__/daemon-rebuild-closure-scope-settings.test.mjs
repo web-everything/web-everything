@@ -22,7 +22,7 @@ it('default rebuild settings resolve to the module-relative filesystem path in a
 
 it('default rebuild settings supply tool provenance without a path override', () => {
   expect(resolveClosureScopeMode(env)).toEqual({ mode: 'shadow', source: 'tool' });
-  expect(resolveClosureScopeMode({ ...env, WE_DAEMON_CLOSURE_SCOPE: 'on' })).toEqual({ mode: 'on', source: 'env' });
+  expect(resolveClosureScopeMode({ ...env, WE_DAEMON_CLOSURE_SCOPE: 'on' })).toEqual({ mode: 'off', source: 'env' });
 });
 
 it('native Node resolves settings relative to the module from an unrelated working directory', () => {

@@ -114,7 +114,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(f.smoke).not.toHaveBeenCalled();
   }, 60_000);
 
-  it('persists pin notices before a later overlay refuses the plan and deduplicates repeated refused ticks', async () => {
+  it.each([false, true])('persists pin notices across refused ticks and recovers safely (re-register=%s)', async (reregister) => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
     expect(await f.tick()).toMatchObject({ adopted: true });
@@ -130,23 +130,46 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
       expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
     }
     expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
-    // An earlier refusal has an incomplete alert list: it cannot prove the previous pin cleared.
-    removeOverlay(f.clone, 'lane/moving', { env: f.env });
-    addOverlay(f.clone, { ref: 'lane/moving', pr: 5793 }, { env: f.env });
-    const early = await f.tick();
-    expect(early).toMatchObject({ moved: false, reason: 'pinned-overlay-conflict' });
-    expect(early.alerts.some(a => a.kind === 'overlay-pinned')).toBe(false);
-    expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
+    let replacement;
+    let recoveryTip;
+    if (reregister) {
+      // An earlier refusal has an incomplete alert list: it cannot prove the previous pin cleared.
+      removeOverlay(f.clone, 'lane/moving', { env: f.env });
+      replacement = addOverlay(f.clone, { ref: 'lane/moving', pr: 5793 }, { env: f.env }).find(o => o.ref === 'lane/moving');
+      expect(replacement.registrationId).not.toBe(registered.find(o => o.ref === 'lane/moving').registrationId);
+      expect(replacement.tipSha).toBeUndefined();
+      const early = await f.tick();
+      expect(early).toMatchObject({ moved: false, reason: 'pinned-overlay-conflict' });
+      expect(early.alerts.some(a => a.kind === 'overlay-pinned')).toBe(false);
+      expect(readRebuildState(f.clone, f.env).pinnedNotified).toEqual({ 'lane/moving': tip });
+    }
     expect(f.head()).toBe(live);
     expect(f.smoke).not.toHaveBeenCalled();
     removeOverlay(f.clone, 'lane/refusal', { env: f.env });
+    if (reregister) {
+      // A replacement cannot borrow the previous registration's adopted head, even after the refusal leaves.
+      const held = await f.tick();
+      expect(held).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
+      expect(held.alerts.some(a => a.kind === 'overlay-pinned')).toBe(false);
+      expect(f.head()).toBe(live);
+      expect(f.smoke).not.toHaveBeenCalled();
+      expect(readOverlays(f.clone, { env: f.env })).toContainEqual(expect.objectContaining({
+        ref: replacement.ref, registrationId: replacement.registrationId,
+      }));
+      expect(readRebuildState(f.clone, f.env).adopted.applied.find(o => o.ref === 'lane/moving').registrationId)
+        .not.toBe(replacement.registrationId);
+      // Recovery requires a compatible current tip. Its new row belongs to the replacement registration.
+      recoveryTip = f.push('lane/moving', tip, { [DAEMON]: lines({ 2: 'fix a' }) });
+    }
     const recovered = await f.tick();
     expect(recovered.adopted || recovered.reason === 'up-to-date').toBe(true);
     expect(f.pinnedLogs()).toHaveLength(1);
     expect(isAncestor(f.clone, f.mOld, f.head())).toBe(true);
     expect(readOverlays(f.clone, { env: f.env }).map(o => o.ref).sort())
       .toEqual(registered.filter(o => o.ref !== 'lane/refusal').map(o => o.ref).sort());
-  }, 60_000);
+    if (reregister) expect(readRebuildState(f.clone, f.env).adopted.applied.find(o => o.ref === 'lane/moving'))
+      .toMatchObject({ registrationId: replacement.registrationId, sha: recoveryTip });
+  }, 90_000);
 
   it('refuses to pin when the adopted head also conflicts', async () => {
     const f = fixture();

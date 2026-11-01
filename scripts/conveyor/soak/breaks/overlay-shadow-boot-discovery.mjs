@@ -1,7 +1,7 @@
-/** PR #6023: shadow boot and skip checks must not depend on host LaunchAgents. */
+/** Shadow/off and the R284 locked on fallback must not depend on host LaunchAgents. */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkDaemonEntriesBoot, DAEMON_ENTRY_MODULES } from '../../../lib/daemon-boot-smoke.mjs';
 import { smokeSurfaceEntries } from '../../../lib/daemon-rebuild/skip-unrelated.mjs';
@@ -17,7 +17,8 @@ export default {
   },
   async run() {
     const home = mkdtempSync(join(tmpdir(), 'soak-shadow-boot-'));
-    const root = fileURLToPath(new URL('../../../../', import.meta.url));
+    // Resolve on the filesystem so Vite does not rewrite this as a browser asset URL.
+    const root = join(dirname(fileURLToPath(import.meta.url)), '../../../..');
     const violations = [];
     try {
       for (const mode of [undefined, 'off', 'shadow', 'on']) {
@@ -26,11 +27,8 @@ export default {
         let spawned = 0;
         const boot = await checkDaemonEntriesBoot({ root, env, log: {},
           runChild: async () => { spawned++; return '{"ok":true}'; } });
-        if (mode === 'on') {
-          if (boot.ok || spawned || !boot.detail.includes('runtime entries unreadable')) {
-            violations.push('on failed to refuse unreadable LaunchAgents');
-          }
-        } else if (!boot.ok || spawned !== DAEMON_ENTRY_MODULES.length
+        // on now exercises the locked fixed-list fallback, just like off.
+        if (!boot.ok || spawned !== DAEMON_ENTRY_MODULES.length
           || boot.entries.some((entry, i) => entry.entry !== DAEMON_ENTRY_MODULES[i])) {
           violations.push(`${mode ?? 'default'} changed the fixed-list boot gate`);
         }

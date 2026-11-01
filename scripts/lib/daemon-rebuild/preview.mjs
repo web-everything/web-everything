@@ -86,18 +86,21 @@ export async function dryRunRebuild({
 
           const scratchGit = makeGit({ run, cwd: scratchDir, env });
           scratchGit(['remote', 'add', 'origin', url]);
-          fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
+          const fetched = fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
 
-          plan = await planRebuild({
-            entries: runtimeEntries, env, closureScopeMode,
-            git: scratchGit,
-            headSha: head,
-            mainRef: 'origin/main',
-            overlays,
-            prState: prState || ((pr) => defaultPrState({ pr, root })),
-            mainOnly: false,
-            edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
-          });
+          plan = fetched.malformed?.length
+            ? { ok: false, reason: 'overlay-state-malformed', detail: { malformed: fetched.malformed } }
+            : await planRebuild({
+              entries: runtimeEntries, env, closureScopeMode,
+              adopted: state.adopted,
+              git: scratchGit,
+              headSha: head,
+              mainRef: 'origin/main',
+              overlays,
+              prState: prState || ((pr) => defaultPrState({ pr, root })),
+              mainOnly: false,
+              edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+            });
 
           // Same untracked-collision check `doRebuild` runs before its real `reset --hard` (see
           // findUnsafeLocalState's header) — computed here against the scratch repo, which shares `root`'s
@@ -195,10 +198,11 @@ export async function previewOverlayConflict({
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
   // Re-registration must compare the candidate against the other overlays. Including it here can
   // let its established priority drop a peer before even reaching the candidate conflict check.
-  existingOverlays = existingOverlays.filter((o) => o.ref !== ref);
+  existingOverlays = existingOverlays.filter((o) => o?.ref !== ref);
   const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
   const head = verifyRev(rootGit, 'HEAD');
   if (!head) return { ok: false, reason: 'head-unresolved' };
+  const adopted = readRebuildState(root, env).adopted;
 
   let url = originUrl;
   if (!url) {
@@ -227,6 +231,7 @@ export async function previewOverlayConflict({
     scratchGit(['remote', 'add', 'origin', url]);
     const allRefs = existingOverlays.concat([{ ref, pr }]);
     const fetched = fetchMainAndOverlays({ git: scratchGit, overlays: allRefs, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
+    if (fetched.malformed?.length) return { ok: false, reason: 'overlay-state-malformed', detail: { malformed: fetched.malformed } };
     if (!fetched.ok) return { ok: false, reason: 'fetch-failed' };
 
     const mainSha = verifyRev(scratchGit, 'origin/main^{commit}');
@@ -247,6 +252,7 @@ export async function previewOverlayConflict({
     for (;;) {
       planExisting = await planRebuild({
         entries: runtimeEntries, env, closureScopeMode,
+        adopted,
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -280,6 +286,7 @@ export async function previewOverlayConflict({
     if (mt.status === 1) {
       const planCandidate = await planRebuild({
         entries: runtimeEntries, env, closureScopeMode,
+        adopted,
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',

@@ -94,6 +94,7 @@ describe('rebuildClone coordination events', () => {
 
   it.each(['quarantined', 'established-overlay-conflict', 'still-rejected',
     'overlay-source-unavailable', 'overlay-source-unverifiable',
+    'overlay-state-malformed', 'overlay-state-malformed: invalid registration', 'overlay-registration-duplicate',
     'error: build unavailable', 'established-overlay-conflict: lane/example'])(
     'emits rebuild-failed once for a prepare refusal: %s', async (reason) => {
       terminal({ moved: false, reason });
@@ -122,7 +123,7 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
-  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted', 'closure-opaque'])(
+  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted', 'closure-opaque', 'overlay-registration-changed'])(
     'emits nothing for a no-op result: %s', async (reason) => {
       terminal({ moved: false, reason });
       expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
@@ -249,6 +250,7 @@ describe('rebuildClone coordination events', () => {
     const idle = new Set([
       'readonly-job-mutation-due',
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
+      'archive-source-uncovered', // Discards a saved candidate; preparation can still build a fresh one.
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
       'deps-job-started', 'detached-off-main', 'detached-or-unreadable-head', 'detached-with-changes',
