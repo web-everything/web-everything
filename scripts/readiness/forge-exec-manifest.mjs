@@ -109,19 +109,17 @@ function entropy(text) {
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
   return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
 }
-// Content scan for a name-flagged file. JSON gets the full structural scan. Source
-// and docs files (sourceExtension) are public code that legitimately spells out
-// secret patterns (scrubbers, PEM docs): they are unscanned, exactly as before
-// R321. Every other type gets the raw token patterns, minus the PEM markers that
-// ordinary prose and code mention. Returns the first finding or null when clean.
+// Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
+// JSON gets the full structural scan; every other type gets all raw token
+// patterns. A file that fails (scrubbers, docs spelling out secrets) stays
+// excluded, so a run that needs it falls back to the Mac. Returns the first
+// finding or null when clean.
 export function credentialContentFinding(path,content) {
   // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
   // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
   const leaf=classifyManifestPath(path).names.at(-1);
   if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
-  if(sourceExtension.test(leaf))return null;
-  const text=Buffer.from(content).toString('utf8');
-  return secretText.filter(([,name])=>name!=='pem-header'&&name!=='private-key').find(([pattern])=>pattern.test(text))?.[1]??null;
+  return textFinding(Buffer.from(content).toString('utf8'));
 }
 // Returns the first secret-like finding, or null when the content is clean.
 export function designTokenSecretFinding(content) {

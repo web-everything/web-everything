@@ -106,6 +106,24 @@ describe('credential-name rule (R321)',()=>{
     await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
+  it.each(['lib/token-scrub.mjs','docs/token-notes.md','src/credential-view.ts'])('refuses a tracked flagged %s containing a fake secret (R323, no type skip)',async p=>{
+    await write(p,'const x = "ghp_abcdefghijklmnopqrstuvwxyz0123";\n');await git(['add','.']);await commit();
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining(p)});
+  });
+  it('refuses a flagged source file with a PEM marker too',()=>{
+    expect(credentialContentFinding(Buffer.from('a/token.mjs'),Buffer.from('-----BEGIN PRIVATE KEY-----'))).toBe('pem-header');
+  });
+  it('ships a tracked flagged clean .mjs identical to origin/main',async()=>{
+    await write('lib/token-util.mjs','export const ok = 1;\n');await git(['add','.']);await commit();
+    expect(names((await buildManifest({cwd,exec})).entries)).toContain('lib/token-util.mjs');
+  });
+  it('scans the agent-memory bridge source too: secret refused, clean source ships through the alias',async()=>{
+    await write('agent-memory-src/token-note.md','ghp_abcdefghijklmnopqrstuvwxyz0123');await fs.mkdir(join(cwd,'.claude'),{recursive:true});
+    await fs.symlink('../agent-memory-src',join(cwd,'.claude/agent-memory'));await git(['add','.']);await commit();
+    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'excluded-source-file',message:expect.stringContaining('agent-memory-src/token-note.md')});
+    await write('agent-memory-src/token-note.md','clean notes');await git(['add','.']);await commit();
+    expect(names((await buildManifest({cwd,exec})).entries)).toEqual(expect.arrayContaining(['agent-memory-src/token-note.md','.claude/agent-memory/token-note.md']));
+  });
   it('scans non-JSON content with the raw secret patterns',()=>{
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('AKIAABCDEFGHIJKLMNOP'))).toBe('aws-access-key');
     expect(credentialContentFinding(Buffer.from('a/token.njk'),Buffer.from('plain text'))).toBe(null);

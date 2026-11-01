@@ -615,8 +615,11 @@ describe('standards input parity', () => {
       git('init','-b','main'); git('config','user.name','Fixture'); git('config','user.email','fixture@example.invalid');
       const tier = 'scripts/lib/disposition-judge.mjs';
       mkdirSync(join(work,'scripts/lib'),{recursive:true});
-      for (const file of ['check-memory.mjs','lib/write-all-sync.mjs','lib/secret-scrub.mjs'])
+      for (const file of ['check-memory.mjs','lib/write-all-sync.mjs'])
         cpSync(new URL(`../../${file}`,import.meta.url),join(work,'scripts',file));
+      // R323: the real scrubber spells out secret patterns, fails the content scan and is
+      // excluded from Forge, so the fixture uses a clean stand-in to test input parity.
+      writeFileSync(join(work,'scripts/lib/secret-scrub.mjs'),'export const scrubPublish = () => [];\n');
       writeFileSync(join(work,'package-lock.json'),'{}');
       writeFileSync(join(work,'.gitignore'),'coverage/\n');
       mkdirSync(join(work,'.claude')); mkdirSync(join(work,'agent-memory-src'));
