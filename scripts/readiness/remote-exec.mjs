@@ -1089,7 +1089,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const index=timings.findLastIndex(t=>t.stage==='finish-receipt');
         timings.splice(index,0,{stage:'forge-install',startedAtET:easternTimestamp(runAt),ms:reply.timings.installMs},{stage:'forge-run',startedAtET:easternTimestamp(runAt+reply.timings.installMs),ms:reply.timings.runMs});
       }
-      return {mode:'remote',code:result.code};
+      return {mode:'remote',code:result.code,run};
     } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {
     try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }

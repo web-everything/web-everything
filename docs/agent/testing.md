@@ -2024,6 +2024,53 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Forge client telemetry and remote admission
 
+For selected `npx vitest run` phases, verify-lane's remote admission plan rewrites plain
+arguments to `npm run test:unit -- ...`; spawn that planned command without a local slot
+or `WE_HEAVY_ADMISSION_HELD`, so the nested wrapper owns remote execution and local fallback.
+Local decisions keep the raw command and slot. Env-prefixed scanners, JSON-report guards,
+isolated retries and unsupported shell syntax stay local. Keep both planning and actual
+spawn regressions in `scripts/__tests__/verify-remote-routing.test.mjs`.
+When a phase planned without a local slot exits non-zero without proven local execution,
+confirm it once locally through normal admission, with `WE_HEAVY_ADMISSION_HELD` and the original raw command (including
+local timeout flags). Log the confirmation and use its result and failure details for the
+phase and any isolated retry; record `ranOn` as local with `remoteRedConfirmedLocally: true`.
+A valid `local-fallback` report already supplies the local verdict: preserve its exit code and
+failure details without another confirmation, including for edited tests and with isolated retry off.
+Untouched failing files remain eligible for the existing one-time isolated retry, which acquires
+its own local slot. The nested wrapper must report a local completion even when its policy/load
+decision changes after verify's remote preflight, or admission takes a bypass branch.
+The `proven local fallback verdict` regressions execute production `timedRunGate` with injected
+child IO for Vitest and standards under both admission modes, offering a passing second child
+to catch an unconditional retry into green.
+Only a remote-planned first attempt sets `WE_FORGE_GATE_DISPATCH`, without a held local slot.
+Local phases and confirmation clear even an inherited dispatch flag so nested wrappers cannot
+dispatch remotely while the local slot is held. Pin both environment shapes in the spawn fixture.
+Each attempt retains its own phase timeout and admission heartbeat. Remote green never
+reruns; watchdog timeouts and signal failures (including shell-inferred signals) retain their
+infrastructure verdict without local confirmation. Exit 124 never reruns and remains
+infrastructure/unconfirmed until an operator confirms remote termination. Cover green,
+red, 75 deferral, 124, watchdog timeouts, signals and local-planned red,
+including local confirmation failure and restoration of stripped flags in the spawn fixture.
+Set `WE_VERIFY_PHASE_ADMISSION` to `0`/`1` in fixtures and assert the recorded admission mode;
+`false`/`true` strings are ignored and can silently exercise the default twice.
+Wrapper eligibility checks the entire command: compound commands, redirections and shell
+expansions retain a local slot and `WE_HEAVY_ADMISSION_HELD` for their full execution scope.
+Direct wrapper paths must resolve to `scripts/readiness/heavy-admission.mjs` in the target
+checkout; foreign directories with the same suffix retain local admission.
+Keep the compound-wrapper table for both npm scripts and the direct heavy-admission wrapper,
+plus the native spawn regression that observes HELD on both the wrapper and following scanner.
+Plan each phase's own command even when admission spans the whole gate; never reuse an
+earlier phase's rewrite for standards, scanners or guards. Check all original arguments with
+Forge's existing `allowedCommand` guard. Unsupported flags, including `--passWithNoTests`,
+`--testTimeout` and `--hookTimeout`, keep the original command and local admission. Never strip
+flags to qualify a command for Forge: its nested wrapper may fall back locally, where losing
+the requested timeouts or empty-match behavior changes the verdict. Keep the timeout-preservation
+regression for both whole-gate and per-phase admission, including quoted flags. Remote location evidence
+requires a non-empty receipt ID and an integer exit code; a dispatched attempt with an incomplete or missing report is location `unknown` (never local), and any unknown phase makes the overall location unknown.
+Observe report reads in tests: reject an already oversized file before reading content, and
+request at most 65,537 bytes even if a regular file grows after its size check.
+Keep allowlisted reporters; unknown options retain the original local command and admission.
+
 The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
 without `telemetry.json`; it never returns a saved timestamp as evidence of current health.
 Keep the stale-idle-file → SSH adapter → health-check regression alongside the ten-second
