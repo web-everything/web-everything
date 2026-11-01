@@ -30,6 +30,7 @@ function assertNoLinks(dir) {
   for (const name of readdirSync(dir)) {
     const st = lstatSync(join(dir, name));
     if (st.isSymbolicLink()) throw new Error(`seat pool object storage contains a link: ${join(dir, name)}`);
+    if (st.isFile() && st.nlink > 1) throw new Error(`seat pool object storage contains a hard link: ${join(dir, name)}`);
     if (st.isDirectory()) assertNoLinks(join(dir, name));
   }
 }
@@ -116,6 +117,20 @@ function slotNumbers(p) {
 }
 const readRev = (p, n) => { try { return readFileSync(join(p.state, `slot-${n}.rev`), 'utf8').trim(); } catch { return null; } };
 
+/** A slot is ours only if it is a real owned directory registered in THIS pool's store through a real, link-free admin dir. */
+function validateSlot(p, dir) {
+  ownPrivateDir(dir);
+  const admin = join(p.repo, 'worktrees', basename(dir));
+  checkAdminRoot(p); ownPrivateDir(admin); // every admin dir, logs/ and info/ included, must be link-free before git writes
+  const dotGit = lstatOrNull(join(dir, '.git'));
+  if (!dotGit?.isFile()) throw new Error(`seat slot is not a worktree of this pool: ${dir}`);
+  const forward = readFileSync(join(dir, '.git'), 'utf8').trim().replace(/^gitdir: /, '');
+  const reverse = readFileSync(join(admin, 'gitdir'), 'utf8').trim();
+  if (realpathSync(forward) !== realpathSync(admin) || realpathSync(reverse) !== realpathSync(join(dir, '.git'))
+    || readFileSync(join(admin, 'commondir'), 'utf8').trim() !== '../..') throw new Error(`seat slot is not registered in this pool: ${dir}`);
+  return admin;
+}
+
 /**
  * Claim a read-only checkout of exactly `rev`, fetched from `lanePath`.
  * `dir` is a path unique to THIS acquisition (a symlink to the slot), so a repeated cleanup of an old handle can never
@@ -167,16 +182,7 @@ export function acquireSeatSlot({ lanePath, rev, poolDir = defaultPoolDir(), now
       const reused = existsSync(join(dir, '.git')) && readRev(p, n) === rev;
       rmSync(join(p.state, `slot-${n}.rev`), { force: true }); // unknown while the tree is being brought to `rev`
       if (lstatOrNull(dir)) {
-        // Only ever reset a slot that is a real directory of ours, registered in THIS pool's store through a real admin dir.
-        ownPrivateDir(dir);
-        const admin = join(p.repo, 'worktrees', basename(dir));
-        checkAdminRoot(p); ownPrivateDir(admin); // every admin dir, logs/ and info/ included, must be link-free before git writes
-        const dotGit = lstatOrNull(join(dir, '.git'));
-        if (!dotGit?.isFile()) throw new Error(`seat slot is not a worktree of this pool: ${dir}`);
-        const forward = readFileSync(join(dir, '.git'), 'utf8').trim().replace(/^gitdir: /, '');
-        const reverse = readFileSync(join(admin, 'gitdir'), 'utf8').trim();
-        if (realpathSync(forward) !== realpathSync(admin) || realpathSync(reverse) !== realpathSync(join(dir, '.git'))
-          || readFileSync(join(admin, 'commondir'), 'utf8').trim() !== '../..') throw new Error(`seat slot is not registered in this pool: ${dir}`);
+        const admin = validateSlot(p, dir);
         // A previous seat may have left sparse-checkout state or per-worktree config: reset to the plain full tree.
         rmSync(join(admin, 'config.worktree'), { force: true });
         git(['-C', dir, 'sparse-checkout', 'disable'], { allowFail: true }); // restores the full tree and clears skip-worktree bits
@@ -228,13 +234,15 @@ export function pruneSeatPool({ poolDir = defaultPoolDir(), now = Date.now, keep
       if (!tryLock(lockDir, now, undefined, undefined, () => slotBusy(join(p.slots, `slot-${n}`)))) return;
       try {
         if (slotBusy(join(p.slots, `slot-${n}`))) return;
-        ownPrivateDir(join(p.slots, `slot-${n}`));
-        checkAdminRoot(p);
-        git(['-C', p.repo, 'worktree', 'remove', '--force', join(p.slots, `slot-${n}`)], { allowFail: true });
-        rmSync(join(p.slots, `slot-${n}`), { recursive: true, force: true });
+        const slotDir = join(p.slots, `slot-${n}`);
+        if (lstatOrNull(slotDir)) {
+          validateSlot(p, slotDir); // never delete a directory that is not provably this pool's worktree
+          if (git(['-C', p.repo, 'worktree', 'remove', '--force', slotDir], { allowFail: true }).status !== 0) return; // keep it, retry later
+        }
+        rmSync(slotDir, { recursive: true, force: true });
         rmSync(join(p.state, `slot-${n}.rev`), { force: true });
         removed.push(n);
-      } finally { rmSync(lockDir, { recursive: true, force: true }); }
+      } catch { /* an unverifiable slot is kept, not deleted */ } finally { rmSync(lockDir, { recursive: true, force: true }); }
     });
     for (const name of existsSync(p.views) ? readdirSync(p.views) : []) { // views whose slot is gone or whose seat died
       const v = join(p.views, name);

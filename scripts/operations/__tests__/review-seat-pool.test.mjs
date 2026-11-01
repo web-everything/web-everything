@@ -1,6 +1,6 @@
 import { it, expect, afterEach, beforeEach } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, renameSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, renameSync, symlinkSync, utimesSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -221,6 +221,16 @@ it('refuses a store with a redirected refs dir, and prune will not delete throug
   expect(pruneSeatPool({ poolDir: pool, keep: 0 })).toEqual([]);
   expect(existsSync(join(victim, 'foo.input'))).toBe(true);
   expect(existsSync(join(a.slotDir, '.git'))).toBe(true);
+});
+
+it('prune keeps a foreign directory in a slot path, and a hard-linked store file is refused', () => {
+  const a = acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool }); a.release();
+  rmSync(a.slotDir, { recursive: true }); mkdirSync(a.slotDir); writeFileSync(join(a.slotDir, 'foreign.txt'), 'not ours');
+  expect(pruneSeatPool({ poolDir: pool, keep: 0 })).toEqual([]);
+  expect(existsSync(join(a.slotDir, 'foreign.txt'))).toBe(true);
+  const store = join(pool, 'repo.git');
+  linkSync(join(lane, 'stable.txt'), join(store, 'hardlinked'));
+  expect(() => acquireSeatSlot({ lanePath: lane, rev: rev1, poolDir: pool })).toThrow(/hard link/);
 });
 
 it('moves a warm slot to a new commit rewriting only the changed file', () => {
