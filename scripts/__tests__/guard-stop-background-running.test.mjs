@@ -52,6 +52,11 @@ describe('guard-stop-background-running', () => {
     expect(findRunningBackgroundTask(mon)).toMatchObject({ taskId: 'ba59nqsob' });
     expect(findRunningBackgroundTask([...mon, use('toolu_t', 'TaskStop', { task_id: 'ba59nqsob' }), ack('toolu_t', 'ok')])).toBeNull();
   });
+  it('a TaskOutput that shows a terminal status ends the task', () => {
+    const done = [use('toolu_o', 'TaskOutput', { task_id: 'bk12345xy' }), ack('toolu_o', '<status>completed</status> output...')];
+    expect(findRunningBackgroundTask([...bg, ...done])).toBeNull();
+    expect(findRunningBackgroundTask([...bg, use('toolu_o', 'TaskOutput', { task_id: 'bk12345xy' }), ack('toolu_o', '<status>running</status>')])).not.toBeNull();
+  });
   it('fails open on junk input', () => {
     expect(findRunningBackgroundTask(null)).toBeNull();
     expect(findRunningBackgroundTask([null, {}, { message: 7 }])).toBeNull();

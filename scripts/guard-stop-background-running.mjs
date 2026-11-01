@@ -22,6 +22,7 @@ export function findRunningBackgroundTask(entries) {
   const taskIdByUse = new Map();
   const stoppedTaskIds = new Set();
   const finishedUses = new Set();
+  const outputUses = new Map(); // TaskOutput tool_use id -> task id; a terminal status in its result ends the task
   const bashUses = new Map(); // every Bash call: a foreground call can be moved to the background by the harness
   const stopUses = new Map(); // TaskStop/KillShell tool_use id -> task id; counts only if it succeeded
   for (const entry of entries) {
@@ -35,11 +36,13 @@ export function findRunningBackgroundTask(entries) {
             const id = block.input?.task_id || block.input?.shell_id;
             if (id) stopUses.set(block.id, id);
           }
+          if (block.name === 'TaskOutput' && block.input?.task_id) outputUses.set(block.id, block.input.task_id);
           if (block.name === 'Bash') bashUses.set(block.id, String(block.input?.description || block.input?.command || '').slice(0, 120));
         }
         if (entry.type === 'user' && block?.type === 'tool_result') {
           if (block.is_error === true && started.has(block.tool_use_id)) { finishedUses.add(block.tool_use_id); continue; } // the launch failed
           const text = typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? '');
+          if (outputUses.has(block.tool_use_id) && block.is_error !== true && new RegExp(`status[>"':\\s]+(?:${DONE})`, 'i').test(text)) stoppedTaskIds.add(outputUses.get(block.tool_use_id));
           if (stopUses.has(block.tool_use_id) && block.is_error !== true) stoppedTaskIds.add(stopUses.get(block.tool_use_id));
           if (bashUses.has(block.tool_use_id) && !started.has(block.tool_use_id) && block.is_error !== true && /running in background with ID/i.test(text)) {
             started.set(block.tool_use_id, { name: 'Bash', label: bashUses.get(block.tool_use_id) });
