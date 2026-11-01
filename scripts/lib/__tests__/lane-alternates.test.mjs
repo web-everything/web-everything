@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -15,7 +15,7 @@ describe('canonical origin match', () => {
   it('treats the chalbert redirect, the org URL, https and ssh as one repo', () => {
     expect(sameRepoUrl('git@github.com:chalbert/web-everything.git', 'git@github.com:web-everything/web-everything.git')).toBe(true);
     expect(sameRepoUrl('https://github.com/chalbert/web-everything', 'git@github.com:web-everything/web-everything.git')).toBe(true);
-    expect(canonicalRepoSlug('git@github.com:chalbert/web-everything.git')).toBe('github.com/web-everything/web-everything/web-everything'.replace('/web-everything/web-everything/', '/web-everything/'));
+    expect(canonicalRepoSlug('git@github.com:chalbert/web-everything.git')).toBe('github.com/web-everything/web-everything');
   });
   it('keeps different repos apart', () => {
     expect(sameRepoUrl('git@github.com:chalbert/web-everything.git', 'git@github.com:chalbert/plateau-app.git')).toBe(false);
@@ -75,5 +75,28 @@ describe('git-bounded', () => {
   it('passes through the exit status of a fast command', () => {
     const cmd = boundedGitCommand([], 5000);
     expect(spawnSync(process.execPath, [cmd.args[0], '--timeout-ms=5000', '--', 'sh', '-c', 'exit 3']).status).toBe(3);
+  });
+});
+
+describe('hardening', () => {
+  it('does not treat another host or an unrelated chalbert repo as the same', () => {
+    expect(sameRepoUrl('git@evil.example:web-everything/web-everything.git', 'git@github.com:web-everything/web-everything.git')).toBe(false);
+    expect(canonicalRepoSlug('git@github.com:chalbert/plateau-app.git')).toBe('github.com/chalbert/plateau-app');
+  });
+  it('never writes through a symlinked alternates path', () => {
+    const primary = mkRepo(join(root, 'primary')), lane = mkRepo(join(root, 'lane-1'));
+    const outside = join(root, 'outside'); mkdirSync(outside);
+    mkdirSync(join(lane, '.git', 'objects', 'info'), { recursive: true });
+    symlinkSync(join(outside, 'x'), join(lane, '.git', 'objects', 'info', 'alternates'));
+    expect(ensureLaneAlternates({ laneDir: lane, referencePath: primary }).status).toBe('skipped');
+    expect(existsSync(join(outside, 'x'))).toBe(false);
+  });
+  it('never promotes a symlinked or wrong-owner checkout to primary', () => {
+    const ws = join(root, 'ws'); mkdirSync(ws);
+    const lane = mkRepo(join(root, '.lanes', 'web-everything', 'lane-3'));
+    symlinkSync(lane, join(ws, 'sneaky'));
+    mkRepo(join(ws, 'fork'));
+    const origins = { sneaky: 'git@github.com:chalbert/web-everything.git', fork: 'git@evil.example:chalbert/web-everything.git' };
+    expect(findPrimaryForPool({ workspaceDir: ws, poolName: 'web-everything', readOrigin: (d) => origins[d.split('/').pop()] })).toBeNull();
   });
 });

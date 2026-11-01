@@ -7,26 +7,26 @@
  * the fact needs no clone flag, works for a shallow primary (verified: a fetch then transfers 0 objects), and
  * never removes an object.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-/** GitHub renamed/redirected chalbert/web-everything <-> web-everything/web-everything; both are one repo. */
-const ORG_ALIASES = new Map([['chalbert', 'web-everything']]);
+/** GitHub redirects chalbert/web-everything to web-everything/web-everything; that ONE pair is the same repo. */
+const REPO_ALIASES = new Map([['chalbert/web-everything', 'web-everything/web-everything']]);
 
-/** `owner/repo` for ssh/https/scp GitHub-style URLs, lowercased, `.git` stripped, known org redirects folded. PURE. */
+/** `host/owner/repo` for ssh/https/scp URLs, lowercased, `.git` stripped, the known redirect folded. PURE. */
 export function canonicalRepoSlug(url) {
   if (typeof url !== 'string') return null;
   const m = /^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?([^/:]+)[/:]([^/]+)\/([^/]+?)(?:\.git)?\/*$/i.exec(url.trim());
   if (!m) return null;
-  const owner = m[2].toLowerCase();
-  return `${m[1].toLowerCase()}/${ORG_ALIASES.get(owner) ?? owner}/${m[3].toLowerCase()}`;
+  const ownerRepo = `${m[2].toLowerCase()}/${m[3].toLowerCase()}`;
+  return `${m[1].toLowerCase()}/${REPO_ALIASES.get(ownerRepo) ?? ownerRepo}`;
 }
 
-/** Same repository, tolerating transport (ssh vs https) and the chalbert redirect. Non-URL paths compare resolved. PURE. */
+/** Same host+repository, tolerating transport (ssh vs https) and the chalbert redirect. Non-URL paths compare resolved. PURE. */
 export function sameRepoUrl(a, b) {
   if (!a || !b) return false;
   const sa = canonicalRepoSlug(a), sb = canonicalRepoSlug(b);
-  if (sa && sb) return sa.split('/').slice(1).join('/') === sb.split('/').slice(1).join('/');
+  if (sa && sb) return sa === sb;
   return !sa && !sb && resolve(a) === resolve(b);
 }
 
@@ -43,13 +43,17 @@ export function ensureLaneAlternates({ laneDir, referencePath, laneOrigin, refer
   if (laneOrigin && referenceOrigin && !sameRepoUrl(laneOrigin, referenceOrigin)) {
     return { status: 'skipped', reason: 'lane origin differs from the reference origin' };
   }
-  const file = join(laneDir, '.git', 'objects', 'info', 'alternates');
+  const infoDir = join(laneDir, '.git', 'objects', 'info');
+  const file = join(infoDir, 'alternates');
+  // Lane-controlled paths: never write through a symlink, never follow one out of the lane.
+  const isLink = (p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } };
+  if ([join(laneDir, '.git'), join(laneDir, '.git', 'objects'), infoDir, file].some(isLink)) return { status: 'skipped', reason: 'symlink in lane object store path' };
   let current = '';
   try { current = readFileSync(file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') return { status: 'skipped', reason: e.message }; }
-  const lines = current.split('\n').map((l) => l.trim()).filter(Boolean);
-  if (lines.length) return { status: 'present' };
-  mkdirSync(join(laneDir, '.git', 'objects', 'info'), { recursive: true });
-  writeFileSync(file, `${resolve(objects)}\n`);
+  if (current.split('\n').some((l) => l.trim())) return { status: 'present' };
+  mkdirSync(infoDir, { recursive: true });
+  if (isLink(infoDir)) return { status: 'skipped', reason: 'symlink in lane object store path' };
+  writeFileSync(file, `${resolve(objects)}\n`, { flag: current === '' && !existsSync(file) ? 'wx' : 'w' });
   return { status: 'added' };
 }
 
@@ -64,7 +68,7 @@ export function poolNameFromLanePath(path) {
  * directory, never a lane-controlled path) whose origin repo name is the pool name. The chalbert redirect and the
  * org URL are one repo. `readOrigin(dir)` is injected; returns `{ path, origin }` or null.
  */
-export function findPrimaryForPool({ workspaceDir, poolName, readOrigin }) {
+export function findPrimaryForPool({ workspaceDir, poolName, readOrigin, expectedOwners = ['web-everything', 'chalbert'] }) {
   if (!workspaceDir || !poolName) return null;
   const found = [];
   let names = [];
@@ -72,10 +76,15 @@ export function findPrimaryForPool({ workspaceDir, poolName, readOrigin }) {
   for (const name of names) {
     if (name.startsWith('.') || /^lane-\d+$/.test(name)) continue;
     const dir = join(workspaceDir, name);
-    try { if (!statSync(join(dir, '.git')).isDirectory()) continue; } catch { continue; }
+    try {
+      // A real directory with a real .git directory; a symlink (to a lane, say) is never a primary.
+      if (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory() || !lstatSync(join(dir, '.git')).isDirectory()) continue;
+      if (realpathSync(dir) !== join(realpathSync(workspaceDir), name) || /\/\.lanes\//.test(realpathSync(dir))) continue;
+    } catch { continue; }
     const origin = readOrigin(dir);
     const slug = canonicalRepoSlug(origin);
-    if (slug && slug.split('/')[2] === poolName.toLowerCase()) found.push({ path: dir, origin });
+    const [host, owner, repo] = slug ? slug.split('/') : [];
+    if (host === 'github.com' && repo === poolName.toLowerCase() && expectedOwners.includes(owner)) found.push({ path: dir, origin });
   }
   // Daemon clones share the primary's origin; every match names the same repo, so the first (sorted) is as good as any.
   return found.sort((a, b) => a.path.localeCompare(b.path))[0] ?? null;

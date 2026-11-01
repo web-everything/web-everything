@@ -1,4 +1,5 @@
-import { sameRepoUrl } from './lane-alternates.mjs';
+import { sameRepoUrl, ensureLaneAlternates } from './lane-alternates.mjs';
+import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './git-bounded.mjs';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -52,10 +53,14 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     return ['-c', 'remote.origin.uploadpack=git-upload-pack', '-c', 'remote.origin.receivepack=git-receive-pack',
       '-c', 'remote.origin.pushurl=', '-c', 'push.gpgSign=false', '-c', 'gpg.ssh.defaultKeyCommand=', command, ...args];
   };
-  const git = (dir, args, timeout = 120_000) => runGit('git', args, {
-    cwd: dir, env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+  // `bounded` runs the command under git-bounded.mjs so a timeout kills the whole process group (index-pack, ssh).
+  const git = (dir, args, timeout = 120_000, bounded = false) => {
+    const cmd = bounded ? boundedGitCommand(args, timeout) : { file: 'git', args };
+    return runGit(cmd.file, cmd.args, {
+      cwd: dir, env, encoding: 'utf8', timeout: bounded ? timeout + BOUNDED_GIT_GRACE_MS : timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  };
   const checkTransportConfig = dir => {
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
@@ -123,7 +128,11 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     const transportArgs = transport(command, ...args);
     if (preflightError) throw preflightError;
     checkTransportConfig(dir);
-    return git(dir, transportArgs);
+    // A fetch into a lane without alternates re-downloads the repository; repair them first (best effort, add-only).
+    if (command === 'fetch' && repo.referencePath) {
+      try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.referencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
+    }
+    return git(dir, transportArgs, 120_000, true);
   };
   return {
     aheadShas: dir => git(dir, ['rev-list', `origin/${repo.branch}..HEAD`]).split('\n').filter(Boolean),
