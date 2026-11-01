@@ -173,6 +173,7 @@ import {
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { stripGateOnlyOptions } from './forge-gate-options.mjs';
+import { createMarkerReaper, markerContent, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -789,7 +790,7 @@ export async function runWithRemoteDecision({
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
+  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
@@ -804,15 +805,23 @@ export async function runWithRemoteDecision({
   const waitAt = clock();
   let slot;
   let healthAt = waitAt;
+  let reapedAt = -Infinity;
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log});
   let overloadWaitLogged = false;
   try {
     for (;;) {
       const nowMs = clock();
       // The extended overload wait never acquires a slot past the run's own timeout.
       if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
-      const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
+      const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
       if(slot.ok)break;
+      // Dead clients' markers must not wall off the cap while Forge is idle: reap by owner liveness plus Forge's own state.
+      if(nowMs-reapedAt>=2000){
+        reapedAt=nowMs;
+        const reaped=await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs);
+        if(reaped.length)continue;
+      }
       const waited = nowMs - waitAt;
       if (waited >= REMOTE_FULL_WAIT_MS) {
         // 7579: local admission would defer an overloaded host at once, so keep queueing for a Forge slot
@@ -858,7 +867,12 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      writeFileSync(executionMarker,'remote termination unconfirmed\n',{flag:'wx',mode:0o600});
+      // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
+      if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+      // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
+      // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
+      if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {

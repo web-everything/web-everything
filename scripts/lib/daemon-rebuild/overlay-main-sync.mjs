@@ -427,7 +427,9 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     io.statSync(join(root, 'node_modules'));
     io.symlinkSync(join(root, 'node_modules'), join(scratch, 'node_modules'), 'dir');
     const frontier = resolve(root, '..', 'frontierui');
-    if (io.existsSync(frontier)) io.symlinkSync(frontier, join(scratchParent, 'frontierui'), 'dir');
+    // A real, clean clone, never a link: the Forge manifest refuses a symlinked or dirty sibling, so a link here
+    // forced every scratch test run back onto the Mac. A local clone is cheap (hardlinked objects) and committed-only.
+    if (io.existsSync(frontier)) output(git(['clone', '--quiet', '--local', frontier, join(scratchParent, 'frontierui')], scratchParent));
     setStep('tests');
     for (let offset = 0; offset < tests.length; offset += 50) {
       const chunk = tests.slice(offset, offset + 50);
