@@ -261,6 +261,8 @@ export const MISS_BACKOFF_HOLD_ELIGIBILITY = Object.freeze({
   'card-group-hold': false,
   'card-grouped': false,
   'enqueue-backoff': false,
+  // Also covers unreadable timeline evidence, which can recover without changing the head or labels.
+  'mq-same-head-failed': false,
   'live-state-unreadable': false,
   'bornas-unreadable': false,
   conflict: false,
