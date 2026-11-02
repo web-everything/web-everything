@@ -270,9 +270,9 @@ const DIAG_LINES = 10;
 const DIAG_LINE_CHARS = 300;
 const DIAG_TOTAL_CHARS = 2400;
 // A gh-throttle slot refusal is the cause of a child's exit 1, but lives only in stderr; the classifier reads detail.
-const GH_THROTTLE_REFUSAL = /^(?:✗ reconcile pass could not read state: )?(gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[^)]*\))(?:; retry next tick)?$/;
-// Only the LAST stderr line may be a refusal, bare or echoed by reconcile-pass's CLI catch.
-// Any other prefix/suffix or later failure stays code; the catch itself adds no new failure cause.
+const GH_THROTTLE_REFUSAL = /^(?:✗ reconcile pass could not read state: (?:open-PR list unreadable for [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+: (?:page page [1-9]\d*|hydrate PR #[1-9]\d*) failed: )?)?(gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[^)]*\))(?:; retry next tick)?$/;
+// Only the LAST stderr line may be a refusal, bare or echoed by reconcile-pass's CLI catch,
+// including PrListUnreadableError's page/hydration context. Unknown wrappers or later failures stay code.
 const throttleCause = (e) => {
   // A signal/crash exit, a non-1 exit code, or any Error/crash line anywhere in stderr is a code failure.
   if (e?.signal || e?.status !== 1) return undefined;
@@ -1284,6 +1284,14 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
   // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
   const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
   if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  // Background gh slots normally give up after 8s. Only markers emitted after throttleCause's exit/stderr
+  // checks qualify; check elapsed time against their own wait, as for a bounded kill. With several failed
+  // repos use the longest wait, so one short refusal cannot excuse a longer one that failed too quickly.
+  const slotWaits = [...detail.matchAll(/ — smoke-env-cause: gh-throttle: throttled — no gh slot within (\d+(?:\.\d+)?)s \(class=[^)]*\)/g)]
+    .map(match => Number(match[1]) * 1000);
+  if (slotWaits.length && slotWaits.every(ms => Number.isFinite(ms) && ms >= MIN_OWN_CAP_MS)) {
+    return Number(row.ms) >= Math.min(minElapsedMs, Math.max(...slotWaits) * 0.9);
+  }
   return Number(row.ms) >= minElapsedMs;
 }
 
