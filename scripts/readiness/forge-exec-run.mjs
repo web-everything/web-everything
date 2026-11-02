@@ -502,17 +502,18 @@ async function procStart(pid) {
   try {const data=(await filesystem.readFile('/proc/'+pid+'/stat')).toString('latin1');return data.slice(data.lastIndexOf(')')+2).split(' ')[19];}
   catch(error) {if(error.code!=='ENOENT')return undefined; return filesystem.access('/proc/self/stat').then(()=>null,()=>undefined);}
 }
-export async function uidBusy(uid) {
+// procFs is direct test injection only; production always uses the real process filesystem.
+export async function uidBusy(uid, procFs=filesystem) {
   // A process can fork and exit between listing /proc and reading its entry. Any vanished entry
   // makes the scan unstable; repeat, and treat a scan that never settles as busy (fail closed).
   for(let attempt=0;attempt<4;attempt++) {
     let vanished=false;
-    for(const entry of await readdir('/proc')) {
+    for(const entry of await procFs.readdir('/proc')) {
       if(!/^\d+$/.test(entry))continue;
       try {
         // Credentials come from status (world-readable even for non-dumpable processes), never from
         // the /proc/<pid> owner, which flips to root when a worker clears its dumpable flag.
-        const status=(await filesystem.readFile('/proc/'+entry+'/status')).toString('latin1');
+        const status=(await procFs.readFile('/proc/'+entry+'/status')).toString('latin1');
         const ids=/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/m.exec(status);
         if(!ids)return true; // credentials undeterminable: keep the reservation
         if(!ids.slice(1).some(id=>Number(id)===uid))continue;

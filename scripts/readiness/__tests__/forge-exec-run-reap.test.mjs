@@ -33,6 +33,135 @@ beforeEach(async () => {
 });
 afterEach(async () => { await rm(root, {recursive: true, force: true}); });
 const owner = {pid: 4242, start: '777'};
+
+// Exercise the production scanner without relying on host /proc contents or process churn.
+const workerUid = 20001;
+const procStatus = (ids = [7, 7, 7, 7], state = 'S (sleeping)') =>
+  `Name:\tworker\nState:\t${state}\nUid:\t${ids.join('\t')}\n`;
+function procFixture({entries = ['self', 'net', '42'], readStatus = () => procStatus()} = {}) {
+  const calls = {lists: 0, reads: [], stats: 0};
+  return {
+    calls,
+    async readdir(path) {
+      expect(path).toBe('/proc');
+      calls.lists++;
+      return entries;
+    },
+    async readFile(path) {
+      expect(path).toMatch(/^\/proc\/\d+\/status$/);
+      calls.reads.push(path);
+      return Buffer.from(await readStatus(path, calls.lists));
+    },
+    async stat() { calls.stats++; return {uid: 0}; },
+  };
+}
+const procError = code => Object.assign(new Error(code), {code});
+describe('production uidBusy scanner', () => {
+  it('retries vanished process entries before reporting a settled scan idle', async () => {
+    const proc = procFixture({entries: ['42', '43'], readStatus: (path, attempt) => {
+      if (path === '/proc/42/status' && attempt < 4) throw procError('ENOENT');
+      return procStatus();
+    }});
+    expect(await uidBusy(workerUid, proc)).toBe(false);
+    expect(proc.calls.lists).toBe(4);
+    expect(proc.calls.reads).toEqual(Array.from({length: 4}, () => ['/proc/42/status', '/proc/43/status']).flat());
+  });
+  it('finds worker credentials after retrying a vanished entry', async () => {
+    const proc = procFixture({readStatus: (_path, attempt) => {
+      if (attempt === 1) throw procError('ENOENT');
+      return procStatus([workerUid, 7, 7, 7]);
+    }});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(proc.calls.lists).toBe(2);
+  });
+  it('retries vanished entries and stays busy after exhaustion', async () => {
+    const proc = procFixture({entries: ['42', '43'], readStatus: path => {
+      if (path === '/proc/42/status') throw procError('ENOENT');
+      return procStatus();
+    }});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(proc.calls.lists).toBe(4);
+    expect(proc.calls.reads).toEqual(Array.from({length: 4}, () => ['/proc/42/status', '/proc/43/status']).flat());
+  });
+  it.each(['EACCES', 'EIO'])('keeps slots when credentials are unreadable (%s)', async code => {
+    const proc = procFixture({readStatus: () => { throw procError(code); }});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(proc.calls.lists).toBe(1);
+  });
+  it.each(['Name:\tworker\n', 'Uid:\t7\t7\t7\n', 'Uid:\t7\t7\tunknown\t7\n'])(
+    'keeps slots when credentials are malformed (%j)', async status => {
+      const proc = procFixture({readStatus: () => status});
+      expect(await uidBusy(workerUid, proc)).toBe(true);
+      expect(proc.calls.lists).toBe(1);
+    });
+  it.each([0, 1, 2, 3])('matches credential field %i independently of proc ownership', async field => {
+    const ids = [7, 7, 7, 7];
+    ids[field] = workerUid;
+    const proc = procFixture({readStatus: () => procStatus(ids)});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(proc.calls.reads).toEqual(['/proc/42/status']);
+    expect(proc.calls.stats).toBe(0); // A non-dumpable worker's proc directory is owned by root.
+  });
+  it('keeps slots for a zombie leader whose threads may still live', async () => {
+    const proc = procFixture({readStatus: () => procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)')});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(proc.calls.reads).toEqual(['/proc/42/status']);
+  });
+  it('reports idle only after checking every numeric process entry', async () => {
+    const proc = procFixture({entries: ['self', 'net', '42', '43']});
+    expect(await uidBusy(workerUid, proc)).toBe(false);
+    expect(proc.calls.reads).toEqual(['/proc/42/status', '/proc/43/status']);
+    expect(proc.calls.lists).toBe(1);
+  });
+  it('finds a worker after scanning unrelated processes', async () => {
+    const proc = procFixture({entries: ['42', '43'], readStatus: path =>
+      procStatus(path === '/proc/43/status' ? [7, workerUid, 7, 7] : undefined)});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(proc.calls.reads).toEqual(['/proc/42/status', '/proc/43/status']);
+  });
+  it('does not report idle when the process directory cannot be listed', async () => {
+    const proc = procFixture();
+    proc.readdir = async () => { throw procError('EACCES'); };
+    await expect(uidBusy(workerUid, proc)).rejects.toMatchObject({code: 'EACCES'});
+  });
+  it.each(['reserved', 'orphan'].flatMap(kind =>
+    ['unreadable', 'malformed', 'unstable', 'zombie', 'unlistable'].map(shape => [kind, shape])))(
+    'keeps leaked %s state when the production scan is %s', async (kind, shape) => {
+      const leaked = await leak(1, 20, {owner});
+      if (kind === 'orphan') await rm(leaked.lock, {recursive: true});
+      const proc = procFixture({readStatus: () => {
+        if (shape === 'unreadable') throw procError('EACCES');
+        if (shape === 'unstable') throw procError('ENOENT');
+        return shape === 'zombie' ? procStatus([workerUid, workerUid, workerUid, workerUid], 'Z (zombie)') : 'Name:\tworker\n';
+      }});
+      if (shape === 'unlistable') proc.readdir = async () => {
+        proc.calls.lists++;
+        throw procError('EACCES');
+      };
+      probe.start = async () => null;
+      probe.uidBusy = uid => uidBusy(uid, proc);
+      expect((await makeRunner().telemetry()).activeRuns).toBe(1);
+      expect(await exists(leaked.lock)).toBe(kind === 'reserved');
+      expect(await exists(leaked.file)).toBe(true);
+      expect(await exists(join(receipts, 'reap-audit.log'))).toBe(false);
+      expect(proc.calls.lists).toBeGreaterThan(0);
+    });
+  it.each(['reserved', 'orphan'])('reaps leaked %s state after the production scan settles idle', async kind => {
+    const leaked = await leak(1, 21, {owner});
+    if (kind === 'orphan') await rm(leaked.lock, {recursive: true});
+    const proc = procFixture({readStatus: (_path, attempt) => {
+      if (attempt === 1) throw procError('ENOENT');
+      return procStatus();
+    }});
+    probe.start = async () => null;
+    probe.uidBusy = uid => uidBusy(uid, proc);
+    expect((await makeRunner().telemetry()).activeRuns).toBe(0);
+    expect(proc.calls.lists).toBe(2);
+    expect(await exists(leaked.lock)).toBe(false);
+    expect(await exists(leaked.file)).toBe(false);
+    expect(await exists(join(receipts, 'reap-audit.log'))).toBe(true);
+  });
+});
 describe('forge leaked-state reaper', () => {
   it('reaps a run whose pid is dead, logs it, and reports zero live runs', async () => {
     const dead = await leak(1, 1, {owner});
