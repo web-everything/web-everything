@@ -3683,7 +3683,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   it.each([
     `GIT_DIR=${CLONE}/.git git log && git commit -m x`,
     `env GIT_WORK_TREE=${CLONE} git log; git reset --hard`,
-    `echo GIT_DIR=${CLONE}/.git; git add .`,
+    `echo GIT_DIR=${CLONE}/.git; git add scripts/guard-bash.mjs`,
     `git reset --hard; printf '%s\\n' GIT_DIR=${CLONE}/.git`,
     `git reset --hard; export GIT_WORK_TREE=${CLONE}`,
     `git reset --hard; GIT_DIR=${CLONE}/.git`,
