@@ -8,6 +8,7 @@
  * Real deps bind only in defaultDeps.
  */
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import nodeFs from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, resolve, relative, join } from 'node:path';
@@ -15,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
-import { recordPendingAdoption } from '../lib/overlay-adoption.mjs';
+import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
 import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 import { planRetirements } from './prototype-retire.mjs';
@@ -259,6 +260,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
+    let pendingAdoption = null;
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
     // Once the replacement is registered, failures name the retained contained registrations.
     const keptNote = () => {
@@ -332,7 +334,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!validSha(input.sha)) return stop('bad-input', { detail: 'bad-sha', fallback: 'Use the full 40-character sha (git rev-parse origin/<branch>), not a short sha.' });
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
-      if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && !(Number(input.waitAdoptionMs) >= 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
+      if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
       stage = 'no-ready';
       out.gate = readyEvidence(jsonLines(read(expand(config.readyRecordPath))), input);
       if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: `No fix-ready record in ${config.readyRecordPath} matches ref=${input.branch} sha=${input.sha}. A record needs the fields {"ref":"${input.branch}","sha":"${input.sha}","tests":"green","audit":"NOT WEAKENED"}; write it after the scoped tests pass and the Codex audit says NOT WEAKENED, or pass --tests-run and --audit="NOT WEAKENED".` });
@@ -553,7 +555,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // about 180 s. By default return right after registration; the rebuild path emits overlay-adopted later.
       const waitMs = Math.min(WAIT_ADOPTION_CAP_MS, Math.max(0, Number(input.waitAdoptionMs) || 0), config.adoption.timeoutMs);
       const deadline = registeredAt + waitMs;
-      out.adoptionEventTracked = recordPendingAdoption(out.clone, { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null }, { env: childEnv, fs });
+      pendingAdoption = { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null, nonce: randomUUID() };
+      out.adoptionEventTracked = recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.
       const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
@@ -596,7 +599,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           out.adoption.reason = reason;
           // Registered and waiting for the next rebuild is not a failure: it succeeded, adoption is pending.
           Object.assign(out, { ok: true, result: 'registered-pending', adopted: false,
-            message: `Registered ${out.effectiveRef}@${out.effectiveSha.slice(0, 7)} on ${input.daemon}; not adopted yet. ${detail} The rebuild emits an overlay-adopted daemon event when it lands (overlay-adoption-overdue if it takes over 15 minutes). Do not wait or poll for it.${out.adoptionEventTracked ? '' : ' Warning: the pending-adoption record could not be written, so no overlay-adopted event will follow; check the daemon rebuild state instead.'}`,
+            message: `Registered ${out.effectiveRef}@${out.effectiveSha.slice(0, 7)} on ${input.daemon}; not adopted yet. ${detail} The rebuild emits an overlay-adopted daemon event when it lands (overlay-adoption-overdue if it takes over 15 minutes). Event tracking lasts up to ${OVERLAY_ADOPTION_TTL_MS / 86400000} days and retains the newest ${OVERLAY_ADOPTION_MAX_PENDING} registrations per clone; if tracking expires or is displaced, check the daemon rebuild state. Do not wait or poll for it.${out.adoptionEventTracked ? '' : ' Warning: the pending-adoption record could not be written, so no overlay-adopted event will follow; check the daemon rebuild state instead.'}`,
             fallback: `${detail}${keptNote()}` });
           return out;
         }
@@ -612,6 +615,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }
       catch (e) { out.ok = false; out.stopReason ||= 'check-unverifiable'; out.recordError = String(e.message || e); }
+      // Pending is the only outcome that delegates its adoption notice to the rebuild path. Do not leave
+      // refused/unverifiable loads or a load already adopted during its wait to emit misleading notices.
+      if (out.adoptionEventTracked && (out.result !== 'registered-pending' || !out.ok)) {
+        clearPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
+      }
     }
   };
 }

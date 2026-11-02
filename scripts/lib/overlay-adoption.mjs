@@ -3,6 +3,9 @@
  * rebuild path (not a human, not a waiting worker) announce when the registered sha becomes an ancestor
  * of the clone HEAD (`overlay-adopted`), or that it is still not adopted after a while
  * (`overlay-adoption-overdue`, once). Every function is best-effort: failure never changes a rebuild.
+ * Retention: at most 128 registrations per clone, for seven days. Expired/invalid dates are discarded
+ * before ancestry probes; the oldest registrations yield to new ones at capacity. Retryable event-write
+ * failures retain records within those bounds. Terminal loader outcomes clear only their own nonce.
  */
 import { spawnSync } from 'node:child_process';
 import nodeFs from 'node:fs';
@@ -11,6 +14,8 @@ import { randomUUID } from 'node:crypto';
 import { overlayFilePath } from './daemon-overlays.mjs';
 
 export const OVERLAY_ADOPTION_OVERDUE_MS = 15 * 60 * 1000;
+export const OVERLAY_ADOPTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const OVERLAY_ADOPTION_MAX_PENDING = 128;
 const FULL_SHA = /^[a-f0-9]{40}$/i;
 // Kept in its own subdirectory with a non-.json name: the overlay registry treats every <key>.json* file in the
 // overlay dir as clone state and drops the ones it cannot read (seen live: pending records were deleted as 'stale').
@@ -37,7 +42,7 @@ export function readPendingAdoptions(root, { env = process.env, fs = nodeFs } = 
 
 function writePending(root, env, fs, list) {
   const file = pendingAdoptionPath(root, env);
-  if (!list.length) { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } return; }
+  if (!list.length) { fs.rmSync(file, { force: true }); return; }
   fs.mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(list)}\n`, 'utf8');
@@ -64,10 +69,23 @@ function updatePending(root, env, fs, change, { staleMs = 10000, waitMs = 3000 }
 }
 
 /** Record that `ref`@`sha` was registered on `root` and awaits adoption. Replaces an older record for the same ref. */
-export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOString(), loadedBy = null }, { env = process.env, fs = nodeFs } = {}) {
-  if (!FULL_SHA.test(sha || '') || typeof ref !== 'string') return false;
+export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOString(), loadedBy = null, nonce = randomUUID() }, { env = process.env, fs = nodeFs } = {}) {
+  if (!FULL_SHA.test(sha || '') || typeof ref !== 'string' || !Number.isFinite(Date.parse(at))) return false;
   try {
-    updatePending(root, env, fs, (list) => [...list.filter((r) => r.ref !== ref), { ref, sha, at, loadedBy, nonce: randomUUID() }]);
+    updatePending(root, env, fs, (list) => [...list.filter((r) => r.ref !== ref
+      && Number.isFinite(Date.parse(r.at)) && Date.parse(at) - Date.parse(r.at) < OVERLAY_ADOPTION_TTL_MS)
+      .slice(-(OVERLAY_ADOPTION_MAX_PENDING - 1)), { ref, sha, at, loadedBy, nonce }]);
+    return true;
+  } catch { return false; }
+}
+
+const sameRecord = (a, b) => a.ref === b.ref && a.sha === b.sha && a.nonce === b.nonce;
+
+/** Clear this load's record under the same mutex, preserving any concurrently refreshed registration. */
+export function clearPendingAdoption(root, record, { env = process.env, fs = nodeFs } = {}) {
+  if (!record || typeof record.nonce !== 'string' || !record.nonce) return false;
+  try {
+    updatePending(root, env, fs, (list) => list.filter((r) => !sameRecord(r, record)));
     return true;
   } catch { return false; }
 }
@@ -77,7 +95,9 @@ const defaultIsAncestor = (root, sha) =>
 
 /**
  * Called from the rebuild path after every pass. Emits overlay-adopted when a pending sha is an ancestor of
- * HEAD (and forgets it), overlay-adoption-overdue once when it is older than overdueMs. Returns the events.
+ * HEAD (and forgets it), overlay-adoption-overdue once when it is older than overdueMs. Prunes at the
+ * seven-day TTL and limits ancestry probes to the newest 128 records, including older persisted files.
+ * Returns the events.
  */
 export async function checkPendingAdoptions({ root, env = process.env, fs = nodeFs, emit, daemon, now = () => Date.now(),
   overdueMs = OVERLAY_ADOPTION_OVERDUE_MS, isAncestor = defaultIsAncestor } = {}) {
@@ -87,8 +107,17 @@ export async function checkPendingAdoptions({ root, env = process.env, fs = node
     if (!pending.length) return sent;
     const adoptedDone = []; // records whose overlay-adopted event was really written
     const overdueDone = [];
-    for (const rec of pending) {
-      const ageMs = now() - Date.parse(rec.at);
+    const pruned = [];
+    const checkedAt = now();
+    const active = pending.filter((rec, i) => {
+      const ageMs = checkedAt - Date.parse(rec.at);
+      if (i < pending.length - OVERLAY_ADOPTION_MAX_PENDING || !Number.isFinite(ageMs) || ageMs >= OVERLAY_ADOPTION_TTL_MS) {
+        pruned.push(rec); return false;
+      }
+      return true;
+    });
+    for (const rec of active) {
+      const ageMs = checkedAt - Date.parse(rec.at);
       let adopted = false;
       try { adopted = isAncestor(root, rec.sha); } catch { adopted = false; }
       let ev = null;
@@ -102,11 +131,14 @@ export async function checkPendingAdoptions({ root, env = process.env, fs = node
       sent.push(ev);
       (adopted ? adoptedDone : overdueDone).push(rec);
     }
-    if (sent.length) {
+    if (sent.length || pruned.length) {
       // Reconcile against FRESH state under the lock: a registration made while we emitted must survive.
-      const same = (list, r) => list.some((x) => x.ref === r.ref && x.sha === r.sha && x.nonce === r.nonce);
-      updatePending(root, env, fs, (fresh) => fresh.filter((r) => !same(adoptedDone, r))
-        .map((r) => (same(overdueDone, r) ? { ...r, overdueSent: true } : r)));
+      // Sets keep pruning linear even for a historical file far above the new entry bound.
+      const key = (r) => JSON.stringify({ ref: r.ref, sha: r.sha, nonce: r.nonce });
+      const forgotten = new Set([...adoptedDone, ...pruned].map(key));
+      const overdue = new Set(overdueDone.map(key));
+      updatePending(root, env, fs, (fresh) => fresh.filter((r) => !forgotten.has(key(r)))
+        .map((r) => (overdue.has(key(r)) ? { ...r, overdueSent: true } : r)));
     }
   } catch { /* never affects a rebuild */ }
   return sent;

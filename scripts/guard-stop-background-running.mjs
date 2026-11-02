@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { readTranscriptTail } from './guard-stop-passive-wait.mjs';
 
-const DONE = 'completed|failed|killed|stopped|cancelled|canceled|error';
+const DONE = 'completed|failed|killed|stopped|cancelled|canceled|error|timed_out|exited';
 
 /** First background Bash / Monitor started in this transcript with no completion notice and no TaskStop. Pure. */
 export function findRunningBackgroundTask(entries) {
@@ -81,11 +81,14 @@ if (IS_CLI) {
   try {
     const event = JSON.parse(readFileSync(0, 'utf8'));
     if (event.hook_event_name !== 'SubagentStop') process.exit(0);
+    // The harness marks a recursive stop attempt even when hook feedback is absent from the transcript.
+    // As in the sibling stop guard, let that retry through rather than relying on persisted markers.
+    if (event.stop_hook_active === true) process.exit(0);
     const path = event.agent_transcript_path;
     if (typeof path !== 'string' || !path) process.exit(0);
     const entries = readTranscriptTail(path).filter((entry) =>
       (!entry?.sessionId || entry.sessionId === event.session_id) && (!entry?.agentId || entry.agentId === event.agent_id));
-    // Bounded: after MAX_BLOCKS refusals in this transcript let the stop through rather than wedge the worker.
+    // Also bound older harnesses that persist feedback but do not set stop_hook_active.
     const priorBlocks = entries.filter((e) => e?.type !== 'assistant' && JSON.stringify(e).includes(GUARD_MARKER)).length;
     const task = priorBlocks >= MAX_BLOCKS ? null : findRunningBackgroundTask(entries);
     if (task) {

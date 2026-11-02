@@ -4,7 +4,7 @@
  * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -19,6 +19,7 @@ import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
+import { checkPendingAdoptions, readPendingAdoptions, recordPendingAdoption } from '../../lib/overlay-adoption.mjs';
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
 const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control', waitAdoptionMs: 30 };
 const settings = {
@@ -217,6 +218,15 @@ function fixture(options = {}) {
     ? options.combinedTest(input)
     : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
   if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
+  if (options.pendingFs) {
+    const readFixture = fs.readFileSync;
+    const mkdirFixture = fs.mkdirSync;
+    for (const method of ['writeFileSync', 'renameSync', 'rmSync', 'rmdirSync', 'statSync']) fs[method] = options.pendingFs[method];
+    fs.readFileSync = (p, ...args) => String(p).endsWith('.pending')
+      ? options.pendingFs.readFileSync(p, ...args) : readFixture(p, ...args);
+    fs.mkdirSync = (p, ...args) => String(p).includes('/adoption-pending')
+      ? options.pendingFs.mkdirSync(p, ...args) : mkdirFixture(p, ...args);
+  }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
@@ -1331,6 +1341,74 @@ describe('prototype-load', () => {
     expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false, stopReason: null });
     expect(r.message).toContain('overlay-adopted');
     expect(f.sleeps).toEqual([]);
+  });
+  it.each([[false, undefined], [true, undefined], [false, 30]])('wires loader registration to a rebuild adoption event (generated merge: %s, wait: %s)', async (behind, waitAdoptionMs) => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-pending-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: dir };
+    try {
+      const f = fixture({ timeout: true, behind, pendingFs: nodeFs, env });
+      const r = await f.run({ waitAdoptionMs });
+      expect(r).toMatchObject({ ok: true, result: 'registered-pending', adoptionEventTracked: true,
+        clone: '/home/test/workspace/wev-control', effectiveRef: behind ? 'lane/new-m1' : BASE.branch, effectiveSha: behind ? MERGE : SHA });
+      expect(r.message).toContain('up to 7 days');
+      expect(r.message).toContain('newest 128 registrations');
+      expect(r.message).toContain('check the daemon rebuild state');
+      expect(readPendingAdoptions(r.clone, { env })).toEqual([expect.objectContaining({ ref: r.effectiveRef, sha: r.effectiveSha, loadedBy: 'tester' })]);
+      const events = [];
+      const isAncestor = vi.fn(() => true);
+      await checkPendingAdoptions({ root: r.clone, env, now: () => 0, daemon: BASE.daemon, isAncestor, emit: (e) => events.push(e) });
+      expect(isAncestor).toHaveBeenCalledWith(r.clone, r.effectiveSha);
+      expect(events).toEqual([expect.objectContaining({ kind: 'overlay-adopted', daemon: BASE.daemon,
+        detail: expect.objectContaining({ ref: r.effectiveRef, sha: r.effectiveSha }) })]);
+      expect(readPendingAdoptions(r.clone, { env })).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('warns when the pending-adoption tracking write fails', async () => {
+    const r = await fixture({ timeout: true }).run({ waitAdoptionMs: undefined });
+    expect(r.adoptionEventTracked).toBe(false);
+    expect(r.message).toContain('pending-adoption record could not be written');
+    expect(r.message).toContain('no overlay-adopted event will follow');
+  });
+  it.each([
+    ['adoption-refused', { alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: BASE.branch, kind: 'conflict-dropped' }) }, false],
+    ['check-unverifiable', { adoptionError: 2 }, false],
+    ['adopted in wait', {}, true],
+    ['adopted before swap refusal', { list: ['lane/old'], contained: ['lane/old'] }, true],
+  ])('clears pending adoption on terminal outcome: %s', async (_, options, adopted) => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-terminal-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: dir };
+    const clone = '/home/test/workspace/wev-control';
+    try {
+      recordPendingAdoption(clone, { ref: 'lane/unrelated', sha: TREE, at: new Date(0).toISOString() }, { env });
+      const writes = vi.fn(nodeFs.renameSync);
+      const f = fixture({ ...options, pendingFs: { ...nodeFs, renameSync: writes }, env });
+      const r = await f.run();
+      expect(r.registered).toBe(true);
+      expect(r.adoptionEventTracked).toBe(true);
+      expect(r.adopted).toBe(adopted);
+      if (options.adoptionError) expect(r.stopReason).toBe('check-unverifiable');
+      if (options.alerts) expect(r.stopReason).toBe('adoption-refused');
+      expect(writes).toHaveBeenCalled();
+      expect(readPendingAdoptions(clone, { env }).map((rec) => rec.ref)).toEqual(['lane/unrelated']);
+      const events = [];
+      await checkPendingAdoptions({ root: clone, env, now: () => 16 * 60000, isAncestor: () => true, emit: (e) => events.push(e) });
+      expect(events.map((e) => e.detail.ref)).toEqual(['lane/unrelated']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['bad-sha', { sha: 'abc1234' }, {}, 'full 40-character sha'],
+    ['bad-branch', { branch: 'main' }, {}, 'Pass --branch=lane/<name>'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: -1, pollMs: 10 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: 30, pollMs: 0 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: Infinity, pollMs: 10 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: 30, pollMs: NaN } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: -1 }, {}, 'number of milliseconds'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: 'NaN' }, {}, 'number of milliseconds'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: 'Infinity' }, {}, 'number of milliseconds'],
+  ])('explains bad-input refusal %s (%j, %j)', async (detail, input, overrides, fallback) => {
+    const f = fixture({ settings: overrides });
+    expect(await f.run(input)).toMatchObject({ ok: false, stopReason: 'bad-input', detail, fallback: expect.stringContaining(fallback) });
+    expect(f.calls).toEqual([]);
   });
   it('--wait-adoption-ms opts into a bounded wait and is capped under 170 s', async () => {
     const f = fixture({ timeout: true, settings: { adoption: { timeoutMs: 600000, pollMs: 50000 } } });

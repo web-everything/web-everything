@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkPendingAdoptions, pendingAdoptionPath, readPendingAdoptions, recordPendingAdoption } from '../overlay-adoption.mjs';
+import { checkPendingAdoptions, clearPendingAdoption, pendingAdoptionPath, readPendingAdoptions, recordPendingAdoption } from '../overlay-adoption.mjs';
 
 const SHA = 'a'.repeat(40);
 const setup = () => {
@@ -12,6 +12,89 @@ const setup = () => {
 const t0 = Date.parse('2026-11-01T10:00:00.000Z');
 
 describe('overlay adoption events', () => {
+  it('retains pending adoption when emit throws and retries successfully', async () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    const emit = vi.fn(() => { throw new Error('event store unavailable'); });
+    const args = { root, env, now: () => t0, isAncestor: () => true };
+    expect(await checkPendingAdoptions({ ...args, emit })).toEqual([]);
+    expect(emit).toHaveBeenCalledOnce();
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'overlay-adopted' }));
+    expect(readPendingAdoptions(root, { env })).toHaveLength(1);
+    const retry = vi.fn(() => true);
+    expect(await checkPendingAdoptions({ ...args, emit: retry })).toHaveLength(1);
+    expect(retry).toHaveBeenCalledOnce();
+    expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
+  it('prunes records at the seven-day TTL before probing git, including overdue and malformed dates', async () => {
+    const { root, env } = setup();
+    const ttl = 7 * 24 * 60 * 60000;
+    recordPendingAdoption(root, { ref: 'lane/old', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    const old = readPendingAdoptions(root, { env })[0];
+    nodeFs.writeFileSync(pendingAdoptionPath(root, env), JSON.stringify([
+      { ...old, overdueSent: true }, { ...old, ref: 'lane/invalid', at: 'bad' },
+      { ...old, ref: 'lane/fresh', at: new Date(t0 + 1).toISOString() },
+    ]));
+    const isAncestor = vi.fn(() => false);
+    const emit = vi.fn(() => true);
+    await checkPendingAdoptions({ root, env, now: () => t0 + ttl, isAncestor, emit });
+    expect(isAncestor).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit.mock.calls[0][0].detail.ref).toBe('lane/fresh');
+    expect(readPendingAdoptions(root, { env }).map((r) => r.ref)).toEqual(['lane/fresh']);
+  });
+  it('bounds persisted pending records and legacy-file probes to the newest 128 entries', async () => {
+    const { root, env } = setup();
+    for (let i = 0; i < 130; i++) {
+      expect(recordPendingAdoption(root, { ref: `lane/${i}`, sha: SHA, at: new Date(t0).toISOString() }, { env })).toBe(true);
+    }
+    expect(readPendingAdoptions(root, { env })).toHaveLength(128);
+    expect(readPendingAdoptions(root, { env })[0].ref).toBe('lane/2');
+    const rec = readPendingAdoptions(root, { env })[0];
+    nodeFs.writeFileSync(pendingAdoptionPath(root, env), JSON.stringify(Array.from({ length: 130 }, (_, i) => ({ ...rec, ref: `lane/legacy-${i}` }))));
+    const isAncestor = vi.fn(() => false);
+    await checkPendingAdoptions({ root, env, now: () => t0, isAncestor, emit: () => true });
+    expect(isAncestor).toHaveBeenCalledTimes(128);
+    expect(readPendingAdoptions(root, { env })).toHaveLength(128);
+    expect(readPendingAdoptions(root, { env })[0].ref).toBe('lane/legacy-2');
+  });
+  it('clears only the matching pending registration and preserves a refresh of the same ref and sha', () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, nonce: 'old' }, { env });
+    const old = readPendingAdoptions(root, { env })[0];
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, nonce: 'new' }, { env });
+    expect(clearPendingAdoption(root, old, { env })).toBe(true);
+    expect(readPendingAdoptions(root, { env })).toHaveLength(1);
+    expect(clearPendingAdoption(root, readPendingAdoptions(root, { env })[0], { env })).toBe(true);
+    expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
+  it('reports a failed terminal cleanup and preserves the record for a successful retry', () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA }, { env });
+    const rec = readPendingAdoptions(root, { env })[0];
+    const fs = { ...nodeFs, rmSync: () => { throw new Error('permission denied'); } };
+    expect(clearPendingAdoption(root, rec, { env, fs })).toBe(false);
+    expect(readPendingAdoptions(root, { env })).toEqual([rec]);
+    expect(clearPendingAdoption(root, rec, { env })).toBe(true);
+    expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
+  it('never overwrites pending state when terminal cleanup cannot read it', () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA }, { env });
+    const rec = readPendingAdoptions(root, { env })[0];
+    const fs = { ...nodeFs, readFileSync: () => { throw new Error('unreadable'); } };
+    expect(clearPendingAdoption(root, rec, { env, fs })).toBe(false);
+    expect(readPendingAdoptions(root, { env })).toEqual([rec]);
+  });
+  it('prunes expired records even when no event is emitted', async () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    const isAncestor = vi.fn(() => false), emit = vi.fn(() => true);
+    expect(await checkPendingAdoptions({ root, env, now: () => t0 + 7 * 24 * 60 * 60000, isAncestor, emit })).toEqual([]);
+    expect(isAncestor).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
   it('emits overlay-adopted once when the sha becomes an ancestor, then forgets it', async () => {
     const { root, env } = setup();
     expect(recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString() }, { env })).toBe(true);
