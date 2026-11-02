@@ -73,8 +73,10 @@ import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
-  roundCardsFindingsMarker, roundCardsHeadMarker,
+  roundCardsFindingsMarker, roundCardsHeadMarker, postAcceptAdvisoryDecision,
 } from '../lib/review-loop-policy.mjs';
+import { resolvePostAcceptAdvisorySettings } from '../lib/post-accept-advisory-settings.mjs';
+import { recordPostAcceptAdvisoryShadow } from './review-pr-io.mjs';
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
@@ -559,6 +561,8 @@ export async function runReviewLoopOnce({
   parallelJudges = false, seatLanes = null,
   readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
+  advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
+  advisoryLog = line => console.error(line),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
@@ -588,7 +592,21 @@ export async function runReviewLoopOnce({
     const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run, { filed: true }) : null;
     const resume = acceptHeld ? null : o.resume;
     return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes })
-      .then((out) => (acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out));
+      .then(async (out) => {
+        if (out?.stopped === 'complete' && out.run?.findings?.confirm === 'accept') {
+          try {
+            const settings = advisorySettings({ log: advisoryLog });
+            if (settings.value.mode !== 'off') {
+              await recordAdvisoryShadow({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, now, out: advisoryLog,
+                decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode }) });
+            }
+          } catch (error) {
+            try { advisoryLog(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+          }
+        }
+        return acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out;
+      });
   };
   const heldLine = (held) => `Unattended accept parked after filing: ${held}.`;
   if (parsed.control.help) {

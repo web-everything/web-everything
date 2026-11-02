@@ -40,7 +40,7 @@ import {
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
-import { createReviewPrSinks } from '../review-pr-io.mjs';
+import { recordPostAcceptAdvisoryShadow, createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
@@ -50,7 +50,7 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 // explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
 // lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
 const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
-const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, ...options });
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -1577,5 +1577,52 @@ describe('unattended accept reads the live head', () => {
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
     expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
     if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
+  });
+});
+
+
+describe('post-accept advisory shadow wiring', () => {
+  it.each(['off', 'shadow', 'on'])('%s preserves acceptance and effects, recording only when enabled', async mode => {
+    const execute = async currentMode => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const rows = [];
+      const effects = [];
+      const fileItem = vi.fn(() => { throw new Error('shadow must not file'); });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks(effects),
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-advisory-shadow', fileItem,
+        advisorySettings: () => ({ value: { mode: currentMode } }),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts,
+          readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } }),
+      });
+      expect(fileItem).not.toHaveBeenCalled();
+      return { out, rows, effects };
+    };
+    const baseline = await execute('off');
+    const result = await execute(mode);
+    expect(result.out.code).toBe(0);
+    expect(result.out.stopped).toBe('complete');
+    expect(result.out.run.findings.confirm).toBe('accept');
+    expect(result.out.lines).toEqual(baseline.out.lines);
+    expect(result.effects.map(effect => effect.type)).toEqual(baseline.effects.map(effect => effect.type));
+    expect(result.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL))
+      .toEqual(baseline.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL));
+    expect(result.rows).toHaveLength(mode === 'off' ? 0 : 1);
+    if (mode !== 'off') expect(result.rows[0]).toMatchObject({ pr: 1234, headSha: HEAD_A, wouldPush: true });
+  });
+
+  it.each(['settings', 'ledger', 'logging'])('%s failure never changes a completed accept', async failure => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const log = vi.fn(() => { if (failure === 'logging') throw new Error('logger failed'); });
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-advisory-error',
+      advisorySettings: () => { if (failure === 'settings') throw new Error('unreadable'); return { value: { mode: 'shadow' } }; },
+      recordAdvisoryShadow: () => { throw new Error('ledger unavailable'); }, advisoryLog: log,
+    });
+    expect(out.code).toBe(0);
+    expect(out.stopped).toBe('complete');
+    expect(out.run.findings.confirm).toBe('accept');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('live review unaffected'));
   });
 });

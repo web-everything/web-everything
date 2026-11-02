@@ -605,6 +605,76 @@ function roundCardsRefusal(verdict) {
   return null;
 }
 
+/** Post-accept advisory policy. This slice always preserves the live push, including mode on. PURE. */
+export function postAcceptAdvisoryDecision({ verdict, guards = {}, mode = 'shadow' } = {}) {
+  if (mode === 'off') return { action: 'push' };
+  const findings = Array.isArray(verdict?.admittedFindings) ? verdict.admittedFindings : verdict?.findings;
+  const out = (wouldCard, reason) => ({ action: 'push', wouldCard, wouldPush: !wouldCard,
+    findings: Array.isArray(findings) ? findings : [], reason });
+  if (!['shadow', 'on'].includes(mode)) return out(false, 'invalid-mode');
+  if (verdict?.verdict !== VERDICTS.ACCEPT || !Array.isArray(findings) || !guards || typeof guards !== 'object') {
+    return out(false, 'incomplete-evidence');
+  }
+  // Apply the shared bounce guards to both evidence sources without letting either overwrite the other.
+  for (const facts of [verdict, guards]) {
+    if (facts.humanRequired !== undefined && typeof facts.humanRequired !== 'boolean') return out(false, 'unknown-guard');
+    for (const key of ['pendingReferrals', 'blockedReferrals', 'uncorroboratedRetirements']) {
+      if (facts[key] !== undefined && !Array.isArray(facts[key])) return out(false, 'unknown-guard');
+    }
+    const refusal = roundCardsRefusal({ ...facts, verdict: VERDICTS.CHANGES, admittedFindings: findings });
+    if (refusal) return out(false, refusal);
+  }
+  if (!findings.length) return out(false, 'no-findings');
+  for (const finding of findings) {
+    if (!finding || requiresMandatoryReferral(finding)
+      || !CARDABLE_IMPACTS.includes(finding.impactIfUnfixed)) return out(false, 'blocking-impact');
+    if (typeof finding.category !== 'string' || finding.category.split('/')[0] === 'security') return out(false, 'security-or-unknown-category');
+  }
+  return out(true, 'advisory-only');
+}
+
+/** Persist one shadow observation per repository, PR and reviewed head. IO is supplied by the caller. */
+export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision, loopsAfter = 0,
+  readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
+  try {
+    if (!repo || !Number.isInteger(pr) || pr < 1 || !/^[a-f0-9]{40}$/i.test(head ?? '')
+      || typeof decision?.wouldCard !== 'boolean' || decision.wouldPush !== !decision.wouldCard
+      || !Array.isArray(decision.findings) || !Number.isSafeInteger(loopsAfter) || loopsAfter < 0) {
+      throw new Error('incomplete shadow evidence');
+    }
+    const rows = await readLedgerRows(repo);
+    if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
+    const kind = 'we.post-accept-advisory-shadow';
+    if (rows.some(row => row.kind === kind && row.repo === repo && row.pr === pr && row.headSha === head)) return null;
+    const row = { v: 1, kind, at: now(), repo, pr, headSha: head,
+      wouldCard: decision.wouldCard, wouldPush: decision.wouldPush, findings: decision.findings, loopsAfter };
+    const result = await appendLedgerRow(row);
+    if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
+    return row;
+  } catch (error) {
+    try { out(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry only */ }
+    return null;
+  }
+}
+
+/** Summarize observations; later ratings count only identities present in the carded finding set. PURE. */
+export function postAcceptAdvisoryShadowReport(rows = []) {
+  const report = { prs: new Set(rows.map(row => `${row.repo}#${row.pr}`)).size,
+    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, laterBroken: 0 };
+  for (const row of rows) {
+    if (row.wouldPush === true) report.wouldPush++;
+    if (Number.isSafeInteger(row.loopsAfter) && row.loopsAfter >= 0) report.loopsAfter += row.loopsAfter;
+    if (row.wouldCard !== true) continue;
+    report.wouldCard++;
+    const findings = Array.isArray(row.findings) ? row.findings : [];
+    report.findings += findings.length;
+    const broken = new Set((row.laterRatings ?? []).filter(rating => rating.impactIfUnfixed === 'broken')
+      .map(rating => rating.findingId).filter(Boolean));
+    report.laterBroken += new Set(findings.map(finding => finding.findingId).filter(id => id && broken.has(id))).size;
+  }
+  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nLater broken: ${report.laterBroken}` };
+}
+
 /**
  * Card 5471 — THE ROUND BUDGET (ruling P5). PURE. Accept with cards only on positive evidence: a `changes` verdict, a
  * known round past K and below the cap, no referral open or block-ruled, no CONFIRMED broken finding, and every held

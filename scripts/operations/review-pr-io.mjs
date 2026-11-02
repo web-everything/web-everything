@@ -1825,3 +1825,22 @@ function safeJson(stdout) {
   }
   return null;
 }
+
+/** Advisory observations use a separate shadow ledger, never judgment-bearing verdict events. */
+export async function recordPostAcceptAdvisoryShadow(options = {}) {
+  const { recordPostAcceptAdvisoryShadow: record } = await import('../lib/review-loop-policy.mjs');
+  const path = join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
+  return record({
+    readLedgerRows: () => {
+      let text;
+      try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+      return text.split('\n').filter(Boolean).map(line => JSON.parse(line));
+    },
+    appendLedgerRow: row => {
+      mkdirSync(dirname(path), { recursive: true });
+      appendFileSync(path, `${JSON.stringify(row)}\n`);
+      return { ok: true };
+    },
+    ...options,
+  });
+}
