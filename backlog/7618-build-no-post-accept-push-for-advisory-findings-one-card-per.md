@@ -1,11 +1,12 @@
 ---
+bornAs: x5vjl3o
 kind: story
 size: 5
 parent: "5467"
 status: open
 scaffoldedBy: "post-accept-advisory"
 dateScaffolded: "2026-11-01"
-blockedBy: ["xu34pnv"]
+blockedBy: ["7617"]
 scope:
   - "we:scripts/lib/review-loop-policy.mjs"
   - "we:scripts/operations/review-loop-cli.mjs"
@@ -20,7 +21,7 @@ tags: []
 
 # Build: no post-accept push for advisory findings; one card per PR, shadow mode first
 
-Mechanics for xu34pnv, ratified R370 and codified in `we:docs/agent/platform-decisions.md#post-accept-advisory-cards`. After an accept, findings are carded only when every impact is in `CARDABLE_IMPACTS` (`cosmetic`/`degraded`), no finding satisfies `requiresMandatoryReferral`, no review seat tags a security finding at any impact, and every `roundCardsRefusal` safety guard is clear. Any other impact (`broken`, `unrecoverable`, unstated or unknown), mandatory referral, security finding or fired guard forces a push regardless of confirmation status. The card must exist before the PR merges as accepted with no new head; failed filing parks the PR. The rule is a pure function in `we:scripts/lib/review-loop-policy.mjs`, next to the round budget of card 5471, reusing its impact split and safety guards rather than copying them. Factor the shared safety checks out of the current changes-only `roundCardsRefusal` gate so they also apply to a genuine accepted verdict; preserve the changes-only gate for existing round-budget callers, without fabricating a changes verdict for the post-accept path. K does not gate this rule. The setting is `review.postAcceptAdvisory.mode` (off | shadow | on) through the policy cascade, shadow first.
+Mechanics for 7617, ratified R370 and codified in `we:docs/agent/platform-decisions.md#post-accept-advisory-cards`. After an accept, findings are carded only when every impact is in `CARDABLE_IMPACTS` (`cosmetic`/`degraded`), no finding satisfies `requiresMandatoryReferral`, no review seat tags a security finding at any impact, and every `roundCardsRefusal` safety guard is clear. Any other impact (`broken`, `unrecoverable`, unstated or unknown), mandatory referral, security finding or fired guard forces a push regardless of confirmation status. The card must exist before the PR merges as accepted with no new head; failed filing parks the PR. The rule is a pure function in `we:scripts/lib/review-loop-policy.mjs`, next to the round budget of card 5471, reusing its impact split and safety guards rather than copying them. Factor the shared safety checks out of the current changes-only `roundCardsRefusal` gate so they also apply to a genuine accepted verdict; preserve the changes-only gate for existing round-budget callers, without fabricating a changes verdict for the post-accept path. K does not gate this rule. The setting is `review.postAcceptAdvisory.mode` (off | shadow | on) through the policy cascade, shadow first.
 
 ## Acceptance
 
