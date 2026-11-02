@@ -130,7 +130,10 @@ describe('break-class policy and shadow observer', () => {
     const dir = tmp(); const filler = Array.from({ length: 100 }, (_, i) => ({ author: { login: 'x' }, body: `c${i}`, createdAt: new Date(Date.UTC(2026, 9, 1, 0, i)).toISOString() }));
     const args = { pr: PR, repo: 'org/repo', subject: { ...subject(), comments: filler }, env, dir, now: Date.UTC(2026, 9, 21), log: () => {} };
     expect(observeBreakClassStop(args)).toMatchObject({ kind: 'break-class-stop', incompleteEvidence: true, wouldStop: false });
-    expect(observeBreakClassStop({ ...args, subject: { ...args.subject, commentsComplete: true } }).incompleteEvidence).toBeUndefined();
+    const fixed = observeBreakClassStop({ ...args, subject: { ...args.subject, commentsComplete: true } });
+    expect(fixed.skipped).toBeUndefined();
+    expect(fixed.kind).toBe('break-class-stop');
+    expect(fixed.incompleteEvidence).toBeUndefined();
   });
   it('unreadable evidence is persisted with the human-review requirement, not silently skipped', () => {
     const dir = tmp();
@@ -146,5 +149,22 @@ describe('break-class policy and shadow observer', () => {
     expect(observeBreakClassStop(args)).toMatchObject({ wouldStop: true });
     const stranger = replay6033.map(c => ({ ...c, author: { login: 'stranger' } }));
     expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: stranger } }).skipped).toBeUndefined();
+  });
+
+  it('dedup also keys on the verdict-affecting setting, viewerDidAuthor and commentsComplete', () => {
+    const dir = tmp();
+    const args = { pr: PR, repo: 'org/repo', subject: subject(), env, dir, now: Date.UTC(2026, 9, 21), log: () => {} };
+    expect(observeBreakClassStop(args)).toMatchObject({ wouldStop: true });
+    expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: replay6033.map(c => ({ ...c, viewerDidAuthor: true })) } }).skipped).toBeUndefined();
+    expect(observeBreakClassStop({ ...args, subject: { ...subject(), commentsComplete: true } }).skipped).toBeUndefined();
+    expect(observeBreakClassStop({ ...args, env: { ...env, WE_ROUNDS_BREAK_CLASS_STOP_MODE: 'on' } }).skipped).toBeUndefined();
+  });
+  it('an observer failure is logged and persisted best effort, never silent', () => {
+    const dir = tmp(); const log = [];
+    const bad = new Proxy({}, { get(_, k) { if (k === 'headRefOid') return 'a'.repeat(40); throw Error('boom'); } });
+    const r = observeBreakClassStop({ pr: PR, repo: 'org/repo', subject: bad, env, dir, now: Date.UTC(2026, 9, 21), log: l => log.push(l) });
+    expect(r).toMatchObject({ skipped: 'error' });
+    expect(log.join('\n')).toMatch(/observer error.*human review/);
+    expect(readFileSync(join(dir, '2026-10.jsonl'), 'utf8')).toMatch(/observerError/);
   });
 });
