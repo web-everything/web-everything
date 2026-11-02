@@ -56,12 +56,15 @@ export async function readLedgerPrs({
     if (body.gap) return unavailable('gap');
     if (!Number.isSafeInteger(body.stateCursor) || body.stateCursor < 0) return unavailable('malformed');
     if (!Array.isArray(body.coverage?.bootstrap)
-      || !body.coverage.bootstrap.some(entry => entry && sameRepo(entry.repo, repo) && entry.status === 'complete')) {
+      || !body.coverage.bootstrap.some(entry => entry && sameRepo(entry.repo, repo) && entry.status === 'complete'
+        && Number.isSafeInteger(entry.cursor) && entry.cursor <= body.stateCursor)) {
       return unavailable('coverage-gap');
     }
     const now = Date.now();
     const feedNow = body.now ?? now;
     if (!Number.isFinite(feedNow) || (body.lastDeliveryAt != null && !Number.isFinite(body.lastDeliveryAt))) return unavailable('malformed');
+    // The Worker's own clock must agree with ours (5 min skew), or its `now` cannot vouch for freshness.
+    if (Math.abs(feedNow - now) > 5 * 60_000) return unavailable('stale');
     // A delivery dated beyond the Worker's own clock (plus 60s skew) is not evidence of freshness.
     if (body.lastDeliveryAt != null && body.lastDeliveryAt > feedNow + 60_000) return unavailable('malformed');
     if (classifyFeedHealth({ lastOkAt: now, lastFailAt: null, lastDeliveryAt: body.lastDeliveryAt,
@@ -76,6 +79,7 @@ export async function readLedgerPrs({
       if (!Number.isInteger(row.number) || row.number <= 0 || typeof row.sha !== 'string' || !row.sha.trim()
         || !Array.isArray(row.labels) || !row.labels.every(label => typeof label === 'string')
         || typeof row.draft !== 'boolean') return unavailable('malformed');
+      if (prs.some(p => p.number === row.number)) return unavailable('malformed');
       prs.push({ number: row.number, headRefOid: row.sha, isDraft: row.draft,
         labels: row.labels.map(name => ({ name })) });
     }
@@ -93,12 +97,15 @@ export function compareLedgerToGithub(githubPrs, ledger) {
   const result = { ok: false, agree: false, onlyGithub: [], onlyLedger: [], disagreements: [],
     savedListCalls: 0, fallbackReason: ledger?.reason ?? 'unavailable' };
   if (ledger?.ok !== true) return result;
+  const dupes = list => list.map(pr => pr.number).filter((n, i, all) => all.indexOf(n) !== i);
+  for (const number of new Set([...dupes(githubPrs), ...dupes(ledger.prs)])) result.disagreements.push({ number, reason: 'duplicate-row' });
   const github = new Map(githubPrs.map(pr => [pr.number, pr]));
   const projected = new Map(ledger.prs.map(pr => [pr.number, pr]));
   const labels = pr => JSON.stringify([...new Set(pr.labels.map(label => typeof label === 'string' ? label : label.name))].sort());
   for (const number of [...new Set([...github.keys(), ...projected.keys()])].sort((a, b) => a - b)) {
     const actual = github.get(number), expected = projected.get(number);
     let reason;
+    if (result.disagreements.some(d => d.number === number)) continue;
     if (!expected) { result.onlyGithub.push(number); reason = 'missing-in-ledger'; }
     else if (!actual) { result.onlyLedger.push(number); reason = 'missing-in-github'; }
     else if (actual.headRefOid !== expected.headRefOid) reason = 'head-differs';

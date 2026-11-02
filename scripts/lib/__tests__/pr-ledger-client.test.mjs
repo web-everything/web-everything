@@ -128,6 +128,25 @@ describe('readLedgerPrs — real HTTP fixture', () => {
     unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'malformed', fixture.url);
   });
 
+  it('refuses a stale-clock response, a bootstrap ahead of the snapshot cursor, and duplicate rows', async () => {
+    const boot = [{ repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'seed-1' }];
+    const cases = [
+      ['stale', body({ now: NOW - 2 * 86_400_000, lastDeliveryAt: NOW - 2 * 86_400_000 })],
+      ['coverage-gap', body({ stateCursor: 0, coverage: { partial: true, bootstrap: boot } })],
+      ['malformed', body({ prs: [row(), row({ labels: ['x'] })] })],
+    ];
+    for (const [reason, payload] of cases) {
+      const fixture = await serve(payload);
+      unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), reason, fixture.url);
+    }
+  });
+
+  it('compare reports duplicate rows instead of collapsing them', () => {
+    const c = compareLedgerToGithub([githubPr(1), githubPr(1)], usable([githubPr(1)]));
+    expect(c.agree).toBe(false);
+    expect(c.disagreements).toEqual([{ number: 1, reason: 'duplicate-row' }]);
+  });
+
   it('returns http-500 without leaking the response body', async () => {
     const fixture = await serve({ error: TOKEN }, { status: 500 });
     unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'http-500', fixture.url);
