@@ -29,17 +29,18 @@ export function summarize(lines) {
 
 export function createAsyncShadow({
   env = process.env,
-  mode = env.WE_ASYNC_DRAIN || 'shadow',
+  mode = env.WE_ASYNC_DRAIN || 'off',
   dir = join(resolveCoordinationRoot({ env }), 'drain-async-shadow'),
   now = Date.now,
   maxBytes = 1_000_000,
+  retentionMs = 24 * 60 * 60_000,
   summaryEvery,
 } = {}) {
-  if (mode === 'off') {
+  if (mode !== 'shadow') {
     const noop = () => {};
     return { observePass: noop, noteSkipReason: noop, recordActual: noop, emitSummary: noop };
   }
-  // Unknown modes deliberately remain measurement-only, just like 'shadow'.
+  // R425: measurement is opt-in; no mode can change admission or enqueue decisions.
   const records = new Map();
   const completed = new Set();
   let pass = 0;
@@ -101,15 +102,27 @@ export function createAsyncShadow({
     return summary;
   };
   return {
-    observePass({ candidates, enqueuedKeys = new Set() }) {
+    observePass({ candidates, enqueuedKeys = new Set(), countMissed = true }) {
       pass++;
+      const seenAt = now();
+      const candidateKeys = new Set(candidates.map(keyOf));
       for (const [key, row] of records) {
-        if (row.actualEnqueueAt == null && !enqueuedKeys.has(key)) row.readyNotReached++;
+        // Freeze superseded, closed/merged, absent and expired heads BEFORE counting this pass.
+        if (row.retired) {
+          if (!candidateKeys.has(key) && seenAt - row.retiredAt >= retentionMs) records.delete(key);
+          continue;
+        }
+        if (row.actualEnqueueAt != null) continue;
+        if (!candidateKeys.has(key) || seenAt - row.wouldEnqueueAt >= retentionMs) {
+          row.retired = true;
+          row.retiredAt = seenAt;
+          continue;
+        }
+        if (countMissed && !enqueuedKeys.has(key)) row.readyNotReached++;
       }
       for (const candidate of candidates) {
         const key = keyOf(candidate);
         if (records.has(key)) continue;
-        const seenAt = now();
         const readyAt = candidate.readyAtMs ?? seenAt;
         records.set(key, {
           repo: candidate.repo, num: candidate.num, headSha: candidate.headSha,
@@ -123,13 +136,14 @@ export function createAsyncShadow({
     },
     noteSkipReason(key, reason) {
       const row = records.get(key);
-      if (row) Object.defineProperty(row.reasons, reason, { value: (Object.hasOwn(row.reasons, reason) ? row.reasons[reason] : 0) + 1, enumerable: true, configurable: true });
-      if (row) persist();
+      if (!row || row.retired || row.actualEnqueueAt != null) return;
+      Object.defineProperty(row.reasons, reason, { value: (Object.hasOwn(row.reasons, reason) ? row.reasons[reason] : 0) + 1, enumerable: true, configurable: true });
+      persist();
     },
     recordActual(candidate) {
       const key = keyOf(candidate);
       const row = records.get(key);
-      if (!row || completed.has(key)) return;
+      if (!row || row.retired || completed.has(key)) return;
       row.actualEnqueueAt = now();
       row.deltaMs = row.actualEnqueueAt - row.wouldEnqueueAt;
       completed.add(key);
