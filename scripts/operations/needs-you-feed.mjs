@@ -72,9 +72,7 @@ const sectionReasons = {
 // a successful queue read supplies no evidence that their independently owned condition resolved.
 export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 // Gate verdicts are new evidence about a head, never a repeat of the stall question: they are not suppressed by it.
-const GATE_KINDS = new Set(['confirmed-break-owed-send-back', 'red-team-undecided']);
-// REPORT_KINDS stays what other producers dedupe against; absence clears also cover the live gate verdicts.
-export const CLEAR_KINDS = new Set([...REPORT_KINDS, ...GATE_KINDS]);
+export const GATE_KINDS = new Set(['confirmed-break-owed-send-back', 'red-team-undecided']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -147,9 +145,9 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
-export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null, retainKeys = [] } = {}) {
+export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null, alsoClear = null, retainKeys = [] } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
-  const retained = new Set([...prev].filter(key => incomplete || retainKeys.includes(key) || (clearKinds && !clearKinds.has(fromKey(key).was))));
+  const retained = new Set([...prev].filter(key => incomplete || retainKeys.includes(key) || (clearKinds && !clearKinds.has(fromKey(key).was) && !alsoClear?.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
@@ -246,6 +244,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
     let checked = item;
     try {
       const view = await readLivePr(item, { gh, cwd });
+      if (!Array.isArray(view.labels)) throw new Error('the live PR read has no labels');
       // Publish the head actually checked, not a stale report head or a later lookup.
       checked = { ...item, head: view.headRefOid };
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
@@ -352,7 +351,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     // verdict). Absence from the queue, unreadable evidence or an undecided verdict never clear it.
     const proven = new Set(fresh.filter(i => LIVE_VERIFIED.has(i) && (i.kind === 'needs-you' || i.kind === 'confirmed-break-owed-send-back')).map(i => `${i.repo}#${i.pr}`));
     const retainKeys = prev.openKeys.filter(k => k.endsWith(':confirmed-break-owed-send-back') && !proven.has(k.slice(0, k.lastIndexOf('@'))));
-    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: CLEAR_KINDS, incomplete: items.incomplete, retainKeys });
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS, incomplete: items.incomplete, retainKeys });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;

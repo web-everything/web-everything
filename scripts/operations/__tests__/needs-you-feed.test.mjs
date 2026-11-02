@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, CLEAR_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
@@ -144,7 +144,7 @@ describe('feed', () => {
   });
   it.each(['red-team-undecided', 'confirmed-break-owed-send-back'])('clears report kind %s by absence while retaining event-only stalled keys', kind => {
     const first = diffFeed([], [{ ...item, kind }, { ...item, kind: 'stalled' }], at);
-    const cleared = diffFeed(first.openKeys, [], at, { clearKinds: CLEAR_KINDS });
+    const cleared = diffFeed(first.openKeys, [], at, { clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS });
     expect(cleared.openKeys).toEqual(['owner/repo#12@abc:stalled']);
     expect(cleared.lines.map(parseFeedLine)).toEqual([expect.objectContaining({ kind: 'cleared', was: kind })]);
   });
@@ -443,6 +443,10 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [{ ...res, body: shape(marker) }]), log: () => {} });
     expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
   });
+  it('a live read with no labels field is red-team-undecided, never all gates pass', async () => {
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head }, gateComments()), log: () => {} });
+    expectUndecided(kept);
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });
@@ -454,10 +458,10 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       [...old, ...gateComments({ outcome: GATE_OUTCOMES.NOTHING_TO_SEND })]), log: () => {} });
     expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
   });
-  it('REPORT_KINDS is unchanged for other producers: gate kinds only clear through CLEAR_KINDS', () => {
+  it('REPORT_KINDS is unchanged for other producers: gate kinds only clear through alsoClear', () => {
     expect(REPORT_KINDS.has('red-team-undecided')).toBe(false);
     expect(REPORT_KINDS.has('confirmed-break-owed-send-back')).toBe(false);
-    expect(CLEAR_KINDS.has('confirmed-break-owed-send-back')).toBe(true);
+    expect(GATE_KINDS.has('confirmed-break-owed-send-back')).toBe(true);
   });
   it('a stale report head cannot clear an open confirmed-break alert when evidence is unreadable', async () => {
     const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${'b'.repeat(40)}:confirmed-break-owed-send-back`;
