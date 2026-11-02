@@ -263,7 +263,7 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'head-unresolved' });
   }
 
-  // ── Step 2a: overlay snapshot ────────────────────────────────────────────────────────────────────────────────────
+  // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
   // A corrupt overlay file reads as an empty list. Building on that would quietly rebuild onto main alone and
   // drop every registered fix, so refuse and alert instead (mainOnly ignores overlays anyway, so it proceeds).
   const overlayState = readOverlayState(root, { env });
