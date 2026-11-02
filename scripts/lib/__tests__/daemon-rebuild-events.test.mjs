@@ -167,7 +167,7 @@ describe('rebuildClone coordination events', () => {
   it.each([
     'tick-in-progress', 'reader-priority', 'concurrent-mover', 'smoke-backoff', 'held-after-rollback',
     'disabled', 'dirty', 'dirty-tree', 'local-commits', 'index-locked', 'switch-busy',
-    'smoke-env-load', 'future-benign-reason',
+    'smoke-env-load', 'closure-opaque', 'future-benign-reason',
   ])('does not announce a failure for a hold or unknown reason: %s', async (reason) => {
     terminal({ moved: false, reason });
     await rebuildClone(options);
@@ -241,10 +241,18 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
+  it('leaves the overlay main-sync conflict diagnostic to its own event channel', async () => {
+    const reason = 'merge conflicts remain after the ref tip moved: worker.mjs';
+    terminal({ moved: false, reason });
+    expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
+    expect(options.emitEvent).not.toHaveBeenCalled();
+  });
+
   it('classifies every declared reason in daemon-rebuild and daemon-version-runtime as idle or failure', () => {
     // Idle here means no failure event when moved=false. This also inventories
     // nested planning/diagnostic reasons, which must not imply a failed rebuild.
     const idle = new Set([
+      'readonly-job-mutation-due',
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
@@ -253,6 +261,7 @@ describe('rebuildClone coordination events', () => {
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
       'index-locked', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
+      'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
       'other-base', 'overlay-no-longer-wanted', 'overlay-set-aside', 'pinned-conflict-skipped',
