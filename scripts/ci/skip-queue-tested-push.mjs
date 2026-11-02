@@ -10,9 +10,9 @@ const trackingRefspec = (branch) => `+refs/heads/${branch}:refs/remotes/origin/$
 export const MAX_RUNS_CHECKED = 20;
 /** An outside input's newest push must predate the matched queue run by this much. */
 export const INPUT_SETTLE_MS = 10 * 60 * 1000;
-/** The sibling repo every full-suite job checks out at its default-branch tip (no `ref:`). */
+/** Every sibling checkout in ci.yml pins this branch; never infer it from the repo default. */
 export const SIBLING_REPO = 'frontier-ui/frontierui';
-export const SIBLING_DEFAULT_BRANCH = 'main';
+export const SIBLING_BRANCH = 'main';
 /** Each git/gh call is bounded; the workflow step adds its own overall timeout-minutes. */
 const CALL_TIMEOUT_MS = 30_000;
 const isSha = (value) => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/i.test(value);
@@ -143,14 +143,13 @@ function readQuarantineAt(exec, repo) {
   return { ok: true, list, tip, lastPush: lastPushOf(exec, repo, QUARANTINE_BRANCH) };
 }
 
-/** The sibling's default-branch tip (what an unpinned checkout gets) and its newest push, read with FUI_TOKEN only. */
+/** The explicitly pinned sibling branch and its newest push, read with FUI_TOKEN only. */
 function readSiblingAt(exec, token) {
   if (typeof token !== 'string' || token.trim() === '') return { ok: false, error: 'no FUI token' };
   const env = { GH_TOKEN: token };
-  const branch = exec('gh', ['api', `repos/${SIBLING_REPO}`, '--jq', '.default_branch'], env);
-  // The activity log does not record a default-branch switch, so a switch to an old branch would look
-  // unchanged. Accept only the expected default; anything else keeps the full suite.
-  if (branch !== SIBLING_DEFAULT_BRANCH) return { ok: false, error: 'unexpected default branch' };
+  // A matching tree includes ci.yml's explicit checkout refs. An older unpinned workflow cannot
+  // match that tree, even if the sibling's default branch switched away and back without a push.
+  const branch = SIBLING_BRANCH;
   const tip = exec('gh', ['api', `repos/${SIBLING_REPO}/branches/${branch}`, '--jq', '.commit.sha'], env);
   return { ok: true, tip, lastPush: lastPushOf(exec, SIBLING_REPO, branch, env) };
 }

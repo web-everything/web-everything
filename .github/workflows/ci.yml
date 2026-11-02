@@ -175,6 +175,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: main
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -264,6 +265,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: main
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -489,6 +491,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: main
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -718,6 +721,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: main
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -831,6 +835,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: main
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -955,6 +960,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: main
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 

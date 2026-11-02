@@ -1,11 +1,13 @@
 // @vitest-environment node
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { decideQueueTestedSkip, MAX_RUNS_CHECKED, INPUT_SETTLE_MS, SIBLING_REPO, SIBLING_DEFAULT_BRANCH } from '../skip-queue-tested-push.mjs';
+import yaml from 'js-yaml';
+import { decideQueueTestedSkip, MAX_RUNS_CHECKED, INPUT_SETTLE_MS, SIBLING_REPO, SIBLING_BRANCH } from '../skip-queue-tested-push.mjs';
 
 const sha = 'a'.repeat(40);
 const pushTree = 'b'.repeat(40);
@@ -53,9 +55,10 @@ const activity = (after, overrides = {}) => JSON.stringify([push(after, override
 function runCli({ args = {}, runs = JSON.stringify({ workflow_runs: [run()] }), tree = pushTree,
   gitTree = pushTree, fail = '', qTip = quarantineTip, qListed = 'quarantine.json', qList = CLI_LIST,
   qActivity = activity(quarantineTip), fuiBranch = 'main', fuiTipOut = fuiTip, fuiActivity = activity(fuiTip),
-  env = { GH_TOKEN: 'we-token', FUI_TOKEN: 'fui-token' } } = {}) {
+  hang = '', env = { GH_TOKEN: 'we-token', FUI_TOKEN: 'fui-token' } } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'queue-tested-cli-'));
   const callsFile = join(cwd, 'calls.jsonl');
+  let completed = false;
   writeFileSync(callsFile, '');
   try {
     for (const command of ['git', 'gh']) {
@@ -63,7 +66,7 @@ function runCli({ args = {}, runs = JSON.stringify({ workflow_runs: [run()] }), 
 const { appendFileSync } = require('node:fs');
 const command = ${JSON.stringify(command)};
 const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ argv: [command, ...args], token: process.env.GH_TOKEN ?? null }) + '\\n');
+appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ argv: [command, ...args], token: process.env.GH_TOKEN ?? null, pid: process.pid }) + '\\n');
 const url = args[1] ?? '';
 const kind = command === 'gh'
   ? (url.includes('/actions/workflows/') ? 'runs' : url.includes('/git/commits/') ? 'tree'
@@ -71,9 +74,14 @@ const kind = command === 'gh'
       : url.startsWith('repos/${SIBLING_REPO}/branches/') ? 'fui-tip' : url === 'repos/${SIBLING_REPO}' ? 'fui-branch' : 'unknown')
   : args[0] === 'rev-parse' ? (args[1] === '--verify' ? 'q-tip' : 'git') : \`q-\${args[0]}\`;
 if (kind === ${JSON.stringify(fail)} || kind === 'unknown') process.exit(1);
+if (kind === ${JSON.stringify(hang)}) {
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1000);
+} else {
 const responses = ${JSON.stringify({ git: gitTree, runs, tree, 'q-fetch': '', 'q-tip': qTip, 'q-ls-tree': qListed,
     'q-show': qList, 'q-activity': qActivity, 'fui-branch': fuiBranch, 'fui-tip': fuiTipOut, 'fui-activity': fuiActivity })};
 process.stdout.write(responses[kind] + '\\n');
+}
 `, { mode: 0o755 });
     }
     const options = { event: 'push', ref: 'refs/heads/main', sha, repo: 'example/project', ...args };
@@ -86,8 +94,15 @@ process.stdout.write(responses[kind] + '\\n');
     expect(result.signal).toBeNull();
     expect(result.status).toBe(0);
     const records = readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map(JSON.parse);
+    completed = true;
     return { ...result, calls: records.map(({ argv }) => argv), records };
   } finally {
+    // Also clean up a hung fixture if a future timeout regression trips the outer CLI deadline.
+    if (hang && !completed) {
+      const records = readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map(JSON.parse);
+      const pid = records.at(-1)?.pid;
+      if (pid) { try { process.kill(pid, 'SIGKILL'); } catch { /* Already reaped by the detector. */ } }
+    }
     rmSync(cwd, { recursive: true, force: true });
   }
 }
@@ -100,12 +115,42 @@ const quarantineCalls = (repo = 'example/project') => [
   ['gh', 'api', `repos/${repo}/activity?ref=refs/heads/ops/quarantine&direction=desc&per_page=1`],
 ];
 const siblingCalls = [
-  ['gh', 'api', 'repos/frontier-ui/frontierui', '--jq', '.default_branch'],
   ['gh', 'api', 'repos/frontier-ui/frontierui/branches/main', '--jq', '.commit.sha'],
   ['gh', 'api', 'repos/frontier-ui/frontierui/activity?ref=refs/heads/main&direction=desc&per_page=1'],
 ];
 
 describe('queue-tested CLI adapter', () => {
+  it('keeps full CI after the default branch switched away and back to main for an older unpinned queue run', () => {
+    const current = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
+    const previous = structuredClone(current);
+    for (const job of Object.values(previous.jobs)) {
+      for (const step of job.steps ?? []) {
+        if (String(step.uses).startsWith('actions/checkout@') && step.with?.repository === SIBLING_REPO) {
+          delete step.with.ref;
+        }
+      }
+    }
+    // Tree identifiers model otherwise identical trees whose workflow blobs differ only by the pins.
+    // The old run checked out default=next; default is main again now, with no main push activity.
+    const treeOf = (workflow) => createHash('sha1').update(yaml.dump(workflow)).digest('hex');
+    const result = runCli({ gitTree: treeOf(current), tree: treeOf(previous), fuiBranch: 'main' });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('tree differs');
+    expect(result.stderr).toContain('running full CI');
+  });
+
+  it.each(['git', 'runs'])('kills a hung %s git/gh call at the subprocess timeout and fails closed to full CI', (hang) => {
+    const started = Date.now();
+    const result = runCli({ hang });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(30_000);
+    expect(Date.now() - started).toBeLessThan(45_000);
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('running full CI');
+    const child = result.records.at(-1);
+    expect(child.argv[0]).toBe(hang === 'git' ? 'git' : 'gh');
+    expect(() => process.kill(child.pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+  }, 45_000);
+
   it('CLI queries all merge_group runs (a newer failure must stay visible) from ci.yml and emits the matching-tree decision', () => {
     const result = runCli();
     expect(result.calls).toEqual([
@@ -126,7 +171,6 @@ describe('queue-tested CLI adapter', () => {
       [expect.stringContaining('repos/example/project/actions/'), 'we-token'],
       [expect.stringContaining('repos/example/project/git/commits/'), 'we-token'],
       [expect.stringContaining('repos/example/project/activity?'), 'we-token'],
-      ['repos/frontier-ui/frontierui', 'fui-token'],
       [expect.stringContaining('repos/frontier-ui/frontierui/branches/'), 'fui-token'],
       [expect.stringContaining('repos/frontier-ui/frontierui/activity?'), 'fui-token'],
     ]);
@@ -134,7 +178,13 @@ describe('queue-tested CLI adapter', () => {
 
   it('pins the sibling repository the workflow checks out', () => {
     expect(SIBLING_REPO).toBe('frontier-ui/frontierui');
-    expect(SIBLING_DEFAULT_BRANCH).toBe('main');
+    expect(SIBLING_BRANCH).toBe('main');
+  });
+
+  it.each(['next', 'Main', '../main', '', 'main'])('uses the pinned main branch regardless of the current default %j', (fuiBranch) => {
+    const result = runCli({ fuiBranch, fail: 'fui-branch' });
+    expect(result.stdout).toBe('queue_tested=true\n');
+    expect(result.calls.filter((argv) => argv[2]?.startsWith(`repos/${SIBLING_REPO}`))).toEqual(siblingCalls);
   });
 
   it('uses the supplied repository for every WE endpoint', () => {
@@ -195,12 +245,6 @@ describe('queue-tested CLI adapter', () => {
     ['quarantine force-reset after the queue run', { qActivity: activity(quarantineTip, { activity_type: 'force_push', timestamp: '2026-10-31T12:05:00Z' }) }],
     ['quarantine moved between the fetch and the activity read', { qActivity: activity(otherSha) }],
     ['future quarantine push time', { qActivity: activity(quarantineTip, { timestamp: '2999-01-01T00:00:00Z' }) }],
-    ['FUI default-branch API error', { fail: 'fui-branch' }],
-    ['unsafe FUI default branch', { fuiBranch: '../main' }],
-    // Self-review round 2: a switch of the default branch to an old branch is invisible to the activity log.
-    ['FUI default branch switched away from main', { fuiBranch: 'next' }],
-    ['FUI default branch with different case', { fuiBranch: 'Main' }],
-    ['empty FUI default branch', { fuiBranch: '' }],
     ['FUI tip API error', { fail: 'fui-tip' }],
     ['invalid FUI tip', { fuiTipOut: 'not-a-sha' }],
     ['FUI activity API error', { fail: 'fui-activity' }],
@@ -308,7 +352,7 @@ describe('quarantine evidence: the matched queue run must have excluded nothing'
 
 // Self-review of 0120bee9: a commit date is the writer's clock, and a force-reset back to an old commit
 // looks old. Every input the queue run read from OUTSIDE the tree (ops/quarantine, the frontierui sibling
-// checked out at its default-branch tip) must be unchanged since before the run, by GitHub's push time.
+// checked out at its pinned main tip) must be unchanged since before the run, by GitHub's push time.
 describe.each([
   // Built directly (no default parameters), so an undefined lastPush stays undefined.
   ['ops/quarantine', 'readQuarantineState',

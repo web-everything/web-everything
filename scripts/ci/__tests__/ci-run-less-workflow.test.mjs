@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import yaml from 'js-yaml';
-import { SIBLING_REPO } from '../skip-queue-tested-push.mjs';
+import { SIBLING_REPO, SIBLING_BRANCH } from '../skip-queue-tested-push.mjs';
 
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
 const { jobs } = workflow;
@@ -80,13 +80,13 @@ describe('ci.yml queue-tested push relief and nightly full-run backstop', () => 
     expect(steps.indexOf(mint)).toBeLessThan(steps.indexOf(steps.find((step) => step.id === 'queue')));
   });
 
-  it('every frontierui checkout is the unpinned default-branch tip the queue detector proves unchanged', () => {
+  it('every frontierui checkout pins the explicit branch the queue detector proves unchanged', () => {
     const checkouts = Object.values(jobs).flatMap((job) => job.steps ?? [])
       .filter((step) => String(step.uses).startsWith('actions/checkout@') && step.with?.repository);
     expect(checkouts.length).toBeGreaterThan(0);
     for (const step of checkouts) {
       expect(step.with.repository).toBe(SIBLING_REPO);
-      expect(step.with.ref).toBeUndefined();
+      expect(step.with.ref).toBe(SIBLING_BRANCH);
     }
   });
 
