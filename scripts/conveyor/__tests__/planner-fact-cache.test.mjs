@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
   prFactKey, mainFactKey, createPlannerFactCache, readThroughShadow,
@@ -6,6 +8,10 @@ import {
 import { defaultReadPrs } from '../reconcile-pass.mjs';
 import { markHungSessions, planReconcile } from '../reconcile-core.mjs';
 import { classifyHungSession } from '../hung-session.mjs';
+
+vi.mock('../../lib/review-facts.mjs', async original => ({
+  ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
+}));
 
 const REPO = 'org/repo';
 const START = Date.parse('2026-10-01T00:00:00Z');
@@ -368,7 +374,7 @@ describe('facts stay below live time-based decisions', () => {
   });
 
   it('has no planner import/reference or named decision-storage API in the cache source', () => {
-    const source = readFileSync(new URL('../planner-fact-cache.mjs', import.meta.url), 'utf8');
+    const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../planner-fact-cache.mjs'), 'utf8');
     expect(source).not.toMatch(/\bplanReconcile\b/);
     expect(source).not.toMatch(/\b(?:store|cache|save|lookup|get)(?:Plan|Dispatch|Decision|ReconcileResult|HungSessions|LedgerHolds)\b/);
   });
@@ -427,5 +433,79 @@ describe('defaultReadPrs shadow wiring contract (round 2)', () => {
     expect(f.lookup).toHaveBeenCalled();
     expect(f.lookup.mock.results.every(result => result.type === 'return' && result.value === null)).toBe(true);
     expect(f.cache.stats()).toMatchObject({ hits: 0, misses: 1 });
+  });
+});
+
+
+describe('shadow safety regression coverage', () => {
+  it('logs changed heavy facts and returns the fresh comments on a cache hit', () => {
+    const { cache } = harness();
+    const comments = Array.from({ length: 100 }, (_, id) => ({ id, body: `comment ${id}` }));
+    const listing = fact({ labels: [], comments });
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { id: 101, body: 'old' }])
+      .mockReturnValueOnce([...comments, { id: 101, body: 'fresh' }]);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const read = () => defaultReadPrs({ repo: REPO, exec: () => JSON.stringify([listing]),
+        readCommits: () => [], readComments, factCache: cache });
+      read();
+      expect(read()[0].comments.at(-1).body).toBe('fresh');
+      expect(cache.diffCount).toBe(1);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^planner-cache-diff .*comments\.100\.body/));
+    } finally { log.mockRestore(); }
+  });
+
+  it('does not store a row dropped by the complete-comment reader or an incomplete listing', () => {
+    const { cache } = harness();
+    const comments = Array.from({ length: 100 }, (_, id) => ({ id, body: `comment ${id}` }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const dropped = defaultReadPrs({ repo: REPO, exec: () => JSON.stringify([fact({ labels: [], comments })]),
+        readCommits: () => [], readComments: () => { throw Error('unreadable'); }, factCache: cache });
+      expect(dropped).toHaveLength(0);
+      expect(dropped.discoveryIncomplete).toBe(true);
+      defaultReadPrs({ repo: REPO, exec: () => JSON.stringify([fact({ discoveryIncomplete: true })]),
+        readCommits: () => [], factCache: cache });
+      expect(cache.stats().stores).toBe(0);
+    } finally { log.mockRestore(); }
+  });
+
+  it('returns failed commit evidence fresh but refuses to cache it', () => {
+    const { cache } = harness();
+    const rows = defaultReadPrs({ repo: REPO, exec: () => JSON.stringify([fact({ labels: [] })]),
+      readCommits: () => null, factCache: cache });
+    expect(rows[0].commits).toBeNull();
+    expect(cache.stats().stores).toBe(0);
+    expect(cache.stats().refused).toBe(1);
+  });
+
+  it('off mode bypasses the shadow observer', () => {
+    const { cache } = harness({ mode: 'off' });
+    const lookup = vi.spyOn(cache, 'lookup');
+    const opts = { repo: REPO, exec: () => JSON.stringify([fact()]), readCommits: () => [] };
+    expect(defaultReadPrs({ ...opts, factCache: cache })).toEqual(defaultReadPrs(opts));
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('daemon passes share one injected cache, persist evidence and append metrics', async () => {
+    const { buildCliDaemonEffects } = await import('../../../skills-src/conveyor/review-daemon.mjs');
+    const fs = memoryFs();
+    const { cache } = harness({ ...fs, snapshotPath: 'daemon-facts.json' });
+    const lines = [];
+    const suppliedCaches = [];
+    const effects = buildCliDaemonEffects({ owner: 'test', factCache: cache,
+      log: { error: line => lines.push(line) }, reapSessions: () => null,
+      reviewTickOpts: ({ factCache }) => { suppliedCaches.push(factCache); return {}; },
+      tick: () => ({ reviewsOwed: 0, refusals: 0, dispatched: [], failed: [] }),
+      convertAdvisoryEnabled: false, runPrepReview: () => null,
+    });
+    await effects.tickOnce();
+    await effects.tickOnce();
+    expect(suppliedCaches).toEqual([cache, cache]);
+    expect(cache.shadowEndRule()).toMatchObject({ passes: 2, diffs: 0 });
+    expect(JSON.parse(fs.files.get('daemon-facts.json')).evidence.passes).toBe(2);
+    expect(lines.filter(line => line.includes('pass timings'))).toHaveLength(2);
+    expect(lines.filter(line => line.includes('pass timings')).every(line =>
+      line.includes('planner-cache hits=0 misses=0 diffs=0 shadowEndRule='))).toBe(true);
   });
 });
