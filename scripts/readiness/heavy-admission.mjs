@@ -147,7 +147,7 @@ import '../lib/tools-root-guard.mjs';
 import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
-import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
+import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -2199,6 +2199,14 @@ export function poolRootOf(lockRoot) {
  * @param {(ms:number) => Promise<void>} [opts.sleep]
  * @returns {Promise<{ exitCode:number, admission:object }>}
  */
+// A child killed by a signal has status null: report the shell convention 128+signal so callers' infrastructure-failure
+// guards see a killed runner, never a plain test failure (exit 1).
+function childExitCode(e) {
+  if (Number.isFinite(e && e.status)) return e.status;
+  const n = e && typeof e.signal === 'string' ? osConstants.signals[e.signal] : undefined;
+  return Number.isInteger(n) ? 128 + n : 1;
+}
+
 export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
@@ -2210,7 +2218,7 @@ export async function runUnderAdmission({
   if (bypass) {
     let exitCode = 0;
     try { exec(command, { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv }); }
-    catch (e) { exitCode = Number.isFinite(e && e.status) ? e.status : 1; }
+    catch (e) { exitCode = childExitCode(e); }
     return { exitCode, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
   }
   mkdirSync(lockRoot, { recursive: true });
@@ -2232,7 +2240,7 @@ export async function runUnderAdmission({
     if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
     exec(command, execOpts);
   } catch (e) {
-    exitCode = Number.isFinite(e && e.status) ? e.status : 1;
+    exitCode = childExitCode(e);
     if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
   } finally {
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
