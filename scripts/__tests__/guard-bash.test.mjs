@@ -18,7 +18,7 @@ import {
   usageReportSecretReadReason,
   isTruncatedOperationJson, truncatedOperationJsonReason,
   isTreeWritingBuildRun, isGeneratorScriptRun, isFileWriteRedirect, primaryTreeWriteReason,
-  daemonCloneWriteReason,
+  daemonCloneWriteReason, readDaemonFetchConfig,
   mainSessionDelegateNudge, hasLeadingEnvEscape, canonicalCommand, shellTokens, stripHeredocBodies,
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
@@ -3692,7 +3692,152 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason('git fetch origin main:refs/remotes/origin/main', { cwd: CLONE, roots })).toBeNull();
     expect(daemonCloneWriteReason('git fetch origin +refs/heads/*:refs/remotes/origin/*', { cwd: CLONE, roots })).toBeNull();
     expect(daemonCloneWriteReason('git fetch git@github.com:org/repo.git main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch github.com:org/repo.git main', { cwd: CLONE, roots })).toBeNull();
     expect(daemonCloneWriteReason('git fetch --update-head-ok origin main:main', { cwd: LANE, roots })).toBeNull();
+  });
+
+  it.each(['clean', 'read-tree', 'checkout-index', 'gc', 'prune', 'repack'])(
+    'DENIES each additional state-changing git command in a daemon clone: %s', (sub) => {
+      expect(daemonCloneWriteReason(`git -C ${CLONE} ${sub}`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+      expect(decide(`git -C ${CLONE} ${sub}`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason(`git ${sub}`, { cwd: LANE, roots })).toBeNull();
+    },
+  );
+
+  it.each([
+    'origin feature@v1:main',
+    "origin feature'@v1':main",
+    'origin feature\\@v1:main',
+    '-- origin feature@v1:main',
+    'git@host:org/repo.git "feature@v1:refs/heads/main"',
+    'host:org/repo.git +feature@v1:main',
+    '--repo=origin feature@v1:main',
+    '--repo origin feature@v1:main',
+    '--refm=refs/heads/*:refs/heads/* origin main',
+    '--refm refs/heads/*:refs/heads/* origin main',
+    '--update-he origin main',
+    '--stdin origin',
+  ])('DENIES branch-writing fetch variants after the repository: %s', (args) => {
+    expect(daemonCloneWriteReason(`git fetch ${args}`, { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(`git fetch ${args}`, { cwd: CLONE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    ['persisted branch mapping', ['+refs/heads/*:refs/heads/*']],
+    ['persisted unqualified branch mapping', ['feature@v1:main']],
+    ['a branch mapping after a safe mapping', ['+refs/heads/*:refs/remotes/origin/*', '+main:main']],
+    ['unreadable or incomplete configuration', null],
+  ])('DENIES fetch with %s', (_name, fetchConfig) => {
+    expect(daemonCloneWriteReason('git fetch origin main', { cwd: CLONE, roots, fetchConfig })).toMatch(/DAEMON CLONE/);
+    expect(decide('git fetch origin main', {
+      cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: () => fetchConfig,
+    })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    'config remote.origin.fetch +main:main',
+    'config --add remote.origin.fetch +main:main',
+    'config set remote.origin.fetch +main:main',
+    'config --unset-all remote.origin.fetch',
+    'config --get --add remote.origin.fetch +main:main',
+    'config --rename-section remote.origin remote.other',
+    'config --edit',
+    'remote add upstream host:org/repo.git',
+    'remote set-branches origin main',
+    'remote set-url origin host:org/repo.git',
+    'remote update',
+    'remote prune origin',
+  ])('DENIES daemon-clone config/remote mutations: %s', (args) => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} ${args}`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(`git -C ${CLONE} ${args} && git -C ${CLONE} fetch origin`, {
+      cwd: LANE, daemonCloneRoots: roots,
+    })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git ${args}`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it.each([
+    'config --get remote.origin.fetch', 'config --get-all remote.origin.fetch',
+    'config --get-regexp remote.*.fetch', 'config --list', 'config get remote.origin.fetch',
+    'config list', 'config get --all remote.origin.fetch',
+    `config -f${CLONE}/config --get remote.origin.fetch`,
+    'remote', 'remote -v', 'remote get-url origin', 'remote show -n origin',
+  ])('ALLOWS daemon-clone config/remote reads: %s', (args) => {
+    expect(daemonCloneWriteReason(`git ${args}`, { cwd: CLONE, roots })).toBeNull();
+  });
+
+  it.each([
+    `git config --file ${CLONE}/config remote.origin.fetch +main:main`,
+    `git config --file=${CLONE}/config remote.origin.fetch +main:main`,
+    `git config --fil=${CLONE}/config remote.origin.fetch +main:main`,
+    `git config -f ${CLONE}/config remote.origin.fetch +main:main`,
+    `git config -f${CLONE}/config remote.origin.fetch +main:main`,
+    `GIT_CONFIG=${CLONE}/config git config remote.origin.fetch +main:main`,
+    `command env GIT_CONFIG=${CLONE}/config git config remote.origin.fetch +main:main`,
+    `GIT_CONFIG_GLOBAL=${CLONE}/config git config --global remote.origin.fetch +main:main`,
+    `GIT_CONFIG_SYSTEM=${CLONE}/config git config --system remote.origin.fetch +main:main`,
+    `git -C /ws config -f wev-review-daemon/config remote.origin.fetch +main:main`,
+  ])('DENIES explicit config-file writes from a lane: %s', (command) => {
+    expect(daemonCloneWriteReason(command, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS explicit config-file reads and config writes to another lane', () => {
+    expect(daemonCloneWriteReason(`git config -f ${CLONE}/config --get remote.origin.fetch`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git config -f ${LANE}/config remote.origin.fetch +main:main`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('protects exported and inherited config-file targets without applying literals or future assignments', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    expect(decide(`export GIT_CONFIG=${CLONE}/config; git config remote.origin.fetch +main:main`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide('git config remote.origin.fetch +main:main', { ...ctx, gitConfigEnv: { GIT_CONFIG: `${CLONE}/config` } })).toMatch(/DAEMON CLONE/);
+    expect(decide(`git config remote.origin.fetch +main:main; export GIT_CONFIG=${CLONE}/config`, ctx)).toBeNull();
+    expect(decide(`echo GIT_CONFIG=${CLONE}/config; git config remote.origin.fetch +main:main`, ctx)).toBeNull();
+    expect(decide(`GIT_CONFIG=${CLONE}/config git log; git config remote.origin.fetch +main:main`, ctx)).toBeNull();
+  });
+
+  it.each(['refs/remotes/origin/main', 'refs/tags/v1', 'refs/custom/main'])(
+    'ALLOWS persisted and explicit non-branch fetch destinations: %s', (destination) => {
+      expect(daemonCloneWriteReason(`git fetch host:repo.git feature@v1:${destination}`, {
+        cwd: CLONE, roots, fetchConfig: [`+main:${destination}`],
+      })).toBeNull();
+    },
+  );
+
+  it('bounds the persisted-config read and preserves global git options without invoking a pager', () => {
+    const calls = [];
+    const spec = '+refs/heads/*:refs/heads/*';
+    const result = readDaemonFetchConfig('GIT_CONFIG=/decoy VALUE=+main:main git -C /ws -C repo --config-env=remote.origin.fetch=VALUE fetch origin', LANE, [], {},
+      (...args) => { calls.push(args); return `remote.origin.fetch\n${spec}\0`; });
+    expect(result).toEqual([spec]);
+    expect(calls[0][0]).toBe('git');
+    expect(calls[0][1]).toEqual(['-C', '/ws', '-C', 'repo', '--config-env=remote.origin.fetch=VALUE',
+      '--no-pager', 'config', '--null', '--get-regexp', '^remote\\..*\\.fetch$']);
+    expect(calls[0][2]).toMatchObject({ cwd: LANE, timeout: 2000, maxBuffer: 128 * 1024, env: { VALUE: '+main:main' } });
+    expect(calls[0][2].env).not.toHaveProperty('GIT_CONFIG');
+  });
+
+  it.each([
+    ['truncated record', () => 'remote.origin.fetch\n+main:main'],
+    ['malformed record', () => 'remote.origin.fetch\0'],
+    ['timeout', () => { throw Object.assign(new Error('timeout'), { status: null, signal: 'SIGTERM' }); }],
+    ['output overflow', () => { throw Object.assign(new Error('maxBuffer'), { code: 'ENOBUFS', stdout: 'partial' }); }],
+    ['invalid configuration', () => { throw Object.assign(new Error('invalid config'), { status: 128 }); }],
+    ['partial failed read', () => { throw Object.assign(new Error('partial'), { status: 1, stdout: 'partial' }); }],
+  ])('fails closed on a %s config read', (_name, run) => {
+    expect(readDaemonFetchConfig('git fetch origin', CLONE, [], {}, run)).toBeNull();
+  });
+
+  it('accepts an empty config result and no-match exit, and refuses an unmodelled inherited target', () => {
+    expect(readDaemonFetchConfig('git fetch origin', CLONE, [], {}, () => '')).toEqual([]);
+    expect(readDaemonFetchConfig('git fetch origin', CLONE, [], {}, () => {
+      throw Object.assign(new Error('no match'), { status: 1, stdout: '' });
+    })).toEqual([]);
+    let called = false;
+    expect(readDaemonFetchConfig('git fetch origin', LANE, [CLONE], {}, () => { called = true; return ''; })).toBeNull();
+    expect(called).toBe(false);
+    expect(decide('git fetch origin', {
+      cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: () => { throw new Error('read failed'); },
+    })).toMatch(/DAEMON CLONE/);
   });
 
   it('DENIES clean, GIT_DIR/GIT_WORK_TREE env, attached -C, and configured/refmap branch-writing fetch', () => {
@@ -3760,6 +3905,49 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
     }).trim();
     return res ? JSON.parse(res) : null;
   };
+
+  // Bare repository fixtures avoid modifying the checkout's .git or running any git mutation.
+  const configRepos = {};
+  for (const [name, config] of [
+    ['branch', '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n'],
+    ['tracking', '[remote "origin"]\nfetch = +refs/heads/*:refs/remotes/origin/*\n'],
+    ['broken', '[remote "origin"\nfetch = +main:main\n'],
+  ]) {
+    const repo = join(fakeClone, name);
+    mkdirSync(join(repo, 'objects'), { recursive: true });
+    mkdirSync(join(repo, 'refs'), { recursive: true });
+    writeFileSync(join(repo, 'HEAD'), 'ref: refs/heads/main\n');
+    writeFileSync(join(repo, 'config'), config);
+    configRepos[name] = repo;
+  }
+
+  it.each(['branch', 'broken'])('DENIES fetch through the CLI with %s persisted config', (name) => {
+    const out = runHook(`git -C ${configRepos[name]} fetch origin main`, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS fetch through the CLI with only remote-tracking persisted config', () => {
+    expect(runHook(`git -C ${configRepos.tracking} fetch origin main`, lane)).toBeNull();
+  });
+
+  it('reads fetch config through --git-dir and leading GIT_DIR, including earlier exports', () => {
+    for (const command of [
+      `git --git-dir=${configRepos.branch} fetch origin main`,
+      `GIT_DIR=${configRepos.branch} git fetch origin main`,
+      `export GIT_DIR=${configRepos.branch}; git fetch origin main`,
+    ]) expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision, command).toBe('deny');
+  });
+
+  it('does not let GIT_CONFIG hide persisted branch mappings from the CLI', () => {
+    const command = `GIT_CONFIG=${configRepos.tracking}/config git -C ${configRepos.branch} fetch origin main`;
+    expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  it('DENIES explicit config-file mutation through the CLI from a lane', () => {
+    const command = `git config --file=${configRepos.tracking}/config --add remote.origin.fetch +main:main`;
+    expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
 
   it('DENIES `cp` into the registry-discovered clone, run from a lane', () => {
     const out = runHook(`cp fix.md ${join(fakeClone, 'fix.md')}`, lane);
