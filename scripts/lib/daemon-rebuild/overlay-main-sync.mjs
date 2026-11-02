@@ -318,7 +318,10 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
           let check;
           try { check = run(['merge-tree', '--write-tree', '--name-only', main, tip]); }
           catch (error) { check = { error }; }
-          if (check?.status === 1 && !check.error && typeof check.stdout === 'string') {
+          // Evidence must be complete: a tree id on the first line, whatever the exit status.
+          const treeOk = !check?.error && typeof check?.stdout === 'string' && /^[a-f0-9]{40}$/.test(check.stdout.split(/\r?\n/)[0]);
+          if (!treeOk) { skip('conflict-check-error'); continue; }
+          if (check.status === 1) {
             const files = check.stdout.split(/\r?\n/).slice(1).map(cleanText);
             const conflicted = files.slice(0, files.indexOf('') < 0 ? files.length : files.indexOf('')).filter(Boolean);
             if (conflicted.length) {

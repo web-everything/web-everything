@@ -1694,7 +1694,8 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(state.attemptedMain[ref]).toBeUndefined();
   });
 
-  it.each([['exit 128', { status: 128, stdout: '', stderr: 'fatal: unsupported' }], ['thrown', 'throw']])(
+  it.each([['exit 128', { status: 128, stdout: '', stderr: 'fatal: unsupported' }], ['thrown', 'throw'], ['exit 0 with empty output', { status: 0, stdout: '', stderr: '' }],
+    ['exit 0 with malformed output', { status: 0, stdout: 'not-a-tree\n', stderr: '' }]])(
     'a merge check that errors (%s) keeps the stop and fails closed', async (_, failure) => {
       const f = fixture({ conflict: true });
       await expect(job(f)).rejects.toThrow(/merge conflicts/);
