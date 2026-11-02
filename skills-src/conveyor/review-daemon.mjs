@@ -74,6 +74,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -1642,6 +1643,7 @@ export function buildCliDaemonEffects({
   // again — see that function's own `for (;;) { await tickOnce(); ... }` shape — so there is never a second,
   // concurrent tick reading or writing this while one is in flight.
   let priorityNames = new Set();
+  let passCount = 0;
   return {
     intervalMs,
     tickOnce: async () => {
@@ -1715,6 +1717,8 @@ export function buildCliDaemonEffects({
         const repos = Object.entries(result?.perRepoMs ?? {}).map(([repo, ms]) => `${repo.split('/').at(-1)} ${seconds(ms)}`).join(', ');
         log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})`);
       }
+      passCount += 1;
+      logDaemonHeap({ daemon: 'review-daemon', pass: passCount, passMs: Date.now() - started, log });
       return { ...result, sessionReap, convertAdvisory, prepReview };
     },
     sleep: realSleep,

@@ -105,6 +105,7 @@ import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
+import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs'; // R368 per-pass heap line (`WE_DAEMON_HEAP_LOG=0` = off)
 import { warmFixFacts, takeFixReadStats, formatFixReadStats } from '../../scripts/lib/fix-facts.mjs'; // perf C1d (`WE_FIX_FACTS=0` = off)
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Verify
@@ -1211,6 +1212,7 @@ export function formatPassTiming(result) {
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, handoffDir } = {}) {
+  let heapPass = 0;
   return {
     intervalMs,
     tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus }),
@@ -1241,6 +1243,8 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       log.error(`reconcile-fix-dispatch-daemon: tick (${repos.map((r) => r.repo).join(', ')}) — dispatched ${dispatched.length}, refused ${refusals.length}`);
       const timing = formatPassTiming(result);
       if (timing) log.error(`reconcile-fix-dispatch-daemon: ${timing}`);
+      heapPass += 1;
+      logDaemonHeap({ daemon: 'reconcile-fix-dispatch-daemon', pass: heapPass, passMs: result?.passMs, log });
       // card x5kagse (epic #4075/#3383) — logged EVERY tick fix/ci-heal dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read; never merely implied by an
       // empty `dispatched` count.
