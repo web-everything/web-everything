@@ -1472,7 +1472,7 @@ describe('legacy explicit load — bounded busy wait', () => {
 });
 
 describe('adoption requires EVERY registered overlay tip (stale ready-candidate, wev-review-daemon 2026-10)', () => {
-  const fakeGit = ({ inHead = [], tips = {}, ancestryStatus = null } = {}) => (args) => {
+  const fakeGit = ({ inHead = [], tips = {}, ancestryStatus = null, ancestryOnly = null } = {}) => (args) => {
     if (args[0] === 'rev-parse') {
       const last = args[args.length - 1];
       if (last === 'HEAD^{commit}') return { status: 0, stdout: 'head1\n' };
@@ -1480,7 +1480,7 @@ describe('adoption requires EVERY registered overlay tip (stale ready-candidate,
       return tips[m?.[1]] ? { status: 0, stdout: `${tips[m[1]]}\n` } : { status: 1, stdout: '' };
     }
     if (args[0] === 'merge-base') {
-      if (ancestryStatus !== null) return { status: ancestryStatus, stdout: '' };
+      if (ancestryStatus !== null && (ancestryOnly === null || args[2] === ancestryOnly)) return { status: ancestryStatus, stdout: '' };
       return { status: inHead.includes(args[2]) ? 0 : 1, stdout: '' };
     }
     return { status: 0, stdout: '' };
@@ -1499,7 +1499,7 @@ describe('adoption requires EVERY registered overlay tip (stale ready-candidate,
   });
 
   it('an ancestry-check error on any overlay refuses (fail closed)', () => {
-    const r = overlayInstalled({ root: '/r', ref: 'lane/a', refs: ['lane/a', 'lane/b'], run: fakeGit({ tips, ancestryStatus: 128 }) });
+    const r = overlayInstalled({ root: '/r', ref: 'lane/a', refs: ['lane/a', 'lane/b'], run: fakeGit({ tips, inHead: ['tipA'], ancestryStatus: 128, ancestryOnly: 'tipB' }) });
     expect(r.inHead).toBe(false);
     expect(r.missing.map((m) => m.reason)).toContain('check-failed');
   });
