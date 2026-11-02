@@ -97,4 +97,45 @@ describe('operator ruling repo spelling (#6170)', () => {
     expect(readOperatorRulings(c).rulings.map(r => r.repo)).toEqual([OLD_REPO, OLD_REPO]);
     expect(state(c, NEW_REPO).pending).toContain(referral.key);
   });
+  it.each(['card', 'not-real'])('an old-owner %s overrides an earlier current-owner policy block', result => {
+    const { referral, comments } = world();
+    const rec = readReferralRecords(comments).records[0];
+    const ruling = (repo, actor, value) => post(buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head,
+      actor, channel: 'c', reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x',
+      rulings: [{ runId: rec.runId, key: referral.key, result: value, ...(value === 'card' ? { card: CARD } : {}) }] }), 'chalbert');
+    const block = ruling(NEW_REPO, 'auto-policy', 'block');
+    expect(state([comments[0], block], NEW_REPO).blocked).toContain(referral.key);
+    for (const repo of [NEW_REPO, OLD_REPO]) {
+      const override = ruling(repo, 'chalbert', result);
+      expect(state([comments[0], block, override], NEW_REPO))
+        .toMatchObject({ pending: [], blocked: [] });
+      expect(state([comments[0], override, block], NEW_REPO).blocked).toContain(referral.key);
+    }
+  });
+  it.each([OLD_REPO, 'Chalbert/Web-Everything'])('a hidden %s block still vetoes adoption beside a visible block', repo => {
+    const { referral, comments } = world();
+    const rec = readReferralRecords(comments).records[0];
+    const block = repo => post(buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head, actor: 'chalbert',
+      channel: 'c', reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x',
+      rulings: [{ runId: rec.runId, key: referral.key, result: 'block' }] }), 'chalbert');
+    for (const blocks of [[block(repo), block(NEW_REPO)], [block(NEW_REPO), block(repo)]]) {
+      const s = state([comments[0], ...blocks, comments[1]], NEW_REPO);
+      expect(s.operatorRulings.at(-1).repo).toBe(OLD_REPO);
+      expect(s.blocked).toContain(referral.key);
+    }
+  });
+  it.each([
+    ['another repo', { repo: 'someone/else' }],
+    ['another head', { head: 'a'.repeat(40) }],
+    ['another PR', { pr: 6171 }],
+    ['another run', { runId: 'review-pr-other' }],
+    ['another finding', { key: '["judge","other.mjs",1,"another finding"]' }],
+  ])('a block for %s cannot prevent repo spelling adoption', (_name, overrides) => {
+    const { referral, comments } = world();
+    const rec = readReferralRecords(comments).records[0];
+    const { repo = OLD_REPO, pr = rec.pr, head = rec.head, runId = rec.runId, key = referral.key } = overrides;
+    const block = post(buildOperatorRulingComment({ version: 1, repo, pr, head, actor: 'chalbert', channel: 'c',
+      reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x', rulings: [{ runId, key, result: 'block' }] }), 'chalbert');
+    expect(state([comments[0], block, comments[1]], NEW_REPO)).toMatchObject({ pending: [], blocked: [] });
+  });
 });

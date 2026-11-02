@@ -3873,23 +3873,35 @@ export function readOperatorRulings(comments, { head } = {}) {
   // origin, records written under the new name). A ruling takes the spelling of the ONE record it rules on, found by
   // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
   // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
-  let recordRepos, aliasBlocks;
+  let recordRepos, blockRepos;
+  const blockSubject = (repo, pr, head, runId, key) => JSON.stringify([canonicalRepoSlug(repo), pr, head, runId, key]);
   const spellingOf = (repo, pr, head, runId, key, result) => {
     // A `block` never adopts: only a clearing ruling is made MORE visible, so a spelling mismatch can never hide a hold.
     if (result === 'block' || canonicalRepoSlug(repo) === repo) return repo;
     recordRepos ??= readReferralRecords(comments).records;
-    // A `block` on this finding written under an alias spelling stays invisible to exact matching, so a clearing ruling
-    // beside it must not become visible either: the block's hold is never bypassed by adoption.
-    aliasBlocks ??= new Set((Array.isArray(comments) ? comments : []).flatMap(c => {
-      const p = parseOperatorRulingComment(c);
-      return p?.record ? p.record.rulings.filter(y => y.result === 'block').map(y => JSON.stringify([p.record.pr, y.runId, y.key])) : [];
-    }));
-    if (aliasBlocks.has(JSON.stringify([pr, runId, key]))) return repo;
     // Only a record that names THIS finding counts, and only when every such record agrees on one spelling: an
     // ambiguous match keeps the ruling's own spelling, so it can never attach to a record it does not rule.
     const spellings = new Set(recordRepos.filter(x => x.pr === pr && x.head === head && x.runId === runId
       && canonicalRepoSlug(x.repo) === canonicalRepoSlug(repo) && x.referrals.some(f => f.key === key)).map(x => x.repo));
-    return spellings.size === 1 ? [...spellings][0] : repo;
+    if (spellings.size !== 1) return repo;
+    const [recordRepo] = spellings;
+    // Only a block on this exact subject that would stay invisible under the record's spelling vetoes adoption.
+    // Blocks already spelled like the record retain ordinary thread ordering, including later operator overrides.
+    if (!blockRepos) {
+      blockRepos = new Map();
+      for (const c of Array.isArray(comments) ? comments : []) {
+        const r = parseOperatorRulingComment(c)?.record;
+        if (!r) continue;
+        for (const y of r.rulings) {
+          if (y.result !== 'block') continue;
+          const subject = blockSubject(r.repo, r.pr, r.head, y.runId, y.key);
+          if (!blockRepos.has(subject)) blockRepos.set(subject, new Set());
+          blockRepos.get(subject).add(r.repo);
+        }
+      }
+    }
+    const blocks = blockRepos.get(blockSubject(repo, pr, head, runId, key));
+    return blocks && [...blocks].some(spelling => spelling !== recordRepo) ? repo : recordRepo;
   };
   for (const comment of Array.isArray(comments) ? comments : []) {
     const parsed = parseOperatorRulingComment(comment);
