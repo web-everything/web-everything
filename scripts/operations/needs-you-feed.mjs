@@ -109,8 +109,8 @@ function headlineAgrees(comments, pr, head) {
     const lines = typeof whole === 'string' ? whole.replace(/\r\n/g, '\n').split('\n') : [];
     // Every embedded result counts, carried wrappers included (liveResultGateState reads those too).
     return lines.every((line, at) => {
-      if (!line.startsWith(RED_TEAM_COMMENT_MARKER)) return true;
-      const body = lines.slice(at).join('\n'), parsed = parseRedTeamComment(body);
+      if (!line.trimStart().toLowerCase().startsWith(RED_TEAM_COMMENT_MARKER)) return true; // same leniency as the shared parser
+      const body = lines.slice(at).join('\n').trimStart(), parsed = parseRedTeamComment(body);
       return !parsed || parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
     });
   });

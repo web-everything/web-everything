@@ -438,6 +438,11 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
     expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
   });
+  it.each([['indented', m => '  ' + m], ['uppercase', m => m.toUpperCase()]])('a %s marker-only comment is not a clean pass', async (_n, shape) => {
+    const [res] = gateComments({ broken: true }), marker = res.body.split('\n')[0];
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [{ ...res, body: shape(marker) }]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });
