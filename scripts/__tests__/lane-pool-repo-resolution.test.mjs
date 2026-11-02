@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
+import { findPrimaryForPool, poolNameFromLanePath } from '../lib/lane-alternates.mjs';
 
 // Exercise the actual resolver without running the pool CLI or mutating git state.
 const source = readFileSync(resolve(process.cwd(), 'scripts/lane-pool.mjs'), 'utf8');
@@ -59,6 +60,7 @@ function resolveOrigin({ command = 'reclaim', cwd = '/pool/project/lane-1', flag
     process: { cwd: () => cwd, env }, CWD_TOP_LEVEL: cwd, CHECKOUT_ROOT: cwd, POOL_ROOT: '/pool',
     LOCAL_GIT_TIMEOUT_MS: 1000, expandHome: p => p,
     resolve, basename, dirname, join, sep, resolveReal: p => realPaths[p] || resolve(p), laneGitHardeningEnv, scrubGitRepoEnv,
+    findPrimaryForPool, poolNameFromLanePath,
     fail: message => { throw new Error(message); },
     tryGit: (args, dir, options) => {
       calls.push({ args, dir, options });

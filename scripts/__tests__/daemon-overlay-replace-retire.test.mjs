@@ -10,8 +10,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops } from '../daemon-overlay.mjs';
+import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, inferPrNumber } from '../daemon-overlay.mjs';
 import { addOverlay } from '../lib/daemon-overlays.mjs';
+import { planRebuild } from '../lib/daemon-rebuild.mjs';
 
 const CLI = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-overlay.mjs');
 const dirs = [];
@@ -51,7 +52,7 @@ function fixture() {
     gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
     return gitOk(author, ['rev-parse', 'HEAD']);
   };
-  const run = (args) => spawnSync(process.execPath, [CLI, ...args, `--clone=${clone}`, '--json'], { encoding: 'utf8', timeout: 60_000, env });
+  const run = (args, extraEnv = {}) => spawnSync(process.execPath, [CLI, ...args, `--clone=${clone}`, '--json'], { encoding: 'utf8', timeout: 60_000, env: { ...env, ...extraEnv } });
   const list = () => {
     const name = readdirSync(state).find((n) => n.endsWith('.json'));
     return name ? JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.map((o) => o.ref) : [];
@@ -66,7 +67,20 @@ function fixture() {
     const name = readdirSync(state).find((n) => n.endsWith('.json'));
     return JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.find((o) => o.ref === ref);
   };
-  return { push, run, list, events, land, entry, clone, env };
+  /** Replace the gh stub: `prs` is what every `pr list` answers; `repo view` still names the repo. */
+  const ghPrs = (prs) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo web-everything/web-everything; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+  /** Squash-merge: main gets the same content in a NEW commit, then the branch is deleted. Returns the main commit. */
+  const squash = (ref, file, content) => {
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'sq-main', 'origin/main']);
+    writeFileSync(join(author, file), content);
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', `squash ${ref}`]);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    gitOk(author, ['push', '-q', 'origin', `:refs/heads/${ref}`]);
+    return gitOk(author, ['rev-parse', 'HEAD']);
+  };
+  return { push, run, list, events, land, entry, clone, env, ghPrs, squash, author };
 }
 
 describe('daemon-overlay.mjs replace', () => {
@@ -262,6 +276,211 @@ describe('daemon-overlay.mjs retire', () => {
       expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => 'f'.repeat(40) } })).toEqual([{ ref: 'lane/done', outcome: 'still-registered' }]);
       expect(f.entry('lane/done')).toMatchObject({ reason: 'newer' });
     });
+  });
+});
+
+describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
+  const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip, mergeCommit: { oid: mergeOid } });
+  const setup = () => {
+    const f = fixture();
+    const tip = f.push('lane/sq', 'a.txt', 'squashed\n');
+    expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
+    const mergeOid = f.squash('lane/sq', 'a.txt', 'squashed\n');
+    return { f, tip, mergeOid };
+  };
+  const retire = (f, tip) => f.run(['retire', '--ref=lane/sq', `--expected-tip=${tip}`]);
+
+  it('retires when the merged PR headed this ref at the expected tip and its merge commit is on main', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    const r = retire(f, tip);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: true, reason: 'pr-squash-merged' });
+    expect(f.list()).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
+  });
+
+  it('restores the registration when the branch is recreated at the proved tip before the drop', async () => {
+    const { f, tip, mergeOid } = setup();
+    const r = await retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
+      prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
+      tip: () => tip, // the branch is back on origin at the very tip the PR had
+    } });
+    expect(r).toMatchObject({ retired: false, refused: 'tip-moved-restored' });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+
+  it('an interrupted squash retire is restored on recovery when the branch reappeared at the proved tip', async () => {
+    const { f, tip, mergeOid } = setup();
+    await expect(retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
+      prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
+      tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
+    expect(f.list()).toEqual([]);
+    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => tip } })).toEqual([{ ref: 'lane/sq', outcome: 'restored' }]);
+    expect(f.list()).toEqual(['lane/sq']);
+    // and with the branch still deleted, the drop is confirmed
+    await expect(retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
+      prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
+      tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
+    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'drop-confirmed' }]);
+  });
+
+  it('refuses when the merge commit is not an ancestor of main', () => {
+    const { f, tip } = setup();
+    f.ghPrs([merged('lane/sq', tip, tip)]); // the (deleted) branch tip is not on main
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+
+  it('refuses when the merged PR head was a different commit than the expected tip', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', 'e'.repeat(40), mergeOid)]);
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+
+  it('refuses when two merged PRs headed this ref (ambiguous)', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', tip, mergeOid, 7), merged('lane/sq', tip, mergeOid, 8)]);
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+  });
+
+  it('refuses when the PR is not merged', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), state: 'CLOSED' }]);
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+  });
+
+  it('refuses when GitHub gives no PR at all', () => {
+    const { f, tip } = setup();
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+  });
+
+  it('does not use the squash proof while the branch still exists with unmerged work', () => {
+    const f = fixture();
+    const tip = f.push('lane/sq', 'a.txt', 'first\n');
+    expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
+    const mergeOid = f.squash('lane/sq', 'a.txt', 'first\n');
+    const tip2 = f.push('lane/sq', 'b.txt', 'extra unmerged work\n', tip);
+    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    expect(JSON.parse(retire(f, tip2).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+});
+
+describe('daemon-overlay.mjs add records the PR when GitHub knows it', () => {
+  const originHead = { headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false };
+
+  it('closing a same-name fork PR cannot remove unmerged origin work in the rebuild planner', async () => {
+    const f = fixture();
+    const tip = f.push('lane/known', 'a.txt', 'unmerged origin work\n');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known',
+      headRepository: { nameWithOwner: 'contributor/web-everything' }, isCrossRepository: true }]);
+    const r = f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' });
+    expect(r.status, r.stderr).toBe(0);
+    const stateQueries = [];
+    const plan = await planRebuild({
+      git: (args, opts = {}) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        cwd: f.author, encoding: 'utf8', env: { ...f.env, ...opts.env }, timeout: 20_000,
+      }),
+      headSha: gitOk(f.author, ['rev-parse', 'origin/main']), mainRef: 'origin/main',
+      overlays: [f.entry('lane/known')],
+      prState: (pr) => { stateQueries.push(pr); return 'CLOSED'; },
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.applied).toMatchObject([{ ref: 'lane/known', sha: tip }]);
+    expect(stateQueries).toEqual([]);
+    expect(f.entry('lane/known').pr).toBe(null);
+  });
+
+  it('fills in the PR of the single open PR headed by the ref', () => {
+    const f = fixture();
+    f.push('lane/known', 'a.txt', 'a\n');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known', ...originHead }]);
+    expect(f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' }).status).toBe(0);
+    expect(f.entry('lane/known').pr).toBe(9);
+  });
+
+  it('leaves the PR empty when two PRs head the ref', () => {
+    const f = fixture();
+    f.push('lane/known', 'a.txt', 'a\n');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known', ...originHead }, { number: 10, state: 'OPEN', headRefName: 'lane/known', ...originHead }]);
+    expect(f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' }).status).toBe(0);
+    expect(f.entry('lane/known').pr).toBe(null);
+  });
+
+  it.each([false, true])('replace records only origin PRs (fork: %s)', (fork) => {
+    const f = fixture();
+    f.push('lane/old-top', 'a.txt', 'a\n');
+    expect(f.run(['add', '--ref=lane/old-top']).status).toBe(0);
+    const tip = f.push('lane/new-top', 'b.txt', 'b\n', 'origin/lane/old-top');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/new-top',
+      ...(fork ? { headRepository: { nameWithOwner: 'contributor/web-everything' }, isCrossRepository: true } : originHead) }]);
+    const r = f.run(['replace', '--ref=lane/new-top', '--replaces=lane/old-top', `--expected-sha=${tip}`], { WE_DAEMON_OVERLAY_INFER_PR: '1' });
+    expect(r.status, r.stderr).toBe(0);
+    expect(f.entry('lane/new-top').pr).toBe(fork ? null : 9);
+  });
+});
+
+describe('inferPrNumber origin identity and incomplete evidence', () => {
+  const originUrl = 'git@github.com:web-everything/web-everything.git';
+  const sameRepo = { number: 9, headRefName: 'lane/known',
+    headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false };
+  function infer(prs, { repo = 'web-everything/web-everything', originStatus = 0, listStatus = 0, repoStatus = 0, raw } = {}) {
+    const calls = [];
+    const value = inferPrNumber({ root: '/unused', ref: 'lane/known', env: {}, run: (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'git') return { status: originStatus, stdout: originUrl };
+      if (args[0] === 'repo') return { status: repoStatus, stdout: repo };
+      return { status: listStatus, stdout: raw ?? JSON.stringify(prs) };
+    } });
+    return { value, calls };
+  }
+
+  it('resolves the origin remote explicitly rather than the gh default repository', () => {
+    const { value, calls } = infer([sameRepo]);
+    expect(value).toBe(9);
+    expect(calls[0]).toEqual(['git', 'remote', 'get-url', 'origin']);
+    expect(calls[1]).toEqual(['gh', 'repo', 'view', originUrl, '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    expect(calls[2][calls[2].indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['headRepository', 'isCrossRepository']));
+  });
+
+  it.each([
+    ['fork', { ...sameRepo, isCrossRepository: true, headRepository: { nameWithOwner: 'contributor/web-everything' } }],
+    ['other owner despite same-repo flag', { ...sameRepo, headRepository: { nameWithOwner: 'contributor/web-everything' } }],
+    ['other repository with same owner', { ...sameRepo, headRepository: { nameWithOwner: 'web-everything/unrelated' } }],
+    ['cross-repository flag contradicts identity', { ...sameRepo, isCrossRepository: true }],
+    ['unknown repository', { ...sameRepo, headRepository: null }],
+    ['missing full identity', { ...sameRepo, headRepository: { name: 'web-everything' } }],
+    ['missing cross-repository flag', { ...sameRepo, isCrossRepository: undefined }],
+    ['wrong ref', { ...sameRepo, headRefName: 'lane/other' }],
+    ['non-integer PR', { ...sameRepo, number: '9' }],
+    ['non-positive PR', { ...sameRepo, number: 0 }],
+  ])('refuses %s evidence', (_name, pr) => {
+    expect(infer([pr]).value).toBe(null);
+  });
+
+  it('ignores a fork when exactly one origin PR matches', () => {
+    expect(infer([{ ...sameRepo, number: 10, isCrossRepository: true,
+      headRepository: { nameWithOwner: 'contributor/web-everything' } }, sameRepo]).value).toBe(9);
+  });
+
+  it('compares GitHub repository identity without case sensitivity', () => {
+    expect(infer([{ ...sameRepo, headRepository: { nameWithOwner: 'Web-Everything/Web-Everything' } }]).value).toBe(9);
+  });
+
+  it.each([
+    ['none', []], ['ambiguous', [sameRepo, { ...sameRepo, number: 10 }]],
+    ['limit reached', [sameRepo, ...Array.from({ length: 4 }, (_, i) => ({ ...sameRepo, number: 10 + i, headRefName: 'lane/other' }))]],
+  ])('refuses %s results', (_name, prs) => {
+    expect(infer(prs).value).toBe(null);
+  });
+
+  it.each([
+    { originStatus: 1 }, { repoStatus: 1 }, { listStatus: 1 }, { repo: 'invalid' },
+    { raw: '{' }, { raw: '{}' }, { raw: 'null' },
+  ])('refuses unreadable or malformed lookup: %j', (opts) => {
+    expect(infer([sameRepo], opts).value).toBe(null);
   });
 });
 
