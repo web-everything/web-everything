@@ -18,7 +18,7 @@ import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, readyEvidence, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal } from './prototype-load.mjs';
 import { planRetirements } from './prototype-retire.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -188,7 +188,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS }, platform: platform.prefs.prototypeLoad, tool });
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'warn' }, platform: platform.prefs.prototypeLoad, tool });
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
@@ -338,6 +338,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       out.gate = readyEvidence(jsonLines(read(expand(config.readyRecordPath))), input);
       if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: `No fix-ready record in ${config.readyRecordPath} matches ref=${input.branch} sha=${input.sha}. A record needs the fields {"ref":"${input.branch}","sha":"${input.sha}","tests":"green","audit":"NOT WEAKENED"}; write it after the scoped tests pass and the Codex audit says NOT WEAKENED, or pass --tests-run and --audit="NOT WEAKENED".` });
+      stage = 'no-canonical-audit';
+      let auditRecords = [];
+      try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
+      const mode = config.canonicalAuditMode === 'warn' ? 'warn' : 'refuse';
+      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha) };
+      if (!out.canonicalAudit.ok) {
+        const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
+        if (mode === 'refuse') return stop('no-canonical-audit', { fallback });
+        console.warn(`WARNING: canonical audit ${out.canonicalAudit.reason}; proceeding in warn mode. ${fallback}`);
+      }
+      stage = 'no-ready';
       requireGit('fetch', 'origin', input.branch);
       const tip = requireGit('rev-parse', `origin/${input.branch}`);
       if (tip !== input.sha) return stop('no-ready', { gate: { ...out.gate, reason: 'sha-not-branch-tip', tip }, fallback: `${input.sha} is not the tip of ${input.branch}: the branch tip is ${tip}. Load the tip (re-run tests and audit if the code changed) or push the branch back to the tested sha.` });

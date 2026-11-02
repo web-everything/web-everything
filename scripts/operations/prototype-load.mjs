@@ -5,6 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
+import { QUESTION_HASH } from './codex-audit.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
 export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
@@ -18,6 +19,16 @@ export function readyEvidence(records, input) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   return record ? { source: 'ready-record', record } : null;
+}
+/** Latest canonical audit for this head, across bases; later appended records break ties. */
+export function canonicalAuditEvidence(records, sha) {
+  let latest = null;
+  for (const record of records) {
+    if (record?.head !== sha || record.questionHash !== QUESTION_HASH || !Number.isFinite(Date.parse(record.at))) continue;
+    if (!latest || Date.parse(record.at) >= Date.parse(latest.at)) latest = record;
+  }
+  if (latest?.verdict === 'NOT WEAKENED') return { ok: true, record: latest };
+  return { ok: false, reason: latest?.verdict === 'WEAKENED' ? 'weakened' : 'no-record' };
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 export function changedPaths(text) {
