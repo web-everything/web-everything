@@ -190,6 +190,11 @@ describe('lane-pool canonical origin env', () => {
       const leaseBefore = readFileSync(marker, 'utf8');
       // Neither inherited environment nor lane-controlled config can authorize this destination.
       git(lane, ['remote', 'set-url', 'origin', callerOrigin]);
+      if (state !== 'configured') {
+        // A lane-writable ref claiming private work is upstream cannot authorize release.
+        git(lane, ['update-ref', 'refs/remotes/origin/main', sha]);
+        expect(git(lane, ['rev-list', 'origin/main..HEAD']).trim()).toBe('');
+      }
       const selection = selector === 'sweep' ? ['--all-pools']
         : ['--lane=1', '--pool=secondary', ...(selector === 'pool' ? [] : [`--${selector}=${other}`])];
       const result = spawnSync(process.execPath, [script, 'release', ...selection,
@@ -209,6 +214,7 @@ describe('lane-pool canonical origin env', () => {
         expect(salvaged).toMatch(new RegExp(`^${sha}\\s+refs/heads/salvage/lane-1-`));
       } else {
         expect(result.stderr).toMatch(/ERROR .*secondary\/lane-1: canonical origin unresolved.*release refused|ERROR lane-1: canonical origin unresolved.*release refused/);
+        expect(result.stderr).toContain('canonical origin unresolved for pool secondary; release refused — pass --origin=<url> or --reference=<primary-checkout> and retry');
         expect(readFileSync(marker, 'utf8')).toBe(leaseBefore);
         expect(salvaged).toBe('');
         expect(git(lane, ['rev-parse', 'HEAD']).trim()).toBe(sha);
