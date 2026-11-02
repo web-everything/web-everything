@@ -262,6 +262,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.insert(seq, record.id || null, now, JSON.stringify(stored));
       storage.setMeta('head', String(seq));
       storage.setMeta('lastEventAt', String(now));
+      // Per-repo clock: only this repo's own events ever move it (R417).
+      if (typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
       foldObservation(storage, stored);
       storage.prune(seq - maxEvents, now - retentionMs);
       return { seq, duplicate: false };
@@ -280,14 +282,14 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // webhook). Their field clock is the cursor the listing was taken at, so any later delivery wins.
       for (const pr of input.prs) foldObservation(storage, { ...pr, number: undefined, prs: [pr.number], repo: input.repo,
         type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor });
-      const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId };
+      const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
       storage.putProjection('bootstrap', input.repo, result);
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
       return { ...result, duplicate: false };
     }); },
-    readPrs(cursor, limit) { return storage.transaction(() => {
+    readPrs(cursor, limit, now = Date.now()) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
-      return { ...envelope, prs: projectPrRows(storage), stateCursor: envelope.head,
+      return { ...envelope, prs: projectPrRows(storage), stateCursor: envelope.head, repos: repoFreshness(storage, envelope.head, now),
         coverage: { ...JSON.parse(storage.getMeta('coverage')), bootstrap: storage.listProjection('bootstrap') } };
     }); },
     /** A verified delivery we chose not to store (ping, ignored action) still proves the pipe is alive. */
@@ -311,6 +313,25 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     },
   };
   return log;
+}
+
+const FUTURE_SKEW_MS = 60_000;
+/** Per-repo `{ bootstrapAt, lastEventAt, coverage }`, each from that repo's OWN bootstrap/event rows. Times are the
+ *  Worker's clock at write, beyond the reader's now + 60 s clamped to now (never trust a future time). Coverage = bootstrap
+ *  complete with a recorded time AND no events pruned since its base cursor (conservative: the ring is global). */
+function repoFreshness(storage, head, now) {
+  const clamp = (v) => (Number.isFinite(v) ? (v > now + FUTURE_SKEW_MS ? now : v) : null);
+  const oldest = storage.minSeq();
+  const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
+  const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
+  const out = {};
+  for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
+    const b = boots.get(repo);
+    const bootstrapAt = b ? clamp(b.at) : null;
+    const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
+    out[repo] = { bootstrapAt, lastEventAt: clamp(lastEvent.get(repo)), coverage: !!b && b.status === 'complete' && bootstrapAt != null && !gap };
+  }
+  return out;
 }
 
 const numOrNull = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
@@ -391,7 +412,7 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
     const cursor = c == null || c === '' ? null : (/^\d+$/.test(c) ? Number(c) : null);
     const limit = Number(url.searchParams.get('limit')) || DEFAULT_PAGE_LIMIT;
     const log = await getLog();
-    return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit) : log.read(cursor, limit))), now: now() });
+    return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit, now()) : log.read(cursor, limit))), now: now() });
   }
 
   return json(404, { error: 'not found' });
