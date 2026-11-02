@@ -506,7 +506,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     const read = tickRead();
     for (const bad of [
       'we:a.mjs b;c', 'we:a.mjs $(id)', 'we:a.mjs `id`', 'we:a.mjs ../x.mjs', 'we:a.mjs we:../../x', 'we:a.mjs /etc/passwd',
-      'we:a.mjs we:/abs/x', 'we:a.mjs bogus:src/t.mjs', 'we:a.mjs ./src/t.mjs', 'we:a.mjs src//t.mjs', "we:a.mjs b'c", 'we:a.mjs\nb|c',
+      'we:a.mjs we:/abs/x', 'we:a.mjs bogus:src/t.mjs', 'we:a.mjs FUI:src/t.mjs', 'we:a.mjs frontierui:src/t.mjs', 'src/a.ts src/b.ts', 'we:a.mjs ./src/t.mjs', 'we:a.mjs src//t.mjs', "we:a.mjs b'c", 'we:a.mjs\nb|c',
     ]) {
       expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
         .toThrow(/characters the brief cannot carry|unsafe scope entry/);
