@@ -8,6 +8,23 @@ const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.y
 const { jobs } = workflow;
 
 describe('ci.yml queue-tested push relief and nightly full-run backstop', () => {
+  it('isolates the nightly backstop from pushes while preserving other concurrency groups', () => {
+    const groupFor = (event, ref) => workflow.concurrency.group.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, source) => {
+      const expression = source
+        .replaceAll('github.event_name', JSON.stringify(event))
+        .replaceAll('github.ref', JSON.stringify(ref));
+      // Evaluate only the string/number/boolean subset used by this group.
+      expect(expression.replace(/'[^']*'|"[^"]*"|\d+|==|!=|&&|\|\||[()\s]/g, '')).toBe('');
+      return runInNewContext(expression, Object.create(null), { timeout: 100 });
+    });
+    const main = 'refs/heads/main';
+    expect(groupFor('schedule', main)).not.toBe(groupFor('push', main));
+    expect(groupFor('push', main)).toBe('ci-refs/heads/main');
+    expect(groupFor('pull_request', 'refs/pull/42/merge')).toBe('ci-refs/pull/42/merge');
+    expect(groupFor('merge_group', 'refs/heads/gh-readonly-queue/main/pr-42')).toBe('ci-refs/heads/gh-readonly-queue/main/pr-42');
+    expect(groupFor('workflow_dispatch', main)).toBe('ci-refs/heads/main');
+  });
+
   it('has exactly one cron entry for the nightly full-run backstop', () => {
     expect(workflow.on.schedule).toEqual([{ cron: expect.any(String) }]);
     expect(workflow.on.schedule[0].cron.trim()).not.toBe('');

@@ -55,7 +55,9 @@ on:
     - cron: '17 6 * * *'
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Pending runs replace each other even with cancel-in-progress=false. Keep the nightly backstop
+  # separate so a push to main cannot replace it while it waits for a runner.
+  group: ci-${{ github.event_name == 'schedule' && 'schedule-' || '' }}${{ github.ref }}
   # #5000: never cancel a run on main. A merge every few minutes cancelled 85 of 100 main runs (2026-10-03),
   # hiding main's red/green for hours. PR branches still cancel superseded runs.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
