@@ -15,7 +15,8 @@ const MAX_AUDITS = 100_000;
 // Safety-critical seed policy is code-owned; checkout settings may only add protection.
 const HARMLESS_PATHS = Object.freeze([
   'docs/examples/**/*.md',
-  'backlog/*.md',
+  // Backlog Markdown renders raw HTML, frontmatter details and related reports
+  // into the website. Require operator review until that rendering is sanitized.
   'docs/*.md',
   'docs/topics/**/*.md',
   'README*.md',

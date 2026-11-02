@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { checkPr, main, matchesGlob } from '../d-r379-check.mjs';
 import { createCheckDeps } from '../d-r379-check-io.mjs';
@@ -220,7 +223,7 @@ describe('CLI and real adapter with injected IO', () => {
     expect(calls).toEqual([
       ['git','fetch','origin','main'],['git','fetch','origin','pull/6223/head'],
       ['git','rev-parse','--verify','FETCH_HEAD^{commit}'],['git','merge-base','origin/main',head],
-      ['git','diff','--no-relative','--no-ext-diff','a'.repeat(40),head,'--name-only','-z'],
+      ['git','diff','--no-relative','--no-ext-diff','--no-renames','a'.repeat(40),head,'--name-only','-z'],
     ]);
   });
   it('fetch head mismatch refuses diff', async () => {
@@ -291,6 +294,35 @@ describe('bounded descriptor evidence reader', () => {
 });
 
 describe('eligibility guard regression guarantees', () => {
+  it('preserves a protected rename source with inherited GIT_CONFIG_PARAMETERS using real Git', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'd-r379-rename-'));
+    try {
+      mkdirSync(join(root, 'before/scripts'), {recursive:true});
+      mkdirSync(join(root, 'after/docs'), {recursive:true});
+      const content = 'export const guard = true;\n';
+      writeFileSync(join(root, 'before/scripts/guard-bash.mjs'), content);
+      writeFileSync(join(root, 'after/docs/moved.md'), content);
+      const f = fixture(6223);
+      const adapter = createCheckDeps({env:{...process.env,
+        GIT_CONFIG_PARAMETERS:"'diff.renames'='true'"}, exec:(bin,args,options) => {
+        if (args[0] === 'fetch') return '';
+        if (args[0] === 'rev-parse') return f.headRefOid;
+        if (args[0] === 'merge-base') return base;
+        if (args[0] !== 'diff') throw Error('unexpected command');
+        // Only replace revision operands with directory operands: real Git handles
+        // config precedence and rename detection without creating any .git state.
+        const probeArgs = ['diff', '--no-index', ...args.slice(1).map(arg =>
+          arg === base ? 'before' : arg === f.headRefOid ? 'after' : arg)];
+        const probe = spawnSync(bin, probeArgs, {...options, cwd:root, encoding:'utf8'});
+        expect(probe.status, probe.stderr).toBe(1);
+        return probe.stdout.replace(/(?:before|after)\//g, '');
+      }});
+      const r = await checkPr(6223, deps(f, {fetchNetDiff:adapter.fetchNetDiff}));
+      expect(r.netDiffPaths).toContain('scripts/guard-bash.mjs');
+      expect(condition(r,4)).toMatchObject({status:'FAIL',evidence:['protected path: scripts/guard-bash.mjs']});
+      expect(r.eligible).toBe(false);
+    } finally { rmSync(root, {recursive:true, force:true}); }
+  });
   it.each([
     ['default Git configuration', {}],
     ['explicit Git configuration', {GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'diff.renames',GIT_CONFIG_VALUE_0:'true',
@@ -383,6 +415,54 @@ describe('eligibility guard regression guarantees', () => {
     const r = await checkPr(6223,deps(undefined,{readAudits:()=>records}));
     expect(condition(r,2).status).toBe('PASS');
     expect(r.eligible).toBe(true);
+  });
+});
+
+describe('backlog rendered content eligibility', () => {
+  const path = 'backlog/9001-story.md';
+  const card = body => `---\ntype: story\nstatus: open\n---\n# Story\n${body}\n`;
+  it.each([
+    '<script>document.body.dataset.injected=1</script>',
+    '<ScRiPt\r\nsrc="https://example.invalid/a.js"></ScRiPt>',
+    '<img src=x onerror="alert(1)">',
+    '<svg onload="alert(1)"></svg>',
+    '<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"></iframe>',
+    '<a href="java&#x73;cript:alert(1)">click</a>',
+    'text <img\nonerror=alert(1) src=x>',
+    '```html\n<script>alert(1)</script>\n```',
+  ])('requires human review for raw markup: %s', async body => {
+    const f = {...fixture(6223), title:'Story #379', netDiffPaths:[path]};
+    const r = await checkPr(6223, deps(f, {readHeadFile:()=>card(body)}));
+    expect(condition(r,3).status).toBe('PASS');
+    expect(condition(r,4).status).toBe('UNKNOWN');
+    expect(condition(r,4).evidence.join(' ')).toContain('operator review');
+    expect(r.eligible).toBe(false);
+  });
+  it.each(['plain **Markdown**', '&lt;script&gt;literal text&lt;/script&gt;'])
+    ('conservatively requires review even for backlog prose: %s', async body => {
+      const r = await checkPr(6223, deps({...fixture(6223),netDiffPaths:[path]}, {readHeadFile:()=>card(body)}));
+      expect(condition(r,4).status).toBe('UNKNOWN');
+      expect(r.eligible).toBe(false);
+    });
+  it.each(['unreadable', 'invalid', 'oversized'])('fails closed on %s backlog content', async kind => {
+    const r = await checkPr(6223, deps({...fixture(6223),netDiffPaths:[path]}, {readHeadFile:()=>{
+      if (kind === 'unreadable') throw Error('cannot read');
+      return kind === 'invalid' ? null : card('x'.repeat(8*1024*1024));
+    }}));
+    expect(condition(r,4).status).toBe('UNKNOWN');
+    expect(condition(r,4).evidence.join(' ')).toContain('operator review');
+    expect(r.eligible).toBe(false);
+  });
+  it.each([
+    'details: "\\u003cscript>document.body.dataset.injected=1\\u003c/script>"',
+    'relatedReport: reports/executable-content.md',
+    'bornAs: x123abc',
+  ])('requires review for indirect rendered content: %s', async metadata => {
+    const text = `---\ntype: story\nstatus: open\n${metadata}\n---\n`;
+    const r = await checkPr(6223, deps({...fixture(6223),netDiffPaths:[path]}, {readHeadFile:()=>text}));
+    expect(condition(r,3).status).toBe('PASS');
+    expect(condition(r,4)).toMatchObject({status:'UNKNOWN', evidence:[`unclassified path: ${path}; operator review`]});
+    expect(r.eligible).toBe(false);
   });
 });
 
@@ -839,7 +919,7 @@ describe('round 4 append-only R391 evidence', () => {
       return `4\t0\t${path}\0`;
     }});
     expect(await adapter.readRulingNumstat(base,f.headRefOid,[path])).toBe(`4\t0\t${path}\0`);
-    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--numstat','-z',base,f.headRefOid,'--',path]]]);
+    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--no-renames','--numstat','-z',base,f.headRefOid,'--',path]]]);
   });
 });
 
@@ -908,7 +988,7 @@ describe('round 6 enforcement-tree classification', () => {
       evidence:[`unclassified path: ${path}; operator review`]});
     expect(r.eligible).toBe(false);
   });
-  it.each(['docs/examples/x.md','backlog/123-story.md','README.md'])('passes allowlisted content path %s', async path => {
+  it.each(['docs/examples/x.md','README.md'])('passes allowlisted content path %s', async path => {
     expect(condition(await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]})),4).status).toBe('PASS');
   });
   it('rejects a non-empty reviewedSafePaths policy for an enforcement path', async () => {
@@ -1003,7 +1083,7 @@ describe('round 6 ruling-entry content evidence', () => {
     expect(condition(await check('- **R999** (date) Operator: "..."\n',{
       readRulingDiff:adapter.readRulingDiff,
     }),3).status).toBe('PASS');
-    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--no-textconv',
+    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--no-renames','--no-textconv',
       '--unified=0',base,f.headRefOid,'--',path]]]);
   });
   it.each(['failure','oversized'])('keeps adapter %s closed', async kind => {
@@ -1276,7 +1356,7 @@ describe('round 10 harmless-path allowlist', () => {
     'blocks/foo/README.md', 'src/content.md', 'LICENSE.txt', 'CHANGELOG.md',
     'blocks/foo/example.njk', 'blocks/foo/style.css', 'src/pages/example.njk',
     'src/assets/style.css', 'apps/docs/README.md', 'packages/docs/example.njk',
-    'validation-generation/README.md', 'research/topic.md', 'backlog/nested/story.md'])
+    'validation-generation/README.md', 'research/topic.md', 'backlog/nested/story.md', 'backlog/123-story.md'])
   ('unknown path %s requires operator review', async path => {
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
     expect(condition(r, 4)).toEqual({id: 4, name: 'Not guard-loosening / hard to undo',
@@ -1284,7 +1364,7 @@ describe('round 10 harmless-path allowlist', () => {
     expect(r.eligible).toBe(false);
   });
   it.each(['docs/examples/example.md', 'docs/topic.md', 'docs/topics/detail.md',
-    'backlog/123-story.md', 'README.fr.md', 'image.jpg', 'assets/image.webp',
+    'README.fr.md', 'image.jpg', 'assets/image.webp',
     'assets/image.png'])('allowlisted %s passes', async path => {
     expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
   });

@@ -164,7 +164,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       if (fetched !== head) throw new Error('fetched head differs from PR head; retry');
       const base = (await run('git', ['merge-base', 'origin/main', head])).trim();
       checkSha(base);
-      const text = await run('git', ['diff', '--no-relative', '--no-ext-diff', base, head, '--name-only', '-z'], true);
+      const text = await run('git', ['diff', '--no-relative', '--no-ext-diff', '--no-renames', base, head, '--name-only', '-z'], true);
       if (!text) return {paths: [], base};
       if (!text.endsWith('\0')) throw new Error('incomplete NUL-delimited diff');
       const paths = text.slice(0, -1).split('\0');
@@ -180,7 +180,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
           || path.split('/').some(part => !part || part === '.' || part === '..'))) {
         throw new Error('invalid ruling paths; human review required');
       }
-      return run('git', ['--literal-pathspecs', 'diff', '--no-relative', '--no-ext-diff', '--numstat', '-z', base, head, '--', ...paths]);
+      return run('git', ['--literal-pathspecs', 'diff', '--no-relative', '--no-ext-diff', '--no-renames', '--numstat', '-z', base, head, '--', ...paths]);
     },
     readRulingDiff(base, head, paths) {
       checkSha(base);
@@ -191,7 +191,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
           || path.split('/').some(part => !part || part === '.' || part === '..'))) {
         throw new Error('invalid ruling paths; human review required');
       }
-      return run('git', ['--literal-pathspecs', 'diff', '--no-relative', '--no-ext-diff', '--no-textconv', '--unified=0', base, head, '--', ...paths]);
+      return run('git', ['--literal-pathspecs', 'diff', '--no-relative', '--no-ext-diff', '--no-renames', '--no-textconv', '--unified=0', base, head, '--', ...paths]);
     },
     readRulingFile(sha, path) {
       checkSha(sha);
