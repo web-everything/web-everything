@@ -80,6 +80,7 @@ export const NON_GATE_CALLS = Object.freeze({
   decideDrainLeaseGate: 'process lease (the queue serialises merges)',
   decideBatchesIdleExit: 'watch-loop exit',
   decideDurableEscalationRecord: 'durable comment',
+  decideStuckUnknownAlert: 'operator alert for persistent UNKNOWN mergeability; merge eligibility is unchanged',
   decideParkReadyStrip: 'label strip on park',
   isPrAlreadyMerged: 'idempotent merge write',
   applyEscalationRelief: 'operator LOOSENING (--no-review-escalation); merge-gate never applies it',

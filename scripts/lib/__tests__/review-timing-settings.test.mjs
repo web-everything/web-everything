@@ -32,3 +32,45 @@ it('uses env over tool over platform and ignores invalid values at every layer',
   expect(invalid.review.startBeforeCi).toBe(false);
   expect(invalid.fix).toMatchObject({ pushAfterCi: false, pushAfterCiMaxMin: 30 });
 });
+
+
+const shadowDefaults = { earlyStartShadow: false, earlyStartCare: ['none', 'low'],
+  earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: ['code'] };
+const shadowPlatform = { earlyStartShadow: true, earlyStartCare: ['none'],
+  earlyStartMaxLines: 300, earlyStartMaxFiles: 10, earlyStartKinds: ['code', 'docs'] };
+const shadowTool = { earlyStartShadow: false, earlyStartCare: ['low'],
+  earlyStartMaxLines: 200, earlyStartMaxFiles: 8, earlyStartKinds: ['code', 'config'] };
+const shadowEnv = { earlyStartShadow: true, earlyStartCare: ['none', 'low'],
+  earlyStartMaxLines: 100, earlyStartMaxFiles: 4, earlyStartKinds: ['code', 'data'] };
+const shadowEnvValues = values => Object.fromEntries(Object.entries(values).map(([key, value]) =>
+  [`WE_REVIEW_${key.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`, JSON.stringify(value)]));
+
+it('R359 defaults early start shadow off with the bounded low-care code policy', () => {
+  const result = resolve();
+  expect(result.review).toMatchObject(shadowDefaults);
+  for (const key of Object.keys(shadowDefaults)) expect(result.sources.review[key]).toBe('standard');
+});
+it.each(['standard', 'platform', 'tool', 'env'])('R359 resolves every shadow leaf and logs its provenance at %s', layer => {
+  const logs = [];
+  const options = { env: { WE_POLICY_CASCADE_LOG: '1' }, log: line => logs.push(line) };
+  if (layer !== 'standard') options.platformReview = shadowPlatform;
+  if (['tool', 'env'].includes(layer))
+    options.read = path => path.endsWith('review-settings.json') ? JSON.stringify(shadowTool) : '{}';
+  if (layer === 'env') Object.assign(options.env, shadowEnvValues(shadowEnv));
+  const expected = { standard: shadowDefaults, platform: shadowPlatform, tool: shadowTool, env: shadowEnv }[layer];
+  const result = resolve(options);
+  expect(result.review).toMatchObject(expected);
+  for (const [key, value] of Object.entries(expected)) {
+    expect(result.sources.review[key]).toBe(layer);
+    expect(logs.join('\n')).toContain(`${key}=${JSON.stringify(value)} (${layer})`);
+  }
+});
+it('R359 rejects malformed shadow overrides and retains the lower valid layer', () => {
+  const result = resolve({ platformReview: shadowPlatform,
+    review: { earlyStartShadow: 'yes', earlyStartCare: 'low', earlyStartMaxLines: -1,
+      earlyStartMaxFiles: 1.5, earlyStartKinds: 'code' },
+    env: shadowEnvValues({ earlyStartShadow: 'true', earlyStartCare: [], earlyStartMaxLines: '400',
+      earlyStartMaxFiles: -1, earlyStartKinds: [] }) });
+  expect(result.review).toMatchObject(shadowPlatform);
+  for (const key of Object.keys(shadowPlatform)) expect(result.sources.review[key]).toBe('platform');
+});

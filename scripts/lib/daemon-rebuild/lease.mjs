@@ -5,6 +5,7 @@
 import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { hostname } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { stateDir } from './state.mjs';
@@ -95,14 +96,51 @@ export const DEFAULT_REBUILD_LEASE_STALE_MS = 20 * 60_000;
  * lease is a courtesy against wasted, colliding smokes, and the unique candidate path is what keeps a takeover
  * from ever touching another attempt's tree.
  */
-export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now() } = {}) {
+/** Start time (epoch ms) of `pid` via `ps -o lstart=` (second resolution), or null when unreadable. */
+export function processStartMs(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000, env: { ...process.env, LC_ALL: 'C' } });
+    if (r.status !== 0) return null;
+    const t = Date.parse(String(r.stdout || '').trim());
+    return Number.isFinite(t) ? t : null;
+  } catch { return null; }
+}
+
+/** Pid-reuse slack: `lstart` has 1 s resolution and startedAt is taken after the process started. */
+const PID_REUSE_SLACK_MS = 2000;
+
+/** Does `pid` exist? ESRCH = no. Any other error (EPERM: another user's process) = it exists, so the pid-reuse
+ *  start-time check still applies to it. */
+function pidExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false; // a malformed pid names no process (fail open, per the lease doc)
+  try { process.kill(pid, 0); return true; } catch (e) { return !(e && e.code === 'ESRCH'); }
+}
+
+/**
+ * The ONE pid-reuse rule, shared by {@link buildLeaseIsLive} and the destructive teardown guard in
+ * {@link claimBuildLease}: `pid` (known to exist) provably did NOT take the lease at `startedMs` when its process
+ * started later than the lease plus {@link PID_REUSE_SLACK_MS}. Fails CLOSED: an unreadable start time (null,
+ * NaN, a throwing reader) or an unreadable `startedMs` is never proof, so it returns false.
+ */
+export function pidReusedSince(pid, startedMs, startTimeOf = processStartMs) {
+  if (!Number.isFinite(startedMs)) return false;
+  let procStart;
+  try { procStart = startTimeOf(pid); } catch { return false; }
+  return Number.isFinite(procStart) && procStart > startedMs + PID_REUSE_SLACK_MS;
+}
+
+export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now(), startTimeOf = processStartMs } = {}) {
   if (!building || typeof building !== 'object') return false;
   const staleMs = Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : DEFAULT_REBUILD_LEASE_STALE_MS;
   const startedMs = Date.parse(building.startedAt || '');
   if (!Number.isFinite(startedMs) || nowMs - startedMs > staleMs) return false;
   if (building.host !== hostname()) return true;
   if (building.pid === process.pid) return ACTIVE_BUILD_TOKENS.has(building.token);
-  try { process.kill(building.pid, 0); return true; } catch (e) { return !(e && e.code === 'ESRCH'); }
+  if (!pidExists(building.pid)) return false;
+  // The pid exists, but a REUSED pid belongs to an unrelated process that started after the lease was taken.
+  // An unreadable start time fails closed (stays live): only a proven later start counts as dead.
+  return !pidReusedSince(building.pid, startedMs, startTimeOf);
 }
 
 /**
@@ -110,9 +148,9 @@ export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now
  * `plan`, tearing down an abandoned lease's leftover candidate first. Returns the lease, or `null` when a live
  * sibling build already holds it. Mutates `state.building`; the caller writes the state.
  */
-export function claimBuildLease({ state, plan, root, run, env, nowMs }) {
-  if (buildLeaseIsLive(state.building, { env, nowMs })) return null;
-  if (state.building?.path && leaseOwnerIsGone(state.building)) removeCandidate({ root, path: state.building.path, run, env });
+export function claimBuildLease({ state, plan, root, run, env, nowMs, startTimeOf = processStartMs }) {
+  if (buildLeaseIsLive(state.building, { env, nowMs, startTimeOf })) return null;
+  if (state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
   const token = `${process.pid}-${randomBytes(4).toString('hex')}`;
   const lease = {
     token, pid: process.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(),
@@ -127,10 +165,11 @@ export function claimBuildLease({ state, plan, root, run, env, nowMs }) {
  *  process (none of our builds is running — see {@link buildLeaseIsLive}), or a dead pid on this host. An AGED
  *  lease from a still-live pid (a smoke slower than the stale limit) or another host is taken over, but its tree
  *  is left alone — the new attempt uses its own unique path, so the two never collide. */
-function leaseOwnerIsGone(building) {
+function leaseOwnerIsGone(building, startTimeOf = processStartMs) {
   if (building.host !== hostname()) return false;
   if (building.pid === process.pid) return !ACTIVE_BUILD_TOKENS.has(building.token);
-  try { process.kill(building.pid, 0); return false; } catch (e) { return !!(e && e.code === 'ESRCH'); }
+  if (!pidExists(building.pid)) return true;
+  return pidReusedSince(building.pid, Date.parse(building.startedAt || ''), startTimeOf);
 }
 
 /** Under the write lock: drop `state.building` if it is still OUR lease (a takeover's newer lease is left alone). */

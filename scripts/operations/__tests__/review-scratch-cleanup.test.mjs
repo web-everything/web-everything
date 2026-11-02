@@ -27,7 +27,10 @@ it('keeps ownership metadata outside a pinned tree containing the former marker 
     env: { ...process.env, TMPDIR: tmp, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8', timeout: 15000,
   });
   expect(r.status, r.stderr).toBe(0);
-  expect(readdirSync(tmp)).toEqual(['bin']);
+  // A failed pool setup falls back to a full copy and leaves nothing behind: no held lock, no slot, no scratch.
+  expect(readdirSync(tmp).sort()).toEqual(['bin', 'we-seat-pool']);
+  expect(readdirSync(join(tmp, 'we-seat-pool', 'locks'))).toEqual([]);
+  expect(readdirSync(join(tmp, 'we-seat-pool', 'slots'))).toEqual([]);
 });
 it('removes a checkout whose pinned fetch fails before makeScratch returns', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'we-seat-failure-test-')); roots.push(tmp);

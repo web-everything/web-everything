@@ -26,11 +26,12 @@ const signalWhenMarked = (f, name) => { const t = setInterval(() => { if (exists
 
 describe('heavy-admission client signals', () => {
   it.each([['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]])('%s cancels the remote run, clears the marker and exits %i', async (name, code) => {
+    const before = process.listenerCount(name);
     const f = fixture(vi.fn(waitsForAbort({mode: 'cancelled', terminated: true, reason: 'client-signal'})));
     signalWhenMarked(f, name);
     expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: code, signal: name});
     expect(existsSync(marker(f.cwd))).toBe(false);
-    expect(process.listenerCount(name)).toBe(process.listenerCount(name)); // handlers removed below
+    expect(process.listenerCount(name)).toBe(before);
   });
   it('removes its signal handlers when the run ends', async () => {
     const before = process.listenerCount('SIGTERM');

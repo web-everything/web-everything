@@ -35,3 +35,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Held-card additions (2026-11-01, themes: loader and overlay lifecycle)
+
+- Loader cannot retire superseded registrations of an open PR (loader-fast-return-m1..m5 vs -m9..-m13 refused `not-proved`; registrations carry `pr:null`). Registrations should record their PR, and a newer adopted registration of the same branch retires its predecessors.
+- A squash-landed overlay deadlocks adoption: the old conflicting top blocks the rebuild (`pinned-overlay-conflict`), so retire-after-adoption never runs (#6184 covers part). Auto-retire a registration when its superseding PR merges.
+- `prototype-load --retire` did not propose retiring perf10-forge-fallbacks-m1 though it is contained in 1101c: the parked "contained" retire slice (S4) should be un-parked and folded into this card's atomic remove.

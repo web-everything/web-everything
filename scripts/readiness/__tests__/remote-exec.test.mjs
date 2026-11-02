@@ -563,7 +563,7 @@ describe('isAllowedCommand', () => {
 
   it.each([
     '--shard=1/2', '--bail=1', '--unknown', '--RUN', '--Silent', '--noColor',
-    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=json', '--reporter=DOT',
+    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=JSON', '--reporter=junit', '--reporter=DOT',
     '--reporter', '--run=true', '--silent=false', '--no-color=true', '-t', '-tcase',
     '--testNamePattern', '--', '--CONFIG=other', '--dangerously-ignore-unhandled-errors',
   ])('fails closed for unsupported option spelling or missing value: %s', async arg => {
@@ -617,8 +617,11 @@ describe('standards input parity', () => {
       git('init','-b','main'); git('config','user.name','Fixture'); git('config','user.email','fixture@example.invalid');
       const tier = 'scripts/lib/disposition-judge.mjs';
       mkdirSync(join(work,'scripts/lib'),{recursive:true});
-      for (const file of ['check-memory.mjs','lib/write-all-sync.mjs','lib/secret-scrub.mjs'])
+      for (const file of ['check-memory.mjs','lib/write-all-sync.mjs'])
         cpSync(new URL(`../../${file}`,import.meta.url),join(work,'scripts',file));
+      // R323: the real scrubber spells out secret patterns, fails the content scan and is
+      // excluded from Forge, so the fixture uses a clean stand-in to test input parity.
+      writeFileSync(join(work,'scripts/lib/secret-scrub.mjs'),'export const scrubPublish = () => [];\n');
       writeFileSync(join(work,'package-lock.json'),'{}');
       writeFileSync(join(work,'.gitignore'),'coverage/\n');
       mkdirSync(join(work,'.claude')); mkdirSync(join(work,'agent-memory-src'));
@@ -2297,8 +2300,19 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({code:'excluded-source-file'});
   });
 
-  it.each(['secrets.json', 'credentials.yaml', 'secret.pem', 'credentials', '.secrets/safe.md', 'secret.key/safe.md'])
-  ('keeps public tracked non-source or forbidden-component path %s excluded', async name => {
+  // R321: a name-only credential match ships when tracked, identical to origin/main and clean.
+  it.each(['secrets.json', 'credentials.yaml', 'credentials'])
+  ('ships public tracked name-flagged path %s', async name => {
+    const data = name.endsWith('.json') ? '{"a":"public"}' : 'public';
+    writeFileSync(join(cwd,name),data);
+    const paths = [Buffer.from(name)];
+    const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, data), {code:0, stdout:treeRecord(name, data)})});
+    expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
+    expect(manifest.excluded).toEqual([]);
+  });
+
+  it.each(['secret.pem', '.secrets/safe.md', 'secret.key/safe.md'])
+  ('keeps public tracked forbidden-component path %s excluded', async name => {
     mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'public');
     const paths = [Buffer.from(name)];
     const exec = gitInventory(paths, indexRecord(name, 'public'), {code:0, stdout:treeRecord(name, 'public')});

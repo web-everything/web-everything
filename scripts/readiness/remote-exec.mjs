@@ -233,7 +233,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, credentialContentFinding, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -497,7 +497,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
       publicOid = await publicBlob(key);
-      if (!indexedOid || indexedOid !== publicOid) throw excludedSource();
+      if (!indexedOid || indexedOid !== publicOid) {
+        // Not tracked-and-identical to origin/main: never ships. Source files
+        // refuse the manifest (local fallback); other types stay excluded as before.
+        if (sourceExtension.test(names.at(-1))) throw excludedSource();
+        publicOid = undefined;
+      }
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
       const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
@@ -540,6 +545,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     hashDone();
+    // Match warm export: pattern-spelling public files stay excluded without
+    // aborting unrelated work. The public worktree identity check above still
+    // refuses private edits; manifestEntry remains a fail-closed leaf guard.
+    if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
     return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });
   for (const leaf of leaves) {
@@ -565,15 +574,17 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       // their remaining components and all other aliases obey the normal policy.
       const bridge=['.claude/skills/','.claude/agent-memory/'].find(prefix=>path.subarray(0,prefix.length).equals(Buffer.from(prefix)));
       const policy=classifyManifestPath(bridge?path.subarray(bridge.length):path);
-      // A credential-named alias is refused unless it is the memory bridge's exact
-      // image of a tracked agent-memory-src/ source that itself passed the public-blob check above.
-      const sourcePath=entry.sourcePath??entry.path,memoryRoot=Buffer.from('agent-memory-src/');
-      const verifiedMemory=bridge==='.claude/agent-memory/'&&policy.credentialSource
-        &&sourcePath.subarray(0,memoryRoot.length).equals(memoryRoot)
-        &&sourcePath.subarray(memoryRoot.length).equals(path.subarray(bridge.length))
-        &&indexBlobs.has(sourcePath.toString('base64'))&&classifyManifestPath(sourcePath).credentialSource
-        &&sourceEntries.some(source=>source.path.equals(sourcePath));
-      if((policy.excluded&&!verifiedMemory)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
+      const sourcePath=entry.sourcePath??entry.path,sourcePolicy=classifyManifestPath(sourcePath);
+      // Preserve the established memory bridge's exact image of verified regular
+      // sources. Credential-named source entries already passed public-blob identity
+      // and content checks above. Nested links and other alias roots never qualify.
+      const verifiedMemory=link.linkPath.equals(Buffer.from('.claude/agent-memory'))
+        &&link.targetPath.equals(Buffer.from('agent-memory-src'))
+        &&entry.tracked&&!entry.sourcePath&&!entry.links?.length
+        &&policy.credentialSource&&sourcePolicy.credentialSource;
+      // Source flags still count: a credential-named real directory behind another
+      // bridge cannot launder them away, even when the alias suffix looks clean.
+      if(((policy.excluded||sourcePolicy.excluded)&&!verifiedMemory)||policy.names.includes('node_modules'))throw manifestRefusal('unshipped-symlink',link.linkPath);
       if(++projectionCount>100000||(projectionBytes+=path.length+1)>LIMIT)throw manifestRefusal('manifest-walk-limit',path);
       leaves.push({...entry,path,tracked:false,sourcePath:entry.sourcePath??entry.path,links:[link,...(entry.links??[])]});
     }
@@ -1044,7 +1055,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -1183,6 +1194,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const preparation = JSON.parse(protocolText(prepared.stdout,4096));
       run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
+      // Tell the admission wrapper which Forge run this client now owns, so a stale slot marker can be judged per run.
+      try {onRun?.(run);} catch { /* advisory only */ }
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
@@ -1225,7 +1238,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1258,7 +1271,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
