@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-import { classifyLaneNames, nextLaneNumbers, capState, recoverPool, realRecoverIo, verifyRecoveryBackup, collectVerdicts, diagnosePool, emitFullPoolNeedsYou } from './lib/lane-pool-recover.mjs';
-import { scheduledLaneGc } from './lib/host-load.mjs';
-import { loadHostOverloadSettings } from './lib/host-overload-settings.mjs';
-import { isTerminalStatus } from './lib/backlog-status.cjs';
+import './lib/stale-tool-guard-entry.mjs';
+// Awaited imports run only after the guard permits this module body to execute.
+const { classifyLaneNames, nextLaneNumbers, capState, recoverPool, realRecoverIo, verifyRecoveryBackup, collectVerdicts, diagnosePool, emitFullPoolNeedsYou } = await import('./lib/lane-pool-recover.mjs');
+const { scheduledLaneGc } = await import('./lib/host-load.mjs');
+const { loadHostOverloadSettings } = await import('./lib/host-overload-settings.mjs');
+const { isTerminalStatus } = await import('./lib/backlog-status.cjs');
 /**
  * lane-pool.mjs — provision & refresh the persistent lane-clone pool for the #1933 clone-based
  * parallel batch orchestrator (slice 2).
@@ -77,31 +79,31 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { createHash, randomBytes } from 'node:crypto';
-import { homedir, hostname, tmpdir } from 'node:os';
-import { join, basename, resolve, dirname, sep } from 'node:path';
-import { resolveReal } from './guard-lane.mjs';
-import { readGit, execRead } from './lib/proc-read.mjs';
-import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './lib/git-bounded.mjs';
-import { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
+const { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } = await import('node:fs');
+const { execFileSync } = await import('node:child_process');
+const { fileURLToPath } = await import('node:url');
+const { createHash, randomBytes } = await import('node:crypto');
+const { homedir, hostname, tmpdir } = await import('node:os');
+const { join, basename, resolve, dirname, sep } = await import('node:path');
+const { resolveReal } = await import('./guard-lane.mjs');
+const { readGit, execRead } = await import('./lib/proc-read.mjs');
+const { boundedGitCommand, BOUNDED_GIT_GRACE_MS } = await import('./lib/git-bounded.mjs');
+const { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } = await import('./lib/lane-alternates.mjs');
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
 // unattributed, GraphQL-backed `execFileSync`, run on EVERY `acquire` and EVERY `list --acquirable` scan
 // across every session in every pool — measured as the top unattributed slice of the app's GraphQL bucket
 // (`gh-spend.mjs report`'s own total minus every row it could explain). Converted to the same REST +
 // ETag-conditional path #4351 built for `build-dispatch-daemon.mjs`'s own top-spender fix.
-import { ghRestGetPaged } from './lib/gh-rest-read.mjs';
+const { ghRestGetPaged } = await import('./lib/gh-rest-read.mjs');
 // #x9fbg1x — every lane clone this pool hands out gets Claude Code's own background-session worktree-isolation
 // guard turned OFF, via an UNTRACKED (`.gitignore`d) settings.local.json this call writes INTO the clone —
 // never the tracked, repo-wide `.claude/settings.json` (which no longer carries this key; see that file's own
 // diff and `scripts/lib/dispatch-bg-isolation.mjs`'s header for the full incident). A lane clone already IS
 // this repo's own isolation boundary (#2123/#104), so the CLI's guard is redundant for ANY session working in
 // one — dispatched or a human-driven single session alike — without ever touching the primary checkout.
-import { ensureWorktreeIsolationOff } from './lib/dispatch-bg-isolation.mjs';
-import { guardedPoolRoot, referenceArgs, checkoutRootFor } from './lib/lane-pool-paths.mjs';
-import {
+const { ensureWorktreeIsolationOff } = await import('./lib/dispatch-bg-isolation.mjs');
+const { guardedPoolRoot, referenceArgs, checkoutRootFor } = await import('./lib/lane-pool-paths.mjs');
+const {
   LEASE_FILENAME,
   DEFAULT_LEASE_TTL_MINUTES,
   WORKFLOW_LANE_PURPOSE,
@@ -119,23 +121,23 @@ import {
   isContestedLease,
   isDeliveredLease,
   laneAuthoredSince,
-} from './lib/lane-lease.mjs';
-import { retryTransientGit } from './lib/git-fetch-retry.mjs';
-import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
+} = await import('./lib/lane-lease.mjs');
+const { retryTransientGit } = await import('./lib/git-fetch-retry.mjs');
+const { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } = await import('./lib/lane-repair.mjs');
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
-import { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } from './lib/free-lane-list.mjs';
+const { readFreeLaneList, isFreeLaneListFresh, freeLaneCandidates, resolveFreeLaneListPath, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, FREE_LANE_LIST_MAX_AGE_ENV } = await import('./lib/free-lane-list.mjs');
 // #2560 — lane-pool may freely import readiness (confirmed no circular import): the advisory scope-lease check
 // at acquire. normScope normalizes the declared `--scope`; candidateLaunch is the pure overlap-at-launch query.
-import { normScope } from './readiness/scope-lease.mjs';
-import { laneGitSignature, readStatusCache, cachedGitFields, writeStatusCache, resolveStatusMaxAgeMs } from './lib/lane-status-cache.mjs';
-import { isCherryOutputAllPatchEquivalent } from './lib/git-patch-equivalence.mjs';
-import { candidateLaunch } from './readiness/scope-lease-live.mjs';
+const { normScope } = await import('./readiness/scope-lease.mjs');
+const { laneGitSignature, readStatusCache, cachedGitFields, writeStatusCache, resolveStatusMaxAgeMs } = await import('./lib/lane-status-cache.mjs');
+const { isCherryOutputAllPatchEquivalent } = await import('./lib/git-patch-equivalence.mjs');
+const { candidateLaunch } = await import('./readiness/scope-lease-live.mjs');
 // #x3jmao3 — the SAME non-busy-wait spin-poll primitive `withNumberingLock` already uses to space its own
 // spin-acquire (`we:scripts/readiness/drain-lock.mjs`), reused rather than re-implemented, for `acquire`'s
 // own optional `--wait-ms` full-pool retry/backoff below. No cycle: drain-lock.mjs never imports lane-pool.
-import { sleepSyncMs } from './readiness/drain-lock.mjs';
-import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
+const { sleepSyncMs } = await import('./readiness/drain-lock.mjs');
+const { jitteredDelayMs } = await import('./lib/lane-acquire-backoff.mjs');
 // #2748 — REUSE the standalone reaper's PURE core so the "provably-dead lease" verdict is SINGLE-SOURCED with
 // `scripts/conveyor/lease-reaper.mjs` (the acquire-native backstop must agree with the periodic reaper, never
 // fork its logic). Importing lease-reaper is side-effect-free — its IO shell is gated on the main-module check —
@@ -144,27 +146,27 @@ import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
 // #xkk4lv7 — `prDetailsFromList`/`resolveLeaseItemNum` ADDED: the SAME branch-based item-resolution fallback
 // (+ its Fork 2/Option C safety gate) `lease-reaper.mjs`'s own resident pass now drives, imported rather than
 // re-derived (this card's Risk 5 — the two reapers must stay single-sourced).
-import { classifyReap, reapPlan, prStatesFromList, prStatesByPrNumber, prDetailsFromList, itemNumFromSession, prNumFromSession, resolveLeaseItemNum, restPullToPrStateShape } from './conveyor/lease-reaper.mjs';
-import { readField } from './backlog/frontmatter.mjs';
+const { classifyReap, reapPlan, prStatesFromList, prStatesByPrNumber, prDetailsFromList, itemNumFromSession, prNumFromSession, resolveLeaseItemNum, restPullToPrStateShape } = await import('./conveyor/lease-reaper.mjs');
+const { readField } = await import('./backlog/frontmatter.mjs');
 // #3383 — the lane-history ledger (`<lane>/.git/lane-history.jsonl`): one line per acquire/adopt/release/reap,
 // so a lane can be traced back to the session/card/PR that used it AFTER its lease is released (today nothing
 // records that — see `scripts/lane-whois.mjs`, the reader). Lives in its OWN module (another worker owns this
 // file for PR #2606 concurrently) — the four call sites below are the only hook points.
-import { appendLaneHistory, laneHistoryEntry, readLaneHistory, lastLaneHistoryEntry } from './lib/lane-history.mjs';
+const { appendLaneHistory, laneHistoryEntry, readLaneHistory, lastLaneHistoryEntry } = await import('./lib/lane-history.mjs');
 // #4370 — the per-POOL lifecycle audit journal (`<poolDir>/.lane-journal.jsonl`): every lease write/delete and
 // every reset/clean below appends one line naming its ACTOR, reason, HEAD before→after and the dirty/ahead/
 // unpushed state it found. `check:standards` (`findUnjournaledLaneMutations`) flags a new mutation point here
 // that forgets to call `journalLaneEvent`.
-import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict } from './lib/lane-history.mjs';
+const { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict } = await import('./lib/lane-history.mjs');
 // #3568 — the shared known-safe-scratch-litter allowlist + cleanup core, reused verbatim by the periodic
 // `we:scripts/conveyor/lane-pool-health-watch.mjs` pass so the two never diverge into two separately-maintained
 // lists. Side-effect-free at import (no top-level dispatch), like every other `./lib/*.mjs` import above.
 // #3383 — `planLitterCleanup` (PURE) is ALSO reused directly by this file's own `litterAdjustedDirty` below,
 // the acquire-time twin of `cleanLaneLitter`'s release-time cleanup — same allowlist, same verdict, never a
 // second hand-rolled classifier.
-import { cleanLaneLitter, planLitterCleanup } from './lib/lane-litter.mjs';
-import { salvageLaneCards } from './lib/lane-card-salvage.mjs';
-import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
+const { cleanLaneLitter, planLitterCleanup } = await import('./lib/lane-litter.mjs');
+const { salvageLaneCards } = await import('./lib/lane-card-salvage.mjs');
+const { pickFreshestTip } = await import('./readiness/scope-lease-collect.mjs');
 // #3383 gap 2 (auto-reclaim) — the SAME preservation primitives `lane-whois.mjs` itself uses to prove a lane's
 // uncommitted/ahead content is provably preserved (identical blob in origin, or a pushed/patch-equivalent
 // commit), reused verbatim by `cmdReclaim`'s own re-check below rather than re-derived. Side-effect-free at
@@ -172,26 +174,26 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // this file already imports (`lease-reaper.mjs`, `lib/lane-litter.mjs`, …), so this is not the "unsafe to
 // import" shape `we:scripts/operations/operator-queue.mjs`'s own header warns about (that warning is about
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
-import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
-import { guessCardIds } from './lib/lane-whois-core.mjs';
-import { realSalvageIo, salvagePushLane } from './lib/lane-pool-salvage-push.mjs';
-import {
+const { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } = await import('./lane-whois.mjs');
+const { guessCardIds } = await import('./lib/lane-whois-core.mjs');
+const { realSalvageIo, salvagePushLane } = await import('./lib/lane-pool-salvage-push.mjs');
+const {
   salvageLane, removeLitterWorktrees, listLitterWorktrees, laneLivenessGate,
-} from './lib/lane-salvage.mjs';
+} = await import('./lib/lane-salvage.mjs');
 // #x5n4zn3 — the SAME shared budget policy `we:scripts/lib/bounded-child.mjs`'s async `runBounded` rollout
 // uses elsewhere (dispatch-plan.mjs's collectors), reused here for its CONSTANTS only (`resolveChildTimeoutMs`
 // / the `WE_CHILD_TIMEOUT_MS` env knob), NOT its async primitive — see the `git`/`gitQuiet` header comment
 // below for why this file deliberately stays synchronous.
-import {
-  resolveChildTimeoutMs, NPM_INSTALL_TIMEOUT_MS, NETWORK_GIT_TIMEOUT_MS as SHARED_NETWORK_GIT_TIMEOUT_MS,
-} from './lib/bounded-child.mjs';
-import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/lane-verify.mjs';
+const {
+  resolveChildTimeoutMs, NPM_INSTALL_TIMEOUT_MS, NETWORK_GIT_TIMEOUT_MS: SHARED_NETWORK_GIT_TIMEOUT_MS,
+} = await import('./lib/bounded-child.mjs');
+const { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } = await import('./lib/lane-verify.mjs');
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
-import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
-import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
-import { applyLaneDietConfig, laneDietConfigState } from './lib/lane-git-diet.mjs';
-import { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from './lib/lane-git-hardening.mjs';
-import { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } from './lib/git-identity.mjs';
+const { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } = await import('./lib/lane-hold-io.mjs');
+const { resolveLaneHoldSettings } = await import('./lib/lane-lease.mjs');
+const { applyLaneDietConfig, laneDietConfigState } = await import('./lib/lane-git-diet.mjs');
+const { dropGitLocationEnv, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } = await import('./lib/lane-git-hardening.mjs');
+const { readGitIdentity, laneIdentityReport, ensureLaneHooksPath, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT } = await import('./lib/git-identity.mjs');
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
 const parseScopeFlag = (v) => (typeof v === 'string' && v ? normScope(v.split(',')) : []);

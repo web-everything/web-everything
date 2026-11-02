@@ -331,5 +331,148 @@ describe('lane-pool entry wiring', () => {
     const imports = source.split(/\r?\n/).filter((line) => /^\s*import\b/.test(line));
     expect(imports[0]).toMatch(/^import\s+['"]\.\/lib\/stale-tool-guard-entry\.mjs['"];?\s*$/);
     expect(imports).not.toContain("import './lib/stale-tool-guard.mjs';");
+    expect(imports).toEqual(["import './lib/stale-tool-guard-entry.mjs';"]);
+  });
+});
+
+describe('guard bounds and settings', () => {
+  it('resolves each setting through standard, platform, tool and environment with provenance', async () => {
+    const { resolveStaleToolSettings } = await load();
+    const log = vi.fn();
+    expect(resolveStaleToolSettings({ platform: {}, settings: {}, env: {}, log }))
+      .toEqual({ threshold: 5, mode: 'refuse' });
+    expect(log.mock.lastCall[0]).toContain('threshold=5 (standard)');
+    expect(resolveStaleToolSettings({ platform: { threshold: 2, mode: 'reexec' },
+      settings: { threshold: 3 }, env: {}, log })).toEqual({ threshold: 3, mode: 'reexec' });
+    expect(log.mock.lastCall[0]).toContain('threshold=3 (tool)');
+    expect(log.mock.lastCall[0]).toContain('mode="reexec" (platform)');
+    expect(resolveStaleToolSettings({ platform: { threshold: 2 }, settings: { threshold: 3 },
+      env: { WE_TOOL_STALE_THRESHOLD: '0', WE_TOOL_STALE_MODE: 'refuse' }, log }))
+      .toEqual({ threshold: 0, mode: 'refuse' });
+    expect(log.mock.lastCall[0]).toContain('threshold=0 (env)');
+  });
+
+  it.each([{ threshold: -1 }, { threshold: Infinity }, { threshold: '6' },
+    { threshold: Number.MAX_SAFE_INTEGER + 1 }, { mode: 'off' }, null])(
+    'refuses invalid tool settings %j before Git IO', async (settings) => {
+      const { guardToolCheckout } = await load();
+      const h = harness();
+      await expect(guardToolCheckout({ ...h, settings })).rejects.toThrow('Invalid staleToolGuard');
+      expect(h.exec).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses unreadable platform settings and malformed environment overrides', async () => {
+    const { resolveStaleToolSettings } = await load();
+    const file = join(scratch(), 'preferences.json');
+    writeFileSync(file, '{broken');
+    expect(() => resolveStaleToolSettings({ settings: {}, env: { WE_PLATFORM_PREFERENCES_FILE: file } }))
+      .toThrow('Unreadable staleToolGuard');
+    for (const threshold of ['', '6junk', '9007199254740992']) {
+      expect(() => resolveStaleToolSettings({ settings: {}, platform: {},
+        env: { WE_TOOL_STALE_THRESHOLD: threshold } })).toThrow('Invalid staleToolGuard');
+    }
+  });
+
+  it.each(['timeout', 'output overflow'])('refuses a fetch %s with an operator recovery path', async (reason) => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    h.exec.mockReturnValue({ status: null, error: new Error(reason) });
+    await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } }))
+      .rejects.toThrow('Update the tool checkout from origin/main and retry');
+    expect(h.exec).toHaveBeenCalledTimes(1);
+    const [, args, options] = h.exec.mock.calls[0];
+    expect(args).toContain('fetch');
+    expect(options.timeout).toBeGreaterThan(0);
+    expect(options.timeout).toBeLessThanOrEqual(30_000);
+    expect(options.maxBuffer).toBeGreaterThan(0);
+    expect(options.maxBuffer).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(options.killSignal).toBe('SIGKILL');
+    expect(options.env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  it('refuses worktree cleanup failure instead of reporting a successful reexec', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ fail: 'worktree-remove' });
+    await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow('Git worktree');
+    expect(nodeCalls(h)).toHaveLength(1);
+    expect(removals(h)).toHaveLength(1);
+  });
+
+  it('parses static imports without following comments, quoted text or dynamic imports', async () => {
+    const { importClosure } = await load();
+    const root = scratch();
+    put(root, 'entry.mjs', `// import './missing.mjs';
+      const text = "import './also-missing.mjs'";
+      const lazy = import('./lazy.mjs');
+      export * from './real.mjs';`);
+    put(root, 'real.mjs', '');
+    expect([...await importClosure(join(root, 'entry.mjs'), { root })].sort())
+      .toEqual(['entry.mjs', 'real.mjs']);
+  });
+});
+
+describe('side-effect entry exit behavior', () => {
+  it('refusal prevents sibling dependency side effects', () => {
+    const root = scratch();
+    const marker = join(root, 'sibling-ran');
+    // Exercise the actual lane-pool bootstrap, including its dependency loading strategy.
+    const source = readFileSync(join(ROOT, 'scripts/lane-pool.mjs'), 'utf8');
+    put(root, 'scripts/lane-pool.mjs', source);
+    put(root, 'scripts/lib/stale-tool-guard-entry.mjs',
+      readFileSync(join(ROOT, 'scripts/lib/stale-tool-guard-entry.mjs'), 'utf8'));
+    put(root, 'scripts/lib/stale-tool-guard.mjs', `export async function guardToolCheckout() {
+      await new Promise(resolve => setImmediate(resolve));
+      throw new Error('asynchronous fixture refusal');
+    }`);
+    const firstDependency = source.match(/(?:import|const) \{([^}]+)\}(?: from | = await import\()['"]\.\/lib\/lane-pool-recover\.mjs['"]/);
+    expect(firstDependency).toBeTruthy();
+    put(root, 'scripts/lib/lane-pool-recover.mjs', `import { writeFileSync } from 'node:fs';
+      writeFileSync(${JSON.stringify(marker)}, 'stale side effect');
+      ${firstDependency[1].split(',').map(name => `export const ${name.trim()} = undefined;`).join('\n')}`);
+    const result = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs')], {
+      env: (({ VITEST, ...e }) => e)(process.env), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe('asynchronous fixture refusal\n');
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('guard follows deferred bootstrap dependencies when deciding staleness', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    put(h.root, 'scripts/tool.mjs', "const { version } = await import('./lib/dep.mjs');");
+    await expect(guardToolCheckout(h)).rejects.toThrow('stale tool checkout (6 behind)');
+    expect(nodeCalls(h)).toHaveLength(0);
+  });
+
+  it('eager awaited imports include their recursive static dependencies', async () => {
+    const { importClosure } = await load();
+    const root = scratch();
+    put(root, 'entry.mjs', "const { value } = await import('./dep.mjs'); await import('./side.mjs');");
+    put(root, 'dep.mjs', "export { value } from './leaf.mjs';");
+    put(root, 'leaf.mjs', 'export const value = 1;');
+    put(root, 'side.mjs', "import './entry.mjs';");
+    expect([...await importClosure(join(root, 'entry.mjs'), { root })].sort())
+      .toEqual(['dep.mjs', 'entry.mjs', 'leaf.mjs', 'side.mjs']);
+  });
+
+  it.each(['continue', 'reexec', 'refuse'])('%s prevents stale tool continuation when appropriate', (action) => {
+    const root = scratch();
+    // Execute the actual entry source with a hermetic guard, never network Git IO.
+    put(root, 'entry.mjs', readFileSync(join(ROOT, 'scripts/lib/stale-tool-guard-entry.mjs'), 'utf8'));
+    put(root, 'stale-tool-guard.mjs', `export async function guardToolCheckout({ entry }) {
+      if (entry !== process.argv[1]) throw new Error('wrong tool entry');
+      ${action === 'continue' ? 'return;' : action === 'reexec' ? 'return 23;' : "throw new Error('fixture refusal');"}
+    }`);
+    put(root, 'tool.mjs', "import './entry.mjs'; console.log('tool continued');");
+    const result = spawnSync(process.execPath, [join(root, 'tool.mjs')], {
+      env: (({ VITEST, ...e }) => e)(process.env), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(action === 'continue' ? 0 : action === 'reexec' ? 23 : 1);
+    expect(result.stdout).toBe(action === 'continue' ? 'tool continued\n' : '');
+    expect(result.stderr).toBe(action === 'refuse' ? 'fixture refusal\n' : '');
   });
 });
