@@ -399,6 +399,12 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(w.reason).toBe('reader-priority');
   });
 
+  it('a string threshold is normalized so it cannot defeat the window cap', async () => {
+    const r = await simulate({ waitPriorityMs: '8000', rReleaseMs: 1e9 });
+    expect(r.w.reason).toBe('reader-priority');
+    expect(r.waitedMs).toBeLessThanOrEqual(8000 + 5 * 60_000 + 11_000);
+  });
+
   it('an infinite wait is not honoured: it falls back to the bounded default', async () => {
     const lockRoot = mkTmp('dcww-root-');
     const clone = mkTmp('dcww-clone-');

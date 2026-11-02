@@ -506,7 +506,7 @@ export async function acquireWrite(root, opts = {}) {
     readerPriorityAfter = resolveReaderPriorityAfter(),
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
-    writerWaitPriorityMs = resolveWriterWaitPriorityMs(),
+    writerWaitPriorityMs: writerWaitPriorityMsOpt = resolveWriterWaitPriorityMs(),
     writerWaitPriorityWindowMs: writerWaitPriorityWindowMsOpt = WRITER_WAIT_PRIORITY_WINDOW_MS,
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
@@ -514,6 +514,9 @@ export async function acquireWrite(root, opts = {}) {
   const waitMs = Number.isFinite(Number(waitMsOpt)) && Number(waitMsOpt) >= 0 ? Number(waitMsOpt) : 600_000;
 
   // The override window can only shrink below the built-in cap; a non-finite or negative value uses the cap.
+  // Normalize a direct option too (a string must not concatenate); invalid or negative means off.
+  const writerWaitPriorityMs = Number.isFinite(Number(writerWaitPriorityMsOpt)) && Number(writerWaitPriorityMsOpt) > 0
+    ? Number(writerWaitPriorityMsOpt) : 0;
   const windowMs = Number.isFinite(Number(writerWaitPriorityWindowMsOpt)) && Number(writerWaitPriorityWindowMsOpt) >= 0
     ? Math.min(Number(writerWaitPriorityWindowMsOpt), WRITER_WAIT_PRIORITY_WINDOW_MS) : WRITER_WAIT_PRIORITY_WINDOW_MS;
   const startMs = now();
