@@ -2032,41 +2032,104 @@ const GIT_FETCH_VALUE_FLAGS = new Set([
  *  `--update-head-ok` / `-u` (the flag exists only to let fetch overwrite the checked-out branch) and for any
  *  refspec whose destination is a local branch: under `refs/heads/`, or unqualified (git resolves a bare
  *  destination to a branch). Destinations under `refs/remotes/`, `refs/tags/` and other `refs/` namespaces,
- *  and refspecs with no destination (`fetch origin main`), are fine. Every positional is checked
- *  (so `fetch --repo=origin main:refs/heads/x` is caught) except remote URLs, which are not refspecs. */
-/** A remote URL (`https://…`, `ssh://…`, scp-style `git@host:org/repo`), never a refspec. */
-function isRemoteUrl(t) {
-  return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(t) || /^[^\s:@\/]+@[^:\s]+:/.test(t);
+ *  and refspecs with no destination (`fetch origin main`), are fine. Only the repository argument is
+ *  exempt: a later `feature@v1:main` is a refspec, regardless of its resemblance to an SCP URL. */
+function fetchDestinationIsBranch(spec) {
+  const sp = spec.replace(/^\+/, '');
+  if (sp.startsWith('^')) return false;
+  const colon = sp.indexOf(':');
+  const dst = colon < 0 ? '' : sp.slice(colon + 1);
+  return !!dst && !/^refs\/(?!heads\/)/.test(dst);
 }
 
 function fetchWritesLocalBranch(segment) {
+  if (shellTokens(segment).some((t) => /^GIT_CONFIG(?:_[^=]+)?=/.test(t.text))) return true;
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
-  const dstIsBranch = (spec) => {
-    const sp = spec.replace(/^\+/, '');
-    if (sp.startsWith('^')) return false;
-    const colon = sp.indexOf(':');
-    const dst = colon < 0 ? '' : sp.slice(colon + 1);
-    return !!dst && !/^refs\/(?!heads\/)/.test(dst);
-  };
   let i = 1;
   while (i < toks.length && toks[i] !== 'fetch') {
     // `git -c remote.<n>.fetch=<refspec> fetch <n>` injects a configured refspec
     const kv = toks[i] === '-c' ? toks[i + 1] || '' : toks[i].startsWith('-c') ? toks[i].slice(2) : '';
-    const cfg = /^remote\.[^=]*\.fetch=(.*)$/s.exec(kv);
-    if (cfg && dstIsBranch(cfg[1])) return true;
+    const cfg = /^remote\.[^=]*\.fetch=(.*)$/is.exec(kv);
+    if (cfg && fetchDestinationIsBranch(cfg[1])) return true;
+    // These can introduce additional fetch mappings that are absent from the persisted snapshot.
+    if (/^include(?:if\..*)?\.path=/i.test(kv)) return true;
+    if (toks[i] === '--config-env' || toks[i].startsWith('--config-env=')) return true;
     i += GIT_VALUE_FLAGS.has(toks[i]) ? 2 : 1;
   }
+  let repositorySeen = false;
+  let options = true;
   for (i += 1; i < toks.length; i++) {
     const t = toks[i];
-    if (t === '--update-head-ok' || t === '-u' || /^-[a-z]*u[a-z]*$/.test(t)) return true;
-    if (t === '--refmap') { if (dstIsBranch(toks[i + 1] || '')) return true; i += 1; continue; }
-    if (t.startsWith('--refmap=')) { if (dstIsBranch(t.slice(9))) return true; continue; }
-    if (GIT_FETCH_VALUE_FLAGS.has(t)) { i += 1; continue; }
-    if (t.startsWith('-')) continue;
-    if (isRemoteUrl(t)) continue;
-    if (dstIsBranch(t)) return true;
+    if (options && t === '--') { options = false; continue; }
+    if (options && t.startsWith('-')) {
+      const name = t.split('=')[0];
+      const long = (flag) => name.length > 2 && flag.startsWith(name);
+      if (long('--update-head-ok') || /^-[a-z]*u[a-z]*$/.test(t)) return true;
+      if (long('--refmap')) {
+        const spec = t.includes('=') ? t.slice(t.indexOf('=') + 1) : toks[++i] || '';
+        if (fetchDestinationIsBranch(spec)) return true;
+        continue;
+      }
+      if (long('--repo')) {
+        repositorySeen = true;
+        if (!t.includes('=')) i += 1;
+        continue;
+      }
+      if (GIT_FETCH_VALUE_FLAGS.has(t)
+        || (!t.includes('=') && [...GIT_FETCH_VALUE_FLAGS].some((flag) => flag.startsWith('--') && long(flag)))) i += 1;
+      continue;
+    }
+    if (!repositorySeen) { repositorySeen = true; continue; }
+    if (fetchDestinationIsBranch(t)) return true;
   }
   return false;
+}
+
+/** Only explicitly read-only config/remote forms may operate on a daemon's repository. Unknown actions
+ *  fail closed here, so a read flag cannot mask a second, mutating action. */
+function gitConfigOrRemoteIsRead(segment, sub) {
+  const args = gitCommandWords(segment).slice(1);
+  if (sub === 'remote') {
+    const action = args.find((arg) => !arg.startsWith('-'));
+    return (!action && args.every((arg) => ['-v', '--verbose'].includes(arg)))
+      || ['get-url', 'show'].includes(action);
+  }
+  const actions = new Set(['get', 'list', '--get', '--get-all', '--get-regexp', '--get-urlmatch', '--get-color', '--get-colorbool', '--list', '-l']);
+  const modifiers = new Set(['--local', '--global', '--system', '--worktree', '--includes', '--no-includes',
+    '--show-origin', '--show-scope', '--name-only', '--null', '-z', '--fixed-value', '--bool', '--int',
+    '--bool-or-int', '--path', '--expiry-date', '--all', '--regexp', '--url']);
+  const values = new Set(['--file', '-f', '--blob', '--type', '--default', '--value', '--format']);
+  let readAction = false;
+  let positionals = 0;
+  let key = '';
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (actions.has(arg) && (arg.startsWith('-') || positionals === 0)) { readAction = true; continue; }
+    const name = arg.split('=')[0];
+    if (values.has(name)) { if (!arg.includes('=')) i += 1; continue; }
+    if (modifiers.has(arg)) continue;
+    if (arg.startsWith('-')) return false;
+    key = arg;
+    positionals += 1;
+  }
+  // Legacy `git config key` is a getter; `git config key value` writes.
+  return readAction || (positionals === 1 && /^[^.]+\..+/.test(key));
+}
+
+function gitConfigFileTargets(segment, cwd) {
+  const args = gitCommandWords(segment).slice(1);
+  const files = [];
+  for (let i = 0; i < args.length; i++) {
+    const name = args[i].split('=')[0];
+    if (name === '-f' || (name.length > 2 && '--file'.startsWith(name))) {
+      files.push(args[i].includes('=') ? args[i].slice(args[i].indexOf('=') + 1) : args[++i]);
+    } else if (args[i].startsWith('-f')) files.push(args[i].slice(2));
+  }
+  for (const token of shellTokens(segment)) {
+    const match = /^GIT_CONFIG=(.+)$/s.exec(token.text);
+    if (match) files.push(match[1]);
+  }
+  return files.filter(Boolean).map((file) => absoluteGitTarget(cwd, file));
 }
 
 /** The deny message for a write inside daemon clone `dir`. A plain function (not a template literal alone) so
@@ -2082,7 +2145,8 @@ function daemonCloneWriteMessage(dir) {
     `Or \`node scripts/lib/daemon-rebuild.mjs\` / \`node scripts/lib/daemon-load-overlay.mjs --clone=${dir}\` — ` +
     `both run from a LANE, targeting the clone by \`--clone=\`, never with cwd inside the clone itself and ` +
     `never via a direct git mutation on it. A read-only command (\`git -C ${dir} log\`, \`cat\`) and ` +
-    `\`git fetch\` (diagnosis only — it never touches the working tree) are unaffected.`
+    `\`git fetch\` with no local-branch destination in its arguments or persisted config are unaffected. ` +
+    `If fetch configuration cannot be read safely, use the sanctioned overlay/rebuild CLI instead.`
   );
 }
 
@@ -2101,13 +2165,12 @@ function daemonCloneWriteMessage(dir) {
  *      from the primary-tree arm above) or an FS-mutating program (`FS_MUTATING_PROGRAMS`: `cp`/`mv`/`rm`/…)
  *      — run with `cwd` already inside a daemon clone.
  *
- * `git fetch` IS ALLOWED — explicitly excluded from the deny set, checked before the daemon-directory test so
- * it is allowed EVEN WHEN targeting a daemon clone by `-C`/cwd. It only updates remote-tracking refs, never
- * the working tree or the index, so it cannot dirty a clone or race its rebuild — exactly the read-only
- * "diagnose from outside" shape the card asks to keep open. Every OTHER `GIT_STATE_SUBCOMMANDS` entry
+ * Diagnostic `git fetch` is allowed when neither the arguments nor the CLI-injected persisted fetch config
+ * writes a local branch. Unreadable persisted config denies fetch. Every OTHER `GIT_STATE_SUBCOMMANDS` entry
  * (including `pull`, which fetches AND merges into the working tree) is denied. The effective target is every
  * directory `gitTargetDirs` finds (ALL `-C` in order, `--git-dir`, `--work-tree`); `fetch` into a daemon clone is
- * denied only when `fetchWritesLocalBranch` (a local-branch refspec destination or `--update-head-ok`). A pure READ op (`log`/
+ * denied on branch-writing refspecs or `--update-head-ok`. Config/remote mutations are denied too; their
+ * explicit read forms remain available. A pure READ op (`log`/
  * `status`/`diff`/`show`/`rev-parse`/…) is never in scope at all: `gitSubcommand` still returns it, but this
  * function only denies subcommands present in `GIT_STATE_SUBCOMMANDS`, so `git -C <clone> log` and `cat`
  * never match either arm below and pass through unmentioned.
@@ -2118,20 +2181,26 @@ function daemonCloneWriteMessage(dir) {
  * cwd naming one explicitly (`cp x /…/wev-review-daemon/y` run from a lane) are caught. Falls back to the
  * ambient-cwd test alone when no operand is found at all (e.g. a bare `rm` with nothing to resolve).
  */
-export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [] } = {}) {
+export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [], gitConfigFiles = [], daemonFetchRefspecs = {} } = {}) {
   if (!roots.length) return null;
   const s = String(segment || '');
   const sub = gitSubcommand(s);
   if (sub) {
-    if (!GIT_STATE_SUBCOMMANDS.has(sub)) return null; // a read op (log/status/diff/show/…) — never denied
+    const configMutation = ['config', 'remote'].includes(sub) && !gitConfigOrRemoteIsRead(s, sub);
+    if (!GIT_STATE_SUBCOMMANDS.has(sub) && !configMutation) return null;
     // `envDirs`: GIT_DIR / GIT_WORK_TREE values assigned/exported by ANY segment of the same command (decide()
     // collects them), since `export GIT_DIR=<clone>/.git && git reset --hard` splits across segments.
     const targets = gitTargetDirs(s, cwd).concat(envDirs.map((p) => absoluteGitTarget(cwd, p)));
+    if (sub === 'config') targets.push(...gitConfigFileTargets(s, cwd), ...gitConfigFiles.map((p) => absoluteGitTarget(cwd, p)));
     const hit = targets.find((d) => d === null || isDaemonCloneRealpath(d, roots));
     if (hit === undefined) return null;
     // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
     // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
-    if (sub === 'fetch' && !fetchWritesLocalBranch(s)) return null;
+    if (sub === 'fetch' && !fetchWritesLocalBranch(s)) {
+      const unsafeConfig = roots.some((root) => targets.some((d) => d !== null && isDaemonCloneRealpath(d, [root]))
+        && (daemonFetchRefspecs[root] === null || (daemonFetchRefspecs[root] || []).some(fetchDestinationIsBranch)));
+      if (!unsafeConfig && hit !== null) return null;
+    }
     return daemonCloneWriteMessage(hit ?? 'unresolved git target: HOME is unavailable or relative');
   }
   const prog = programWord(s);
@@ -3892,7 +3961,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], gitEnvDirs = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], gitEnvDirs = [], gitConfigFiles = [], daemonFetchRefspecs = {}, fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -3904,7 +3973,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, envDirs: gitEnvDirs });
+  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, envDirs: gitEnvDirs, gitConfigFiles, daemonFetchRefspecs });
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4563,18 +4632,22 @@ const FS_MUTATING_PROGRAMS = new Set([
  *  VALUE for the subcommand (`git -C /some/path add -A` → `add`, never `/some/path`). */
 const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
 
-/** The git SUBCOMMAND of `segment`, or '' when it is not git. Pure. Reads the wrapper-peeled, basename-
+/** The git subcommand and its arguments, or [] when it is not git. Pure. Reads the wrapper-peeled, basename-
  *  resolved `canonicalCommand` view, so `/usr/bin/git`, `env git` and `"git"` all resolve — the same
  *  normalization every deny arm above reads, rather than a second weaker one (the #2788 r3 lesson). */
-function gitSubcommand(segment) {
-  if (programWord(segment) !== 'git') return '';
+function gitCommandWords(segment) {
+  if (programWord(segment) !== 'git') return [];
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   for (let i = 1; i < toks.length; i++) {
     if (GIT_VALUE_FLAGS.has(toks[i])) { i += 1; continue; }
     if (toks[i].startsWith('-')) continue;
-    return toks[i];
+    return toks.slice(i);
   }
-  return '';
+  return [];
+}
+
+function gitSubcommand(segment) {
+  return gitCommandWords(segment)[0] || '';
 }
 
 /** What STATE would this segment have produced, in a few words — or null if it produces none. Pure.
@@ -4808,18 +4881,66 @@ export function decide(command, ctx = {}) {
   // structurally — and covers the `bash -c "npm run build"` shape base never caught at all.
   const nested = withNestedCommands(segments, command);
   const gitEnvDirs = [];
+  const gitConfigFiles = [];
   for (const seg of nested) {
     for (const t of shellTokens(String(seg || '')).filter((x) => !x.op)) {
       const m = /^(?:GIT_DIR|GIT_WORK_TREE)=(.+)$/s.exec(t.text);
       if (m) gitEnvDirs.push(m[1]);
+      const config = /^GIT_CONFIG=(.+)$/s.exec(t.text);
+      if (config) gitConfigFiles.push(config[1]);
     }
   }
-  const rctx = gitEnvDirs.length ? { ...ctx, gitEnvDirs } : ctx;
+  const rctx = gitEnvDirs.length || gitConfigFiles.length ? { ...ctx, gitEnvDirs, gitConfigFiles } : ctx;
   for (const seg of nested) {
     const r = reason(seg, rctx);
     if (r) return r;
   }
   return null;
+}
+
+/** CLI-only persisted evidence. Ask Git to parse its config (including includes), rather than maintaining
+ *  a second config grammar. No fetch runs here. Reads are bounded; malformed, missing-repository,
+ *  oversized and timed-out evidence remains null and therefore denies fetch with the overlay remedy. */
+function collectDaemonFetchRefspecs(command, cwd, roots) {
+  const result = Object.create(null);
+  if (!roots.length) return result;
+  const segments = withNestedCommands(parseSegments(command).segments, command);
+  const envDirs = [];
+  let unknownConfig = false;
+  for (const seg of segments) {
+    for (const t of shellTokens(seg)) {
+      const m = /^(?:GIT_DIR|GIT_WORK_TREE)=(.+)$/s.exec(t.text);
+      if (m) envDirs.push(absoluteGitTarget(cwd, m[1]));
+      if (/^GIT_CONFIG(?:_[^=]+)?=/.test(t.text)) unknownConfig = true;
+    }
+  }
+  const targets = new Set();
+  for (const seg of segments) {
+    if (gitSubcommand(seg) === 'fetch') for (const d of gitTargetDirs(seg, cwd).concat(envDirs)) {
+      if (d !== null && isDaemonCloneRealpath(d, roots)) targets.add(d);
+    }
+  }
+  const cache = new Map();
+  for (const target of targets) {
+    let specs = null;
+    if (!unknownConfig && targets.size <= 8) {
+      try {
+        const output = execFileSync('git', ['-C', target, 'config', '--includes', '--null', '--get-regexp', /^remote\..*\.fetch$/.source], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000, maxBuffer: 256 * 1024,
+        });
+        specs = output.split('\0').filter(Boolean).map((entry) => entry.slice(entry.indexOf('\n') + 1));
+      } catch (error) {
+        // --get-regexp exits 1 when no keys match. Every other failure is unknown evidence.
+        if (error.status === 1 && !error.signal && !error.stdout?.length) specs = [];
+      }
+    }
+    cache.set(target, specs);
+  }
+  for (const root of roots) {
+    const entries = [...cache].filter(([target]) => isDaemonCloneRealpath(target, [root]));
+    if (entries.length) result[root] = entries.some(([, specs]) => specs === null) ? null : entries.flatMap(([, specs]) => specs);
+  }
+  return result;
 }
 
 // #2323 — how many commits is `cwd`'s HEAD behind its upstream (`@{u}`)? Impure (a git call), so it lives in
@@ -4991,7 +5112,8 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, fixPushes };
+  const daemonFetchRefspecs = collectDaemonFetchRefspecs(cmd, effectiveCwd, daemonRoots);
+  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, daemonFetchRefspecs, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed
