@@ -78,7 +78,7 @@ describe('GET /prs per-repo freshness', () => {
     const log = createEventLog(createMemoryStorage());
     log.append(ev('o/a'), T);
     const body = log.readPrs(null, 10, T);
-    expect(Object.keys(body).sort()).toEqual(['cursor', 'coverage', 'events', 'gap', 'head', 'lastDeliveryAt', 'lastEventAt', 'more', 'prs', 'repos', 'reset', 'stateCursor'].sort());
+    expect(Object.keys(body).sort()).toEqual(['cursor', 'coverage', 'events', 'gap', 'head', 'lastDeliveryAt', 'lastEventAt', 'more', 'prs', 'prsCursor', 'prsMore', 'prsAfter', 'repos', 'reset', 'stateCursor', 'truncated'].sort());
     expect(body.coverage).toMatchObject({ partial: true, bootstrap: [] });
     expect(body.lastEventAt).toBe(T);
   });

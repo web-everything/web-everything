@@ -23,7 +23,9 @@ function sqlStorage(storage) {
     transaction: (fn) => storage.transactionSync(fn),
     getProjection: (bucket, key) => JSON.parse(sql.exec('SELECT body FROM projection WHERE bucket = ? AND k = ?', bucket, key).toArray()[0]?.body || 'null'),
     putProjection: (bucket, key, value) => { sql.exec('INSERT INTO projection VALUES (?, ?, ?) ON CONFLICT(bucket, k) DO UPDATE SET body = excluded.body', bucket, key, JSON.stringify(value)); },
-    listProjection: (bucket) => sql.exec('SELECT body FROM projection WHERE bucket = ? ORDER BY k', bucket).toArray().map((r) => JSON.parse(r.body)),
+    deleteProjection: (bucket, key) => { sql.exec('DELETE FROM projection WHERE bucket = ? AND k = ?', bucket, key); },
+    listProjection: (bucket, withKeys = false) => sql.exec('SELECT k, body FROM projection WHERE bucket = ? ORDER BY k', bucket).toArray()
+      .map((r) => withKeys ? { key: r.k, value: JSON.parse(r.body) } : JSON.parse(r.body)),
     getMeta: (k) => sql.exec('SELECT v FROM meta WHERE k = ?', k).toArray()[0]?.v ?? null,
     setMeta: (k, v) => { sql.exec('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', k, v); },
     hasDelivery: (id) => sql.exec('SELECT 1 FROM events WHERE delivery_id = ? LIMIT 1', id).toArray().length > 0,
@@ -41,7 +43,7 @@ export class PrEventLog extends DurableObject {
     this.log = createEventLog(this.storageAdapter);
   }
   append(record, now) { return this.log.append(record, now); }
-  readPrs(cursor, limit, now) { return this.log.readPrs(cursor, limit, now); }
+  readPrs(cursor, limit, now, rowPage) { return this.log.readPrs(cursor, limit, now, rowPage); }
   bootstrap(input, now) { return this.log.bootstrap(input, now); }
   touch(now) { return this.log.touch(now); }
   read(cursor, limit) { return this.log.read(cursor, limit); }

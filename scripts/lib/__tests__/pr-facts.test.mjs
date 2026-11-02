@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { createEventLog, createMemoryStorage, handleRequest, parseGithubEvent } from '../../conveyor/pr-events-worker/core.mjs';
 import {
   PR_FACTS_DEFAULTS, lookupPrFacts, readPrFacts, readPrFactsFromGithub, readPrFactsOrGithub, readRepoFacts,
-  resolvePrFactsConfig,
+  resolvePrFactsConfig, refreshMirror, mirrorRows, lookupInMirror,
 } from '../pr-facts.mjs';
 
 const REPO = 'Web-Everything/web-everything';
@@ -71,6 +71,71 @@ function coveredWorker() {
   w.deliver('pull_request', prPayload('opened'));
   return w;
 }
+
+describe('full mirror pagination', () => {
+  const row = (number) => ({ repo: REPO.toLowerCase(), number, seq: number, sha: HEAD, draft: false, state: 'open', labels: [], checks: [], suites: [] });
+  const first = { stateCursor: 9, lastDeliveryAt: T0, coverage: { bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0 }] } };
+  const options = { repo: REPO, url: 'https://w.local', token: 'read', nowMs: T0, pageLimit: 1 };
+
+  it('retains every PR when an already-returned tied bootstrap row advances between pages', async () => {
+    const w = worker();
+    w.bootstrap(Array.from({ length: 5 }, (_, n) => ({ number: n + 1, sha: `sha-${n}`, draft: false, state: 'open', labels: [] })));
+    w.log.touch(T0);
+    let pages = 0;
+    const { mirror, mode } = await refreshMirror(null, { ...options, pageLimit: 2, fetchImpl: async (url, init) => {
+      const response = await w.fetchImpl(url, init);
+      if (++pages === 1) w.deliver('pull_request', { ...prPayload('synchronize'), number: 1 });
+      return response;
+    } });
+    expect(mode).toBe('full');
+    expect(mirrorRows(mirror).map((r) => r.number).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]);
+    expect(mirrorRows(mirror).find((r) => r.number === 1).sha).toBe(HEAD);
+    expect(mirror.bootstrap.status).toBe('complete');
+    expect(pages).toBe(3);
+  });
+
+  it('reads all 501 tied bootstrap rows through the real Worker and retains complete coverage', async () => {
+    const w = worker();
+    w.bootstrap(Array.from({ length: 501 }, (_, n) => ({ number: n + 1, sha: `sha-${n}`, draft: false, state: 'open', labels: [] })));
+    w.log.touch(T0);
+    const result = await readRepoFacts(w.opts());
+    expect(result.prs.map((p) => p.number)).toEqual(Array.from({ length: 501 }, (_, n) => n + 1));
+    expect(w.hits.prs).toBe(2);
+  });
+
+  it('accumulates every page using PR cursors and preserves the first page coverage and event cursor', async () => {
+    const queries = [];
+    const { mirror, mode } = await refreshMirror(null, { ...options, fetchImpl: async (url) => {
+      const q = new URL(url).searchParams; queries.push(q);
+      return new Response(JSON.stringify(queries.length === 1
+        ? { ...first, prs: [row(1)], prsCursor: 1, prsMore: true }
+        : { prs: [row(2)], prsCursor: 2, prsMore: false, truncated: { repos: {} } }));
+    } });
+    expect(mode).toBe('full');
+    expect(mirrorRows(mirror).map((r) => r.number)).toEqual([1, 2]);
+    expect(mirror.cursor).toBe(9);
+    expect(mirror.bootstrap.status).toBe('complete');
+    expect(queries).toHaveLength(2);
+    expect(queries[1].get('prsCursor')).toBe('1');
+    expect(queries[1].get('prsLimit')).toBe('1');
+    expect(queries[1].has('cursor')).toBe(false);
+  });
+
+  it.each(['HTTP failure', 'truncated repo', 'stalled cursor', 'malformed cursor'])('fails closed without publishing a partial mirror on %s', async (failure) => {
+    let calls = 0;
+    const result = await refreshMirror(null, { ...options, fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return new Response(JSON.stringify({ ...first, prs: [row(1)], prsCursor: 1, prsMore: true }));
+      if (failure === 'HTTP failure') return new Response('', { status: 503 });
+      return new Response(JSON.stringify({ prs: [row(2)], prsCursor: 1, prsMore: failure === 'stalled cursor' || failure === 'malformed cursor',
+        prsAfter: failure === 'malformed cursor' ? 'broken' : null,
+        truncated: { repos: failure === 'truncated repo' ? { [REPO.toLowerCase()]: 1 } : {} } }));
+    } });
+    expect(result.mode).toBe('failed');
+    expect(result.mirror.lastFailAt).toBe(T0);
+    expect(lookupInMirror(result.mirror, { number: 1, nowMs: T0 })).toMatchObject({ facts: null, reason: 'feed-unreachable' });
+  });
+});
 
 describe('readPrFacts — served only when trustworthy', () => {
   it('healthy and covered → served from the store, with source and the normalized fields', async () => {

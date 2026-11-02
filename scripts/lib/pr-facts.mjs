@@ -270,7 +270,34 @@ async function withAsyncLock(lockPath, fn, { waitMs, staleMs }) {
 export async function refreshMirror(prev, { repo, url, token, fetchImpl = globalThis.fetch, nowMs = Date.now(),
   timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
   const io = { fetchImpl, timeoutMs };
-  const full = async () => seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs });
+  const full = async () => {
+    const prs = [];
+    let first, cursor = null, after = null, key = null;
+    for (;;) {
+      const q = new URLSearchParams({ prsLimit: String(pageLimit) });
+      if (cursor != null) q.set('prsCursor', String(cursor));
+      if (after != null) q.set('prsAfter', after);
+      const body = await getJson(`${url}/prs?${q}`, token, io);
+      if (!body || !Array.isArray(body.prs) || typeof body.prsMore !== 'boolean') throw new Error('malformed /prs page');
+      if ((body.truncated?.repos?.[repoKey(repo)] || 0) > 0 ||
+          (body.truncated?.malformed > 0 && body.repos?.[repoKey(repo)]?.coverage === false))
+        throw new Error('incomplete /prs coverage');
+      first ??= body;
+      prs.push(...body.prs);
+      if (!body.prsMore) return seedMirror({ repo, body: { ...first, prs }, nowMs });
+      const next = body.prsCursor, nextAfter = body.prsAfter ?? null;
+      let nextKey = null;
+      if (nextAfter != null) {
+        try { nextKey = JSON.parse(nextAfter); } catch { /* Rejected below. */ }
+        if (!Array.isArray(nextKey) || nextKey.length !== 2 || typeof nextKey[0] !== 'string' || !Number.isInteger(nextKey[1]))
+          throw new Error('malformed /prs cursor');
+      }
+      const keyAdvances = key && nextKey && (nextKey[0] > key[0] || (nextKey[0] === key[0] && nextKey[1] > key[1]));
+      if (!Number.isSafeInteger(next) || next < 0 ||
+          (cursor != null && (next < cursor || (next === cursor && !keyAdvances)))) throw new Error('stalled /prs cursor');
+      cursor = next; after = nextAfter; key = nextKey;
+    }
+  };
   try {
     if (!prev || prev.v !== PR_FACTS_VERSION || !Number.isInteger(prev.cursor)) return { mirror: await full(), mode: 'full' };
     let m = prev;

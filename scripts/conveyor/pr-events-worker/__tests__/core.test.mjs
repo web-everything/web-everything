@@ -233,9 +233,10 @@ it('associates late, empty and multiple checks by repo/SHA, separates suites/run
   log.append({ ...check('a'), id: 'dedup' });
   expect(log.append({ ...check('a', [], 'o/r', 'check_run', 'failure'), id: 'dedup' }).duplicate).toBe(true);
   const rows = log.readPrs(0).prs;
-  expect(rows[0]).toMatchObject({ sha: 'b', checks: [expect.objectContaining({ sha: 'a', conclusion: 'success' }), expect.objectContaining({ sha: 'b', conclusion: 'failure' }), expect.objectContaining({ sha: 'explicit' })], suites: [expect.objectContaining({ sha: 'a' })] });
-  expect(rows[1].checks.map((c) => c.sha)).toEqual(['a', 'explicit']);
-  expect(rows[2].checks).toEqual([]);
+  expect(rows.map((r) => [r.repo, r.number, r.seq])).toEqual([['other/r', 1, 4], ['o/r', 1, 10], ['o/r', 2, 10]]);
+  expect(rows[1]).toMatchObject({ sha: 'b', checks: [expect.objectContaining({ sha: 'a', conclusion: 'success' }), expect.objectContaining({ sha: 'b', conclusion: 'failure' }), expect.objectContaining({ sha: 'explicit' })], suites: [expect.objectContaining({ sha: 'a' })] });
+  expect(rows[2].checks.map((c) => c.sha)).toEqual(['a', 'explicit']);
+  expect(rows[0].checks).toEqual([]);
   expect(log.readPrs(0).gap).toBe(true);
   expect(rows.flatMap((r) => r.checks).some((c) => c.sha === null)).toBe(false);
 });
@@ -330,7 +331,7 @@ describe('advisory and operator-ruling PR comments', () => {
 
   it.each([
     ['advisory', advisory], ['ruling', '<!-- mandatory-referral-operator-ruling-v1 -->\nPRIVATE comment text'],
-  ])('keeps %s metadata without body and folds only the row sequence', async (kind, body) => {
+  ])('keeps %s metadata without body and folds the row sequence and last-event time', async (kind, body) => {
     const { foldObservation } = await import('../core.mjs');
     const event = parseGithubEvent('issue_comment', payload(body), { deliveryId: 'comment-1', receivedAt: 0 });
     expect(event).toEqual({ id: 'comment-1', at: '1970-01-01T00:00:00.000Z', type: 'issue_comment',
@@ -342,7 +343,7 @@ describe('advisory and operator-ruling PR comments', () => {
     const key = JSON.stringify([REPO.full_name, 4624]);
     const before = structuredClone(storage.getProjection('prs', key));
     expect(() => foldObservation(storage, { ...event, seq: 2 })).not.toThrow();
-    expect(storage.getProjection('prs', key)).toEqual({ ...before, seq: 2 });
+    expect(storage.getProjection('prs', key)).toEqual({ ...before, seq: 2, updatedAt: 0 });
   });
 
   it('ignores ordinary comments, non-PR issues, and edits', () => {

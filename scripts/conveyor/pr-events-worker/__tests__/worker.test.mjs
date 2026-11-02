@@ -27,7 +27,7 @@ async function runtime(persist, legacy = false) {
     import {createEventLog} from './core.mjs';
     export class PrEventLog extends Base {
       fault(on) { this.ctx.storage.sql.exec(on ? "CREATE TRIGGER fail_projection BEFORE INSERT ON projection BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END" : 'DROP TRIGGER fail_projection'); }
-      retention(maxEvents, retentionMs) { this.log = createEventLog(this.storageAdapter, {maxEvents, retentionMs}); }
+      retention(maxEvents, retentionMs, prRetentionMs) { this.log = createEventLog(this.storageAdapter, {maxEvents, retentionMs, prRetentionMs}); }
     }
     export default worker;`;
   const output = await build({ stdin: { contents, resolveDir: directory, sourcefile: 'runtime-test.mjs' }, bundle: true,
@@ -48,6 +48,23 @@ async function deliver(mf, type, payload, id) {
     'x-github-event': type, 'x-github-delivery': id, 'x-hub-signature-256': await signBody(bindings.GITHUB_WEBHOOK_SECRET, body),
   } });
 }
+
+it('prunes closed SQLite projections on write and forwards independent PR pagination over real RPC', async () => {
+  const mf = await runtime();
+  try {
+    const object = await stub(mf), t = Date.now();
+    await object.retention(5000, 7 * 24 * 3600_000, 0);
+    await object.append({ repo: 'o/r', prs: [1], sha: 'expired', type: 'pull_request', action: 'closed' }, t);
+    await object.append({ repo: 'o/r', prs: [2], sha: 'open', type: 'pull_request', action: 'opened' }, t + 5 * 60_000);
+    await object.append({ repo: 'o/r', prs: [3], sha: 'another', type: 'pull_request', action: 'opened' }, t + 5 * 60_000);
+    const first = await read(mf, '?prsLimit=1');
+    expect(first.prs.map((r) => r.number)).toEqual([2]);
+    expect(first).toMatchObject({ prsCursor: 2, prsMore: true });
+    const last = await read(mf, '?prsCursor=2&prsLimit=1');
+    expect(last.prs.map((r) => r.number)).toEqual([3]);
+    expect(last.prsMore).toBe(false);
+  } finally { await mf.dispose(); }
+});
 
 it('SQLite upgrade, rollback, signed observations, restart, count/age pruning and bootstrap race soak', async () => {
   const persist = await mkdtemp(join(tmpdir(), 'pr-ledger-'));

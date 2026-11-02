@@ -52,8 +52,12 @@ export function classifyPrComment(body) {
 
 export const DEFAULT_MAX_EVENTS = 5000;
 export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_PR_RETENTION_MS = DEFAULT_RETENTION_MS;
+export const PROJECTION_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_PAGE_LIMIT = 200;
 export const MAX_PAGE_LIMIT = 500;
+export const PRS_RESPONSE_BUDGET_BYTES = 20 * 1024 * 1024;
+const PRS_ENVELOPE_OVERFLOW = 'PR snapshot envelope exceeds response budget';
 
 const enc = new TextEncoder();
 
@@ -139,7 +143,7 @@ export function checkProjectionKey(event) {
 }
 
 /** Fold only received evidence. Field clocks protect concurrent bootstrap imports. */
-export function foldObservation(storage, observed) {
+export function foldObservation(storage, observed, now = Date.parse(observed.at)) {
   // GitHub spells a repo one way, an operator may type another: the projection identifies a repo case-insensitively.
   const event = { ...observed, repo: String(observed.repo).toLowerCase() };
   const { repo, seq, sha, type } = event;
@@ -190,12 +194,52 @@ export function foldObservation(storage, observed) {
     }
     if (type === 'pull_request_review') row.review = { sha, state: event.state, action: event.action, seq };
     row.seq = Math.max(row.seq, seq);
+    if (Number.isFinite(now)) row.updatedAt = now;
     put('prs', rowKey, row);
   }
 }
 
+/** Remove expired closed rows and their exclusive evidence; shared SHA/check attachments survive. */
+function pruneProjection(storage, now, retentionMs) {
+  const last = numOrNull(storage.getMeta('lastProjectionPruneAt'));
+  if (last != null && now >= last && now - last < PROJECTION_PRUNE_INTERVAL_MS) return;
+  storage.setMeta('lastProjectionPruneAt', String(now));
+  const expired = new Map(), deadShas = new Set();
+  for (const { key, value: row } of storage.listProjection('prs', true)) {
+    if (!isPrRow(row) || row.state !== 'closed' || (Number.isFinite(row.updatedAt) && row.updatedAt >= now - retentionMs)) continue;
+    if (!expired.has(row.repo)) expired.set(row.repo, new Set());
+    expired.get(row.repo).add(row.number);
+    if (row.sha) deadShas.add(JSON.stringify([row.repo, row.sha]));
+    storage.deleteProjection('prs', key);
+  }
+  if (!expired.size) return;
+  for (const { key, value: numbers } of storage.listProjection('shas', true)) {
+    let repo;
+    try { [repo] = JSON.parse(key); } catch { continue; }
+    if (!expired.has(repo) || !Array.isArray(numbers)) continue;
+    const kept = numbers.filter((n) => !expired.get(repo).has(n));
+    if (kept.length === numbers.length) continue;
+    if (kept.length) storage.putProjection('shas', key, kept);
+    else { storage.deleteProjection('shas', key); deadShas.add(key); }
+  }
+  for (const { key, value: c } of storage.listProjection('checks', true)) {
+    if (!isObject(c) || !expired.has(c.repo)) continue;
+    const prs = Array.isArray(c.prs) ? c.prs : [];
+    const kept = prs.filter((n) => !expired.get(c.repo).has(n));
+    const shaKey = JSON.stringify([c.repo, c.sha]);
+    if (kept.length === prs.length && !deadShas.has(shaKey)) continue;
+    const associated = c.sha && storage.getProjection('shas', shaKey);
+    if (!kept.length && !(Array.isArray(associated) && associated.length)) storage.deleteProjection('checks', key);
+    else storage.putProjection('checks', key, { ...c, prs: kept });
+  }
+}
+
 /** The served per-PR rows (`GET /prs`'s `prs`) of a projection storage. Exported for the reader-side mirror. */
-export function projectPrRows(storage) {
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const isPrRow = (r) => isObject(r) && typeof r.repo === 'string' && Number.isInteger(r.number);
+const comparePrKey = (a, b) => a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : a.number - b.number;
+
+export function projectPrRows(storage, malformed = () => {}) {
   // One pass over checks, one SHA→PRs lookup per distinct (repo, sha): bounded by distinct SHAs, never PRs × checks.
   const byPr = new Map();
   const shaPrs = new Map();
@@ -205,16 +249,24 @@ export function projectPrRows(storage) {
     byPr.get(k).add(c);
   };
   for (const c of storage.listProjection('checks')) {
+    if (!isObject(c) || typeof c.repo !== 'string' || (c.prs != null && !Array.isArray(c.prs))) {
+      malformed(c); continue;
+    }
     for (const number of c.prs || []) attach(c, number);
     if (!c.sha) continue;
     const shaKey = JSON.stringify([c.repo, c.sha]);
-    if (!shaPrs.has(shaKey)) shaPrs.set(shaKey, storage.getProjection('shas', shaKey) || []);
+    if (!shaPrs.has(shaKey)) {
+      const numbers = storage.getProjection('shas', shaKey);
+      shaPrs.set(shaKey, Array.isArray(numbers) ? numbers : []);
+    }
     for (const number of shaPrs.get(shaKey)) attach(c, number);
   }
-  return storage.listProjection('prs').map(({ fields, ...row }) => {
+  return storage.listProjection('prs').flatMap((stored) => {
+    if (!isPrRow(stored)) { malformed(stored); return []; }
+    const { fields, ...row } = stored;
     const matches = [...(byPr.get(JSON.stringify([row.repo, row.number])) || [])];
-    return { ...row, seq: Math.max(row.seq, ...matches.map((c) => c.seq)),
-      checks: matches.filter((c) => c.type === 'check_run'), suites: matches.filter((c) => c.type === 'check_suite') };
+    return [{ ...row, seq: matches.reduce((seq, c) => Math.max(seq, c.seq || 0), row.seq || 0),
+      checks: matches.filter((c) => c.type === 'check_run'), suites: matches.filter((c) => c.type === 'check_suite') }];
   });
 }
 
@@ -239,9 +291,11 @@ export function validateBootstrap(input) {
  *
  * storage: { getMeta(k), setMeta(k, v), hasDelivery(id), insert(seq, id, at, json), range(afterSeq, limit),
  *            minSeq(), prune(throughSeq, olderThanMs), transaction(fn),
- *            getProjection(bucket, key), putProjection(bucket, key, value), listProjection(bucket) }
+ *            getProjection(bucket, key), putProjection(bucket, key, value), deleteProjection(bucket, key),
+ *            listProjection(bucket, withKeys = false) } // withKeys returns { key, value } entries for pruning
  */
-export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS } = {}) {
+export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS,
+  prsBudgetBytes = PRS_RESPONSE_BUDGET_BYTES, prRetentionMs = DEFAULT_PR_RETENTION_MS } = {}) {
   const head = () => Number(storage.getMeta('head') || 0);
   storage.transaction(() => {
     if (!storage.getMeta('projectionVersion')) {
@@ -264,7 +318,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.setMeta('lastEventAt', String(now));
       // Per-repo clock: only this repo's own events ever move it (R417).
       if (typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
-      foldObservation(storage, stored);
+      foldObservation(storage, stored, now);
+      pruneProjection(storage, now, prRetentionMs);
       storage.prune(seq - maxEvents, now - retentionMs);
       return { seq, duplicate: false };
     }); },
@@ -281,7 +336,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // replay ring, never advance `head`, and never refresh the feed-health clocks (a seed must not mask a dead
       // webhook). Their field clock is the cursor the listing was taken at, so any later delivery wins.
       for (const pr of input.prs) foldObservation(storage, { ...pr, number: undefined, prs: [pr.number], repo: input.repo,
-        type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor });
+        type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor }, now);
       const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
       // Import history for the NEW per-repo coverage only (fail closed); it changes no seeding behaviour.
       const seen = storage.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
@@ -292,10 +347,70 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
       return { ...result, duplicate: false };
     }); },
-    readPrs(cursor, limit, now = Date.now()) { return storage.transaction(() => {
+    readPrs(cursor, limit, now = Date.now(), { prsCursor = null, prsLimit = DEFAULT_PAGE_LIMIT, prsAfter = null } = {}) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
-      return { ...envelope, prs: projectPrRows(storage), stateCursor: envelope.head, repos: repoFreshness(storage, envelope.head, now),
-        coverage: { ...JSON.parse(storage.getMeta('coverage')), bootstrap: storage.listProjection('bootstrap') } };
+      const truncated = { rows: 0, repos: {}, malformed: 0 }, incomplete = new Set();
+      const after = Number.isSafeInteger(prsCursor) && prsCursor >= 0 ? prsCursor : null;
+      let key = null;
+      if (prsAfter != null) {
+        try { key = JSON.parse(prsAfter); } catch { /* Rejected below, never restart an unreadable cursor. */ }
+        if (after == null || !Array.isArray(key) || key.length !== 2 || typeof key[0] !== 'string' || !Number.isInteger(key[1]))
+          throw new RangeError('invalid PR row cursor');
+      }
+      const pageSize = Math.max(1, Math.min(MAX_PAGE_LIMIT, Math.floor(Number(prsLimit) || DEFAULT_PAGE_LIMIT)));
+      const projected = projectPrRows(storage, (row) => {
+        truncated.malformed += 1;
+        if (typeof row?.repo === 'string') incomplete.add(row.repo);
+      }).sort((a, b) => a.seq - b.seq || comparePrKey(a, b));
+      // Stable identity within a sequence survives earlier rows advancing during concurrent deliveries.
+      const eligible = projected.filter((r) => after == null || r.seq > after ||
+        (r.seq === after && key && comparePrKey(r, { repo: key[0], number: key[1] }) > 0));
+      const rows = eligible.slice(0, pageSize);
+      let coverage;
+      try { coverage = JSON.parse(storage.getMeta('coverage')); } catch { /* Legacy metadata is not evidence. */ }
+      const response = { ...envelope, prs: [], stateCursor: envelope.head, repos: repoFreshness(storage, envelope.head, now),
+        coverage: { ...(isObject(coverage) ? coverage : {}), bootstrap: storage.listProjection('bootstrap') }, truncated,
+        prsCursor: rows.at(-1)?.seq ?? after ?? 0, prsMore: eligible.length > rows.length, prsAfter: null };
+      const pagePosition = (kept) => {
+        response.prsCursor = kept.at(-1)?.seq ?? after ?? 0;
+        const last = kept.at(-1);
+        response.prsAfter = last ? JSON.stringify([last.repo, last.number]) : key ? JSON.stringify(key) : null;
+        response.prsMore = eligible.length > kept.length;
+      };
+      pagePosition(rows);
+      const failClosed = (repo) => {
+        response.repos[repo] ??= { bootstrapAt: null, lastEventAt: null, omittedOpen: [], coverage: false };
+        response.repos[repo].coverage = false;
+      };
+      incomplete.forEach(failClosed);
+      const drop = (row) => {
+        truncated.rows += 1;
+        truncated.repos[row.repo] = (truncated.repos[row.repo] || 0) + 1;
+        if (row.state === 'open') failClosed(row.repo);
+      };
+      const size = (value) => enc.encode(JSON.stringify(value)).length;
+      // Reserve the HTTP timestamp too, while preserving the existing internal snapshot shape.
+      const baseBytes = size({ ...response, now }), sizes = [];
+      let rowBytes = 0, exhausted = false;
+      for (const row of rows) {
+        // Serialize each candidate once; count UTF-8 bytes and array commas, not just UTF-16 characters.
+        const bytes = exhausted ? 0 : size(row);
+        if (exhausted || baseBytes + rowBytes + bytes + sizes.length > prsBudgetBytes) {
+          exhausted = true; drop(row);
+        } else {
+          response.prs.push(row); sizes.push(bytes); rowBytes += bytes;
+        }
+      }
+      pagePosition(response.prs);
+      // Truncation counts and repo coverage can enlarge the envelope. Trim the retained prefix to fit them too.
+      const envelopeBytes = () => size({ ...response, prs: [], now });
+      while (sizes.length && envelopeBytes() + rowBytes + sizes.length - 1 > prsBudgetBytes) {
+        rowBytes -= sizes.pop(); drop(response.prs.pop());
+        pagePosition(response.prs);
+      }
+      // Replay and coverage metadata cannot be silently dropped. Reject before crossing the RPC boundary.
+      if (envelopeBytes() > prsBudgetBytes) throw new RangeError(PRS_ENVELOPE_OVERFLOW);
+      return response;
     }); },
     /** A verified delivery we chose not to store (ping, ignored action) still proves the pipe is alive. */
     touch(now = Date.now()) { storage.setMeta('lastDeliveryAt', String(now)); },
@@ -329,7 +444,7 @@ function repoFreshness(storage, head, now) {
   const oldest = storage.minSeq();
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
   const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i]));
-  const openRows = storage.listProjection('prs').filter((r) => r.state === 'open');
+  const openRows = storage.listProjection('prs').filter((r) => isPrRow(r) && r.state === 'open');
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
   const out = {};
   for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
@@ -362,7 +477,9 @@ export function createMemoryStorage() {
     },
     getProjection: (bucket, key) => structuredClone(projection.get(JSON.stringify([bucket, key])) ?? null),
     putProjection: (bucket, key, value) => { projection.set(JSON.stringify([bucket, key]), structuredClone(value)); },
-    listProjection: (bucket) => [...projection].filter(([k]) => JSON.parse(k)[0] === bucket).map(([, v]) => structuredClone(v)),
+    deleteProjection: (bucket, key) => { projection.delete(JSON.stringify([bucket, key])); },
+    listProjection: (bucket, withKeys = false) => [...projection].filter(([k]) => JSON.parse(k)[0] === bucket)
+      .map(([k, v]) => withKeys ? { key: JSON.parse(k)[1], value: structuredClone(v) } : structuredClone(v)),
     getMeta: (k) => (meta.has(k) ? meta.get(k) : null),
     setMeta: (k, v) => { meta.set(k, v); },
     hasDelivery: (id) => rows.some((r) => r.id === id),
@@ -425,7 +542,19 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
     const cursor = c == null || c === '' ? null : (/^\d+$/.test(c) ? Number(c) : null);
     const limit = Number(url.searchParams.get('limit')) || DEFAULT_PAGE_LIMIT;
     const log = await getLog();
-    return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit, now()) : log.read(cursor, limit))), now: now() });
+    try {
+      const timestamp = now(); // Use exactly the timestamp reserved by readPrs, even if the RPC takes time.
+      const rowCursor = url.searchParams.get('prsCursor');
+      const prsCursor = rowCursor != null && /^\d+$/.test(rowCursor) ? Number(rowCursor) : null;
+      const rowPage = { prsCursor, prsLimit: Number(url.searchParams.get('prsLimit')) || DEFAULT_PAGE_LIMIT,
+        prsAfter: url.searchParams.get('prsAfter') };
+      return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit, timestamp, rowPage) : log.read(cursor, limit))), now: timestamp });
+    } catch (error) {
+      // Match the message because Durable Object RPC preserves standard errors, not custom properties.
+      if (url.pathname === '/prs' && error?.message === PRS_ENVELOPE_OVERFLOW) return json(503, { error: PRS_ENVELOPE_OVERFLOW });
+      if (url.pathname === '/prs' && error?.message === 'invalid PR row cursor') return json(400, { error: error.message });
+      throw error;
+    }
   }
 
   return json(404, { error: 'not found' });
