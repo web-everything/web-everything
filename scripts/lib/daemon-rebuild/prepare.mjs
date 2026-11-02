@@ -331,8 +331,8 @@ export async function prepareRebuild({
   const goneRefs = new Set(fetchResult.goneRefs);
   fetchResult.refEvidence = new Map(overlaysBefore.map((o) =>
     [o?.ref, !isSafeBranchName(o?.ref) || goneRefs.has(o.ref) ? 'unavailable' : 'refreshed']));
-  // Preserve unavailable registrations without building from cached tips. Unpinned overlays may be skipped,
-  // but an unavailable pin must use the normal refusal/last-good hold path before any new build is adopted.
+  // Preserve unavailable registrations without building from cached tips. Pins refuse here; other running
+  // content must still reach the established-overlay loss guard after planning the refreshed registrations.
   const overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
   const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed');
   let unavailablePinned = null;
@@ -491,7 +491,21 @@ export async function prepareRebuild({
   // the repair from ever being adopted. Only a tip the running build already carries qualifies: a changed tip says
   // nothing about the older live heads it replaced. Ancestry git cannot confirm keeps the overlay lost (fail closed).
   const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
-  const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
+  // Filtering unavailable registrations out of planning must not filter their running content out of
+  // loss protection. History/adopted rows describe content, never authority to pin a replacement id.
+  // Keep this check tied to the captured registration set; unreadable history holds until the branch
+  // is restored (or the operator deliberately removes its registration).
+  const unavailableLive = !mainOnly && unverified.length ? liveOverlaysOf(prevHead, plan.mainSha) : [];
+  const unavailableLost = mainOnly ? [] : unverified.flatMap((raw) => {
+    const rows = unavailableLive?.filter((row) => row.ref === raw.ref);
+    const tip = validTipSha(raw);
+    const heads = new Set(rows?.map((row) => row.sha));
+    if (tip && contains(tip, prevHead)) heads.add(tip);
+    if (!rows) heads.add(null); // Unknown running history cannot authorize dropping this registration.
+    return [...heads].map((sha) => ({ ref: raw.ref, pr: raw.pr ?? null, sha, reason: 'ref-unavailable', files: [] }));
+  });
+  if (!snapshotHolds()) return registrationChanged();
+  const lost = mainOnly ? [] : [...(plan.establishedLost ?? []), ...unavailableLost].filter((l) => !(l.sha
     && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
   if (!mainOnly && lost.length > 0) {
     const detail = {

@@ -68,7 +68,7 @@ function fixture(ref = REF) {
   return { root, env, file, list, add, seed, bytes };
 }
 
-function gitFixture(ref = REF) {
+function gitFixture(ref = REF, { mechanism = true } = {}) {
   const f = fixture(ref);
   const git = (args, options = {}) => spawnSync('git', args, {
     cwd: f.root, env: f.env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
@@ -85,9 +85,14 @@ function gitFixture(ref = REF) {
   ok(['commit', '-qm', 'base']);
   const mainSha = ok(['rev-parse', 'HEAD']);
   ok(['update-ref', 'refs/remotes/origin/main', mainSha]);
-  mkdirSync(join(f.root, 'scripts/lib'), { recursive: true });
-  writeFileSync(join(f.root, 'scripts/lib/daemon-rebuild.mjs'), '// mechanism supplied by overlay\n');
-  ok(['add', 'scripts']);
+  if (mechanism) {
+    mkdirSync(join(f.root, 'scripts/lib'), { recursive: true });
+    writeFileSync(join(f.root, 'scripts/lib/daemon-rebuild.mjs'), '// mechanism supplied by overlay\n');
+    ok(['add', 'scripts']);
+  } else {
+    writeFileSync(join(f.root, 'README.md'), 'base\nhotfix supplied by overlay\n');
+    ok(['add', 'README.md']);
+  }
   ok(['commit', '-qm', 'overlay mechanism']);
   const head = ok(['rev-parse', 'HEAD']);
   ok(['update-ref', `refs/remotes/origin/${ref}`, head]);
@@ -95,7 +100,7 @@ function gitFixture(ref = REF) {
   const adopted = { head, mainSha, applied: [{ ref, pr: 17, sha: head, registrationId: old.registrationId }], at: NOW };
   const save = (value = adopted) => writeRebuildState(f.root, { adopted: value }, f.env);
   save();
-  const prepare = async ({ available = false, now = Date.parse(NOW), visit = () => {} } = {}) => {
+  const prepare = async ({ available = false, historyReadable = true, now = Date.parse(NOW), visit = () => {} } = {}) => {
     seams.visit = visit;
     try {
       return await prepareRebuild({ root: f.root, env: f.env, log: {}, now: () => now,
@@ -107,7 +112,9 @@ function gitFixture(ref = REF) {
           if (args[0] === 'fetch') {
             result = { status: available || !args.some(a => a.includes(`heads/${ref}:`)) ? 0 : 1, stdout: '', stderr: '' };
           } else if (args[0] === 'ls-remote') result = { status: 2, stdout: '', stderr: '' };
-          else result = git(args, options);
+          else if (!historyReadable && args[0] === 'log' && args.includes('--first-parent')) {
+            result = { status: 1, stdout: '', stderr: 'injected unreadable running history' };
+          } else result = git(args, options);
           visit(`git:${args[0]}:after`);
           return result;
         },
@@ -136,6 +143,56 @@ function expectNoBorrowedPin(result) {
 }
 
 describe('overlay registration generations', () => {
+  it('unavailable non-mechanism running content absent from the candidate prevents adoption', async () => {
+    const f = gitFixture(REF, { mechanism: false });
+    const before = readRebuildState(f.root, f.env).adopted;
+    const registry = f.bytes();
+    const result = await f.prepare();
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'established-overlay-conflict',
+      detail: { lost: [{ ref: REF, sha: f.adopted.head, reason: 'ref-unavailable' }] } } });
+    expect(result.result.adopted).not.toBe(true);
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.adopted.head);
+    expect(readRebuildState(f.root, f.env).adopted).toEqual(before);
+    expect(readRebuildState(f.root, f.env).held).toMatchObject({ lastGood: f.adopted.head });
+    expect(f.bytes()).toBe(registry);
+  });
+
+  it('unavailable registration with unreadable running history fails closed and prevents adoption', async () => {
+    const f = gitFixture(REF, { mechanism: false });
+    const before = readRebuildState(f.root, f.env).adopted;
+    const registry = f.bytes();
+    const result = await f.prepare({ historyReadable: false });
+    expect(result).toMatchObject({ terminal: true, result: { moved: false, reason: 'established-overlay-conflict',
+      detail: { lost: [{ ref: REF, sha: null, reason: 'ref-unavailable' }] } } });
+    expect(result.result.adopted).not.toBe(true);
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.adopted.head);
+    expect(readRebuildState(f.root, f.env).adopted).toEqual(before);
+    expect(f.bytes()).toBe(registry);
+  });
+
+  it('unavailable running content already contained in the candidate permits adoption', async () => {
+    const f = gitFixture(REF, { mechanism: false });
+    const registry = f.bytes();
+    writeFileSync(join(f.root, 'release.txt'), 'main advanced with the hotfix\n');
+    f.ok(['add', 'release.txt']);
+    f.ok(['commit', '-qm', 'main carries the running hotfix']);
+    const candidate = f.ok(['rev-parse', 'HEAD']);
+    f.ok(['update-ref', 'refs/remotes/origin/main', candidate]);
+    f.ok(['reset', '--hard', f.adopted.head]);
+    const prepared = await f.prepare();
+    expect(prepared).toMatchObject({ terminal: false, plan: { ok: true, finalSha: candidate } });
+    expect(prepared.alerts.map(a => a.kind)).not.toContain('established-overlay-hold');
+    const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      plan: prepared.plan, prevHead: prepared.prevHead, lease: prepared.lease,
+      run: (args, options) => f.git(args, options),
+    });
+    expect(result).toMatchObject({ moved: true, adopted: true, head: candidate });
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(candidate);
+    expect(f.ok(['show', 'HEAD:README.md'])).toContain('hotfix supplied by overlay');
+    expect(readRebuildState(f.root, f.env).adopted.head).toBe(candidate);
+    expect(f.bytes()).toBe(registry);
+  });
+
   it.each([false, true])('T12 historical pin belongs only to its registration (replaced=%s)', async (replaced) => {
     const ref = 'lane/reused';
     const f = gitFixture(ref);
