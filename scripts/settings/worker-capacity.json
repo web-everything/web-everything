@@ -1,0 +1,4 @@
+{
+  "$comment": "R313/R349 measured worker capacity (SHADOW: computed and logged next to the R349 step rule; nothing consumes it yet). workerCapacity.targetLoad = Mac 1-min load to stay near (default 30); workerCapacity.ceiling = max workers (default 10). Overrides resolve standard -> repo settings -> environment (WE_WORKER_CAPACITY_TARGET_LOAD, WE_WORKER_CAPACITY_CEILING). Invalid values are ignored and the lower layer answers.",
+  "workerCapacity": { "targetLoad": 30, "ceiling": 10 }
+}
