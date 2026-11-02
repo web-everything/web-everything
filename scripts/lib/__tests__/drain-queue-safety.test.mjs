@@ -461,9 +461,10 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
     const calls = [];
     const exec = (_c, args) => { calls.push(args.join(' '));
       if (args[1].includes('actions/runs')) return JSON.stringify({ workflow_runs: [
-        { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-abc', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: new Date().toISOString(), updated_at: '2026-11-02T10:00:00Z' },
-        { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6216-abc', head_sha: 'g2', conclusion: 'failure', status: 'completed', created_at: new Date().toISOString(), updated_at: '2026-11-02T10:00:00Z' }] });
+        { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-abc', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' },
+        { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6216-abc', head_sha: 'g2', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' }] });
       if (args[1].includes('head_sha=')) return JSON.stringify({ workflow_runs: [{ name: 'CI', event: 'pull_request', status: 'completed', conclusion: 'success', updated_at: '2026-11-02T09:00:00Z' }] });
+      if (args[1].endsWith(`commits/${H}`)) return JSON.stringify({ commit: { committer: { date: '2026-11-02T08:00:00Z' } } });
       if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
       throw new Error(`unexpected ${args}`); };
     const r = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec, log: l => lines.push(l) });
@@ -476,18 +477,29 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
     expect(lines.at(-1)).toContain('mq-same-head-unreadable');
   });
   it('fails closed on a response without workflow_runs, and on history that the page cap does not cover', () => {
-    const none = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: () => '{}' });
+    const none = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: (_c, a) => a[1].endsWith(`commits/${H}`) ? JSON.stringify({ commit: { committer: { date: '2026-11-02T08:00:00Z' } } }) : '{}' });
     expect(none.kind).toBe('mq-same-head-unreadable');
-    const full = Array.from({ length: 100 }, () => ({ name: 'CI', head_branch: 'gh-readonly-queue/main/pr-1-x', head_sha: 'z', status: 'completed', conclusion: 'success', created_at: new Date().toISOString() }));
-    const capped = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: () => JSON.stringify({ workflow_runs: full }) });
+    const full = Array.from({ length: 100 }, () => ({ name: 'CI', head_branch: 'gh-readonly-queue/main/pr-1-x', head_sha: 'z', status: 'completed', conclusion: 'success', created_at: '2026-11-02T09:30:00Z' }));
+    const capped = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: (_c, a) => a[1].endsWith(`commits/${H}`) ? JSON.stringify({ commit: { committer: { date: '2000-01-01T00:00:00Z' } } }) : JSON.stringify({ workflow_runs: full }) });
     expect(capped.kind).toBe('mq-same-head-unreadable');
     expect(capped.reason).toContain('not covered');
   });
   it('a failure released by a later PR-leg success of the same workflow re-enqueues', () => {
     const exec = (_c, args) => {
-      if (args[1].includes('event=merge_group')) return JSON.stringify({ workflow_runs: [{ name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-a', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: new Date().toISOString(), updated_at: '2026-11-02T10:00:00Z' }] });
+      if (args[1].includes('event=merge_group')) return JSON.stringify({ workflow_runs: [{ name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-a', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' }] });
+      if (args[1].endsWith(`commits/${H}`)) return JSON.stringify({ commit: { committer: { date: '2026-11-02T08:00:00Z' } } });
       if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
       return JSON.stringify({ workflow_runs: [{ name: 'CI', event: 'pull_request', status: 'completed', conclusion: 'success', updated_at: '2026-11-02T11:00:00Z' }] }); };
     expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec }).hold).toBe(false);
+  });
+  it('a same-named success from another workflow id or a non-PR event does not release the failure', () => {
+    const base = (extra) => (_c, args) => {
+      if (args[1].endsWith(`commits/${H}`)) return JSON.stringify({ commit: { committer: { date: '2026-11-02T08:00:00Z' } } });
+      if (args[1].includes('event=merge_group')) return JSON.stringify({ workflow_runs: [{ name: 'CI', workflow_id: 1, head_branch: 'gh-readonly-queue/main/pr-6215-a', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' }] });
+      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
+      return JSON.stringify({ workflow_runs: [{ name: 'CI', status: 'completed', conclusion: 'success', updated_at: '2026-11-02T11:00:00Z', ...extra }] }); };
+    expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: base({ workflow_id: 2, event: 'pull_request' }) }).hold).toBe(true);
+    expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: base({ workflow_id: 1, event: 'workflow_dispatch' }) }).hold).toBe(true);
+    expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: base({ workflow_id: 1, event: 'pull_request' }) }).hold).toBe(false);
   });
 });

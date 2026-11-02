@@ -95,7 +95,7 @@ export function sameHeadFailedDecision({ pr, head, runs = [], readError = null }
   return { hold: true, kind: 'mq-same-head-failed', reason: line, line };
 }
 
-const HORIZON_MS = 24 * 3_600_000, MAX_PAGES = 5, MAX_PR_RUNS = 20;
+const MAX_PAGES = 12, MAX_PR_RUNS = 20;
 /** Reads this PR's recent merge_group runs and same-head PR-leg successes through gh, decides, and logs the one named line. */
 export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = () => {}, now = Date.now } = {}) {
   const readJson = args => JSON.parse(exec('gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
@@ -105,17 +105,20 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
   let decision;
   try {
     // Page newest-first until the horizon is covered; hitting the page cap first means the history is incomplete: fail closed.
+    // No run on `head` can predate the commit itself, so its committer date is the exact history floor.
+    const committed = Date.parse(readJson(['api', `repos/${repo}/commits/${head}`])?.commit?.committer?.date);
+    if (!Number.isFinite(committed)) throw new Error('head commit date unreadable');
     const all = [];
     let covered = false;
     for (let page = 1; page <= MAX_PAGES && !covered; page++) {
       const rows = listRuns(`repos/${repo}/actions/runs?event=merge_group&per_page=100&page=${page}`);
       all.push(...rows);
-      covered = rows.length < 100 || rows.some(r => now() - (Date.parse(r.created_at) || now()) > HORIZON_MS);
+      covered = rows.length < 100 || rows.some(r => (Date.parse(r.created_at) || Infinity) < committed);
     }
     if (!covered) throw new Error(`merge_group run history not covered within ${MAX_PAGES} pages`);
     const mine = all.filter(r => done(r) && new RegExp(`/pr-${pr}-`).test(r.head_branch ?? '') && r.conclusion !== 'cancelled' && r.conclusion !== 'skipped');
     if (mine.length > MAX_PR_RUNS) throw new Error(`more than ${MAX_PR_RUNS} merge_group runs for the PR in the window`);
-    const toRun = r => ({ workflow: r.name ?? r.workflow_id, conclusion: r.conclusion, completedAt: stamp(r) });
+    const toRun = r => ({ workflow: r.workflow_id ?? r.name, conclusion: r.conclusion, completedAt: stamp(r) });
     const runs = mine.map(r => {
       const parents = readJson(['api', `repos/${repo}/commits/${r.head_sha}`]).parents;
       if (!Array.isArray(parents) || !parents.length) throw new Error(`merge_group commit ${String(r.head_sha).slice(0, 12)} has no readable parents`);
@@ -124,7 +127,7 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
     if (runs.some(r => r.prHead === head && (r.conclusion === 'failure' || r.conclusion === 'timed_out'))) {
       // PR-leg runs of the same head (a fresh green rerun of the same workflow), kept with their workflow identity.
       for (const r of listRuns(`repos/${repo}/actions/runs?head_sha=${head}&per_page=100`)) {
-        if (done(r) && r.event !== 'merge_group') runs.push({ ...toRun(r), prHead: head });
+        if (done(r) && r.event === 'pull_request') runs.push({ ...toRun(r), prHead: head });
       }
     }
     decision = sameHeadFailedDecision({ pr, head, runs });
