@@ -4845,8 +4845,8 @@ async function runCli() {
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
   const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
-      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
-        fields ? fields.join(',') : 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
+      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
+        ...(fields ? ['--json', fields.join(',')] : ['--json', 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'])],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
       if (!data || (!fields && data.number !== num)) return null;
