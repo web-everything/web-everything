@@ -65,6 +65,7 @@ export function isLoadShapedRow(row, env = {}) {
   if (isEnvTimeoutRow(row, { minElapsedMs })) return true;
   const detail = String(row.detail ?? '');
   if (LOAD_CONTENTION_SIGNATURES.some((re) => re.test(detail))) return true;
-  if (row.mayBeTransient !== false && isGhThrottleOnlyDetail(detail)) return true;
+  // Our slot refusal is load contention even for code checks such as dispatch-dry-run.
+  if (isGhThrottleOnlyDetail(detail)) return true;
   return row.mayBeTransient !== false && TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(detail));
 }
