@@ -4594,3 +4594,61 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
     expect(assessLiveness([{ agent: spare(), cwd: '/d', sha: SHA }])).toMatchObject({ kind: 'live-process' });
   });
 });
+
+
+describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () => {
+  const policy = { startAfter: 'ci-green', startBeforeCi: false, earlyStartShadow: true,
+    earlyStartCare: ['none', 'low'], earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: ['code'] };
+  // An addressed advisory reaches refuseUnreviewable before reviewChecksAllow.
+  const fixture = over => pr1563({ labels: lbl('review:human', 'advisory:changes'),
+    comments: [{ body: `${ADVISORY_NOTE_MARKER}\n\ncurrent finding`, author: AUTOMATION },
+      { body: buildAdvisoryFixComment({}), author: AUTOMATION }],
+    statusCheckRollup: pendingRollup, careLevel: 'low', diffLines: 100, diffFiles: 3,
+    kinds: ['code'], verifyGreen: true, ...over });
+  const run = (pr, reviewTiming = policy) => planReconcile({ prs: [pr], reviewTiming, agents: [], now: NOW });
+
+  it.each([['draft', true], ['review-ci', false]])('attaches an eligible shadow to %s without dispatching', (kind, isDraft) => {
+    const pr = fixture({ isDraft });
+    const baseline = run(pr, { ...policy, earlyStartShadow: false });
+    const result = run(pr);
+    expect(baseline.refusals).toHaveLength(1);
+    expect(baseline.refusals[0].kind).toBe(kind);
+    if (isDraft) expect(baseline.refusals[0].why).toBe('PR is still a draft — no independent review is dispatched until it is promoted to ready for review');
+    expect(result.dispatch).toEqual(baseline.dispatch);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toEqual([{ ...baseline.refusals[0], earlyStartShadow: {
+      wouldStartEarly: true, reason: expect.any(String), mergeAllowed: false,
+    } }]);
+  });
+  it.each([true, false])('reads each PR input and waits when absent (draft=%s)', isDraft => {
+    for (const key of ['careLevel', 'diffLines', 'diffFiles', 'kinds', 'verifyGreen', 'headRefOid']) {
+      const result = run(fixture({ isDraft, [key]: undefined }));
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: isDraft ? 'draft' : 'review-ci',
+        earlyStartShadow: { wouldStartEarly: false, reason: expect.any(String), mergeAllowed: false } })]);
+      if (key === 'careLevel') expect(result.refusals[0].earlyStartShadow.reason).toBe('missing-care');
+    }
+  });
+  it.each([
+    { careLevel: 'high' }, { careLevel: 'elevated' }, { diffLines: 401 }, { diffFiles: 13 },
+    { kinds: ['code', 'docs'] }, { kinds: ['config'] }, { kinds: ['data'] }, { verifyGreen: false },
+  ])('uses PR evidence to report a wait: %j', over => {
+    for (const isDraft of [true, false]) {
+      const result = run(fixture({ isDraft, ...over }));
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: isDraft ? 'draft' : 'review-ci',
+        earlyStartShadow: { wouldStartEarly: false, reason: expect.any(String), mergeAllowed: false } })]);
+    }
+  });
+  it.each([true, false])('leaves refusal objects identical when shadow is off (draft=%s)', isDraft => {
+    const pr = fixture({ isDraft });
+    const { earlyStartShadow, ...legacyPolicy } = policy;
+    const baseline = run(pr, legacyPolicy);
+    const off = run(pr, { ...policy, earlyStartShadow: false });
+    expect(off.refusals).toEqual(baseline.refusals);
+    expect(off.refusals).toHaveLength(1);
+    expect(off.refusals[0].kind).toBe(isDraft ? 'draft' : 'review-ci');
+    expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
+    expect(off.dispatch).toEqual(baseline.dispatch);
+  });
+});
