@@ -3782,6 +3782,12 @@ and verdict across runs. Both confirmed and plausible broken ratings have produc
 only confirmed ratings increase `laterBroken`, while plausible ratings feed `unconfirmedBroken`.
 The CLI regression compares all live effects with mode off and exercises replay and writer/logger
 failures. Policy and persisted-IO probes cover refusal, lock ownership, and concurrent deduplication.
+
+The auto-discovered `post-accept-advisory-shadow-replay` soak scenario drives the production
+review loop with in-memory runs, ledger IO and effect sinks. It replays an accepted head and
+a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
+broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
