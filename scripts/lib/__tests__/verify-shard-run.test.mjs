@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli } from '../verify-shard-run.mjs';
 
@@ -12,7 +13,7 @@ describe('shard split', () => {
     expect(() => splitVitestArgs(['npx', 'vitest', 'run'], 2)).toThrow();
   });
 });
-function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () => ({ ok: true })) {
+function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () => ({ ok: true }), discover = () => null) {
   let time = 0, calls = [], lines = [], releases = 0;
   const reports = new Map();
   const fs = { mkdtempSync: () => '/scratch/shards', readFileSync: p => { if (!reports.has(p)) throw Error('missing'); return reports.get(p); }, rmSync: () => {} };
@@ -24,7 +25,7 @@ function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () =>
     if (mode === 'remote-red') reports.set(remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
     return { exitCode: ['red', 'remote-red'].includes(mode) ? 1 : 0 };
   };
-  const run = () => runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c'], shards: 3, parallel, budgetMs }, {
+  const run = () => runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c'], shards: 3, parallel, budgetMs }, { discover,
     fs, execute, now: () => time, tmpdir: () => '/scratch', log: s => lines.push(s), env: {},
     acquireLocal: acquire, releaseLocal: () => { releases++; },
   });
@@ -88,7 +89,7 @@ describe('process boundary and bounds', () => {
   });
   it('runs at most P shards at once and keeps flags on each', async () => {
     let active = 0, peak = 0; const reports = new Map(), calls = [];
-    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c', 'd', '--passWithNoTests'], shards: 4, parallel: 2, budgetMs: 5000 }, {
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c', 'd', '--passWithNoTests'], shards: 4, parallel: 2, budgetMs: 5000 }, { discover: () => null,
       log: () => {}, env: {}, tmpdir: () => '/scratch', fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: p => { if (!reports.has(p)) throw Error(); return reports.get(p); } },
       execute: async ({ files, report, args }) => {
         active++; peak = Math.max(peak, active); calls.push(args);
@@ -99,5 +100,26 @@ describe('process boundary and bounds', () => {
     });
     expect(code).toBe(0); expect(peak).toBe(2); expect(calls).toHaveLength(4);
     for (const args of calls) expect(args).toContain('--passWithNoTests');
+  });
+});
+
+describe('config-excluded selected files', () => {
+  const abs = f => resolve(process.cwd(), f);
+  it('names and drops a file the vitest config excludes; never runs it', async () => {
+    const f = fixture([], 100, 1, undefined, () => new Set([abs('a'), abs('b')]));
+    expect(await f.run()).toBe(0);
+    expect(f.calls.flatMap(c => c.files)).toEqual(['a', 'b']);
+    expect(f.lines.join('')).toMatch(/NOTE 1 selected file\(s\) are excluded by the vitest config.*: c/);
+  });
+  it('unknown discovery keeps every file (fail closed)', async () => {
+    const f = fixture();
+    expect(await f.run()).toBe(0);
+    expect(f.calls.flatMap(c => c.files)).toEqual(['a', 'b', 'c']);
+    expect(f.lines.join('')).not.toMatch(/NOTE/);
+  });
+  it('nothing runnable is red without --passWithNoTests', async () => {
+    const f = fixture([], 100, 1, undefined, () => new Set());
+    expect(await f.run()).toBe(1);
+    expect(f.calls).toEqual([]);
   });
 });

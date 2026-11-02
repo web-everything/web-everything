@@ -1,5 +1,5 @@
 import * as nodeFs from 'node:fs';
-import { spawn as nodeSpawn } from 'node:child_process';
+import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { tmpdir as nodeTmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -90,14 +90,39 @@ async function acquireLocalDefault({ cwd, env, remainingMs }) {
   return { ...acquired, options };
 }
 
+// Which of `files` does vitest's own config discover? (null = unknown: keep every file, fail closed.)
+// A selected path the config excludes (e.g. a trial directory) can never execute under ANY run, local or CI; it is
+// named loudly and dropped instead of turning every run red, while every runnable file still has to run and pass.
+const VITEST_SELECT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'forge-vitest-select.mjs');
+function discoverDefault({ files, cwd }) {
+  try {
+    const out = execFileSync(process.execPath, [VITEST_SELECT_SCRIPT, JSON.stringify({ options: { watch: false, run: true }, filters: files })],
+      { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+    const found = JSON.parse(out);
+    return Array.isArray(found) ? new Set(found.map(f => resolve(String(f)))) : null;
+  } catch { return null; }
+}
+
 export async function runShards({ argv, shards: count, parallel, budgetMs }, deps = {}) {
   const { fs = nodeFs, now = Date.now, tmpdir = nodeTmpdir, log = s => process.stdout.write(s),
     env = process.env, cwd = process.cwd(), execute = executeShard,
-    acquireLocal = acquireLocalDefault, releaseLocal = slot => releaseOwnedSlot(slot.options) } = deps;
+    discover = discoverDefault, acquireLocal = acquireLocalDefault, releaseLocal = slot => releaseOwnedSlot(slot.options) } = deps;
   let directory;
   try {
     if (!positive(parallel) || !Number.isSafeInteger(budgetMs) || budgetMs < 0) throw Error('invalid parallelism or budget');
-    const { shards, flags } = splitVitestArgs(argv, count);
+    const planned = splitVitestArgs(argv, 1).shards.flat();
+    const found = planned.length ? discover({ files: planned, cwd }) : null;
+    const excluded = found ? planned.filter(f => !found.has(resolve(cwd, f))) : [];
+    if (excluded.length) {
+      log(`verify-shards: NOTE ${excluded.length} selected file(s) are excluded by the vitest config (never runnable here or in CI), not run: ${excluded.join(' ')}\n`);
+      argv = argv.filter(a => !excluded.includes(a));
+    }
+    if (excluded.length === planned.length && planned.length) {
+      const ok = argv.includes('--passWithNoTests');
+      log(`verify-shards: ${ok ? 'GREEN' : 'RED'} (no selected file is runnable under the vitest config${ok ? '; --passWithNoTests' : ''})\n`);
+      return ok ? 0 : 1;
+    }
+    const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
     const deadline = now() + budgetMs, results = new Array(shards.length);
     directory = fs.mkdtempSync(join(tmpdir(), 'verify-shards-'));
     let next = 0;
