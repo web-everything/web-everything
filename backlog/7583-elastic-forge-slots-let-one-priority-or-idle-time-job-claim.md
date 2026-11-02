@@ -4,7 +4,7 @@ kind: decision
 size: 8
 status: open
 scope: ["we:docs/agent/platform-decisions.md"]
-scopeRationale: "The named executable checks are delivered by xzzsdv9 after policy completion; this card delivers only the statute amendment and its card update."
+scopeRationale: "The named executable checks are delivered by 7615 after policy completion; this card delivers only the statute amendment and its card update."
 dateOpened: "2026-11-01"
 tags: []
 ---
@@ -12,7 +12,7 @@ tags: []
 
 # Elastic Forge slots (policy only): grow a job to N slots when Forge is idle
 
-R331 (2026-11-01 11:22 ET) "Ok idle first": v1 is idle-time growth only. R350 (2026-11-01 17:29 ET) "1. Split": this card keeps ONLY the policy; all mechanics are in the build story xzzsdv9. R324 (09:44 ET): allow a single job to use multiple slots before adding smaller slots.
+R331 (2026-11-01 11:22 ET) "Ok idle first": v1 is idle-time growth only. R350 (2026-11-01 17:29 ET) "1. Split": this card keeps ONLY the policy; all mechanics are in the build story 7615. R324 (09:44 ET): allow a single job to use multiple slots before adding smaller slots.
 
 ## The axis
 
@@ -29,11 +29,11 @@ No real fork survives. The call to ratify is the five rulings below plus the sta
 - **Fail closed to 1 slot.** Any doubt grants exactly 1 slot, today's behaviour. An optimisation failure never denies a run.
 - **Ordering.** Elastic lands first; shrinking to about 16 smaller slots is a later card that depends on this one.
 
-Mechanics (grant function, polling, starvation bound, timeout, grant contract, runner slice and clamp, lease and marker reaping, settings and env layers, proof steps) are NOT decided here: see build story xzzsdv9.
+Mechanics (grant function, polling, starvation bound, timeout, grant contract, runner slice and clamp, lease and marker reaping, settings and env layers, proof steps) are NOT decided here: see build story 7615.
 
 ## Acceptance
 
-- [A1] **Executable** - completion requires only the recorded ratification and statute amendments 0–5 landed by this card in we:docs/agent/platform-decisions.md. That completion unblocks xzzsdv9; no build implementation or live proof is a prerequisite for this policy card. Planned check `policyCompletionHasStatuteAndUnblockedBuild` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` asserts that ratification plus the landed statute permits policy completion and makes xzzsdv9 eligible, even with the build and its live proof unfinished; missing ratification or statute text refuses completion. The dependency is one-way: xzzsdv9 is blocked by 7583, and 7583 is never blocked by xzzsdv9.
+- [A1] **Executable** - completion requires only the recorded ratification and statute amendments 0–5 landed by this card in we:docs/agent/platform-decisions.md. That completion unblocks 7615; no build implementation or live proof is a prerequisite for this policy card. Planned check `policyCompletionHasStatuteAndUnblockedBuild` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` asserts that ratification plus the landed statute permits policy completion and makes 7615 eligible, even with the build and its live proof unfinished; missing ratification or statute text refuses completion. The dependency is one-way: 7615 is blocked by 7583, and 7583 is never blocked by 7615.
 - [A2] **Must refuse** - planned check `policyChangeTouchesNoRuntimeCode` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` asserts that the policy delivery changes only this card and we:docs/agent/platform-decisions.md, rejecting any runtime or runner change.
 - [A3] **Must refuse** - planned check `elasticDefaultStaysDisabledUntilProof` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` resolves settings with the elastic configuration absent and separately with `enabled: false`; both must keep elastic disabled and grant exactly 1 slot. A proposed platform-preferences flip to true without the build story's attached live proof must be rejected. This future enablement gate does not block policy completion.
 
@@ -60,21 +60,21 @@ Unchanged: clause 3 (waiting-for-capacity tick). Consistent with, not amended: "
 
 1. **Untrusted text** - n/a: policy only; the build story handles it.
 2. **Truncated reads** - n/a: policy only; fail closed to 1 slot covers it.
-3. **Shared state files** - n/a: policy only; see xzzsdv9.
+3. **Shared state files** - n/a: policy only; see 7615.
 4. **Fail closed** - any doubt grants exactly 1 slot.
-5. **Identity scoping** - n/a: policy only; see xzzsdv9.
-6. **State over time** - n/a: policy only; see xzzsdv9.
+5. **Identity scoping** - n/a: policy only; see 7615.
+6. **State over time** - n/a: policy only; see 7615.
 7. **Who wrote it** - n/a: policy only; admission decides, never the requester.
 
 ## Ratified — 2026-11-01 (R354)
 
 Operator chalbert, 2026-11-01 17:34 ET: "\"Ratify as is\" for xjba691."
 
-Statute amendments 0–5 to `#heavy-command-admission-queue` are ratified as written. This policy card (7583) owns and lands the we:docs/agent/platform-decisions.md amendment, including the text-location clarifications below, before xzzsdv9 is unblocked. The build story implements the landed rule and does not own its initial statute amendment.
+Statute amendments 0–5 to `#heavy-command-admission-queue` are ratified as written. This policy card (7583) owns and lands the we:docs/agent/platform-decisions.md amendment, including the text-location clarifications below, before 7615 is unblocked. The build story implements the landed rule and does not own its initial statute amendment.
 
 ## Ratification clarifications (close here before statute delivery)
 
-Six second-screen flags were recorded at ratification. This card resolves the statute wording and anchors before landing it; xzzsdv9 tests that its implementation matches that landed wording:
+Six second-screen flags were recorded at ratification. This card resolves the statute wording and anchors before landing it; 7615 tests that its implementation matches that landed wording:
 
 1. Values: `maxSlots` 3; idle = at least 4 of 8 slots free.
 2. Anchor amendment 0.
