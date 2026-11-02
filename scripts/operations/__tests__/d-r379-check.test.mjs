@@ -168,7 +168,7 @@ describe('CLI and real adapter with injected IO', () => {
     expect(calls).toEqual([
       ['git','fetch','origin','main'],['git','fetch','origin','pull/6223/head'],
       ['git','rev-parse','--verify','FETCH_HEAD^{commit}'],['git','merge-base','origin/main',head],
-      ['git','diff','a'.repeat(40),head,'--name-only','-z'],
+      ['git','diff','--no-relative','--no-ext-diff','a'.repeat(40),head,'--name-only','-z'],
     ]);
   });
   it('fetch head mismatch refuses diff', async () => {
@@ -739,7 +739,7 @@ describe('round 4 append-only R391 evidence', () => {
       return `4\t0\t${path}\0`;
     }});
     expect(await adapter.readRulingNumstat(base,f.headRefOid,[path])).toBe(`4\t0\t${path}\0`);
-    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--numstat','-z',base,f.headRefOid,'--',path]]]);
+    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--numstat','-z',base,f.headRefOid,'--',path]]]);
   });
 });
 
@@ -880,7 +880,7 @@ describe('round 6 ruling-entry content evidence', () => {
     expect(condition(await check('- **R999** (date) Operator: "..."\n',{
       readRulingDiff:adapter.readRulingDiff,
     }),3).status).toBe('PASS');
-    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-ext-diff','--no-textconv',
+    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--no-textconv',
       '--unified=0',base,f.headRefOid,'--',path]]]);
   });
   it.each(['failure','oversized'])('keeps adapter %s closed', async kind => {
