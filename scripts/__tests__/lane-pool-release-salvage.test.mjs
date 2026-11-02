@@ -11,7 +11,7 @@ const git = (args, cwd) => execFileSync('git', args, {
 }).trim();
 let fixtureRoot, sharedFixture, origin, reference, base, poolRoot, backupRoot, laneDir, lane;
 const poolArgs = (originUrl = origin, referencePath = reference) => [...(originUrl === null ? [] : [`--origin=${originUrl}`]), ...(referencePath === null ? [] : [`--reference=${referencePath}`]), '--name=releasesalvage', '--branch=main', '--no-install'];
-function runPool(args, env = {}, { stderr, cwd, originUrl = origin, referencePath = reference } = {}) {
+function runPool(args, env = {}, { stderr, cwd, originUrl = origin, referencePath = reference, raw = false } = {}) {
   const preload = `import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module';
     os.userInfo = () => ({ homedir: ${JSON.stringify(base)} }); syncBuiltinESMExports();`;
   const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
@@ -22,6 +22,7 @@ function runPool(args, env = {}, { stderr, cwd, originUrl = origin, referencePat
       LANE_POOL_ROOT: poolRoot, WE_LANE_BACKUP_ROOT: backupRoot, ...env }),
   });
   expect(result.error).toBeUndefined();
+  if (raw) return result;
   expect(result.status, result.stderr).toBe(0);
   if (stderr) expect(result.stderr).toMatch(stderr);
   else expect(result.stderr).not.toContain('SALVAGE PUSH FAILED');
@@ -32,6 +33,16 @@ const salvageBranches = () => git(['ls-remote', '--heads', origin, `refs/heads/s
 function assertReleased(result) {
   expect(result.released).toBe(1);
   expect(existsSync(join(laneDir, '.git', '.lane-lease'))).toBe(false);
+}
+function assertReleaseRefused(result, marker, leaseBefore, reason) {
+  expect.soft(existsSync(marker), 'failed salvage must retain the lease marker').toBe(true);
+  if (existsSync(marker)) expect.soft(readFileSync(marker, 'utf8')).toBe(leaseBefore);
+  expect.soft(result.stderr).toMatch(/lane-1.*SALVAGE PUSH FAILED/);
+  expect.soft(result.stderr).toMatch(reason);
+  expect.soft(result.stderr + result.stdout).not.toContain('releasing anyway');
+  expect.soft(result.signal).toBeNull();
+  expect.soft(result.status).not.toBeNull();
+  expect.soft(result.status).not.toBe(0);
 }
 function commitLocalWork() {
   writeFileSync(join(laneDir, 'local-work.txt'), 'work that must survive release\n');
@@ -134,7 +145,10 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
         git(['config', 'extensions.worktreeConfig', 'true'], laneDir);
         git(['config', '--worktree', key, origin], laneDir);
       } else git(['config', key, origin], laneDir);
-      assertReleased(runPool(['release', '--lane=1'], {}, { stderr: /SALVAGE PUSH FAILED.*URL rewriting.*canonical origin/ }));
+      const marker = join(laneDir, '.git', '.lane-lease');
+      const leaseBefore = readFileSync(marker, 'utf8');
+      assertReleaseRefused(runPool(['release', '--lane=1'], {}, { raw: true }), marker, leaseBefore,
+        /URL rewriting.*canonical origin/);
       expect(salvageBranches()).toEqual([]);
       expect(git(['ls-remote', '--heads', attacker, 'refs/heads/salvage/*'], reference)).toBe('');
       expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
@@ -348,10 +362,24 @@ test -f "$LANE_POOL_ROOT/releasesalvage/lane-1/.git/.lane-lease"
     }
   });
 
-  it('warns and still releases across pools when salvage is refused', () => {
-    commitLocalWork();
+  it.each(['--lane=1', '--all-pools'])('fails closed and retains the lease when salvage push is rejected: release %s', selector => {
+    const sha = commitLocalWork();
+    const marker = join(laneDir, '.git', '.lane-lease');
+    const leaseBefore = readFileSync(marker, 'utf8');
+    if (selector === '--all-pools') {
+      // A later healthy lane must still release after lane-1's salvage fails.
+      runPool(['provision', '--count=2']);
+      runPool(['acquire', '--lane=2', '--no-reset', '--purpose=healthy-sweep-lane']);
+      expect(existsSync(join(poolRoot, 'releasesalvage', 'lane-2', '.git', '.lane-lease'))).toBe(true);
+    }
     writeFileSync(join(origin, 'hooks', 'pre-receive'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-    assertReleased(runPool(['release', '--all-pools'], {}, { stderr: /SALVAGE PUSH FAILED/ }));
+    const result = runPool(['release', selector], {}, { raw: true });
+    assertReleaseRefused(result, marker, leaseBefore, /pre-receive hook declined/);
+    if (selector === '--all-pools') {
+      expect(existsSync(join(poolRoot, 'releasesalvage', 'lane-2', '.git', '.lane-lease'))).toBe(false);
+      expect(JSON.parse(result.stdout).released).toBe(1);
+    }
+    expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
     expect(salvageBranches()).toEqual([]);
   });
 
