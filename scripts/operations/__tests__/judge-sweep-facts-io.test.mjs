@@ -32,6 +32,7 @@ it.each([
     }) }];
   const calls = [];
   const reader = createJudgeSweepFactsReader({
+    checkoutState: () => ({ behind: 0 }),
     gh: args => {
       calls.push(args);
       if (args[0] !== 'pr' || args[1] !== 'list') throw new Error('unexpected extra GitHub read');
@@ -54,6 +55,7 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
   baseRefOid: 'b'.repeat(40), labels: [], assignees: [], updatedAt: at,
   body: '<!-- authored-by-actor: author -->', createdAt: at, ...extra });
 const options = (extra = {}) => ({
+  checkoutState: () => ({ behind: 0 }),
   exec,
   gh: () => JSON.stringify([pr()]), now: () => Date.parse(at), baseCap,
   readLedgerRows: () => [], readFixRows: () => [], readJobs: () => [], readComments: () => [],
@@ -523,4 +525,45 @@ it.each([
 it('flags a ledger row that names the PR head but is malformed as unreadable evidence', () => {
   const facts = ledgerFacts([ledgerRow({ verdict: 7 })]);
   expect(facts.evidenceErrors).toContain('verdict ledger row malformed');
+// Evidence must never depend on how stale the caller's checkout is (R372).
+const freshFacts = { generatedAt: at, prs: [{ number: 7, evidenceErrors: [] }] };
+const staleOptions = extra => options({ gh: vi.fn(() => { throw new Error('stale checkout must not read locally'); }), ...extra });
+
+it('reads facts from a fresh origin/main when the checkout is behind', () => {
+  const readFresh = vi.fn(() => freshFacts);
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 1232 }), readFresh }));
+  expect(reader({ repo })).toEqual(freshFacts);
+  expect(readFresh).toHaveBeenCalledWith(expect.objectContaining({ repo, behind: 1232 }));
+});
+
+it('reads in place and never builds a fresh checkout when the checkout is current', () => {
+  const readFresh = vi.fn();
+  expect(createJudgeSweepFactsReader(options({ readFresh }))({ repo }).prs).toHaveLength(1);
+  expect(readFresh).not.toHaveBeenCalled();
+});
+
+it('refuses loudly with checkout-stale (N behind) when the fresh read fails, with no local fallback', () => {
+  const readFresh = vi.fn(() => { throw new Error('worktree add failed'); });
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 1232 }), readFresh }));
+  expect(() => reader({ repo })).toThrow(/checkout-stale \(1232 behind\)/);
+});
+
+it.each([null, {}, { prs: 'x' }, []])('refuses a malformed fresh read (%j) as checkout-stale', bad => {
+  const reader = createJudgeSweepFactsReader(staleOptions({ checkoutState: () => ({ behind: 3 }), readFresh: () => bad }));
+  expect(() => reader({ repo })).toThrow(/checkout-stale \(3 behind\)/);
+});
+
+it.each([() => { throw new Error('fetch failed'); }, () => ({ behind: -1 }), () => ({ behind: Number.NaN }), () => null])(
+  'refuses when freshness cannot be proven, without reading locally', checkoutState => {
+    const gh = vi.fn();
+    const reader = createJudgeSweepFactsReader(options({ gh, checkoutState, readFresh: () => freshFacts }));
+    expect(() => reader({ repo })).toThrow(/checkout-stale \(unknown behind\)/);
+    expect(gh).not.toHaveBeenCalled();
+  });
+
+it('does not recurse: the fresh child skips the freshness check', () => {
+  vi.stubEnv('WE_JUDGE_FACTS_FRESH_CHILD', '1');
+  const checkoutState = vi.fn(() => ({ behind: 5 }));
+  expect(createJudgeSweepFactsReader(options({ checkoutState }))({ repo }).prs).toHaveLength(1);
+  expect(checkoutState).not.toHaveBeenCalled();
 });
