@@ -95,14 +95,30 @@ describe('guard-stop-background-running', () => {
     const probe = spawnSync('node', ['--input-type=module', '-e', `
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
+      const open = fs.openSync;
       const read = fs.readSync;
+      const close = fs.closeSync;
+      const transcriptFds = new Set();
       const calls = [];
+      // ESM loading may also use readSync; count only descriptors opened for this transcript.
+      fs.openSync = (path, ...args) => {
+        const fd = open(path, ...args);
+        if (path === ${JSON.stringify(file)}) transcriptFds.add(fd);
+        return fd;
+      };
       fs.readSync = (fd, buffer, offset, length, position) => {
-        if (fd !== 0) calls.push({ bufferLength: buffer.length, offset, length, position });
+        if (transcriptFds.has(fd)) calls.push({ bufferLength: buffer.length, offset, length, position });
         return read(fd, buffer, offset, length, position);
+      };
+      fs.closeSync = (fd) => {
+        const result = close(fd);
+        transcriptFds.delete(fd);
+        return result;
       };
       syncBuiltinESMExports();
       process.argv[1] = ${JSON.stringify(resolve(import.meta.dirname, '../guard-stop-background-running.mjs'))};
+      // Exercise an unrelated read even on Node versions whose loader bypasses readSync.
+      fs.readFileSync(process.argv[1]);
       await import(process.argv[1]);
       process.stdout.write(JSON.stringify({ calls }));
     `], { encoding: 'utf8', timeout: 10000, maxBuffer: 256 * 1024,
