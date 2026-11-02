@@ -3957,7 +3957,7 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 1563, label: 'review:pending' })]);
   });
   it('fails closed: an unlabelled green bot PR on ci/refresh-test-timings is owed review:pending (PR #6254)', () => {
-    const pr = open({ number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', author: { login: 'github-actions[bot]', __typename: 'Bot' } });
+    const pr = open({ number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', author: { login: 'app/web-everything', is_bot: true } });
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 6254, label: 'review:pending' })]);
   });
@@ -3977,9 +3977,13 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
       expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
     }
   });
-  it('an unlabelled green non-lane human PR is owed review:pending', () => {
-    const plan = planReconcile({ prs: [open({ headRefName: 'feature/human' })], agents: [], durableCounts: {}, now: NOW });
-    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  it('a non-lane HUMAN PR, or a non-lane bot PR with no/!green checks (even stacked), is not owed', () => {
+    const stackedEmpty = open({ headRefName: 'feature/human', baseRefName: 'lane/parent', statusCheckRollup: [] });
+    const botRed = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: redRollup });
+    const botStackedEmpty = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, baseRefName: 'lane/parent', statusCheckRollup: [] });
+    for (const p of [open({ headRefName: 'feature/human' }), stackedEmpty, botRed, botStackedEmpty]) {
+      expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
+    }
   });
   it('never for a labelled, draft, red/pending or ready-to-merge PR', () => {
     for (const p of [

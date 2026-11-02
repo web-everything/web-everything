@@ -2815,7 +2815,13 @@ export function planReconcile({
     // whose checks are not red is owed the same neutral `review:pending`; review itself still waits on CI via
     // {@link reviewChecksAllow}, exactly as for a labelled stacked PR.
     const stackedLanePr = typeof pr?.baseRefName === 'string' && pr.baseRefName.startsWith('lane/') && pr.baseRefName !== defaultBranch;
-    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red'))
+    // D-R338 (#6254): a bot-authored non-lane PR (e.g. `ci/refresh-test-timings`) is owed the same label, but ONLY
+    // when its checks are green — the stacked-base exception and human non-lane PRs stay out (explicit hand-off).
+    const laneHead = String(pr?.headRefName ?? '').startsWith('lane/');
+    const botAuthored = /^app\//.test(String(pr?.author?.login ?? '')) || /\[bot\]$/.test(String(pr?.author?.login ?? '')) || pr?.author?.is_bot === true;
+    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft
+        && ((laneHead && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red')))
+          || (!laneHead && botAuthored && withPhase.check === 'green'))
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
       dispatch.push({
