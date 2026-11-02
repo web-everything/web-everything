@@ -455,6 +455,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // (the same one review-set-label.mjs's approval-time filing already used) instead of driving `file-item`
   // in-process; a new direct import of the review-loop-cli entry file.
   'scripts/lib/prevention-landing-job.mjs',
+  // review-loop-cli's post-accept advisory policy cascade is a direct review dependency.
+  'scripts/lib/post-accept-advisory-settings.mjs',
   // card xq1xbsl — review-loop-cli resumes a ruled, parked review; it reads the complete PR thread to find it.
   'scripts/conveyor/pr-comments-complete.mjs',
   // review-job.mjs (the default dispatch mode, which the daemon runs) — its own direct imports. review-job is

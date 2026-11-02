@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { checkMainStaleness, gitRun } from '../../lib/main-staleness.mjs';
 import { assertRunnerFreshness, requiresFreshRunner, FRESHNESS_TTL } from '../runner-freshness.mjs';
-import { OPERATIONS, resolveOperation, cliPreflight } from '../run.mjs';
+import { OPERATIONS, resolveOperation, cliPreflight, createCodexAuditSink, finishCodexAudit } from '../run.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
+import * as auditIo from '../codex-audit-io.mjs';
 
 function fixture(options = {}) {
   const calls = [], writes = [], diagnostics = [];
@@ -203,5 +206,106 @@ describe('runner freshness policy', () => {
   });
   it('independent dispatch refusal remains authoritative', () => {
     expect(() => cliPreflight('dispatch-lane', { arm: () => {}, assertFresh: () => { throw new Error('dispatch refusal'); } })).toThrow('dispatch refusal');
+  });
+
+  describe('codex-audit --json', () => {
+    const SHA = 'a'.repeat(40), HEAD = 'b'.repeat(40);
+    const deps = (answer, out = []) => ({ resolveSha: ref => (ref === HEAD ? HEAD : SHA), runCodex: () => answer,
+      appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
+    const run = async (answer, json) => {
+      const written = [];
+      const auditDeps = { ...deps(answer, written), stderr: t => written.push(t), appendRecord: vi.fn() };
+      const sink = createCodexAuditSink({ makeDeps: () => auditDeps });
+      const binding = resolveOperation('codex-audit');
+      const outcome = await runOperationCli({ ...binding, sinks: { 'codex-audit.run': sink },
+        argv: ['--base=m', `--head=${HEAD}`, ...(json ? ['--json'] : [])],
+        store: createMemoryRunStore(), newRunId: () => 'audit-output',
+      });
+      return { written, verdict: outcome.run.verdict, records: auditDeps.appendRecord.mock.calls,
+        out: finishCodexAudit({ ...outcome, json }) };
+    };
+    it('json mode: nothing is written by the sink and stdout is only the parseable envelope', async () => {
+      const { written, verdict, records, out } = await run('NOT WEAKENED\n', true);
+      expect(written).toEqual([]);
+      expect(out.code).toBe(0);
+      expect(out.lines).toHaveLength(1);
+      const env = JSON.parse(out.lines[0]);
+      expect(env.verdict).toEqual({ ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' });
+      expect(records).toEqual([[expect.objectContaining({ verdict: 'NOT WEAKENED', base: SHA, head: HEAD, findings: [] })]]);
+      expect(verdict.code).toBe(0);
+    });
+    it('json mode carries WEAKENED findings and a nonzero code', async () => {
+      const { written, records, out } = await run('WEAKENED\nrun.mjs:1 loosened\n', true);
+      expect(out.code).toBe(1);
+      expect(written).toEqual([]);
+      expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 1,
+        stdout: 'WEAKENED\nrun.mjs:1 loosened\n', stderr: '' });
+      expect(records).toEqual([[expect.objectContaining({ verdict: 'WEAKENED', findings: ['run.mjs:1 loosened'] })]]);
+    });
+    it('plain mode is unchanged: verdict then findings lines, no JSON', async () => {
+      const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', false);
+      expect(out.lines.join('\n')).toBe('WEAKENED\nrun.mjs:1 loosened');
+    });
+    it('an incomplete audit keeps its code and returns its diagnostic in the operations envelope', async () => {
+      const { written, records, out } = await run(undefined, true);
+      expect(out.code).toBe(3);
+      expect(written).toEqual([]);
+      expect(records).toEqual([]);
+      expect(out.lines).toHaveLength(1);
+      expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 3, stdout: '',
+        stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' });
+    });
+    it.each([
+      ['NOT WEAKENED', [], 0],
+      ['WEAKENED', ['run.mjs:1 loosened'], 1],
+    ])('registered CLI --json emits only the %s envelope', async (verdict, findings, code) => {
+      const written = [];
+      const injectedDeps = { ...deps([verdict, ...findings].join('\n'), written),
+        stderr: text => written.push(String(text)), appendRecord: vi.fn() };
+      const auditDeps = vi.spyOn(auditIo, 'createAuditDeps').mockReturnValue(injectedDeps);
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(text => {
+        written.push(String(text));
+        return true;
+      });
+      try {
+        const binding = resolveOperation('codex-audit');
+        const outcome = await runOperationCli({
+          ...binding, argv: ['--base=m', `--head=${HEAD}`, '--json'],
+          store: createMemoryRunStore(), newRunId: () => 'audit-json-regression',
+        });
+        expect(auditDeps).toHaveBeenCalledOnce();
+        const captured = { ok: code === 0, code, stdout: `${[verdict, ...findings].join('\n')}\n`, stderr: '' };
+        expect(outcome.run.verdict).toEqual(captured);
+        expect(injectedDeps.appendRecord).toHaveBeenCalledOnce();
+        expect(injectedDeps.appendRecord).toHaveBeenCalledWith(expect.objectContaining({
+          verdict, findings, base: SHA, head: HEAD,
+        }));
+        expect(written).toEqual([]);
+        const output = binding.finish({ ...outcome, json: true });
+        expect(output.code).toBe(code);
+        process.stdout.write(`${output.lines.join('\n')}\n`);
+        expect(JSON.parse(written.join(''))).toMatchObject({ op: 'codex-audit', verdict: captured });
+      } finally {
+        stdout.mockRestore();
+        auditDeps.mockRestore();
+      }
+    });
+    it('captures both streams without mutating injected dependencies', async () => {
+      const stdout = vi.fn(), stderr = vi.fn();
+      const auditDeps = Object.freeze({ stdout, stderr });
+      const sink = createCodexAuditSink({ makeDeps: () => auditDeps,
+        auditMain: async (_argv, io) => { io.stdout('partial\n'); io.stderr('refused\n'); return 3; },
+      });
+      const verdict = await sink({ base: 'm', head: HEAD });
+      expect(verdict).toEqual({ ok: false, code: 3, stdout: 'partial\n', stderr: 'refused\n' });
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).not.toHaveBeenCalled();
+      expect(finishCodexAudit({ run: { verdict }, code: 0, lines: [], json: false }))
+        .toEqual({ code: 3, lines: ['partial', 'refused'] });
+    });
+    it.each([true, false])('preserves adapter diagnostics when no audit verdict exists (json=%s)', json => {
+      expect(finishCodexAudit({ run: {}, code: 1, lines: ['adapter refusal'], json }))
+        .toEqual({ code: 1, lines: ['adapter refusal'] });
+    });
   });
 });

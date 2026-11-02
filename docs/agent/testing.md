@@ -3743,6 +3743,51 @@ invariants: a credential source must pass the public-blob checks before entering
 corpus. Do not claim independent mutation coverage for those redundant checks from a test
 that already refuses at source admission.
 
+
+## Post-accept advisory shadow evidence
+
+`review-loop-policy.test.mjs` exercises invalid settings with advisory-only findings, concurrent
+ledger writers (including separate Node processes), malformed persisted rows, and later loop
+observations. Accept-time `loopsAfter: null` means unmeasured; only later `kind: loops` observations
+supply measurements. A numeric accept-time count seeds the per-accept measurements; only higher
+counts advance the latest value per repo/PR/head. Equal or lower explicit replays append nothing,
+and historical replay rows cannot lower the report or the next run's count. The named accept-count,
+persisted-replay, and interleaved-accept probes in `review-loop-policy.test.mjs` pin these guarantees.
+`review-loop-cli.test.mjs` compares every live effect against mode off for an
+advisory-bearing accept, including settings and recorder failures.
+Persisted observations lock beside the ledger for at most two seconds. A busy/orphaned lock
+reports a shadow miss and preserves live review; an operator can inspect the writer and remove
+an orphaned `.lock` before retrying the observation.
+
+## Post-accept advisory replay probes
+
+The shadow advisory ledger uses recorded order, unique accepted-head identities, and a per-accept
+set of measured run IDs. Persist a run marker even when no earlier accept exists; otherwise a
+restart can turn an old run into a later run against a newly accepted head. Historical accepts
+also fence their own head when migrating to run markers. Probe partial fanout writes followed by
+a later accept and restart, concurrent duplicate and distinct runs, and duplicate or inconsistent
+persisted rows. The report and recorder share the replay reducer so skipped rows cannot suppress
+a valid replacement or inflate measurements. Keep these probes in the three review-loop-policy,
+review-loop-cli, and review-pr-io test files.
+
+
+## Post-accept advisory production ratings
+
+The CLI records later verdict ratings after the loop recorder has established the run marker.
+`advisory-rating` rows name an earlier would-card accept and reuse its repository/PR/head identity.
+Match cited findings with `roundCardsFindingsFingerprint`; without a valid path, require a stable
+finding ID rather than the fingerprint's prose fallback. Replay and the writer share this identity
+helper and the recorded-order boundary. Deduplicate by accepted head, finding identity, impact,
+and verdict across runs. Both confirmed and plausible broken ratings have production writers;
+only confirmed ratings increase `laterBroken`, while plausible ratings feed `unconfirmedBroken`.
+The CLI regression compares all live effects with mode off and exercises replay and writer/logger
+failures. Policy and persisted-IO probes cover refusal, lock ownership, and concurrent deduplication.
+
+The auto-discovered `post-accept-advisory-shadow-replay` soak scenario drives the production
+review loop with in-memory runs, ledger IO and effect sinks. It replays an accepted head and
+a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
+broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
@@ -3785,3 +3830,10 @@ Strict clone traversal must resolve relative, absolute and file-URL ESM specifie
 containment and syntax. Exercise percent encoding, URL suffixes and symlink targets as well as plain relative
 imports; JavaScript string escapes that the scanner cannot decode must leave proof incomplete. Keep a positive
 ESM alias case proving both alias and real dependency paths remain relevant, alongside refusal cases.
+## UID scanner idle proofs
+
+An absent UID does not guarantee an idle result from a shared host's `/proc`: repeated process
+churn or unreadable credentials deliberately retain reservations. In `forge-exec-run-reap.test.mjs`,
+keep the live host busy probe, but pin the idle probe's PID listing to the test process and read
+its real status file. Inject process churn, unreadable entries, and settled scans separately to
+verify the production scanner's fail-closed behavior without relying on host quiescence.
