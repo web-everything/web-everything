@@ -74,6 +74,13 @@ describe('detached rebuild jobMain integration', () => {
     expect(readResult()).toMatchObject({ reason: 'ready-recorded', readyRecorded: true, target: 'abc' });
   });
 
+  it('records WHICH deferred mutation was due in the result file and the log line', async () => {
+    const runChild = vi.fn(async () => ({ moved: false, reason: 'readonly-job-mutation-due', mutation: 'clone-commit-graph-repair' }));
+    await jobs.jobMain({ runChild, reportTimeout: vi.fn(() => null), env, ppid: 1, host: 'host' });
+    expect(readResult()).toMatchObject({ reason: 'readonly-job-mutation-due', mutation: 'clone-commit-graph-repair' });
+    expect(process.stderr.write.mock.calls.map(c => String(c[0])).join('')).toContain('(clone-commit-graph-repair)');
+  });
+
   it('overrides the child reason in the result file and emits the timeout event through injected IO', async () => {
     const r = { reason: 'tick-in-progress', heldBy: 'host:123', moved: false };
     const runChild = vi.fn(async () => r);
