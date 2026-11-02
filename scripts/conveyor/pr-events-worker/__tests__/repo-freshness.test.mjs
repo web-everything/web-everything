@@ -82,4 +82,16 @@ describe('GET /prs per-repo freshness', () => {
     expect(body.coverage).toMatchObject({ partial: true, bootstrap: [] });
     expect(body.lastEventAt).toBe(T);
   });
+
+  it('lists open PRs the latest complete import omits as omittedOpen and gives coverage false, changing no state', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.bootstrap({ ...seed('o/a'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
+    log.append(ev('o/b', 9), T);
+    log.append(ev('o/a', 2), T); // opened after the listing: never "omitted"
+    log.bootstrap(seed('o/a', 1, 'complete', 'i2'), T);
+    const body = log.readPrs(null, 10, T);
+    expect(body.repos['o/a']).toMatchObject({ coverage: false, omittedOpen: [1] });
+    expect(body.prs.filter((p) => p.repo === 'o/a').map((p) => [p.number, p.state])).toEqual([[1, 'open'], [2, 'open']]);
+    expect(body.repos['o/b']).not.toHaveProperty('omittedOpen', [1]);
+  });
 });
