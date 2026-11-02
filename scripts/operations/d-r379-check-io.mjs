@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 const POLICY = new URL('../settings/d-r379-protected-paths.json', import.meta.url);
 const AUDIT_SETTINGS = new URL('../settings/prototype-load.json', import.meta.url);
@@ -77,11 +78,11 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
   return {
     async readPr(pr) {
       checkPrNumber(pr);
-      return JSON.parse(await run('gh', ['pr', 'view', String(pr), '--json', 'title,body,headRefOid']));
+      return JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'title,body,headRefOid']));
     },
     async readLabels(pr, head) {
       checkPrNumber(pr);
-      const snapshot = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--json', 'labels,headRefOid']));
+      const snapshot = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'labels,headRefOid']));
       if (snapshot.headRefOid !== head) throw new Error('PR head moved; retry');
       return snapshot.labels;
     },
