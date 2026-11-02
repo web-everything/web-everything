@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawnKeepAlive } from '../../../lib/test-keepalive.mjs';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
 
@@ -44,7 +44,7 @@ export default {
       log,
       async perRound(w, round, ctx, api) {
         const { buildLeaseIsLive } = await import(pathToFileURL(join(w.simCloneRoot, 'scripts/lib/daemon-rebuild/lease.mjs')).href);
-        const unrelated = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+        const unrelated = spawnKeepAlive({ maxLifetimeMs: 60_000 });
         try {
           // The lease was taken 10 minutes before this unrelated process even started: its owner is long gone.
           const nowMs = Date.now();
