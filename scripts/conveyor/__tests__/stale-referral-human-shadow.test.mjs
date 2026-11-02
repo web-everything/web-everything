@@ -9,7 +9,7 @@ import {
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import {
-  createLiveShadowReaders, decideStaleReferralHumanHold, emitShadowEvent, resolveStaleReferralHumanShadow,
+  createLiveShadowReaders, decideStaleReferralHumanHold, emitShadowEvent, readHumanHoldPrs, resolveStaleReferralHumanShadow,
 } from '../stale-referral-human-shadow.mjs';
 
 // Spy on the shared writer while retaining real JSONL persistence for dedup tests.
@@ -76,6 +76,60 @@ function checked(decision, cause, status) {
     expect.objectContaining({ cause, status, detail: expect.any(String) }),
   ]));
 }
+
+describe('paginated human-hold discovery', () => {
+  const node = (number, names = []) => ({ number, labels: {
+    nodes: names.map(name => ({ name })), pageInfo: { hasNextPage: false },
+  } });
+  const page = (nodes, hasNextPage = false, endCursor = null) => ({ data: { repository: {
+    pullRequests: { nodes, pageInfo: { hasNextPage, endCursor } },
+  } } });
+
+  it.each([
+    ['all holds', undefined], ['explicit --pr target', [101]],
+  ])('reads %s beyond 100 unrelated open PRs', (_name, selected) => {
+    const pr = { number: 101, headRefOid: movedHead, labels: [{ name: 'review:human' }] };
+    const gh = vi.fn()
+      .mockReturnValueOnce(page(Array.from({ length: 100 }, (_, i) => node(i + 1)), true, 'page-1'))
+      .mockReturnValueOnce(page([node(101, ['review:human'])]))
+      .mockReturnValueOnce(pr);
+    expect([...readHumanHoldPrs({ repo, gh, selected })]).toEqual([pr]);
+    expect(gh).toHaveBeenCalledTimes(3);
+    expect(gh.mock.calls[0][0]).toEqual(expect.arrayContaining(['api', 'graphql', `owner=${repo.split('/')[0]}`]));
+    expect(gh.mock.calls[1][0]).toContain('cursor=page-1');
+    expect(gh.mock.calls[2][0]).toEqual(['pr', 'view', '101', '--repo', repo, '--json',
+      'number,headRefOid,baseRefName,labels,isDraft,mergeable,statusCheckRollup,body,createdAt,reviews']);
+  });
+
+  it.each([
+    ['missing connection', {}],
+    ['GraphQL partial error', { ...page([]), errors: [{ message: 'unreadable' }] }],
+    ['missing labels', page([{ number: 1 }])],
+    ['truncated labels', page([{ number: 1, labels: { nodes: [], pageInfo: { hasNextPage: true } } }])],
+    ['missing continuation cursor', page([], true)],
+  ])('fails closed on %s with operator guidance', (_name, response) => {
+    const gh = vi.fn(() => response);
+    expect(() => [...readHumanHoldPrs({ repo, gh })]).toThrow(/operator/);
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a repeated cursor rather than looping over incomplete discovery', () => {
+    const gh = vi.fn(() => page([], true, 'same-cursor'));
+    expect(() => [...readHumanHoldPrs({ repo, gh })]).toThrow(/operator must inspect remaining human holds/);
+    expect(gh).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates the shared 128-call budget refusal on oversized discovery', () => {
+    let calls = 0;
+    const gh = () => {
+      if (calls === 128) throw new Error('GitHub read budget exhausted; operator inspection required');
+      calls++;
+      return page(Array.from({ length: 100 }, (_, i) => node((calls - 1) * 100 + i + 1)), true, `page-${calls}`);
+    };
+    expect(() => [...readHumanHoldPrs({ repo, gh })]).toThrow(/budget exhausted; operator inspection required/);
+    expect(calls).toBe(128);
+  });
+});
 
 describe('CLI production evidence adapter', () => {
   function setup() {

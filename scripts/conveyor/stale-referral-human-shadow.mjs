@@ -11,6 +11,7 @@ import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 import { resolveCascade, logCascadeSources, platformPreference } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { defaultListPrComments } from './pr-comments-list.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { readReviewRunEvidence, decideReferralHold, decideSameHeadHold, verdictNeverLanded } from './review-referral-hold.mjs';
 import { sharedRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { resolve } from 'node:path';
@@ -326,12 +327,56 @@ export function createLiveShadowReaders({ repo, gh, readRuns = readShadowRuns, r
   };
 }
 
+/** Cursor-paged discovery uses the ordinary repository connection, never the search index.
+ * Every page and selected PR view goes through the caller's shared tick budget.
+ */
+export function* readHumanHoldPrs({ repo, gh, selected }) {
+  const [owner, name] = repo.split('/');
+  const query = `query($owner:String!,$name:String!,$cursor:String) {
+    repository(owner:$owner,name:$name) {
+      pullRequests(first:100,states:OPEN,after:$cursor) {
+        nodes { number labels(first:100) { nodes { name } pageInfo { hasNextPage } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }`;
+  let cursor;
+  const seen = new Set();
+  for (;;) {
+    const argv = ['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`];
+    if (cursor) argv.push('-f', `cursor=${cursor}`);
+    const response = gh(argv);
+    const page = response?.data?.repository?.pullRequests;
+    if (response?.errors || !Array.isArray(page?.nodes) || page.nodes.length > 100
+      || typeof page.pageInfo?.hasNextPage !== 'boolean'
+      || page.nodes.some(pr => !Number.isInteger(pr?.number) || pr.number <= 0
+        || !Array.isArray(pr.labels?.nodes) || pr.labels.pageInfo?.hasNextPage !== false
+        || pr.labels.nodes.some(label => typeof label?.name !== 'string'))) {
+      throw new Error('PR list or labels unreadable; operator inspection required');
+    }
+    const next = page.pageInfo.endCursor;
+    if (page.pageInfo.hasNextPage && (typeof next !== 'string' || !next || seen.has(next))) {
+      throw new Error('PR pagination incomplete; operator must inspect remaining human holds');
+    }
+    for (const listed of page.nodes.filter(p => p.labels.nodes.some(label => label.name === 'review:human')
+      && (!selected || selected.includes(p.number)))) {
+      const pr = gh(['pr', 'view', String(listed.number), '--repo', repo, '--json',
+        'number,headRefOid,baseRefName,labels,isDraft,mergeable,statusCheckRollup,body,createdAt,reviews']);
+      if (pr?.number !== listed.number) throw new Error('PR view unreadable; operator inspection required');
+      yield pr;
+    }
+    if (!page.pageInfo.hasNextPage) return;
+    seen.add(next);
+    cursor = next;
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (!args.includes('--live') || args.some(a => !/^(--live|--dry|--repo=[\w.-]+\/[\w.-]+|--pr=\d+(,\d+)*)$/.test(a))) {
     throw new Error('usage: stale-referral-human-shadow.mjs --live [--repo=owner/name] [--pr=N,N] [--dry]');
   }
-  const repo = args.find(a => a.startsWith('--repo='))?.slice(7) ?? 'web-everything/web-everything';
+  const repo = args.find(a => a.startsWith('--repo='))?.slice(7) ?? CONSTELLATION_REPOS.we.slug;
   const settings = resolveStaleReferralHumanShadow({ platform: platformPreference('staleReferralHumanShadow') });
   logCascadeSources('staleReferralHumanShadow', settings);
   if (!settings.value.enabled) return;
@@ -342,19 +387,12 @@ async function main() {
     return JSON.parse(execFileSyncThrottled('gh', argv,
       { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   };
-  const prs = gh(['pr', 'list', '--state', 'open', '--label', 'review:human',
-    '--repo', repo, '--limit', '100', '--json', 'number,headRefOid,baseRefName,labels,comments,isDraft,mergeable,statusCheckRollup,body,createdAt,reviews'],
-  );
-  if (!Array.isArray(prs)) throw new Error('PR list unreadable');
-  if (prs.length === 100) console.error('PR list capped at 100; operator must inspect remaining human holds');
   const readers = createLiveShadowReaders({ repo, gh });
-  for (const pr of prs.filter(p => !selected || selected.includes(p.number))) {
-    if (pr.comments?.length >= 100) {
-      try {
-        pr.comments = defaultListPrComments({ number: pr.number, repo, gh, maxPages: 10 });
-        pr.commentsComplete = true;
-      } catch { pr.comments = undefined; }
-    }
+  for (const pr of readHumanHoldPrs({ repo, gh, selected })) {
+    try {
+      pr.comments = defaultListPrComments({ number: pr.number, repo, gh, maxPages: 10 });
+      pr.commentsComplete = true;
+    } catch { pr.comments = undefined; }
     const decision = await decideStaleReferralHumanHold(pr, { repo, settings, ...readers });
     const reason = decision.wouldClear ? decision.why
       : decision.checked.find(c => c.status !== 'absent')?.detail ?? decision.why;
