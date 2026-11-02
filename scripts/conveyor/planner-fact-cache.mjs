@@ -9,7 +9,7 @@ export function prFactKey(row) {
     c.name ?? c.context, c.status ?? c.state, c.conclusion, c.completedAt ?? c.completed_at,
   ])).sort();
   const checkHash = createHash('sha256').update(JSON.stringify(checks)).digest('hex');
-  return JSON.stringify(['pr', row.repo, row.number, row.headRefOid, row.baseSha ?? row.baseRefName, labels, checkHash]);
+  return JSON.stringify(['pr-fact-row', row.repo, row.number, row.headRefOid, row.baseSha ?? row.baseRefName, labels, checkHash]);
 }
 
 export function mainFactKey({ repo, mainSha }) {
@@ -32,7 +32,7 @@ const acceptable = row => plain(row) && !row.discoveryIncomplete && !row.deferre
   && (!Object.hasOwn(row, 'comments') || Array.isArray(row.comments))
   && !['plan', 'dispatch'].some(k => Object.hasOwn(row, k));
 const scopeOf = key => {
-  try { const [type, repo, number] = JSON.parse(key); return type === 'pr' ? JSON.stringify([repo, number]) : null; }
+  try { const [type, repo, number] = JSON.parse(key); return type === 'pr-fact-row' ? JSON.stringify([repo, number]) : null; }
   catch { return null; }
 };
 
