@@ -201,17 +201,18 @@ export function readyBuildVerified({
 /** Drop the suspect overlays a passing plain-main fallback proved bad (shared by the direct finalize and by a
  *  later adoption of the same fallback from its ready record). */
 export function dropSuspectOverlays({
-  root, env, suspects, failed, alert,
+  root, env, suspects, failed, alert, plan,
 }) {
   for (const s of suspects) {
-    // Legacy fallback records can name a ref without binding their smoke evidence to a registration.
+    // Smoke suspects may omit the id; the prepared plan binds the failing ref to its snapshot registration.
+    const registrationId = s.registrationId || plan?.applied?.find((row) => row.ref === s.ref)?.registrationId;
     // An absent CAS token would make removeOverlay unconditional, so keep the entry for operator review.
-    if (typeof s.registrationId !== 'string' || !s.registrationId) {
+    if (typeof registrationId !== 'string' || !registrationId) {
       alert('overlay-registration-changed', { ref: s.ref });
       continue;
     }
     try {
-      removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: s.registrationId });
+      removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: registrationId });
     } catch (error) {
       if (!/registration changed/.test(String(error?.message))) throw error;
       alert('overlay-registration-changed', { ref: s.ref });
@@ -278,16 +279,6 @@ export async function finalizeRebuild({
       appendFileSync(file, `${JSON.stringify({ at: nowIso(), kind, detail })}\n`, 'utf8');
     } catch { /* best-effort audit trail only */ }
   };
-  const adoptionRows = () => {
-    const registry = readOverlayState(root, { env });
-    return plan.applied.map((row) => {
-      if (!row.registrationId || (!registry.corrupt && registry.overlays.some((entry) =>
-        entry?.ref === row.ref && entry.registrationId === row.registrationId))) return row;
-      alert('overlay-registration-changed', { ref: row.ref });
-      const { registrationId, ...unbound } = row;
-      return unbound;
-    });
-  };
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
@@ -305,6 +296,18 @@ export async function finalizeRebuild({
     return { ...result, alerts: alertsList };
   };
 
+  // Refuse stale smoke evidence before either adoption branch writes or moves the candidate.
+  // An overlay-free (mainOnly) plan has no registration evidence to validate.
+  if (plan.applied.some((row) => row.registrationId)) {
+    const registry = readOverlayState(root, { env });
+    const changed = plan.applied.filter((row) => row.registrationId && (registry.corrupt
+      || !registry.overlays.some((entry) => entry?.ref === row.ref && entry.registrationId === row.registrationId)));
+    if (changed.length) {
+      for (const row of changed) alert('overlay-registration-changed', { ref: row.ref });
+      return terminal({ moved: false, reason: 'overlay-registration-changed', plan });
+    }
+  }
+
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
@@ -312,7 +315,7 @@ export async function finalizeRebuild({
   if (headNow === plan.finalSha) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
       };
       state.rejected = null;
       state.held = null;
@@ -368,7 +371,7 @@ export async function finalizeRebuild({
       });
     }
     state.adopted = {
-      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
+      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
     };
     state.rejected = null;
     state.held = null;

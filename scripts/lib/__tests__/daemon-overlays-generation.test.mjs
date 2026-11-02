@@ -499,24 +499,57 @@ describe('overlay registration generations', () => {
     expect(readRebuildState(f.root, f.env).held).toMatchObject({ reason: 'pinned-overlay-unbound', lastGood: f.adopted.head });
   });
 
-  it.each(['already-adopted', 'moved'])('T10 adopt CAS: %s strips replaced ids and preserves matching evidence', async (branch) => {
+  it.each(['already-adopted', 'moved'])('T10 adopt CAS: %s refuses replaced, removed, or corrupt registrations', async (branch) => {
+    for (const change of ['replaced', 'removed', 'corrupt']) {
+      const f = gitFixture();
+      const kept = overlays.addOverlay(f.root, { ref: 'lane/kept' }, { env: f.env }).find(o => o.ref === 'lane/kept');
+      const replacement = change === 'replaced' ? f.add() : null;
+      if (change === 'removed') overlays.removeOverlay(f.root, REF, { env: f.env, expectRegistrationId: f.old.registrationId });
+      if (change === 'corrupt') writeFileSync(f.file, '{broken');
+      const applied = [...f.adopted.applied, { ref: kept.ref, sha: SHA, registrationId: kept.registrationId },
+        { ref: 'lane/legacy', sha: SHA }];
+      const finalSha = branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha;
+      const onAdopted = vi.fn();
+      const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW), onAdopted,
+        lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha, mainSha: f.adopted.mainSha, inputsKey: 'cas', applied },
+        run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),
+      });
+      expect(result).toMatchObject({ moved: false, reason: 'overlay-registration-changed' });
+      expect(result.adopted).toBeUndefined();
+      expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
+      expect(readRebuildState(f.root, f.env).adopted).toEqual(f.adopted);
+      expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).stdout.trim()).toBe(f.adopted.head);
+      expect(onAdopted).not.toHaveBeenCalled();
+      if (replacement) expect(f.list()).toContainEqual(replacement);
+    }
+  });
+
+  it('adoption refuses a candidate whose registration was replaced during smoke', async () => {
     const f = gitFixture();
-    const kept = overlays.addOverlay(f.root, { ref: 'lane/kept' }, { env: f.env }).find(o => o.ref === 'lane/kept');
+    const prepared = await f.prepare({ available: true });
+    expect(prepared.terminal).toBe(false);
     const replacement = f.add();
-    const applied = [...f.adopted.applied, { ref: kept.ref, sha: SHA, registrationId: kept.registrationId },
-      { ref: 'lane/legacy', sha: SHA }];
-    const finalSha = branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha;
     const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
-      lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha, mainSha: f.adopted.mainSha, inputsKey: 'cas', applied },
+      lease: prepared.lease, prevHead: f.adopted.head, plan: prepared.plan,
       run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),
     });
-    expect(result.adopted).toBe(true);
-    expect(result.moved).toBe(branch === 'moved');
-    expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
-    const { registrationId, ...unbound } = applied[0];
-    expect(readRebuildState(f.root, f.env).adopted.applied).toEqual([unbound, ...applied.slice(1)]);
-    expect(overlays.appliedRowFor(readRebuildState(f.root, f.env).adopted, REF, replacement.registrationId)).toBeNull();
-    expect(f.list()).toContainEqual(replacement);
+    expect(result).toMatchObject({ moved: false, reason: 'overlay-registration-changed', plan: prepared.plan });
+    expect(result.adopted).toBeUndefined();
+    expect(result.alerts).toContainEqual({ kind: 'overlay-registration-changed', detail: { ref: REF } });
+    expect(readRebuildState(f.root, f.env).adopted).toEqual(f.adopted);
+    expect(f.list()).toEqual([replacement]);
+  });
+
+  it("smoke suspect without its own registrationId is removed using the plan's bound id", () => {
+    const f = fixture();
+    const bound = f.add();
+    const alert = vi.fn();
+    dropSuspectOverlays({ root: f.root, env: f.env, suspects: [{ ref: REF, pr: bound.pr }],
+      plan: { applied: [bound] }, failed: 'smoke', alert });
+    expect(f.list()).toEqual([]);
+    expect(alert.mock.calls.map(([kind]) => kind)).toEqual(['overlay-dropped-smoke-failed']);
+    const events = readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'dropped-smoke-failed', ref: REF }));
   });
 
   it('T10 suspect replacement is kept without a drop event', () => {
