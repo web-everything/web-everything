@@ -337,9 +337,15 @@ describe('forge leaked-state reaper', () => {
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(await exists(lock)).toBe(true);
   });
-  it.runIf(process.platform === 'linux')('sees a live process by its credentials, and a uid with none as idle', async () => {
-    expect(await uidBusy(process.getuid())).toBe(true);
-    expect(await uidBusy(4000000123)).toBe(false);
+  it('sees a process in a /proc fixture by its credentials, and a uid absent from it as idle', async () => {
+    const proc = procFixture({entries: ['self', '42', '43'], readStatus: path =>
+      procStatus(path === '/proc/43/status' ? [workerUid, workerUid, workerUid, workerUid] : [7, 7, 7, 7])});
+    expect(await uidBusy(workerUid, proc)).toBe(true);
+    expect(await uidBusy(4000000123, proc)).toBe(false);
+  });
+  it('fails closed (busy) when a fixture entry keeps vanishing', async () => {
+    const proc = procFixture({entries: ['42'], readStatus: () => { throw procError('ENOENT'); }});
+    expect(await uidBusy(4000000123, proc)).toBe(true);
   });
   it('keeps empty, malformed and pre-lease reservations even when old and idle', async () => {
     const old = new Date(Date.now() - 3600e3);
