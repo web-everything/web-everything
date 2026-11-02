@@ -522,6 +522,18 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(mk(' , '), 'separators only').toThrow(/has no scope/);
   });
 
+  it.each([
+    ['we', 'webeverything'], ['fui', 'frontierui'], ['plateau', 'plateau-app'],
+  ])('R372 — accepts canonical %s scope and refuses its %s alias', (canonical, alias) => {
+    const read = tickRead();
+    const withScope = (prefix) => ({ ...read, item: { ...read.item, scope: [`${prefix}:src/a.mjs`] } });
+    const shaped = shapeDispatchRead(withScope(canonical), { num: '3037' });
+    expect(shaped.dispatching).toBe(true);
+    expect(shaped.scope).toEqual([`${canonical}:src/a.mjs`]);
+    expect(() => shapeDispatchRead(withScope(alias), { num: '3037' }))
+      .toThrow(/unsafe scope entry.*canonical/);
+  });
+
   it('R372 — an unprefixed piece inherits the entry repo prefix (lease overlap stays correct)', () => {
     const read = tickRead();
     const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:a.mjs b.mjs'] } }, { num: '3037' });

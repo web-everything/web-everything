@@ -233,7 +233,10 @@ describe('#4649 real process preflight boundaries', () => {
     try {
       mkdirSync(f.env.WE_BACKLOG_DIR, { recursive: true });
       mkdirSync(join(f.dir, '.git'));
-      writeFileSync(join(f.env.WE_BACKLOG_DIR, '4620-mixed-locus.md'), `---\nkind: story\nsize: 5\nstatus: open\nscope: ${JSON.stringify(scope)}\n---\n# Mixed locus\n`);
+      // R372 requires canonical scope prefixes at dispatch. Keep the historical child fixture above,
+      // but use plateau: here so the CLI reaches the mixed-locus gate with otherwise valid scope.
+      const canonicalScope = scope.map((path) => path.replace(/^plateau-app:/, 'plateau:'));
+      writeFileSync(join(f.env.WE_BACKLOG_DIR, '4620-mixed-locus.md'), `---\nkind: story\nsize: 5\nstatus: open\nscope: ${JSON.stringify(canonicalScope)}\n---\n# Mixed locus\n`);
       // The operation/reader/loader/store are real. External planner/GitHub/Git reads are supplied;
       // freshness observes a current checkout and writes its cache only in the temporary Git directory.
       // every unexpected subprocess fails, and every async spawn is fatal (no detached child can exist).
