@@ -3,7 +3,7 @@ import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { tmpdir as nodeTmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { readRemoteReport, shouldConfirmRemoteRed } from './verify-remote-routing.mjs';
+import { readRemoteReport, shouldConfirmRemoteRed, phaseRunLocation } from './verify-remote-routing.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
 import { killProcessTree } from './bounded-child.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
@@ -125,13 +125,13 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
     const deadline = now() + budgetMs, results = new Array(shards.length);
     directory = fs.mkdtempSync(join(tmpdir(), 'verify-shards-'));
-    let next = 0, infraExit = 0;
+    let next = 0, infraExit = 0, stopLaunching = false;
     // The slot helpers identify holders by process. Serialize confirmation in
     // this process so one confirmation cannot release another's slot.
     let localTail = Promise.resolve();
     const remaining = () => Math.max(0, deadline - now());
     async function worker() {
-      while (next < shards.length) {
+      while (next < shards.length && !stopLaunching) {
         const index = next++, files = shards[index], started = now();
         const remoteReport = join(directory, `${index}.remote.jsonl`);
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
@@ -157,15 +157,15 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         let status;
         try {
           status = await attempt(false);
-          let remote = false;
+          let ranOn = { location: 'unknown' };
           try {
-            const lines = readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding));
-            remote = lines.length > 0 && lines.every(r => r.location === 'remote');
+            ranOn = phaseRunLocation(readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding)), { remoteAttempt: true });
           } catch { /* Unknown location cannot authorize replacing a red verdict. */ }
-          // Same predicate verify-lane uses: a signal, timeout or infrastructure exit (e.g. 137) is never replaced by a local pass.
-          if (remote && ['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
+          // Same predicate verify-lane uses: needs a REPORTED remote failure, and a signal, timeout or infrastructure exit
+          // (e.g. 137) is never replaced by a local pass.
+          if (['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
             && shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: lastResult.exitCode, signal: lastResult.signal,
-              timedOut: lastResult.timedOut, ranOn: { location: 'remote', failureLocation: 'remote' } })) {
+              timedOut: lastResult.timedOut, ranOn })) {
             log(`verify-shard ${index + 1}/${shards.length}: remote red; confirming locally\n`);
             if (!remaining()) status = 'NOT-RUN';
             else {
@@ -186,18 +186,20 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
         if (status !== 'PASS' && lastResult && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
+        if (status === 'TIMEOUT' || infraExit) stopLaunching = true;
         results[index] = status;
         log(`verify-shard ${index + 1}/${shards.length}: ${status} (${files.length} files, ${now() - started} ms)\n`);
       }
     }
     await Promise.all(Array.from({ length: Math.min(parallel, shards.length) }, worker));
+    for (let i = 0; i < shards.length; i++) if (results[i] === undefined) { results[i] = 'NOT-RUN'; log(`verify-shard ${i + 1}/${shards.length}: NOT-RUN (stopped after an infrastructure failure or timeout)\n`); }
     if (results.every(r => r === 'PASS')) {
       log(`verify-shards: GREEN (all ${shards.length} shards, ${shards.flat().length} files executed and passed)\n`);
       return 0;
     }
     log(`verify-shards: RED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; inspect shard output and rerun the affected selection)\n`);
     if (infraExit > 0 && infraExit < 256 && infraExit !== 124) return infraExit;
-    return results.some(r => !['PASS', 'TIMEOUT', 'NOT-RUN'].includes(r)) ? 1 : 124;
+    return results.some(r => ['TIMEOUT', 'NOT-RUN'].includes(r)) ? 124 : 1;
   } catch (error) {
     log(`verify-shards: RED (internal error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')})\n`);
     return 1;

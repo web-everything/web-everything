@@ -21,9 +21,10 @@ function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () =>
     calls.push({ command, args, files, env, timeoutMs });
     const mode = modes[calls.length - 1] ?? 'pass';
     if (mode === 'timeout') { time += timeoutMs; return { exitCode: 124, timedOut: true }; }
-    if (mode !== 'unreadable') reports.set(report, JSON.stringify({ testResults: (mode === 'missing' ? [] : files).map(name => ({ name, status: mode === 'red' || mode === 'remote-red' || mode === 'remote-red-137' ? 'failed' : 'passed', assertionResults: [{ status: 'passed' }] })) }));
+    if (mode !== 'unreadable') reports.set(report, JSON.stringify({ testResults: (mode === 'missing' ? [] : files).map(name => ({ name, status: ['red', 'remote-red', 'remote-red-137', 'red-with-ok-remote'].includes(mode) ? 'failed' : 'passed', assertionResults: [{ status: 'passed' }] })) }));
     if (mode === 'remote-red' || mode === 'remote-red-137') reports.set(remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
-    return { exitCode: mode === 'remote-red-137' ? 137 : ['red', 'remote-red'].includes(mode) ? 1 : 0 };
+    if (mode === 'red-with-ok-remote') reports.set(remoteReport, JSON.stringify({ location: 'remote', exitCode: 0 }) + '\n');
+    return { exitCode: mode === 'remote-red-137' ? 137 : ['red', 'remote-red', 'red-with-ok-remote'].includes(mode) ? 1 : 0 };
   };
   const run = () => runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c'], shards: 3, parallel, budgetMs }, { discover,
     fs, execute, now: () => time, tmpdir: () => '/scratch', log: s => lines.push(s), env: {},
@@ -47,8 +48,8 @@ describe('fail-closed wrapper', () => {
     const f = fixture(['timeout']); expect(await f.run()).toBe(124);
     expect(f.calls).toHaveLength(1); expect(f.lines.join('')).toContain('NOT-RUN');
   });
-  it('plain red takes priority over a later timeout', async () => {
-    const f = fixture(['red', 'timeout']); expect(await f.run()).toBe(1);
+  it('a later timeout still surfaces as a timeout (never hidden as a plain red)', async () => {
+    const f = fixture(['red', 'timeout']); expect(await f.run()).toBe(124);
   });
   it('exhausted budget starts nothing and cannot pass', async () => {
     const f = fixture([], 0); expect(await f.run()).toBe(124); expect(f.calls).toHaveLength(0);
@@ -127,5 +128,19 @@ describe('config-excluded selected files', () => {
     expect(await f.run()).not.toBe(0);
     expect(f.lines.join('')).not.toMatch(/confirming locally/);
     expect(await fixture(['remote-red-137']).run()).toBe(137);
+  });
+});
+
+describe('exit-code precedence and remote evidence', () => {
+  it('a timeout beats a sibling red and no further shard starts after it', async () => {
+    const f = fixture(['timeout', 'red', 'pass']);
+    expect(await f.run()).toBe(124);
+    expect(f.calls.length).toBe(1);
+    expect(f.lines.join('')).toMatch(/NOT-RUN/);
+  });
+  it('a successful remote report never authorizes a local replacement', async () => {
+    const f = fixture(['red-with-ok-remote']);
+    expect(await f.run()).not.toBe(0);
+    expect(f.lines.join('')).not.toMatch(/confirming locally/);
   });
 });
