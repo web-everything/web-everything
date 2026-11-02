@@ -98,10 +98,10 @@ describe('direction paths and R391', () => {
     const d = deps({...fixture(6223),netDiffPaths:['backlog/123-test.md']},{readHeadFile:()=>`---\nkind: decision\nstatus: ${status}\n---\n`});
     expect(condition(await checkPr(1,d),3).status).toBe('FAIL');
   });
-  it.each(['resolved','ratified'])('previously ratified decision %s passes', async status => {
+  it.each(['resolved','ratified'])('touched previously ratified decision %s fails even with unchanged status', async status => {
     const card = `---\nkind: decision\nstatus: ${status}\n---\n`;
     const d = deps({...fixture(6223),netDiffPaths:['backlog/123-test.md']},{readHeadFile:()=>card,readBaseFile:()=>card});
-    expect(condition(await checkPr(1,d),3).status).toBe('PASS');
+    expect(condition(await checkPr(1,d),3).status).toBe('FAIL');
   });
   it('unreadable decision stays UNKNOWN', async () => {
     const d = deps({...fixture(6223),netDiffPaths:['backlog/123-test.md']},{readHeadFile:()=>{throw Error();}});
@@ -362,7 +362,17 @@ describe('current-head ledger acceptance regressions', () => {
 });
 
 describe('protected implementation and test regressions', () => {
+  it.each(['gate','guard','verdict','ledger','codeql','secret','policy','permission','approval','label']
+    .flatMap(name => ['scripts', '.github'].flatMap(tree => [
+      `${tree}/lib/custom-${name}-helper.mjs`,
+      `${tree}/lib/__tests__/custom-${name}-helper.test.mjs`,
+    ])))('generic protection refuses condition 4 for %s', async path => {
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    expect(condition(r,4).status).toBe('FAIL'); expect(r.eligible).toBe(false);
+  });
   it.each([
+    'scripts/lib/codeql-gate.mjs',
+    'scripts/lib/__tests__/merge-gate-verdict.test.mjs',
     'scripts/operations/d-r379-check-io.mjs',
     'scripts/operations/codex-audit.mjs',
     'scripts/operations/codex-audit-io.mjs',
@@ -412,8 +422,9 @@ describe('protected implementation and test regressions', () => {
     expect(condition(r,4).status).toBe('FAIL');
     expect(r.eligible).toBe(false);
   });
-  it('keeps ordinary documentation outside protected paths', () => {
-    expect(settings.protectedPaths.some(glob=>matchesGlob('docs/harmless.md',glob))).toBe(false);
+  it.each(['docs/foo.md','scripts/lib/format-date.mjs','docs/gate-policy.md'])('keeps innocuous %s eligible', async path => {
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    expect(condition(r,4).status).toBe('PASS'); expect(r.eligible).toBe(true);
   });
 });
 
@@ -434,11 +445,30 @@ describe('merge-base decision ratification regressions', () => {
     const r = await check({readHeadFile:()=>card('resolved','kind','story'),readBaseFile:()=>card('open')});
     expect(condition(r,3).status).toBe('FAIL');
   });
-  it('binds the historical read to the net diff base and permits resolved to ratified', async () => {
+  it('binds the historical read to the net diff base and rejects resolved to ratified', async () => {
     const calls = [], diffBase = 'b'.repeat(40);
     const r = await check({fetchNetDiff:()=>({paths:[path],base:diffBase}),
       readHeadFile:()=>card('ratified','type'),readBaseFile:(sha,p)=>{calls.push([sha,p]);return card('resolved','type');}});
-    expect(calls).toEqual([[diffBase,path]]); expect(condition(r,3).status).toBe('PASS');
+    expect(calls).toEqual([[diffBase,path]]); expect(condition(r,3).status).toBe('FAIL');
+  });
+  it.each(['kind','type'])('rejects a body-only edit to a resolved %s decision', async key => {
+    const r = await check({readHeadFile:()=>`${card('resolved',key)}Reversed ruling.\n`,
+      readBaseFile:()=>`${card('resolved',key)}Original ruling.\n`});
+    expect(condition(r,3).status).toBe('FAIL'); expect(r.eligible).toBe(false);
+  });
+  it('cannot hide a resolved base decision by rewriting its head kind', async () => {
+    const r = await check({readHeadFile:()=>card('resolved','kind','story'),readBaseFile:()=>card('resolved')});
+    expect(condition(r,3).status).toBe('FAIL');
+  });
+  it('preserves the R391 exception for a pure decision ruling-record', async () => {
+    const f = {...fixture(6223),title:'R391 record',body:'> Operator ruling',netDiffPaths:['backlog/123-rulings.md']};
+    const r = await checkPr(6223,deps(f,{readHeadFile:()=>card('resolved'),readBaseFile:()=>card('resolved')}));
+    expect(condition(r,3)).toMatchObject({status:'PASS',evidence:expect.arrayContaining(['R391 ruling-record'])});
+  });
+  it('refuses R391 when a non-record decision body is also touched', async () => {
+    const f = {...fixture(6223),title:'R391 record',body:'> Operator ruling',netDiffPaths:['rulings.md',path]};
+    const r = await checkPr(6223,deps(f,{readHeadFile:()=>`${card('resolved')}Reversed ruling.\n`,readBaseFile:()=>card('resolved')}));
+    expect(condition(r,3).status).toBe('FAIL');
   });
   it.each(['error','malformed','oversized','undefined'])('keeps %s base evidence UNKNOWN with a human fallback', async kind => {
     const r = await check({readHeadFile:()=>card('resolved'),readBaseFile:()=>{

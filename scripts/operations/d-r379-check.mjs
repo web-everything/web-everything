@@ -112,8 +112,7 @@ function decisionState(text) {
   if (!match) throw new Error('missing frontmatter');
   const data = yaml.safeLoad(match[1]);
   if (!data || typeof (data.kind ?? data.type) !== 'string' || typeof data.status !== 'string') throw new Error('incomplete frontmatter');
-  return { decision: data.kind === 'decision' || data.type === 'decision',
-    ratified: ['resolved', 'ratified'].includes(data.status) };
+  return { decision: data.kind === 'decision' || data.type === 'decision' };
 }
 
 async function directionPaths(paths, settings, metadata, head, base, deps) {
@@ -126,8 +125,8 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
         // null is verified absence; every other unreadable historical value is UNKNOWN.
         const historicalText = await deps.readBaseFile(base, path);
         const historical = historicalText === null ? null : decisionState(historicalText);
-        if ((current.decision || historical?.decision)
-          && !(current.decision && current.ratified && historical?.decision && historical.ratified)) matches.push(path);
+        // Any net-diff touch can reverse a ruling, even with a resolved status at both ends.
+        if (current.decision || historical?.decision) matches.push(path);
       } catch { unreadable.push(path); }
     }
   }
@@ -137,7 +136,7 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
     && /(?:^\s*>|\bverbatim\b)/im.test(metadata.body);
   if (hits.length && !recording) return result(3, 'Sets no direction', 'FAIL', hits.map(path => `direction path: ${path}`));
   if (unreadable.length) return unknown(3, 'Sets no direction', `unreadable decision evidence: ${unreadable.join(', ')}`);
-  return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', ...hits] : ['no direction paths or unratified decision cards']);
+  return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', ...hits] : ['no direction paths or touched decision cards']);
 }
 
 function protectedPaths(paths, settings) {
