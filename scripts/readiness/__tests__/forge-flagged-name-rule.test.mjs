@@ -223,6 +223,37 @@ describe('manifestEntry fail-closed leaf guard',()=>{
 
 describe('content secret scan',()=>{
   it.each([
+    'password=aB3$dE6!gH9@kL2',
+    'password = ordinary-password',
+    'PASSWD: aaaa',
+    'secret=1234',
+    'TOKEN=value',
+    'api_key: value',
+    'api-key=value',
+    'apiKey=value',
+    '  - "password": "short"',
+    "\r\n'password': 'short'",
+    'password=example-but-real',
+    'password="example" + realSecret',
+  ])('excludes a tracked non-JSON secret assignment: %s',async content=>{
+    await write('credentials.txt',content);await git(['add','.']);await commit();
+    await expectExcluded('credentials.txt');
+    expect(()=>manifestEntry(Buffer.from('credentials.txt'),Buffer.from(content),false,true))
+      .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+  it.each(['example','"example"',"'example'",'<placeholder>','<redacted>','[REDACTED]','', '""', "''"])(
+    'admits an explicit non-JSON placeholder: %s',value=>{
+      expect(credentialContentFinding(Buffer.from('credentials.txt'),Buffer.from('password='+value))).toBe(null);
+    });
+  it('excludes credentials.json containing invalid UTF-8 password bytes',async()=>{
+    const bytes=Buffer.concat([Buffer.from('{"password":"'),Buffer.from(Array.from({length:24},(_,i)=>0xff-i)),Buffer.from('"}')]);
+    await write('credentials.json',bytes);await git(['add','.']);await commit();
+    await expectExcluded('credentials.json');
+    expect(designTokenSecretFinding(bytes)).toBe('unsupported-text-encoding');
+    expect(()=>manifestEntry(Buffer.from('credentials.json'),bytes,false,true))
+      .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+  it.each([
     ['PEM','-----BEGIN','pem-header'],
     ['standalone private key','PRIVATE KEY','private-key'],
     ['AWS','AKIAABCDEFGHIJKLMNOP','aws-access-key'],
