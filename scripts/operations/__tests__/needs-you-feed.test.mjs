@@ -453,6 +453,12 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [res, card]), log: () => {} });
     expect(kept.find(i => i.pr === 5768).kind).toBe('confirmed-break-owed-send-back');
   });
+  it('a trusted result marker the shared parser cannot read is never a clean pass', async () => {
+    const [res] = gateComments({ broken: true }), clean = gateComments().slice(0, 1);
+    const bad = { ...res, created_at: '2026-10-10T03:00:00Z', body: res.body.replace(/ -->/, '-->') };
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [...clean, bad]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });

@@ -109,7 +109,9 @@ function headlineAgrees(comments, pr, head) {
     return lines.every((line, at) => {
       if (!line.trimStart().toLowerCase().startsWith(RED_TEAM_COMMENT_MARKER)) return true; // same leniency as the shared parser
       const body = lines.slice(at).join('\n').trimStart(), parsed = parseRedTeamComment(body);
-      return !parsed || parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
+      // A trusted result marker the shared parser cannot read is unknown content: never a clean pass.
+      if (!parsed) return false;
+      return parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
     });
   });
 }
@@ -322,6 +324,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   const report = JSON.parse(String(stdout));
   if (!report || typeof report !== 'object' || !Array.isArray(report.ready)) throw new Error('needs-you-feed: invalid operator-queue report');
   if (failedRead) report.incomplete = true;
+  // liveGate:false is a hermetic test seam only: no CLI argument or setting reaches it.
   const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
   for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
   const items = !liveGate ? gated.kept : (await gateRulingItems(gated.kept, { gh, cwd: checkoutRoot, log })).kept;
