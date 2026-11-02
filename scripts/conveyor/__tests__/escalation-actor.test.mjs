@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 // Phase 1 deliberately imports the absent module: no implementation or substitute lives in this fixture.
 import { recordSweep as recordSweepWithClock, owedTakeovers as owedTakeoversWithClock, resolveEscalationActorSettings } from '../escalation-actor.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -271,6 +274,17 @@ describe('resolveEscalationActorSettings', () => {
     const result = resolveEscalationActorSettings({ env: {}, readSettings: () => value, readPlatform: () => undefined });
     expect(result.enabled).toBe(false);
     expect(result.sources.enabled).toMatch(/tool.*read.*fail/);
+  });
+});
+
+describe('resolveEscalationActorSettings platform container', () => {
+  it.each([false, null, 'on', []])('audit: malformed platform escalation container %j disables the actor', escalation => {
+    const dir = mkdtempSync(join(tmpdir(), 'esc-actor-'));
+    const file = join(dir, 'prefs.json');
+    writeFileSync(file, JSON.stringify({ escalation }));
+    const result = resolveEscalationActorSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, readSettings: () => ({}) });
+    expect(result.enabled).toBe(false);
+    expect(result.sources.enabled).toMatch(/platform-read-failed/);
   });
 });
 

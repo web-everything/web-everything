@@ -61,6 +61,7 @@ function defaultReadSettings() {
 function defaultReadPlatform(env) {
   const { prefs, errors } = readPlatformPreferences({ env });
   if (errors.length) throw new Error('platform preferences unreadable');
+  if (prefs.escalation !== undefined && !object(prefs.escalation)) throw new Error('platform escalation settings unreadable');
   return prefs.escalation?.actor;
 }
 
