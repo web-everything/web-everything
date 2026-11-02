@@ -199,14 +199,15 @@ export const DEFAULT_WRITER_CLAIM_TTL_MS = 30 * 60_000;
 /** Setting: how long (ms) a writer must have waited for readers to drain before it stops backing off to readers
  *  that began starving AFTER its wait began (the reader stream its own reservation refuses). Already-held
  *  reader locks are never broken; the writer intent is its ordinary lease/pid-liveness reservation, so a crashed
- *  writer's intent lapses on its own. Default 30 s; `0` = off (the pre-fix behaviour). */
+ *  writer's intent lapses on its own. Default `0` = OFF (today's reader-priority behaviour, exactly); a daemon
+ *  opts in with a positive value (enabling needs an operator ruling). */
 export const WRITER_WAIT_PRIORITY_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS';
-export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 30_000;
+export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 0;
 /** The override is a bounded window, not forever: this long after the threshold the writer yields to starved
  *  readers again (so a stream of starved readers is queued behind a writer for at most this long). */
 export const WRITER_WAIT_PRIORITY_WINDOW_MS = 5 * 60_000;
 
-/** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default; 0 = off). */
+/** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default 0 = off). */
 export function resolveWriterWaitPriorityMs(env = process.env) {
   const raw = env?.[WRITER_WAIT_PRIORITY_ENV];
   if (raw === undefined || String(raw).trim() === '') return DEFAULT_WRITER_WAIT_PRIORITY_MS;

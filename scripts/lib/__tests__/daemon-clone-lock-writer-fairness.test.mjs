@@ -302,6 +302,14 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(r.w.reason).toBe('reader-priority');
   });
 
+  it('DEFAULT (setting absent) keeps today\'s reader-priority behaviour exactly', async () => {
+    const r = await simulate({ waitPriorityMs: undefined });
+    expect(r.w.ok).toBe(false);
+    expect(r.w.reason).toBe('reader-priority');
+    expect(r.w.heldBy).toBe('S1');
+    expect(r.w.starved).toBe(3);
+  });
+
   it('AFTER: past the threshold the writer keeps waiting and acquires as soon as the held reader drains', async () => {
     const r = await simulate({ waitPriorityMs: 8000 });
     expect(r.w).toEqual({ ok: true });
@@ -340,8 +348,8 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     await w2;
   });
 
-  it('resolves the setting with a safe default (0 = off, junk = default)', () => {
-    expect(DEFAULT_WRITER_WAIT_PRIORITY_MS).toBeGreaterThan(0);
+  it('resolves the setting: default 0 = off, junk = default, a positive value opts in', () => {
+    expect(DEFAULT_WRITER_WAIT_PRIORITY_MS).toBe(0); // off unless a daemon opts in
     expect(resolveWriterWaitPriorityMs({})).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '0' })).toBe(0);
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '45000' })).toBe(45000);
