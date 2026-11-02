@@ -72,7 +72,17 @@ const toDateString = (v) =>
 // OVERLAP semantics live in the dispatcher, never here.
 const normalizeScope = (v) => {
   if (!Array.isArray(v)) return undefined;
-  const list = v.map((s) => (s == null ? '' : String(s).trim())).filter(Boolean);
+  // R372 — an entry may name several paths (`we:a.mjs b.mjs`): split on whitespace/commas so every consumer sees one
+  // path per entry; an unprefixed piece inherits the nearest earlier `repo:` prefix of the same entry.
+  const list = [];
+  for (const entry of v) {
+    let repo = '';
+    for (const piece of (entry == null ? '' : String(entry)).split(/[\s,]+/).filter(Boolean)) {
+      const own = /^[a-z][a-z0-9-]*:/i.exec(piece)?.[0] ?? '';
+      if (own) repo = own;
+      list.push(own ? piece : repo + piece);
+    }
+  }
   return list.length ? list : undefined;
 };
 
