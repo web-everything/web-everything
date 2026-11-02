@@ -1,6 +1,7 @@
 /** Pure adapters from read evidence to fail-closed dispatch eligibility facts. */
 import { known, unread, POPULATIONS } from './dispatch-eligibility.mjs';
 import { liveResultGateState, parseRedTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -55,7 +56,7 @@ export function redTeamFact(comments, prNumber, head) {
     // is associated by thread order, which is not a digest binding.
     const named = comments.some(c => {
       const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
-      return m?.pr === Number(prNumber) && m.rev === head.toLowerCase() && m.outcome === 'sent-back' && m.result === s.resultId;
+      return isTrustedMarkerAuthor(c) && m?.pr === Number(prNumber) && m.rev === head.toLowerCase() && m.outcome === 'sent-back' && m.result === s.resultId;
     });
     return named ? bound('send-back') : unread();
   }
