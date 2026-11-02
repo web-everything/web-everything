@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'nod
 import { resolve, join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import yaml from 'js-yaml';
 import { classifyCardOnly, isCardPath, isCardOnlyDiff, resolveCardOnlyBase, SAFE_BASE_REF } from '../ci-card-only.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
@@ -129,12 +130,17 @@ describe('fresh main basis (#5619: frozen event base.sha after the drain merged 
   });
   it('ci.yml passes event values through env, quoted, and only a fresh fetch yields FRESH_MAIN_SHA', () => {
     const yml = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/ci.yml'), 'utf8');
-    const step = yml.slice(yml.indexOf('- name: Is this a card-only PR?'), yml.indexOf('# Sharded unit suite'));
-    expect(step).toContain('BASE_REF: ${{ github.event.pull_request.base.ref }}');
-    expect(step).toContain('BASE_SHA: ${{ github.event.pull_request.base.sha }}');
-    expect(step.slice(step.indexOf('run: |'))).not.toContain('${{'); // no expression interpolated into the script
-    expect(step).toContain("if git fetch --no-tags --filter=blob:none --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then");
-    expect(step).toContain('--base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA"');
+    // Inspect this step's script, independent of expressions in neighbouring steps' env maps.
+    const step = yaml.load(yml).jobs.changes.steps.find(({ id }) => id === 'detect');
+    expect(step).toBeDefined();
+    expect(step.env).toEqual({
+      EVENT_NAME: '${{ github.event_name }}',
+      BASE_REF: '${{ github.event.pull_request.base.ref }}',
+      BASE_SHA: '${{ github.event.pull_request.base.sha }}',
+    });
+    expect(step.run).not.toContain('${{'); // no expression interpolated into the script
+    expect(step.run).toContain("if git fetch --no-tags --filter=blob:none --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then");
+    expect(step.run).toContain('node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"');
   });
 });
 
