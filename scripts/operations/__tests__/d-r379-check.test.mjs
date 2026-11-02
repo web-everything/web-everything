@@ -808,7 +808,7 @@ describe('round 6 enforcement-tree classification', () => {
       evidence:[`unclassified enforcement-tree path: ${path}; operator review`]});
     expect(r.eligible).toBe(false);
   });
-  it.each(['docs/examples/x.md','backlog/123-story.md','blocks/widget.js','src/content.md',
+  it.each(['docs/examples/x.md','backlog/123-story.md','blocks/foo/README.md','src/content.md',
     'README.md','LICENSE.txt','CHANGELOG.md'])('passes content path %s', async path => {
     expect(condition(await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]})),4).status).toBe('PASS');
   });
@@ -1036,5 +1036,78 @@ describe('round 8 malformed audit evidence', () => {
     const r = await checkPr(1, deps(undefined, { readAudits: () => [audit(head), audit(head, { at: '2026-11-02T11:00:00Z', verdict: 'WEAKENED', findings: null })] }));
     expect(condition(r, 2).status).toBe('UNKNOWN');
     expect(r.eligible).toBe(false);
+  });
+});
+
+
+describe('round 8 audit structure validation before question filtering', () => {
+  const malformed = [
+    ['missing timestamp', {at: undefined}], ['null timestamp', {at: null}],
+    ['numeric timestamp', {at: 0}], ['unparseable timestamp', {at: 'not-a-date'}],
+    ['object timestamp', {at: {}}], ['missing base', {base: undefined}],
+    ['short base', {base: 'abc'}], ['base with trailing newline', {base: 'a'.repeat(40) + '\n'}],
+    ['non-hex base', {base: 'z'.repeat(40)}],
+    ['non-string base', {base: 42}], ['missing verdict', {verdict: undefined}],
+    ['unknown verdict', {verdict: 'CLEAR'}], ['missing findings', {findings: undefined}],
+    ['non-array findings', {findings: 'finding'}], ['non-string finding', {findings: ['finding', 42]}],
+    ['missing question hash', {questionHash: undefined}], ['empty question hash', {questionHash: ''}],
+    ['blank question hash', {questionHash: '  '}], ['non-string question hash', {questionHash: 42}],
+  ];
+  it.each(malformed)('keeps same-head %s UNKNOWN despite an existing clearance', async (_name, extra) => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, {
+      readAudits: () => [audit(head), audit(head, extra)],
+    }));
+    expect(condition(r, 2).status).toBe('UNKNOWN');
+    expect(condition(r, 2).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+  it.each(malformed)('ignores different-head %s', async (_name, extra) => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, {
+      readAudits: () => [audit(head), audit('f'.repeat(40), extra)],
+    }));
+    expect(condition(r, 2).status).toBe('PASS');
+  });
+  it.each(malformed.filter(([, extra]) => !Object.hasOwn(extra, 'questionHash')))
+  ('rejects foreign-question same-head %s before ignoring its question hash', async (_name, extra) => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, {
+      readAudits: () => [audit(head), audit(head, {questionHash: 'foreign', ...extra})],
+    }));
+    expect(condition(r, 2).status).toBe('UNKNOWN');
+    expect(r.eligible).toBe(false);
+  });
+  it('ignores a structurally valid foreign-question weakened audit', async () => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, {
+      readAudits: () => [audit(head), audit(head, {questionHash: 'foreign', verdict: 'WEAKENED',
+        at: '2026-11-02T11:00:00Z'})],
+    }));
+    expect(condition(r, 2).status).toBe('PASS');
+  });
+});
+
+describe('round 8 runtime source enforcement across trees', () => {
+  it.each(['blocks/router/route-config.ts', 'blocks/widget.js', 'src/assets/js/runtime.js',
+    'src/runtime/check.ts', 'src/runtime/check.mjs', 'apps/server/validate.cjs',
+    'packages/schema/check.py', 'plateau/runtime/validate.rs', 'plateau-app/runtime/check.sh',
+    'packages/runtime/config.json', 'validation-generation/provider.ts',
+    'validator-resolution/provider.ts', 'validity-merge/provider.ts', 'capability-manifest/guard.ts',
+    'conformance-vectors/schema.ts', 'conformance-evidence/provider.ts', 'explorer/schema.ts',
+    'repro-bundle/schema.ts', 'guard/accessControl.ts', 'config/defineConfig.ts',
+    'webcases/requirementValidator.ts', 'functions/runtime/check.js', 'tools/runtime/check.mjs'])
+  ('keeps runtime source %s UNKNOWN with operator fallback', async path => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
+    expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
+      evidence: [`unclassified enforcement-tree path: ${path}; operator review`]});
+    expect(r.eligible).toBe(false);
+  });
+  it.each(['docs/examples/x.md', 'blocks/foo/README.md', 'blocks/foo/example.njk',
+    'blocks/foo/style.css', 'blocks/foo/image.png', 'src/pages/example.njk',
+    'src/assets/style.css', 'apps/docs/README.md', 'packages/docs/example.njk',
+    'plateau/docs/image.svg', 'validation-generation/README.md'])
+  ('keeps content %s PASS', async path => {
+    expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
   });
 });

@@ -57,12 +57,20 @@ function labelNames(labels) {
 /** Validate every head record, retaining cross-base weakened evidence newer than the bound clear. */
 function latestAudit(records, head, base) {
   if (!Array.isArray(records) || records.length > MAX_AUDITS) throw new Error('invalid or oversized audit ledger');
-  const valid = records.filter(record => record?.head === head
-    && Array.isArray(record.findings) && record.findings.every(line => typeof line === 'string')
-    && findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH }));
-  // Malformed evidence for this head must never silently revive an older clearance.
-  if (records.some(record => record?.head === head && (!Array.isArray(record.findings) || !record.findings.every(line => typeof line === 'string')))) {
-    throw new Error('malformed audit record for this head');
+  const valid = [];
+  for (const record of records) {
+    if (record?.head !== head) continue;
+    // Validate this head's evidence before ignoring a foreign question. Otherwise
+    // a malformed record can silently revive an older clearance.
+    if (typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))
+      || typeof record.base !== 'string' || record.base.length !== 40 || !SHA.test(record.base)
+      || !['NOT WEAKENED', 'WEAKENED'].includes(record.verdict)
+      || !Array.isArray(record.findings) || !record.findings.every(line => typeof line === 'string')
+      || typeof record.questionHash !== 'string' || !record.questionHash.trim()) {
+      throw new Error('malformed audit record for this head');
+    }
+    if (record.questionHash === QUESTION_HASH
+      && findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH })) valid.push(record);
   }
   const newer = (record, previous) => !previous || Date.parse(record.at) >= Date.parse(previous.at);
   let latest = null, accepting = null;
