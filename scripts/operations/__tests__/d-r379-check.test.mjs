@@ -309,13 +309,19 @@ describe('eligibility guard regression guarantees', () => {
         if (args[0] === 'rev-parse') return f.headRefOid;
         if (args[0] === 'merge-base') return base;
         if (args[0] !== 'diff') throw Error('unexpected command');
-        // Only replace revision operands with directory operands: real Git handles
-        // config precedence and rename detection without creating any .git state.
+        // Real Git handles config precedence and rename detection without creating
+        // .git state. Unlike a repository diff, --no-index --name-only reports a
+        // deletion as /dev/null. Use name-status to retain its source path, then
+        // translate the directory records into the adapter's repository path list.
         const probeArgs = ['diff', '--no-index', ...args.slice(1).map(arg =>
-          arg === base ? 'before' : arg === f.headRefOid ? 'after' : arg)];
+          arg === base ? 'before' : arg === f.headRefOid ? 'after'
+            : arg === '--name-only' ? '--name-status' : arg)];
         const probe = spawnSync(bin, probeArgs, {...options, cwd:root, encoding:'utf8'});
         expect(probe.status, probe.stderr).toBe(1);
-        return probe.stdout.replace(/(?:before|after)\//g, '');
+        const records = probe.stdout.slice(0, -1).split('\0');
+        expect(records).toEqual(['A', 'after/docs/moved.md', 'D', 'before/scripts/guard-bash.mjs']);
+        return records.filter((_record, index) => index % 2 === 1)
+          .map(path => path.replace(/^(?:before|after)\//, '')).join('\0') + '\0';
       }});
       const r = await checkPr(6223, deps(f, {fetchNetDiff:adapter.fetchNetDiff}));
       expect(r.netDiffPaths).toContain('scripts/guard-bash.mjs');
