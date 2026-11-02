@@ -380,6 +380,25 @@ describe('gateReadyItems: a confirmed red-team break on the live head is owed a 
     expect(next.openKeys).toContain(`${repo}#6239@${head}:confirmed-break-owed-send-back`);
     expect(next.lines.join('\n')).not.toMatch(/NEEDS-YOU-CLEARED/);
   });
+  it('fails closed on a malformed confirmed line inside a CARRIED advisory', async () => {
+    const from = 'c'.repeat(40);
+    const carried = { user: { login: 'web-everything' }, created_at: '2026-11-02T13:00:00Z',
+      body: `<!-- review-verdict-carried from=${from} to=${head} patch-id=${'d'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${advisory(head, '1. [**confirmed**] (logic) `a.mjs:1` — no impact\n').body}` };
+    expect((await run([carried])).kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  it('fails closed on a numbered finding line it cannot parse at all', async () => {
+    expect((await run([advisory(head, '1. [garbled finding\n')])).kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  it('an open stalled key never hides the confirmed-break alert for the same PR and head', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#6239@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[advisory(head, confirmed)]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const result = await runOnce({ exec: async () => JSON.stringify(report), gh, settings, log: () => {}, fixClaimLive: undefined,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' } });
+    expect(result.lines.join('\n')).toContain('confirmed-break-owed-send-back');
+    expect(result.openKeys).toContain(`${repo}#6239@${head}:stalled`);
+  });
   it('resolves by absence like the other report kinds', () => {
     const open = diffFeed([], [{ repo, pr: 6239, head, kind: 'confirmed-break-owed-send-back', reason: 'r' }], at);
     const next = diffFeed(open.openKeys, [], at, { clearKinds: REPORT_KINDS });
