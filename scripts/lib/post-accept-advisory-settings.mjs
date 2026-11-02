@@ -1,6 +1,6 @@
 /** Shadow-only post-accept advisory settings: standard → platform → tool → environment. */
 import { readFileSync } from 'node:fs';
-import { cascadePolicy, formatCascadeSourcesLine, platformPreference } from './policy-cascade.mjs';
+import { cascadePolicy, formatCascadeSourcesLine, readPlatformPreferences } from './policy-cascade.mjs';
 import { REVIEW_SETTINGS_FILE } from './review-seat-settings.mjs';
 
 export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
@@ -13,24 +13,28 @@ export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
     warn(`invalid ${layer} mode`);
     return { mode: 'shadow' };
   };
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const blockMode = (value, layer) => {
+    if (value === undefined) return undefined;
+    if (!object(value)) { warn(`invalid ${layer} settings shape`); return 'shadow'; }
+    return value.mode;
+  };
   let tool;
   try {
     const data = JSON.parse(readFile(file));
-    if (!data || typeof data !== 'object' || Array.isArray(data)
-      || (data.postAcceptAdvisory !== undefined && (!data.postAcceptAdvisory
-        || typeof data.postAcceptAdvisory !== 'object' || Array.isArray(data.postAcceptAdvisory)))) {
-      throw new Error('invalid settings shape');
-    }
-    tool = data.postAcceptAdvisory?.mode;
+    if (!object(data)) throw new Error('invalid settings shape');
+    tool = blockMode(data.postAcceptAdvisory, 'tool');
   }
   catch { warn('unreadable review settings'); tool = 'shadow'; }
   let plat = platform;
   if (plat === undefined) {
-    try { plat = platformPreference('review', { env })?.postAcceptAdvisory; }
-    catch { warn('unreadable platform settings'); plat = { mode: 'shadow' }; }
+    const { prefs, errors } = readPlatformPreferences({ env, readFile });
+    if (errors.length) warn('unreadable platform settings');
+    if (prefs.review !== undefined && !object(prefs.review)) warn('invalid platform review shape');
+    else plat = prefs.review?.postAcceptAdvisory;
   }
   const result = cascadePolicy('review.postAcceptAdvisory', project(tool, 'tool'), {
-    standard: { mode: 'shadow' }, platform: project(plat?.mode, 'platform'), env,
+    standard: { mode: 'shadow' }, platform: project(blockMode(plat, 'platform'), 'platform'), env,
     envValues: project(env.WE_REVIEW_POST_ACCEPT_ADVISORY_MODE, 'env'),
   });
   if (invalid) result.value.mode = 'shadow';

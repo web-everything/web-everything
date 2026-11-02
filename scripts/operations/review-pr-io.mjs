@@ -1866,7 +1866,10 @@ async function recordAdvisoryObservation(recorder, options) {
           });
         },
         appendLedgerRow: row => {
-          appendFileSync(path, `${JSON.stringify(row)}\n`);
+          let text = '';
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+          const separator = text && !text.endsWith('\n') ? '\n' : '';
+          appendFileSync(path, `${separator}${JSON.stringify(row)}\n`);
           return { ok: true };
         },
         ...options,

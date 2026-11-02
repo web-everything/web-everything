@@ -139,7 +139,35 @@ describe('post-accept advisory settings cascade', () => {
   });
 
   it.each([
+    ['read error', null],
+    ['unparseable JSON', '{truncated'],
+    ['non-object file', '[]'],
+    ['non-object review', '{"review":false}'],
+    ['non-object advisory block', '{"review":{"postAcceptAdvisory":"off"}}'],
+    ['wrong mode type', '{"review":{"postAcceptAdvisory":{"mode":42}}}'],
+  ])('fails closed on platform %s even with a valid off override', async (_name, text) => {
+    const result = await resolve({ platform: undefined, file: 'review-settings',
+      env: { WE_PLATFORM_PREFERENCES_FILE: 'platform-settings', WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: 'off' },
+      readFile: path => {
+        if (path === 'review-settings') return '{}';
+        if (text === null) throw Object.assign(new Error('read denied'), { code: 'EACCES' });
+        return text;
+      } });
+    expect(result).toMatchObject({ invalid: true, value: { mode: 'shadow' } });
+    expect(result.logs.join('\n')).toMatch(/warning.*platform/);
+    expect(reviewLoopPolicy.postAcceptAdvisoryDecision({ ...result.value, invalid: result.invalid,
+      verdict: { verdict: VERDICTS.ACCEPT, admittedFindings: [{ category: 'correctness', impactIfUnfixed: 'cosmetic' }] } }))
+      .toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
+  });
+
+  it.each([
     { platform: { mode: 'invalid' } },
+    ...[null, false, 42, 'off', [], { mode: null }, { mode: 42 }, { mode: [] }].map(platform => ({ platform })),
+    ...[null, [], 'off', 42, { mode: null }, { mode: false }].map(postAcceptAdvisory => ({
+      readFile: () => JSON.stringify({ postAcceptAdvisory }),
+    })),
+    ...['null', '[]', '42'].map(text => ({ readFile: () => text })),
+    { env: { WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: null } },
     { readFile: () => '{"postAcceptAdvisory":{"mode":"invalid"}}' },
     { env: { WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: 'invalid' } },
     { readFile: () => '{not json' },
@@ -189,6 +217,40 @@ describe('post-accept advisory shadow ledger', () => {
       expect(row).toMatchObject({ wouldCard: true, loopsAfter: null });
       expect(rows).toHaveLength(2);
     });
+
+  it.each([
+    ['null finding', { findings: [null] }],
+    ['scalar finding', { findings: [42] }],
+    ['array finding', { findings: [[]] }],
+    ['non-array laterRatings', { laterRatings: {} }],
+    ['null laterRatings', { laterRatings: null }],
+    ['null rating entry', { laterRatings: [null] }],
+    ['missing rating identity', { laterRatings: [{ impactIfUnfixed: 'broken' }] }],
+    ['unknown rating impact', { laterRatings: [{ findingId: 'finding-1', impactIfUnfixed: 'unknown' }] }],
+  ])('skips a persisted %s in reports and permits a valid replacement observation', async (_name, malformed) => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, ...malformed }];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, wouldCard: 0, findings: 0, skipped: 1,
+    });
+    const replacement = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision,
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(replacement).toMatchObject({ wouldCard: true, findings: [finding] });
+    expect(rows).toHaveLength(2);
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 1, skipped: 1 });
+    expect(report.text).toContain('Skipped: 1');
+  });
+
+  it('refuses to persist a new observation containing a null finding', async () => {
+    const rows = [];
+    const logs = [];
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head,
+      decision: { ...decision, findings: [null] }, readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) })).toBeNull();
+    expect(rows).toEqual([]);
+    expect(logs.join('\n')).toContain('incomplete shadow evidence; live review unaffected');
+  });
 
   it('serializes concurrent calls with independent ledger snapshots', async () => {
     const { recordPostAcceptAdvisoryShadow } = await import('../../operations/review-pr-io.mjs');
@@ -247,7 +309,7 @@ describe('post-accept advisory shadow ledger', () => {
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ prs: 2, wouldCard: 2, loopsAfter: 4, unmeasured: 1 });
     await recordPostAcceptAdvisoryLoops({ ...io, pr: 8, loopsAfter: 0 });
     const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
-    expect(report).toMatchObject({ loopsAfter: 4, unmeasured: 0 });
+    expect(report).toMatchObject({ loopsAfter: 4, unmeasured: 0, skipped: 0 });
     expect(report.text).toContain('Unmeasured: 0');
     expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: -1 })).toBeNull();
     expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();

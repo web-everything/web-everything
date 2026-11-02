@@ -639,7 +639,7 @@ export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision,
   try {
     if (!repo || !Number.isInteger(pr) || pr < 1 || !/^[a-f0-9]{40}$/i.test(head ?? '')
       || typeof decision?.wouldCard !== 'boolean' || decision.wouldPush !== !decision.wouldCard
-      || !Array.isArray(decision.findings) || (loopsAfter !== null && !validLoopCount(loopsAfter))) {
+      || !validAdvisoryFindings(decision.findings) || (loopsAfter !== null && !validLoopCount(loopsAfter))) {
       throw new Error('incomplete shadow evidence');
     }
     const rows = await readLedgerRows(repo);
@@ -661,8 +661,13 @@ const validLoopCount = value => Number.isSafeInteger(value) && value >= 0;
 const advisoryIdentity = row => row && typeof row === 'object' && !Array.isArray(row)
   && typeof row.repo === 'string' && row.repo.length > 0 && Number.isInteger(row.pr) && row.pr > 0
   && /^[a-f0-9]{40}$/i.test(row.headSha ?? row.head ?? '');
+const advisoryObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const validAdvisoryFindings = findings => Array.isArray(findings) && findings.every(advisoryObject);
+const validLaterRatings = ratings => ratings === undefined || (Array.isArray(ratings)
+  && ratings.every(rating => advisoryObject(rating) && typeof rating.findingId === 'string'
+    && rating.findingId.length > 0 && ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(rating.impactIfUnfixed)));
 const validAdvisoryRow = row => advisoryIdentity(row) && typeof row.wouldCard === 'boolean'
-  && row.wouldPush === !row.wouldCard && Array.isArray(row.findings);
+  && row.wouldPush === !row.wouldCard && validAdvisoryFindings(row.findings) && validLaterRatings(row.laterRatings);
 const advisoryKey = row => JSON.stringify([row.repo, row.pr, row.headSha ?? row.head]);
 
 /** Append measured loop counts later; replaying the same identity/value is idempotent. */
@@ -688,13 +693,15 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
 export function postAcceptAdvisoryShadowReport(rows = []) {
   const observations = rows.filter(row => validAdvisoryRow(row) && row.kind !== 'loops');
   const loops = new Map();
+  let skipped = rows.length - observations.length;
   for (const row of rows) {
     if (advisoryIdentity(row) && row.kind === 'loops' && validLoopCount(row.loopsAfter)) {
       loops.set(advisoryKey(row), row.loopsAfter);
+      skipped--;
     }
   }
   const report = { prs: new Set(observations.map(row => `${row.repo}#${row.pr}`)).size,
-    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0 };
+    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0, skipped };
   for (const row of observations) {
     if (row.wouldPush === true) report.wouldPush++;
     const count = loops.has(advisoryKey(row)) ? loops.get(advisoryKey(row)) : row.loopsAfter;
@@ -708,7 +715,7 @@ export function postAcceptAdvisoryShadowReport(rows = []) {
       .map(rating => rating.findingId).filter(Boolean));
     report.laterBroken += new Set(findings.map(finding => finding.findingId).filter(id => id && broken.has(id))).size;
   }
-  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}` };
+  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nSkipped: ${report.skipped}` };
 }
 
 /**

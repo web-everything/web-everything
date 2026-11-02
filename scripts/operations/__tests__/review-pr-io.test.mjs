@@ -52,6 +52,27 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 const CTX = { key: 'run-1#4#0', runId: 'run-1', type: 'x', stepIndex: 4, step: 'record', index: 0 };
 
+describe('post-accept advisory persisted ledger', () => {
+  it('separates a truncated JSON tail from new rows and skips unparseable lines on replay', async () => {
+    const { recordPostAcceptAdvisoryShadow } = await import('../review-pr-io.mjs');
+    const ledgerPath = join(root, 'shadow.jsonl');
+    const tail = '{"kind":"we.post-accept-advisory-shadow","repo":';
+    writeFileSync(ledgerPath, `not json\n${tail}`);
+    const facts = { repo: 'o/r', pr: 7, head: 'a'.repeat(40), ledgerPath,
+      decision: { wouldCard: true, wouldPush: false, findings: [{ findingId: 'one' }] } };
+    const row = await recordPostAcceptAdvisoryShadow(facts);
+    expect(row).toMatchObject({ repo: 'o/r', pr: 7, headSha: facts.head });
+    const text = readFileSync(ledgerPath, 'utf8');
+    expect(text).toBe(`not json\n${tail}\n${JSON.stringify(row)}\n`);
+    expect(JSON.parse(text.split('\n')[2])).toEqual(row);
+    expect(await recordPostAcceptAdvisoryShadow(facts)).toBeNull();
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(text);
+    const next = await recordPostAcceptAdvisoryShadow({ ...facts, pr: 8 });
+    expect(next).toMatchObject({ pr: 8 });
+    expect(JSON.parse(readFileSync(ledgerPath, 'utf8').split('\n')[3])).toEqual(next);
+  });
+});
+
 describe('the write-up sink', () => {
   it('writes the comment body to the operation sidecar, deterministically', async () => {
     const sinks = createReviewPrSinks({ root });
