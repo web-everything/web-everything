@@ -70,6 +70,9 @@ describe('PR cancelled required-check rerun acceptance', () => {
     expect(result.dispatch).toEqual([expect.objectContaining(action({ cancelReason: 'unknown' }))]);
     expect(result.refusals).toEqual([]);
     expect(result.applied).toEqual([expect.objectContaining(action({ ok: true }))]);
+    expect(f.options.postComment).toHaveBeenCalledWith(42, { repo,
+      body: `Cancelled required CI rerun submitted for head ${sha}, run 123.\n\n<!-- pr-ci-cancelled-rerun: ${repo}#42@${sha} -->`,
+    });
     expect(f.options.rerunFailed).toHaveBeenCalledOnce();
     expect(f.options.rerunFailed).toHaveBeenCalledWith(123, { repo });
     expect(f.options.readRecord).toHaveBeenCalledWith(f.options.recordPath);

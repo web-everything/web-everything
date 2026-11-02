@@ -56,6 +56,17 @@ export function readLiveRequiredChecks({
 }
 
 export const prCancelledRerunMarker = (repo, pr, head) => `<!-- pr-ci-cancelled-rerun: ${repo}#${pr}@${head} -->`;
+const rerunCommentPrefix = (head, runId) => `Cancelled required CI rerun submitted for head ${head}, run ${runId}.`;
+
+/** Only the pass's own leading sentence and standalone marker prove a submitted run. */
+export function parsePrCancelledRerunComment(comment, repo, pr, head) {
+  if (!isTrustedMarkerAuthor(comment) || typeof comment?.body !== 'string') return null;
+  const lines = comment.body.split(/\r?\n/);
+  const runId = lines[0].match(/, run ([1-9]\d*)\.$/)?.[1];
+  if (!validId(runId) || lines[0] !== rerunCommentPrefix(head, runId) ||
+    !lines.includes(prCancelledRerunMarker(repo, pr, head))) return null;
+  return { runId: Number(runId) };
+}
 
 const ioOptions = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
   maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
@@ -364,7 +375,7 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
       }
       try {
         assertHeld();
-        postComment?.(pr.number, { repo, body: `Cancelled required CI rerun submitted for head ${sha}, run ${runId}.\n\n${prCancelledRerunMarker(repo, pr.number, sha)}` });
+        postComment?.(pr.number, { repo, body: `${rerunCommentPrefix(sha, runId)}\n\n${prCancelledRerunMarker(repo, pr.number, sha)}` });
       } catch { refuse('rerun-marker-unpublished', { ...detail, error: 'rerun submitted; inspect PR CI and re-arm review manually if needed' }); }
       try { Promise.resolve(emitEvent({ kind: 'pr-ci-cancelled-rerun', detail: { ...detail, runId, cancelReason } })).catch(() => {}); }
       catch { /* Best-effort; the attempt record is authoritative. */ }

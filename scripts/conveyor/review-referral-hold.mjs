@@ -15,7 +15,7 @@ import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { latestCheckNamed, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
-import { prCancelledRerunMarker, readLiveRequiredChecks, safeRequiredBase } from './pr-cancelled-rerun.mjs';
+import { parsePrCancelledRerunComment, readLiveRequiredChecks, safeRequiredBase } from './pr-cancelled-rerun.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
@@ -366,8 +366,8 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // Only a completed accepted review covering this exact head may use it, at most once.
   if (last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
     Array.isArray(last.pending) && last.pending.length === 0) {
-    const marker = prCancelledRerunMarker(repo, pr.number, pr.headRefOid);
-    const rerunAt = Math.max(0, ...(pr.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && c.body?.includes(marker))
+    const rerunAt = Math.max(0, ...(pr.comments ?? []).filter(c =>
+      parsePrCancelledRerunComment(c, repo, pr.number, pr.headRefOid))
       .map(c => Date.parse(c.createdAt)).filter(Number.isFinite));
     if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) {
       // Unknown, stale or partial requirements cannot prove recovery. Keep the normal hold and its
@@ -378,7 +378,9 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
       const recovered = Array.isArray(checks) && checks.length > 0 &&
         checks.every(name => !requiredCheckReadNeeded(pr, name) && (() => {
           const row = latestCheckNamed(pr.statusCheckRollup, name);
-          return row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion);
+          const finishedAt = Date.parse(row?.completedAt ?? row?.completed_at);
+          return row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion) &&
+            Number.isFinite(finishedAt) && finishedAt > rerunAt;
         })());
       if (recovered) return null;
     }

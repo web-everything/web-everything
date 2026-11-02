@@ -1070,7 +1070,8 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
 
 describe('R372 accepted same-head CI rerun release', () => {
   const requiredChecks = { source: 'live', checks: ['check-0', 'check-1', 'check-2'] };
-  const marker = h => `<!-- pr-ci-cancelled-rerun: ${repo}#3481@${h} -->`;
+  const markerLine = h => `<!-- pr-ci-cancelled-rerun: ${repo}#3481@${h} -->`;
+  const marker = h => `Cancelled required CI rerun submitted for head ${h}, run 123.\n\n${markerLine(h)}`;
   function accepted() {
     const r = run();
     r.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
@@ -1079,7 +1080,7 @@ describe('R372 accepted same-head CI rerun release', () => {
   }
   const acceptedPr = comments => pr({ baseRefName: 'main', labels: [{ name: 'review:accepted' }],
     statusCheckRollup: ['SUCCESS', 'SKIPPED', 'NEUTRAL'].map((conclusion, i) => ({
-      name: `check-${i}`, status: 'COMPLETED', conclusion,
+      name: `check-${i}`, status: 'COMPLETED', conclusion, completedAt: iso(at + 2),
     })), comments: [
     comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, at), ...comments,
   ] });
@@ -1088,6 +1089,24 @@ describe('R372 accepted same-head CI rerun release', () => {
     expect(decideSameHeadHold(p, [accepted()], { repo, readRequiredChecks: () => requiredChecks, now: at + 2 })).toBeNull();
     expect(decideSameHeadHold(p, [accepted(), { ...accepted(), startedAt: at + 2, completedAt: at + 3 }],
       { repo, readRequiredChecks: () => requiredChecks, now: at + 4 })).not.toBeNull();
+  });
+  it.each([
+    ['quoted marker inside prose', `Cancelled required CI rerun submitted for head ${head}, run 123.\nExample: ${markerLine(head)}`],
+    ['marker line plus wrong prefix', `Diagnostic example\n${markerLine(head)}`],
+    ['leading whitespace before prefix', ` ${marker(head)}`],
+    ['indented marker line', marker(head).replace(markerLine(head), ` ${markerLine(head)}`)],
+    ['invalid run id', marker(head).replace('run 123.', 'run invalid.')],
+  ])('keeps the hold for %s', (_case, body) => {
+    const p = acceptedPr([comment(body, at + 1)]);
+    expect(decideSameHeadHold(p, [accepted()], { repo, readRequiredChecks: () => requiredChecks, now: at + 2 })).not.toBeNull();
+  });
+  it.each([
+    ['before rerun', iso(at)], ['equal to rerun', iso(at + 1)],
+    ['missing', undefined], ['null', null], ['invalid', 'unreadable'],
+  ])('keeps the hold when one required green row finish is %s', (_case, completedAt) => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup[1].completedAt = completedAt;
+    expect(decideSameHeadHold(p, [accepted()], { repo, readRequiredChecks: () => requiredChecks, now: at + 2 })).not.toBeNull();
   });
   it('keeps a green subset held when a required name is missing', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
