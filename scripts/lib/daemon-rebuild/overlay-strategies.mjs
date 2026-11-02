@@ -67,9 +67,10 @@ export const OVERLAY_CONFLICT_STRATEGIES = Object.freeze([
  *  `approvedEdgeSha` is the sha an operator recorded for this overlay's `origin/edge/<ref>` (see
  *  {@link recordedEdgeSha}): an edge branch is adopted ONLY when its tip equals it. A branch that merely exists
  *  and contains the PR head — anyone with push access can create one — is never trusted. */
-export function resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha = null }) {
+export function resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha = null, edgeResolve = true }) {
   const tried = [];
   for (const strategy of OVERLAY_CONFLICT_STRATEGIES) {
+    if (!edgeResolve) continue;
     const r = strategy.run({ git, cur, ovSha, ref, approvedEdgeSha, tried });
     if (r) return r;
   }
