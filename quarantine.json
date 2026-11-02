@@ -1,17 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/readiness/__tests__/forge-exec-run-reap.test.mjs",
-      "brokenSha": "527ca9f87f",
-      "owner": "card:main-red-forge-exec-run-reap-1102",
-      "reason": "main red 19:15Z: forge-exec-run-reap.test.mjs AssertionError (expected true to be false) after #6258 (daemon-clone registry adds wev-pass-readers); R157 quarantine while traced",
-      "addedAt": 1793649200963,
-      "expiresAt": 1793735600963
-    }
-  ],
-  "mode": "quarantine",
-  "fixPrs": [
-    6268
-  ]
+  "entries": [],
+  "mode": "quarantine"
 }

@@ -45,3 +45,5 @@
 {"type":"quarantine-removed","at":1793464426663,"actor":"red-main-safety-net","test":"scripts/lib/__tests__/proc-identity.test.mjs","brokenSha":"06649b99","why":"main-green"}
 {"type":"quarantine-added","at":1793649200963,"actor":"operator","test":"scripts/readiness/__tests__/forge-exec-run-reap.test.mjs","brokenSha":"527ca9f87f","owner":"card:main-red-forge-exec-run-reap-1102","reason":"main red 19:15Z: forge-exec-run-reap.test.mjs AssertionError (expected true to be false) after #6258 (daemon-clone registry adds wev-pass-readers); R157 quarantine while traced","addedAt":1793649200963,"expiresAt":1793735600963}
 {"type":"quarantine-fix-prs","at":1793649612265,"actor":"red-main-safety-net","fixPrs":[6268]}
+{"type":"quarantine-removed","at":1793649930665,"actor":"red-main-safety-net","test":"scripts/readiness/__tests__/forge-exec-run-reap.test.mjs","brokenSha":"527ca9f87f","why":"main-green"}
+{"type":"quarantine-fix-prs","at":1793649930665,"actor":"red-main-safety-net","fixPrs":[]}
