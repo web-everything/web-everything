@@ -7,6 +7,10 @@ const require = createRequire(import.meta.url);
 const { normalizeScope } = require('../backlog.js');
 
 describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
+  it('unprefixed pieces inherit the nearest earlier prefix when an entry changes repos', () => {
+    expect(normalizeScope(['we:a.mjs b.mjs,fui:c.mjs d.mjs,we:e.mjs f.mjs', 'g.mjs h.mjs']))
+      .toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs', 'we:e.mjs', 'we:f.mjs', 'g.mjs', 'h.mjs']);
+  });
   it('splits on whitespace and commas; unprefixed pieces inherit the entry repo prefix', () => {
     expect(normalizeScope(['we:a.mjs b.mjs', 'fui:c.mjs,d.mjs'])).toEqual(['we:a.mjs', 'we:b.mjs', 'fui:c.mjs', 'fui:d.mjs']);
   });
