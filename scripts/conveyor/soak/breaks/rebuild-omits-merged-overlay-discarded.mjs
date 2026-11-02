@@ -41,7 +41,7 @@ export default {
     const m = (liveApplied, merged, contained = true) => matchReadyCandidate({
       ready, plan: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [] }, prevHead: 'H',
       treeOf: () => 'T2', stillWanted: () => true, verifyBuilt: () => true, liveApplied, carries: () => false,
-      leftForMain: (r) => merged.includes(r), contentInBuild: () => contained, nowMs: t0 + 60_000, maxAgeMs: 3_600_000,
+      removedForMain: (r) => merged.includes(r), contentInBuild: () => contained, nowMs: t0 + 60_000, maxAgeMs: 3_600_000,
     });
     const inMain = m(live('perf5-job-store-m1', 'perf-fetch-fresh-m2', 'm5'), ['perf5-job-store-m1', 'perf-fetch-fresh-m2', 'm5']);
     log?.(`in-main omitted -> adopt=${!!inMain.adopt} reason=${inMain.reason ?? ''}`);

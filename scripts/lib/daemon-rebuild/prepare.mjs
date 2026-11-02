@@ -13,6 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
+  overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import {
@@ -747,6 +748,16 @@ export async function prepareRebuild({
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
       }
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
+      let overlayEvents;
+      const readOverlayEvents = () => {
+        if (overlayEvents === undefined) {
+          try {
+            const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+            overlayEvents = readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
+          } catch { overlayEvents = []; }
+        }
+        return overlayEvents;
+      };
       const m = matchReadyCandidate({
         ready,
         plan,
@@ -767,8 +778,12 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        leftForMain: (applied, build) => overlayGraduated({
+          ...applied, build, git, events: readOverlayEvents(),
+          registered: (ref) => overlaysBefore.some((o) => o?.ref === ref) || registeredRefs.has(ref),
+        }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
-        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       // A saved candidate predates this tick's archives (auto-retirement may have run since it passed).
       // Hold it to the same rule as a fresh plan: every registered carrier's archived sources must be in

@@ -18,6 +18,7 @@ export default {
     const violations = [];
     let child;
     let pausedWorker;
+    const isWorkerPid = pid => Number.isInteger(pid) && pid > 1 && pid !== child?.pid && pid !== process.pid;
     try {
       const backlog = join(dir, 'backlog'); const bin = join(dir, 'bin');
       mkdirSync(backlog); mkdirSync(bin);
@@ -47,18 +48,30 @@ const timer = setInterval(()=>{
         WE_DISPATCH_PLAN_ALREADY_DONE_CACHE_FILE: cache, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'),
         WE_PR_SNAPSHOT_DIR: join(dir, 'snapshot'), SOAK_CALLS: callsPath, SOAK_RELEASE: release };
       const runPlanner = () => {
-        let output = ''; let stderr = '';
+        const output = []; const maxBytes = 8 * 1024 * 1024;
+        let outputBytes = 0; let overBudget = false; let stderr = '';
         const planner = child = spawn(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
           '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        planner.stdout.on('data', d => { output += d; }); planner.stderr.on('data', d => { stderr += d; });
+        planner.stdout.on('data', d => {
+          if (overBudget) return;
+          outputBytes += d.length;
+          if (outputBytes > maxBytes) {
+            overBudget = true;
+            try { process.kill(-planner.pid, 'SIGKILL'); } catch {}
+            return;
+          }
+          output.push(d);
+        });
+        planner.stderr.on('data', d => { stderr += d; });
         return new Promise((resolve, reject) => {
-          // This bounds a hung process; the response barrier below proves non-blocking behavior.
+          // The response barrier proves non-blocking behavior; the base 5s watchdog bounds a hung planner.
           const timer = setTimeout(() => { try { process.kill(-planner.pid, 'SIGKILL'); } catch {} reject(new Error(`planner blocked on slow GitHub: ${stderr}`)); }, 5000);
           planner.on('error', e => { clearTimeout(timer); reject(e); });
           planner.on('close', code => {
             clearTimeout(timer);
-            if (code !== 0) reject(new Error(`planner exit ${code}: ${stderr}`));
-            else { try { resolve(JSON.parse(output)); } catch (e) { reject(e); } }
+            if (overBudget) reject(new Error(`planner stdout exceeded ${maxBytes} bytes; inspect planner output manually`));
+            else if (code !== 0) reject(new Error(`planner exit ${code}: ${stderr}`));
+            else { try { resolve(JSON.parse(Buffer.concat(output).toString('utf8'))); } catch (e) { reject(e); } }
           });
         });
       };
@@ -73,21 +86,30 @@ const timer = setInterval(()=>{
         if (Date.now() >= requestDeadline) throw new Error('refresh did not reach fake GitHub');
         await delay(25);
       }
-      const { pid } = JSON.parse(readFileSync(`${cache}.refresh-lock`, 'utf8'));
-      // A real request proves the reservation has been handed from planner to detached worker.
-      if (!Number.isInteger(pid) || pid <= 1 || pid === child.pid || pid === process.pid) throw new Error('invalid refresh worker pid');
-      pausedWorker = pid;
-      process.kill(-pausedWorker, 'SIGSTOP');
+      let worker;
+      try { worker = JSON.parse(readFileSync(`${cache}.refresh-lock`, 'utf8')); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (worker === undefined) {
+        // A synchronous planner has no detached-worker lock. Release its request so it can return
+        // within the runaway ceiling, then report the missing worker through not-awaited below.
+        writeFileSync(release, '');
+      } else {
+        // A real request proves the reservation has been handed from planner to detached worker.
+        const { pid } = worker;
+        if (!isWorkerPid(pid)) throw new Error('invalid refresh worker pid');
+        pausedWorker = pid;
+        process.kill(-pausedWorker, 'SIGSTOP');
+      }
       const plan = await first;
       const elapsedMs = Date.now() - started;
       if (plan.groundTruth.pending !== 444) violations.push({ invariant: 'queue-exercised', detail: JSON.stringify(plan.groundTruth) });
       if (plan.groundTruth.refresh.ids.length !== 2) violations.push({ invariant: 'bounded-selection', detail: JSON.stringify(plan.groundTruth) });
-      if (!existsSync(`${cache}.refresh-lock`)) violations.push({ invariant: 'not-awaited', detail: 'slow worker did not outlive planner' });
+      if (worker === undefined || !existsSync(`${cache}.refresh-lock`)) violations.push({ invariant: 'not-awaited', detail: 'slow worker did not outlive planner' });
       // A second tick WHILE the first worker is alive must not add any requests.
       const second = await runPlanner();
       if (second.groundTruth.refresh.started) violations.push({ invariant: 'single-flight', detail: 'overlapping tick started another worker' });
       writeFileSync(release, '');
-      process.kill(-pausedWorker, 'SIGCONT');
+      if (pausedWorker) process.kill(-pausedWorker, 'SIGCONT');
       pausedWorker = null;
       const deadline = Date.now() + 18000;
       while (existsSync(`${cache}.refresh-lock`) && Date.now() < deadline) await delay(50);
@@ -103,7 +125,7 @@ const timer = setInterval(()=>{
       // Reap any background enrichment before deleting its inputs, including on the pre-fix RED path.
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
       try { if (pausedWorker) process.kill(-pausedWorker, 'SIGKILL'); } catch {}
-      try { const { pid } = JSON.parse(readFileSync(join(dir, 'cache.refresh-lock'), 'utf8')); process.kill(-pid, 'SIGKILL'); } catch {}
+      try { const { pid } = JSON.parse(readFileSync(join(dir, 'cache.refresh-lock'), 'utf8')); if (isWorkerPid(pid)) process.kill(-pid, 'SIGKILL'); } catch {}
       rmSync(dir, { recursive: true, force: true });
     }
   },
