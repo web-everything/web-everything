@@ -122,7 +122,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    \`--resume=<threadId>\` (the \`threadId\` from the previous run's report) so Codex keeps its context instead of re-reading files.
    Add \`--detach\` to the command above, then repeat \`node scripts/codex-direct-task.mjs wait --job=<id> --wait=150000\`
    in separate foreground calls. Repeat only on exit 75 (still running); exit 0 = success;
-   any other exit = stop and report the failure. Don't start a second copy.
+   any other exit = stop and report the failure; don't start a second copy.
    Even with \`timeout: 600000\`, agent Bash calls over ~180s are auto-backgrounded. Such a call is harness-tracked,
    but never end the turn while a task is running. Use the bounded waits to follow the detached job to completion.
    Do not use \`&\`, \`nohup\`, or \`setsid\` to create an untracked child. Review the diff before you commit.
