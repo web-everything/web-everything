@@ -12,8 +12,8 @@ scope:
   - fui:src/assets/favicon.svg
   - plateau:branding-proposals/journey.json
   - plateau:branding-proposals/loop/LOOP-LOG.md
-  - plateau:branding-proposals/loop/ (new fui-*.svg iteration files)
-  - plateau:branding.html (regenerated, not hand-edited)
+  - plateau:branding-proposals/loop/ # new fui-*.svg iteration files
+  - plateau:branding.html # regenerated, not hand-edited
 ---
 
 # Finalize the Frontier UI mark

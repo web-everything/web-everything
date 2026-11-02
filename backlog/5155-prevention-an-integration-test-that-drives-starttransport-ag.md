@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:src/diagnostics/transport.ts", "we:src/wip/wip-agent.ts", "we:src/wip/wip-read.ts", "we:wip-relay.js", "we:src/wip/agent-broadcast.ts", "we:scripts/lib/intake-config.mjs", "we:src/diagnostics/scrub.ts", "we:src/wip/glance/glance-mount.ts", "we:src/wip/request-advance.ts", "we:src/wip/glance/glance-view.ts", "we:src/diagnostics/__tests__/transport.test.mjs", "we:src/wip/__tests__/wip-agent.test.mjs", "we:src/wip/__tests__/wip-read.test.mjs", "we:./__tests__/wip-relay.test.mjs", "we:src/wip/__tests__/agent-broadcast.test.mjs", "we:scripts/lib/__tests__/intake-config.test.mjs", "we:src/diagnostics/__tests__/scrub.test.mjs", "we:src/wip/glance/__tests__/glance-mount.test.mjs", "we:src/wip/__tests__/request-advance.test.mjs", "we:src/wip/glance/__tests__/glance-view.test.mjs"]
+scope: ["we:src/diagnostics/transport.ts", "we:src/wip/wip-agent.ts", "we:src/wip/wip-read.ts", "we:wip-relay.js", "we:src/wip/agent-broadcast.ts", "we:scripts/lib/intake-config.mjs", "we:src/diagnostics/scrub.ts", "we:src/wip/glance/glance-mount.ts", "we:src/wip/request-advance.ts", "we:src/wip/glance/glance-view.ts", "we:src/diagnostics/__tests__/transport.test.mjs", "we:src/wip/__tests__/wip-agent.test.mjs", "we:src/wip/__tests__/wip-read.test.mjs", "we:__tests__/wip-relay.test.mjs", "we:src/wip/__tests__/agent-broadcast.test.mjs", "we:scripts/lib/__tests__/intake-config.test.mjs", "we:src/diagnostics/__tests__/scrub.test.mjs", "we:src/wip/glance/__tests__/glance-mount.test.mjs", "we:src/wip/__tests__/request-advance.test.mjs", "we:src/wip/glance/__tests__/glance-view.test.mjs"]
 dateOpened: "2026-10-05"
 tags: []
 ---

@@ -9,7 +9,7 @@ dateOpened: "2026-07-04"
 scope:
   - plateau:branding-proposals/loop/LOOP-LOG.md
   - plateau:branding-proposals/journey.json
-  - plateau:branding.html (regenerated, not hand-edited)
+  - plateau:branding.html # regenerated, not hand-edited
 tags: [branding, plateau, favicon]
 ---
 
