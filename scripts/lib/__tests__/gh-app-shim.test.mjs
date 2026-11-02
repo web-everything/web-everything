@@ -237,7 +237,7 @@ describe('renderGhShimScript — pure text, and REALLY RUN against a fake real g
     const src = renderGhShimScript({ realGhPath: '/opt/homebrew/bin/gh', cachePath: '/home/op/.claude/github-app-token/web-everything.json' });
     expect(src).toContain(`const REAL_GH = ${JSON.stringify('/opt/homebrew/bin/gh')};`);
     expect(src).toContain(`const CACHE_PATH = ${JSON.stringify('/home/op/.claude/github-app-token/web-everything.json')};`);
-    expect(src).toMatch(/^#!\/usr\/bin\/env node/);
+    expect(src).toMatch(/^#!\/bin\/sh/);
   });
 
   it('every spawnSync target in the rendered shim is an absolute path or process.execPath — never a PATH lookup (PR #2851 review)', () => {

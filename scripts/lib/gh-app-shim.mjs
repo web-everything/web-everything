@@ -448,6 +448,167 @@ export function defaultGithubAppRefreshCliPath(options) {
   return join(dirname(defaultGhThrottleCliPath(options)), 'github-app-refresh-cli.mjs');
 }
 
+// POSIX shell quoting is separate from the JSON literals in the Node body.
+const shQuote = (value) => ("'" + String(value).replaceAll("'", "'\"'\"'") + "'")
+  // Split a star/slash across quotes so baked paths cannot close the polyglot's JS comment.
+  .replaceAll('*/', "*'/'");
+
+function renderGhFastpath(realGhPath, cachePath) {
+  const owners = Object.entries(OWNER_INSTALLATIONS).map(([owner, id]) => {
+    const pattern = [...owner].map((c) => /[a-z]/.test(c) ? `[${c}${c.toUpperCase()}]` : c).join('');
+    return `    ${pattern}) cache=${shQuote(installationCachePath(cachePath, id))} ;;`;
+  }).join('\n');
+  // § stands for $ here to keep the shell parameter expansions readable in a JS template.
+  return String.raw`
+# FAST PATH (operator R427): intentionally bypasses gh-throttle pacing and the 401 retry
+# to exec gh in this process. WE_GH_SHIM_NO_FASTPATH=1 restores the Node path.
+# No sanitizer runs on cached-token calls: preserve inherited env, override only GH_TOKEN.
+# Personal routing can replace credentials; leave that transformation to Node. Internally
+# added GH_DEBUG=api is a captured/stripped throttle probe, intentionally absent here.
+gh_fastpath() {
+  [ -z "§{WE_GH_SHIM_NO_FASTPATH-}§{WE_GH_DAEMON_CALLER-}§{GH_HOST-}§{GH_DEBUG-}§{WE_GITHUB_APP_INSTALLATIONS-}§{WE_GH_THROTTLE_PERSONAL_ROUTE-}" ] || return
+  case §{XPC_SERVICE_NAME-} in com.we.*|com.plateau.*) return ;; esac
+  slash=/
+  first=§{1-} pending= slug= found=
+  for arg do
+    if [ -n "§pending" ]; then
+      pending=
+      if [ -n "§arg" ]; then slug=§arg; found=1; break; fi
+    fi
+    case §arg in
+      --repo|-R) pending=1 ;;
+      --repo=*) slug=§{arg#--repo=}; [ -z "§slug" ] || { found=1; break; } ;;
+      -R?*) slug=§{arg#-R}; found=1; break ;;
+    esac
+  done
+  if [ -n "§found" ]; then
+    repo=§{slug##*"§slash"}; rest=§{slug%"§slash"*}; owner=§{rest##*"§slash"}
+    [ "§rest" != "§slug" ] || return
+  else
+    if [ "§first" = api ]; then
+      for arg do
+        path=§{arg#/}
+        case §path in repos/*)
+          path=§{path#repos/}; owner=§{path%%"§slash"*}; repo=§{path#*"§slash"}
+          [ "§repo" != "§path" ] || continue
+          case §owner in ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9-]*) continue ;; esac
+          # The API regex accepts a repo prefix before punctuation or another slash.
+          rest=§repo; repo=
+          while [ -n "§rest" ]; do
+            char=§{rest%"§{rest#?}"}
+            case §char in [a-zA-Z0-9._-]) repo=§repo§char; rest=§{rest#?} ;; *) break ;; esac
+          done
+          [ -z "§repo" ] || { found=1; break; }
+        ;; esac
+      done
+    fi
+    if [ -z "§found" ]; then
+      slug=§{GH_REPO-}; repo=§{slug##*"§slash"}; rest=§{slug%"§slash"*}; owner=§{rest##*"§slash"}
+      [ "§rest" != "§slug" ] || return
+    fi
+  fi
+  case §owner in ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9-]*) return ;; esac
+  case §repo in ''|*[!a-zA-Z0-9._-]*) return ;; esac
+  case §owner in
+__OWNERS__
+    *) return ;;
+  esac
+  [ -f "§cache" ] && [ -r "§cache" ] || return
+  # Only a bounded, flat JSON subset is accepted. Unknown shapes, escaped strings,
+  # duplicate fields and control characters always defer to Node. The bounded read
+  # is a shell builtin (no helper process): C locale counts bytes, and the NUL
+  # delimiter prevents skipped NUL bytes from making the physical read unbounded.
+  # EOF (status 1) within 16 KiB is required. A delimiter, the sentinel byte, or an
+  # unsupported builtin option takes the Node path without parsing the buffer.
+  json=
+  LC_ALL=C IFS= read -r -d '' -n 16385 json 2>/dev/null < "§cache"
+  read_status=§?
+  [ "§read_status" -eq 1 ] && [ -n "§json" ] && [ "§{#json}" -le 16384 ] || return
+  gh_json_ws
+  case §json in '{'*) json=§{json#?} ;; *) return ;; esac
+  seen= v= token= expires=
+  while :; do
+    gh_json_ws
+    gh_json_string || return
+    key=§value
+    case §key in v|token|expiresAt|appId|installationId) ;; *) return ;; esac
+    case §seen in *"|§key|"*) return ;; esac
+    seen="§seen|§key|"
+    gh_json_ws
+    case §json in :*) json=§{json#?} ;; *) return ;; esac
+    gh_json_ws
+    case §json in
+      '"'*) gh_json_string || return; kind=string ;;
+      *) value=§{json%%[!0-9]*}; [ -n "§value" ] || return
+         case §value in 0?*) return ;; esac
+         json=§{json#"§value"}; kind=number ;;
+    esac
+    case §key:§kind in
+      v:number) v=§value ;;
+      token:string) token=§value ;;
+      expiresAt:string) expires=§value ;;
+      appId:*|installationId:*) ;;
+      *) return ;;
+    esac
+    gh_json_ws
+    case §json in
+      ,*) json=§{json#?} ;;
+      '}'*) json=§{json#?}; break ;;
+      *) return ;;
+    esac
+  done
+  gh_json_ws
+  [ -z "§json" ] && [ "§v" = __VERSION__ ] || return
+  case §token in ''|*[!a-zA-Z0-9_]*) return ;; esac
+  case §expires in ????-??-??T??:??:??Z) ;; *) return ;; esac
+  digits=§expires
+  for separator in - T : Z; do
+    while :; do case §digits in *"§separator"*) digits=§{digits%%"§separator"*}§{digits#*"§separator"} ;; *) break ;; esac; done
+  done
+  case §digits in *[!0-9]*) return ;; esac
+  year=§{expires%%-*}; rest=§{expires#*-}; month=§{rest%%-*}; rest=§{rest#*-}
+  day=§{rest%%T*}; rest=§{rest#*T}; hour=§{rest%%:*}; rest=§{rest#*:}
+  minute=§{rest%%:*}; second=§{rest#*:}; second=§{second%Z}
+  y=§((1§year - 10000)); m=§((1§month - 100)); d=§((1§day - 100))
+  h=§((1§hour - 100)); min=§((1§minute - 100)); sec=§((1§second - 100))
+  [ "§m" -ge 1 ] && [ "§m" -le 12 ] && [ "§d" -ge 1 ] && [ "§h" -le 23 ] && [ "§min" -le 59 ] && [ "§sec" -le 59 ] || return
+  leap=0; [ §((y % 4)) -ne 0 ] || { [ §((y % 100)) -eq 0 ] && [ §((y % 400)) -ne 0 ] || leap=1; }
+  max=31
+  case §m in 4|6|9|11) max=30 ;; 2) max=§((28 + leap)) ;; esac
+  [ "§d" -le "§max" ] || return
+  # Howard Hinnant's days-from-civil, with floor division for the January year-0 case.
+  [ "§m" -gt 2 ] || y=§((y - 1))
+  era=§(( (y - (y < 0 ? 399 : 0)) / 400 )); yoe=§((y - era * 400))
+  mp=§((m + (m > 2 ? -3 : 9)))
+  days=§((era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * mp + 2) / 5 + d - 1 - 719468))
+  expiry=§((days * 86400 + h * 3600 + min * 60 + sec))
+  now=§(date +%s) || return
+  case §now in ''|*[!0-9]*) return ;; esac
+  [ §((expiry - __BUFFER__)) -gt "§now" ] || return
+  GH_TOKEN=§token
+  export GH_TOKEN
+  exec __REAL_GH__ "§@"
+}
+gh_json_ws() {
+  while :; do
+    case §json in ' '*|'	'*|'
+'*|'__CR__'*) json=§{json#?} ;; *) return ;; esac
+  done
+}
+gh_json_string() {
+  case §json in '"'*) json=§{json#?} ;; *) return 1 ;; esac
+  value=§{json%%\"*}
+  [ "§value" != "§json" ] || return 1
+  # Printable ASCII without backslash; strings needing JSON unescaping use Node.
+  case §value in *[!\ -~]*|*'\'*) return 1 ;; esac
+  json=§{json#"§value"}; json=§{json#?}
+}
+gh_fastpath "§@"
+`.replaceAll('§', '$').replace('__OWNERS__', () => owners)
+    .replace('__CR__', '\r').replace('__VERSION__', String(SHIM_CACHE_VERSION)).replace('__BUFFER__', String(SHIM_REFRESH_BUFFER_MS / 1000))
+    .replace('__REAL_GH__', () => shQuote(realGhPath));
+}
+
 /**
  * PURE: the shim script's own source text — a standalone, dependency-free CommonJS Node script (no repo
  * import reaches it; see the module header for why). Reads `cachePath` fresh on every invocation, applies
@@ -496,7 +657,11 @@ export function renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath = 
   // generator's static import closure stay complete; the throttle is already a direct import above.
   // JSON-escape the contents before inserting them between the template's double quotes.
   const throttleModuleUrl = JSON.stringify(pathToFileURL(realGhThrottleCliPath).href).slice(1, -1);
-  return `#!/usr/bin/env node
+  return `#!/bin/sh
+':' /*
+# AUTO-GENERATED by we:scripts/lib/gh-app-shim.mjs
+${Object.keys(roleTable ?? {}).length === 0 ? renderGhFastpath(realGhPath, cachePath) : ''}exec /usr/bin/env node "$0" "$@"
+*/
 // AUTO-GENERATED by we:scripts/lib/gh-app-shim.mjs — regenerated on every dispatch; do not edit by hand.
 // A transparent \`gh\` pass-through that reads the shared GitHub App token cache FRESH on every call (#x8mpubm),
 // so a dispatched session's gh calls keep authenticating as the App installation for as long as the shared
