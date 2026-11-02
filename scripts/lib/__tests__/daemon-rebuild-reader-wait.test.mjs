@@ -400,6 +400,7 @@ describe('ready-only preparation defers clone mutations to the normal tick', () 
     const { ignoreOwners: _ignored, ...lockOpts } = f.opts;
     const before = cloneBytes(f.root);
     const r = await rebuildClone({ ...f.args, env, readyOnly, asJob: false, versions: null,
+      spawnerOwners: () => ['Mac:60796'],
       lockOpts: { ...lockOpts, owner: 'Mac:12154', ...(ignoreOwners === undefined ? {} : { ignoreOwners }) },
     });
     expect(r).toMatchObject(admitted
@@ -407,6 +408,23 @@ describe('ready-only preparation defers clone mutations to the normal tick', () 
       : { moved: false, reason: 'tick-in-progress', heldBy: 'Mac:60796' });
     expect(cloneBytes(f.root)).toEqual(before);
     if (!admitted) expect(f.run).not.toHaveBeenCalled();
+    expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, 'Mac:60796')).not.toBeNull();
+  });
+
+  it('drops an env ignore-owner that is not the spawner or an ancestor, warns, and still waits for that reader', async () => {
+    const f = prepareFixture(); mutationCases[0][1](f);
+    f.read('Mac:60796', 60796);
+    const errors = [];
+    const env = { ...f.env, WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS: 'Mac:60796' };
+    const { ignoreOwners: _ignored, ...lockOpts } = f.opts;
+    const before = cloneBytes(f.root);
+    const r = await rebuildClone({ ...f.args, env, readyOnly: true, asJob: false, versions: null,
+      spawnerOwners: () => ['Mac:555'], log: { ...console, error: (m) => errors.push(String(m)) },
+      lockOpts: { ...lockOpts, owner: 'Mac:12154' },
+    });
+    expect(r).toMatchObject({ moved: false, reason: 'tick-in-progress', heldBy: 'Mac:60796' });
+    expect(errors.join('\n')).toMatch(/ignored.*Mac:60796|Mac:60796.*not (the|a) spawner/i);
+    expect(cloneBytes(f.root)).toEqual(before);
     expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, 'Mac:60796')).not.toBeNull();
   });
 });
