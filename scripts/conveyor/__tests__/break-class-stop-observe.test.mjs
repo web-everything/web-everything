@@ -137,3 +137,15 @@ it('I1/I2 a matching digest never replays a stored verdict: a forged CONTINUE ro
   fs.writeFileSync(file, `${JSON.stringify({ ...first, verdict: 'CONTINUE' })}\n`);
   expect(await observeBreakClassStop(o)).toEqual({ skipped: 'deduped', verdict: 'UNKNOWN' });
 });
+
+it('I7 an error-generated UNKNOWN row never suppresses the recovered observation of the same inputs', async () => {
+  const o = fixture(); add(o, 1); add(o, 2); add(o, 3);
+  const failed = await observeBreakClassStop({ ...o, io: { classify() { throw new Error('transient'); } } });
+  expect(failed).toMatchObject({ verdict: 'UNKNOWN', error: 'transient' });
+  expect(failed.inputDigest).toMatch(/^[a-f0-9]{64}$/);
+  const recovered = await observeBreakClassStop(o);
+  expect(recovered).toMatchObject({ verdict: 'STOP' });
+  expect(recovered.skipped).toBeUndefined();
+  expect(rows(o)).toHaveLength(2);
+  expect(o.log).toHaveBeenCalledWith(expect.stringContaining('would STOP'));
+});

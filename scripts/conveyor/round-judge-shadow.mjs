@@ -187,7 +187,7 @@ export async function observeBreakClassStop({ pr, head, env = process.env, now =
     };
     record.inputDigest = crypto.createHash('sha256').update(JSON.stringify(canonical({ records: slice.records,
       malformed: slice.malformed, complete: slice.complete, threshold }))).digest('hex');
-    const duplicate = prior.find(row => row.inputDigest === record.inputDigest);
+    const duplicate = prior.find(row => row.inputDigest === record.inputDigest && !row.error);
     Object.assign(record, (io.classify ?? judge.classify)(slice.records, { malformed: slice.malformed, complete: slice.complete, threshold }));
     if (duplicate) return { skipped: 'deduped', verdict: prior.some(row => row.verdict === 'STOP') ? 'STOP' : record.verdict };
     if (prior.some(row => row.verdict === 'STOP')) record.verdict = 'STOP';
