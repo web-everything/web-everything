@@ -430,8 +430,8 @@ describe('confirmed dequeue', () => {
 
 describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run failed', () => {
   const H = 'b'.repeat(40), OTHER = 'c'.repeat(40);
-  const run = (conclusion, at, prHead = H) => ({ conclusion, completedAt: at, prHead });
-  const decide = (over = {}) => sameHeadFailedDecision({ pr: 6215, head: H, runs: [], freshGreenAt: null, ...over });
+  const run = (conclusion, at, prHead = H, workflow = 'CI') => ({ workflow, conclusion, completedAt: at, prHead });
+  const decide = (over = {}) => sameHeadFailedDecision({ pr: 6215, head: H, runs: [], ...over });
 
   it('#6215 pattern: its own gate failed at H, so no enqueue at H and one named line', () => {
     const d = decide({ runs: [run('failure', 100)] });
@@ -445,10 +445,10 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
   it('a new head enqueues (failure was at another head)', () => {
     expect(decide({ runs: [run('failure', 100, OTHER)] }).hold).toBe(false);
   });
-  it('a green rerun on H enqueues (later success run or fresh green check)', () => {
+  it('a green rerun of the SAME workflow on H enqueues; another workflow, or an older success, does not release it', () => {
     expect(decide({ runs: [run('failure', 100), run('success', 200)] }).hold).toBe(false);
-    expect(decide({ runs: [run('failure', 100)], freshGreenAt: 150 }).hold).toBe(false);
-    expect(decide({ runs: [run('failure', 100)], freshGreenAt: 50 }).hold).toBe(true);
+    expect(decide({ runs: [run('failure', 100), run('success', 200, H, 'Other')] }).hold).toBe(true);
+    expect(decide({ runs: [run('success', 50), run('failure', 100)] }).hold).toBe(true);
   });
   it('an errored failure read holds and says so', () => {
     const d = decide({ readError: new Error('gh boom') });
@@ -461,10 +461,10 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
     const calls = [];
     const exec = (_c, args) => { calls.push(args.join(' '));
       if (args[1].includes('actions/runs')) return JSON.stringify({ workflow_runs: [
-        { head_branch: 'gh-readonly-queue/main/pr-6215-abc', head_sha: 'g1', conclusion: 'failure', status: 'completed', updated_at: '2026-11-02T10:00:00Z' },
-        { head_branch: 'gh-readonly-queue/main/pr-6216-abc', head_sha: 'g2', conclusion: 'failure', status: 'completed', updated_at: '2026-11-02T10:00:00Z' }] });
+        { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-abc', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: new Date().toISOString(), updated_at: '2026-11-02T10:00:00Z' },
+        { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6216-abc', head_sha: 'g2', conclusion: 'failure', status: 'completed', created_at: new Date().toISOString(), updated_at: '2026-11-02T10:00:00Z' }] });
+      if (args[1].includes('head_sha=')) return JSON.stringify({ workflow_runs: [{ name: 'CI', event: 'pull_request', status: 'completed', conclusion: 'success', updated_at: '2026-11-02T09:00:00Z' }] });
       if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
-      if (args[1].includes('check-runs')) return JSON.stringify({ check_runs: [] });
       throw new Error(`unexpected ${args}`); };
     const r = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec, log: l => lines.push(l) });
     expect(r.hold).toBe(true);
@@ -474,5 +474,20 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
     expect(bad.hold).toBe(true);
     expect(bad.kind).toBe('mq-same-head-unreadable');
     expect(lines.at(-1)).toContain('mq-same-head-unreadable');
+  });
+  it('fails closed on a response without workflow_runs, and on history that the page cap does not cover', () => {
+    const none = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: () => '{}' });
+    expect(none.kind).toBe('mq-same-head-unreadable');
+    const full = Array.from({ length: 100 }, () => ({ name: 'CI', head_branch: 'gh-readonly-queue/main/pr-1-x', head_sha: 'z', status: 'completed', conclusion: 'success', created_at: new Date().toISOString() }));
+    const capped = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: () => JSON.stringify({ workflow_runs: full }) });
+    expect(capped.kind).toBe('mq-same-head-unreadable');
+    expect(capped.reason).toContain('not covered');
+  });
+  it('a failure released by a later PR-leg success of the same workflow re-enqueues', () => {
+    const exec = (_c, args) => {
+      if (args[1].includes('event=merge_group')) return JSON.stringify({ workflow_runs: [{ name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-a', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: new Date().toISOString(), updated_at: '2026-11-02T10:00:00Z' }] });
+      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
+      return JSON.stringify({ workflow_runs: [{ name: 'CI', event: 'pull_request', status: 'completed', conclusion: 'success', updated_at: '2026-11-02T11:00:00Z' }] }); };
+    expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec }).hold).toBe(false);
   });
 });
