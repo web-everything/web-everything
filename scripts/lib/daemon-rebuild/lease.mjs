@@ -5,6 +5,7 @@
 import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { hostname } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { stateDir } from './state.mjs';
@@ -95,14 +96,33 @@ export const DEFAULT_REBUILD_LEASE_STALE_MS = 20 * 60_000;
  * lease is a courtesy against wasted, colliding smokes, and the unique candidate path is what keeps a takeover
  * from ever touching another attempt's tree.
  */
-export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now() } = {}) {
+/** Start time (epoch ms) of `pid` via `ps -o lstart=` (second resolution), or null when unreadable. */
+export function processStartMs(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000, env: { ...process.env, LC_ALL: 'C' } });
+    if (r.status !== 0) return null;
+    const t = Date.parse(String(r.stdout || '').trim());
+    return Number.isFinite(t) ? t : null;
+  } catch { return null; }
+}
+
+/** Pid-reuse slack: `lstart` has 1 s resolution and startedAt is taken after the process started. */
+const PID_REUSE_SLACK_MS = 2000;
+
+export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now(), startTimeOf = processStartMs } = {}) {
   if (!building || typeof building !== 'object') return false;
   const staleMs = Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : DEFAULT_REBUILD_LEASE_STALE_MS;
   const startedMs = Date.parse(building.startedAt || '');
   if (!Number.isFinite(startedMs) || nowMs - startedMs > staleMs) return false;
   if (building.host !== hostname()) return true;
   if (building.pid === process.pid) return ACTIVE_BUILD_TOKENS.has(building.token);
-  try { process.kill(building.pid, 0); return true; } catch (e) { return !(e && e.code === 'ESRCH'); }
+  try { process.kill(building.pid, 0); } catch (e) { return !(e && e.code === 'ESRCH'); }
+  // The pid exists, but a REUSED pid belongs to an unrelated process that started after the lease was taken.
+  // An unreadable start time fails closed (stays live): only a proven later start counts as dead.
+  const procStart = startTimeOf(building.pid);
+  if (Number.isFinite(procStart) && procStart > startedMs + PID_REUSE_SLACK_MS) return false;
+  return true;
 }
 
 /**
@@ -130,7 +150,10 @@ export function claimBuildLease({ state, plan, root, run, env, nowMs }) {
 function leaseOwnerIsGone(building) {
   if (building.host !== hostname()) return false;
   if (building.pid === process.pid) return !ACTIVE_BUILD_TOKENS.has(building.token);
-  try { process.kill(building.pid, 0); return false; } catch (e) { return !!(e && e.code === 'ESRCH'); }
+  try { process.kill(building.pid, 0); } catch (e) { return !!(e && e.code === 'ESRCH'); }
+  const procStart = processStartMs(building.pid);
+  const startedMs = Date.parse(building.startedAt || '');
+  return Number.isFinite(procStart) && Number.isFinite(startedMs) && procStart > startedMs + PID_REUSE_SLACK_MS;
 }
 
 /** Under the write lock: drop `state.building` if it is still OUR lease (a takeover's newer lease is left alone). */
