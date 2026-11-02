@@ -27,6 +27,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { prioritizeMainFix } from '../lib/merge-queue-hook.mjs';
 
 const REPO = 'example/web';
 const HEAD = 'a'.repeat(40);
@@ -205,6 +206,50 @@ describe('stuck UNKNOWN marks across passes', () => {
     expect(events).toEqual([`read:${REPO}#42`, 'context', 'cascade']);
     expect(read).toHaveBeenCalledTimes(1);
   });
+
+  it.each([0, 3])('marks and nudges listing-only UNKNOWN after %s retries, before context', async retries => {
+    const events = [];
+    const rows = new Map([[REPO, [unknown()]]]);
+    await drain.repollThenCollectContext({
+      repoll: () => drain.repollUnknownListings({ prsByRepo: rows, read: async () => unknown(),
+        setting: { retries, delayMs: 0 }, sleep: async () => {},
+        onPersistentUnknown: ({ repo, num }) => events.push(`mark:${repo}#${num}`),
+        nudge: ({ repo, num }) => events.push(`nudge:${repo}#${num}`) }),
+      collect: () => events.push('context'),
+    });
+    expect(events).toEqual([`mark:${REPO}#42`, `nudge:${REPO}#42`, 'context']);
+    expect(rows.get(REPO)[0].mergeable).toBe('UNKNOWN');
+  });
+
+  it('keeps listing recovery fail soft and bounded when both hooks fail', async () => {
+    const mark = vi.fn(() => { throw new Error('state unavailable'); });
+    const nudge = vi.fn(() => { throw new Error('GitHub unavailable'); });
+    const rows = new Map([[REPO, [unknown()]]]);
+    await drain.repollUnknownListings({ prsByRepo: rows, read: async () => unknown(),
+      sleep: async () => {}, setting: { retries: 3, delayMs: 0 }, onPersistentUnknown: mark, nudge });
+    expect(mark).toHaveBeenCalledTimes(1);
+    expect(nudge).toHaveBeenCalledTimes(1);
+    expect(rows.get(REPO)[0].mergeable).toBe('UNKNOWN');
+  });
+
+  it.each([pr(), null, pr({ number: 999, mergeable: 'UNKNOWN' }),
+    pr({ mergeable: 'UNKNOWN', state: 'CLOSED' }), pr({ mergeable: 'UNKNOWN', state: 'MERGED' })])('does not mark or nudge resolved, departed or unreadable listing evidence (%j)', async fresh => {
+    const mark = vi.fn(), nudge = vi.fn();
+    await drain.repollUnknownListings({ prsByRepo: new Map([[REPO, [unknown()]]]), read: async () => fresh,
+      sleep: async () => {}, setting: { retries: 3, delayMs: 0 }, onPersistentUnknown: mark, nudge });
+    expect(mark).not.toHaveBeenCalled();
+    expect(nudge).not.toHaveBeenCalled();
+  });
+
+  it('builds reasons after queue main-fix priority, including in card-number mode', () => {
+    const candidates = [1, 2, 42].map(num => ({ repo: REPO, num, decision: 'merge' }));
+    const plan = drain.planLabelDrain(candidates, { readyOrder: { order: 'card-number',
+      stuckUnknownMarks: marksAt(), prioritize: rows => prioritizeMainFix(rows, {
+        mainFix: { repo: REPO, pr: 2 }, queueSettings: { enabled: true },
+      }) } });
+    expect(plan.ready.map(c => c.num)).toEqual([2, 42, 1]);
+    expect(plan.readyOrder.map(c => c.num)).toEqual([2, 42, 1]);
+  });
 });
 
 describe('operator fallback for a continuously stuck UNKNOWN', () => {
@@ -236,7 +281,7 @@ it('nudges recomputation with one injected mergeable-only read, even when still 
 const cliGh = `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2), f = process.env.UNKNOWN_FIXTURE;
-const { prs, fresh, wrongNumber, unreadable, failMerge } = JSON.parse(fs.readFileSync(f, 'utf8'));
+const { prs, fresh, nudgeFresh, wrongNumber, unreadable, failMerge } = JSON.parse(fs.readFileSync(f, 'utf8'));
 const openPrPageFixture = ${openPrPageFixture};
 const landed = n => fs.existsSync(f + '.merged-' + n);
 const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
@@ -250,10 +295,12 @@ if (a[0] === 'api' && a[1] === 'graphql') {
 }
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
-  if (!p || (p.number === 42 && unreadable)) process.exit(1);
+  if (!p) process.exit(1);
   const fields = a[a.indexOf('--json') + 1] || '';
   const full = fields.includes('mergeStateStatus');
+  if (p.number === 42 && full && unreadable) process.exit(1);
   out({ ...p, ...(p.number === 42 && (full || fields === 'mergeable') ? { mergeable: fresh } : {}),
+    ...(fields === 'mergeable' && nudgeFresh ? { mergeable: nudgeFresh } : {}),
     ...(p.number === 42 && full && wrongNumber ? { number: 999 } : {}),
     state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? new Date().toISOString() : null });
 }
@@ -287,12 +334,15 @@ function withCli(test) {
     const seed = rows => writeFileSync(path, JSON.stringify(rows));
     const repo = 'fixture/drain-unknown';
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.UNKNOWN_HOME; syncBuiltinESMExports();");
-    const run = ({ numbers = [42], fresh = 'MERGEABLE', wrongNumber = false, unreadable = false, failMerge = null, unready = false, flags = [], json = true, env = {}, mainFixPr = null, alertAfterMinutes = 30, redRequired = false } = {}) => {
+    const run = ({ numbers = [42], fresh = 'MERGEABLE', listed = 'MERGEABLE', nudgeFresh = null, wrongNumber = false, unreadable = false, failMerge = null, unready = false, flags = [], json = true, env = {}, mainFixPr = null, alertAfterMinutes = 30, redRequired = false, queueEnabled = false } = {}) => {
+      writeFileSync(deliverySettings, JSON.stringify({ mergeDelivery: { strategy: 'drain-direct' },
+        mergeQueue: { enabled: queueEnabled }, mergeFreshness: { enabled: false } }));
       const prs = numbers.map(number => pr({ number, headRefOid: number.toString(16).padStart(40, '0'), headRefName: `lane/leaf-${number}`,
+        mergeable: listed,
         labels: unready ? [] : [{ name: 'ready-to-merge' }], comments: [],
         ...(redRequired ? { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] } : {}),
         files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }] }));
-      writeFileSync(fixture, JSON.stringify({ prs, fresh, wrongNumber, unreadable, failMerge }));
+      writeFileSync(fixture, JSON.stringify({ prs, fresh, nudgeFresh, wrongNumber, unreadable, failMerge }));
       const mainFixFile = join(dir, 'main-fix.json');
       if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'drain-unknown', pr: mainFixPr, prs: [mainFixPr], setAt: Date.now(), expiresAt: Date.now() + 3_600_000 }));
       else rmSync(mainFixFile, { force: true });
@@ -318,6 +368,37 @@ function withCli(test) {
 }
 
 describe('persistent UNKNOWN real drain wiring', () => {
+  it('retains another listed mark before --pr narrowing', () => withCli(({ run, seed, marks, repo }) => {
+    const mark = { repo, num: 42, since: Date.now() - 80 * MINUTE };
+    seed([mark]);
+    run({ numbers: [1, 42], flags: ['--pr=1'] });
+    expect(marks()).toEqual([mark]);
+  }), 90_000);
+
+  it('keeps a mergeable-only nudge advisory until an identity-checked full read resolves the mark', () => withCli(({ run, seed, marks, repo }) => {
+    const mark = { repo, num: 42, since: Date.now() - 80 * MINUTE };
+    seed([mark]);
+    const out = run({ fresh: 'UNKNOWN', nudgeFresh: 'MERGEABLE' });
+    expect(out.attempts).toEqual([]);
+    expect(marks()).toEqual([mark]);
+    expect(out.result.alerts).toContainEqual(expect.objectContaining({ repo, num: 42 }));
+  }), 90_000);
+
+  it('persists and nudges UNKNOWN that never passes listing classification', () => withCli(({ run, marks, repo }) => {
+    const out = run({ listed: 'UNKNOWN', fresh: 'UNKNOWN' });
+    expect(out.attempts).toEqual([]);
+    expect(marks()).toEqual([{ repo, num: 42, since: expect.any(Number) }]);
+    expect(out.calls.filter(a => a[0] === 'pr' && a[1] === 'view' && a[a.indexOf('--json') + 1] === 'mergeable')).toHaveLength(1);
+  }), 90_000);
+
+  it('logs the queue main-fix first even when delivery classes are off', () => withCli(({ run, seed, repo }) => {
+    seed([{ repo, num: 42, since: Date.now() - 80 * MINUTE }]);
+    const out = run({ numbers: [1, 2, 42], mainFixPr: 2, queueEnabled: true, json: false });
+    expect(out.attempts).toEqual([2, 42, 1]);
+    expect(out.stderr).toMatch(/1\. #2 /);
+    expect(out.stderr).toMatch(/2\. #42 .*persistent UNKNOWN recovery priority/);
+  }), 90_000);
+
   it('persists a refusal and nudge, retains resolved priority across invocations until confirmed merge', () => withCli(({ run, marks, repo }) => {
     const first = run({ fresh: 'UNKNOWN' });
     expect(first.attempts).toEqual([]);

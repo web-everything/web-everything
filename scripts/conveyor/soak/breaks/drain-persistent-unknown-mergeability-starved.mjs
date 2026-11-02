@@ -36,6 +36,12 @@ export default {
     });
     if (verdict.decision === 'merge') violations.push('a persistent UNKNOWN mergeability was treated as mergeable');
     if (marked !== 1 || nudged !== 1) violations.push('a persistent UNKNOWN was not marked and nudged once');
+    marked = 0; nudged = 0;
+    const listings = new Map([['example/web', [pr()]]]);
+    await drain.repollUnknownListings({ prsByRepo: listings, read: async () => pr(), sleep: async () => {},
+      setting: { retries: 3, delayMs: 0 }, onPersistentUnknown: () => { marked += 1; }, nudge: () => { nudged += 1; } });
+    if (marked !== 1 || nudged !== 1) violations.push('listing-only UNKNOWN never reached durable recovery');
+    if (listings.get('example/web')[0].mergeable !== 'UNKNOWN') violations.push('listing recovery admitted UNKNOWN');
     const now = 80 * 60_000;
     const plan = planCatchUp({ prs: [{ num: 42, labels: [{ name: 'ready-to-merge' }], baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', isDraft: false, inQueue: false, readyAt: 0 }],
       queued: 0, capacity: 5, pendingNums: [42], pendingSince: new Map([[42, 0]]), pendingExpiryMinutes: 15, repo: 'example/web', now });
