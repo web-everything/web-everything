@@ -390,7 +390,8 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
     if (list.some((o) => o?.ref === record.ref)) { clearPending(root, env, record.ref); settled.push({ ref: record.ref, outcome: 'still-registered' }); continue; }
     const tipNow = tip(record.ref);
     const newNow = record.newRef ? tip(record.newRef) : undefined;
-    if (tipNow === record.tip && (!record.newRef || newNow === record.newTip)) {
+    // A squash-merged retire was proved on a DELETED branch: only a still-deleted branch confirms it.
+    if ((record.refGone === true ? tipNow === null : tipNow === record.tip) && (!record.newRef || newNow === record.newTip)) {
       clearPending(root, env, record.ref);
       appendOverlayEvent(root, { kind: record.kind === 'replace' ? 'replaced' : 'auto-retired', ref: record.ref, by, tip: record.tip, recovered: true }, { env });
       settled.push({ ref: record.ref, outcome: 'drop-confirmed' });
@@ -429,7 +430,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     const proof = prove(entry);
     if (proof.action !== 'retire') return refuse('not-proved', { proof });
     if (proof.tip !== expectedTip) return refuse('tip-moved', { proof, tipNow: proof.tip });
-    addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, at: new Date().toISOString() });
+    addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, ...(proof.evidence?.refGone === true ? { refGone: true } : {}), at: new Date().toISOString() });
     let removed;
     try {
       ({ removed } = removeOverlay(root, ref, { env, why: proof.reason, expectedOverlay: entry }));
