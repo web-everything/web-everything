@@ -257,7 +257,7 @@ const isRepo = (v) => typeof v === 'string' && /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9]
 const isPrRow = (r) => isObject(r) && isRepo(r.repo) && Number.isInteger(r.number);
 const comparePrKey = (a, b) => a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : a.number - b.number;
 
-export function projectPrRows(storage, malformed = () => {}) {
+export function projectPrRows(storage, malformed = () => { throw new Error('malformed PR projection'); }) {
   // One pass over checks, one SHA→PRs lookup per distinct (repo, sha): bounded by distinct SHAs, never PRs × checks.
   const byPr = new Map();
   const shaPrs = new Map();

@@ -78,6 +78,28 @@ describe('full mirror pagination', () => {
     coverage: { bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0 }] } };
   const options = { repo: REPO, url: 'https://w.local', token: 'read', nowMs: T0, pageLimit: 1 };
 
+  it.each([
+    ['coverage false', { coverage: false, omittedOpen: [] }],
+    ['omitted open PRs', { coverage: true, omittedOpen: [7] }],
+  ])('records failure and falls back to GitHub for %s despite a complete bootstrap', async (_name, coverage) => {
+    const fetchImpl = async () => new Response(JSON.stringify({ ...first, prs: [row(7)], prsCursor: 7, prsMore: false,
+      repos: { [REPO.toLowerCase()]: coverage },
+    }));
+    const refreshed = await refreshMirror(null, { ...options, fetchImpl });
+    expect(refreshed.mode).toBe('failed');
+    expect(refreshed.mirror.lastFailAt).toBe(T0);
+    const result = await readPrFactsOrGithub({ repo: REPO, number: 7, dir, env: {}, now: () => T0,
+      url: options.url, token: 'read', exec: fakeGh(githubFixture()), fetchImpl });
+    expect(result).toMatchObject({ source: 'github', reason: 'feed-unreachable' });
+  });
+
+  it.each([null, 42, {}, { type: 'check_run', prs: [7], sha: HEAD }].map((value) => [value]))(
+    'throws when projecting malformed checks from a persisted mirror (%j)', (invalid) => {
+      const mirror = seedMirror({ repo: REPO, body: { ...first, prs: [row(7)] }, nowMs: T0 });
+      mirror.buckets.checks.corrupt = invalid;
+      expect(() => mirrorRows(mirror)).toThrow(/malformed/);
+    });
+
   it.each(['stateCursor', 'bootstrap', 'repo coverage'])('restarts a full pull when %s changes and publishes only a consistent snapshot', async (field) => {
     let calls = 0;
     const base = { ...first, repos: { [REPO.toLowerCase()]: { coverage: true } } };
@@ -216,14 +238,14 @@ describe('readPrFacts — served only when trustworthy', () => {
     expect(await lookupPrFacts({ ...w.opts(), number: 7 })).toEqual({ facts: null, reason: 'feed-stale' });
   });
 
-  it('no bootstrap baseline → null; a truncated one → null', async () => {
+  it('rejects full pulls without a bootstrap baseline or with truncated coverage', async () => {
     const w = worker();
     w.deliver('pull_request', prPayload('opened'));
-    expect(await lookupPrFacts({ ...w.opts(), number: 7 })).toEqual({ facts: null, reason: 'no-bootstrap' });
+    expect(await lookupPrFacts({ ...w.opts(), number: 7 })).toEqual({ facts: null, reason: 'feed-unreachable' });
     const t = worker();
     t.bootstrap([], 'truncated');
     t.deliver('pull_request', prPayload('opened'));
-    expect(await lookupPrFacts({ ...t.opts({ dir: join(dir, 'other') }), number: 7 })).toEqual({ facts: null, reason: 'bootstrap-truncated' });
+    expect(await lookupPrFacts({ ...t.opts({ dir: join(dir, 'other') }), number: 7 })).toEqual({ facts: null, reason: 'feed-unreachable' });
   });
 
   it('a PR the store has no row for → null', async () => {
@@ -253,6 +275,8 @@ describe('readPrFacts — served only when trustworthy', () => {
     const have = ['review:pending'];
     for (const l of ['a', 'b', 'c']) { have.push(l); w.deliver('pull_request', labelEvent('labeled', l, have)); }
     w.clock.t += PR_FACTS_DEFAULTS.refreshAfterMs;
+    // A full pull can repair the mirror's replay gap only with a complete, current repo baseline.
+    w.bootstrap([{ number: 7, sha: HEAD, draft: false, state: 'open', labels: have }]);
     const f = await readPrFacts({ ...w.opts(), number: 7 });
     expect(w.hits.prs).toBe(2);
     expect(f.labels).toEqual(['a', 'b', 'c', 'review:pending']);

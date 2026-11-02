@@ -315,7 +315,7 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
           continue retry; // Discard every row and cursor from the interrupted pull.
         }
         if (body.truncated?.unattributed > 0 || (body.truncated?.repos?.[repoKey(repo)] || 0) > 0 ||
-            (body.truncated?.malformed > 0 && current.coverage === false)) throw new Error('incomplete /prs coverage');
+            current.coverage === false || body.repos[repoKey(repo)].omittedOpen?.length > 0) throw new Error('incomplete /prs coverage');
         first ??= body; snapshot ??= current;
         prs.push(...body.prs);
         if (!body.prsMore) return seedMirror({ repo, body: { ...first, prs }, nowMs });
