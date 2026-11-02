@@ -13,7 +13,7 @@ Dropped from the thin split of #6044 because it depends on #6033 registration ge
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/daemon-rebuild-fallback-registration.test.mjs` (ported from #6044) passes on main after #6033 lands.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,16 +21,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] n/a: port only; no new behaviour beyond #6044.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: ported verbatim from #6044; re-audit when ported.
+2. **Truncated reads** — n/a: ported verbatim from #6044; re-audit when ported.
+3. **Shared state files** — n/a: ported verbatim from #6044; re-audit when ported.
+4. **Fail closed** — n/a: ported verbatim from #6044; re-audit when ported.
+5. **Identity scoping** — n/a: ported verbatim from #6044; re-audit when ported.
+6. **State over time** — n/a: ported verbatim from #6044; re-audit when ported.
+7. **Who wrote it** — n/a: ported verbatim from #6044; re-audit when ported.
