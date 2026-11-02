@@ -16,7 +16,7 @@ import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, posix } from 'node:path';
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
+import { makeGit, verifyRev, archiveUncovered, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
@@ -24,6 +24,8 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -117,7 +119,7 @@ export function attributeSmokeFailure({ git, files, overlays }) {
       }
       const changed = String(diff.stdout ?? '').split('\n').map((file) => file.trim());
       const matched = [...new Set(changed.filter((file) => wanted.has(file)))].sort();
-      if (matched.length) culprits.push({ ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha, matched });
+      if (matched.length) culprits.push({ ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha, registrationId: ap.registrationId, matched });
     } catch {
       unknown.push(ap.ref);
     }
@@ -272,7 +274,8 @@ export function dispatchSmokeSuspects({
   const out = [];
   for (const ap of applied || []) {
     if (!ap?.ref || (known && ap.sha && known.get(ap.ref) === ap.sha)) continue;
-    const suspect = { ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha };
+    // The applied row's registration id binds a later drop to the registration this build actually carried.
+    const suspect = { ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha, registrationId: ap.registrationId };
     const baseRes = ap.sha ? git(['merge-base', 'origin/main', ap.sha]) : { status: 1 };
     const base = baseRes.status === 0 ? String(baseRes.stdout ?? '').trim() : '';
     const diff = base ? git(['diff', '--name-only', base, ap.sha]) : null;
@@ -334,8 +337,10 @@ async function resolveDispatchSmoke(opt, env) {
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false, entries = [],
 }) {
+  const closureScopeMode = resolveClosureScopeMode(env).mode;
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries, env });
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
    *  never mid-fallback (a sibling must not start a build while B/C are still being smoked). Returns the
@@ -535,8 +540,14 @@ export async function smokeAndAdopt({
     });
     if (definite && !mainOnly) {
       for (const s of suspects) {
+        // Same CAS as dropSuspectOverlays: never remove a registration this smoke did not run (e.g. one re-added
+        // while it ran); an unbound suspect is kept for the operator.
+        if (typeof s.registrationId !== 'string' || !s.registrationId) {
+          alert('overlay-registration-changed', { ref: s.ref });
+          continue;
+        }
         try {
-          removeOverlay(root, s.ref, { env, why });
+          removeOverlay(root, s.ref, { env, why, expectRegistrationId: s.registrationId });
           appendOverlayEvent(root, {
             kind: 'dropped-dispatch-smoke-failed', ref: s.ref, pr: s.pr, reason: why,
           }, { env });
@@ -545,7 +556,8 @@ export async function smokeAndAdopt({
             message: 'this overlay broke the real worker launch — fix it, then re-add it',
           });
         } catch (e) {
-          alert('overlay-drop-failed', { ref: s.ref, error: String(e?.message || e) });
+          if (/registration changed/.test(String(e?.message))) alert('overlay-registration-changed', { ref: s.ref });
+          else alert('overlay-drop-failed', { ref: s.ref, error: String(e?.message || e) });
         }
       }
     }
@@ -592,7 +604,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, archiveGuard: !mainOnly,
     }), finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
@@ -695,6 +707,41 @@ export async function smokeAndAdopt({
 
   // ── (a) plain main: drop every NON-pinned overlay and try again ──────────────────────────────────────
   const rawByRef = new Map((overlaysBefore || []).map((o) => [o?.ref, o]));
+  const replanWithRegistrationIds = async (retained) => {
+    const ids = new Map(retained.map((ap) => [ap.ref, ap.registrationId]));
+    const replanned = await planRebuild({
+      entries: runtimeEntries, env, closureScopeMode,
+      adopted: adoptedState,
+      git, headSha: prevHead, mainRef: 'origin/main',
+      overlays: retained.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr, registrationId: ap.registrationId })),
+      edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+    });
+    // The planner produces content rows. Bind fallback evidence to the original candidate's
+    // captured registrations before smoke, ready persistence, or adoption; never read new ids here.
+    // Missing ids stay unbound, and finalizeRebuild still strips ids replaced during smoke.
+    if (replanned.applied) replanned.applied = replanned.applied.map((ap) => ({
+      ...ap, registrationId: ids.get(ap.ref),
+    }));
+    return replanned;
+  };
+  // Every registered carrier matters, including carriers excluded from this fallback's applied list.
+  // An unreadable archive is refused too; leave the running build and registrations available for retry.
+  const archiveFailure = (candidate) => {
+    if (!candidate.ok) return null;
+    let uncovered;
+    let error;
+    try { uncovered = archiveUncovered(git, overlaysBefore || [], candidate.finalSha); }
+    catch (e) {
+      uncovered = (overlaysBefore || []).filter(o => o.retiredSources?.length);
+      error = String(e?.message ?? e);
+    }
+    if (!uncovered.length && !error) return null;
+    const refs = uncovered.map(o => o.ref);
+    const failed = `archive-source-uncovered: ${refs.join(', ')}`;
+    alert('overlay-source-unavailable', { refs, failed, target: candidate.finalSha, ...(error ? { error } : {}),
+      message: 'Fallback cannot prove archived content is preserved; keeping the running build and overlay registrations.' });
+    return failed;
+  };
   const withPin = plan.applied.map((ap) => ({
     ...ap, pinned: pinnedStatus(git, rawByRef.get(ap.ref) ?? {}, plan.mainSha, ap.sha).pinned,
   }));
@@ -732,16 +779,15 @@ export async function smokeAndAdopt({
     if (culprits.length > 0 && unknown.length === 0 && culprits.length < suspects.length) {
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
-      const planA2 = await planRebuild({
-        git, headSha: prevHead, mainRef: 'origin/main',
-        overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
-        edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
-      });
+      const planA2 = await replanWithRegistrationIds(kept);
       const failedNames = failedA.map((r) => r.name).join(',');
       let failed = planA2.reason ?? 'not planned';
+      const a2ArchiveFailure = archiveFailure(planA2);
       // x9diisp — setting the culprits aside must never also lose an overlay the running build carries (e.g. one a
       // culprit's change had let apply in the retry pass): such a fallback is refused like prepare refuses it.
-      if (planA2.ok && planA2.establishedLost?.length > 0) {
+      if (a2ArchiveFailure) {
+        failed = a2ArchiveFailure;
+      } else if (planA2.ok && planA2.establishedLost?.length > 0) {
         failed = `established-overlay-conflict: ${planA2.establishedLost.map((l) => l.ref).join(', ')}`;
       } else if (planA2.ok) {
         alert('overlay-set-aside-attributed', {
@@ -762,7 +808,7 @@ export async function smokeAndAdopt({
           });
           const fin = await finalize(planA2, dropCulprits, {
             kind: 'fallback', forInputsKey: plan.inputsKey,
-            dropRefs: culprits.map(({ ref, pr, sha }) => ({ ref, pr, sha })), failed: failedNames,
+            dropRefs: culprits.map(({ ref, pr, sha, registrationId }) => ({ ref, pr, sha, registrationId })), failed: failedNames,
           }, a2.smokeResult);
           return { ...fin, reason: 'overlay-set-aside', setAside: { from: plan.finalSha, to: planA2.finalSha, dropped: culprits } };
         }
@@ -774,28 +820,27 @@ export async function smokeAndAdopt({
   }
 
   if (!mainOnly && suspects.length > 0) {
-    const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
-    const planB = await planRebuild({
-      git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
-      edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
-    });
+    const planB = await replanWithRegistrationIds(withPin.filter((ap) => ap.pinned));
     // x9diisp/overlay-pin — like planA2, plain main must never lose an overlay the running build carries (e.g. a
     // pinned head that only merged thanks to a suspect it now leaves out): refused as unplannable instead.
     const bLost = planB.ok && planB.establishedLost?.length > 0;
-    if (planB.ok && !bLost) {
+    const bArchiveFailure = archiveFailure(planB);
+    if (planB.ok && !bLost && !bArchiveFailure) {
       const suspectInfo = suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr }));
       alert('fallback-plain-main', {
         failed: failedA.map((r) => r.name).join(','), suspects: suspectInfo, target: planB.finalSha,
         message: 'main + overlays failed the live smoke — retrying plain main (pinned overlays only) (x5wbsbc)',
       });
       const failedNames = failedA.map((r) => r.name).join(',');
+      // The drop is bound to each suspect's registration id; the alert-facing `suspectInfo` stays {ref, pr}.
       const dropSuspects = ({ alert: finAlert }) => dropSuspectOverlays({
-        root, env, suspects: suspectInfo, failed: failedNames, alert: finAlert,
+        root, env, suspects: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr, registrationId: ap.registrationId })),
+        failed: failedNames, alert: finAlert,
       });
       const fallbackReady = {
         // Each suspect's failing sha rides along, so a later adoption after main moved can tell that the suspect
         // itself did not (matchReadyCandidate's `fallback-main-moved`).
-        kind: 'fallback', forInputsKey: plan.inputsKey, dropRefs: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr, sha: ap.sha })), failed: failedNames,
+        kind: 'fallback', forInputsKey: plan.inputsKey, dropRefs: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr, sha: ap.sha, registrationId: ap.registrationId })), failed: failedNames,
       };
       // Even the currently adopted head needs a fresh comparison before blaming an overlay.
       // Fail fast on every check A failed: if plain main fails one of them too, the rest of B cannot change the outcome.
@@ -853,7 +898,7 @@ export async function smokeAndAdopt({
       }
     } else {
       alert('fallback-plain-main-unplannable', {
-        reason: bLost ? `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}` : planB.reason,
+        reason: bArchiveFailure ?? (bLost ? `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}` : planB.reason),
       });
     }
   }

@@ -69,6 +69,7 @@ export default defineConfig({
       'scripts/__tests__/rust-scan-citation-check-parity.test.mjs',
       'scripts/__tests__/gate-entrypoint-integration.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
+      'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
@@ -162,6 +163,8 @@ export default defineConfig({
       // Multiple real-git rebuilds per test exceeded 5s in the unit shard. Queue with the daemon scenarios;
       // retain the fixture's full behavior checks and its existing deadline.
       ['scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs', 'forks'],
+      // Candidate, backoff and retry rebuilds share the same real-git contention risk.
+      ['scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs', 'forks'],
       // Existing/added-file pairs run multiple real-git rebuilds and hit the unit shard's 5s deadline too.
       ['scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs', 'forks'],
       ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],

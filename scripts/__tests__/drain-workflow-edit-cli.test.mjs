@@ -20,6 +20,8 @@ describe('workflow human hold through the drain CLI', () => {
     cpSync(join(source, 'scripts'), join(root, 'scripts'), {
       recursive: true, filter: (path) => !path.includes('__tests__'),
     });
+    cpSync(join(source, 'skills-src/conveyor/daemon-manifest.mjs'),
+      join(root, 'skills-src/conveyor/daemon-manifest.mjs'));
     // codex-direct-task imports the transcript parser from outside scripts/.
     cpSync(join(source, 'skills-src', 'inspect-codex-transcript'),
       join(root, 'skills-src', 'inspect-codex-transcript'), { recursive: true });

@@ -5,12 +5,15 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { readOverlayState, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
-import { verifyRev, makeGit } from './shared.mjs';
-import { resolveOverlayConflict } from './overlay-strategies.mjs';
+import { verifyRev, makeGit, archiveUncovered } from './shared.mjs';
+import { finalClosureScope, isExcludable } from './closure-scope.mjs';
+import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -109,14 +112,34 @@ export function matchReadyCandidate({
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null,
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
+  const mode = lockClosureScopeMode(closureScopeMode ?? resolveClosureScopeMode(env).mode);
+  const applied = Array.isArray(adopt?.applied) ? adopt.applied : [];
+  const scoped = applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined);
+  // Persisted scoped builds still need runtime evidence after the strategy is disabled.
+  if (scoped || mode === 'on') {
+    try {
+      entries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(entries) || !entries.length) return false;
+    } catch { return false; }
+  }
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
   // Never a rollback: the record's main must be at or past the main the current head was built on.
   const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
-  const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
+  let finalScope;
+  if (scoped) {
+    const final = finalClosureScope({ git, sha: adopt.finalSha, entries, env });
+    if (!final.ok) return false;
+    finalScope = final.scope;
+    for (const a of applied) {
+      if (a?.resolvedVia !== 'closure-scope' && a?.excluded !== undefined) return false;
+      if (a?.resolvedVia === 'closure-scope' && (!Array.isArray(a.excluded) || !a.excluded.length
+        || new Set(a.excluded).size !== a.excluded.length || !a.excluded.every(p => isExcludable(p, finalScope)))) return false;
+    }
+  }
   let cur = adopt.finalSha;
   for (let i = applied.length - 1; i >= 0; i -= 1) {
     const a = applied[i];
@@ -135,7 +158,11 @@ export function readyBuildVerified({
     if (tip ? !isAncestor(a.sha, tip) : !isAncestor(a.sha, mainTip)) return false;
     // The merge's tree is exactly what planRebuild mints for (prev, overlay) — never an arbitrary tree.
     let minted;
-    if (a.resolvedVia) {
+    if (a.resolvedVia === 'closure-scope') {
+      const resolved = resolveClosureScopedConflict({ git, cur: prev, ovSha: a.sha, scope: finalScope });
+      if (!resolved?.ok || JSON.stringify(resolved.excluded) !== JSON.stringify(a.excluded)) return false;
+      minted = resolved.tree;
+    } else if (a.resolvedVia) {
       // An edge-resolved build is only as trusted as the operator's CURRENT recorded approval: the record's own
       // `edgeSha` must still equal it, and the tree is re-derived through that same approved edge.
       const approvedEdgeSha = approvedEdgeShaFor(a.ref);
@@ -159,7 +186,19 @@ export function dropSuspectOverlays({
   root, env, suspects, failed, alert,
 }) {
   for (const s of suspects) {
-    removeOverlay(root, s.ref, { env, why: 'smoke-failed' });
+    // Legacy fallback records can name a ref without binding their smoke evidence to a registration.
+    // An absent CAS token would make removeOverlay unconditional, so keep the entry for operator review.
+    if (typeof s.registrationId !== 'string' || !s.registrationId) {
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
+    try {
+      removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: s.registrationId });
+    } catch (error) {
+      if (!/registration changed/.test(String(error?.message))) throw error;
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
     appendOverlayEvent(root, {
       kind: 'dropped-smoke-failed', ref: s.ref, pr: s.pr, reason: failed,
     }, { env });
@@ -204,7 +243,7 @@ export function staleAlertDetail(result, state) {
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
 export async function finalizeRebuild({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, archiveGuard = true,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -220,6 +259,16 @@ export async function finalizeRebuild({
       mkdirSync(dirname(file), { recursive: true });
       appendFileSync(file, `${JSON.stringify({ at: nowIso(), kind, detail })}\n`, 'utf8');
     } catch { /* best-effort audit trail only */ }
+  };
+  const adoptionRows = () => {
+    const registry = readOverlayState(root, { env });
+    return plan.applied.map((row) => {
+      if (!row.registrationId || (!registry.corrupt && registry.overlays.some((entry) =>
+        entry?.ref === row.ref && entry.registrationId === row.registrationId))) return row;
+      alert('overlay-registration-changed', { ref: row.ref });
+      const { registrationId, ...unbound } = row;
+      return unbound;
+    });
   };
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
@@ -242,10 +291,37 @@ export async function finalizeRebuild({
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
   const headNow = verifyRev(git, 'HEAD');
+  if (headNow !== prevHead && headNow !== plan.finalSha) {
+    alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
+    return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
+  }
+
+  // A sibling tick may archive a source while this build smokes unlocked. Check the current registry
+  // before EVERY adoption, including already-adopted: its onAdopted callback can still drop carriers.
+  // A mainOnly rebuild never edits the overlay list, so it skips this (as its planning does).
+  if (archiveGuard) {
+    const registry = readOverlayState(root, { env });
+    let uncovered = [];
+    let error = null;
+    if (registry.corrupt) error = 'overlay registry unreadable';
+    else {
+      try { uncovered = archiveUncovered(git, registry.overlays, plan.finalSha); }
+      catch (e) { error = String(e?.message ?? e); }
+    }
+    if (error) uncovered = (registry.overlays ?? []).filter((o) => o?.retiredSources?.length);
+    if (error || uncovered.length) {
+      const refs = uncovered.map((o) => o.ref);
+      alert('overlay-source-unavailable', { refs, failed: `archive-source-uncovered: ${refs.join(', ')}`, target: plan.finalSha,
+        ...(error ? { error } : {}),
+        message: 'Finalize cannot prove archived content is preserved; keeping the running build and overlay registrations.' });
+      return terminal({ moved: false, reason: error ? 'overlay-source-unverifiable' : 'overlay-source-unavailable', plan });
+    }
+  }
+
   if (headNow === plan.finalSha) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
       };
       state.rejected = null;
       state.held = null;
@@ -254,10 +330,6 @@ export async function finalizeRebuild({
     return terminal({
       moved: false, adopted: true, reason: 'already-adopted', head: plan.finalSha, plan,
     });
-  }
-  if (headNow !== prevHead) {
-    alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
-    return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
   }
 
   // Re-run the same safety gate `prepareRebuild` already passed — the tree could, in principle, have picked up
@@ -301,7 +373,7 @@ export async function finalizeRebuild({
       });
     }
     state.adopted = {
-      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
     };
     state.rejected = null;
     state.held = null;

@@ -33,6 +33,7 @@ import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
+import { fetchMainAndOverlays } from '../daemon-rebuild/edge-fetch.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -126,6 +127,8 @@ function makeFixture() {
     WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,
+    // Historical planner fixtures retain their registry semantics; retirement cases opt in explicitly.
+    WE_DAEMON_OVERLAY_AUTO_RETIRE: 'off',
   };
   return { base, originDir, cloneDir, stateDir, lockDir, overlayDir, env };
 }
@@ -148,6 +151,29 @@ function conflictFixture({ replay = false } = {}) {
   const overlays = [{ ref: 'lane/a', pr: 1 }, { ref: 'lane/b', pr: 2 }];
   return { ...f, a, b, runGit, main, overlays };
 }
+
+describe('fetchMainAndOverlays — malformed registry recovery', () => {
+  it.each([false, true])('fetches main and valid overlays without malformed ref evidence (batch failure: %s)', (batchFails) => {
+    const git = vi.fn((args) => ({ status: batchFails && args[0] === 'fetch' && args.length > 5 ? 1 : 0 }));
+    const result = fetchMainAndOverlays({ git, edgeResolve: false,
+      overlays: [null, { ref: 'lane/valid' }, [], 'bad', {}, { ref: 123 }, { ref: '' }] });
+    expect(result).toMatchObject({ ok: true, goneRefs: [], malformed: [0, 2, 3, 4, 5, 6] });
+    expect([...result.refEvidence]).toEqual([['lane/valid', 'refreshed']]);
+    expect(git).toHaveBeenCalledWith(['fetch', '--quiet', '--prune', 'origin',
+      '+refs/heads/main:refs/remotes/origin/main', '+refs/heads/lane/valid:refs/remotes/origin/lane/valid']);
+    if (batchFails) expect(git).toHaveBeenCalledWith(['fetch', '--quiet', '--prune', 'origin',
+      '+refs/heads/main:refs/remotes/origin/main']);
+  });
+
+  it('reports malformed entries even when main cannot be fetched', () => {
+    const git = vi.fn(() => ({ status: 1 }));
+    expect(fetchMainAndOverlays({ git, overlays: [null] })).toMatchObject({
+      ok: false, reason: 'fetch-failed', malformed: [0],
+    });
+    expect(git).toHaveBeenCalledWith(['fetch', '--quiet', '--prune', 'origin',
+      '+refs/heads/main:refs/remotes/origin/main']);
+  });
+});
 
 describe('overlay conflict resolution', () => {
   const plan = (f, options = {}) => planRebuild({
@@ -670,8 +696,9 @@ describe('rebuildClone', () => {
     expect(slow?.detail).toMatchObject({ ms: 209_000, checks: 'lane-acquire-release:171834ms' });
   });
 
-  it('removes an overlay whose content already landed on main in a different (squashed) form', async () => {
+  it.each(['off', 'shadow', 'on'])('%s removes an overlay whose content already landed on main in a different (squashed) form', async (mode) => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     pushBranch(originDir, 'lane/squashed', (dir) => writeFile(dir, 'squash.txt', 'same content\n'));
     // main picks up the SAME content plus an unrelated change in ONE commit — a different patch-id than the
     // overlay's own commit, so `git cherry` will NOT see it as upstream-equivalent; only the tree-equality
@@ -734,20 +761,63 @@ describe('rebuildClone', () => {
     expect(existsSync(join(cloneDir, 'c.txt'))).toBe(false);
   });
 
-  it('removes an overlay whose ref was deleted on origin', async () => {
+  it('refuses a deleted overlay without recorded commit evidence and preserves main and healthy overlays', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/gone', (dir) => writeFile(dir, 'd.txt', 'hello d\n'));
     addOverlay(cloneDir, { ref: 'lane/gone' }, { env });
     deleteBranch(originDir, 'lane/gone');
+    advanceMain(originDir, (dir) => writeFile(dir, 'new-main.txt', 'new main\n'));
+    pushBranch(originDir, 'lane/healthy', (dir) => writeFile(dir, 'healthy.txt', 'healthy\n'));
+    addOverlay(cloneDir, { ref: 'lane/healthy' }, { env });
+    const headBefore = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const registrations = readOverlays(cloneDir, { env });
 
     const runSmoke = passSmoke();
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
     });
 
-    expect(readOverlays(cloneDir, { env })).toEqual([]);
-    expect(result.alerts.some((a) => a.kind === 'overlay-auto-dropped' && a.detail?.reason === 'ref-gone')).toBe(true);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/gone', 'lane/healthy']);
+    expect(result).toMatchObject({ moved: false, reason: 'pinned-overlay-unavailable', detail: { pinnedBy: 'unknown' } });
+    expect(result.alerts.some((a) => a.kind === 'pinned-overlay-unavailable')).toBe(true);
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+    expect(readOverlays(cloneDir, { env })).toEqual(registrations);
     expect(existsSync(join(cloneDir, 'd.txt'))).toBe(false);
+    expect(existsSync(join(cloneDir, 'new-main.txt'))).toBe(false);
+    expect(existsSync(join(cloneDir, 'healthy.txt'))).toBe(false);
+  });
+
+  it('discards a saved candidate carrying an overlay whose refresh failed while advancing main', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    const tipSha = pushBranch(originDir, 'lane/stale', (dir) => writeFile(dir, 'stale-overlay.txt', 'stale\n'));
+    addOverlay(cloneDir, { ref: 'lane/stale' }, { env });
+    // Establish non-mechanism pin evidence independently of the not-yet-adopted saved candidate.
+    writeOverlays(cloneDir, readOverlays(cloneDir, { env }).map((o) => ({ ...o, tipSha })), { env });
+    const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'new-main.txt', 'new main\n'));
+    const readOpts = { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, owner: 'stale-overlay-reader' };
+    const options = { root: cloneDir, env, prState: async () => null, lockOpts: { waitMs: 30, pollMs: 5 } };
+    const first = await rebuildClone({ ...options, runSmoke: async () => {
+      expect(acquireRead(cloneDir, readOpts).ok).toBe(true);
+      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    } });
+    expect(first.reason).toBe('tick-in-progress');
+    releaseRead(cloneDir, readOpts);
+    const runSmoke = passSmoke();
+    const second = await rebuildClone({ ...options, runSmoke, run: (args, opts = {}) => {
+      if (args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/lane/stale:'))) return { status: 1 };
+      // Keep the cached tip to prove candidate eligibility, rather than tracking-ref deletion, rejects it.
+      if (args[0] === 'update-ref' && args[1] === '-d' && args[2] === 'refs/remotes/origin/lane/stale') return { status: 1 };
+      return gitRun(args, { cwd: cloneDir, env: { ...env, ...opts.env } });
+    } });
+    expect(second).toMatchObject({ moved: true, adopted: true });
+    expect(second.alerts).toContainEqual(expect.objectContaining({
+      kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'overlay-no-longer-wanted' }),
+    }));
+    expect(runSmoke).toHaveBeenCalled();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
+    expect(existsSync(join(cloneDir, 'stale-overlay.txt'))).toBe(false);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/stale']);
   });
 
   it('refuses a dirty tree (uncommitted change to a TRACKED file) without touching anything', async () => {
@@ -955,6 +1025,45 @@ describe('rebuildClone', () => {
     expect(existsSync(join(cloneDir, 'planted.txt'))).toBe(true);
   });
 
+  it.each([false, true])('malformed registry entries refuse builds and retirement but allow mainOnly recovery (%s)', async (mainOnly) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
+    pushBranch(originDir, 'lane/landed', (dir) => writeFile(dir, 'landed.txt', 'landed\n'));
+    addOverlay(cloneDir, { ref: 'lane/landed' }, { env });
+    const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'landed.txt', 'landed\n'));
+    writeOverlays(cloneDir, [null, ...readOverlays(cloneDir, { env })], { env });
+    const registryBefore = readFileSync(overlayFilePath(cloneDir, env), 'utf8');
+    const headBefore = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const runSmoke = passSmoke();
+    const options = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS };
+
+    if (!mainOnly) {
+      const refused = await rebuildClone(options);
+      expect(refused).toMatchObject({ moved: false, reason: 'overlay-state-malformed' });
+      expect(refused.alerts).toContainEqual(expect.objectContaining({
+        kind: 'overlay-state-malformed', detail: expect.objectContaining({ malformed: [0] }),
+      }));
+      expect(runSmoke).not.toHaveBeenCalled();
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+      expect(gitOk(cloneDir, ['rev-parse', 'origin/main']).trim()).toBe(mainSha);
+      expect(readFileSync(overlayFilePath(cloneDir, env), 'utf8')).toBe(registryBefore);
+
+      const preview = await dryRunRebuild(options);
+      expect(preview).toMatchObject({ wouldDo: 'refuse', plan: { ok: false, reason: 'overlay-state-malformed' } });
+      const registration = await previewOverlayConflict({ ...options, ref: 'lane/candidate', existingOverlays: [null] });
+      expect(registration).toMatchObject({ ok: false, reason: 'overlay-state-malformed' });
+      return;
+    }
+
+    const recovered = await rebuildClone({ ...options, mainOnly: true });
+    expect(recovered).toMatchObject({ moved: true, adopted: true });
+    expect(recovered.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-state-malformed' }));
+    expect(runSmoke).toHaveBeenCalledOnce();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
+    expect(readFileSync(join(cloneDir, 'landed.txt'), 'utf8')).toBe('landed\n');
+    expect(readFileSync(overlayFilePath(cloneDir, env), 'utf8')).toBe(registryBefore);
+  });
+
   it('mainOnly ignores every overlay', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/refused', (dir) => writeFile(dir, 'f.txt', 'x\n'));
@@ -979,8 +1088,10 @@ describe('rebuildClone', () => {
   // local commit and froze the rebuild with `local-commits`, forever, on a perfectly safe clone.
   it('an adopted overlay squash-merged + branch-deleted on origin is auto-dropped next rebuild — never refused as local-commits', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    pushBranch(originDir, 'lane/squash-drop', (dir) => writeFile(dir, 'squash-drop.txt', 'overlay content\n'));
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
+    const sha = pushBranch(originDir, 'lane/squash-drop', (dir) => writeFile(dir, 'squash-drop.txt', 'overlay content\n'));
     addOverlay(cloneDir, { ref: 'lane/squash-drop' }, { env });
+    writeOverlays(cloneDir, readOverlays(cloneDir, { env }).map((o) => ({ ...o, sha })), { env });
 
     const runSmoke = passSmoke();
     const first = await rebuildClone({
@@ -1003,7 +1114,8 @@ describe('rebuildClone', () => {
     expect(second.reason).not.toBe('local-commits');
     expect(second.moved).toBe(true);
     expect(readOverlays(cloneDir, { env })).toEqual([]);
-    expect(second.alerts.some((a) => a.kind === 'overlay-auto-dropped' && a.detail?.reason === 'ref-gone')).toBe(true);
+    const events = readFileSync(overlayFilePath(cloneDir, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toContainEqual(expect.objectContaining({ by: 'auto-retire', ref: 'lane/squash-drop', sha, reason: 'landed-by-content' }));
     expect(existsSync(join(cloneDir, 'squash-drop.txt'))).toBe(true);
     // Lands on PLAIN main — no overlay merge commit left in the picture.
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(gitOk(cloneDir, ['rev-parse', 'origin/main']).trim());
@@ -1868,17 +1980,101 @@ describe('rebuildClone — pinned overlays never conflict-drop (self-destruct gu
     expect(readOverlays(cloneDir, { env })[0]).toMatchObject({ ref: 'lane/pinned-plain', pinned: true });
   });
 
-  it('a pinned overlay whose ref vanished (PR not merged) refuses instead of auto-dropping', async () => {
+  it.each(['off', 'shadow', 'on'].flatMap((mode) => ['flag', 'mechanism'].flatMap((pin) =>
+    ['transient', 'deleted'].map((failure) => [mode, pin, failure]))))(
+    'failed refresh preserves an adopted pinned overlay (%s, %s, %s)', async (mode, pin, failure) => {
+      const { originDir, cloneDir, env } = makeFixture();
+      env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+      const file = pin === 'flag' ? 'pinned.txt' : 'scripts/lib/daemon-rebuild.mjs';
+      pushBranch(originDir, 'lane/pinned-refresh', (dir) => writeFile(dir, file, 'pinned content\n'));
+      addOverlay(cloneDir, { ref: 'lane/pinned-refresh', pinned: pin === 'flag' }, { env });
+      const first = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), lockOpts: LOCK_OPTS });
+      expect(first).toMatchObject({ moved: true, adopted: true });
+      const headBefore = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+      const overlaySha = readRebuildState(cloneDir, env).adopted.applied.find((o) => o.ref === 'lane/pinned-refresh').sha;
+      const registrations = readOverlays(cloneDir, { env });
+      advanceMain(originDir, (dir) => writeFile(dir, 'main-after-pin.txt', 'advanced\n'));
+      if (failure === 'deleted') deleteBranch(originDir, 'lane/pinned-refresh');
+      const runSmoke = passSmoke();
+      const run = (args, opts = {}) => {
+        if (failure === 'transient' && args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/lane/pinned-refresh:'))) {
+          return { status: 1, stdout: '', stderr: 'injected transient overlay fetch failure' };
+        }
+        return gitRun(args, { cwd: cloneDir, env: { ...env, ...opts.env } });
+      };
+      const second = await rebuildClone({ root: cloneDir, env, run, runSmoke, lockOpts: LOCK_OPTS });
+      expect(second).toMatchObject({ moved: false, reason: 'pinned-overlay-unavailable', detail: { pinnedBy: pin } });
+      expect(runSmoke).not.toHaveBeenCalled();
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+      expect(readFileSync(join(cloneDir, file), 'utf8')).toBe('pinned content\n');
+      expect(readOverlays(cloneDir, { env })).toEqual(registrations);
+      expect(readRebuildState(cloneDir, env).held).toMatchObject({ reason: 'pinned-overlay-unavailable', lastGood: headBefore });
+      if (failure === 'deleted') gitOk(cloneDir, ['push', '-q', 'origin', `${overlaySha}:refs/heads/lane/pinned-refresh`]);
+      const recovered = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), lockOpts: LOCK_OPTS });
+      expect(recovered).toMatchObject({ moved: true, adopted: true });
+      expect(readFileSync(join(cloneDir, file), 'utf8')).toBe('pinned content\n');
+      expect(readFileSync(join(cloneDir, 'main-after-pin.txt'), 'utf8')).toBe('advanced\n');
+      expect(readRebuildState(cloneDir, env).held).toBeNull();
+    });
+
+  it.each(['recorded', 'missing', 'short', 'non-string'])(
+    'lost rebuild state keeps an unavailable mechanism overlay (%s tipSha)', async (tipKind) => {
+      const { originDir, cloneDir, env } = makeFixture();
+      pushMechanismOverlay(originDir, 'lane/lost-state');
+      addOverlay(cloneDir, { ref: 'lane/lost-state' }, { env });
+      const first = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), lockOpts: LOCK_OPTS });
+      expect(first).toMatchObject({ moved: true, adopted: true });
+      const sha = readRebuildState(cloneDir, env).adopted.applied[0].sha;
+      const registration = readOverlays(cloneDir, { env })[0];
+      const tipSha = tipKind === 'recorded' ? sha : tipKind === 'short' ? sha.slice(0, 10)
+        : tipKind === 'non-string' ? [sha] : undefined;
+      writeOverlays(cloneDir, [{ ...registration, tipSha }], { env });
+      const registrations = readOverlays(cloneDir, { env });
+      const headBefore = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+      rmSync(rebuildStatePath(cloneDir, env));
+      advanceMain(originDir, (dir) => writeFile(dir, 'new-main.txt', 'advanced\n'));
+
+      const runSmoke = passSmoke();
+      const run = (args, opts = {}) => {
+        if (args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/lane/lost-state:'))) return { status: 1 };
+        // Keep the cached ref so the independent local-commits safety guard cannot mask a lost-state drop.
+        // Its presence is not fresh evidence: pin classification must use the registry's recorded tip.
+        if (args[0] === 'update-ref' && args[1] === '-d' && args[2] === 'refs/remotes/origin/lane/lost-state') return { status: 1 };
+        return gitRun(args, { cwd: cloneDir, env: { ...env, ...opts.env } });
+      };
+      const result = await rebuildClone({ root: cloneDir, env, run, runSmoke, lockOpts: LOCK_OPTS });
+      expect(result).toMatchObject({ moved: false, reason: 'pinned-overlay-unavailable', detail: {
+        ref: 'lane/lost-state', sha: tipKind === 'recorded' ? sha : null,
+        pinnedBy: tipKind === 'recorded' ? 'mechanism' : 'unknown',
+      } });
+      expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'pinned-overlay-unavailable' }));
+      expect(runSmoke).not.toHaveBeenCalled();
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+      expect(readFileSync(join(cloneDir, 'scripts/lib/daemon-rebuild.mjs'), 'utf8')).toBe('// the rebuild mechanism\n');
+      expect(readOverlays(cloneDir, { env })).toEqual(registrations);
+      expect(existsSync(join(cloneDir, 'new-main.txt'))).toBe(false);
+    });
+
+  it('a pinned overlay whose ref vanished refuses advancement and stays registered', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/pinned-gone', (dir) => writeFile(dir, 'g.txt', 'g\n'));
     addOverlay(cloneDir, { ref: 'lane/pinned-gone', pinned: true }, { env });
     deleteBranch(originDir, 'lane/pinned-gone');
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-after-pin.txt', 'advanced\n'));
 
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS,
     });
-    expect(result.moved).toBe(false);
-    expect(result.reason).toBe('pinned-overlay-unavailable');
+    expect(result).toMatchObject({ moved: false, reason: 'pinned-overlay-unavailable' });
+    expect(existsSync(join(cloneDir, 'main-after-pin.txt'))).toBe(false);
+    expect(result.alerts.some((a) => a.kind === 'pinned-overlay-unavailable')).toBe(true);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/pinned-gone']);
+
+    const mainOnly = await rebuildClone({
+      root: cloneDir, env, mainOnly: true, runSmoke: passSmoke(), lockOpts: LOCK_OPTS,
+    });
+    expect(mainOnly).toMatchObject({ moved: true, adopted: true });
+    expect(readFileSync(join(cloneDir, 'main-after-pin.txt'), 'utf8')).toBe('advanced\n');
     expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/pinned-gone']);
   });
 
