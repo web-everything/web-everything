@@ -88,9 +88,14 @@ export function sameHeadFailedDecision({ pr, head, runs = [], readError = null }
   if (readError) return { hold: true, kind: 'mq-same-head-unreadable', reason: `merge_group failure read errored: ${readError.message ?? readError}`,
     line: `mq-same-head-unreadable: #${pr} head ${short} — merge_group failure read errored (${String(readError.message ?? readError).split('\n')[0].slice(0, 120)}); holding the enqueue` };
   const own = runs.filter(r => r.prHead === head);
-  const inFlight = own.some(r => r.conclusion == null || ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(r.conclusion));
-  const open = own.filter(r => (r.conclusion === 'failure' || r.conclusion === 'timed_out')
-    && !own.some(g => g.conclusion === 'success' && g.workflow === r.workflow && (g.completedAt ?? 0) > (r.completedAt ?? 0)));
+  // Structural inversion: only an exact `success` is good. A first-attempt `cancelled` is GitHub dropping a group because an
+  // entry ahead failed (not this PR's gate), so it is neutral. EVERY other value (failure, timed_out, startup_failure, skipped,
+  // neutral, stale, action_required, unknown, missing, or a cancelled RERUN) is bad until a LATER success of the same workflow.
+  const good = r => r.conclusion === 'success';
+  const inFlight = own.some(r => ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(r.conclusion));
+  const open = own.filter(r => !good(r) && !(r.conclusion === 'cancelled' && Number(r.attempt) === 1)
+    && !['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(r.conclusion)
+    && !own.some(g => good(g) && g.workflow === r.workflow && (g.completedAt ?? 0) > (r.completedAt ?? 0)));
   if (!open.length && !inFlight) return { hold: false };
   const line = `mq-same-head-failed: #${pr} head ${short} — waiting for a new head or green rerun${inFlight ? ' (rerun not finished)' : ''}`;
   return { hold: true, kind: 'mq-same-head-failed', reason: line, line };
@@ -120,9 +125,9 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
       covered = rows.length < 100 || rows.some(r => (Date.parse(r.created_at) || Infinity) < committed);
     }
     if (!covered) throw new Error(`merge_group run history not covered within ${MAX_PAGES} pages`);
-    const mine = all.filter(r => new RegExp(`/pr-${pr}-`).test(r.head_branch ?? '') && r.conclusion !== 'cancelled' && r.conclusion !== 'skipped');
+    const mine = all.filter(r => new RegExp(`/pr-${pr}-`).test(r.head_branch ?? ''));
     if (mine.length > MAX_PR_RUNS) throw new Error(`more than ${MAX_PR_RUNS} merge_group runs for the PR in the window`);
-    const toRun = r => ({ workflow: r.workflow_id ?? r.name, conclusion: done(r) ? r.conclusion : (r.status || 'in_progress'), completedAt: stamp(r) });
+    const toRun = r => ({ workflow: r.workflow_id ?? r.name, attempt: r.run_attempt, conclusion: done(r) ? (r.conclusion ?? 'missing') : (r.status || 'in_progress'), completedAt: stamp(r) });
     const runs = mine.map(r => {
       const parents = readJson(['api', `repos/${repo}/commits/${r.head_sha}`]).parents;
       if (!Array.isArray(parents) || !parents.length || !parents.every(q => SHA.test(q?.sha))) throw new Error(`merge_group commit ${String(r.head_sha).slice(0, 12)} has missing or malformed parent shas`);

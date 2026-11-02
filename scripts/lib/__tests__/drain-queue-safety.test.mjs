@@ -430,7 +430,7 @@ describe('confirmed dequeue', () => {
 
 describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run failed', () => {
   const H = 'b'.repeat(40), OTHER = 'c'.repeat(40);
-  const run = (conclusion, at, prHead = H, workflow = 'CI') => ({ workflow, conclusion, completedAt: at, prHead });
+  const run = (conclusion, at, prHead = H, workflow = 'CI', attempt = 1) => ({ workflow, conclusion, completedAt: at, prHead, attempt });
   const decide = (over = {}) => sameHeadFailedDecision({ pr: 6215, head: H, runs: [], ...over });
 
   it('#6215 pattern: its own gate failed at H, so no enqueue at H and one named line', () => {
@@ -514,6 +514,18 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
       }
       expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: 'nothex', exec: mk({}, good), log: l => lines.push(l) }).kind).toBe('mq-same-head-unreadable');
       expect(lines.length).toBe(4);
+    });
+  });
+  describe('structural inversion: only an exact success releases', () => {
+    const d = runs => sameHeadFailedDecision({ pr: 6215, head: H, runs });
+    it('cancelled rerun (attempt 2), startup_failure and unknown strings hold; success releases', () => {
+      for (const c of ['cancelled', 'startup_failure', 'timed_out', 'neutral', 'skipped', 'stale', 'action_required', 'weird-new-value', 'missing', undefined, null])
+        expect(d([run(c, 100, H, 'CI', 2)]).hold, String(c)).toBe(true);
+      expect(d([run('failure', 100), run('cancelled', 200, H, 'CI', 2)]).hold).toBe(true);
+      expect(d([run('failure', 100), run('success', 200, H, 'CI', 2)]).hold).toBe(false);
+    });
+    it('a first-attempt cancelled run (predecessor failed) stays neutral', () => {
+      expect(d([run('cancelled', 100, H, 'CI', 1)]).hold).toBe(false);
     });
   });
 });
