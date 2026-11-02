@@ -33,7 +33,11 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
 
     it(`${f}: each FUI checkout is preceded by a guarded, least-privilege app-token step`, () => {
       const mints = all.filter((s) => /uses:\s*actions\/create-github-app-token@/.test(s));
-      expect(mints.length).toBe(checkouts.length);
+      // One mint feeds no checkout: ci.yml's changes job mints a token for the queue-tested detector's
+      // frontierui API reads (scripts/ci/skip-queue-tested-push.mjs). It must sit right before that step.
+      const proofMints = mints.filter((m) => /^\s*id:\s*queue\s*$/m.test(all[all.indexOf(m) + 1] ?? ''));
+      expect(proofMints.length).toBe(f === 'ci.yml' ? 1 : 0);
+      expect(mints.length).toBe(checkouts.length + proofMints.length);
       for (const m of mints) {
         expect(m).toMatch(/id:\s*fui-app-token/);
         // The shard also skips card-only changes. Both bare and wrapped expressions must
