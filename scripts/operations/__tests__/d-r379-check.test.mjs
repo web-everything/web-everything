@@ -286,7 +286,7 @@ describe('eligibility guard regression guarantees', () => {
   });
   it.each([
     ['missing path policy', {readSettings:()=>({})}],
-    ['incomplete path policy', {readSettings:()=>({...settings,protectedPaths:[]})}],
+    ['invalid path policy', {readSettings:()=>({...settings,protectedPaths:null})}],
     ['malformed diff', {fetchNetDiff:()=>({paths:['../AGENTS.md'],base})}],
     ['missing diff', {fetchNetDiff:()=>null}],
   ])('refuses eligibility for %s', async (_name, overrides) => {
@@ -833,7 +833,7 @@ describe('round 6 enforcement-tree classification', () => {
     }));
     expect(condition(r,4).status).toBe('UNKNOWN');
   });
-  it.each([{enforcementTrees:[]},{enforcementTrees:null},{reviewedSafePaths:null},
+  it.each([{enforcementTrees:null},{reviewedSafePaths:null},
     {reviewedSafePaths:['']},{reviewedSafePaths:Array(1001).fill('docs/**')}])
   ('keeps invalid classification settings closed: %j', async extra => {
     const r = await checkPr(6223,deps(undefined,{readSettings:()=>({...settings,...extra})}));
@@ -1219,15 +1219,15 @@ describe('round 10 harmless-path allowlist', () => {
     expect(condition(r, 4).evidence.join(' ')).toContain('human review');
     expect(r.eligible).toBe(false);
   });
-  it('protected paths fail even when they match harmlessPaths', async () => {
-    const path = 'tests/image.svg';
+  it('protected paths fail even when they match the built-in harmless allowlist', async () => {
+    const path = 'tests/image.png';
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
     expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
     expect(r.eligible).toBe(false);
   });
   it.each([undefined, null, [], [''], Array(1001).fill('docs/**'), ['x'.repeat(4097)]]
     .map(harmlessPaths => ({harmlessPaths})))
-  ('missing, invalid or oversized harmlessPaths stays closed: %j', async ({harmlessPaths}) => {
+  ('any supplied harmlessPaths key stays closed: %j', async ({harmlessPaths}) => {
     const r = await checkPr(6223, deps(undefined, {
       readSettings: () => ({...settings, harmlessPaths}),
     }));
@@ -1245,60 +1245,79 @@ describe('round 10 harmless-path allowlist', () => {
   });
 });
 
-describe('round 12 trusted minimum path policy', () => {
-  const canaries = ['scripts/guard-bash.mjs', 'scripts/lib/jury-core.mjs',
-    'scripts/review-set-label.mjs', '.github/workflows/ci.yml', 'package.json',
-    'tests/a/b.test.mjs', 'docs/agent/platform-decisions.md', 'AGENTS.md'];
-  const closed = async policy => {
-    const r = await checkPr(6223, deps(undefined, {readSettings: () => policy}));
+describe('round 17 code-owned path policy', () => {
+  const minimal = {rulingRecordPaths: settings.rulingRecordPaths};
+  const empty = {...minimal, protectedPaths: [], directionPaths: [], enforcementTrees: []};
+  it.each([undefined, null, [], ['docs/examples/**/*.md'], ['**']])
+  ('rejects the harmlessPaths key regardless of its value: %j', async harmlessPaths => {
+    const r = await checkPr(6223, deps(undefined, {
+      readSettings: () => ({...settings, harmlessPaths}),
+    }));
     for (const id of [3, 4]) {
       expect(condition(r, id).status).toBe('UNKNOWN');
       expect(condition(r, id).evidence.join(' ')).toContain('human review');
     }
     expect(r.eligible).toBe(false);
-  };
-  it('rejects a replacement policy containing only a universal harmless allowlist', async () => {
-    await closed({harmlessPaths: ['**']});
   });
-  it.each(['**', '*', '**/*', ...canaries, 'docs/**/*.md'])
-  ('rejects dangerous harmless entry %s even beside a valid policy', async pattern => {
-    await closed({...settings, harmlessPaths: [...settings.harmlessPaths, pattern]});
-  });
-  it('rejects empty protectedPaths', async () => {
-    await closed({...settings, protectedPaths: []});
-  });
-  it.each(canaries.slice(0, 5))('rejects missing protection for canary %s', async missing => {
-    await closed({...settings, protectedPaths: canaries.slice(0, 5).filter(path => path !== missing),
-      enforcementTrees: ['unrelated/**']});
-  });
-  it('accepts canary coverage supplied entirely by enforcement trees', async () => {
-    const r = await checkPr(6223, deps(undefined, {readSettings: () => ({...settings,
-      protectedPaths: ['unrelated/**'], enforcementTrees: canaries.slice(0, 5)})}));
+  it.each([['empty', empty], ['omitted', minimal]])
+  ('%s additions retain the built-in harmless allowlist', async (_name, policy) => {
+    const r = await checkPr(6223, deps(undefined, {readSettings: () => policy}));
     expect(r.eligible).toBe(true);
   });
-  it('rejects a policy that no longer recognizes ordinary example Markdown', async () => {
-    await closed({...settings, harmlessPaths: ['backlog/*.md']});
-  });
-  it('shipped harmless entries exclude every canary and include ordinary example Markdown', () => {
-    for (const path of canaries) {
-      expect(settings.harmlessPaths.some(glob => matchesGlob(path, glob))).toBe(false);
-    }
-    expect(settings.harmlessPaths.some(glob => matchesGlob('docs/examples/x.md', glob))).toBe(true);
-  });
-  it.each(['scripts/settings/d-r379-protected-paths.json',
+  it.each(['scripts/guard-bash.mjs', 'scripts/lib/jury-core.mjs',
+    'scripts/review-set-label.mjs', '.github/workflows/ci.yml', 'package.json',
+    'tests/security.test.ts', 'scripts/lib/delivery-platform-preferences.json',
+    'scripts/settings/d-r379-protected-paths.json',
     'scripts/operations/d-r379-check.mjs', 'scripts/operations/d-r379-check-io.mjs',
     'scripts/operations/__tests__/d-r379-check.test.mjs',
     'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
     'scripts/operations/__fixtures__/d-r379/nested/policy.json'])
-  ('built-in protection for %s wins over permissive policy', async path => {
+  ('empty or omitted additions cannot remove built-in protection for %s', async path => {
+    for (const policy of [empty, minimal]) {
+      const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
+        readSettings: () => policy,
+      }));
+      expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
+      expect(r.eligible).toBe(false);
+    }
+  });
+  it.each(['scripts/example.png', '.github/example.png', '.claude/example.png',
+    'skills-src/example.png', 'docs/agent/example.png', 'docs/prompts/example.md'])
+  ('empty enforcement additions cannot bless harmless-looking %s', async path => {
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-      readSettings: () => ({...settings, protectedPaths: ['unrelated/**'],
-        enforcementTrees: canaries.slice(0, 5),
-        harmlessPaths: [...settings.harmlessPaths, path]}),
+      readSettings: () => empty,
     }));
-    expect(condition(r, 3).status).toBe('PASS');
-    expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
+    expect(condition(r, 4).status).toBe('UNKNOWN');
     expect(r.eligible).toBe(false);
+  });
+  it('empty direction additions cannot remove conformance-vector protection', async () => {
+    const path = 'conformance-vectors/x.md';
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
+      readSettings: () => empty,
+    }));
+    expect(condition(r, 3)).toMatchObject({status: 'FAIL', evidence: [`direction path: ${path}`]});
+    expect(r.eligible).toBe(false);
+  });
+  it.each([
+    ['protectedPaths', 'docs/examples/protected.md', 4, 'FAIL'],
+    ['directionPaths', 'docs/examples/direction.md', 3, 'FAIL'],
+    ['enforcementTrees', 'docs/examples/enforcement.md', 4, 'UNKNOWN'],
+  ])('JSON %s additions extend built-in protection', async (key, path, id, status) => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
+      readSettings: () => ({...empty, [key]: [path]}),
+    }));
+    expect(condition(r, id).status).toBe(status);
+    expect(r.eligible).toBe(false);
+  });
+  it.each(['protectedPaths', 'directionPaths', 'enforcementTrees'])
+  ('oversized %s additions require human review', async key => {
+    const r = await checkPr(6223, deps(undefined, {
+      readSettings: () => ({...empty, [key]: Array(1001).fill('extra/**')}),
+    }));
+    for (const id of [3, 4]) {
+      expect(condition(r, id).status).toBe('UNKNOWN');
+      expect(condition(r, id).evidence.join(' ')).toContain('human review');
+    }
   });
 });
 

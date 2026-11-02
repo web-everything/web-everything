@@ -12,16 +12,6 @@
     "src/_includes/*-descriptions/**"
   ],
   "rulingRecordPaths": ["docs/agent/platform-decisions.md"],
-  "harmlessPaths": [
-    "docs/examples/**/*.md",
-    "backlog/*.md",
-    "docs/*.md",
-    "docs/topics/**/*.md",
-    "README*.md",
-    "**/*.png",
-    "**/*.jpg",
-    "**/*.webp"
-  ],
   "enforcementTrees": [
     "scripts/**",
     ".github/**",
