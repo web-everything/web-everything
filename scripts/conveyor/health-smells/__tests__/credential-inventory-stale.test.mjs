@@ -26,7 +26,7 @@ describe('credential-inventory-stale', () => {
     const tick = (s) => { const r = runHealthTick(state, { credentialInventory: s }, [smell], now); state = r.state; return r; };
     const partial = sample(); partial.repositories[0].secrets.complete = false; partial.repositories[0].ci.complete = false;
     expect(tick(partial).transitions.filter((t) => t.type === 'opened')).toHaveLength(2);
-    partial.secrets = [];
+    partial.secrets.splice(0);
     partial.ciFindings = [];
     expect(tick(partial).transitions).toHaveLength(0);
     expect(tick(sample(1, false)).transitions.filter((t) => t.type === 'closed')).toHaveLength(0);
