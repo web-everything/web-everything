@@ -147,8 +147,9 @@ export function readFromFreshOrigin({ repo, checkCoverage, root = rootDir(), exe
     // Dependencies are installed per checkout; reuse this one's (the fresh tree has the same lockfile family).
     if (!existsSync(join(root, 'node_modules'))) throw new Error('node_modules missing in this checkout');
     symlinkSync(join(root, 'node_modules'), join(tree, 'node_modules'));
-    const script = `import(${JSON.stringify(join(tree, 'scripts/operations/judge-sweep-facts-io.mjs'))})`
-      + `.then(m => process.stdout.write(JSON.stringify(m.createJudgeSweepFactsReader({ checkoutState: () => ({ behind: 0 }) })(${JSON.stringify({ repo, checkCoverage })}))))`;
+    // Static child import keeps this generated program from making daemon import closures incomplete.
+    const script = `import { createJudgeSweepFactsReader } from ${JSON.stringify(join(tree, 'scripts/operations/judge-sweep-facts-io.mjs'))};`
+      + `process.stdout.write(JSON.stringify(createJudgeSweepFactsReader({ checkoutState: () => ({ behind: 0 }) })(${JSON.stringify({ repo, checkCoverage })})));`;
     try {
       return JSON.parse(String(exec(process.execPath, ['--input-type=module', '-e', script], { cwd: tree, encoding: 'utf8',
         timeout: 600_000, maxBuffer: 64 * 1024 * 1024 })));
