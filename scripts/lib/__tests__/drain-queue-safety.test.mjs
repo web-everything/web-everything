@@ -17,6 +17,9 @@ describe('merge-queue same-head failure admission', () => {
     beforeCommit: { oid: 'b'.repeat(40), parents: { nodes: [{ oid: prior }, { oid: testedHead }] } },
   });
   const added = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:00:00Z' };
+  const pushed = (after = head, createdAt = '2026-11-01T13:00:00Z') => ({
+    __typename: 'HeadRefForcePushedEvent', createdAt, beforeCommit: { oid: prior }, afterCommit: { oid: after },
+  });
   const timeline = (...nodes) => ({ nodes, hasPreviousPage: false });
   const decide = evidence => decideMqSameHead({ pr, head, timeline: evidence });
   const released = { hold: false, line: null };
@@ -29,6 +32,11 @@ describe('merge-queue same-head failure admission', () => {
   const response = evidence => JSON.stringify({ data: { repository: { pullRequest: {
     timelineItems: { nodes: evidence.nodes, pageInfo: { hasPreviousPage: evidence.hasPreviousPage } },
   } } } });
+  const queueResponse = (inQueue = false, queueHead = head) => JSON.stringify({ data: { repository: {
+    pullRequest: { isInMergeQueue: inQueue, headRefOid: queueHead },
+  } } });
+  const withQueue = read => vi.fn((command, args) => args.some(arg => arg.includes('isInMergeQueue'))
+    ? queueResponse() : read(command, args));
 
   it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
     expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
@@ -63,6 +71,59 @@ describe('merge-queue same-head failure admission', () => {
   it('compares reasons case-insensitively and trims whitespace', () => {
     expect(decide(timeline(removed(' FaIlEd_ChEcKs ')))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
   });
+  it.each([[head.toUpperCase(), head], [head, head.toUpperCase()], [head.toUpperCase(), head.toUpperCase()]])(
+    'compares tested OID %s and current OID %s case-insensitively', (testedHead, currentHead) => {
+      expect(decideMqSameHead({ pr, head: currentHead, timeline: timeline(removed('failed_checks', testedHead)) }).hold).toBe(true);
+    });
+  // Prevention owed: add recorded GitHub merge_conflict and branch_protection_failure payloads here.
+  // These null-beforeCommit fixtures are synthetic; this repair runs without live GitHub access.
+  it('releases old unbound failures after a server-timestamped force push to the current head', () => {
+    for (const reason of ['merge_conflict', 'branch_protection_failure', 'invalid_merge_commit']) {
+      expect(decide(timeline({ ...removed(reason), beforeCommit: null }, pushed()))).toEqual(released);
+    }
+  });
+  it('property: any number of older unbound failures cannot hold a proven new head forever', () => {
+    // Deterministically vary heads, event counts, timestamps and payload order.
+    for (let seed = 1; seed <= 64; seed++) {
+      const currentHead = seed.toString(16).padStart(40, '0');
+      const events = Array.from({ length: seed % 20 + 1 }, (_, i) => ({
+        ...removed(i % 2 ? 'merge_conflict' : 'branch_protection_failure'), beforeCommit: null,
+        createdAt: new Date(Date.UTC(2026, 10, 1, 0, 0, i)).toISOString(),
+      }));
+      events.push(pushed(currentHead));
+      if (seed % 2) events.reverse();
+      expect(decideMqSameHead({ pr, head: currentHead, timeline: timeline(...events) })).toEqual(released);
+    }
+  });
+  it.each([
+    ['other head', pushed(prior)],
+    ['same timestamp', pushed(head, '2026-11-01T12:00:00Z')],
+    ['earlier push', pushed(head, '2026-11-01T11:00:00Z')],
+    ['invalid push time', pushed(head, 'invalid')],
+    ['missing prior binding', { ...pushed(), beforeCommit: null }],
+    ['unchanged head', { ...pushed(), beforeCommit: { oid: head } }],
+  ])('an unbound failure still holds with insufficient head-change proof: %s', (_label, event) => {
+    expectHold(decide(timeline({ ...removed(), beforeCommit: null }, event)), /no commit binding/i);
+  });
+  it.each([undefined, 'invalid', '2026-11-01T14:00:00Z'])('an unbound failure with missing/invalid/newer time %s still holds', createdAt => {
+    expectHold(decide(timeline({ ...removed(), beforeCommit: null, createdAt }, pushed())), /no commit binding/i);
+  });
+  it('a head-change event cannot erase a bound failure on this head or a later unbound failure', () => {
+    expectHold(decide(timeline(pushed(), removed())), /failed_checks/);
+    expectHold(decide(timeline({ ...removed(), beforeCommit: null }, pushed(),
+      { ...removed(), beforeCommit: null, createdAt: '2026-11-01T14:00:00Z' })), /no commit binding/i);
+    expect(decide(timeline(pushed(head.toUpperCase()), { ...removed(), beforeCommit: null }))).toEqual(released);
+  });
+  it('restoring a previously failed head does not erase its unbound failure', () => {
+    const away = { ...pushed(prior, '2026-11-01T12:30:00Z'), beforeCommit: { oid: head } };
+    const failure = { ...removed(), beforeCommit: null };
+    // An already-observed head at failure time is not a new head when it is restored later.
+    expectHold(decide(timeline(pushed(head, '2026-11-01T11:00:00Z'), failure, away, pushed())), /no commit binding/i);
+    // Nor can the first observation being a push AWAY from this head prove it was new later.
+    expectHold(decide(timeline(failure, away, pushed())), /no commit binding/i);
+    // A failure between the first introduction and a later restoration also stays held.
+    expectHold(decide(timeline(pushed(head, '2026-11-01T11:00:00Z'), failure, pushed())), /no commit binding/i);
+  });
   it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
     expectHold(decide(evidence), /unreadable/i);
   });
@@ -72,14 +133,14 @@ describe('merge-queue same-head failure admission', () => {
   it.each([null, { parents: { nodes: [] } }, { parents: { nodes: [{ oid: head }] } }])('an unbound failure removal holds with no commit binding (%j)', beforeCommit => {
     expectHold(decide(timeline({ ...removed(), beforeCommit })), /no commit binding/i);
   });
-  it.each(['', undefined, null])('an empty or missing head %s holds', missingHead => {
+  it.each(['', undefined, null, 'invalid', 'g'.repeat(40), `${head}\n`])('an empty, missing or malformed head %s holds', missingHead => {
     const result = decideMqSameHead({ pr, head: missingHead, timeline: timeline() });
     expect(result.hold).toBe(true);
     expect(result.line).toMatch(/head/i);
   });
 
   it('readMqTimeline issues exactly one gh graphql call with last:100 and reads the second-parent binding and cap', () => {
-    const evidence = { nodes: [removed(), added], hasPreviousPage: true };
+    const evidence = { nodes: [removed(), added, pushed()], hasPreviousPage: true };
     const exec = vi.fn(() => response(evidence));
     expect(readMqTimeline({ repo, pr, exec })).toEqual(evidence);
     expect(exec).toHaveBeenCalledTimes(1);
@@ -90,12 +151,13 @@ describe('merge-queue same-head failure admission', () => {
     const query = args.find(arg => arg.startsWith('query='));
     expect(query).toBeDefined();
     const compact = query.replace(/\s+/g, '');
-    expect(compact).toMatch(/timelineItems\(last:100,itemTypes:\[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT\]\)/);
+    expect(compact).toMatch(/timelineItems\(last:100,itemTypes:\[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,HEAD_REF_FORCE_PUSHED_EVENT\]\)/);
     expect(compact).toContain('pageInfo{hasPreviousPage}');
     expect(compact).toMatch(/\.\.\.onRemovedFromMergeQueueEvent\{/);
     expect(compact).toContain('beforeCommit{oidparents(first:2){nodes{oid}}}');
     expect(compact).toContain('reason');
     expect(compact).toContain('createdAt');
+    expect(compact).toContain('...onHeadRefForcePushedEvent{createdAtbeforeCommit{oid}afterCommit{oid}}');
     // Arguments may use GraphQL variables or literals, but must identify this repo and PR.
     expect(args.join(' ')).toContain('fixture');
     expect(args.join(' ')).toContain('drain');
@@ -110,28 +172,47 @@ describe('merge-queue same-head failure admission', () => {
     ['missing pull request', () => JSON.stringify({ data: { repository: { pullRequest: null } } })],
     ['malformed timeline nodes', () => response({ nodes: null, hasPreviousPage: false })],
   ])('unreadable timeline (%s) returns an error and the guard holds and logs it', (_label, read) => {
-    const exec = vi.fn(read);
+    const exec = withQueue(read);
     expect(readMqTimeline({ repo, pr, exec })).toEqual({ error: expect.any(String) });
     expect(exec).toHaveBeenCalledTimes(1);
     exec.mockClear();
     const log = vi.fn();
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expectHold(result, /unreadable/i);
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledTimes(2);
     expect(log.mock.calls).toEqual([[result.line]]);
   });
   it('mqSameHeadGuard composes the read and decision and logs the exact hold line', () => {
-    const exec = vi.fn(() => response(timeline(removed()))), log = vi.fn();
+    const exec = withQueue(() => response(timeline(removed()))), log = vi.fn();
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expect(result).toEqual(decide(timeline(removed())));
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledTimes(2);
     expect(log.mock.calls).toEqual([[result.line]]);
   });
   it('mqSameHeadGuard releases manual removal without logging a hold', () => {
-    const exec = vi.fn(() => response(timeline(removed('manual')))), log = vi.fn();
+    const exec = withQueue(() => response(timeline(removed('manual')))), log = vi.fn();
+    expect(mqSameHeadGuard({ repo, pr, head, exec, log })).toEqual(released);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(log).not.toHaveBeenCalled();
+  });
+  it('a manual same-head retry already in the live queue bypasses historical failures', () => {
+    const exec = vi.fn((_command, args) => args.some(arg => arg.includes('isInMergeQueue'))
+      ? queueResponse(true) : response(timeline(removed()))), log = vi.fn();
     expect(mqSameHeadGuard({ repo, pr, head, exec, log })).toEqual(released);
     expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][1].join(' ')).toContain('isInMergeQueue');
     expect(log).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['moved head', () => queueResponse(true, prior)],
+    ['missing head', () => queueResponse(true, null)],
+    ['malformed membership', () => queueResponse(null)],
+    ['failed read', () => { throw new Error('offline'); }],
+  ])('unreadable or mismatched live queue state holds: %s', (_label, read) => {
+    const exec = vi.fn(read), log = vi.fn();
+    expectHold(mqSameHeadGuard({ repo, pr, head, exec, log }), /live.*queue|queue.*state/i);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
   });
 });
 const bot = { author: { login: 'web-everything' } };

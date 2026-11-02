@@ -4820,6 +4820,7 @@ async function runCli() {
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options) {
+    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };

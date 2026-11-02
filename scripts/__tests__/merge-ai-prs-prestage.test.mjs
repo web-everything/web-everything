@@ -42,7 +42,7 @@ if (a[0] === 'api') {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
     } } } } });
     if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
-    if (q.includes('isInMergeQueue')) out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
+    if (q.includes('isInMergeQueue')) out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:!!pr.inQueue || fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
     const [owner, name] = process.env.PRESTAGE_REPO.split('/');
     if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
@@ -143,6 +143,38 @@ describe('real drain pre-stage path', () => {
     const next = run(green);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
     expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(1);
+  }));
+  it.each([false, true])('a human same-head re-enqueue preserves already-queued recording through cascade/prestage (green event: %s)', green => world(({pr,run,coord,ledger,slug}) => {
+    if (green) expect(run().stderr).toContain('eligible=true');
+    mkdirSync(ledger, { recursive: true });
+    const ledgerFile = join(ledger, `${slug.replace('/', '-')}.jsonl`);
+    writeFileSync(ledgerFile, JSON.stringify(buildLedgerEvent({ type: EVENT_TYPES.HOLD, repo: slug, pr: 42, at: new Date().toISOString(),
+      source: 'merge-ai-prs', declaredActor: 'drain', reasonCode: 'ci-red', holdSource: 'drain' })) + '\n');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.inQueue = true;
+    pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-01T12:00:00Z',
+      beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}} }];
+    const next = run(green);
+    expect(next.report.enqueueOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({num:42,outcome:'enqueued',already:true})]));
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    expect(next.stderr).not.toContain('mq-same-head-failed');
+    const queueState = JSON.parse(readFileSync(join(coord, 'drain-merge-queue-followups.json'), 'utf8'));
+    expect(queueState.pending).toEqual(expect.arrayContaining([expect.objectContaining({num:42,headSha:sha})]));
+    const facts = readFileSync(ledgerFile, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(facts.filter(f => f.type === EVENT_TYPES.RELEASE)).toEqual([
+      expect.objectContaining({pr:42,reasonCode:'ci-red',holdSource:'drain'}),
+    ]);
+  }));
+  it.each([false, true])('a new force-pushed head releases an old unbound failure through cascade/prestage (green event: %s)', green => world(({pr,run}) => {
+    if (green) expect(run().stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.mqTimeline = [
+      { __typename:'RemovedFromMergeQueueEvent', reason:'merge_conflict', createdAt:'2026-11-01T12:00:00Z', beforeCommit:null },
+      { __typename:'HeadRefForcePushedEvent', createdAt:'2026-11-01T13:00:00Z', beforeCommit:{oid:'c'.repeat(40)}, afterCommit:{oid:sha} },
+    ];
+    const next = run(green);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
+    expect(next.stderr).not.toContain('mq-same-head-failed');
   }));
   it.each(['--repos=frontier-ui/frontierui', '--repos=frontierui'])('a green event cannot enqueue WE#42 outside %s', scope => world(({pr,run,coord}) => {
     expect(run().stderr).toContain('eligible=true');

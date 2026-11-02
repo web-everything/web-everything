@@ -6,24 +6,43 @@ import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
+const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
+const mqEventTime = value => typeof value === 'string' ? Date.parse(value) : NaN;
+function mqSameHeadHold({ pr, head }, reason) {
+  const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+  return { hold: true, line: `mq-same-head-failed: #${safe(pr)} head ${safe(head)} — ${safe(reason)}` };
+}
+
 /** Only the merge-group commit's second parent identifies the tested PR head. */
 export function decideMqSameHead({ pr, head, timeline } = {}) {
-  const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
-  const hold = reason => ({ hold: true, line: `mq-same-head-failed: #${safe(pr)} head ${safe(head)} — ${reason}` });
-  if (typeof head !== 'string' || !head.trim()) return hold('missing head');
+  const hold = reason => mqSameHeadHold({ pr, head }, reason);
+  const currentHead = mqOid(head);
+  if (!currentHead) return hold('missing or invalid head');
   if (timeline?.error || !Array.isArray(timeline?.nodes) || typeof timeline.hasPreviousPage !== 'boolean')
     return hold('unreadable merge-queue timeline; inspect timeline before retrying');
   if (timeline.hasPreviousPage)
     return hold('incomplete timeline at 100-event cap; operator must inspect full history before retrying');
+  // GitHub's force-push time proves a rebase happened after an unbound removal. Commit author/committer
+  // dates do not prove when the PR head changed. Use the first introduction, so restoring a previously
+  // failed SHA cannot erase its failure. Missing proof retains the operator-visible hold below.
+  const pushes = timeline.nodes.filter(event => event?.__typename === 'HeadRefForcePushedEvent').map(event => ({
+    before: mqOid(event.beforeCommit?.oid), after: mqOid(event.afterCommit?.oid), at: mqEventTime(event.createdAt),
+  }));
+  const firstIntroductionAt = Math.min(...pushes.filter(push => push.after === currentHead && push.before !== currentHead).map(push => push.at));
+  const newHeadAt = pushes.some(push => !push.before || !push.after || !Number.isFinite(push.at)
+    || (push.before === currentHead && push.at <= firstIntroductionAt)) ? NaN : firstIntroductionAt;
   for (const event of timeline.nodes) {
-    if (event?.__typename === 'AddedToMergeQueueEvent') continue;
+    if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
     const reason = typeof event.reason === 'string' ? event.reason.trim().toLowerCase() : '';
     if (reason === 'manual' || reason === 'merged') continue;
-    const testedHead = event.beforeCommit?.parents?.nodes?.[1]?.oid;
-    if (typeof testedHead !== 'string' || !/^[a-f0-9]{40}$/i.test(testedHead))
+    const testedHead = mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid);
+    if (!testedHead) {
+      const removedAt = mqEventTime(event.createdAt);
+      if (Number.isFinite(newHeadAt) && Number.isFinite(removedAt) && removedAt < newHeadAt) continue;
       return hold('no commit binding for merge-queue removal; inspect timeline before retrying');
-    if (testedHead === head) return hold(safe(reason) || 'unknown removal reason');
+    }
+    if (testedHead === currentHead) return hold(reason || 'unknown removal reason');
   }
   return { hold: false, line: null };
 }
@@ -36,11 +55,12 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
       return { error: 'invalid repository or PR' };
     const query = `query($owner:String!,$name:String!,$number:Int!){
       repository(owner:$owner,name:$name){pullRequest(number:$number){
-        timelineItems(last:100,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT]){
+        timelineItems(last:100,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,HEAD_REF_FORCE_PUSHED_EVENT]){
           pageInfo{hasPreviousPage}
           nodes{__typename
             ... on RemovedFromMergeQueueEvent{reason createdAt beforeCommit{oid parents(first:2){nodes{oid}}}}
             ... on AddedToMergeQueueEvent{createdAt}
+            ... on HeadRefForcePushedEvent{createdAt beforeCommit{oid} afterCommit{oid}}
           }
         }
       }}
@@ -58,7 +78,15 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
 }
 
 export function mqSameHeadGuard({ repo, pr, head, exec = execFileSync, log = () => {} } = {}) {
-  const decision = decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
+  // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
+  // This only skips historical admission: the strategy still revalidates its normal safety evidence.
+  const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
+  const currentHead = mqOid(head);
+  const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
+    ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
+    : queue.inQueue === true ? { hold: false, line: null }
+      : decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
   if (decision.hold) log(decision.line);
   return decision;
 }
