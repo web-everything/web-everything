@@ -9,6 +9,7 @@ import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOver
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
+import { pruneStaleOverlayRecords } from '../daemon-clone-registry.mjs';
 import { replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
@@ -28,7 +29,7 @@ const gitCommand = args => args[0] === '--attr-source=origin/main' ? args[1] : a
 const ok = (cwd, args) => { const r = run(args, { cwd }); if (r.status !== 0) throw new Error(`${args}: ${r.stderr}`); return r.stdout.trim(); };
 const write = (root, file, text) => { fs.mkdirSync(dirname(join(root, file)), { recursive: true }); fs.writeFileSync(join(root, file), text); };
 const json = file => JSON.parse(fs.readFileSync(file, 'utf8'));
-const sidecar = f => `${overlayFilePath(f.root, f.env)}.main-sync.json`;
+const sidecar = f => `${overlayFilePath(f.root, f.env)}.main-sync.state`;
 const marker = f => join(`${overlayFilePath(f.root, f.env)}.auto-rebase`, `${encodeURIComponent(ref)}.lock`);
 const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
@@ -75,7 +76,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
     WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_EVENTS: join(base, 'daemon-events.jsonl'),
     WE_NEEDS_YOU_FEED: join(base, 'needs-you-events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_MAIN_SYNC: 'on' };
   addOverlay(root, { ref, pr: 123 }, { env });
-  if (exhausted) fs.writeFileSync(`${overlayFilePath(root, env)}.main-sync.json`, JSON.stringify({
+  if (exhausted) fs.writeFileSync(`${overlayFilePath(root, env)}.main-sync.state`, JSON.stringify({
     lastSyncedMain: {}, retryMain: { [ref]: mainSha }, retryTries: { [ref]: 3 }, retryAfter: { [ref]: 0 },
   }));
   const events = [], scratched = [], pushes = [];

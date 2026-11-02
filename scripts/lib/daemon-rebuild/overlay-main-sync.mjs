@@ -20,7 +20,7 @@ import { buildHeavyTestInvocation, runHeavyTests } from './auto-rebase.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
-const sidecar = (root, env) => `${overlayFilePath(root, env)}.main-sync.json`;
+const sidecar = (root, env) => `${overlayFilePath(root, env)}.main-sync.state`;
 const cloneLock = (root, env) => `${sidecar(root, env)}.clone.lock`;
 const failureMarker = (root, env, ref) => join(`${alertsFilePath(root, env)}.main-sync`,
   `${createHash('sha256').update(ref).digest('hex')}.json`);
@@ -102,7 +102,7 @@ function readSyncState(file, io = fs) {
     data = JSON.parse(io.readFileSync(file, 'utf8'));
   } catch (error) { if (error.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw error; }
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
     const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef'].includes(key);
     const invalid = value => {
@@ -278,10 +278,17 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       if (!fetchOverlay(run, root, env, ref, registration)) { skip('stale-registration'); continue; }
       const main = sha(run(['rev-parse', 'origin/main']));
       if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
+      const tip = sha(run(['rev-parse', `origin/${ref}`]));
+      const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
+      // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
+      if (pairKnown) { result.skipped.push(ref); continue; }
+      // A moved ref tip (owner rebased) re-opens a conflict-marked main.
+      const tipMoved = Object.hasOwn(synced.conflictMain, ref) && synced.conflictMain[ref] === main;
       const last = synced.lastSyncedMain[ref];
-      if (synced.attemptedMain[ref] === main && Object.hasOwn(synced.firstFailureAt, ref)
+      const attemptedHere = synced.attemptedMain[ref] === main && !tipMoved;
+      if (attemptedHere && Object.hasOwn(synced.firstFailureAt, ref)
         && !Object.hasOwn(synced.failureAlertedAt, ref)) failureAlert(root, env, ref);
-      if (last === main || synced.attemptedMain[ref] === main || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
+      if (last === main || attemptedHere || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
         skip('up-to-date'); continue;
       }
       const base = last ?? sha(run(['merge-base', 'origin/main', `origin/${ref}`]));
@@ -349,7 +356,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     await outcome(root, env, ref, 'skipped', { reason }, deps);
     return { skipped: true, reason };
   };
-  let cloneToken, scratchParent, heartbeat, main, mergeConflict = false, publicationStarted = false;
+  let cloneToken, scratchParent, heartbeat, main, conflictInfo, mergeConflict = false, publicationStarted = false;
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
     cloneToken = acquire(clone, io);
@@ -382,6 +389,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
     main = sha(git(['rev-parse', 'origin/main'], scratch));
+    if (synced.conflictMain[ref] === main && synced.conflictTip[ref] === from) return await skip('conflict-known');
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
     let merge, mergeError;
@@ -401,13 +409,15 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
     if (conflicts.length) {
       mergeConflict = true;
+      conflictInfo = { files: conflicts, tip: from,
+        stderrTail: stderrTail(merge) || cleanText(merge?.stdout).slice(-500) };
       event(root, { kind: 'overlay-main-merge-conflict', ref, files: conflicts }, { env });
       if (old.pr) markOverlayConflictWake(env, { pr: old.pr, ref, files: conflicts, at: now(), clone: root });
       else publishNeedsYou(root, env, ref, 'overlay-main-merge-conflict',
         `Merge conflicts on ${ref}: ${conflicts.join(', ')}`, { files: conflicts });
       output(git(['merge', '--abort'], scratch));
       throw Object.assign(new Error(`merge conflicts require operator resolution: ${conflicts.join(', ')}`),
-        { step: 'merge', stderrTail: stderrTail(merge) });
+        { step: 'merge', stderrTail: conflictInfo.stderrTail });
     }
     if (mergeError) throw mergeError;
     output(merge);
@@ -485,6 +495,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       delete state.firstFailureAt[ref]; delete state.failureAlertedAt[ref]; delete state.failureReason[ref];
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
+      delete state.conflictMain[ref]; delete state.conflictTip[ref];
     }, io);
     const diagnostic = failureMarker(root, env, ref);
     transaction(diagnostic, () => io.rmSync(diagnostic, { force: true }), io);
@@ -504,6 +515,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
           const tries = state.retryMain[ref] === main ? state.retryTries[ref] : 0;
           if (mergeConflict || tries >= RETRY_DELAYS.length) {
             state.attemptedMain[ref] = main;
+            if (mergeConflict) { state.conflictMain[ref] = main; state.conflictTip[ref] = conflictInfo.tip; }
             clearRetry(state, ref);
           } else {
             state.retryMain[ref] = main;
@@ -513,7 +525,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         }, io);
       }
     } catch { /* The diagnostic below can keep an independent failure streak. */ }
-    await failureEvent(error);
+    // One conflict event per (main, tip) pair replaces the repeating failed event; the wake / needs-you
+    // rebase request was already raised once at detection above.
+    if (mergeConflict) await outcome(root, env, ref, 'conflict', { step: 'merge', main, tip: conflictInfo.tip,
+      files: conflictInfo.files, stderrTail: conflictInfo.stderrTail, reason: error.message }, deps);
+    else await failureEvent(error);
     failureAlert(root, env, ref, error, io, mergeConflict); throw error;
   }
   finally {
