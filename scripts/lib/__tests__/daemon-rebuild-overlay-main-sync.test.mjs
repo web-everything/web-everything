@@ -1480,3 +1480,62 @@ describe('health-watch overlay main sync wiring', () => {
     expect(kick.mock.calls).toEqual([[{ root: 'broken' }], [{ root: 'healthy' }]]);
   });
 });
+
+describe('R372 genuine merge conflict stops retrying', () => {
+  const daemonEvents = f => !fs.existsSync(f.env.WE_DAEMON_EVENTS) ? []
+    : fs.readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  const moveRefTip = f => {
+    ok(f.root, ['checkout', '-q', ref]); write(f.root, 'rebased.txt', 'owner rebased\n');
+    ok(f.root, ['add', 'rebased.txt']); ok(f.root, ['commit', '-qm', 'owner moved tip']);
+    ok(f.root, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]); ok(f.root, ['checkout', '-q', 'main']);
+  };
+
+  it('keeps its state outside the *.json overlay-record namespace, so the stale-record pruner cannot delete it', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expect(sidecar(f).endsWith('.json')).toBe(false);
+    expect(fs.existsSync(sidecar(f))).toBe(true);
+    pruneStaleOverlayRecords(f.base, { env: f.env, log: () => {} });
+    expect(fs.existsSync(sidecar(f))).toBe(true);
+    expect(json(sidecar(f)).attemptedMain[ref]).toBe(f.mainSha);
+  });
+
+  it('emits one overlay-main-sync-conflict event with the conflicting files and the real git output, not a failed event', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    const conflicts = daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-conflict');
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].detail).toMatchObject({ ref, step: 'merge', main: f.mainSha, tip: f.oldSha, files: ['worker.mjs'] });
+    expect(conflicts[0].detail.stderrTail).toMatch(/CONFLICT|Automatic merge failed/);
+    expect(daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-failed')).toEqual([]);
+  });
+
+  it('skips the identical (main, ref tip) pair silently and retries when the ref tip moves', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expect(json(sidecar(f)).conflictTip[ref]).toBe(f.oldSha);
+    const before = daemonEvents(f).length;
+    for (let i = 0; i < 2; i++) expect(tick(f, { spawnFn: spawner() })).toMatchObject({ started: [], skipped: [ref] });
+    expect(daemonEvents(f).slice(before).filter(e => /failed|conflict/.test(e.kind))).toEqual([]);
+    moveRefTip(f);
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [ref] });
+    expect(spawnFn).toHaveBeenCalledOnce();
+  });
+
+  it('raises the rebase request once through the existing wake path (one wake, one needs-you, no repeat)', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    tick(f, { spawnFn: spawner() }); tick(f, { spawnFn: spawner() });
+    expect([...readOverlayConflictWakes(f.env).values()]).toHaveLength(1);
+    expect(alerts(f)).toHaveLength(1);
+  });
+
+  it('an unreadable ref tip fails closed: no spawn', () => {
+    const f = fixture({ conflict: true });
+    const git = vi.fn((args, opts) => args[0] === 'rev-parse' && String(args.at(-1)).startsWith('origin/lane') ? { status: 1, stdout: '', stderr: 'bad' } : f.deps.git(args, opts));
+    const spawnFn = spawner();
+    tick(f, { spawnFn, git });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+});
