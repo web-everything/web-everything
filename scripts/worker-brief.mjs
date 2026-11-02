@@ -120,10 +120,17 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
    Do small fixes (a few lines, a known finding) yourself. For a follow-up fix on the same work, add
    \`--resume=<threadId>\` (the \`threadId\` from the previous run's report) so Codex keeps its context instead of re-reading files.
-   It is SYNCHRONOUS: run it as a normal Bash call with \`timeout: 600000\`, never wrapped in a wait; don't poll it and
-   don't start a second copy. If the harness moves a call running over ~180s to the background it is harness-tracked
-   and wakes you when done, so you may end your turn on it. A job you detach yourself (\`&\`, \`nohup\`, \`setsid\`) or an
-   untracked nested child never wakes you: never end a turn on one. Review the diff before you commit. You keep root cause, design, edge adoption and live proof.
+   Add \`--detach\` to the command above, then repeat \`node scripts/codex-direct-task.mjs wait --job=<id> --wait=150000\`
+   in separate foreground calls. Repeat only on exit 75 (still running); exit 0 = success;
+   status=failed is a terminal worker failure: stop and report it; don't start a second copy.
+   status=wait-error (exit 2), missing/unreadable JSON, or a wait command error does not prove the worker stopped.
+   Pause dependent work, retain the lane and scope (keep renewing leases), and report the waiter error;
+   recover waiting and retry the same job. Do not release either resource or end the turn until the worker is confirmed terminal.
+   If waiting cannot recover, escalate for supervised termination and confirm the worker stopped before cleanup.
+   Even with \`timeout: 600000\`, agent Bash calls over ~180s are auto-backgrounded. Such a call is harness-tracked,
+   but never end the turn while a task is running. Use the bounded waits to follow the detached job to completion.
+   Do not use \`&\`, \`nohup\`, or \`setsid\` to create an untracked child. Review the diff before you commit.
+   You keep root cause, design, edge adoption and live proof.
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
    ${testsFirstWorkerRule()}
    Run tests with \`npm run test:unit -- <test files>\`. Running vitest directly is denied.
@@ -135,7 +142,15 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    If unreadable, stop, restore readable git diff evidence, and retry before verify/converge.
 
 6. **One PR.** Commit with a tight pathspec (your files only), verify ONCE at the end with
-   \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it), then open exactly one PR:
+   \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it).
+   While verification is running, repeat \`node scripts/verify-lane.mjs check --wait=150000 --json\` in separate foreground calls
+   from the lane until it settles. Repeat only for a timeout with lastStatus=running;
+   stop and report red, infrastructure-failure, or any other non-running result.
+   If settled is not true, JSON is missing/unreadable, or the check command errors, pause dependent work,
+   retain the lane and scope (keep renewing leases), and recover observation of the same verification.
+   Do not release either resource or end the turn until verification is confirmed terminal;
+   if observation cannot recover, escalate for supervised termination before cleanup. Open a PR only after green;
+   never end the turn while a task is running. Then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:

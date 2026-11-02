@@ -26,7 +26,43 @@ describe('renderWorkerBrief', () => {
     const brief = renderWorkerBrief(params);
     const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
     for (const text of ['timeout: 600000', "don't start a second copy", 'harness-tracked', '~180s',
-      'nohup', 'setsid', 'SYNCHRONOUS']) expect(codex).toContain(text);
+      'nohup', 'setsid']) expect(codex).toContain(text);
+  });
+
+  it('tells workers to detach Codex, repeat short waits, and never end the turn while a task runs', () => {
+    const brief = renderWorkerBrief(params);
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    for (const text of ['--detach', 'wait --job=<id> --wait=150000', 'separate foreground calls',
+      'check --wait=150000', 'never end the turn while a task is running']) expect(brief).toContain(text);
+    expect(codex).not.toContain('SYNCHRONOUS');
+    expect(codex).not.toContain('never wrapped in a wait');
+  });
+
+  it('stops polling on success or terminal failure in both worker and runner instructions', () => {
+    const brief = renderWorkerBrief(params);
+    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
+    for (const text of [brief, runner]) {
+      expect(text).toContain('Repeat only on exit 75');
+      expect(text).toContain('exit 0 = success');
+      expect(text).toContain('status=failed is a terminal worker failure');
+      expect(text).toContain('status=wait-error');
+      expect(text).toContain('does not prove the worker stopped');
+      expect(text).toContain('retain the lane and scope');
+      expect(text).toContain('keep renewing leases');
+      expect(text).toContain('missing/unreadable JSON');
+      expect(text).toContain('retry the same job');
+      expect(text).toContain('confirmed terminal');
+      expect(text).toContain('supervised termination');
+      expect(text).toContain('confirm the worker stopped before cleanup');
+      expect(text).not.toContain('any other exit = stop and report the failure');
+      expect(text).not.toContain('until it exits 0');
+      expect(text).toContain('check --wait=150000 --json');
+      expect(text).toContain('Repeat only for a timeout with lastStatus=running');
+      expect(text).toContain('stop and report red, infrastructure-failure, or any other non-running result');
+      expect(text).toContain('If settled is not true');
+      expect(text).toContain('recover observation of the same verification');
+      expect(text).toContain('until verification is confirmed terminal');
+    }
   });
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
