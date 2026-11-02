@@ -15,9 +15,10 @@ import { collectRunClosure } from './daemon-rebuild/skip-unrelated.mjs';
 export function collectCloneImportClosure({ readFile = path => readFileSync(path, 'utf8'), ...options }) {
   let realRoot;
   try { realRoot = realpathSync(options.root); } catch { return null; }
+  const aliases = new Set();
   // Never accept parsed results from the legacy policy as strict proof. Spawn walks
   // still share raw reads, but each strict traversal validates its own source.
-  return collectImportClosure({ ...options, root: realRoot, parsed: new Map(), canonicalize: path => {
+  const closure = collectImportClosure({ ...options, root: realRoot, parsed: new Map(), canonicalize: path => {
     const realPath = realpathSync(path);
     const rel = relative(realRoot, realPath);
     if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
@@ -26,6 +27,10 @@ export function collectCloneImportClosure({ readFile = path => readFileSync(path
     if ([path, realPath].some(entry => extname(entry) === '.cjs')) {
       throw new Error('unsupported clone dependency syntax');
     }
+    // Canonicalize ancestor aliases without losing the final symlink's name.
+    // An absolute import through a clone-root alias must retain the in-clone link.
+    const alias = relative(realRoot, join(realpathSync(dirname(path)), basename(path)));
+    if (alias && alias !== '..' && !alias.startsWith('../') && !isAbsolute(alias)) aliases.add(alias);
     return realPath;
   }, readFile: path => {
     const source = readFile(path);
@@ -34,6 +39,8 @@ export function collectCloneImportClosure({ readFile = path => readFileSync(path
     }
     return source;
   } });
+  if (closure) for (const alias of aliases) closure.files.add(alias);
+  return closure;
 }
 
 // Canonicalize both sides of containment, including aliases of a missing entry's

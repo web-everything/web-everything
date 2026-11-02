@@ -9,6 +9,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, resolve as resolvePath, relative, isAbsolute, basename } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const IMPORT_SPEC_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\1/g;
 const JSON_LITERAL_RE = /['"`]([^'"`\n]*\.json)['"`]/g;
@@ -79,11 +80,21 @@ export function collectImportClosure({
       if (src !== undefined) {
         for (const m of src.matchAll(IMPORT_SPEC_RE)) {
           const spec = m[2];
-          if (spec.startsWith('./') || spec.startsWith('../')) {
-            // Strict ESM proof must inspect the named path itself: a missing/broken
-            // link cannot be substituted with an extension or index-file candidate.
-            const hit = canonicalize ? resolvePath(dirname(file), spec) : resolveRelativeSpec(file, spec, existsOnce);
-            if (hit && (canonicalize || !relative(absRoot, hit).startsWith('..'))) info.imports.push(hit);
+          if (canonicalize && spec.includes('\\')) {
+            // This scanner does not decode JavaScript string escapes. Never let
+            // an escaped local path bypass the realpath check as an unknown token.
+            info.complete = false;
+          } else if (canonicalize && (spec.startsWith('./') || spec.startsWith('../')
+            || isAbsolute(spec) || /^file:/i.test(spec))) {
+            // Node resolves ESM specifiers as URLs, including percent escapes and
+            // query/fragment suffixes. Inspect that file before classifying it;
+            // absolute and file: imports must pass the same realpath boundary.
+            try { info.imports.push(fileURLToPath(new URL(spec, pathToFileURL(file)))); }
+            catch { info.complete = false; }
+          } else if (spec.startsWith('./') || spec.startsWith('../')) {
+            // Preserve extension/index lookup only for the legacy walker.
+            const hit = resolveRelativeSpec(file, spec, existsOnce);
+            if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
           } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
             info.bareDeps = true;
           }

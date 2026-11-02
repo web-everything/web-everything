@@ -3780,3 +3780,8 @@ soaks must tolerate unrelated lag using the default production graph as well as 
 counts over one corpus (legacy: 2; strict: 3). Before changing production policy, measure that cost and disclose
 it in the PR. Missing-root consumer tests remain conservative under both policies. Load consumer modules during
 test collection so cold module transformation cannot consume the fixture's timeout.
+
+Strict clone traversal must resolve relative, absolute and file-URL ESM specifiers before checking realpath
+containment and syntax. Exercise percent encoding, URL suffixes and symlink targets as well as plain relative
+imports; JavaScript string escapes that the scanner cannot decode must leave proof incomplete. Keep a positive
+ESM alias case proving both alias and real dependency paths remain relevant, alongside refusal cases.

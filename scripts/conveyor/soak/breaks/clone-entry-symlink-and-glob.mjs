@@ -30,17 +30,21 @@ export default {
         mkdirSync(dirname(join(root, entry)), { recursive: true });
         writeFileSync(join(root, entry), 'export {};');
       }
-      writeFileSync(join(root, 'entry.mjs'), "import './alias.mjs';");
       writeFileSync(join(root, 'hidden.cjs'), 'module.exports = 1;');
       symlinkSync('hidden.cjs', join(root, 'alias.mjs'));
-      const closure = collectRunClosure({ root, entries: ['entry.mjs'], byName: () => [],
-        importClosure: collectCloneImportClosure });
-      const decision = decideSkipRebuild({ closure, changedFiles: ['scripts/changed.mjs'] });
-      if (decision.skip) violations.push('imported CommonJS symlink permitted skipping rebuild');
-      let symlinkRefused = false;
-      try { cloneRuntimeEntries({ root, launchAgentsDir, entries: ['entry.mjs'] }); }
-      catch (error) { symlinkRefused = /runtime dependency proof incomplete/.test(error.message); }
-      if (!symlinkRefused) violations.push('runtime discovery accepted imported CommonJS symlink');
+      for (const spec of ['./alias.mjs', join(root, 'alias.mjs'), pathToFileURL(join(root, 'alias.mjs')).href,
+        './%61lias.mjs?version=1#entry']) {
+        writeFileSync(join(root, 'entry.mjs'), `import ${JSON.stringify(spec)};`);
+        const closure = collectRunClosure({ root, entries: ['entry.mjs'], byName: () => [],
+          importClosure: collectCloneImportClosure });
+        const decision = decideSkipRebuild({ closure, changedFiles: ['scripts/changed.mjs'] });
+        if (decision.skip) violations.push(`imported CommonJS symlink permitted skipping rebuild: ${spec}`);
+        let symlinkRefused = false;
+        try { cloneRuntimeEntries({ root, launchAgentsDir, entries: ['entry.mjs'] }); }
+        catch (error) { symlinkRefused = /runtime dependency proof incomplete/.test(error.message); }
+        if (!symlinkRefused) violations.push(`runtime discovery accepted imported CommonJS symlink: ${spec}`);
+        log?.(`specifier=${spec}; symlink refused=${symlinkRefused}; rebuild skipped=${decision.skip}`);
+      }
 
       // A literal wildcard file is innocuous; launchd may instead select the hidden worker.
       writeFileSync(join(root, '*.mjs'), 'export {};');
@@ -53,7 +57,7 @@ export default {
         }) }) });
       } catch (error) { globRefused = /LaunchAgents glob argument refused/.test(error.message); }
       if (!globRefused) violations.push('runtime discovery accepted launchd wildcard entry');
-      log?.(`symlink refused=${symlinkRefused}; rebuild skipped=${decision.skip}; glob refused=${globRefused}`);
+      log?.(`glob refused=${globRefused}`);
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },

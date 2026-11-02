@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cloneRuntimeEntries, collectCloneImportClosure } from '../daemon-clone-entries.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
@@ -237,6 +237,60 @@ it('walks ESM symlink imports from the real directory and retains both path iden
     expect(closureHits({ closure, changedFiles: [path] })).toEqual([path]);
   }
 });
+
+it.each(['absolute', 'file URL', 'uppercase file URL', 'encoded file URL', 'relative URL'])(
+  'validates imported symlinks before classifying a %s specifier', form => {
+    const f = fixture();
+    writeFileSync(join(f.dir, 'foreign.mjs'), 'export {};');
+    writeFileSync(join(f.root, 'hidden.cjs'), 'module.exports = 1;');
+    for (const [target, destination] of [['CommonJS', 'hidden.cjs'], ['outside', '../foreign.mjs'],
+      ['missing', 'absent.mjs'], ['loop', 'alias.mjs']]) {
+      const alias = join(f.root, 'alias.mjs');
+      symlinkSync(destination, alias);
+      const spec = form === 'absolute' ? alias : form === 'file URL' ? pathToFileURL(alias).href
+        : form === 'uppercase file URL' ? pathToFileURL(alias).href.replace('file:', 'FILE:')
+        : form === 'encoded file URL' ? pathToFileURL(alias).href.replace('alias.mjs', '%61lias.mjs')
+          : './%61lias.mjs?version=1#entry';
+      writeFileSync(join(f.root, 'entry.mjs'), `import ${JSON.stringify(spec)};`);
+      const closure = collectCloneImportClosure({ root: f.root, entries: ['entry.mjs'] });
+      expect(closure?.complete, target).not.toBe(true);
+      expect(decideSkipRebuild({ closure, changedFiles: ['scripts/changed.mjs'] }).skip, target).toBe(false);
+      expect(() => cloneRuntimeEntries({ ...f, entries: ['entry.mjs'] }))
+        .toThrow('runtime dependency proof incomplete');
+      rmSync(alias);
+    }
+  });
+
+it.each(['absolute', 'file URL', 'uppercase file URL', 'encoded file URL', 'relative URL'])(
+  'retains the real ESM dependency of a %s import', form => {
+    const f = fixture();
+    mkdirSync(join(f.root, 'actual'));
+    writeFileSync(join(f.root, 'actual/worker.mjs'), "import './dependency.mjs';");
+    writeFileSync(join(f.root, 'actual/dependency.mjs'), 'export {};');
+    symlinkSync('actual/worker.mjs', join(f.root, 'alias.mjs'));
+    // Exercise an ancestor alias on every platform, not just macOS's /var alias.
+    symlinkSync(f.root, join(f.dir, 'clone-alias'));
+    const alias = join(f.dir, 'clone-alias/alias.mjs');
+    const spec = form === 'absolute' ? alias : form === 'file URL' ? pathToFileURL(alias).href
+      : form === 'uppercase file URL' ? pathToFileURL(alias).href.replace('file:', 'FILE:')
+      : form === 'encoded file URL' ? pathToFileURL(alias).href.replace('alias.mjs', '%61lias.mjs')
+        : './%61lias.mjs?version=1#entry';
+    writeFileSync(join(f.root, 'entry.mjs'), `import ${JSON.stringify(spec)};`);
+    const closure = collectCloneImportClosure({ root: f.root, entries: ['entry.mjs'] });
+    expect(closure?.complete).toBe(true);
+    for (const path of ['alias.mjs', 'actual/worker.mjs', 'actual/dependency.mjs']) {
+      expect(closureHits({ closure, changedFiles: [path] })).toEqual([path]);
+    }
+  });
+
+it.each(['file:///bad%ZZ.mjs', 'file:///bad%2Fname.mjs', String.raw`\x2fhidden.mjs`])(
+  'keeps undecodable import paths incomplete: %s', spec => {
+    const { root } = fixture();
+    writeFileSync(join(root, 'entry.mjs'), `import '${spec}';`);
+    const closure = collectCloneImportClosure({ root, entries: ['entry.mjs'] });
+    expect(closure?.complete).toBe(false);
+    expect(decideSkipRebuild({ closure, changedFiles: ['scripts/changed.mjs'] }).skip).toBe(false);
+  });
 
 it('refuses an outside entry even beside a readable clone entry', () => {
   const f = fixture();
