@@ -685,18 +685,12 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('waiting for a remote slot instead of deferring locally');
   });
 
-  it.each([
-    {envMinutes: 180, timeoutMinutes: 10, expectedMinutes: 180},
-    {envMinutes: 60, timeoutMinutes: 240, expectedMinutes: 240},
-  ])('records the originating ceiling before dispatch and the Forge run id when reported: %j', async ({envMinutes, timeoutMinutes, expectedMinutes}) => {
+  it('records the Forge run id when reported', async () => {
     const f = await overloadFixture({ overloaded: false, freeAtMs: null });
-    f.env = {WE_HEAVY_ADMISSION_CEILING_MS: String(envMinutes * 60_000)};
-    f.timeoutMs = timeoutMinutes * 60_000;
     const remoteRoot = join(f.lockRoot, '..', 'remote');
     rmSync(join(remoteRoot, 'slot-0.unconfirmed'));
     let seen;
     f.remoteExec = vi.fn(async options => {
-      expect(JSON.parse(readFileSync(join(remoteRoot, 'slot-0.unconfirmed'), 'utf8')).ceilingMs).toBe(expectedMinutes * 60_000);
       options.onRun('r-' + 'a'.repeat(32));
       seen = JSON.parse(readFileSync(join(remoteRoot, 'slot-0.unconfirmed.run'), 'utf8'));
       return { mode: 'remote', code: 0 };
@@ -729,34 +723,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(existsSync(marker)).toBe(true);
     expect(f.remoteExec).not.toHaveBeenCalled();
   });
-  it.each([60, 180])('uses the persisted originating ceiling (%s minutes) for run-less marker recovery', async minutes => {
-    const {easternTimestamp} = await import('../forge-exec-run.mjs');
-    const f = await overloadFixture({overloaded: false, freeAtMs: null});
-    f.env = {WE_HEAVY_ADMISSION_CEILING_MS: String(minutes * 60_000)};
-    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
-    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
-    expect(child.status).toBe(0);
-    const at = Date.now() - 180 * 60_000;
-    writeFileSync(marker, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at, ceilingMs: minutes * 60_000}));
-    utimesSync(marker, at / 1000, at / 1000);
-    const st = statSync(marker);
-    writeFileSync(marker + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000}));
-    const health = f.readTelemetry;
-    f.readTelemetry = async () => ({...await health(), activeRuns: 1, recent: [
-      {runId: 'r-' + 'b'.repeat(32), startedAtET: easternTimestamp(at - 60_000), stageMs: {install: 1, run: 1}, code: 0},
-      {runId: 'r-' + 'a'.repeat(32), startedAtET: easternTimestamp(at + 170 * 60_000), stageMs: {install: 1, run: 1}, code: null},
-    ]});
-    if (minutes === 60) {
-      expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
-      expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    } else {
-      expect(await runWithRemoteDecision(f)).toEqual({handled: false});
-      expect(f.remoteExec).not.toHaveBeenCalled();
-      expect(existsSync(marker)).toBe(true);
-      expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('remote-full (30s wait exhausted)');
-    }
-  });
-  it.each([undefined, 120, 180])('does not dispatch when a 60-minute caller recovers a marker from a %s-minute origin with an unfinished receipt at minute 100', async originMinutes => {
+  it.each([undefined, 120, 180])('keeps markers with historical ceiling metadata (%s) when a receipt remains unfinished', async originMinutes => {
     const {easternTimestamp} = await import('../forge-exec-run.mjs');
     const f = await overloadFixture({overloaded: false, freeAtMs: null});
     f.env = {WE_HEAVY_ADMISSION_CEILING_MS: String(60 * 60_000)};

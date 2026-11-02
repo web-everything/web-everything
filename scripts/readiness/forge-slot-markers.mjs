@@ -17,8 +17,8 @@ const NAME = /^slot-(\d+)\.unconfirmed$/;
 const HELD_NAME = /^slot-(\d+)\.unconfirmed(?:\.held-[0-9a-f]{16})?$/;
 
 /** New markers carry their owner pid so a later client can prove the owner is dead. `run` (the Forge run id) is added once known. */
-export function markerContent({owner, pid, nowMs, host, run, ceilingMs = 120 * 60_000}) {
-  return JSON.stringify({v: 1, note: 'remote termination unconfirmed', host, owner, pid, at: nowMs, ceilingMs, ...(run ? {run} : {})}) + '\n';
+export function markerContent({owner, pid, nowMs, host, run}) {
+  return JSON.stringify({v: 1, note: 'remote termination unconfirmed', host, owner, pid, at: nowMs, ...(run ? {run} : {})}) + '\n';
 }
 
 const CLOCK_SKEW_MS = 60_000;
@@ -123,13 +123,12 @@ function readMarker(file) {
       // A field that is present must be well formed; a malformed structured marker is unknown evidence, never reapable.
       const ok = (key, test) => marker[key] === undefined || test(marker[key]);
       if (!ok('host', v => typeof v === 'string') || !ok('owner', v => typeof v === 'string') || !ok('pid', Number.isInteger)
-        || !ok('at', Number.isFinite) || !ok('run', v => typeof v === 'string' && RUN.test(v))
-        || !ok('ceilingMs', v => Number.isSafeInteger(v) && v >= 1000)) {
+        || !ok('at', Number.isFinite) || !ok('run', v => typeof v === 'string' && RUN.test(v))) {
         return {unreadable: true, legacy: false, host: undefined, pid: null, run: null, at: null};
       }
       return {legacy: false, host: marker.host, owner: marker.owner, pid: marker.pid ?? null,
         run: marker.run ?? (marker.owner !== undefined ? sidecarRun(file, marker.owner) : null),
-        at: marker.at ?? null, ceilingMs: marker.ceilingMs};
+        at: marker.at ?? null};
     }
   } catch { /* not JSON: legacy only if it is exactly the known bare text */ }
   if (text.trim() !== LEGACY_TEXT) return {unreadable: true, legacy: false, host: undefined, pid: null, run: null, at: null};
@@ -181,28 +180,15 @@ function ownerGone(root, index, file, liveness, selfPid, startMs) {
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
  * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
- * was never recorded uses [at - skew, at + originating ceilingMs + ten minutes + skew]: recent must cover its start (or activeRuns be zero),
- * and no unfinished receipt may fall inside it, except unbound stage-zero prepares older than ceilingMs + ten minutes at sampling.
+ * was never recorded requires recent to cover at - skew (or activeRuns to be zero), with no unfinished receipt
+ * starting at or after at - skew. There is no upper time bound or stage-zero exception.
  * If the capped recent window cannot cover the marker, retain it for operator-confirmed remote cleanup.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run binding: retain it
  * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
  */
 export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, startMs = probePidStartMs, selfPid = process.pid,
-  graceMs = MARKER_GRACE_MS, ceilingMs = 120 * 60_000, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
+  graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
   const firstDead = new Map();
-  // Check the current directory after telemetry arrives, including markers outside this reaper's host/dead-owner set.
-  function boundElsewhere(file, run) {
-    let names;
-    try { names = fs.readdirSync(root); } catch { return true; }
-    for (const name of names) {
-      const other = join(root, name);
-      if (!NAME.test(name) || other === file) continue;
-      const marker = readMarker(other);
-      if (marker.unreadable || marker.legacy || marker.run === run
-        || (marker.owner !== undefined && sidecarRun(other, marker.owner) === run)) return true;
-    }
-    return false;
-  }
   const sidecar = file => file + '.dead';
   function stampFor(file, key) {
     if (firstDead.has(key)) return firstDead.get(key);
@@ -256,7 +242,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (marker.host !== host || host === undefined) continue;
         if (!ownerGone(root, index, file, liveness, selfPid, startMs)) { forget(file, key); continue; }
         stampFor(file, key);
-        dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner, ceilingMs: marker.ceilingMs});
+        dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner});
       }
       if (dead.length) {
         let telemetry;
@@ -272,12 +258,9 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             } else {
               const at = entry.at;
               if (!Number.isFinite(at)) continue;
-              // Historical markers lack the originating ceiling. Never shrink their old 120-minute bound
-              // to a new caller's shorter setting; a longer current setting widens it conservatively.
-              const abandonMs = (entry.ceilingMs ?? Math.max(120 * 60_000, ceilingMs)) + 10 * 60_000;
               const coversStart = telemetry.recent.some(item => Date.parse(item.startedAtET) <= at - CLOCK_SKEW_MS);
               if ((!evidence.complete && !coversStart)
-                || maybeOwnsInflight(telemetry, at, sampledAt, abandonMs, run => boundElsewhere(entry.file, run))) continue;
+                || maybeOwnsInflight(telemetry, at)) continue;
             }
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
@@ -294,19 +277,13 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   };
 }
 
-// The client ceiling bounds dispatch even when death was first observed much later.
-function maybeOwnsInflight(telemetry, atMs, sampledAtMs, abandonMs, boundElsewhere) {
+// Any unfinished receipt at or after the window start may belong to this marker.
+function maybeOwnsInflight(telemetry, atMs) {
   return telemetry.recent.some(item => {
     const started = Date.parse(item?.startedAtET);
     if (!Number.isFinite(started)) return true;
-    // A stage-zero code:null receipt is a prepared run that never entered install/run: no remote command
-    // was executed to terminate, and its only possible starting client has exceeded its ceiling. Another
-    // extant marker binding this run defeats that ownership proof, so keep it even if that owner seems dead.
-    const abandoned = item.code === null && item.stageMs?.install === 0 && item.stageMs?.run === 0
-      && started < sampledAtMs - abandonMs && !boundElsewhere(item.runId);
     const finished = Number.isInteger(item.code)
       && (![97, 254].includes(item.code) || telemetry.activeRuns === 0);
-    return !finished && !abandoned
-      && started >= atMs - CLOCK_SKEW_MS && started <= atMs + abandonMs + CLOCK_SKEW_MS;
+    return !finished && started >= atMs - CLOCK_SKEW_MS;
   });
 }

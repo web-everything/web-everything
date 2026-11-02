@@ -3821,17 +3821,12 @@ verify the production scanner's fail-closed behavior without relying on host qui
 
 ## Run-less Forge slot recovery
 
-`forge-slot-markers.test.mjs` covers the persisted originating client ceiling plus ten-minute dispatch window,
-inclusive clock-skew bounds, capped-recent coverage, and strictly older stage-zero leaked prepares.
-Stage-zero `code:null` prepares never executed a remote command; discount them only after that
-ceiling plus ten minutes and with no other extant marker binding their run (inline or owner-bound sidecar).
-Codes 97/254 require zero active runs as cleanup evidence, including for run-less markers.
-Malformed ceiling metadata retains quarantine; historical markers without it use the larger of
-120 minutes and the recovering caller's ceiling. Test mixed ceilings so a shorter recovering caller
-cannot exclude an older client's unfinished receipt. Operator-confirmed remote cleanup remains the fallback. Unknown
-start timestamps, unreachable telemetry, and unknown PID birth times retain markers.
-When the newest 50 receipts no longer cover a marker's window start, retain quarantine
-until zero-active telemetry or operator-confirmed remote cleanup; never infer cleanup
-from marker age. PID reuse requires birth more than five seconds after marker creation
-and is checked again after the atomic claim. Run the marker and heavy-admission remote
-suites through heavy-admission when changing recovery or its per-marker log format.
+`forge-slot-markers.test.mjs` covers run-less recovery: recent must cover `at - skew`
+(or active runs must be zero), and no unfinished receipt may start at or after that
+boundary. There is no upper time bound, ceiling guess, or stage-zero exception.
+Codes 97/254 need zero active runs as cleanup evidence. Unknown timestamps,
+unreachable telemetry, and uncovered capped-recent windows retain markers for
+operator-confirmed remote cleanup. PID reuse requires birth more than five seconds
+after marker creation and is checked again after the atomic claim. Run the marker
+and heavy-admission remote suites through heavy-admission when changing recovery
+or its per-marker log format.
