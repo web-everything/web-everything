@@ -148,7 +148,7 @@ import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { gateOutcomesForHead, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
+import { gateOutcomeForHead, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
 import { sessionSlugFor } from '../operations/dispatch-lane.mjs';
@@ -2779,7 +2779,7 @@ export function planReconcile({
       const redTeamSendBack = redTeamHold && phase === 'bounced' && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN'
         && /^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') && redTeamRound?.head && sameHeadSha(redTeamRound.head, pr.headRefOid)
         && openDefects(pr.comments, pr.headRefOid)?.count >= 1
-        && gateOutcomesForHead(pr.comments, prNumber, pr.headRefOid).has(GATE_OUTCOMES.SENT_BACK);
+        && gateOutcomeForHead(pr.comments, prNumber, pr.headRefOid) === GATE_OUTCOMES.SENT_BACK;
       if (redTeamHold && !redTeamSendBack) {
         refuse('draft', { ...withPhase, why: `${redTeamHold} — a draft held by red team is never promoted` });
         continue;

@@ -74,4 +74,17 @@ describe('draft red-team send-back (R392(1), live #6023)', () => {
     ('absent/unreadable labels %j cannot authorize a fix pass', unreadable => {
       expect(plan({ labels: unreadable }).dispatch.filter(row => row.kind === 'fix')).toEqual([]);
     });
+
+  it('ROUND_CAP after SENT_BACK on the same head owns the PR: the gate reader says round-cap, so no fix dispatches', () => {
+    for (const hold of ['red-team:blocked', 'red-team:pending']) {
+      const result = plan({ labels: labels(hold, 'review:changes'),
+        comments: [finding(), sentBack(), sentBack(HEAD, 'web-everything', 6023, GATE_OUTCOMES.ROUND_CAP)] });
+      expect(result.dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+    }
+  });
+
+  it('a gate-reader outcome of sent-back on the current head dispatches a fix', () => {
+    const result = plan();
+    expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 6023, kind: 'fix' })]);
+  });
 });
