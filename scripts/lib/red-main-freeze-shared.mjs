@@ -389,7 +389,7 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
 
 export async function prepareDrainFreeze({ local = null, settings = resolveDrainFreezeSettings(), shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true, lkg = {} } = {}) {
   if (logSettings) for (const [key, setting] of Object.entries(settings)) stderr(`red-main freeze: ${key} setting ${setting.value} via ${setting.source}\n`);
-  const read = () => readSharedWithFallback({ readShared, env, stderr, lkg: { key: `${repo ?? REPO_ROOT}|${branch ?? resolveFreezeBranch()}`, ...lkg } });
+  const read = () => readSharedWithFallback({ readShared, env, stderr, lkg: { key: `${REPO_ROOT}|${resolveFreezeBranch()}`, ...lkg } });
   if (settings.redMainFreezeReader.value === 'shared-first' && shared === undefined) shared = read();
   let state = evaluateDrainFreeze({ local, shared, settings });
   if (state.unpublished) {
