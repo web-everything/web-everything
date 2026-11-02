@@ -124,6 +124,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     matches: (f) => /^skills-src\/.*-brief[^/]*\.md$/.test(f),
     inputs: ['scripts/operations/worker-result.mjs', 'schemas/worker-result.v1.json', 'scripts/operations/__tests__/worker-result.test.mjs'],
   },
+  {
+    test: 'scripts/lib/__tests__/daemon-clone-entries.test.mjs',
+    scope: 'full',
+    why: 'walks every non-test source under scripts/ and skills-src/ to prove nothing references daemon-clone-entries yet (a whole-tree absence fact: a new wiring anywhere must trip it); not expressible per file',
+    matches: (f) => /\.[cm]?[jt]s$/.test(f) && !skipped(f) && !/\.(?:test|spec)\./.test(f) && inTree(f, ['scripts', 'skills-src']),
+    inputs: ['scripts/lib/daemon-clone-entries.mjs', 'scripts/lib/__tests__/daemon-clone-entries.test.mjs'],
+  },
 ]);
 
 /**
