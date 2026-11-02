@@ -373,9 +373,11 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // Only a completed accepted review covering this exact head may use it, at most once.
   if (!persistSpent && !noVerdict && last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
     Array.isArray(last.pending) && last.pending.length === 0) {
+    // The first valid marker owns this head's one CI release. Later markers cannot renew it
+    // after any review attempt (including an unfinished one) has started at or after that marker.
     const marker = (pr.comments ?? []).map(c => ({
       ...parsePrCancelledRerunComment(c, repo, pr.number, pr.headRefOid), at: Date.parse(c.createdAt),
-    })).filter(c => c.runId && Number.isFinite(c.at)).sort((a, b) => b.at - a.at || b.runId - a.runId)[0];
+    })).filter(c => c.runId && Number.isFinite(c.at)).sort((a, b) => a.at - b.at || a.runId - b.runId)[0];
     const rerunAt = marker?.at;
     if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) {
       // Unknown, stale or partial requirements cannot prove recovery. Keep the normal hold and its

@@ -1091,6 +1091,19 @@ describe('R372 accepted same-head CI rerun release', () => {
     expect(decideSameHeadHold(p, [accepted(), { ...accepted(), startedAt: at + 2, completedAt: at + 3 }],
       { repo, readRequiredChecks: () => requiredChecks, now: at + 4 })).not.toBeNull();
   });
+  it.each([
+    ['completed', 1], ['completed', 2], ['incomplete', 1], ['incomplete', 2],
+  ])('keeps two rerun markers held after a %s review started at offset %i (first marker: 1)', (status, offset) => {
+    // Newest-first thread order must not let the later marker renew the release.
+    const p = acceptedPr([comment(marker(head), at + 4), comment(marker(head), at + 1)]);
+    p.statusCheckRollup.forEach(row => { row.completedAt = iso(at + 5); });
+    const reviewed = { ...accepted(), startedAt: at + offset,
+      completedAt: status === 'completed' ? at + 3 : null,
+      incomplete: status === 'incomplete' };
+    expect(decideSameHeadHold(p, [accepted(), reviewed], {
+      repo, readRequiredChecks: () => requiredChecks, now: at + 6,
+    })).toMatchObject({ kind: 'same-head' });
+  });
   it.each(['resumed', 'separate-runs'])('keeps an accepted head held after its persisted retry budget is spent (%s)', mode => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     const spent = mode === 'resumed'
