@@ -5,16 +5,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { decideQueueTestedSkip, MAX_RUNS_CHECKED, QUARANTINE_SETTLE_MS } from '../skip-queue-tested-push.mjs';
+import { decideQueueTestedSkip, MAX_RUNS_CHECKED, INPUT_SETTLE_MS, SIBLING_REPO } from '../skip-queue-tested-push.mjs';
 
 const sha = 'a'.repeat(40);
 const pushTree = 'b'.repeat(40);
 const otherSha = 'c'.repeat(40);
 const otherTree = 'd'.repeat(40);
 const quarantineTip = 'f'.repeat(40);
+const fuiTip = '9'.repeat(40);
 const RUN_CREATED = '2026-10-31T12:00:00Z';
 const NOW = Date.parse('2026-10-31T12:30:00Z');
-const OLD_LIST_TIME = '2026-10-30T12:00:00Z';
+const OLD_PUSH_TIME = '2026-10-30T12:00:00Z';
+// GitHub's own record of the newest push to a ref (GET /repos/{repo}/activity): server time, not the writer's clock.
+const push = (after, overrides = {}) => ({ activity_type: 'push', after, timestamp: OLD_PUSH_TIME, ...overrides });
 const run = (head_sha = otherSha, overrides = {}) => ({
   head_sha, conclusion: 'success', created_at: RUN_CREATED, ...overrides,
 });
@@ -23,13 +26,15 @@ const entry = (overrides = {}) => ({
   test: 'scripts/x/__tests__/flaky.test.mjs', brokenSha: '1234567', owner: 'red-main-safety-net',
   reason: 'red on main', addedAt: 1, expiresAt: 2, ...overrides,
 });
-const quarantine = (list = { version: 1, entries: [], mode: 'stop' }, committedAt = OLD_LIST_TIME) => (
-  { ok: true, list, committedAt });
+const quarantine = (list = { version: 1, entries: [], mode: 'stop' }, lastPush = push(quarantineTip)) => (
+  { ok: true, list, tip: quarantineTip, lastPush });
+const sibling = () => ({ ok: true, tip: fuiTip, lastPush: push(fuiTip) });
 const input = (overrides = {}) => ({
   event: 'push', ref: 'refs/heads/main', sha, pushTree, now: NOW,
   listMergeGroupRuns: vi.fn().mockResolvedValue([run()]),
   getCommitTree: vi.fn().mockResolvedValue(otherTree),
   readQuarantineState: vi.fn().mockResolvedValue(quarantine()),
+  readSiblingState: vi.fn().mockResolvedValue(sibling()),
   ...overrides,
 });
 const expectClosed = (result) => {
@@ -41,12 +46,14 @@ const expectClosed = (result) => {
 
 // Spawn the shipped entry point; only fixture binaries are on PATH. Each stub records
 // argv independently of its response, so a wrong API filter cannot silently pass.
-// The created_at the CLI fixtures use is far in the past relative to the real clock, and the list
-// time predates it by more than the settle margin, so the default fixture proves "nothing excluded".
+// The run's created_at is in the past of the real clock, and every recorded push predates it by more
+// than the settle margin, so the default fixture proves "the queue run read these same inputs".
 const CLI_LIST = JSON.stringify({ version: 1, entries: [], mode: 'quarantine' });
+const activity = (after, overrides = {}) => JSON.stringify([push(after, overrides)]);
 function runCli({ args = {}, runs = JSON.stringify({ workflow_runs: [run()] }), tree = pushTree,
-  gitTree = pushTree, fail = '', qTip = quarantineTip, qTime = OLD_LIST_TIME, qListed = 'quarantine.json',
-  qList = CLI_LIST } = {}) {
+  gitTree = pushTree, fail = '', qTip = quarantineTip, qListed = 'quarantine.json', qList = CLI_LIST,
+  qActivity = activity(quarantineTip), fuiBranch = 'main', fuiTipOut = fuiTip, fuiActivity = activity(fuiTip),
+  env = { GH_TOKEN: 'we-token', FUI_TOKEN: 'fui-token' } } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'queue-tested-cli-'));
   const callsFile = join(cwd, 'calls.jsonl');
   writeFileSync(callsFile, '');
@@ -56,11 +63,16 @@ function runCli({ args = {}, runs = JSON.stringify({ workflow_runs: [run()] }), 
 const { appendFileSync } = require('node:fs');
 const command = ${JSON.stringify(command)};
 const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify([command, ...args]) + '\\n');
-const kind = command === 'gh' ? (args[1]?.includes('/actions/workflows/') ? 'runs' : 'tree')
+appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ argv: [command, ...args], token: process.env.GH_TOKEN ?? null }) + '\\n');
+const url = args[1] ?? '';
+const kind = command === 'gh'
+  ? (url.includes('/actions/workflows/') ? 'runs' : url.includes('/git/commits/') ? 'tree'
+    : url.startsWith('repos/${SIBLING_REPO}/activity') ? 'fui-activity' : url.includes('/activity') ? 'q-activity'
+      : url.startsWith('repos/${SIBLING_REPO}/branches/') ? 'fui-tip' : url === 'repos/${SIBLING_REPO}' ? 'fui-branch' : 'unknown')
   : args[0] === 'rev-parse' ? (args[1] === '--verify' ? 'q-tip' : 'git') : \`q-\${args[0]}\`;
-if (kind === ${JSON.stringify(fail)}) process.exit(1);
-const responses = ${JSON.stringify({ git: gitTree, runs, tree, 'q-fetch': '', 'q-tip': qTip, 'q-log': qTime, 'q-ls-tree': qListed, 'q-show': qList })};
+if (kind === ${JSON.stringify(fail)} || kind === 'unknown') process.exit(1);
+const responses = ${JSON.stringify({ git: gitTree, runs, tree, 'q-fetch': '', 'q-tip': qTip, 'q-ls-tree': qListed,
+    'q-show': qList, 'q-activity': qActivity, 'fui-branch': fuiBranch, 'fui-tip': fuiTipOut, 'fui-activity': fuiActivity })};
 process.stdout.write(responses[kind] + '\\n');
 `, { mode: 0o755 });
     }
@@ -69,22 +81,28 @@ process.stdout.write(responses[kind] + '\\n');
       fileURLToPath(new URL('../skip-queue-tested-push.mjs', import.meta.url)),
       ...Object.entries(options).filter(([, value]) => value !== undefined)
         .map(([key, value]) => `--${key}=${value}`),
-    ], { cwd, env: { PATH: cwd }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    ], { cwd, env: { PATH: cwd, ...env }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(0);
-    return { ...result, calls: readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map(JSON.parse) };
+    const records = readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map(JSON.parse);
+    return { ...result, calls: records.map(({ argv }) => argv), records };
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 }
 
-const quarantineCalls = [
+const quarantineCalls = (repo = 'example/project') => [
   ['git', 'fetch', '--quiet', '--no-tags', '--depth=1', 'origin', '+refs/heads/ops/quarantine:refs/remotes/origin/ops/quarantine'],
   ['git', 'rev-parse', '--verify', 'refs/remotes/origin/ops/quarantine^{commit}'],
-  ['git', 'log', '-1', '--format=%cI', quarantineTip],
   ['git', 'ls-tree', '--name-only', quarantineTip, '--', 'quarantine.json'],
   ['git', 'show', `${quarantineTip}:quarantine.json`],
+  ['gh', 'api', `repos/${repo}/activity?ref=refs/heads/ops/quarantine&direction=desc&per_page=1`],
+];
+const siblingCalls = [
+  ['gh', 'api', 'repos/frontier-ui/frontierui', '--jq', '.default_branch'],
+  ['gh', 'api', 'repos/frontier-ui/frontierui/branches/main', '--jq', '.commit.sha'],
+  ['gh', 'api', 'repos/frontier-ui/frontierui/activity?ref=refs/heads/main&direction=desc&per_page=1'],
 ];
 
 describe('queue-tested CLI adapter', () => {
@@ -94,18 +112,37 @@ describe('queue-tested CLI adapter', () => {
       ['git', 'rev-parse', `${sha}^{tree}`],
       ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
       ['gh', 'api', `repos/example/project/git/commits/${otherSha}`, '--jq', '.tree.sha'],
-      ...quarantineCalls,
+      ...quarantineCalls(),
+      ...siblingCalls,
     ]);
     expect(result.stdout).toBe('queue_tested=true\n');
     expect(result.stderr).toContain('push tree already passed merge-group CI');
   });
 
-  it('uses the supplied repository for both API endpoints', () => {
+  it('uses the WE token for WE endpoints and the FUI token only for the sibling endpoints', () => {
+    const { records } = runCli();
+    const gh = records.filter(({ argv }) => argv[0] === 'gh');
+    expect(gh.map(({ argv, token }) => [argv[2], token])).toEqual([
+      [expect.stringContaining('repos/example/project/actions/'), 'we-token'],
+      [expect.stringContaining('repos/example/project/git/commits/'), 'we-token'],
+      [expect.stringContaining('repos/example/project/activity?'), 'we-token'],
+      ['repos/frontier-ui/frontierui', 'fui-token'],
+      [expect.stringContaining('repos/frontier-ui/frontierui/branches/'), 'fui-token'],
+      [expect.stringContaining('repos/frontier-ui/frontierui/activity?'), 'fui-token'],
+    ]);
+  });
+
+  it('pins the sibling repository the workflow checks out', () => {
+    expect(SIBLING_REPO).toBe('frontier-ui/frontierui');
+  });
+
+  it('uses the supplied repository for every WE endpoint', () => {
     const result = runCli({ args: { repo: 'another-owner/another-repo' } });
     expect(result.calls.slice(1)).toEqual([
       ['gh', 'api', 'repos/another-owner/another-repo/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
       ['gh', 'api', `repos/another-owner/another-repo/git/commits/${otherSha}`, '--jq', '.tree.sha'],
-      ...quarantineCalls,
+      ...quarantineCalls('another-owner/another-repo'),
+      ...siblingCalls,
     ]);
     expect(result.stdout).toBe('queue_tested=true\n');
   });
@@ -116,14 +153,22 @@ describe('queue-tested CLI adapter', () => {
     expect(result.calls).toEqual([
       ['git', 'rev-parse', `${sha}^{tree}`],
       ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
-      ...quarantineCalls,
+      ...quarantineCalls(),
+      ...siblingCalls,
     ]);
   });
 
   it('treats a tip without a list file as an empty list and does not show it', () => {
     const result = runCli({ qListed: '' });
     expect(result.stdout).toBe('queue_tested=true\n');
-    expect(result.calls.slice(-1)).toEqual([quarantineCalls[3]]);
+    expect(result.calls).not.toContainEqual(quarantineCalls()[3]);
+  });
+
+  it('keeps full CI without a FUI token and makes no sibling call', () => {
+    const result = runCli({ env: { GH_TOKEN: 'we-token' } });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('frontierui');
+    expect(result.calls.filter((argv) => argv[2]?.startsWith('repos/frontier-ui/'))).toEqual([]);
   });
 
   it('keeps full CI when the published list is in quarantine mode with an entry (red-team break, PR #6211)', () => {
@@ -136,14 +181,28 @@ describe('queue-tested CLI adapter', () => {
     ['quarantine fetch error', { fail: 'q-fetch' }],
     ['quarantine tip error', { fail: 'q-tip' }],
     ['invalid quarantine tip', { qTip: 'not-a-sha' }],
-    ['quarantine commit time error', { fail: 'q-log' }],
     ['quarantine ls-tree error', { fail: 'q-ls-tree' }],
     ['quarantine show error', { fail: 'q-show' }],
     ['malformed quarantine JSON', { qList: '{' }],
     ['invalid quarantine list', { qList: JSON.stringify({ version: 2, entries: [] }) }],
     ['invalid quarantine entry', { qList: JSON.stringify({ version: 1, mode: 'stop', entries: [{ test: '../x' }] }) }],
-    ['quarantine list changed after the queue run', { qTime: '2026-10-31T11:55:00Z' }],
-    ['future quarantine commit time', { qTime: '2999-01-01T00:00:00Z' }],
+    ['quarantine activity API error', { fail: 'q-activity' }],
+    ['malformed quarantine activity JSON', { qActivity: '[' }],
+    ['non-array quarantine activity', { qActivity: '{}' }],
+    ['empty quarantine activity', { qActivity: '[]' }],
+    ['quarantine pushed after the queue run', { qActivity: activity(quarantineTip, { timestamp: '2026-10-31T11:55:00Z' }) }],
+    ['quarantine force-reset after the queue run', { qActivity: activity(quarantineTip, { activity_type: 'force_push', timestamp: '2026-10-31T12:05:00Z' }) }],
+    ['quarantine moved between the fetch and the activity read', { qActivity: activity(otherSha) }],
+    ['future quarantine push time', { qActivity: activity(quarantineTip, { timestamp: '2999-01-01T00:00:00Z' }) }],
+    ['FUI default-branch API error', { fail: 'fui-branch' }],
+    ['unsafe FUI default branch', { fuiBranch: '../main' }],
+    ['empty FUI default branch', { fuiBranch: '' }],
+    ['FUI tip API error', { fail: 'fui-tip' }],
+    ['invalid FUI tip', { fuiTipOut: 'not-a-sha' }],
+    ['FUI activity API error', { fail: 'fui-activity' }],
+    ['empty FUI activity', { fuiActivity: '[]' }],
+    ['FUI pushed after the queue run', { fuiActivity: activity(fuiTip, { timestamp: '2026-10-31T11:55:00Z' }) }],
+    ['FUI moved between the tip and the activity read', { fuiActivity: activity(otherSha) }],
   ])('keeps full CI on %s', (_name, fixture) => {
     const result = runCli(fixture);
     expect(result.stdout).toBe('queue_tested=false\n');
@@ -226,43 +285,99 @@ describe('quarantine evidence: the matched queue run must have excluded nothing'
     ['a read that throws', vi.fn().mockRejectedValue(new Error('fetch failed')), /read failed/],
     ['ok:false', vi.fn().mockResolvedValue({ ok: false, error: 'unreachable' }), /unreadable/],
     ['a missing state', vi.fn().mockResolvedValue(undefined), /unreadable/],
-    ['a missing list', vi.fn().mockResolvedValue({ ok: true, committedAt: OLD_LIST_TIME }), /unreadable/],
+    ['a missing list', vi.fn().mockResolvedValue({ ok: true, tip: quarantineTip, lastPush: push(quarantineTip) }), /unreadable/],
     ['non-array entries', vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'stop', entries: null })), /entries unreadable/],
     ['an unknown mode', vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'skip-all', entries: [] })), /unknown quarantine mode/],
-    ['a missing commit time', vi.fn().mockResolvedValue({ ok: true, list: { version: 1, entries: [] } }), /commit time unreadable/],
-    ['an unparseable commit time', vi.fn().mockResolvedValue(quarantine(undefined, 'yesterday-ish')), /commit time unreadable/],
-    ['a future commit time', vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T13:00:00Z')), /in the future/],
-    ['a list changed after the run started', vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T12:05:00Z')), /changed near or after/],
   ])('fails closed on %s', async (_name, readQuarantineState, reason) => {
     const result = await decideQueueTestedSkip(matchTree({ readQuarantineState }));
     expectClosed(result);
     expect(result.reason).toMatch(reason);
   });
 
-  it('pins the settle margin to both sides of its boundary', async () => {
-    expect(QUARANTINE_SETTLE_MS).toBe(10 * 60 * 1000);
-    const at = (ms) => new Date(Date.parse(RUN_CREATED) - ms).toISOString();
-    expect(await decideQueueTestedSkip(matchTree({ readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, at(QUARANTINE_SETTLE_MS))) })))
-      .toMatchObject({ skip: true });
-    expectClosed(await decideQueueTestedSkip(matchTree({ readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, at(QUARANTINE_SETTLE_MS - 1000))) })));
+  it('does not read the quarantine list when no run matches', async () => {
+    const args = input();
+    expectClosed(await decideQueueTestedSkip(args));
+    expect(args.readQuarantineState).not.toHaveBeenCalled();
+    expect(args.readSiblingState).not.toHaveBeenCalled();
+  });
+});
+
+// Self-review of 0120bee9: a commit date is the writer's clock, and a force-reset back to an old commit
+// looks old. Every input the queue run read from OUTSIDE the tree (ops/quarantine, the frontierui sibling
+// checked out at its default-branch tip) must be unchanged since before the run, by GitHub's push time.
+describe.each([
+  // Built directly (no default parameters), so an undefined lastPush stays undefined.
+  ['ops/quarantine', 'readQuarantineState',
+    (lastPush) => ({ ok: true, list: { version: 1, entries: [], mode: 'stop' }, tip: quarantineTip, lastPush }), quarantineTip],
+  ['frontierui', 'readSiblingState', (lastPush) => ({ ok: true, tip: fuiTip, lastPush }), fuiTip],
+])('external input %s must be unchanged since before the matched run', (name, reader, state, tip) => {
+  const matchTree = (value) => input({ getCommitTree: vi.fn().mockResolvedValue(pushTree),
+    [reader]: vi.fn().mockResolvedValue(value) });
+  const at = (ms) => new Date(Date.parse(RUN_CREATED) - ms).toISOString();
+
+  it('skips when GitHub recorded its newest push well before the run', async () => {
+    expect(await decideQueueTestedSkip(matchTree(state(push(tip))))).toMatchObject({ skip: true });
   });
 
-  it("judges the list against the MATCHED run's created_at, not the newest run's", async () => {
+  it.each([
+    ['no recorded push', undefined, /push activity unreadable/],
+    ['a non-object push record', 'push', /push activity unreadable/],
+    ['a branch deletion', push(tip, { activity_type: 'branch_deletion' }), /branch was deleted/],
+    ['a push to another tip (moved between reads)', push(otherSha), /moved since its last recorded push/],
+    ['a push record without a tip', push(undefined), /moved since its last recorded push/],
+    ['an unparseable push time', push(tip, { timestamp: 'yesterday-ish' }), /push time unreadable/],
+    ['a missing push time', push(tip, { timestamp: undefined }), /push time unreadable/],
+    ['a future push time', push(tip, { timestamp: '2026-10-31T13:00:00Z' }), /push time is in the future/],
+    ['a push after the run started', push(tip, { timestamp: '2026-10-31T12:05:00Z' }), /changed near or after/],
+    // An old commit pushed (or force-reset onto the branch) recently: only the push time counts.
+    ['a force-push of an old commit after the run started', push(tip, { activity_type: 'force_push', timestamp: '2026-10-31T12:05:00Z' }), /changed near or after/],
+  ])('fails closed on %s', async (_name, lastPush, reason) => {
+    const result = await decideQueueTestedSkip(matchTree(state(lastPush)));
+    expectClosed(result);
+    expect(result.reason).toMatch(reason);
+    expect(result.reason).toContain(name);
+  });
+
+  it('fails closed on an unreadable tip', async () => {
+    const value = { ...state(push(tip)), tip: 'not-a-sha' };
+    const result = await decideQueueTestedSkip(matchTree(value));
+    expectClosed(result);
+    expect(result.reason).toContain(`${name} tip unreadable`);
+  });
+
+  it.each([
+    ['a read that throws', () => vi.fn().mockRejectedValue(new Error('api down'))],
+    ['ok:false', () => vi.fn().mockResolvedValue({ ok: false, error: 'no token' })],
+    ['a missing state', () => vi.fn().mockResolvedValue(undefined)],
+  ])('fails closed on %s', async (_name, make) => {
+    const result = await decideQueueTestedSkip(input({ getCommitTree: vi.fn().mockResolvedValue(pushTree), [reader]: make() }));
+    expectClosed(result);
+    expect(result.reason).toContain(name);
+  });
+
+  it('pins the settle margin to both sides of its boundary', async () => {
+    expect(INPUT_SETTLE_MS).toBe(10 * 60 * 1000);
+    expect(await decideQueueTestedSkip(matchTree(state(push(tip, { timestamp: at(INPUT_SETTLE_MS) })))))
+      .toMatchObject({ skip: true });
+    expectClosed(await decideQueueTestedSkip(matchTree(state(push(tip, { timestamp: at(INPUT_SETTLE_MS - 1000) })))));
+  });
+
+  it("judges the push against the MATCHED run's created_at, not the newest run's", async () => {
     const newest = run('e'.repeat(40), { created_at: '2026-10-31T12:20:00Z' });
     const matched = run(otherSha, { created_at: '2026-10-31T12:02:00Z' });
     const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([newest, matched]),
       getCommitTree: vi.fn(async (head) => head === otherSha ? pushTree : otherTree),
       // Old enough for the newest run, but inside the margin for the matched one.
-      readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T11:58:00Z')) });
+      [reader]: vi.fn().mockResolvedValue(state(push(tip, { timestamp: '2026-10-31T11:58:00Z' }))) });
     const result = await decideQueueTestedSkip(args);
     expectClosed(result);
     expect(result.reason).toMatch(/changed near or after/);
   });
 
-  it('does not read the quarantine list when no run matches', async () => {
-    const args = input();
+  it('also guards an exact-head match', async () => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([run(sha)]),
+      [reader]: vi.fn().mockResolvedValue(state(push(tip, { timestamp: '2026-10-31T12:05:00Z' }))) });
     expectClosed(await decideQueueTestedSkip(args));
-    expect(args.readQuarantineState).not.toHaveBeenCalled();
   });
 });
 
@@ -391,7 +506,9 @@ describe('decideQueueTestedSkip (pure function, no CLI or main export required)'
       { getCommitTree: vi.fn().mockResolvedValue(pushTree),
         readQuarantineState: vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'quarantine', entries: [entry()] })) },
       { getCommitTree: vi.fn().mockResolvedValue(pushTree),
-        readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T12:05:00Z')) },
+        readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, push(quarantineTip, { timestamp: '2026-10-31T12:05:00Z' }))) },
+      { getCommitTree: vi.fn().mockResolvedValue(pushTree),
+        readSiblingState: vi.fn().mockResolvedValue({ ok: true, tip: fuiTip, lastPush: push(fuiTip, { timestamp: '2026-10-31T12:05:00Z' }) }) },
     ];
     const reasons = [];
     for (const overrides of cases) {

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import yaml from 'js-yaml';
+import { SIBLING_REPO } from '../skip-queue-tested-push.mjs';
 
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
 const { jobs } = workflow;
@@ -42,9 +43,47 @@ describe('ci.yml queue-tested push relief and nightly full-run backstop', () => 
       REF: '${{ github.ref }}',
       SHA: '${{ github.sha }}',
       REPO: '${{ github.repository }}',
+      FUI_TOKEN: "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && (steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN) || '' }}",
     });
     expect(queue.run).toBe('node scripts/ci/skip-queue-tested-push.mjs --event="$EVENT_NAME" --ref="$REF" --sha="$SHA" --repo="$REPO" >> "$GITHUB_OUTPUT"');
     expect(queue['continue-on-error']).toBe(true);
+  });
+
+  it.each([
+    ['push', 'refs/heads/main', 'app', '', 'app'],
+    ['push', 'refs/heads/main', '', 'pat', 'pat'],
+    ['push', 'refs/heads/main', '', '', ''],
+    ['push', 'refs/heads/feature', 'app', 'pat', ''],
+    ['pull_request', 'refs/pull/1/merge', 'app', 'pat', ''],
+    ['merge_group', 'refs/heads/gh-readonly-queue/main/pr-1', 'app', 'pat', ''],
+    ['schedule', 'refs/heads/main', 'app', 'pat', ''],
+  ])('passes the FUI token on %s %s only for push to main (app=%j pat=%j → %j)', (event, ref, app, pat, expected) => {
+    const source = jobs.changes.steps.find((step) => step.id === 'queue').env.FUI_TOKEN.match(/^\$\{\{([\s\S]*)\}\}$/)[1]
+      .replaceAll('github.event_name', JSON.stringify(event)).replaceAll('github.ref', JSON.stringify(ref))
+      .replaceAll('steps.fui-app-token.outputs.token', JSON.stringify(app))
+      .replaceAll('secrets.FUI_READ_TOKEN', JSON.stringify(pat));
+    expect(source.replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, '')).toMatch(/^[\s=&|()]*$/);
+    expect(runInNewContext(source.replace(/'/g, '"'))).toBe(expected);
+  });
+
+  it('mints the FUI read token only on push to main, fail-soft, before the queue step', () => {
+    const steps = jobs.changes.steps;
+    const mint = steps.find((step) => step.id === 'fui-app-token');
+    expect(mint.uses).toBe('actions/create-github-app-token@v2');
+    expect(mint.if).toBe("${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WE_APP_ID != '' }}");
+    expect(mint['continue-on-error']).toBe(true);
+    expect(mint.with).toMatchObject({ owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read' });
+    expect(steps.indexOf(mint)).toBeLessThan(steps.indexOf(steps.find((step) => step.id === 'queue')));
+  });
+
+  it('every frontierui checkout is the unpinned default-branch tip the queue detector proves unchanged', () => {
+    const checkouts = Object.values(jobs).flatMap((job) => job.steps ?? [])
+      .filter((step) => String(step.uses).startsWith('actions/checkout@') && step.with?.repository);
+    expect(checkouts.length).toBeGreaterThan(0);
+    for (const step of checkouts) {
+      expect(step.with.repository).toBe(SIBLING_REPO);
+      expect(step.with.ref).toBeUndefined();
+    }
   });
 
   it('bounds the queue step below the changes job timeout and keeps the git credentials its ops/quarantine fetch needs', () => {

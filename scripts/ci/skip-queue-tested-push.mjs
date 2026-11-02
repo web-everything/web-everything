@@ -8,46 +8,73 @@ import { QUARANTINE_BRANCH, QUARANTINE_LIST_PATH, validateQuarantineList } from 
 const trackingRefspec = (branch) => `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
 
 export const MAX_RUNS_CHECKED = 20;
-/** The quarantine list must predate the matched queue run by this much (tolerates committer clock skew). */
-export const QUARANTINE_SETTLE_MS = 10 * 60 * 1000;
+/** An outside input's newest push must predate the matched queue run by this much. */
+export const INPUT_SETTLE_MS = 10 * 60 * 1000;
+/** The sibling repo every full-suite job checks out at its default-branch tip (no `ref:`). */
+export const SIBLING_REPO = 'frontier-ui/frontierui';
 /** Each git/gh call is bounded; the workflow step adds its own overall timeout-minutes. */
 const CALL_TIMEOUT_MS = 30_000;
 const isSha = (value) => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/i.test(value);
 const full = (reason) => ({ skip: false, reason: `${reason}; running full CI` });
 
 /**
- * A merge_group run's success proves the full suite only if it excluded no quarantined test
- * (scripts/ci/quarantine-skip.mjs excludes entries on merge_group, never on a push to main).
- * Proof: the list now is readable, either not in quarantine mode or empty (every entry counts:
- * expired, job-tagged and name-qualified ones too), and its tip predates the run's creation by
- * QUARANTINE_SETTLE_MS, so the run read this same list. Returns null when proven, else the reason.
+ * The queue run read `name` at some point after its creation; the push run would read it now.
+ * Both read the same content only if the ref's tip is unchanged since before the run. Proof uses
+ * GitHub's own record of the newest push (GET /repos/{repo}/activity): a server timestamp, so the
+ * writer's clock, a stalled push or a force-reset back to an old commit cannot make it look old.
+ * The record must name the tip read now, so a push between the two reads is caught too.
  */
-async function quarantineUnproven(readQuarantineState, run, now) {
-  let state;
-  try {
-    state = await readQuarantineState();
-  } catch {
-    return 'quarantine list read failed';
+function inputChangedReason(name, { tip, lastPush }, run, now) {
+  if (!isSha(tip)) return `${name} tip unreadable`;
+  if (!lastPush || typeof lastPush !== 'object') return `${name} push activity unreadable`;
+  if (lastPush.activity_type === 'branch_deletion') return `${name} branch was deleted`;
+  if (!isSha(lastPush.after) || lastPush.after.toLowerCase() !== tip.toLowerCase()) {
+    return `${name} moved since its last recorded push`;
   }
-  if (state?.ok !== true || !state.list || typeof state.list !== 'object') return 'quarantine list unreadable';
-  const { mode, entries } = state.list;
-  if (!Array.isArray(entries)) return 'quarantine list entries unreadable';
+  const pushedAt = typeof lastPush.timestamp === 'string' ? Date.parse(lastPush.timestamp) : NaN;
+  if (!Number.isFinite(pushedAt)) return `${name} push time unreadable`;
+  if (!Number.isFinite(now) || pushedAt > now) return `${name} push time is in the future`;
+  if (pushedAt > Date.parse(run.created_at) - INPUT_SETTLE_MS) return `${name} changed near or after the merge-group run`;
+  return null;
+}
+
+async function readState(name, read) {
+  try {
+    const state = await read();
+    return state?.ok === true ? { state } : { reason: `${name} state unreadable` };
+  } catch {
+    return { reason: `${name} read failed` };
+  }
+}
+
+/**
+ * A merge_group run's success proves what a push to main would test only if it read the same outside
+ * inputs and excluded nothing. Inputs: the ops/quarantine list (scripts/ci/quarantine-skip.mjs excludes
+ * entries on merge_group, never on a push to main) and the frontierui sibling. The list must be out of
+ * quarantine mode or empty (every entry counts: expired, job-tagged and name-qualified ones too).
+ * Returns null when proven, else the reason.
+ */
+async function queueRunUnproven({ readQuarantineState, readSiblingState }, run, now) {
+  const q = await readState('ops/quarantine', readQuarantineState);
+  if (q.reason) return q.reason;
+  if (!q.state.list || typeof q.state.list !== 'object') return 'ops/quarantine list unreadable';
+  const { mode, entries } = q.state.list;
+  if (!Array.isArray(entries)) return 'ops/quarantine list entries unreadable';
   if (mode !== undefined && mode !== 'stop' && mode !== 'quarantine') return 'unknown quarantine mode';
   if (mode === 'quarantine' && entries.length > 0) {
     return 'quarantine mode has entries, so the merge-group run may have excluded tests';
   }
-  const listTime = typeof state.committedAt === 'string' ? Date.parse(state.committedAt) : NaN;
-  if (!Number.isFinite(listTime)) return 'quarantine list commit time unreadable';
-  if (!Number.isFinite(now) || listTime > now) return 'quarantine list commit time is in the future';
-  if (listTime > Date.parse(run.created_at) - QUARANTINE_SETTLE_MS) {
-    return 'quarantine list changed near or after the merge-group run';
-  }
-  return null;
+  const qChanged = inputChangedReason('ops/quarantine', q.state, run, now);
+  if (qChanged) return qChanged;
+  const s = await readState('frontierui', readSiblingState);
+  if (s.reason) return s.reason;
+  return inputChangedReason('frontierui', s.state, run, now);
 }
 
 /** Decide from injected evidence; unavailable evidence always retains full CI. */
 export async function decideQueueTestedSkip({
-  event, ref, sha, pushTree, listMergeGroupRuns, getCommitTree, readQuarantineState, now = Date.now(),
+  event, ref, sha, pushTree, listMergeGroupRuns, getCommitTree, readQuarantineState, readSiblingState,
+  now = Date.now(),
 } = {}) {
   if (event !== 'push') return full('only push events qualify');
   if (ref !== 'refs/heads/main') return full('only the main branch qualifies');
@@ -68,7 +95,7 @@ export async function decideQueueTestedSkip({
   if (!candidates.length) return full('no valid successful merge-group runs');
 
   const accept = async (run, reason) => {
-    const unproven = await quarantineUnproven(readQuarantineState, run, now);
+    const unproven = await queueRunUnproven({ readQuarantineState, readSiblingState }, run, now);
     return unproven ? full(unproven) : { skip: true, matchedSha: run.head_sha, reason };
   };
   for (const run of candidates) {
@@ -89,16 +116,34 @@ export async function decideQueueTestedSkip({
   return full(`tree differs from the newest ${candidates.length} successful runs (limit ${MAX_RUNS_CHECKED})`);
 }
 
-/** Read the published list and its tip time from one fetched commit (same transport as quarantine-skip). */
-function readQuarantineAt(exec) {
+/** The newest push GitHub recorded for a branch (undefined when none). */
+function lastPushOf(exec, repo, branch, env) {
+  const activity = JSON.parse(exec('gh', ['api',
+    `repos/${repo}/activity?ref=refs/heads/${branch}&direction=desc&per_page=1`], env));
+  if (!Array.isArray(activity)) throw new Error('activity is not an array');
+  return activity[0];
+}
+
+/** Read the published list from one fetched tip (same transport as quarantine-skip), plus its newest push. */
+function readQuarantineAt(exec, repo) {
   exec('git', ['fetch', '--quiet', '--no-tags', '--depth=1', 'origin', trackingRefspec(QUARANTINE_BRANCH)]);
   const tip = exec('git', ['rev-parse', '--verify', `refs/remotes/origin/${QUARANTINE_BRANCH}^{commit}`]);
   if (!isSha(tip)) return { ok: false, error: 'invalid quarantine tip' };
-  const committedAt = exec('git', ['log', '-1', '--format=%cI', tip]);
   const listed = exec('git', ['ls-tree', '--name-only', tip, '--', QUARANTINE_LIST_PATH]);
   const list = listed ? JSON.parse(exec('git', ['show', `${tip}:${QUARANTINE_LIST_PATH}`])) : { version: 1, entries: [] };
   const valid = validateQuarantineList(list);
-  return valid.ok ? { ok: true, list, committedAt } : { ok: false, error: valid.errors.join('; ') };
+  if (!valid.ok) return { ok: false, error: valid.errors.join('; ') };
+  return { ok: true, list, tip, lastPush: lastPushOf(exec, repo, QUARANTINE_BRANCH) };
+}
+
+/** The sibling's default-branch tip (what an unpinned checkout gets) and its newest push, read with FUI_TOKEN only. */
+function readSiblingAt(exec, token) {
+  if (typeof token !== 'string' || token.trim() === '') return { ok: false, error: 'no FUI token' };
+  const env = { GH_TOKEN: token };
+  const branch = exec('gh', ['api', `repos/${SIBLING_REPO}`, '--jq', '.default_branch'], env);
+  if (!/^[\w-]+$/.test(branch)) return { ok: false, error: 'unsafe default branch' };
+  const tip = exec('gh', ['api', `repos/${SIBLING_REPO}/branches/${branch}`, '--jq', '.commit.sha'], env);
+  return { ok: true, tip, lastPush: lastPushOf(exec, SIBLING_REPO, branch, env) };
 }
 
 async function main() {
@@ -110,9 +155,9 @@ async function main() {
     if (typeof values.repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(values.repo)
       || values.repo.includes('\n')) throw new Error('invalid repository');
     if (!isSha(values.sha)) throw new Error('invalid push SHA');
-    const exec = (command, args) => execFileSync(command, args, {
+    const exec = (command, args, env) => execFileSync(command, args, {
       encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: CALL_TIMEOUT_MS, killSignal: 'SIGKILL',
+      timeout: CALL_TIMEOUT_MS, killSignal: 'SIGKILL', ...(env ? { env: { ...process.env, ...env } } : {}),
     }).trim();
     result = await decideQueueTestedSkip({
       ...values,
@@ -121,7 +166,8 @@ async function main() {
         `repos/${values.repo}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100`,
       ])).workflow_runs,
       getCommitTree: (sha) => exec('gh', ['api', `repos/${values.repo}/git/commits/${sha}`, '--jq', '.tree.sha']),
-      readQuarantineState: () => readQuarantineAt(exec),
+      readQuarantineState: () => readQuarantineAt(exec, values.repo),
+      readSiblingState: () => readSiblingAt(exec, process.env.FUI_TOKEN),
     });
   } catch {
     result = full('queue-tested evidence could not be read');

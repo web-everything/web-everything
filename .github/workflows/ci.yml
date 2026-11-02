@@ -110,7 +110,20 @@ jobs:
             fi
           fi
           node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
-      # A queue run counts only if it excluded no quarantined test (the script reads ops/quarantine).
+      # The queue run read two inputs from outside the tree: ops/quarantine and the unpinned frontierui
+      # sibling. It counts only if it excluded no quarantined test and neither input was pushed since
+      # before it (GitHub's push time). The FUI token reaches the script on push to main only.
+      - name: Mint FUI read token for the queue-tested proof (GitHub App)
+        id: fui-app-token
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WE_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
       # Bounded: a timeout leaves queue_tested empty, which keeps the full suite.
       - name: Was this push tree already queue-tested?
         id: queue
@@ -118,6 +131,7 @@ jobs:
         timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
+          FUI_TOKEN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && (steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN) || '' }}
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           SHA: ${{ github.sha }}
