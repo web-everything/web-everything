@@ -53,13 +53,31 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 const CTX = { key: 'run-1#4#0', runId: 'run-1', type: 'x', stepIndex: 4, step: 'record', index: 0 };
 
 describe('post-accept advisory persisted ledger', () => {
+  it('persists later-run counts under the ledger lock and dedupes replayed run IDs', async () => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');
+    const ledgerPath = join(root, 'loops.jsonl');
+    const facts = { repo: 'o/r', pr: 7, head: 'a'.repeat(40), ledgerPath };
+    await recordPostAcceptAdvisoryShadow({ ...facts, decision: { wouldCard: false, wouldPush: true, findings: [] } });
+    await recordPostAcceptAdvisoryLoops({ ...facts, runId: 'same-head' });
+    const later = { ...facts, head: 'b'.repeat(40), runId: 'later-1' };
+    await Promise.all([recordPostAcceptAdvisoryLoops(later), recordPostAcceptAdvisoryLoops(later)]);
+    await recordPostAcceptAdvisoryLoops({ ...later, runId: 'later-2' });
+    await recordPostAcceptAdvisoryLoops(later);
+    const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows).toHaveLength(3);
+    expect(rows.slice(1)).toMatchObject([
+      { head: facts.head, loopsAfter: 1, runId: 'later-1' },
+      { head: facts.head, loopsAfter: 2, runId: 'later-2' },
+    ]);
+  });
+
   it('separates a truncated JSON tail from new rows and skips unparseable lines on replay', async () => {
     const { recordPostAcceptAdvisoryShadow } = await import('../review-pr-io.mjs');
     const ledgerPath = join(root, 'shadow.jsonl');
     const tail = '{"kind":"we.post-accept-advisory-shadow","repo":';
     writeFileSync(ledgerPath, `not json\n${tail}`);
     const facts = { repo: 'o/r', pr: 7, head: 'a'.repeat(40), ledgerPath,
-      decision: { wouldCard: true, wouldPush: false, findings: [{ findingId: 'one' }] } };
+      decision: { wouldCard: true, wouldPush: false, findings: [{ findingId: 'one', category: 'correctness/correctness', summary: 'improve diagnostic', impactIfUnfixed: 'cosmetic' }] } };
     const row = await recordPostAcceptAdvisoryShadow(facts);
     expect(row).toMatchObject({ repo: 'o/r', pr: 7, headSha: facts.head });
     const text = readFileSync(ledgerPath, 'utf8');

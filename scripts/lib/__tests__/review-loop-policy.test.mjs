@@ -56,6 +56,12 @@ describe('post-accept advisory replay fixtures', () => {
       .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
   });
 
+  it.each(['', '   ', undefined, null, 42, {}, 'unknown', 'invented/category', '/correctness', ' security/untrusted-text'])(
+    'fails closed on empty, non-string or unknown category %j with cosmetic impact', category => {
+      expect(decide({ verdict: accepted([{ ...cosmetic, category }]) }))
+        .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+    });
+
   it.each([undefined, 'unknown'])('(c) fail closed on unstated/unknown impact %s', impactIfUnfixed => {
     expect(decide({ verdict: accepted([{ ...cosmetic, impactIfUnfixed }]) }))
       .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
@@ -222,6 +228,16 @@ describe('post-accept advisory shadow ledger', () => {
     ['null finding', { findings: [null] }],
     ['scalar finding', { findings: [42] }],
     ['array finding', { findings: [[]] }],
+    ['empty finding', { findings: [{}] }],
+    ['empty category', { findings: [{ ...finding, category: '' }] }],
+    ['non-string category', { findings: [{ ...finding, category: 42 }] }],
+    ['unknown impact', { findings: [{ ...finding, impactIfUnfixed: 'unknown' }] }],
+    ['non-string impact', { findings: [{ ...finding, impactIfUnfixed: 42 }] }],
+    ['empty text', { findings: [{ ...finding, summary: '  ' }] }],
+    ['non-string text', { findings: [{ ...finding, summary: 42 }] }],
+    ['negative loop count', { loopsAfter: -9 }],
+    ['fractional loop count', { loopsAfter: 1.5 }],
+    ['non-string loop count', { loopsAfter: '2' }],
     ['non-array laterRatings', { laterRatings: {} }],
     ['null laterRatings', { laterRatings: null }],
     ['null rating entry', { laterRatings: [null] }],
@@ -229,7 +245,7 @@ describe('post-accept advisory shadow ledger', () => {
     ['unknown rating impact', { laterRatings: [{ findingId: 'finding-1', impactIfUnfixed: 'unknown' }] }],
   ])('skips a persisted %s in reports and permits a valid replacement observation', async (_name, malformed) => {
     const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
-      ...decision, ...malformed }];
+      ...decision, loopsAfter: null, ...malformed }];
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
       prs: 0, wouldCard: 0, findings: 0, skipped: 1,
     });
@@ -240,6 +256,27 @@ describe('post-accept advisory shadow ledger', () => {
     const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
     expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 1, skipped: 1 });
     expect(report.text).toContain('Skipped: 1');
+  });
+
+  it('keeps the existing undeclared-impact marker and finding-text alias readable', async () => {
+    const { impactIfUnfixed, summary, ...undeclared } = finding;
+    const rows = [];
+    const recorded = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head,
+      decision: { ...decision, wouldCard: false, wouldPush: true, findings: [{ ...undeclared, finding: summary }] },
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(recorded).toMatchObject({ wouldPush: true, loopsAfter: null });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldPush: 1, skipped: 0 });
+  });
+
+  it('refuses exhausted measured loop counts with an operator-visible ledger inspection fallback', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, loopsAfter: Number.MAX_SAFE_INTEGER }];
+    const logs = [];
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'b'.repeat(40), runId: 'later',
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) })).toBeNull();
+    expect(rows).toHaveLength(1);
+    expect(logs.join('\n')).toContain('loop count exhausted; inspect shadow ledger; live review unaffected');
   });
 
   it('refuses to persist a new observation containing a null finding', async () => {

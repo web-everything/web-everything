@@ -40,7 +40,7 @@ import {
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
-import { recordPostAcceptAdvisoryShadow, createReviewPrSinks } from '../review-pr-io.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
@@ -50,7 +50,7 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 // explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
 // lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
 const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
-const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), ...options });
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -1582,6 +1582,51 @@ describe('unattended accept reads the live head', () => {
 
 
 describe('post-accept advisory shadow wiring', () => {
+  it.each(['shadow', 'on', 'recorder-error', 'logging-error'])(
+    '%s measures later review runs once per run ID and preserves mode-off live effects', async scenario => {
+      const execute = async mode => {
+        const rows = [], effects = [], outcomes = [], logs = [];
+        const io = { readLedgerRows: () => structuredClone(rows),
+          appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+        const store = createMemoryRunStore();
+        const review = async (rev, id, answer = CLEAN_ANSWER) => {
+          const { declaration, registry } = registryFor({ rev });
+          const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+            sinks: recordingSinks(effects), makeJudge: cannedJudge(answer), mintRunId: () => id,
+            advisorySettings: () => ({ value: { mode: mode === 'off' ? 'off' : mode === 'on' ? 'on' : 'shadow' } }),
+            recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+            recordAdvisoryLoops: facts => {
+              if (facts.head !== HEAD_A && (mode === 'recorder-error' || mode === 'logging-error')) throw new Error('loops ledger unavailable');
+              return recordPostAcceptAdvisoryLoops({ ...facts, ...io });
+            },
+            advisoryLog: line => { logs.push(line); if (mode === 'logging-error') throw new Error('logger failed'); },
+          });
+          outcomes.push({ code: out.code, stopped: out.stopped, lines: out.lines, verdict: out.run.verdict });
+          return out;
+        };
+        // An actual accepted earlier head, followed by later reviews that need not accept.
+        await review(HEAD_A, 'accepted');
+        if (mode !== 'off') {
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({ headSha: HEAD_A, loopsAfter: null });
+        }
+        await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
+        if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops'))
+          .toMatchObject([{ head: HEAD_A, loopsAfter: 1, runId: 'later-1' }]);
+        await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
+        if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops')).toHaveLength(1);
+        await review(HEAD_B, 'later-2', BLOCKING_ANSWER);
+        return { rows, effects, outcomes, logs };
+      };
+      const baseline = await execute('off');
+      const result = await execute(scenario);
+      expect(result.effects).toEqual(baseline.effects);
+      expect(result.outcomes).toEqual(baseline.outcomes);
+      if (['shadow', 'on'].includes(scenario)) expect(result.rows.filter(row => row.kind === 'loops'))
+        .toMatchObject([{ head: HEAD_A, loopsAfter: 1, runId: 'later-1' }, { head: HEAD_A, loopsAfter: 2, runId: 'later-2' }]);
+      else expect(result.logs.join('\n')).toContain('live review unaffected');
+    });
+
   it.each(['shadow', 'on', 'invalid-settings', 'settings-error', 'recorder-error'])(
     '%s preserves all live effects for an advisory-bearing would-card accept', async scenario => {
       const execute = async mode => {

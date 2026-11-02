@@ -81,7 +81,7 @@ import { isValidRoundBudget } from './review-settings.mjs';
 
 import { CONFIRM_ACTORS, CONFIRM_OPTIONS, REVIEW_EFFECTS } from '../operations/review-pr-constants.mjs';
 import { VERDICTS, hasUncapturedPrevention, normalizeFinding, requiresMandatoryReferral, DEFAULT_ROUND_CAP,
-  MANDATORY_LENSES } from './jury-core.mjs';
+  MANDATORY_LENSES, PANEL_LENSES } from './jury-core.mjs';
 import { findingHeldVerdict } from './review-round-rules.mjs';
 import { FIELD_CAPS, KINDS } from '../conveyor/learnings-drop.mjs';
 // #883 — every code-path reference filed into a backlog card's `scope` or BODY prose must carry its `<repo>:`
@@ -628,7 +628,9 @@ export function postAcceptAdvisoryDecision({ verdict, guards = {}, mode = 'shado
   for (const finding of findings) {
     if (!finding || requiresMandatoryReferral(finding)
       || !CARDABLE_IMPACTS.includes(finding.impactIfUnfixed)) return out(false, 'blocking-impact');
-    if (typeof finding.category !== 'string' || finding.category.split('/')[0] === 'security') return out(false, 'security-or-unknown-category');
+    if (typeof finding.category !== 'string' || !finding.category.trim()
+      || !PANEL_LENSES.includes(finding.category.split('/')[0])
+      || finding.category.split('/')[0] === 'security') return out(false, 'security-or-unknown-category');
   }
   return out(true, 'advisory-only');
 }
@@ -662,21 +664,44 @@ const advisoryIdentity = row => row && typeof row === 'object' && !Array.isArray
   && typeof row.repo === 'string' && row.repo.length > 0 && Number.isInteger(row.pr) && row.pr > 0
   && /^[a-f0-9]{40}$/i.test(row.headSha ?? row.head ?? '');
 const advisoryObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-const validAdvisoryFindings = findings => Array.isArray(findings) && findings.every(advisoryObject);
+const nonemptyAdvisoryString = value => typeof value === 'string' && value.trim().length > 0;
+const validAdvisoryFindings = findings => Array.isArray(findings) && findings.every(finding => advisoryObject(finding)
+  && nonemptyAdvisoryString(finding.category)
+  // Absent impact is the existing UNDECLARED marker; unknown declared values are corrupt evidence.
+  && (finding.impactIfUnfixed === undefined || ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(finding.impactIfUnfixed))
+  && nonemptyAdvisoryString(finding.summary ?? finding.finding));
 const validLaterRatings = ratings => ratings === undefined || (Array.isArray(ratings)
   && ratings.every(rating => advisoryObject(rating) && typeof rating.findingId === 'string'
     && rating.findingId.length > 0 && ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(rating.impactIfUnfixed)));
 const validAdvisoryRow = row => advisoryIdentity(row) && typeof row.wouldCard === 'boolean'
-  && row.wouldPush === !row.wouldCard && validAdvisoryFindings(row.findings) && validLaterRatings(row.laterRatings);
+  && row.wouldPush === !row.wouldCard && validAdvisoryFindings(row.findings) && validLaterRatings(row.laterRatings)
+  && (row.loopsAfter === null || validLoopCount(row.loopsAfter));
 const advisoryKey = row => JSON.stringify([row.repo, row.pr, row.headSha ?? row.head]);
 
-/** Append measured loop counts later; replaying the same identity/value is idempotent. */
-export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter,
+/** Append explicit counts, or measure one later run per earlier accepted head, idempotently by run ID. */
+export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter, runId,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
-    if (!advisoryIdentity({ repo, pr, head }) || !validLoopCount(loopsAfter)) throw new Error('incomplete loops evidence');
+    if (!advisoryIdentity({ repo, pr, head })
+      || (loopsAfter === undefined ? !nonemptyAdvisoryString(runId) : !validLoopCount(loopsAfter))) throw new Error('incomplete loops evidence');
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
+    if (loopsAfter === undefined) {
+      const accepts = new Map(rows.filter(row => validAdvisoryRow(row)
+        && row.kind === 'we.post-accept-advisory-shadow' && row.repo === repo && row.pr === pr
+        && (row.headSha ?? row.head) !== head).map(row => [advisoryKey(row), row]));
+      for (const [key, accept] of accepts) {
+        const measurements = rows.filter(row => advisoryIdentity(row) && row.kind === 'loops'
+          && advisoryKey(row) === key && validLoopCount(row.loopsAfter));
+        if (measurements.some(row => row.runId === runId)) continue;
+        const count = measurements.reduce((count, row) => Math.max(count, row.loopsAfter), accept.loopsAfter ?? 0) + 1;
+        if (!validLoopCount(count)) throw new Error('loop count exhausted; inspect shadow ledger');
+        const row = { kind: 'loops', repo, pr, head: accept.headSha ?? accept.head, loopsAfter: count, runId, at: now() };
+        const result = await appendLedgerRow(row);
+        if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
+      }
+      return null;
+    }
     const row = { kind: 'loops', repo, pr, head, loopsAfter, at: now() };
     if (rows.some(old => advisoryIdentity(old) && old.kind === 'loops'
       && advisoryKey(old) === advisoryKey(row) && old.loopsAfter === loopsAfter)) return null;
