@@ -299,6 +299,16 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
   });
 
+  it('restores the registration when the branch is recreated at the proved tip before the drop', async () => {
+    const { f, tip, mergeOid } = setup();
+    const r = await retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
+      prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
+      tip: () => tip, // the branch is back on origin at the very tip the PR had
+    } });
+    expect(r).toMatchObject({ retired: false, refused: 'tip-moved-restored' });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+
   it('refuses when the merge commit is not an ancestor of main', () => {
     const { f, tip } = setup();
     f.ghPrs([merged('lane/sq', tip, tip)]); // the (deleted) branch tip is not on main
