@@ -990,9 +990,16 @@ describe('real git: cleanup CLI', () => {
     const looseBefore = parseCountObjects(git(lane(5), 'count-objects', '-v')).count;
     expect(looseBefore).toBeGreaterThan(0);
     const late = join(root, 'late-borrower', 'objects');
+    // The CLI scans every child of its tmpdir for borrowers, and a shared CI tmpdir is churned by sibling test files
+    // (repos made and deleted mid-scan), which turned this lane into an error row on main @ 524e63ebc. A private
+    // tmpdir under `root` keeps the scan to this test's own repos.
+    const privateTmp = join(root, 'private-tmp');
+    mkdirSync(privateTmp, { recursive: true });
     const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=5', '--json'], {
-      env: { ...env, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: late, LANE_GIT_DIET_TEST_QUOTED_ALTERNATE: quoted ? '1' : '' }, encoding: 'utf8',
+      env: { ...env, TMPDIR: privateTmp, VITEST: 'true', LANE_GIT_DIET_TEST_LATE_BORROWER: late, LANE_GIT_DIET_TEST_QUOTED_ALTERNATE: quoted ? '1' : '' }, encoding: 'utf8',
     }));
+    // Name the whole row on failure, so an error row shows its message instead of "got undefined".
+    expect(out.rows[0], JSON.stringify(out.rows[0])).toHaveProperty('skipped');
     expect(out.rows[0].skipped).toMatch(/borrowed by .*late-borrower.*gc skipped/);
     expect(parseCountObjects(git(lane(5), 'count-objects', '-v')).count).toBe(looseBefore); // gc never ran
     expect(existsSync(join(lane(5), '.git', '.lane-lease'))).toBe(false);
