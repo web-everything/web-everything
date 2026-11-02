@@ -1,8 +1,8 @@
 import * as nodeFs from 'node:fs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { tmpdir as nodeTmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join, resolve, dirname } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readRemoteReport } from './verify-remote-routing.mjs';
 import { killProcessTree } from './bounded-child.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
@@ -11,6 +11,8 @@ const positive = n => Number.isSafeInteger(n) && n > 0;
 // Gate arguments use --key=value. Also preserve ordinary two-token Vitest options;
 // boolean switches must never consume the following test file.
 const booleans = new Set(['--passWithNoTests', '--run', '--watch', '--coverage', '--silent', '--globals', '--isolate', '--no-isolate', '--no-file-parallelism', '--fileParallelism']);
+const HEAVY_ADMISSION_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'heavy-admission.mjs');
+
 export function splitVitestArgs(argv, count) {
   if (!positive(count) || argv.slice(0, 3).join(' ') !== 'npx vitest run') throw Error('expected npx vitest run and a positive shard count');
   const files = [], flags = [];
@@ -115,7 +117,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           const report = join(directory, `${index}.${local ? 'local' : 'initial'}.json`);
           const args = ['vitest', 'run', ...files, ...flags, '--reporter=default', '--reporter=json', `--outputFile=${report}`];
           const result = await execute({ command: local ? 'npx' : 'node',
-            args: local ? args : ['scripts/readiness/heavy-admission.mjs', 'run', '--', ...args],
+            args: local ? args : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
             files, report, remoteReport, cwd, env: local ? { ...childEnv, [ADMISSION_HELD_ENV]: '1' } : childEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';

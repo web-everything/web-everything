@@ -60,7 +60,10 @@
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
-import { relative, sep } from 'node:path';
+import { relative, sep, join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Absolute path of the wrapper beside this module: a daemon verifies a lane checkout that may not contain it yet.
+const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
 import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS, findLastGreenAncestor, decideSinceLastGreen } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
@@ -440,7 +443,7 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
       selection.shards = shards;
       decision.shards = shards;
       decision.reasons = [...decision.reasons, `${shards.count} shards (size ${shards.size}, parallel ${shards.parallel}); shardMinTests=${settings.shardMinTests} (${settingsSource.shardMinTests}), shardSize=${settings.shardSize} (${settingsSource.shardSize}), shardParallel=${settings.shardParallel} (${settingsSource.shardParallel}), phaseTimeoutMs=${settings.phaseTimeoutMs} (${settingsSource.phaseTimeoutMs})`];
-      vitestCmd = `node scripts/lib/verify-shard-run.mjs --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
+      vitestCmd = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
     }
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
     // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number

@@ -35,7 +35,7 @@ describe('fail-closed wrapper', () => {
     const f = fixture(); expect(await f.run()).toBe(0);
     expect(f.lines.join('')).toContain('GREEN (all 3 shards, 3 files executed and passed)');
     expect(f.lines.filter(l => l.startsWith('verify-shard '))).toHaveLength(3);
-    expect(f.calls[0].args).toContain('scripts/readiness/heavy-admission.mjs');
+    expect(f.calls[0].args.some(a => a.endsWith('scripts/readiness/heavy-admission.mjs'))).toBe(true);
   });
   it.each(['red', 'missing', 'unreadable'])('%s cannot turn green', async mode => {
     const f = fixture([mode]); expect(await f.run()).toBe(1);

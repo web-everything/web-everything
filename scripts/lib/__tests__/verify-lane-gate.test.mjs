@@ -1210,7 +1210,7 @@ describe('explicit-list sharding', () => {
   }
   it('wraps at threshold, with 75 files producing seven shards and a 90% budget', () => {
     const result = gate(75);
-    expect(result.testCommand).toMatch(/^node scripts\/lib\/verify-shard-run.mjs --shards=7 --parallel=3 --budget-ms=9000 -- npx vitest run /);
+    expect(result.testCommand).toMatch(/^node '[^']*\/scripts\/lib\/verify-shard-run\.mjs' --shards=7 --parallel=3 --budget-ms=9000 -- npx vitest run /);
     expect(result.decision.selection.shards).toEqual({ count: 7, size: 12, parallel: 3 });
     expect(describeGate(result)).toContain('7 shards');
     expect(gate(24).testCommand).toContain('--shards=2');
