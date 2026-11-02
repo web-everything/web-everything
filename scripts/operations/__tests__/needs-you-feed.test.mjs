@@ -433,6 +433,11 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       gh: async () => '[[]]', settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
     expect(result.openKeys).toContain(key);
   });
+  it('an untrusted marker-only comment cannot suppress a trusted clean result', async () => {
+    const comments = [...gateComments().slice(0, 1), { user: { login: 'mallory' }, body: gateComments().at(0).body.split('\n')[0], created_at: '2026-10-10T03:00:00Z' }];
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });

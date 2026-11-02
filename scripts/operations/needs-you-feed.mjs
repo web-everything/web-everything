@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
 import { GATE_OUTCOMES, liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
@@ -103,6 +104,7 @@ const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-
 function headlineAgrees(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   return (Array.isArray(comments) ? comments : []).every(c => {
+    if (!isTrustedMarkerAuthor(c)) return true; // untrusted text is data, never a veto
     const whole = typeof c === 'string' ? c : c?.body;
     const lines = typeof whole === 'string' ? whole.replace(/\r\n/g, '\n').split('\n') : [];
     // Every embedded result counts, carried wrappers included (liveResultGateState reads those too).
