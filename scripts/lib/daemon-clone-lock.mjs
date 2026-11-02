@@ -202,6 +202,9 @@ export const DEFAULT_WRITER_CLAIM_TTL_MS = 30 * 60_000;
  *  writer's intent lapses on its own. Default 30 s; `0` = off (the pre-fix behaviour). */
 export const WRITER_WAIT_PRIORITY_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS';
 export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 30_000;
+/** The override is a bounded window, not forever: this long after the threshold the writer yields to starved
+ *  readers again (so a stream of starved readers is queued behind a writer for at most this long). */
+export const WRITER_WAIT_PRIORITY_WINDOW_MS = 5 * 60_000;
 
 /** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default; 0 = off). */
 export function resolveWriterWaitPriorityMs(env = process.env) {
@@ -490,7 +493,7 @@ export async function acquireWrite(root, opts = {}) {
     // Callers must explicitly opt in to excluding readers; inherited env never grants a bypass.
     ignoreOwners = [],
     lockRoot = defaultLockRoot(),
-    waitMs = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
+    waitMs: waitMsOpt = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
     pollMs = 1000,
     sleep = defaultSleep,
     now = () => Date.now(),
@@ -502,8 +505,11 @@ export async function acquireWrite(root, opts = {}) {
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
     writerWaitPriorityMs = resolveWriterWaitPriorityMs(),
+    writerWaitPriorityWindowMs = WRITER_WAIT_PRIORITY_WINDOW_MS,
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
+  // Fail closed on an unbounded/invalid wait: the wait-priority override must always end.
+  const waitMs = Number.isFinite(Number(waitMsOpt)) && Number(waitMsOpt) > 0 ? Number(waitMsOpt) : 600_000;
 
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
@@ -517,7 +523,9 @@ export async function acquireWrite(root, opts = {}) {
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
-    const waitedPast = writerWaitPriorityMs > 0 && nowMsN - startMs >= writerWaitPriorityMs;
+    const waited = nowMsN - startMs;
+    const waitedPast = writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
+      && waited < writerWaitPriorityMs + writerWaitPriorityWindowMs;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
       startedBeforeMs: waitedPast ? startMs : null,

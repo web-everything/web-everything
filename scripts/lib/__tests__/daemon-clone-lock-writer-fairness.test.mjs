@@ -260,7 +260,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
 
   /** R holds a read slot until `rReleaseMs`; a fresh reader (distinct owner + key) arrives every `arriveMs`
    *  and keeps retrying each tick, so it reaches starvation priority (3 refusals) 10s after arriving. Returns the writer result + wait + readers. */
-  async function simulate({ waitPriorityMs, rReleaseMs = 100_000, arriveMs = 5000 }) {
+  async function simulate({ waitPriorityMs, rReleaseMs = 100_000, arriveMs = 5000, window }) {
     const lockRoot = mkTmp('dcww-root-');
     const clone = mkTmp('dcww-clone-');
     const common = { lockRoot, probe: alive, leaseMinutes: LEASE, writerClaimTtlMs: TTL, readerPriorityAfter: 3 };
@@ -290,6 +290,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     const startedAt = t;
     const w = await acquireWrite(clone, {
       ...common, owner: 'W', waitMs: 600_000, pollMs: 1000, now: () => t, writerWaitPriorityMs: waitPriorityMs,
+      ...(window ? { writerWaitPriorityWindowMs: window } : {}),
       sleep: async (ms) => { t += ms; step(); },
     });
     return { w, waitedMs: t - startedAt, admitted, rEntryWhileWaiting, lockRoot, clone, rHeld };
@@ -346,6 +347,26 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '45000' })).toBe(45000);
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: 'x' })).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '   ' })).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
+  });
+
+  it('the override is a bounded window: after it the writer yields to the starved readers again', async () => {
+    const r = await simulate({ waitPriorityMs: 8000, window: 20_000 });
+    expect(r.w.ok).toBe(false);
+    expect(r.w.reason).toBe('reader-priority');
+    expect(r.waitedMs).toBeGreaterThanOrEqual(28_000);
+  });
+
+  it('an infinite wait is not honoured: it falls back to the bounded default', async () => {
+    const lockRoot = mkTmp('dcww-root-');
+    const clone = mkTmp('dcww-clone-');
+    let t = 0;
+    expect(acquireRead(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'R', nowMs: t }).ok).toBe(true);
+    const w = await acquireWrite(clone, {
+      lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'W', waitMs: Infinity, pollMs: 1000, now: () => t,
+      sleep: async (ms) => { t += ms; },
+    });
+    expect(w.reason).toBe('tick-in-progress');
+    expect(t).toBeLessThanOrEqual(601_000);
   });
 
   it('the override is bounded to one wait: if the writer gives up, the starved reader still has priority next attempt', async () => {
