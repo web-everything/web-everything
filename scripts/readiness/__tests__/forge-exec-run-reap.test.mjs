@@ -337,12 +337,20 @@ describe('forge leaked-state reaper', () => {
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(await exists(lock)).toBe(true);
   });
-  it.runIf(process.platform === 'linux')('reads live credentials and reports an unmatched uid idle in a stable process list', async () => {
+  it.runIf(process.platform === 'linux')('sees live credentials, and proves an absent uid idle in a stable process set', async () => {
     expect(await uidBusy(process.getuid())).toBe(true);
-    // The real host can churn through all four retries, which correctly reports
-    // busy even for an unused uid. Pin the list to our living process while
-    // still reading real /proc credentials; unstable scans are covered above.
-    const proc = {readdir: async () => [String(process.pid)], readFile};
+    // Unrelated host processes can vanish during every retry, correctly keeping a full scan busy.
+    // Pin only the listing to this live test process; still read its real /proc credentials.
+    const proc = {
+      async readdir(path) {
+        expect(path).toBe('/proc');
+        return [String(process.pid)];
+      },
+      async readFile(path) {
+        expect(path).toBe('/proc/' + process.pid + '/status');
+        return readFile(path);
+      },
+    };
     expect(await uidBusy(process.getuid(), proc)).toBe(true);
     expect(await uidBusy(4000000123, proc)).toBe(false);
   });

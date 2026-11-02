@@ -36,7 +36,9 @@ import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
-import { createRegistry } from './registry.mjs';
+import { createRegistry, op } from './registry.mjs';
+import { compute, effect } from './step-kinds.mjs';
+import { main as codexAuditMain } from './codex-audit.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -195,6 +197,29 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * validation — `--help` prints `[--tier=A|B, default A] …` because the declaration says so. The same
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
+
+// Capture both audit streams as the operation result. The CLI adapter owns the JSON envelope;
+// plain mode prints the captured verdict/findings or refusal diagnostic, preserving the audit exit code.
+export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = {}) {
+  return async ({ base, head }) => {
+    let stdout = '', stderr = '';
+    const deps = makeDeps ? makeDeps() : (await import('./codex-audit-io.mjs')).createAuditDeps();
+    const code = await auditMain([`--base=${base}`, `--head=${head}`], {
+      ...deps,
+      stdout: text => { stdout += text; },
+      stderr: text => { stderr += text; },
+    });
+    return { ok: code === 0, code, stdout, stderr };
+  };
+}
+
+export function finishCodexAudit({ run, code, lines, json }) {
+  const v = run?.verdict;
+  const outCode = v?.code ?? code;
+  return { code: outCode, lines: json || !v ? lines
+    : [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd()) };
+}
+
 
 export const OPERATIONS = Object.freeze({
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
@@ -465,6 +490,22 @@ export const OPERATIONS = Object.freeze({
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  'codex-audit': () => ({
+    declaration: op('codex-audit', {
+      input: { base: { type: 'string' }, head: { type: 'string' } },
+      verdictFrom: 'assess',
+      audit: effect({ reads: ['input.base', 'input.head'], effects: ({ input }) => [{
+        type: 'codex-audit.run', payload: input, idempotent: false,
+      }] }),
+      assess: compute({ reads: ['findings.audit'], fn: ({ findings }) => {
+        const entry = findings.audit?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('codex-audit: audit did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'codex-audit.run': createCodexAuditSink() },
+    finish: finishCodexAudit,
   }),
   [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
     sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },

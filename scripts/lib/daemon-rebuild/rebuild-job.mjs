@@ -367,12 +367,12 @@ export async function jobMain({
         const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
         const timeout = reportTimeout({ root: input.root, env, r });
         const result = {
-          finishedAt: Date.now(), reason: r.reason ?? null, readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
+          finishedAt: Date.now(), reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}), readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
           alerts: (r.alerts || []).map((a) => a.kind),
           ...(timeout ?? {}),
         };
         writeFileSync(join(dir, `${jobId}${RESULT_SUFFIX}`), `${JSON.stringify(result)}\n`);
-        process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
+        process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.mutation ? ` (${result.mutation})` : ''}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
         return { reason: result.reason, readyRecorded: result.readyRecorded };
       },
     }],
