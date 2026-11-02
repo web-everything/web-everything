@@ -482,11 +482,40 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it('refuses a {{SCOPE}} value that could close the quote or inject — `\'`, space, `;`, `$`, backtick, newline, `"`, `|`, `\\`', () => {
     const read = tickRead();
-    for (const bad of ["we:a';id;'", 'we:a b', 'we:a;b', 'we:a$(id)', 'we:a`id`', 'we:a\nb', 'we:a"b', 'we:a|b', 'we:a\\b']) {
+    for (const bad of ["we:a';id;'", 'we:a;b', 'we:a$(id)', 'we:a`id`', 'we:a\nb', 'we:a"b', 'we:a|b', 'we:a\\b']) {
       expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
         .toThrow(/characters the brief cannot carry/);
     }
     expect(BRIEF_SCOPE_VALUE_RE.test("we:a'b")).toBe(false);
+  });
+
+  it('R372 — a scope entry naming several paths (space or comma separated) dispatches as a comma-joined list', () => {
+    const read = tickRead();
+    const shaped = shapeDispatchRead({
+      ...read,
+      item: { ...read.item, scope: ['we:scripts/readiness/heavy-admission.mjs scripts/readiness/remote-exec.mjs', 'we:a.mjs, we:b.mjs\tc.mjs'] },
+    }, { num: '3037' });
+    expect(shaped.dispatching).toBe(true);
+    expect(shaped.scope).toEqual([
+      'we:scripts/readiness/heavy-admission.mjs', 'scripts/readiness/remote-exec.mjs', 'we:a.mjs', 'we:b.mjs', 'c.mjs',
+    ]);
+    expect(shaped.prompt).toContain("--scope='we:scripts/readiness/heavy-admission.mjs,scripts/readiness/remote-exec.mjs,we:a.mjs,we:b.mjs,c.mjs'");
+  });
+
+  it('R372 — fails closed when ANY entry of a multi-path scope is unsafe (metachar, `..`, absolute)', () => {
+    const read = tickRead();
+    for (const bad of [
+      'we:a.mjs b;c', 'we:a.mjs $(id)', 'we:a.mjs `id`', 'we:a.mjs ../x.mjs', 'we:a.mjs we:../../x', 'we:a.mjs /etc/passwd',
+      'we:a.mjs we:/abs/x', "we:a.mjs b'c", 'we:a.mjs\nb|c',
+    ]) {
+      expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
+        .toThrow(/characters the brief cannot carry|unsafe scope entry/);
+    }
+  });
+
+  it('R372 — a scope that is only separators is refused as unscoped', () => {
+    const read = tickRead();
+    expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [' , '] } }, { num: '3037' })).toThrow(/no `scope:`/);
   });
 
   it('refuses an unscoped item — an empty scope declares a lane that owns no paths', () => {
