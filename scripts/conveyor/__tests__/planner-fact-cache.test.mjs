@@ -176,9 +176,9 @@ describe('fact storage, scoped eviction and TTL', () => {
     cache.lookup(key);
     const next = fact({ headRefOid: 'new-head' });
     cache.store(prFactKey(next), next, { complete: true });
-    expect(cache.stats()).toEqual({ hits: 1, misses: 1, stores: 2, refused: 1, evictions: 1 });
+    expect(cache.stats()).toEqual({ hits: 1, misses: 1, stores: 2, refused: 1, evictions: 1, compared: 0 });
     cache.resetStats();
-    expect(cache.stats()).toEqual({ hits: 0, misses: 0, stores: 0, refused: 0, evictions: 0 });
+    expect(cache.stats()).toEqual({ hits: 0, misses: 0, stores: 0, refused: 0, evictions: 0, compared: 0 });
     expect(cache.lookup(prFactKey(next))).toEqual(next);
   });
 });
@@ -318,6 +318,27 @@ describe('persisted shadow promotion evidence', () => {
     for (let i = 0; i < 100; i++) cache.recordPass({ diffCount: 0, compared: 0 });
     setNow(START + 48 * HOUR);
     expect(cache.shadowEndRule({ now: START + 48 * HOUR })).toMatchObject({ met: false, passes: 100, comparedPasses: 0 });
+  });
+
+  it('rejects a snapshot whose comparedPasses is malformed or exceeds passes', async () => {
+    for (const comparedPasses of ['100', 101, -1]) {
+      const fs = memoryFs();
+      fs.files.set('bad.json', JSON.stringify({ version: 1, entries: [],
+        evidence: { firstShadowAt: START - 48 * HOUR, passes: 100, diffs: 0, comparedPasses } }));
+      const { cache } = harness({ ...fs, snapshotPath: 'bad.json' });
+      await cache.loadSnapshot();
+      expect(cache.shadowEndRule({ now: START }).met).toBe(false);
+      expect(cache.shadowEndRule({ now: START }).passes).toBe(0);
+    }
+  });
+
+  it('counts only completed comparisons, not lookup hits', () => {
+    const { cache } = harness();
+    cache.store('k', { a: 1 }, { complete: true });
+    cache.lookup('k');
+    expect(cache.stats()).toMatchObject({ hits: 1, compared: 0 });
+    cache.compareShadow({ a: 1 }, { a: 1 });
+    expect(cache.stats().compared).toBe(1);
   });
 
   it('persists firstShadowAt and cumulative passes/diffs across restart and stats reset', async () => {

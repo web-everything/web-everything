@@ -42,7 +42,7 @@ export function createPlannerFactCache({ now = Date.now, ttlMs = 600_000, mode =
   const scopes = new Map();
   let counters, diffCount = 0;
   let evidence = { firstShadowAt: null, passes: 0, diffs: 0 };
-  const resetStats = () => { counters = { hits: 0, misses: 0, stores: 0, refused: 0, evictions: 0 }; diffCount = 0; };
+  const resetStats = () => { counters = { hits: 0, misses: 0, stores: 0, refused: 0, evictions: 0, compared: 0 }; diffCount = 0; };
   resetStats();
   const remove = key => {
     rows.delete(key);
@@ -84,6 +84,7 @@ export function createPlannerFactCache({ now = Date.now, ttlMs = 600_000, mode =
       };
       walk(cached, freshRow, '');
       diffCount += diffs.length;
+      counters.compared++;
       return { same: diffs.length === 0, diffs };
     },
     recordPass({ diffCount: count = 0, compared = 0 } = {}) {
@@ -115,7 +116,8 @@ export function createPlannerFactCache({ now = Date.now, ttlMs = 600_000, mode =
         if (snapshot.version !== 1 || !Array.isArray(snapshot.entries) || !plain(e)
           || !(e.firstShadowAt === null || (Number.isFinite(e.firstShadowAt) && e.firstShadowAt <= now()))
           || !Number.isSafeInteger(e.passes) || e.passes < 0 || !Number.isSafeInteger(e.diffs) || e.diffs < 0
-          || (e.passes > 0 && e.firstShadowAt === null)) return;
+          || (e.passes > 0 && e.firstShadowAt === null)
+          || !(e.comparedPasses === undefined || (Number.isSafeInteger(e.comparedPasses) && e.comparedPasses >= 0 && e.comparedPasses <= e.passes))) return;
         evidence = { ...e };
         for (const item of snapshot.entries) {
           if (!Array.isArray(item) || item.length !== 2) continue;
