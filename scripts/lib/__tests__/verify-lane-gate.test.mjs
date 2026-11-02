@@ -1066,7 +1066,7 @@ describe('#5128 — bounded related-test selection', () => {
     const selectedTestCommand = new RegExp(pattern[1]);
     for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
     expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
-    expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
+    expect(source).toMatch(/const retryableGate = isSelectedTestCommand\(resolvedGate\?\.testCommand \?\? ''\)/);
   });
 });
 
@@ -1196,5 +1196,27 @@ describe('skipLocalForCardOnly — card-only diffs skip the local gate (CI keeps
   it('an untracked non-litter file breaks card-only; lane litter does not', () => {
     expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: ['scripts/new.mjs'] }) })).toBe(false);
     expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: [LANE_RELEASE_LITTER_ALLOWLIST[0]] }) })).toBe(true);
+  });
+});
+
+describe('explicit-list sharding', () => {
+  function gate(count, settings = {}) {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < count; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
+    files['scripts/deep.test.mjs'] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2, phaseTimeoutMs: 10000, ...settings }, readRepoFile: p => files[p],
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
+  }
+  it('wraps at threshold, with 75 files producing seven shards and a 90% budget', () => {
+    const result = gate(75);
+    expect(result.testCommand).toMatch(/^node '[^']*\/scripts\/lib\/verify-shard-run\.mjs' --shards=7 --parallel=3 --budget-ms=9000 -- npx vitest run /);
+    expect(result.decision.selection.shards).toEqual({ count: 7, size: 12, parallel: 3 });
+    expect(describeGate(result)).toContain('7 shards');
+    expect(gate(24).testCommand).toContain('--shards=2');
+  });
+  it('below threshold and disabled commands are byte-identical', () => {
+    expect(gate(23).testCommand).toBe(gate(23, { shardMinTests: 0 }).testCommand);
+    expect(gate(75, { shardMinTests: 0 }).testCommand).toMatch(/^npx vitest run /);
   });
 });

@@ -84,7 +84,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
@@ -347,6 +347,8 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
 }
 // The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
 const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
+// The sharded form of the same selected-test gate (still retryable, still runs the always-run guards).
+const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).startsWith(`node '${SHARD_RUN_SCRIPT}' `);
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
@@ -471,7 +473,7 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   } catch { /* Unknown selection cannot authorize a retry. */ }
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
-  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && SELECTED_TEST_COMMAND.test(GATE)) {
+  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && isSelectedTestCommand(GATE)) {
     admissionFallback = 'requested gate is not this checkout\'s default selection under any declared settings variant';
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }
@@ -615,7 +617,7 @@ const ADMISSION_CAP = resolveCap(process.env);
 const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
 // #verify-phase-admission — acquire the first phase before dispatch's execution marker.
-const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? '');
+const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
