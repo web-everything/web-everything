@@ -43,6 +43,8 @@ export function readOverlayEventLog(root, env) {
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
  * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
 export function contentContainedInBuild(git, sha, build) {
+  // Custom merge drivers can discard overlay changes while reporting an unchanged tree: refuse (fail closed).
+  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
   const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
   const t = String(m.stdout ?? '').split('\n')[0].trim();
   return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);

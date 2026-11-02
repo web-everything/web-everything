@@ -134,6 +134,22 @@ describe('the Git proof of omitted content in the candidate build', () => {
     ), overlay, build)).toBe(false);
   });
 
+  it('refuses content proof when a custom merge driver is configured', () => {
+    const { originDir, cloneDir } = makeFixture();
+    const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, 'README.md', 'overlay\n'));
+    const build = advanceMain(originDir, (dir) => writeFile(dir, 'README.md', 'candidate\n'));
+    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    const realGit = (args) => git(cloneDir, args);
+    expect(preparation.contentContainedInBuild((args) => (
+      args[0] === 'config' ? { status: 0, stdout: 'merge.ours.driver true\n' } : realGit(args)
+    ), build, build)).toBe(false);
+    expect(preparation.contentContainedInBuild((args) => (
+      args[0] === 'config' ? { status: 128, stdout: '' } : realGit(args)
+    ), build, build)).toBe(false);
+    expect(preparation.contentContainedInBuild(realGit, build, build)).toBe(true);
+    void overlay;
+  });
+
   it('rejects a failed merge-tree even if its output names the candidate tree', () => {
     const { cloneDir } = makeFixture();
     const build = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
