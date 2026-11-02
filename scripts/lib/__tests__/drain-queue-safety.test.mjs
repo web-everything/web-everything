@@ -1,5 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, mqSameHeadRefresh, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
@@ -76,7 +80,7 @@ describe('merge-queue same-head failure admission', () => {
       expect(f.passWithHold(approvedHeadHold).hold).toBe(true);
       f.passWithHold(approvedHeadHold);
       expect(approvedHeadHold).toHaveBeenCalledTimes(1);
-      expect(approvedHeadHold).toHaveBeenCalledWith({ repo, num: pr }, head);
+      expect(approvedHeadHold).toHaveBeenCalledWith({ repo, num: pr }, head, { strict: true });
       expect(f.puts()).toHaveLength(1);
       expect(f.puts()[0][1]).toEqual(['api', '-X', 'PUT',
         `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]);
@@ -85,7 +89,7 @@ describe('merge-queue same-head failure admission', () => {
       const f = fixture(), approvedHeadHold = vi.fn(() => true);
       f.passWithHold(approvedHeadHold);
       expect(approvedHeadHold).toHaveBeenCalledTimes(1);
-      expect(approvedHeadHold).toHaveBeenCalledWith({ repo, num: pr }, head);
+      expect(approvedHeadHold).toHaveBeenCalledWith({ repo, num: pr }, head, { strict: true });
       expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
     });
     it('wired resolver exception fails closed without spending its key', () => {
@@ -94,6 +98,26 @@ describe('merge-queue same-head failure admission', () => {
       expect(() => f.passWithHold(approvedHeadHold)).not.toThrow();
       expect(approvedHeadHold).toHaveBeenCalledTimes(1);
       expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+    });
+    it.each([
+      ['unreadable', new Error('approval proof denied'), 0],
+      ['explicit not-held', { hold: false }, 1],
+      ['held', { hold: true }, 0],
+    ])('production approved-head resolver: %s evidence controls PUTs', (_name, proof, count) => {
+      // Exercise the actual sweep resolver, including its legacy catch path.
+      const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+      const start = source.indexOf('  const approvedHeadHold = ');
+      const end = source.indexOf('  const prestageSetting = ', start);
+      const readProof = () => { if (proof instanceof Error) throw proof; return proof; };
+      const resolver = new Function('mergeStrategy', 'isLocalRepo', 'approvedHeadSetting',
+        'readApprovedHumanSurfaceHold', 'AS_JSON', 'repoTag', 'process',
+        source.slice(start, end) + '\nreturn approvedHeadHold;')(
+        { queueOwnsFreshness: () => true }, () => true, { value: 'on' }, readProof,
+        true, () => '', { cwd: () => '.', stderr: { write: vi.fn() } });
+      const f = fixture();
+      f.passWithHold(resolver);
+      expect(f.puts()).toHaveLength(count);
+      if (proof instanceof Error) expect(resolver({ repo, num: pr }, head)).toBe(false);
     });
     it.each([undefined, null])('wired incomplete hold evidence %s fails closed', evidence => {
       const f = fixture();
@@ -196,10 +220,77 @@ describe('merge-queue same-head failure admission', () => {
   });
 
   describe('refresh spent-head persistence', () => {
+    function diskFixture(run) {
+      const dir = mkdtempSync(join(tmpdir(), 'mq-refresh-'));
+      const path = join(dir, 'ledger.json');
+      try { run({ path, dir }); } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+    it('disk fixture works when TMPDIR is unset', () => {
+      const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP };
+      try {
+        // Keep scratch in the task directory while exercising Node's fallback.
+        if (saved.TMPDIR) process.env.TMP = saved.TMPDIR;
+        delete process.env.TMPDIR;
+        diskFixture(({ path }) => {
+          const store = createMqSameHeadRefreshStore({ path });
+          expect(store.add('key')).toBe(true);
+          expect(store.has('key')).toBe(true);
+        });
+      } finally {
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
+    it('two injected stores preserve keys from snapshots loaded before either write', () => {
+      let disk = '[]';
+      const makeStore = () => createMqSameHeadRefreshStore({ read: () => disk,
+        write: data => { disk = data; }, withLock: fn => ({ ran: true, result: fn() }) });
+      const a = makeStore(), b = makeStore();
+      a.has('k1'); b.has('k2');
+      expect(a.add('k1')).toBe(true); expect(b.add('k2')).toBe(true);
+      expect(JSON.parse(disk)).toEqual(['k1', 'k2']);
+      expect(a.has('k2')).toBe(true); expect(b.has('k1')).toBe(true);
+    });
+    it('two stores merge keys on disk and both observe each other without lost updates', () => diskFixture(({ path }) => {
+      const a = createMqSameHeadRefreshStore({ path }), b = createMqSameHeadRefreshStore({ path });
+      expect(a.has('k2')).toBe(false); expect(b.has('k1')).toBe(false);
+      expect(a.add('k1')).toBe(true); expect(b.add('k2')).toBe(true);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(['k1', 'k2']);
+      for (const store of [a, b]) {
+        expect(store.has('k1')).toBe(true); expect(store.has('k2')).toBe(true);
+      }
+      expect(b.add('k1')).toBe(false); // another process already spent it
+    }));
+    it('ledger lock unavailable refuses refresh without a PUT and logs the operator fallback', () => diskFixture(({ path, dir }) => {
+      const store = createMqSameHeadRefreshStore({ path,
+        read: () => readFileSync(path, 'utf8'), write: data => writeFileSync(path, data) });
+      const exec = vi.fn(() => JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' }));
+      const log = vi.fn();
+      withNumberingLock(() => {
+        mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store, log });
+      }, { lockRoot: join(dir, 'locks'), lockPath: path, owner: 'fixture-lock-holder', waitMs: 0,
+        runUnlockedOnContention: false });
+      expect(exec.mock.calls.filter(([, args]) => args.includes('PUT'))).toHaveLength(0);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('state unavailable; not requesting'));
+    }));
+    it('unreadable merge-read after a successful has refuses refresh without a PUT', () => diskFixture(({ path }) => {
+      writeFileSync(path, '[]');
+      const store = createMqSameHeadRefreshStore({ path,
+        read: () => readFileSync(path, 'utf8'), write: data => writeFileSync(path, data) });
+      const exec = vi.fn(() => {
+        writeFileSync(path, '{');
+        return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
+      });
+      mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store });
+      expect(exec.mock.calls.filter(([, args]) => args.includes('PUT'))).toHaveLength(0);
+      expect(readFileSync(path, 'utf8')).toBe('{');
+    }));
     it('persists before the request and suppresses it after a simulated restart', () => {
       let disk = '[]';
       const write = vi.fn(data => { disk = data; });
-      const makeStore = () => createMqSameHeadRefreshStore({ read: () => disk, write });
+      const makeStore = () => createMqSameHeadRefreshStore({ withLock: fn => ({ ran: true, result: fn() }), read: () => disk, write });
       const exec = vi.fn((_cmd, args) => {
         if (args[0] === 'pr') return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
         expect(JSON.parse(disk)).toContain(`${repo}#${pr}@${head}`);
@@ -215,7 +306,7 @@ describe('merge-queue same-head failure admission', () => {
         if (kind === 'unreadable') throw Object.assign(new Error('denied'), { code: 'EACCES' });
         return kind === 'bad JSON' ? '{' : kind === 'bad key' ? '[null]' : '{}';
       };
-      const store = createMqSameHeadRefreshStore({ read, write, log });
+      const store = createMqSameHeadRefreshStore({ withLock: fn => ({ ran: true, result: fn() }), read, write, log });
       const exec = vi.fn(() => JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' }));
       expect(() => mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store, log })).not.toThrow();
       expect(exec.mock.calls.filter(([, args]) => args.includes('PUT'))).toHaveLength(0);
@@ -226,7 +317,7 @@ describe('merge-queue same-head failure admission', () => {
     });
     it('write failure refuses refresh and disables further requests from that store', () => {
       const log = vi.fn(), write = vi.fn(() => { throw new Error('EACCES'); });
-      const store = createMqSameHeadRefreshStore({ read: () => '[]', write, log });
+      const store = createMqSameHeadRefreshStore({ withLock: fn => ({ ran: true, result: fn() }), read: () => '[]', write, log });
       const exec = vi.fn(() => JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' }));
       expect(() => mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store, log })).not.toThrow();
       expect(exec.mock.calls.filter(([, args]) => args.includes('PUT'))).toHaveLength(0);
@@ -240,7 +331,7 @@ describe('merge-queue same-head failure admission', () => {
     it('a missing file starts fresh without an unreadable warning', () => {
       const log = vi.fn();
       const store = createMqSameHeadRefreshStore({
-        read: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, write: vi.fn(), log,
+        withLock: fn => ({ ran: true, result: fn() }), read: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, write: vi.fn(), log,
       });
       expect(store.has('key')).toBe(false); expect(log).not.toHaveBeenCalled();
     });

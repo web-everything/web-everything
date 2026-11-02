@@ -1,6 +1,10 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -64,29 +68,51 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
 /** Append-only spent-head ledger: no expiry, since old heads must never be retried.
  * Persistence must succeed before requesting; unavailable state disables refresh.
  */
-export function createMqSameHeadRefreshStore({ read, write }) {
-  let keys, unavailable = false;
+export function createMqSameHeadRefreshStore({ path,
+  read = () => readFileSync(path, 'utf8'),
+  write = data => {
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, data, { mode: 0o600, flag: 'wx' });
+      renameSync(temporary, path);
+    } finally {
+      try { unlinkSync(temporary); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    }
+  },
+  withLock = fn => withNumberingLock(fn, {
+    lockRoot: join(dirname(path), 'locks'), lockPath: path,
+    owner: `mq-refresh:${process.pid}:${randomUUID()}`, waitMs: 0, runUnlockedOnContention: false,
+  }),
+}) {
+  let unavailable = false;
   const load = () => {
-    if (keys) return;
-    keys = new Set();
     try {
       const saved = JSON.parse(read());
       if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid ledger');
-      keys = new Set(saved);
+      return new Set(saved);
     } catch (error) {
-      if (error?.code !== 'ENOENT') unavailable = true;
+      if (error?.code === 'ENOENT') return new Set();
+      unavailable = true;
+      return null;
     }
   };
   return {
-    has(key) { load(); return keys.has(key); },
+    has(key) { return load()?.has(key) ?? false; },
     add(key) {
-      load();
       if (unavailable) return false;
-      const next = new Set(keys).add(key);
-      try { write(JSON.stringify([...next]) + '\n'); }
-      catch { unavailable = true; return false; }
-      keys = next;
-      return true;
+      try {
+        // A dedicated ledger key avoids nesting the land-write mutex. Contention defers
+        // this request to a later pass; never use the shared helper's unlocked fallback.
+        const locked = withLock(() => {
+          const keys = load();
+          if (!keys || keys.has(key)) return false;
+          keys.add(key);
+          write(JSON.stringify([...keys]) + '\n');
+          return true;
+        });
+        return locked.ran === true && locked.result === true;
+      } catch { unavailable = true; return false; }
     },
   };
 }
@@ -95,7 +121,7 @@ export function createMqSameHeadRefreshStore({ read, write }) {
  * Resolver errors propagate to mqSameHeadRefresh's fail-closed allow boundary.
  */
 export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, repo, pr, head }) {
-  return { store, allow: () => approvedHeadHold({ repo, num: pr }, head) === false };
+  return { store, allow: () => approvedHeadHold({ repo, num: pr }, head, { strict: true }) === false };
 }
 
 /** Owns recovery of a confirmed removal; the admission hold remains until the head changes. */

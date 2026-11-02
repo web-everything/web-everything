@@ -253,14 +253,7 @@ function recordEnqueue(outcomes, repo, outcome) {
 const REVIEW_BASELINE_STATE_PATH = resolve(process.cwd(), '.claude/skills/drain/review-baseline-state.json');
 const MQ_SAME_HEAD_REFRESH_STATE_PATH = resolve(dirname(REVIEW_BASELINE_STATE_PATH), 'mq-same-head-refresh-state.json');
 // Module lifetime spans watch passes; persisted spent keys also survive drain restarts.
-const mqSameHeadRefreshStore = createMqSameHeadRefreshStore({
-  read: () => readFileSync(MQ_SAME_HEAD_REFRESH_STATE_PATH, 'utf8'),
-  write: data => {
-    mkdirSync(dirname(MQ_SAME_HEAD_REFRESH_STATE_PATH), { recursive: true });
-    writeFileSync(MQ_SAME_HEAD_REFRESH_STATE_PATH, data, { mode: 0o600 });
-  },
-  log: line => process.stderr.write(`${line}\n`),
-});
+const mqSameHeadRefreshStore = createMqSameHeadRefreshStore({ path: MQ_SAME_HEAD_REFRESH_STATE_PATH });
 
 const argv = process.argv.slice(2);
 const flags = parseArgvFlags(argv); // #2859 — single source: scripts/lib/reconcile-predicate.mjs
@@ -5309,7 +5302,7 @@ async function runCli() {
   const sweepOnce = async () => {
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
-  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha) => {
+  const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false } = {}) => {
     // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
     if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
@@ -5321,7 +5314,8 @@ async function runCli() {
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;
     } catch (e) {
-      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); using legacy rebase/refresh path\n`);
+      process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
+      if (strict) throw e;
       return false;
     }
   };
