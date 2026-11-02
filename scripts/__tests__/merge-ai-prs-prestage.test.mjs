@@ -35,6 +35,8 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (path.includes('/actions/runs')) out({ workflow_runs: [] });
+  if (/\\/pulls\\/\\d+$/.test(path)) out({ created_at: '2026-01-01T00:00:00Z' });
   if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';

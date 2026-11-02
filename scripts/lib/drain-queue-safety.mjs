@@ -80,7 +80,7 @@ export function dequeueSentBack({ repo, pr, reason, exec = execFileSync, log = (
  * PURE: should the drain refuse to enqueue `head` because its OWN merge_group run already failed there?
  * `runs`: this PR's completed runs on that head, each `{ workflow, conclusion, completedAt (ms), prHead }` (prHead = the PR
  * head the run was built from). A cancelled run (an entry ahead failed) never counts. A failure is released only by a LATER
- * success of the SAME workflow on the same head (a rerun going green, or the PR-leg run of that workflow). A failed read
+ * merge_group success of the SAME workflow on the same head (a rerun going green); a PR-leg success never releases it. A failed read
  * (`readError`) holds, visibly. No flake classifier exists for merge_group failures, so there is no retry.
  */
 export function sameHeadFailedDecision({ pr, head, runs = [], readError = null } = {}) {
@@ -96,7 +96,7 @@ export function sameHeadFailedDecision({ pr, head, runs = [], readError = null }
 }
 
 const MAX_PAGES = 12, MAX_PR_RUNS = 20;
-/** Reads this PR's recent merge_group runs and same-head PR-leg successes through gh, decides, and logs the one named line. */
+/** Reads this PR's recent merge_group runs and  through gh, decides, and logs the one named line. */
 export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = () => {}, now = Date.now } = {}) {
   const readJson = args => JSON.parse(exec('gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
   const listRuns = path => { const l = readJson(['api', path]); if (!Array.isArray(l?.workflow_runs)) throw new Error('runs response has no workflow_runs'); return l.workflow_runs; };
@@ -105,9 +105,10 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
   let decision;
   try {
     // Page newest-first until the horizon is covered; hitting the page cap first means the history is incomplete: fail closed.
-    // No run on `head` can predate the commit itself, so its committer date is the exact history floor.
-    const committed = Date.parse(readJson(['api', `repos/${repo}/commits/${head}`])?.commit?.committer?.date);
-    if (!Number.isFinite(committed)) throw new Error('head commit date unreadable');
+    // No merge_group run of this PR can predate the PR itself; created_at is set by GitHub, never by the author.
+    // (A run cannot be queried by PR head: its head_sha is the group commit, and the branch suffix is the base sha.)
+    const committed = Date.parse(readJson(['api', `repos/${repo}/pulls/${pr}`])?.created_at);
+    if (!Number.isFinite(committed)) throw new Error('PR creation date unreadable');
     const all = [];
     let covered = false;
     for (let page = 1; page <= MAX_PAGES && !covered; page++) {
@@ -124,12 +125,6 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
       if (!Array.isArray(parents) || !parents.length) throw new Error(`merge_group commit ${String(r.head_sha).slice(0, 12)} has no readable parents`);
       return { ...toRun(r), prHead: parents.some(p => p.sha === head) ? head : parents.at(-1).sha };
     });
-    if (runs.some(r => r.prHead === head && (r.conclusion === 'failure' || r.conclusion === 'timed_out'))) {
-      // PR-leg runs of the same head (a fresh green rerun of the same workflow), kept with their workflow identity.
-      for (const r of listRuns(`repos/${repo}/actions/runs?head_sha=${head}&per_page=100`)) {
-        if (done(r) && r.event === 'pull_request') runs.push({ ...toRun(r), prHead: head });
-      }
-    }
     decision = sameHeadFailedDecision({ pr, head, runs });
   } catch (error) { decision = sameHeadFailedDecision({ pr, head, readError: error }); }
   if (decision.hold) log(decision.line);
