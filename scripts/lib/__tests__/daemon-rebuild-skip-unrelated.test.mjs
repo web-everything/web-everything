@@ -74,6 +74,11 @@ function writeFile(dir, name, content) {
   writeFileSync(full, content);
 }
 
+// A complete fixture needs every smoke root: a missing root deliberately makes the closure unknown.
+function writeSmokeSurface(root) {
+  for (const name of smokeSurfaceEntries({})) writeFile(root, name, 'export {};\n');
+}
+
 /** Fresh {origin (bare), clone (working tree under test), env} fixture. The clone starts on `main`, clean,
  *  tracking `origin`, one commit. Every per-clone state/lock/overlay dir is a fresh mkdtemp threaded via `env`. */
 function makeFixture() {
@@ -226,6 +231,22 @@ describe('the skip decision covers everything the shared candidate smoke exercis
     expect(surface).toContain('scripts/conveyor/reconcile-pass.mjs');
     expect(surface).toContain('scripts/lib/daemon-live-smoke.mjs');
     expect(smokeSurfaceEntries({ WE_SMOKE_DAEMON_ENTRIES: 'x/extra-daemon.mjs' })).toContain('x/extra-daemon.mjs');
+  });
+
+  it.each(['caller', 'smoke surface'])('a missing %s root requires the smoke even alongside readable roots', (source) => {
+    const root = mktemp('we-skip-missing-root-');
+    writeSmokeSurface(root);
+    writeFile(root, entry, 'export {};\n');
+    writeFile(root, 'scripts/other.mjs', 'export {};\n');
+    const options = { root, entries: [entry], env: { WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' } };
+    expect(makeSkipCheck(options)(['scripts/other.mjs']).skip).toBe(true);
+
+    const missing = source === 'caller' ? entry : surface[0];
+    rmSync(join(root, missing));
+    const check = makeSkipCheck(options);
+    expect(check(['scripts/other.mjs']).skip).toBe(false);
+    expect(check([missing]).skip).toBe(false);
+    expect(check(['docs/a.md']).skip).toBe(true);
   });
 
   it.each([
@@ -428,6 +449,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
   /** A throwaway tree (no git) holding `files`, and the real `makeSkipCheck` built over it. */
   function treeCheck(files, entries = ['scripts/d.mjs']) {
     const root = mktemp('we-skip-spawn-');
+    writeSmokeSurface(root);
     for (const [name, body] of Object.entries(files)) writeFile(root, name, body);
     return makeSkipCheck({ root, entries, env: ENV });
   }
@@ -476,6 +498,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
   /** Same, but the tree is a git repo: the basename fallback for a path assembled from pieces reads `git ls-files`. */
   function gitTreeCheck(files, entries = ['scripts/d.mjs'], extra = {}) {
     const root = mktemp('we-skip-spawn-git-');
+    writeSmokeSurface(root);
     for (const [name, body] of Object.entries(files)) writeFile(root, name, body);
     gitOk(root, ['init', '-q', '-b', 'main']);
     gitOk(root, ['add', '-A']);
@@ -538,6 +561,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
   it('an unreadable closure file makes the closure incomplete: any code file takes the smoke', () => {
     const check = treeCheck({ 'scripts/d.mjs': spawnUrl, 'scripts/other.mjs': '1;\n' });
     const root = mktemp('we-skip-unreadable-');
+    writeSmokeSurface(root);
     writeFile(root, 'scripts/d.mjs', 'export {};\n');
     writeFile(root, 'scripts/other.mjs', '1;\n');
     const broken = makeSkipCheck({ root, entries: ['scripts/d.mjs'], env: ENV, readFile: () => { throw new Error('EIO'); } });
