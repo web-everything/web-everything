@@ -159,7 +159,13 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   if (decision.hold) {
     log(decision.line);
     // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
-    const confirmed = !timeline?.error && timeline?.hasPreviousPage === false && timeline.nodes.some(event =>
+    const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
+      && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
+        event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
+        || (event?.__typename === 'RemovedFromMergeQueueEvent'
+          && (['manual', 'merged'].includes(String(event.reason ?? '').trim().toLowerCase())
+            || mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid))))
+      && timeline.nodes.some(event =>
       event?.__typename === 'RemovedFromMergeQueueEvent'
       && !['manual', 'merged'].includes(String(event.reason ?? '').trim().toLowerCase())
       && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);

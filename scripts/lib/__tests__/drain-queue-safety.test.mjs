@@ -62,7 +62,7 @@ describe('merge-queue same-head failure admission', () => {
         }
         if (args.includes('mergeStateStatus,headRefOid,statusCheckRollup')) return JSON.stringify(f.live);
         if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse();
-        return response(timeline(removed()));
+        return response(f.timeline ?? timeline(removed()));
       });
       f.run = (selectedStore = store) => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
         refresh: createMqSameHeadRefreshOptions({ store: selectedStore, approvedHeadHold: f.approvedHeadHold, repo, pr, head }) });
@@ -79,6 +79,26 @@ describe('merge-queue same-head failure admission', () => {
       f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
       expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
+    }));
+    it.each([
+      ['unbound removal', { ...removed(), beforeCommit: null }],
+      ['invalid bound oid', removed('failed_checks', 'invalid')],
+      ['unreadable event', null],
+      ['unknown event type', { __typename: 'UnknownEvent' }],
+    ])('%s alongside a bound failure keeps operator-only quarantine without update-branch', (_name, event) => fixture(f => {
+      f.timeline = timeline(event, removed());
+      expect(f.run().hold).toBe(true);
+      f.timeline = timeline(removed(), event);
+      expect(f.run().hold).toBe(true);
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+      expect(f.approvedHeadHold).not.toHaveBeenCalled();
+    }));
+    it('readable additions, force pushes and manual/merged or bound removals permit refresh of a bound failure', () => fixture(f => {
+      f.timeline = timeline(added, pushed(), { ...removed(' MANUAL '), beforeCommit: null },
+        { ...removed(' MERGED '), beforeCommit: null }, removed('failed_checks', prior.toUpperCase()), removed());
+      expect(f.run().hold).toBe(true);
+      expect(f.requests()).toHaveLength(1);
     }));
     it.each(['review:changes', 'red-team:blocked', 'review:human', 'review:pending', 'red-team:pending', 'missing-ready', null, [null]])(
       'live label hold/unreadable %s does not spend state or request', label => fixture(f => {
