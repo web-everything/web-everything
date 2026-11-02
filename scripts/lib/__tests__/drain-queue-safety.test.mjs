@@ -118,14 +118,14 @@ describe('merge-queue same-head failure admission', () => {
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expectHold(result, /unreadable/i);
     expect(exec).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledExactlyOnceWith(result.line);
+    expect(log.mock.calls).toEqual([[result.line]]);
   });
   it('mqSameHeadGuard composes the read and decision and logs the exact hold line', () => {
     const exec = vi.fn(() => response(timeline(removed()))), log = vi.fn();
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expect(result).toEqual(decide(timeline(removed())));
     expect(exec).toHaveBeenCalledTimes(1);
-    expect(log).toHaveBeenCalledExactlyOnceWith(result.line);
+    expect(log.mock.calls).toEqual([[result.line]]);
   });
   it('mqSameHeadGuard releases manual removal without logging a hold', () => {
     const exec = vi.fn(() => response(timeline(removed('manual')))), log = vi.fn();

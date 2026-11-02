@@ -6,6 +6,63 @@ import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
+/** Only the merge-group commit's second parent identifies the tested PR head. */
+export function decideMqSameHead({ pr, head, timeline } = {}) {
+  const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+  const hold = reason => ({ hold: true, line: `mq-same-head-failed: #${safe(pr)} head ${safe(head)} — ${reason}` });
+  if (typeof head !== 'string' || !head.trim()) return hold('missing head');
+  if (timeline?.error || !Array.isArray(timeline?.nodes) || typeof timeline.hasPreviousPage !== 'boolean')
+    return hold('unreadable merge-queue timeline; inspect timeline before retrying');
+  if (timeline.hasPreviousPage)
+    return hold('incomplete timeline at 100-event cap; operator must inspect full history before retrying');
+  for (const event of timeline.nodes) {
+    if (event?.__typename === 'AddedToMergeQueueEvent') continue;
+    if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
+    const reason = typeof event.reason === 'string' ? event.reason.trim().toLowerCase() : '';
+    if (reason === 'manual' || reason === 'merged') continue;
+    const testedHead = event.beforeCommit?.parents?.nodes?.[1]?.oid;
+    if (typeof testedHead !== 'string' || !/^[a-f0-9]{40}$/i.test(testedHead))
+      return hold('no commit binding for merge-queue removal; inspect timeline before retrying');
+    if (testedHead === head) return hold(safe(reason) || 'unknown removal reason');
+  }
+  return { hold: false, line: null };
+}
+
+/** One bounded read: incomplete history is evidence to hold, never to paginate or guess. */
+export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
+  try {
+    const parts = typeof repo === 'string' ? repo.split('/') : [];
+    if (parts.length !== 2 || parts.some(part => !part) || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0)
+      return { error: 'invalid repository or PR' };
+    const query = `query($owner:String!,$name:String!,$number:Int!){
+      repository(owner:$owner,name:$name){pullRequest(number:$number){
+        timelineItems(last:100,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT]){
+          pageInfo{hasPreviousPage}
+          nodes{__typename
+            ... on RemovedFromMergeQueueEvent{reason createdAt beforeCommit{oid parents(first:2){nodes{oid}}}}
+            ... on AddedToMergeQueueEvent{createdAt}
+          }
+        }
+      }}
+    }`;
+    const result = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`,
+      '-f', `owner=${parts[0]}`, '-f', `name=${parts[1]}`, '-F', `number=${pr}`],
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    const items = result?.data?.repository?.pullRequest?.timelineItems;
+    if (result?.errors?.length || !Array.isArray(items?.nodes) || typeof items?.pageInfo?.hasPreviousPage !== 'boolean')
+      return { error: 'unreadable merge-queue timeline' };
+    return { nodes: items.nodes, hasPreviousPage: items.pageInfo.hasPreviousPage };
+  } catch {
+    return { error: 'unreadable merge-queue timeline' };
+  }
+}
+
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSync, log = () => {} } = {}) {
+  const decision = decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
+  if (decision.hold) log(decision.line);
+  return decision;
+}
+
 export function readDrainQueueSafety({ env = process.env, tool, platform, log = () => {} } = {}) {
   const booleanEnv = key => env[key] === undefined ? undefined
     : /^(true|1|on)$/i.test(env[key]) ? true : /^(false|0|off)$/i.test(env[key]) ? false : env[key];
