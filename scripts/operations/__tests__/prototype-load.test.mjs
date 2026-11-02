@@ -1372,7 +1372,8 @@ describe('prototype-load', () => {
   it.each([
     ['adoption-refused', { alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: BASE.branch, kind: 'conflict-dropped' }) }, false],
     ['check-unverifiable', { adoptionError: 2 }, false],
-    ['adopted in wait', {}, true],
+    ['adopted immediately', {}, true],
+    ['adopted in wait', { timeout: true }, true],
     ['adopted before swap refusal', { list: ['lane/old'], contained: ['lane/old'] }, true],
   ])('clears pending adoption on terminal outcome: %s', async (_, options, adopted) => {
     const dir = mkdtempSync(join(tmpdir(), 'load-terminal-'));
@@ -1381,11 +1382,20 @@ describe('prototype-load', () => {
     try {
       recordPendingAdoption(clone, { ref: 'lane/unrelated', sha: TREE, at: new Date(0).toISOString() }, { env });
       const writes = vi.fn(nodeFs.renameSync);
-      const f = fixture({ ...options, pendingFs: { ...nodeFs, renameSync: writes }, env });
+      const loadOptions = { ...options, pendingFs: { ...nodeFs, renameSync: writes }, env };
+      if (options.timeout) loadOptions.onSleep = () => {
+        // Prove that this is adoption during the wait, with the registration already persisted.
+        expect(readPendingAdoptions(clone, { env })).toEqual(expect.arrayContaining([
+          expect.objectContaining({ ref: BASE.branch, sha: SHA }),
+        ]));
+        loadOptions.timeout = false;
+      };
+      const f = fixture(loadOptions);
       const r = await f.run();
       expect(r.registered).toBe(true);
       expect(r.adoptionEventTracked).toBe(true);
       expect(r.adopted).toBe(adopted);
+      expect(f.sleeps).toEqual(options.timeout ? [10] : []);
       if (options.adoptionError) expect(r.stopReason).toBe('check-unverifiable');
       if (options.alerts) expect(r.stopReason).toBe('adoption-refused');
       expect(writes).toHaveBeenCalled();
