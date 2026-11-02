@@ -20,7 +20,7 @@ export default {
     let gitCalls = 0, spawns = 0;
     try {
       for (const ref of ['lane/one', 'lane/two']) addOverlay(root, { ref }, { env });
-      const file = `${overlayFilePath(root, env)}.main-sync.json`;
+      const file = `${overlayFilePath(root, env)}.main-sync.state`;
       writeFileSync(file, '{corrupt');
       for (let tick = 0; tick < 6; tick++) kickOverlayMainSync({ root, env, mode: 'on',
         git: () => { gitCalls++; throw new Error('unexpected Git call'); },
