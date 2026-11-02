@@ -425,6 +425,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // reads live in `free-scope-io.mjs` behind the injected `collect` reader.
     [FREE_SCOPE_OP]: 'free-scope.mjs',
     'prototype-load': 'prototype-load.mjs',
+    // Runs Codex and appends an audit record: effectful, never read-only.
+    'codex-audit': 'codex-audit.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's
