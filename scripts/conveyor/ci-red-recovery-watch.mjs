@@ -1029,8 +1029,10 @@ export function readLiveRequiredChecks({
       if (result?.source === 'live' && Array.isArray(result.checks) && result.checks.length &&
         result.checks.every(check => typeof check === 'string' && check)) return result.checks;
 
+      // Only an explicit unprotected-base result permits borrowing the default branch's set.
+      if (result?.source !== 'fallback' || !Array.isArray(result.checks) || result.checks.length !== 0) return null;
     } catch {
-      // The default branch may still supply live evidence for a stacked base.
+      return null;
     }
   }
   return null;

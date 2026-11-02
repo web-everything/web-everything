@@ -358,10 +358,21 @@ describe('R372 live required set for stacked bases', () => {
     expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toEqual(['smoke']);
     expect(readRequiredChecks.mock.calls.map(([o]) => o.branch)).toEqual(['lane/stack', 'main']);
   });
-  it.each(['fallback', 'stale-cache', 'declared', 'unavailable'])('refuses a non-live main fallback (%s)', source => {
-    const readRequiredChecks = vi.fn(({ branch }) => ({ source: branch === 'main' ? source : 'fallback', checks: ['smoke'] }));
+  it.each(['fallback', 'stale-cache', 'cache', 'declared', 'unavailable'])('refuses a non-live main fallback (%s)', source => {
+    const readRequiredChecks = vi.fn(({ branch }) => ({ source: branch === 'main' ? source : 'fallback', checks: branch === 'main' ? ['smoke'] : [] }));
     expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toBeNull();
     expect(readRequiredChecks).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    ...['unavailable', 'stale-cache', 'cache', 'declared', 'live'].map(source => ({ source, checks: [] })),
+    ...['fallback', 'unavailable', 'stale-cache', 'cache', 'declared'].map(source => ({ source, checks: ['base-check'] })),
+    { source: 'fallback' }, { source: 'fallback', checks: null },
+    { source: 'live', checks: [''] },
+  ])('refuses ambiguous base evidence without consulting main (%j)', result => {
+    const readRequiredChecks = vi.fn(({ branch }) => branch === 'main'
+      ? { source: 'live', checks: ['smoke'] } : result);
+    expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toBeNull();
+    expect(readRequiredChecks).toHaveBeenCalledOnce();
   });
   it.each(['lane/../main', '-main', 'lane//bad', 'lane/bad.lock', 'x'.repeat(256)])('refuses unsafe base %s without reading protection', branch => {
     const readRequiredChecks = vi.fn(() => ({ source: 'live', checks: ['smoke'] }));
@@ -403,7 +414,7 @@ describe('R372 fallback and marker boundaries', () => {
     const f = fixture({ prs: [pr({ baseRefName: 'lane/stack' })] });
     f.options.requiredChecks = undefined;
     const read = vi.fn(({ branch }) => branch === 'main' ? { source: 'live', checks: ['smoke', 'test', 'lint'] }
-      : { source: 'live', checks: [] });
+      : { source: 'fallback', checks: [] });
     f.options.readRequiredChecks = args => readLiveRequiredChecks({ ...args, readRequiredChecks: read });
     expect(f.tick().applied).toEqual([expect.objectContaining({ ok: true })]);
     expect(f.options.postComment).toHaveBeenCalledWith(42, { repo,
@@ -422,10 +433,13 @@ describe('R372 fallback and marker boundaries', () => {
     expect(readLiveRequiredChecks({ repo, readRequiredChecks })).toBeNull();
     expect(readRequiredChecks).toHaveBeenCalledOnce();
   });
-  it('falls back after a base read exception but refuses if main throws too', () => {
-    const readRequiredChecks = vi.fn(() => { throw Error('denied'); });
+  it('refuses a base read exception without consulting live main', () => {
+    const readRequiredChecks = vi.fn(({ branch }) => {
+      if (branch !== 'main') throw Error('denied');
+      return { source: 'live', checks: ['smoke'] };
+    });
     expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toBeNull();
-    expect(readRequiredChecks.mock.calls.map(([o]) => o.branch)).toEqual(['lane/stack', 'main']);
+    expect(readRequiredChecks.mock.calls.map(([o]) => o.branch)).toEqual(['lane/stack']);
   });
   it('does not trust a forged unreadable marker or publish notices in dry-run mode', () => {
     const f = fixture();

@@ -359,14 +359,17 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
   if (!last || last.persistenceFailed) return null;
-  // A successful cancelled-required-CI rerun proves the mechanical gap. Only a completed accepted
-  // review covering this exact head may use it, and the marker releases at most one later attempt.
+  // The marker proves submission only; this head's current rollup must also prove CI recovered.
+  // Only a completed accepted review covering this exact head may use it, at most once.
   if (last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
     Array.isArray(last.pending) && last.pending.length === 0) {
     const marker = prCancelledRerunMarker(repo, pr.number, pr.headRefOid);
     const rerunAt = Math.max(0, ...(pr.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && c.body?.includes(marker))
       .map(c => Date.parse(c.createdAt)).filter(Number.isFinite));
-    if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) return null;
+    const rollup = pr.statusCheckRollup;
+    const recovered = Array.isArray(rollup) && rollup.length > 0 && rollup.every(row =>
+      row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion));
+    if (recovered && rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) return null;
   }
   const wake = wakeTime(pr, last);
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,

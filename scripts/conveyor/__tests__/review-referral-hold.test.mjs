@@ -1076,14 +1076,33 @@ describe('R372 accepted same-head CI rerun release', () => {
     r.verdict = r.findings.referralVerdict;
     return reviewRunEvidence(r);
   }
-  const acceptedPr = comments => pr({ labels: [{ name: 'review:accepted' }], comments: [
+  const acceptedPr = comments => pr({ labels: [{ name: 'review:accepted' }],
+    statusCheckRollup: ['SUCCESS', 'SKIPPED', 'NEUTRAL'].map((conclusion, i) => ({
+      name: `check-${i}`, status: 'COMPLETED', conclusion,
+    })), comments: [
     comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, at), ...comments,
   ] });
-  it('releases an accepted unchanged head once after a trusted CI rerun marker', () => {
+  it('re-arms an all-green accepted head once after a newer trusted rerun marker and no later review', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).toBeNull();
     expect(decideSameHeadHold(p, [accepted(), { ...accepted(), startedAt: at + 2, completedAt: at + 3 }],
       { repo, now: at + 4 })).not.toBeNull();
+  });
+  it.each(['QUEUED', 'IN_PROGRESS'])('keeps the hold while the rerun is %s', status => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup.push({ name: 'rerun', status, conclusion: 'SUCCESS' });
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+  });
+  it.each(['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', undefined])('keeps the hold for a non-green rerun (%s)', conclusion => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup.push({ name: 'rerun', status: 'COMPLETED', conclusion });
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+  });
+  it.each([undefined, null, [], {}, [null]])('keeps the hold when rollup evidence is absent or unreadable (%j)', rollup => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    if (rollup === undefined) delete p.statusCheckRollup;
+    else p.statusCheckRollup = rollup;
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
   });
   it('releases a stacked accept without a reviewed-sha stamp', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
