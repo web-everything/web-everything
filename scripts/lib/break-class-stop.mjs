@@ -36,6 +36,7 @@ export function classify(records, options = {}) {
     for (const r of sorted) if (!validRoundRecord(r)) malformed++;
     if (malformed > 0) return unknown('malformed ledger evidence');
     if (complete !== true) return unknown('incomplete ledger evidence');
+    if (!sorted.length) return unknown('no round evidence');
     sorted.sort((a, b) => a.round - b.round);
     if (sorted.some((r, i) => r.round !== i + 1 || r.pr !== sorted[0].pr)) return unknown('rounds must be contiguous 1..n for one PR');
     const seen = new Set();

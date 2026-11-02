@@ -56,3 +56,7 @@ it('Replay #6033: nine rounds, six edge-case paths; STOP first appears at round 
   expect(classify(history.slice(0, 3))).toMatchObject({ verdict: 'STOP', consecutive: 3 });
   expect(classify(history).verdict).toBe('STOP');
 });
+
+it('I1 an empty history is UNKNOWN (a missing ledger is no evidence, never CONTINUE)', () => {
+  expect(classify([]).verdict).toBe('UNKNOWN');
+});

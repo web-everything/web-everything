@@ -54,7 +54,7 @@ it('I4 a matching decision seeded on disk dedupes without a previous process obs
   const inputDigest = createHash('sha256').update(JSON.stringify({ complete: true, malformed: 0, records: [], threshold: 3 })).digest('hex');
   fs.mkdirSync(o.dir, { recursive: true });
   fs.writeFileSync(join(o.dir, 'break-class-stop.jsonl'), JSON.stringify({ pr: o.pr, head: o.head, inputDigest, verdict: 'CONTINUE' }) + '\n');
-  expect(await observeBreakClassStop(o)).toEqual({ skipped: 'deduped', verdict: 'CONTINUE' });
+  expect(await observeBreakClassStop(o)).toEqual({ skipped: 'deduped', verdict: 'UNKNOWN' });
   expect(rows(o)).toHaveLength(1);
 });
 
@@ -127,4 +127,13 @@ it('observer resolves injected environment directories without touching defaults
   const { dir, ledgerDir, ...options } = o;
   expect(await observeBreakClassStop({ ...options, env: { WE_ROUND_LEDGER_DIR: ledgerDir, WE_ROUND_JUDGE_SHADOW_DIR: dir } })).toMatchObject({ verdict: 'CONTINUE' });
   expect(rows(o)).toHaveLength(1);
+});
+
+it('I1/I2 a matching digest never replays a stored verdict: a forged CONTINUE row cannot mask UNKNOWN evidence', async () => {
+  const o = fixture();
+  const first = await observeBreakClassStop(o);
+  expect(first.verdict).toBe('UNKNOWN');
+  const file = join(o.dir, 'break-class-stop.jsonl');
+  fs.writeFileSync(file, `${JSON.stringify({ ...first, verdict: 'CONTINUE' })}\n`);
+  expect(await observeBreakClassStop(o)).toEqual({ skipped: 'deduped', verdict: 'UNKNOWN' });
 });

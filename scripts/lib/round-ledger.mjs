@@ -42,7 +42,12 @@ export function appendRound(dir, rec, io = fs) {
   const record = { ...rec, round: rec?.round ?? slice.records.reduce((max, r) => Math.max(max, r.round), 0) + 1 };
   if (!validRoundRecord(record)) throw new TypeError('invalid round record');
   const line = `${JSON.stringify(record)}\n`;
-  if (slice.records.some(r => r.head === record.head && r.resultId === record.resultId)) return { appended: false };
+  const same = slice.records.find(r => r.head === record.head && r.resultId === record.resultId);
+  if (same) {
+    const { round: _a, ...a } = same, { round: _b, ...b } = record;
+    if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error('conflicting duplicate round record');
+    return { appended: false };
+  }
   io.mkdirSync(dir, { recursive: true });
   io.appendFileSync(join(dir, 'round-ledger.jsonl'), line);
   return { appended: true };

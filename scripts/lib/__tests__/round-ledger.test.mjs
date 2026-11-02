@@ -52,3 +52,12 @@ it('ledgerDir accepts only the named override and defaults portably', () => {
   expect(ledgerDir({ WE_ROUND_LEDGER_DIR: base })).toBe(fallback);
   expect(ledgerDir({ WE_ROUND_LEDGER_DIR: ` ${join(base, 'round-ledger')} ` })).toBe(resolve(base, 'round-ledger'));
 });
+
+it('I4 a conflicting duplicate (pr, head, resultId) is rejected, an identical one is a no-op', () => {
+  const dir = temp();
+  expect(appendRound(dir, rec({ round: 1 }))).toEqual({ appended: true });
+  expect(appendRound(dir, rec({ round: 1 }))).toEqual({ appended: false });
+  const worse = rec({ round: 1, findings: [{ category: 'security', path: 'a.mjs', confirmed: true }] });
+  expect(() => appendRound(dir, worse)).toThrow(/conflicting duplicate/);
+  expect(fs.readFileSync(join(dir, 'round-ledger.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1);
+});
