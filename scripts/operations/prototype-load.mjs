@@ -28,7 +28,8 @@ export function readyEvidence(records, input, ruledWeakened = []) {
     && validSha(r.sha) && RULING.test(r.auditRuling || '')
     && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
     && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && e.sha === r.sha && e.ruling === r.auditRuling
-      && Array.isArray(e.findings) && e.findings.length > 0));
+      && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
+      && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
   return ruled ? { source: 'ready-record', record: ruled, ruledWeakened: { ruling: ruled.auditRuling, findings: ruled.auditDisclosed } } : null;
 }
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a

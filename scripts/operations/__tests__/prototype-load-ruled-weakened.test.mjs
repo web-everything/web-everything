@@ -26,6 +26,11 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
     expect(readyEvidence([record({ auditDisclosed: [] })], input, [entry()])).toBeNull();
     expect(readyEvidence([record({ tests: 'red' })], input, [entry()])).toBeNull();
   });
+  it('requires the record to disclose exactly the allowlisted findings', () => {
+    expect(readyEvidence([record({ auditDisclosed: ['something unrelated'] })], input, [entry()])).toBeNull();
+    expect(readyEvidence([record({ auditDisclosed: [null] })], input, [entry({ findings: [null] })])).toBeNull();
+    expect(readyEvidence([record({ auditDisclosed: ['excluded-file drop made loud', 'extra'] })], input, [entry()])).toBeNull();
+  });
   it('never lets a --audit argument claim the exception', () => {
     expect(readyEvidence([], { ...input, testsRun: 'x', audit: 'WEAKENED' }, [entry()])).toBeNull();
   });
