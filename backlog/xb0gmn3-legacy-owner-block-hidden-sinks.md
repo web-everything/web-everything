@@ -4,7 +4,7 @@ size: 3
 status: active
 scaffoldedBy: "fix-6188"
 dateScaffolded: "2026-11-02"
-scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/operations/record-referral-ruling.mjs"]
+scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/ruling-ledger.mjs", "we:scripts/operations/record-referral-ruling.mjs"]
 dateOpened: "2026-11-02"
 tags: []
 ---
