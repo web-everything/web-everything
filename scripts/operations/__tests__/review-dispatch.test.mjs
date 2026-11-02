@@ -681,12 +681,12 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     git(up, 'push', '-q', 'origin', 'main');
     return join(dir, 'clone');
   }
-  const run = (root) => {
+  const run = (root, spawnAgent = () => '') => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234, repo: 'web-everything/web-everything', root, home: '/home/test', checkoutExists: () => true,
       readBrief: () => REAL_TEMPLATE_STUB, mintSessionId: () => '11111111-1111-4111-8111-111111111111',
-      spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+      spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return spawnAgent(argv, opts); },
       resolveSettingsEnv: () => ({}), sessionCwdFor: () => join(dir, 'session'), ensureSessionCwd: () => {},
       isolateSession: () => ({}),
     });
@@ -700,13 +700,28 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
   });
   const managed = () => { prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1'; };
 
-  it('behind only in code OFF the review path: the review dispatches (before #4387: refused)', () => {
+  it('refuses code lag outside the declared review paths when the sandbox closure is incomplete', () => {
     const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
     managed();
+    const spawnAgent = vi.fn();
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      expect(run(root)).toHaveLength(1);
-      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/capacity\.mjs.*tolerating the lag/);
+      expect(() => run(root, spawnAgent)).toThrow(/3 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
+      expect(spawnAgent).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).not.toMatch(/tolerating the lag/);
+    } finally { stderr.mockRestore(); }
+    expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
+  });
+
+  it('dispatches with an incomplete sandbox closure when the lag contains only non-code files', () => {
+    const root = behindClone('docs/review-note.md', 'backlog/1-card.md', 'backlog/2-card.md');
+    managed();
+    const spawnAgent = vi.fn(() => '');
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(run(root, spawnAgent)).toHaveLength(1);
+      expect(spawnAgent).toHaveBeenCalledOnce();
+      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main in non-code files only/);
     } finally { stderr.mockRestore(); }
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });

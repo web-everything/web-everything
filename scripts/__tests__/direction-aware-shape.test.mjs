@@ -55,7 +55,11 @@ describe('R131 direction-aware shape wiring', () => {
     expect(buildShapePlan).toBe(sharedShapePlan);
     expect(isBlastRadiusPath('scripts/lib/review-shape.mjs')).toBe(true);
     const closure = importClosure.collectImportClosure({ root: resolve('.'), entries: ['scripts/operations/review-pr.mjs'] });
-    expect(closure?.complete).toBe(true);
+    // The operation reaches CommonJS via under-test.mjs. Its ESM edges remain
+    // inspectable, but cannot prove an unrelated change safe to skip.
+    expect(closure?.complete).toBe(false);
+    expect(closure.files.has('scripts/lib/under-test.mjs')).toBe(true);
+    expect(importClosure.closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toBeNull();
     expect(closure.files.has('scripts/lib/review-shape.mjs')).toBe(true);
     for (const file of ['scripts/review-core-cli.mjs', 'scripts/lib/read-only-ops.mjs',
       'scripts/operations/run.mjs', 'scripts/operations/cli-adapter.mjs']) {

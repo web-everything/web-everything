@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
@@ -11,6 +11,12 @@ import { decideRestart } from '../daemon-self-sync.mjs';
 import { checkCodeUnchanged } from '../daemon-live-smoke.mjs';
 import { loadReadOnlyOps } from '../read-only-ops.mjs';
 import * as importClosureModule from '../import-closure.mjs';
+import { isReviewCodePath } from '../../operations/review-dispatch.mjs';
+import { isPromoteCodePath } from '../../operations/promote-draft-pr-dispatch.mjs';
+import { isFixCodePath } from '../../conveyor/reconcile-fix-dispatch.mjs';
+
+// Load the dispatch graphs during collection; their cold transforms can exceed a test's 5s budget.
+const classifiers = { isReviewCodePath, isPromoteCodePath, isFixCodePath };
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -78,12 +84,7 @@ it.each(['collectRunClosure', 'makeSkipCheck', 'decideRestart', 'checkCodeUnchan
         expect(await loadReadOnlyOps(root, options)).toEqual(new Set(['heavy-queue']));
       } finally { spy.mockRestore(); }
     } else {
-      const modules = {
-        isReviewCodePath: '../../operations/review-dispatch.mjs',
-        isPromoteCodePath: '../../operations/promote-draft-pr-dispatch.mjs',
-        isFixCodePath: '../../conveyor/reconcile-fix-dispatch.mjs',
-      };
-      const classify = (await import(modules[consumer]))[consumer];
+      const classify = classifiers[consumer];
       expect(classify(changedFiles[0], { closure })).toBe(true);
       expect(classify(changedFiles[0], { closure: collectImportClosure({ root, entries: ['readable.mjs'] }) })).toBe(false);
     }
