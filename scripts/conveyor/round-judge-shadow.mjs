@@ -22,6 +22,7 @@ import { readConfirmedBreaks } from '../lib/red-team-gate.mjs';
 import { detectRoundCap, judgeRound, formatJudgeLine } from '../lib/round-judge.mjs';
 import { verifyFinding, makeGitRepo } from '../lib/round-judge-verify.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { breakClassStop } from '../lib/break-class-stop.mjs';
 
 export const ROUND_JUDGE_MODES = Object.freeze(['off', 'shadow', 'on']);
 export const ROUND_JUDGE_MODE_ENV = 'WE_ROUNDS_JUDGE_MODE';
@@ -48,6 +49,52 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   const mg = resolved.leafValues?.['judge.maxGrants'];
   const maxGrants = Number.isInteger(mg) && mg >= 1 ? mg : ROUND_JUDGE_MAX_GRANTS_STANDARD;
   return { mode, source, maxGrants, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
+}
+
+/** Independent R115 policy: leaf provenance follows the same rounds cascade as the round judge. */
+export function resolveBreakClassStopSetting({ env = process.env, path = ROUND_JUDGE_SETTINGS_FILE, platform, log } = {}) {
+  let file = {};
+  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { /* standard/platform fallback */ }
+  let plat = platform;
+  if (plat === undefined) { try { plat = platformPreference('rounds', { env }); } catch { /* standard fallback */ } }
+  const resolved = resolveCascade({ standard: { mode: 'off', consecutive: 3, enumerateFirst: false },
+    platform: plat?.breakClassStop, tool: (file?.rounds ?? file)?.breakClassStop,
+    envValues: { mode: env?.WE_ROUNDS_BREAK_CLASS_STOP_MODE },
+    valid: { mode: v => normMode(v) !== null,
+      consecutive: v => Number.isInteger(v) && v >= 1 && v <= 100, enumerateFirst: v => typeof v === 'boolean' } });
+  logCascadeSources('rounds.breakClassStop', resolved, { env, ...(log ? { log } : {}) });
+  return { ...resolved.value, mode: normMode(resolved.value.mode), source: resolved.sources.mode,
+    sources: resolved.sources, line: formatCascadeSourcesLine('rounds.breakClassStop', resolved) };
+}
+
+/** Later prompt wiring must record the enumeration in a trusted review comment before round 1. */
+export function enumerateFirstPrompt() {
+  return 'Before round 1 on daemon/Forge PRs, enumerate the full list of edge cases and break candidates; record it in a review comment with <!-- we:enumerate-first -->.';
+}
+
+/** Shadow only, including mode=on: live stopping/needs-you/dispatch actions require a later flip. Never throws. */
+export function observeBreakClassStop({ pr, repo = null, subject = {}, env = process.env, now = Date.now(), dir, log = l => console.error(l) } = {}) {
+  try {
+    if (isUnderTest(env) && !dir) return { skipped: 'under-test' };
+    const cfg = resolveBreakClassStopSetting({ env });
+    if (cfg.mode === 'off') return { skipped: 'off', source: cfg.source };
+    const result = breakClassStop({ pr, comments: subject?.comments, files: subject?.files, setting: cfg });
+    const head = subject?.headRefOid;
+    if (typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return { skipped: 'unreadable-head' };
+    if (result.reason) return { skipped: 'incomplete-evidence', reason: result.reason };
+    if (!result.applies) return { skipped: 'not-applicable' };
+    const outDir = dir ?? roundJudgeDir(env);
+    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head.toLowerCase(), result.rounds.length]);
+    if (seenKeys(outDir, now).has(key)) return { skipped: 'already-logged', key };
+    const record = { ts: new Date(now).toISOString(), kind: 'break-class-stop', key, pr: Number(pr), repo,
+      head: head.toLowerCase(), mode: cfg.mode, modeSource: cfg.source, setting: cfg, ...result,
+      wouldEmit: result.wouldStop ? ['design-stage-miss needs-you', 'non-convergence analysis dispatch'] : [] };
+    mkdirSync(outDir, { recursive: true });
+    appendFileSync(monthFile(outDir, now), `${JSON.stringify(record)}\n`);
+    seenKeys(outDir, now).add(key);
+    try { log(`break-class-stop: #${Number(pr)} wouldStop=${result.wouldStop} mode=${cfg.mode} source=${cfg.source} · ${cfg.line}`); } catch { /* log only */ }
+    return record;
+  } catch { return { skipped: 'error', reason: 'observer unreadable; human review of full thread and diff required' }; }
 }
 
 const DIR_NAME = 'round-judge-shadow';
