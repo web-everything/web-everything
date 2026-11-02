@@ -482,6 +482,57 @@ describe('post-accept advisory shadow ledger', () => {
     expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
   });
 
+  it.each([3, 2, 4])('accept count 3, later run 4, explicit replay %i appends nothing and reports 4', async loopsAfter => {
+    const rows = [];
+    const io = { repo: 'o/r', pr: 7, head, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, loopsAfter: 3 });
+    const accepted = structuredClone(rows);
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 3 })).toBeNull();
+    expect(rows).toEqual(accepted);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'later', runId: 'later' });
+    expect(rows.at(-1)).toMatchObject({ headSha: head, loopsAfter: 4, runId: 'later' });
+    const before = structuredClone(rows);
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 4, skipped: 0 });
+  });
+
+  it('adversarial persisted lower and equal explicit replays cannot regress the report or next run', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      headSha: head, ...decision, loopsAfter: 3 },
+    ...[4, 3, 2, 4].map(loopsAfter => ({ kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter }))];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 4, skipped: 3 });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'later', runId: 'later',
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(rows.at(-1)).toMatchObject({ headSha: head, loopsAfter: 5, runId: 'later' });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 5, skipped: 3 });
+  });
+
+  it('adversarial interleaved accepts keep independent measurements across explicit and run replays', async () => {
+    const rows = [];
+    const io = { repo: 'o/r', pr: 7, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'A', loopsAfter: 3 });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'B' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', loopsAfter: 0 });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', loopsAfter: 3 });
+    const before = structuredClone(rows);
+    for (const [head, loopsAfter] of [['A', 3], ['A', 2], ['A', 4], ['B', 0], ['B', 2], ['B', 3]]) {
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head, loopsAfter })).toBeNull();
+    }
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'B' });
+    expect(rows).toEqual(before);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows.slice(-2)).toMatchObject([
+      { headSha: 'A', loopsAfter: 5, runId: 'C' }, { headSha: 'B', loopsAfter: 4, runId: 'C' },
+    ]);
+    const after = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows).toEqual(after);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 9, skipped: 0 });
+  });
+
   it('orphan explicit measurement cannot suppress a valid replacement', async () => {
     const orphan = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter: 1 };
     const rows = [orphan, { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,

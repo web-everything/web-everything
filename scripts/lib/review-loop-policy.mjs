@@ -710,7 +710,8 @@ function replayAdvisoryLedger(rows) {
     if (validAdvisoryRow(row)) {
       const key = advisoryKey(row);
       if (accepts.has(key)) { skipped++; return; }
-      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Set(), measurements: new Set() });
+      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Set(),
+        measurements: new Set(validLoopCount(row.loopsAfter) ? [row.loopsAfter] : []) });
     } else if (validAdvisoryRun(row)) {
       const key = advisoryRunKey(row);
       if (!runs.has(key)) runs.set(key, {
@@ -728,7 +729,9 @@ function replayAdvisoryLedger(rows) {
           || accept.seen.has(row.runId) || !validLoopCount((accept.count ?? 0) + 1)
           || row.loopsAfter !== (accept.count ?? 0) + 1) { skipped++; return; }
         accept.seen.add(row.runId);
-      } else if (!accept) { skipped++; return; }
+      } else if (!accept || (validLoopCount(accept.count) && row.loopsAfter <= accept.count)) {
+        skipped++; return;
+      }
       accept.count = row.loopsAfter;
       accept.measurements.add(row.loopsAfter);
     } else skipped++;
@@ -771,7 +774,8 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
     }
     const row = { kind: 'loops', repo, pr, headSha: head, loopsAfter, at: now() };
     if (!accepts.has(advisoryKey(row))) throw new Error('missing accept; inspect shadow ledger');
-    if (accepts.get(advisoryKey(row)).measurements.has(loopsAfter)) return null;
+    const accept = accepts.get(advisoryKey(row));
+    if (accept.measurements.has(loopsAfter) || (validLoopCount(accept.count) && loopsAfter <= accept.count)) return null;
     await append(row);
     return row;
   } catch (error) {
