@@ -36,16 +36,26 @@ import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
 
-function validTipSha(raw) {
-  return typeof raw?.tipSha === 'string' && FULL_SHA_RE.test(raw.tipSha) ? raw.tipSha : null;
+/** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
+export function readOverlayEventLog(root, env) {
+  try {
+    const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
+  } catch { return []; }
 }
 
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
  * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
 export function contentContainedInBuild(git, sha, build) {
+  // Custom merge drivers can discard overlay changes while reporting an unchanged tree: refuse (fail closed).
+  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
   const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
   const t = String(m.stdout ?? '').split('\n')[0].trim();
   return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
+}
+
+function validTipSha(raw) {
+  return typeof raw?.tipSha === 'string' && FULL_SHA_RE.test(raw.tipSha) ? raw.tipSha : null;
 }
 
 /**
@@ -751,10 +761,7 @@ export async function prepareRebuild({
       let overlayEvents;
       const readOverlayEvents = () => {
         if (overlayEvents === undefined) {
-          try {
-            const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
-            overlayEvents = readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
-          } catch { overlayEvents = []; }
+          overlayEvents = readOverlayEventLog(root, env);
         }
         return overlayEvents;
       };
@@ -778,9 +785,9 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
-        leftForMain: (applied, build) => overlayGraduated({
-          ...applied, build, git, events: readOverlayEvents(),
-          registered: (ref) => overlaysBefore.some((o) => o?.ref === ref) || registeredRefs.has(ref),
+        leftForMain: (a, build) => overlayGraduated({
+          readyAt: ready.at ?? ready.passedAt,
+          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
@@ -799,10 +806,24 @@ export async function prepareRebuild({
             error: String(e?.message ?? e) };
         }
       }
-      if (!m.adopt || archiveRefusal) {
+      if (archiveRefusal) {
+        Object.assign(m, { adopt: null, reason: 'archive-source-uncovered', omitted: archiveRefusal.refs });
+      }
+      const discardAlert = alert;
+      if (!m.adopt) {
+        const alert = (kind, detail) => discardAlert(kind, {
+          ...detail, ...(archiveRefusal?.error ? { error: archiveRefusal.error } : {}),
+        });
         clearReadyCandidate(root, stEnv);
-        alert('ready-candidate-discarded', { target: ready.adopt.finalSha,
-          ...(archiveRefusal ? { reason: 'archive-source-uncovered', ...archiveRefusal } : { reason: m.reason }) });
+        reportDiscardedCandidate({
+          ready, match: m, alert,
+          needsYou: ({ kind, ...detail }) => {
+            try {
+              appendOverlayEvent(root, { kind: 'needs-you', need: kind, ...detail }, { env });
+            } catch { /* the alert remains visible when the event log is unwritable */ }
+            alert('ready-candidate-discarded-needs-you', detail);
+          },
+        });
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {

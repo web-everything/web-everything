@@ -23,7 +23,7 @@ import {
 } from '../daemon-rebuild.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
-import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
+import { overlayGraduated, readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
 import * as preparation from '../daemon-rebuild/prepare.mjs';
 
 const tempDirs = [];
@@ -132,6 +132,22 @@ describe('the Git proof of omitted content in the candidate build', () => {
     expect(preparation.contentContainedInBuild((args) => (
       args[0] === 'merge-tree' ? { status: 129, stdout: '', stderr: 'unsupported option' } : realGit(args)
     ), overlay, build)).toBe(false);
+  });
+
+  it('refuses content proof when a custom merge driver is configured', () => {
+    const { originDir, cloneDir } = makeFixture();
+    const overlay = pushBranch(originDir, 'lane/omitted', (dir) => writeFile(dir, 'README.md', 'overlay\n'));
+    const build = advanceMain(originDir, (dir) => writeFile(dir, 'README.md', 'candidate\n'));
+    gitOk(cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    const realGit = (args) => git(cloneDir, args);
+    expect(preparation.contentContainedInBuild((args) => (
+      args[0] === 'config' ? { status: 0, stdout: 'merge.ours.driver true\n' } : realGit(args)
+    ), build, build)).toBe(false);
+    expect(preparation.contentContainedInBuild((args) => (
+      args[0] === 'config' ? { status: 128, stdout: '' } : realGit(args)
+    ), build, build)).toBe(false);
+    expect(preparation.contentContainedInBuild(realGit, build, build)).toBe(true);
+    void overlay;
   });
 
   it('rejects a failed merge-tree even if its output names the candidate tree', () => {
@@ -653,6 +669,28 @@ describe('matchReadyCandidate — pure', () => {
   describe('omitted live overlays', () => {
     const live = (...refs) => refs.map((r) => ({ ref: r, sha: `${r}-sha` }));
     const o = (extra) => args({ liveApplied: live('lane/m'), carries: () => false, ...extra });
+    it('only exempts the overlay with complete graduation evidence', () => {
+      const liveApplied = live('lane/m', 'lane/u');
+      const sha = 'a'.repeat(40);
+      const tree = 'b'.repeat(40);
+      const events = [{ kind: 'removed', ref: 'lane/m', reason: `graduated #6011 (merged ${sha})` }];
+      const git = vi.fn((argv) => {
+        if (argv[0] === 'config') return { status: 1, stdout: '' };
+        if (argv[0] === 'merge-base') return { status: 0, stdout: '' };
+        return { status: 0, stdout: `${argv[1] === '--verify' ? sha : tree}\n` };
+      });
+      const m = matchReadyCandidate(o({ liveApplied,
+        leftForMain: (applied, build) => overlayGraduated({ ...applied, build, events, git, registered: () => false }),
+      }));
+      expect(m.adopt).toBeNull();
+      expect(m.omitted).toEqual(['lane/u']);
+    });
+    it.each([undefined, null, 'unknown', {}])('refuses unknown graduation proof (%j)', (proof) => {
+      const liveApplied = live('lane/m', 'lane/u');
+      const m = matchReadyCandidate(o({ liveApplied, leftForMain: () => proof }));
+      expect(m.adopt).toBeNull();
+      expect(m.omitted).toEqual(liveApplied.map(({ ref }) => ref));
+    });
     it('adopts when the omitted overlay left for main AND its content is in the candidate build', () => {
       const m = matchReadyCandidate(o({ removedForMain: () => true, contentInBuild: () => true }));
       expect(m.match).toBe('superseded');

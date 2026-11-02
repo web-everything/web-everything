@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
+import { readOverlayEventLog } from '../daemon-rebuild/prepare.mjs';
+import { overlayFilePath } from '../daemon-overlays.mjs';
 
 const liveApplied = [
   { ref: 'lane/stack-base-refs-m1', sha: 'a'.repeat(40) },
@@ -12,6 +17,7 @@ const buildTree = 'c'.repeat(40);
 function fixture() {
   const ready = {
     kind: 'candidate', prevHead: 'H', tree: 'T1',
+    at: new Date(1_000_000).toISOString(),
     passedAt: new Date(1_000_000).toISOString(),
     adopt: { finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied: [] },
   };
@@ -27,6 +33,7 @@ function fixture() {
 function graduation(overrides = {}) {
   const build = fixture().ready.adopt.finalSha;
   const responses = new Map([
+    [JSON.stringify(['config', '--get-regexp', '^merge\\..*\\.driver$']), { status: 1, stdout: '' }],
     [JSON.stringify(['rev-parse', '--verify', `${merged}^{commit}`]), { status: 0, stdout: `${mergeSha}\n` }],
     [JSON.stringify(['merge-base', '--is-ancestor', mergeSha, build]), { status: 0, stdout: '' }],
     [JSON.stringify(['rev-parse', `${build}^{tree}`]), { status: 0, stdout: `${buildTree}\n` }],
@@ -46,11 +53,57 @@ function graduation(overrides = {}) {
   };
 }
 
-function matchWith(evidence) {
-  const args = fixture();
-  const leftForMain = vi.fn((applied, build) => adoption.overlayGraduated({ ...evidence, ...applied, build }));
+function autoDropped(overrides = {}) {
+  const ref = 'lane/daemon-heap-log-m2';
+  const { event = {}, ...rest } = overrides;
+  return graduation({
+    ref, readyAt: fixture().ready.at,
+    events: [
+      { kind: 'added', ref },
+      { kind: 'auto-dropped', ref, reason: 'in-main', at: new Date(999_999).toISOString(), ...event },
+    ],
+    ...rest,
+  });
+}
+
+function matchWith(evidence, overrides = {}) {
+  const args = { ...fixture(), ...overrides };
+  const leftForMain = vi.fn((applied, build) => adoption.overlayGraduated({
+    ...evidence, ...applied, build, readyAt: args.ready.at,
+  }));
   return { args, leftForMain, match: adoption.matchReadyCandidate({ ...args, leftForMain }) };
 }
+
+describe('readOverlayEventLog', () => {
+  it('reads auto-dropped in-main events from the overlay directory and skips blank lines', () => {
+    const root = mkdtempSync(join(tmpdir(), 'daemon-rebuild-graduated-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: root };
+    try {
+      const events = autoDropped().events;
+      const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+      writeFileSync(file, `\n${events.map((event) => JSON.stringify(event)).join('\n \t\n')}\n\n`, 'utf8');
+      expect(readOverlayEventLog(root, env)).toEqual(events);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns no evidence when the overlay event log is missing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'daemon-rebuild-graduated-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: root };
+    try {
+      expect(readOverlayEventLog(root, env)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns no partial evidence when an overlay event cannot be parsed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'daemon-rebuild-graduated-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: root };
+    try {
+      const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+      writeFileSync(file, `${JSON.stringify(autoDropped().events[1])}\ninvalid json\n`, 'utf8');
+      expect(readOverlayEventLog(root, env)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe('squash-graduated overlays in superseded ready candidates', () => {
   it('adopts a candidate that omits a squash-graduated, unregistered overlay', () => {
@@ -83,19 +136,91 @@ describe('squash-graduated overlays in superseded ready candidates', () => {
     expect(match.omitted).toEqual(liveApplied.map(({ ref }) => ref));
     expect(match.reason).toBe(`superseded-omits-live-overlay: ${match.omitted.join(', ')}`);
   });
+});
 
-  it('only exempts the overlay with complete graduation evidence', () => {
-    const evidence = graduation();
-    evidence.events = evidence.events.filter(({ ref }) => ref === liveApplied[0].ref);
-    const { match } = matchWith(evidence);
-    expect(match.adopt).toBeNull();
-    expect(match.omitted).toEqual([liveApplied[1].ref]);
+describe('auto-dropped in-main overlays in superseded ready candidates', () => {
+  it('adopts a candidate omitting lane/daemon-heap-log-m2 auto-dropped before ready.at', () => {
+    const evidence = autoDropped({ readyAt: undefined });
+    const applied = { ref: evidence.ref, sha: evidence.sha };
+    const { args, leftForMain, match } = matchWith(evidence, { liveApplied: [applied] });
+    expect(Date.parse(args.ready.at)).toBeLessThan(args.nowMs);
+    expect(args.ready.adopt.applied).toEqual([]);
+    expect(match).toEqual({ adopt: args.ready.adopt, dropRefs: [], match: 'superseded' });
+    expect(leftForMain.mock.calls).toEqual([[applied, args.ready.adopt.finalSha]]);
   });
 
-  it.each([undefined, null, 'unknown', {}])('refuses unknown graduation proof (%j)', (proof) => {
-    const match = adoption.matchReadyCandidate({ ...fixture(), leftForMain: () => proof });
+  it('discards a candidate when lane/daemon-heap-log-m2 was auto-dropped after ready.at', () => {
+    const evidence = autoDropped({ events: [
+      { kind: 'auto-dropped', ref: 'lane/daemon-heap-log-m2', reason: 'in-main', at: new Date(1_000_001).toISOString() },
+    ] });
+    const applied = { ref: evidence.ref, sha: evidence.sha };
+    const { args, leftForMain, match } = matchWith(evidence, { liveApplied: [applied] });
     expect(match.adopt).toBeNull();
-    expect(match.omitted).toEqual(liveApplied.map(({ ref }) => ref));
+    expect(match.omitted).toEqual([applied.ref]);
+    expect(match.reason).toMatch(/^superseded-omits-live-overlay/);
+    expect(leftForMain.mock.calls).toEqual([[applied, args.ready.adopt.finalSha]]);
+  });
+});
+
+describe('overlayGraduated auto-dropped in-main evidence', () => {
+  it.each([
+    ['ISO', new Date(1_000_000).toISOString()],
+    ['milliseconds', 1_000_000],
+  ])('accepts an unregistered overlay auto-dropped before %s readyAt with content proof and no merge sha', (_name, readyAt) => {
+    const evidence = autoDropped({ readyAt });
+    expect(adoption.overlayGraduated(evidence)).toBe(true);
+    expect(evidence.git.mock.calls.map(([args]) => args)).toEqual(expect.arrayContaining([
+      ['merge-tree', '--write-tree', '--no-messages', evidence.build, evidence.sha],
+      ['rev-parse', `${evidence.build}^{tree}`],
+    ]));
+  });
+
+  it.each([
+    ['events missing', () => ({ events: undefined })],
+    ['events not an array', () => ({ events: {} })],
+    ['events empty', () => ({ events: [] })],
+    ['still registered', () => ({ registered: () => true })],
+    ['readyAt missing', () => ({ readyAt: undefined })],
+    ['readyAt null', () => ({ readyAt: null })],
+    ['readyAt unparsable', () => ({ readyAt: 'not-a-date' })],
+    ['readyAt nonfinite', () => ({ readyAt: NaN })],
+    ['event at missing', () => ({ event: { at: undefined } })],
+    ['event at null', () => ({ event: { at: null } })],
+    ['event at unparsable', () => ({ event: { at: 'not-a-date' } })],
+    ['event at equals readyAt', () => ({ event: { at: fixture().ready.at } })],
+    ['event at after readyAt', () => ({ event: { at: new Date(1_000_001).toISOString() } })],
+    ...['pr-closed', 'ref-gone', 'pr-merged'].map((reason) => [
+      `reason is ${reason} without a merge sha`, () => ({ event: { reason } }),
+    ]),
+    ['a later added event exists for the ref', () => ({ events: [
+      ...autoDropped().events, { kind: 'added', ref: 'lane/daemon-heap-log-m2' },
+    ] })],
+    ['auto-drop belongs to another ref', () => ({ events: [
+      { kind: 'auto-dropped', ref: 'lane/other', reason: 'in-main', at: new Date(999_999).toISOString() },
+    ] })],
+  ])('fails closed when %s', (_name, overrides) => {
+    expect(adoption.overlayGraduated(autoDropped(overrides()))).toBe(false);
+  });
+
+  it.each([
+    ['merge-tree changes the build tree', 'merge-tree', { status: 0, stdout: `${'d'.repeat(40)}\n` }],
+    ['only a later output line matches the build tree', 'merge-tree', { status: 0, stdout: `${'d'.repeat(40)}\n${buildTree}\n` }],
+    ['merge-tree conflicts', 'merge-tree', { status: 1, stdout: `${buildTree}\n` }],
+    ['merge-tree status is unknown', 'merge-tree', { status: null, stdout: `${buildTree}\n` }],
+    ['merge-tree output is empty', 'merge-tree', { status: 0, stdout: '' }],
+    ['build tree cannot be read', 'rev-parse', { status: 1, stdout: `${buildTree}\n` }],
+    ['build tree is empty', 'rev-parse', { status: 0, stdout: '' }],
+    ['git returns unknown evidence', 'merge-tree', undefined],
+  ])('fails closed when %s', (_name, command, response) => {
+    const evidence = autoDropped();
+    const success = evidence.git;
+    evidence.git = vi.fn((args) => args[0] === command ? response : success(args));
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
+  });
+
+  it('fails closed when git throws during the content proof', () => {
+    const evidence = autoDropped({ git: () => { throw new Error('unreadable git evidence'); } });
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
   });
 });
 
@@ -146,6 +271,36 @@ describe('overlayGraduated evidence', () => {
     const success = evidence.git;
     evidence.git = (args) => args[0] === command && args[1] === argument ? response : success(args);
     expect(adoption.overlayGraduated(evidence)).toBe(false);
+  });
+});
+
+describe.each([
+  ['graduated-merged', graduation],
+  ['auto-dropped in-main', autoDropped],
+])('overlayGraduated %s merge driver evidence', (_name, makeEvidence) => {
+  const configArgs = ['config', '--get-regexp', '^merge\\..*\\.driver$'];
+
+  it.each([
+    ['a custom merge driver is configured', { status: 0, stdout: 'merge.ours.driver true\n' }],
+    ['config fails with status 128', { status: 128, stdout: '' }],
+    ['config status is undefined', { stdout: '' }],
+    ['config response is undefined', undefined],
+  ])('fails closed before merge-tree when %s', (_reason, response) => {
+    const evidence = makeEvidence();
+    const success = evidence.git;
+    evidence.git = vi.fn((args) => JSON.stringify(args) === JSON.stringify(configArgs) ? response : success(args));
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
+    expect(evidence.git).toHaveBeenCalledWith(configArgs);
+    expect(evidence.git.mock.calls.some(([args]) => args[0] === 'merge-tree')).toBe(false);
+  });
+
+  it('accepts content proof when config status is exactly 1', () => {
+    const evidence = makeEvidence();
+    expect(adoption.overlayGraduated(evidence)).toBe(true);
+    const calls = evidence.git.mock.calls.map(([args]) => args);
+    const configIndex = calls.findIndex((args) => JSON.stringify(args) === JSON.stringify(configArgs));
+    expect(configIndex).toBeGreaterThanOrEqual(0);
+    expect(calls.findIndex((args) => args[0] === 'merge-tree')).toBeGreaterThan(configIndex);
   });
 });
 

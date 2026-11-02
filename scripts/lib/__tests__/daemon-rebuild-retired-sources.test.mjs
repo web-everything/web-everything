@@ -416,6 +416,7 @@ describe('a saved ready candidate is held to the archived-source rule (PR #6033 
         return { adopt: null, reason: 'graduation-proof-probed' };
       });
       await f.prepare({ run: (args) => {
+        if (args[0] === 'config' && args[1] === '--get-regexp') return { status: 1, stdout: '' };
         if (args[0] === 'merge-base' && args[1] === '--is-ancestor'
           && args[2] === merged && args[3] === target) return { status: 0, stdout: '' };
         return f.git(args);
@@ -448,15 +449,23 @@ describe('a saved ready candidate is held to the archived-source rule (PR #6033 
     expect(next.result?.reason).not.toBe('ready-adopted');
     expect(discarded).toEqual([expect.objectContaining({ detail: expect.objectContaining({
       reason: 'archive-source-uncovered', refs: ['top'], target: '5'.repeat(40) }) })]);
+    expect(next.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded-needs-you',
+      detail: expect.objectContaining({ reason: 'archive-source-uncovered', refs: ['top'], target: '5'.repeat(40) }) }));
+    const events = readFileSync(overlayFilePath(root, f.env).replace(/\.json$/, '.events.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'needs-you', need: 'ready-candidate-discarded',
+      reason: 'archive-source-uncovered', refs: ['top'], target: '5'.repeat(40) }));
     expect(readReadyCandidate(root, f.env)).toBeNull();
     expect(readOverlayState(root, { env: f.env }).overlays.find((o) => o.ref === 'top').retiredSources).toHaveLength(1);
   });
 
   it('discards a saved candidate when archive containment cannot be verified (fails closed)', async () => {
-    const { f, discarded } = await readyTick({ target: '5'.repeat(40), gitError: true });
+    const { f, next, discarded } = await readyTick({ target: '5'.repeat(40), gitError: true });
     expect(model.finalize).not.toHaveBeenCalled();
     expect(discarded).toEqual([expect.objectContaining({ detail: expect.objectContaining({
       reason: 'archive-source-uncovered', refs: ['top'], error: expect.any(String) }) })]);
+    expect(next.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded-needs-you',
+      detail: expect.objectContaining({ reason: 'archive-source-uncovered', refs: ['top'], error: expect.any(String) }) }));
     expect(readReadyCandidate(root, f.env)).toBeNull();
   });
 
