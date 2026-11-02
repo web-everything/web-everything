@@ -53,6 +53,39 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 const CTX = { key: 'run-1#4#0', runId: 'run-1', type: 'x', stepIndex: 4, step: 'record', index: 0 };
 
 describe('post-accept advisory persisted ledger', () => {
+  it('reopens normalization-poisoned JSONL while unrelated decisions, loops and ratings persist under lock', async () => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } = await import('../review-pr-io.mjs');
+    const { postAcceptAdvisoryShadowReport } = await import('../../lib/review-loop-policy.mjs');
+    const ledgerPath = join(root, 'normalization-poison.jsonl'), logs = [];
+    const finding = { findingId: 'one', file: 'scripts/a.mjs', line: 4,
+      category: 'correctness/correctness', summary: 'diagnostic', impactIfUnfixed: 'cosmetic' };
+    const decision = { wouldCard: true, wouldPush: false, findings: [finding] };
+    const corrupt = ['rootCause', 'prevention', 'line', 'file', 'quote', 'reproCommand', 'failure_scenario'].map(key => ({
+      kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 99, headSha: 'bad', ...decision,
+      findings: [{ ...finding, [key]: { toString: null } }], loopsAfter: null,
+    }));
+    const original = corrupt.map(JSON.stringify).join('\n') + '\n';
+    writeFileSync(ledgerPath, original);
+    const io = { repo: 'o/r', pr: 7, head: 'A', ledgerPath, decision, out: line => logs.push(line) };
+    await expect(recordPostAcceptAdvisoryShadow(io)).resolves.toMatchObject({ headSha: 'A' });
+    await expect(recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'R' })).resolves.toBeNull();
+    await expect(recordPostAcceptAdvisoryRating({ ...io, head: 'B', runId: 'R',
+      findings: [{ ...finding, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] })).resolves.toBeNull();
+    const persisted = readFileSync(ledgerPath, 'utf8');
+    expect(persisted.startsWith(original)).toBe(true);
+    const rows = persisted.trim().split('\n').map(JSON.parse);
+    expect(rows.slice(corrupt.length).map(row => row.kind)).toEqual([
+      'we.post-accept-advisory-shadow', 'advisory-run', 'loops', 'advisory-rating',
+    ]);
+    expect(postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 1, wouldCard: 1, findings: 1, loopsAfter: 1, laterBroken: 1, skipped: corrupt.length, unresolved: 1,
+    });
+    expect(logs).toEqual([]);
+    expect(existsSync(ledgerPath + '.lock')).toBe(false);
+    await recordPostAcceptAdvisoryShadow(io);
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(persisted);
+  });
+
   it.each([{}, { readLedgerRows: () => [] }, { appendLedgerRow: () => ({ ok: true }) },
     { readLedgerRows: [], appendLedgerRow: null }])('refuses incomplete injected IO %j without touching persisted state', async injected => {
     const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');

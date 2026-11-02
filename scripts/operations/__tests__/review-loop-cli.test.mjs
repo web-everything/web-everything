@@ -1705,6 +1705,44 @@ describe('post-accept advisory shadow wiring', () => {
       else expect(result.logs.join('\n')).toContain('live review unaffected');
     });
 
+  it('normalization-poisoned rows from another PR preserve live effects and recording across replay', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 9999,
+      headSha: 'poison', wouldCard: true, wouldPush: false, loopsAfter: null,
+      findings: [{ category: 'correctness/correctness', summary: 'poison', impactIfUnfixed: 'cosmetic',
+        rootCause: { toString: null } }] }];
+    const logs = [], effects = [], store = createMemoryRunStore();
+    const io = { readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+    const review = async (rev, id) => {
+      const { declaration, registry } = registryFor({ rev });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks(effects), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => id,
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: line => logs.push(line),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+        recordAdvisoryRating: facts => recordPostAcceptAdvisoryRating({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+    };
+    await review(HEAD_A, 'safe-A');
+    const firstCount = effects.length;
+    await review(HEAD_B, 'safe-B');
+    const before = structuredClone(rows), applied = structuredClone(effects);
+    const secondEffects = applied.slice(firstCount);
+    expect(secondEffects.length).toBeGreaterThan(0);
+    await review(HEAD_B, 'safe-B');
+    expect(rows).toEqual(before);
+    expect(effects.slice(applied.length)).toEqual(secondEffects);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([{ headSha: HEAD_A, loopsAfter: 1 }]);
+    expect(rows.filter(row => row.kind === 'we.post-accept-advisory-shadow')).toHaveLength(3);
+    expect(postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 1, wouldPush: 2, loopsAfter: 1, skipped: 1, unresolved: 1,
+    });
+    expect(logs).toEqual([]);
+  });
+
   it('corrupt persisted loops refuse telemetry on both heads while the live review still completes', async () => {
     const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A,
       wouldCard: false, wouldPush: true, findings: [], loopsAfter: null },

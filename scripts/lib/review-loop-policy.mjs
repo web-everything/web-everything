@@ -647,16 +647,16 @@ export function postAcceptAdvisoryDecision(input = {}) {
 export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision, loopsAfter = null,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
-    if (!advisoryIdentity({ repo, pr, head })
-      || !validAdvisoryDecision(decision) || (loopsAfter !== null && !validLoopCount(loopsAfter))) {
+    if (!safeRow(() => advisoryIdentity({ repo, pr, head })
+      && validAdvisoryDecision(decision) && (loopsAfter === null || validLoopCount(loopsAfter)))) {
       throw new Error('incomplete shadow evidence');
     }
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
-    const { unresolved } = replayAdvisoryLedger(rows);
+    const { accepts, unresolved } = replayAdvisoryLedger(rows);
     if (unresolved.has(advisoryPrKey({ repo, pr }))) throw new Error('invalid loop history; inspect shadow ledger');
     const kind = 'we.post-accept-advisory-shadow';
-    if (rows.some(row => validAdvisoryRow(row) && row.kind === kind && row.repo === repo && row.pr === pr && advisoryKey(row) === advisoryKey({ repo, pr, head }))) return null;
+    if (accepts.has(advisoryKey({ repo, pr, head }))) return null;
     const row = { v: 1, kind, at: now(), repo, pr, headSha: head,
       wouldCard: decision.wouldCard, wouldPush: decision.wouldPush, findings: decision.findings, loopsAfter };
     const result = await appendLedgerRow(row);
@@ -667,6 +667,10 @@ export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision,
     return null;
   }
 }
+
+// A persisted row is untrusted through normalization, not just shape validation.
+// Keep all row work inside this boundary; a bad row must never poison another PR.
+const safeRow = fn => { try { return fn(); } catch { return null; } };
 
 const validLoopCount = value => Number.isSafeInteger(value) && value >= 0;
 const advisoryObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -724,59 +728,74 @@ function replayAdvisoryLedger(rows) {
   let skipped = 0;
   const reject = row => {
     skipped++;
-    if (nonemptyAdvisoryString(row?.repo) && Number.isSafeInteger(row.pr) && row.pr > 0) {
-      unresolved.add(advisoryPrKey(row));
-    }
+    const identity = safeRow(() => {
+      const { repo, pr } = row ?? {};
+      return nonemptyAdvisoryString(repo) && Number.isSafeInteger(pr) && pr > 0
+        ? advisoryPrKey({ repo, pr }) : null;
+    });
+    if (identity !== null) unresolved.add(identity);
   };
-  Array.from(rows).forEach((row, index) => {
-    if (validAdvisoryRow(row)) {
-      const key = advisoryKey(row);
-      if (accepts.has(key)) { skipped++; return; }
-      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Map(), ratings: new Map(),
-        measurements: new Set(validLoopCount(row.loopsAfter) ? [row.loopsAfter] : []) });
-    } else if (validAdvisoryRun(row)) {
-      const key = advisoryRunKey(row);
-      if (!runs.has(key)) runs.set(key, {
-        index: Math.min(index, accepts.get(advisoryKey(row))?.index ?? index),
-        head: advisoryIdentity(row).headSha,
-      });
-      else if (runs.get(key).head !== advisoryIdentity(row).headSha) reject(row);
-      else skipped++;
-    } else if (validAdvisoryLoops(row)) {
-      const accept = accepts.get(advisoryKey(row));
-      if (!accept) { reject(row); return; }
-      if (row.runId !== undefined) {
+  Array.from(rows).forEach((source, index) => {
+    const processed = safeRow(() => {
+      // Detach getters/prototypes so subsequent consumers use the exact evidence
+      // validated here. Reject non-serializable rows, including cyclic evidence.
+      const row = structuredClone(source);
+      JSON.stringify(row);
+      if (validAdvisoryRow(row)) {
+        row.findings.forEach(finding => {
+          normalizeFinding(finding);
+          postAcceptAdvisoryFindingIdentity(finding);
+        });
+        const key = advisoryKey(row);
+        if (accepts.has(key)) { skipped++; return; }
+        accepts.set(key, { row, index, count: row.loopsAfter, seen: new Map(), ratings: new Map(),
+          measurements: new Set(validLoopCount(row.loopsAfter) ? [row.loopsAfter] : []) });
+      } else if (validAdvisoryRun(row)) {
         const key = advisoryRunKey(row);
-        const run = runs.get(key) ?? { index, head: null };
-        if (accept.index >= run.index || run.head === advisoryIdentity(accept.row).headSha) { reject(row); return; }
-        if (accept.seen.has(row.runId)) {
-          if (accept.seen.get(row.runId) !== row.loopsAfter) reject(row);
-          else skipped++;
-          return;
+        if (!runs.has(key)) runs.set(key, {
+          index: Math.min(index, accepts.get(advisoryKey(row))?.index ?? index),
+          head: advisoryIdentity(row).headSha,
+        });
+        else if (runs.get(key).head !== advisoryIdentity(row).headSha) reject(row);
+        else skipped++;
+      } else if (validAdvisoryLoops(row)) {
+        const accept = accepts.get(advisoryKey(row));
+        if (!accept) { reject(row); return; }
+        if (row.runId !== undefined) {
+          const key = advisoryRunKey(row);
+          const run = runs.get(key) ?? { index, head: null };
+          if (accept.index >= run.index || run.head === advisoryIdentity(accept.row).headSha) { reject(row); return; }
+          if (accept.seen.has(row.runId)) {
+            if (accept.seen.get(row.runId) !== row.loopsAfter) reject(row);
+            else skipped++;
+            return;
+          }
+          if (!validLoopCount((accept.count ?? 0) + 1)
+            || row.loopsAfter !== (accept.count ?? 0) + 1) { reject(row); return; }
+          // Validate the complete measurement before reserving a run or changing any count.
+          runs.set(key, run);
+          accept.seen.set(row.runId, row.loopsAfter);
+        } else if (validLoopCount(accept.count) && row.loopsAfter <= accept.count) {
+          skipped++; return; // A well-formed redundant explicit measurement is harmless.
         }
-        if (!validLoopCount((accept.count ?? 0) + 1)
-          || row.loopsAfter !== (accept.count ?? 0) + 1) { reject(row); return; }
-        // Validate the complete measurement before reserving a run or changing any count.
-        runs.set(key, run);
-        accept.seen.set(row.runId, row.loopsAfter);
-      } else if (validLoopCount(accept.count) && row.loopsAfter <= accept.count) {
-        skipped++; return; // A well-formed redundant explicit measurement is harmless.
-      }
-      accept.count = row.loopsAfter;
-      accept.measurements.add(row.loopsAfter);
-    } else if (validAdvisoryRating(row)) {
-      const accept = accepts.get(advisoryKey(row));
-      const run = runs.get(advisoryRunKey(row));
-      if (!accept?.row.wouldCard || !run?.head || accept.index >= run.index
-        || run.head === advisoryIdentity(row).headSha
-        || !accept.row.findings.some(f => postAcceptAdvisoryFindingIdentity(f) === row.findingIdentity)) {
-        reject(row); return;
-      }
-      const key = advisoryRatingKey(row);
-      if (accept.ratings.has(key)) skipped++;
-      else accept.ratings.set(key, row);
-    } else if (['loops', 'advisory-run', 'advisory-rating'].includes(row?.kind)) reject(row);
-    else skipped++;
+        accept.count = row.loopsAfter;
+        accept.measurements.add(row.loopsAfter);
+      } else if (validAdvisoryRating(row)) {
+        const accept = accepts.get(advisoryKey(row));
+        const run = runs.get(advisoryRunKey(row));
+        if (!accept?.row.wouldCard || !run?.head || accept.index >= run.index
+          || run.head === advisoryIdentity(row).headSha
+          || !accept.row.findings.some(f => postAcceptAdvisoryFindingIdentity(f) === row.findingIdentity)) {
+          reject(row); return;
+        }
+        const key = advisoryRatingKey(row);
+        if (accept.ratings.has(key)) skipped++;
+        else accept.ratings.set(key, row);
+      } else if (['loops', 'advisory-run', 'advisory-rating'].includes(row?.kind)) reject(row);
+      else skipped++;
+      return true;
+    });
+    if (processed === null) reject(source);
   });
   // No state from an unresolved identity is committed to the replay result, even
   // when its bad row follows otherwise valid measurements or run markers.
@@ -792,9 +811,9 @@ function replayAdvisoryLedger(rows) {
 export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter, runId,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
-    if (!advisoryIdentity({ repo, pr, head })
-      || (runId !== undefined && !nonemptyAdvisoryString(runId))
-      || (loopsAfter === undefined ? !nonemptyAdvisoryString(runId) : !validLoopCount(loopsAfter))) throw new Error('incomplete loops evidence');
+    if (!safeRow(() => advisoryIdentity({ repo, pr, head })
+      && (runId === undefined || nonemptyAdvisoryString(runId))
+      && (loopsAfter === undefined ? nonemptyAdvisoryString(runId) : validLoopCount(loopsAfter)))) throw new Error('incomplete loops evidence');
     if (runId !== undefined && loopsAfter !== undefined) throw new Error('ambiguous loops evidence; supply a run ID or an explicit count; inspect shadow ledger');
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
@@ -813,11 +832,15 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
         accepts.get(advisoryKey({ repo, pr, head }))?.index ?? rows.length);
       const pending = [];
       for (const accept of accepts.values()) {
-        if (accept.row.repo !== repo || accept.row.pr !== pr || accept.index >= boundary
-          || advisoryIdentity(accept.row).headSha === head || accept.seen.has(runId)) continue;
-        const count = (accept.count ?? 0) + 1;
-        if (!validLoopCount(count)) throw new Error('loop count exhausted; inspect shadow ledger');
-        pending.push({ kind: 'loops', repo, pr, headSha: advisoryIdentity(accept.row).headSha, loopsAfter: count, runId, at: now() });
+        const measurement = safeRow(() => {
+          if (accept.row.repo !== repo || accept.row.pr !== pr || accept.index >= boundary
+            || advisoryIdentity(accept.row).headSha === head || accept.seen.has(runId)) return false;
+          const count = (accept.count ?? 0) + 1;
+          return { kind: 'loops', repo, pr, headSha: advisoryIdentity(accept.row).headSha, loopsAfter: count, runId, at: now() };
+        });
+        if (!measurement) continue;
+        if (!validLoopCount(measurement.loopsAfter)) throw new Error('loop count exhausted; inspect shadow ledger');
+        pending.push(measurement);
       }
       if (!run) await append({ kind: 'advisory-run', repo, pr, headSha: head, runId, at: now() });
       for (const row of pending) await append(row);
@@ -839,8 +862,8 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
 export async function recordPostAcceptAdvisoryRating({ repo, pr, head, runId, findings,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
-    if (!advisoryIdentity({ repo, pr, head }) || !nonemptyAdvisoryString(runId)
-      || !validAdvisoryFindings(findings)) throw new Error('incomplete rating evidence; inspect shadow ledger');
+    if (!safeRow(() => advisoryIdentity({ repo, pr, head }) && nonemptyAdvisoryString(runId)
+      && validAdvisoryFindings(findings))) throw new Error('incomplete rating evidence; inspect shadow ledger');
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
     const { accepts, runs, unresolved } = replayAdvisoryLedger(rows);
@@ -850,17 +873,24 @@ export async function recordPostAcceptAdvisoryRating({ repo, pr, head, runId, fi
     if (run.head !== head) throw new Error('conflicting run head; inspect shadow ledger');
     const boundary = Math.min(run.index, accepts.get(advisoryKey({ repo, pr, head }))?.index ?? rows.length);
     for (const accept of accepts.values()) {
-      if (accept.row.repo !== repo || accept.row.pr !== pr || !accept.row.wouldCard
-        || accept.index >= boundary || advisoryIdentity(accept.row).headSha === head) continue;
-      const identities = new Set(accept.row.findings.map(postAcceptAdvisoryFindingIdentity).filter(Boolean));
-      for (const finding of findings) {
-        const findingIdentity = postAcceptAdvisoryFindingIdentity(finding);
-        if (!findingIdentity || !identities.has(findingIdentity)) continue;
-        if (!['CONFIRMED', 'PLAUSIBLE'].includes(finding.verdict) || !finding.impactIfUnfixed) {
-          throw new Error('incomplete matched rating; inspect shadow ledger');
+      const pending = safeRow(() => {
+        if (accept.row.repo !== repo || accept.row.pr !== pr || !accept.row.wouldCard
+          || accept.index >= boundary || advisoryIdentity(accept.row).headSha === head) return [];
+        const identities = new Set(accept.row.findings.map(postAcceptAdvisoryFindingIdentity).filter(Boolean));
+        const matched = [];
+        for (const finding of findings) {
+          const findingIdentity = postAcceptAdvisoryFindingIdentity(finding);
+          if (!findingIdentity || !identities.has(findingIdentity)) continue;
+          if (!['CONFIRMED', 'PLAUSIBLE'].includes(finding.verdict) || !finding.impactIfUnfixed) {
+            return null;
+          }
+          matched.push({ kind: 'advisory-rating', repo, pr, headSha: advisoryIdentity(accept.row).headSha,
+            runId, findingIdentity, impactIfUnfixed: finding.impactIfUnfixed, verdict: finding.verdict, at: now() });
         }
-        const row = { kind: 'advisory-rating', repo, pr, headSha: advisoryIdentity(accept.row).headSha,
-          runId, findingIdentity, impactIfUnfixed: finding.impactIfUnfixed, verdict: finding.verdict, at: now() };
+        return matched;
+      });
+      if (pending === null) throw new Error('incomplete matched rating; inspect shadow ledger');
+      for (const row of pending) {
         const key = advisoryRatingKey(row);
         if (accept.ratings.has(key)) continue;
         const result = await appendLedgerRow(row);
@@ -884,28 +914,35 @@ export function postAcceptAdvisoryShadowReport(rows = []) {
     wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0,
     unconfirmedBroken: 0, skipped, unresolved: unresolved.size };
   for (const row of observations) {
-    if (row.wouldPush === true) report.wouldPush++;
-    const count = accepts.get(advisoryKey(row)).count;
-    if (validLoopCount(count)) {
-      if (!validLoopCount(report.loopsAfter + count)) throw new RangeError('loop total exhausted; inspect shadow ledger');
-      report.loopsAfter += count;
-    }
-    else report.unmeasured++;
-    if (row.wouldCard !== true) continue;
-    report.wouldCard++;
-    // Repeated IDs are one finding; historical findings without IDs remain separate observations.
-    const findings = [...new Map(row.findings.map((finding, index) => [finding.findingId ?? index, finding])).values()];
-    report.findings += findings.length;
-    const brokenRatings = (row.laterRatings ?? []).filter(rating => rating.impactIfUnfixed === 'broken');
-    const confirmed = new Set(brokenRatings.filter(rating => rating.verdict === 'CONFIRMED').map(rating => rating.findingId));
-    const unconfirmed = new Set(brokenRatings.filter(rating => rating.verdict !== 'CONFIRMED').map(rating => rating.findingId));
-    const recorded = [...accepts.get(advisoryKey(row)).ratings.values()].filter(rating => rating.impactIfUnfixed === 'broken');
-    for (const finding of findings) {
-      const ratings = recorded.filter(rating => rating.findingIdentity === postAcceptAdvisoryFindingIdentity(finding));
-      const hasId = nonemptyAdvisoryString(finding.findingId);
-      if ((hasId && confirmed.has(finding.findingId)) || ratings.some(rating => rating.verdict === 'CONFIRMED')) report.laterBroken++;
-      else if ((hasId && unconfirmed.has(finding.findingId)) || ratings.length) report.unconfirmedBroken++;
-    }
+    const contribution = safeRow(() => {
+      const report = { wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0,
+        laterBroken: 0, unconfirmedBroken: 0 };
+      if (row.wouldPush === true) report.wouldPush++;
+      const count = accepts.get(advisoryKey(row)).count;
+      if (validLoopCount(count)) {
+        report.loopsAfter += count;
+      }
+      else report.unmeasured++;
+      if (row.wouldCard !== true) return report;
+      report.wouldCard++;
+      // Repeated IDs are one finding; historical findings without IDs remain separate observations.
+      const findings = [...new Map(row.findings.map((finding, index) => [finding.findingId ?? index, finding])).values()];
+      report.findings += findings.length;
+      const brokenRatings = (row.laterRatings ?? []).filter(rating => rating.impactIfUnfixed === 'broken');
+      const confirmed = new Set(brokenRatings.filter(rating => rating.verdict === 'CONFIRMED').map(rating => rating.findingId));
+      const unconfirmed = new Set(brokenRatings.filter(rating => rating.verdict !== 'CONFIRMED').map(rating => rating.findingId));
+      const recorded = [...accepts.get(advisoryKey(row)).ratings.values()].filter(rating => rating.impactIfUnfixed === 'broken');
+      for (const finding of findings) {
+        const ratings = recorded.filter(rating => rating.findingIdentity === postAcceptAdvisoryFindingIdentity(finding));
+        const hasId = nonemptyAdvisoryString(finding.findingId);
+        if ((hasId && confirmed.has(finding.findingId)) || ratings.some(rating => rating.verdict === 'CONFIRMED')) report.laterBroken++;
+        else if ((hasId && unconfirmed.has(finding.findingId)) || ratings.length) report.unconfirmedBroken++;
+      }
+      return report;
+    });
+    if (contribution === null) { report.skipped++; continue; }
+    if (!validLoopCount(report.loopsAfter + contribution.loopsAfter)) throw new RangeError('loop total exhausted; inspect shadow ledger');
+    for (const key of Object.keys(contribution)) report[key] += contribution[key];
   }
   return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nUnconfirmed broken: ${report.unconfirmedBroken}\nSkipped: ${report.skipped}\nUnresolved: ${report.unresolved}` };
 }
