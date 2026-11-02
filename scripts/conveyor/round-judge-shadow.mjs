@@ -14,6 +14,7 @@
  *   One record per (PR, head, cap trigger, cap episode); a re-seen cap is skipped. Never throws into the caller.
  */
 import { createHash } from 'node:crypto';
+import { threadMayBeTruncated } from './takeover-budget.mjs';
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -72,8 +73,8 @@ export function resolveBreakClassStopSetting({ env = process.env, path = ROUND_J
 /** Hash of the thread and file evidence the verdict was computed from, so corrected evidence is never suppressed. */
 function evidenceHash(subject) {
   const h = createHash('sha256');
-  for (const c of subject?.comments ?? []) h.update(`${c?.createdAt ?? ''}\0${c?.body ?? ''}\0`);
-  for (const f of subject?.files ?? []) h.update(`${typeof f === 'string' ? f : f?.path}\0`);
+  for (const c of Array.isArray(subject?.comments) ? subject.comments : []) h.update(`${c?.author?.login ?? c?.user?.login ?? ''}\0${c?.authorAssociation ?? ''}\0${c?.createdAt ?? ''}\0${c?.body ?? ''}\0`);
+  for (const f of Array.isArray(subject?.files) ? subject.files : []) h.update(`${typeof f === 'string' ? f : f?.path}\0`);
   return h.digest('hex');
 }
 
@@ -88,20 +89,22 @@ export function observeBreakClassStop({ pr, repo = null, subject = {}, env = pro
     const cfg = resolveBreakClassStopSetting({ env });
     if (cfg.mode === 'off') return { skipped: 'off', source: cfg.source };
     const result = breakClassStop({ pr, comments: subject?.comments, files: subject?.files, setting: cfg });
-    const head = subject?.headRefOid;
-    if (typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return { skipped: 'unreadable-head' };
-    if (result.reason) return { skipped: 'incomplete-evidence', reason: result.reason };
-    if (!result.applies) return { skipped: 'not-applicable' };
+    const head = typeof subject?.headRefOid === 'string' && /^[a-f0-9]{40}$/i.test(subject.headRefOid) ? subject.headRefOid.toLowerCase() : null;
+    // Unreadable, unmarked-possibly-cut or head-less evidence is persisted (never a silent skip, never a clean no-stop).
+    const incomplete = result.reason ?? (threadMayBeTruncated(subject) ? 'comment list may be cut at one page; human review of the full thread and diff required'
+      : (!head ? 'unreadable head; human review of the full thread and diff required' : null));
+    if (!incomplete && !result.applies) return { skipped: 'not-applicable' };
     const outDir = dir ?? roundJudgeDir(env);
-    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head.toLowerCase(), evidenceHash(subject)]);
+    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head ?? 'unknown', evidenceHash(subject)]);
     if (seenKeys(outDir, now).has(key)) return { skipped: 'already-logged', key };
     const record = { ts: new Date(now).toISOString(), kind: 'break-class-stop', key, pr: Number(pr), repo,
-      head: head.toLowerCase(), mode: cfg.mode, modeSource: cfg.source, setting: cfg, ...result,
-      wouldEmit: result.wouldStop ? ['design-stage-miss needs-you', 'non-convergence analysis dispatch'] : [] };
+      head, mode: cfg.mode, modeSource: cfg.source, setting: cfg, ...result,
+      ...(incomplete ? { incompleteEvidence: true, reason: incomplete, wouldStop: false } : {}),
+      wouldEmit: result.wouldStop && !incomplete ? ['design-stage-miss needs-you', 'non-convergence analysis dispatch'] : [] };
     mkdirSync(outDir, { recursive: true });
     appendFileSync(monthFile(outDir, now), `${JSON.stringify(record)}\n`);
     seenKeys(outDir, now).add(key);
-    try { log(`break-class-stop: #${Number(pr)} wouldStop=${result.wouldStop} mode=${cfg.mode} source=${cfg.source} · ${cfg.line}`); } catch { /* log only */ }
+    try { log(`break-class-stop: #${Number(pr)} wouldStop=${record.wouldStop}${incomplete ? ' INCOMPLETE-EVIDENCE' : ''} mode=${cfg.mode} source=${cfg.source} · ${cfg.line}`); } catch { /* log only */ }
     return record;
   } catch { return { skipped: 'error', reason: 'observer unreadable; human review of full thread and diff required' }; }
 }
