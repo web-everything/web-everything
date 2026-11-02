@@ -86,17 +86,104 @@ function excludedComponent(name, leaf, allowCredential = false) {
     || keyComponent.test(name) || (!allowCredential && credentialComponent.test(name));
 }
 
+// Ruling R321 (replaces the per-folder exceptions of R312/R316). A file whose
+// NAME alone trips credentialComponent ships to Forge only when ALL hold:
+//   1. it is git-tracked;
+//   2. it is a regular source whose bytes equal origin/main (remote-exec compares
+//      index/public blobs and hashes worktree bytes). Only the established
+//      .claude/agent-memory -> agent-memory-src bridge may project that verified
+//      source; credential-named aliases through other links are refused;
+//   3. it passes the content secret scan below.
+// Why this leaks nothing: a tracked file identical to origin/main is already
+// public, so shipping it to our own Forge reveals nothing new. Anything
+// untracked, modified versus main, or local-only stays excluded. Names that are
+// unsafe for other reasons (key files, dotfiles, .env, non-ASCII) never qualify.
+const secretField=/key|secret|token|passw(?:or)?d|credential|creds|oauth|^id_/i;
+const secretText=[
+  [/-----BEGIN/,'pem-header'],[/PRIVATE KEY/i,'private-key'],[/AKIA[0-9A-Z]{16}/,'aws-access-key'],
+  [/gh[opsur]_[A-Za-z0-9]{20,}/,'github-token'],[/\bsk-[A-Za-z0-9_-]{16,}/,'sk-token'],
+  [/xox[bp]-[A-Za-z0-9-]{8,}/,'slack-token'],
+];
+const textFinding=text=>secretText.find(([pattern])=>pattern.test(text))?.[1]??null;
+function entropy(text) {
+  // Count code points on both sides: UTF-16 length would dilute astral characters.
+  const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
+  return [...counts.values()].reduce((bits,n)=>bits-(n/chars.length)*Math.log2(n/chars.length),0);
+}
+// Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
+// JSON gets the full structural scan; other UTF-8 text gets raw token patterns
+// and fail-closed secret assignments. Unknown encodings stay excluded.
+// A file that fails (scrubbers, docs spelling out secrets) stays
+// excluded, so a run that needs it falls back to the Mac. Returns the first
+// finding or null when clean.
+export function credentialContentFinding(path,content) {
+  // The SAME normalized name admission used (NFKC, trailing dots/spaces, case), so
+  // `token.json.` or fullwidth `.ｊｓｏｎ` cannot dodge the scanner chosen by extension.
+  const leaf=classifyManifestPath(path).names.at(-1);
+  if(/\.json$/.test(leaf))return designTokenSecretFinding(content);
+  let text;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
+  if(text.includes('\0'))return 'unsupported-text-encoding';
+  const raw=textFinding(text);
+  if(raw)return raw;
+  // YAML/INI/plain-text assignments, including quoted fields and YAML lists.
+  // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
+  for(const [,field,value] of text.matchAll(/(?:^|[\r\n])[\t ]*(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
+    if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
+      // Only whole, explicit placeholders qualify; expressions and suffixes do not.
+      const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
+      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
+    }
+  }
+  return null;
+}
+// Returns the first secret-like finding, or null when the content is clean.
+export function designTokenSecretFinding(content) {
+  let text;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
+  const raw=textFinding(text);
+  if(raw)return raw;
+  let json;
+  try {json=JSON.parse(text);} catch {return 'unparseable-json';}
+  if(!json||typeof json!=='object'||Array.isArray(json))return 'non-object-json';
+  // Scan every string literal in the raw bytes, decoded, in order. JSON.parse
+  // keeps only the last duplicate property, so its object view is never used.
+  // A secret-named field taints every string nested under it (arrays, objects).
+  const stack=[false];let field;
+  for(const [token,literal,colon] of text.matchAll(/("(?:[^"\\]|\\.)*")(\s*:)?|[{}[\],]/g)) {
+    if(!literal) {
+      if(token==='{'||token==='[')stack.push(stack.at(-1)||(field!==undefined&&secretField.test(field)));
+      else if(token!==',')stack.pop();
+      field=undefined;continue;
+    }
+    const value=JSON.parse(literal),decoded=textFinding(value);
+    if(decoded)return decoded;
+    // Under a tainted container, property names are secret candidates too.
+    if(colon&&stack.at(-1)&&value.length>=20&&entropy(value)>=3.5)return 'high-entropy-nested-key';
+    if(colon) {field=value;continue;}
+    const name=field!==undefined&&secretField.test(field)?field:stack.at(-1)?'nested':null;
+    if(name&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${name}`;
+    field=undefined;
+  }
+  return null;
+}
+
 // Pure policy and leaf construction are shared by inventory, warm export and delta.
 export function classifyManifestPath(path) {
   const parts=pathParts(path),names=parts.map(normalizedComponent);
   const excluded=names.some((name,i)=>excludedComponent(name,i===names.length-1));
-  const credentialSource=excluded && sourceExtension.test(names.at(-1))
-    && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
+  // Excluded ONLY because of a credential-looking name (see R321 above).
+  const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
 export function manifestEntry(path,content,executable,tracked) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
+  if(classifyManifestPath(path).credentialSource) {
+    const finding=tracked?credentialContentFinding(path,content):'untracked';
+    if(finding)throw Object.assign(new Error(`Excluded credential-named file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
+  }
   return {path,sha256:sha(content),executable,tracked};
 }
 export function decodeManifest(manifest) {
