@@ -13,7 +13,7 @@ const body = (overrides = {}) => ({ cursor: 7, head: 7, events: [], reset: false
   gap: false, more: false, lastEventAt: NOW - 250, lastDeliveryAt: NOW - 250,
   now: NOW, stateCursor: 7, prs: [row()], coverage: {
     partial: true, observedSince: NOW - 1000, historyComplete: false,
-    bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'seed-1' }],
+    bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'seed-1', importedAt: NOW - 1000 }],
   }, ...overrides });
 const githubPr = (number = 1, overrides = {}) => ({ number, headRefOid: SHA,
   isDraft: false, labels: [{ name: 'advisory:accepted' }], ...overrides });
@@ -129,7 +129,7 @@ describe('readLedgerPrs — real HTTP fixture', () => {
   });
 
   it('refuses a stale-clock response, a bootstrap ahead of the snapshot cursor, and duplicate rows', async () => {
-    const boot = [{ repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'seed-1' }];
+    const boot = [{ repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'seed-1', importedAt: NOW - 1000 }];
     const cases = [
       ['stale', body({ now: NOW - 2 * 86_400_000, lastDeliveryAt: NOW - 2 * 86_400_000 })],
       ['coverage-gap', body({ stateCursor: 0, coverage: { partial: true, bootstrap: boot } })],
@@ -139,6 +139,23 @@ describe('readLedgerPrs — real HTTP fixture', () => {
       const fixture = await serve(payload);
       unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), reason, fixture.url);
     }
+  });
+
+  it('a fresh delivery for repo A cannot make repo B with an old bootstrap look fresh', async () => {
+    const old = NOW - 2 * 24 * 3600_000;
+    const payload = body({ lastDeliveryAt: NOW - 100, coverage: { partial: true, bootstrap: [
+      { repo: 'a/a', status: 'complete', baseCursor: 0, cursor: 7, importId: 'a', importedAt: NOW - 100 },
+      { repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'b', importedAt: old }] },
+    prs: [row({ repo: 'a/a' }), row()] });
+    const fixture = await serve(payload);
+    unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'stale-repo', fixture.url);
+    expect((await readLedgerPrs({ repo: 'a/a', env: fixture.env })).ok).toBe(true);
+  });
+
+  it('a repo with no timestamp evidence at all falls back as stale-repo', async () => {
+    const fixture = await serve(body({ coverage: { partial: true, bootstrap: [
+      { repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'b' }] } }));
+    unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'stale-repo', fixture.url);
   });
 
   it('compare reports duplicate rows instead of collapsing them', () => {

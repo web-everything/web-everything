@@ -7,7 +7,7 @@ const sameRepo = (a, b) => typeof a === 'string' && a.toLowerCase() === b.toLowe
 export async function readLedgerPrs({
   repo, env = process.env, config, fetchImpl = globalThis.fetch,
   timeoutMs = PR_EVENTS_DEFAULTS.timeoutMs, staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs,
-  maxBytes = 16 * 1024 * 1024,
+  maxBytes = 16 * 1024 * 1024, repoMaxAgeMs = Number(env.WE_LEDGER_REPO_MAX_AGE_MS) || 6 * 3600_000,
 } = {}) {
   if (typeof repo !== 'string' || !repo.trim()) return unavailable('no-repo');
   let timer;
@@ -69,6 +69,16 @@ export async function readLedgerPrs({
     if (body.lastDeliveryAt != null && body.lastDeliveryAt > feedNow + 60_000) return unavailable('malformed');
     if (classifyFeedHealth({ lastOkAt: now, lastFailAt: null, lastDeliveryAt: body.lastDeliveryAt,
       now: feedNow, staleAfterMs }) !== 'healthy') return unavailable('stale');
+    // Repo-scoped freshness: the global lastDeliveryAt must never vouch for this repo. Only this repo's own bootstrap
+    // time (`importedAt`/`at`, when the Worker serves it) or its own rows' check observations (`at`) count.
+    const stamp = v => { const t = typeof v === 'number' ? v : Date.parse(v); return Number.isFinite(t) ? t : null; };
+    const seen = [];
+    for (const entry of body.coverage.bootstrap) if (entry && sameRepo(entry.repo, repo)) seen.push(stamp(entry.importedAt ?? entry.at));
+    for (const row of body.prs) {
+      if (row && sameRepo(row.repo, repo)) for (const c of [...(row.checks || []), ...(row.suites || [])]) seen.push(stamp(c?.at));
+    }
+    const repoSeenAt = Math.max(-Infinity, ...seen.filter(t => t !== null));
+    if (!(feedNow - repoSeenAt <= repoMaxAgeMs)) return unavailable('stale-repo');
     const prs = [];
     for (const row of body.prs) {
       // A row without a repository cannot safely be excluded from this listing.
