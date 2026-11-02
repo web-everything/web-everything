@@ -6515,3 +6515,9 @@ and held`; their `sealed/` archive counterparts are listed in 6941's edge case 6
 `archive failure preserves the active slot and retry preserves every member`.
 
 **Lineage:** `#6940` (ruled 2026-10-18). Epic 6944.
+
+### Review and fixer may start while CI runs under cascade eligibility rules; the merge gate never moves {#review-fixer-early-start-rules}
+
+Ruled 2026-11-01 (R359, decision xrz0ezn). The review may start, and the fixer may start on confirmed findings, while CI runs. Rules: (1) merge never happens before CI is green and a head change voids any early review or fix; (2) a started review keeps its findings when CI goes red and joins them with the CI findings into one fix round, cancel-on-red stays off; (3) the fixer holds its push until the previous head's CI is complete and never pushes into a running CI; confirmed means red-team confirmed or at least two review seats agree on the exact head sha; (4) missing or unreadable care, size, kind, verify record or CI state means wait for CI, and docs, config and data diffs wait; (5) eligibility is a cascade setting with care, size and kind limits, default care band `none` or `low`, all new settings default off; (6) rollout is shadow first with an end rule (10% wasted starts, 7 days, 30 PRs, whichever first), flipped by a human settings change.
+
+**Lineage:** `#xrz0ezn` (ruled 2026-11-01, R359). Parent #5467. Builds on #7503 and R241.
