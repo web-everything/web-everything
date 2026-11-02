@@ -1,7 +1,7 @@
 /** #6170: a ruling recorded under a repo's old owner must rule the finding a record names under the new one, and nothing else. */
 import { describe, it, expect } from 'vitest';
 import { readOperatorRulings, readReferralRecords, buildOperatorRulingComment, renderReferralRecord, mandatoryReferralState, mandatoryReferralReviewer,
-  validateReferralRecord, referralFindingKey, normalizeFinding, findSameHeadSiblingRuling, findCarriedOperatorRuling, judgeSameGapPairs, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
+  validateReferralRecord, referralFindingKey, normalizeFinding, findSameHeadSiblingRuling, findCarriedOperatorRuling, carriedBackingHolds, judgeSameGapPairs, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
 import { canonicalRepoSlug } from '../repo-slug.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -284,6 +284,24 @@ describe('operator ruling repo spelling (#6170)', () => {
     const block = post(buildOperatorRulingComment({ version: 1, repo, pr, head, actor: 'chalbert', channel: 'c',
       reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x', rulings: [{ runId, key, result: 'block' }] }), 'chalbert');
     expect(state([comments[0], block, comments[1]], NEW_REPO)).toMatchObject({ pending: [], blocked: [] });
+  });
+  it.each(['card', 'not-real'])('a later old-owner block holds a finding already %s-cleared under the new spelling', result => {
+    const { referral, comments } = world();
+    const rec = readReferralRecords(comments).records[0];
+    const ruling = (repo, value) => post(buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head,
+      actor: 'chalbert', channel: 'c', reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x',
+      rulings: [{ runId: rec.runId, key: referral.key, result: value, ...(value === 'card' ? { card: CARD } : {}) }] }), 'chalbert');
+    const clear = ruling(NEW_REPO, result), block = ruling(OLD_REPO, 'block');
+    expect(state([comments[0], clear], NEW_REPO)).toMatchObject({ pending: [], blocked: [] });
+    // A hidden legacy block holds the finding pending (never cleared), as it does beside a visible clearance elsewhere.
+    expect(state([comments[0], clear, block], NEW_REPO).pending).toContain(referral.key);
+    expect(state([comments[0], block, clear], NEW_REPO)).toMatchObject({ pending: [], blocked: [] });
+    const held = { from: { head: rec.head, runId: rec.runId, key: referral.key }, result };
+    const rulings = comments => readOperatorRulings(comments).rulings;
+    expect(carriedBackingHolds({ ...held, ...(result === 'card' ? { card: CARD } : {}) },
+      { repo: NEW_REPO, pr: rec.pr, operatorRulings: rulings([comments[0], clear]) })).not.toBeNull();
+    expect(carriedBackingHolds({ ...held, ...(result === 'card' ? { card: CARD } : {}) },
+      { repo: NEW_REPO, pr: rec.pr, operatorRulings: rulings([comments[0], clear, block]) })).toBeNull();
   });
   describe('a later old-owner block holds the same finding raised again on a new head', () => {
     const NEXT = '2'.repeat(40);

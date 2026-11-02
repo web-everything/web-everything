@@ -3118,7 +3118,7 @@ export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed'
  * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
  */
 export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
-  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+  const backing = operatorRulings.filter(o => sameOwnerRuling(o, repo) && o.pr === pr
     && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
   return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
 }
@@ -3173,6 +3173,13 @@ function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings
 /** A `block` spelled with the repo's other (legacy/alias) owner: never adopted onto the record's spelling. */
 const isLegacyOwnerBlock = (o, repo) => Boolean(o) && o.result === 'block' && o.repo !== repo
   && canonicalRepoSlug(o.repo) === canonicalRepoSlug(repo);
+/**
+ * Whether an operator ruling belongs to `repo`'s thread-order decision on a subject: a clearance only under the exact
+ * spelling (it was adopted onto the record's spelling when it rules one), a block ALSO under the legacy spelling it was
+ * written with. A hold must never be hidden by a spelling mismatch, so every "latest ruling on this subject" read
+ * uses this one definition.
+ */
+const sameOwnerRuling = (o, repo) => o.repo === repo || isLegacyOwnerBlock(o, repo);
 
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
@@ -3428,7 +3435,7 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   }
   // An operator ruling is decided by the LATEST one on its (head, run, finding): a block the operator later re-ruled
   // is no longer standing (the same rule `carriedBackingHolds` applies to an operator carry).
-  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === repo && o.pr === pr);
+  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameOwnerRuling(o, repo) && o.pr === pr);
   if (ops.some(o => o.result === 'block' && sameId(o.head, o.runId, o.key)
     && ops.filter(p => p.head === o.head && p.runId === o.runId && p.key === o.key).at(-1) === o)) return null;
   return ruling;
@@ -3575,8 +3582,16 @@ export function referralRecordState(record, options = {}) {
     // #4979 — the operator's ruling on THIS exact (repo, PR, head, run, finding) is the explicit, authorized
     // supersession: the latest one decides, over the reviewer's. It is pinned to the record's head, so a new
     // head (or an unreadable card) leaves the finding pending exactly like a reviewer ruling would.
-    const operator = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === record.repo
-      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key).at(-1);
+    const onSubject = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameOwnerRuling(o, record.repo)
+      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key);
+    // A legacy-owner block stays invisible as a ruling (it holds the finding PENDING, never cleared), so one written
+    // after a clearance spelled as the record withdraws that clearance instead of being skipped by the spelling filter.
+    const operator = onSubject.filter(o => !isLegacyOwnerBlock(o, record.repo)).at(-1);
+    if (operator && operator.result !== 'block'
+      && onSubject.slice(onSubject.lastIndexOf(operator) + 1).some(o => isLegacyOwnerBlock(o, record.repo))) {
+      pending.push(f.key);
+      continue;
+    }
     if (operator) {
       if (head !== record.head || (operator.result === 'card' && !cardReadable(operator.card))) pending.push(f.key);
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
