@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
  * CI light-path detection (actions-queue-relief). A pull request whose diff touches ONLY backlog cards
- * (`backlog/**`) does not need the full sharded suite; `ci.yml`'s `changes` job runs this and the `test` /
- * `smoke` jobs read its output.
+ * or docs (root `*.md` and `.md` files anywhere under `docs/`) does not need the full sharded suite. `ci.yml`'s `changes`
+ * job runs this; required `test` / `smoke` still report as running jobs, and the `standards` job still
+ * runs `check:standards`.
  *
  * FAIL-CLOSED by construction: only a `pull_request` event with a NON-EMPTY file list, every path of which is
- * under `backlog/`, is light. A push (main must always run the full suite), a manual dispatch, an empty or
- * unreadable diff, and any path outside `backlog/` (including `..` tricks and look-alike prefixes such as
- * `backlog-tools/`) are all full.
+ * accepted by isCardPath or isDocsPath, is light. A push (main must always run the full suite), a manual
+ * dispatch, an empty or unreadable diff, and everything else (including `..` tricks and look-alike
+ * prefixes such as `backlog-tools/` or `docs-tools/`) all run the full suite.
  *
  * Usage: node scripts/ci-card-only.mjs --event=<name> [--base=<sha>] [--head=<ref>]
  * Prints `light=true|false` (the GITHUB_OUTPUT line) and the reason on stderr.
@@ -24,6 +25,26 @@ export function isCardPath(path) {
   return /^backlog\/[^/\\\s]+\.md$/.test(path);
 }
 
+/** @param {string} path */
+export function isDocsPath(path) {
+  if (typeof path !== 'string' || !path || /[\0\\\s]/.test(path)) return false;
+  if (path.split('/').some((part) => !part || part === '.' || part === '..')) return false;
+  return /^(?:docs\/)?[^/]+\.md$/.test(path) || /^docs\/(?:[^/]+\/)+[^/]+\.md$/.test(path);
+}
+
+/**
+ * CI light path; local card-only gates retain their narrower classifier below.
+ * @param {{event?: string, files?: string[]}} input
+ * @returns {{light: boolean, reason: string}}
+ */
+export function classifyLight({ event, files } = {}) {
+  if (event !== 'pull_request') return { light: false, reason: `event "${event}" always runs the full suite` };
+  if (!Array.isArray(files) || files.length === 0) return { light: false, reason: 'no changed-file list; running the full suite' };
+  const outside = files.filter((f) => !isCardPath(f) && !isDocsPath(f));
+  if (outside.length) return { light: false, reason: `touches non-card/docs path(s): ${outside.join(', ')}` };
+  return { light: true, reason: `cards/docs-only: ${files.length} file(s), all cards or docs` };
+}
+
 /**
  * @param {{event?: string, files?: string[]}} input
  * @returns {{light: boolean, reason: string}}
@@ -37,7 +58,7 @@ export function classifyCardOnly({ event, files } = {}) {
 }
 
 /**
- * THE one definition of "card-only", shared by CI (`main` below) and the local verify gate
+ * THE one definition of "card-only", shared by card-only callers and the local verify gate
  * (`resolveDefaultGate`, skipLocalForCardOnly). Takes the `--no-renames` changed-file list of a PR.
  * @param {string[]|null|undefined} files
  */
@@ -109,7 +130,7 @@ function main() {
       process.stderr.write(`ci-card-only: ${String(e.message).split('\n')[0]}; full suite\n`);
     }
   }
-  const { light, reason } = classifyCardOnly({ event: flags.event, files });
+  const { light, reason } = classifyLight({ event: flags.event, files });
   process.stderr.write(`ci-card-only: ${reason}\n`);
   process.stdout.write(`light=${light}\n`);
 }

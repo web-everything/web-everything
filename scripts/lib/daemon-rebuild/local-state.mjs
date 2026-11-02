@@ -21,18 +21,20 @@ export function collectUntrackedPaths(git) {
   return String(r.stdout ?? '').split('\0').filter(Boolean);
 }
 
-/** Locked, post-fetch exception to untracked preservation: only main-proven birth identities. */
-export function pruneLandedBacklogSidecars({ git, root, paths, mainSha, alert }) {
+/** Locked, post-fetch exception to untracked preservation: only main-proven birth identities.
+ * Returns the paths pruned, or eligible for pruning in dryRun mode without changing clone bytes. */
+export function pruneLandedBacklogSidecars({ git, root, paths, mainSha, alert, dryRun = false }) {
+  const pruned = [];
   const candidates = paths.filter((path) => /^backlog\/[^/]+\.md$/.test(path)
     && isHash(idFromName(path.slice('backlog/'.length, -3))));
-  if (!candidates.length) return;
+  if (!candidates.length) return pruned;
   const failed = (detail) => alert('backlog-sidecar-prune-failed', { mainSha, ...detail });
-  if (!mainSha) { failed({ error: 'Cannot resolve fetched main commit; retaining sidecars' }); return; }
+  if (!mainSha) { failed({ error: 'Cannot resolve fetched main commit; retaining sidecars' }); return pruned; }
   try {
     // Grep is only a blob prefilter, NEVER deletion evidence. Pin every read to this one commit.
     const hashes = [...new Set(candidates.map((path) => idFromName(path.slice(8, -3))))];
     const matches = git(['grep', '--no-textconv', '-l', '-z', '-F', ...hashes.flatMap((hash) => ['-e', hash]), mainSha, '--', 'backlog']);
-    if (matches.status === 1) return;
+    if (matches.status === 1) return pruned;
     if (matches.status !== 0) throw new Error('Cannot search fetched main backlog blobs');
     const landed = new Map();
     for (const match of String(matches.stdout ?? '').split('\0').filter(Boolean)) {
@@ -67,13 +69,17 @@ export function pruneLandedBacklogSidecars({ git, root, paths, mainSha, alert })
         if (current === null) throw new Error('Cannot recheck untracked membership; retaining sidecar');
         if (!current.includes(path)) continue;
         if (!lstatSync(join(root, 'backlog')).isDirectory() || !lstatSync(join(root, path)).isFile()) continue;
-        unlinkSync(join(root, path));
-        alert('backlog-sidecar-pruned', { path, hash, landedPath, mainSha });
+        if (!dryRun) {
+          unlinkSync(join(root, path));
+          alert('backlog-sidecar-pruned', { path, hash, landedPath, mainSha });
+        }
+        pruned.push(path);
       } catch (error) {
         if (error.code !== 'ENOENT') failed({ path, hash, landedPath, error: String(error.message || error) });
       }
     }
   } catch (error) { failed({ error: String(error.message || error) }); }
+  return pruned;
 }
 
 /**

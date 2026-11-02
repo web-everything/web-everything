@@ -22,10 +22,12 @@
  *   node scripts/lib/daemon-rebuild/rebuild-job.mjs          # the job child (env from the runtime)
  */
 import { spawn as spawnChild, execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import { hostname } from 'node:os';
 import {
   existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -35,7 +37,10 @@ import {
 import { evictSnapshots, npmCiInstaller } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
-import { cloneKey } from '../daemon-overlays.mjs';
+import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { cloneLockDirs } from '../daemon-clone-lock.mjs';
+import { lockIdFor } from '../../readiness/file-locks.mjs';
+import { alertsFilePath } from './state.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -285,23 +290,86 @@ export function runRebuildChild({
   });
 }
 
-async function jobMain() {
+/** The ready-only child excludes just its spawner; the next daemon tick still honours its writer slot. */
+export function rebuildChildEnv(env = process.env, { ppid = process.ppid, host = hostname() } = {}) {
+  const childEnv = { ...env, [REBUILD_AS_JOB_ENV]: '0' };
+  for (const k of Object.keys(childEnv)) if (k.startsWith('DAEMON_JOB_')) delete childEnv[k];
+  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS']) delete childEnv[k];
+  if (ppid > 1) childEnv.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS = `${host}:${ppid}`;
+  return childEnv;
+}
+
+/** PURE: a reader timeout ends this job with explicit, bounded operator evidence. Missing evidence stays null. */
+export function buildReaderWaitOutcome(r, { command = null, readerEntry = null, nowMs = Date.now() } = {}) {
+  if (r?.reason !== 'tick-in-progress') return null;
+  const match = /^(.+):([1-9]\d*)$/.exec(r.heldBy ?? '');
+  const parsedPid = match ? Number(match[2]) : null;
+  const pid = Number.isSafeInteger(parsedPid) ? parsedPid : null;
+  const stamp = [readerEntry?.heartbeatAt, readerEntry?.acquiredAt].map(Date.parse).find(Number.isFinite);
+  return {
+    reason: 'reader-wait-timeout',
+    detail: {
+      pid,
+      command: command == null ? null : String(command).replace(/[\x00-\x1f\x7f-\x9f]/g, '').trim().slice(0, 200),
+      tickAgeMs: Number.isFinite(stamp) ? Math.max(0, nowMs - stamp) : null,
+    },
+  };
+}
+
+/** Same two audit sinks as auto-rebase's reportNeedsYou; all evidence and reporting IO is injectable. */
+export function reportReaderWaitTimeout({
+  root, env = process.env, r, io = fs, event = appendOverlayEvent, exec = execFileSync,
+  now = Date.now, host = hostname(),
+}) {
+  if (r?.reason !== 'tick-in-progress') return null;
+  let readerEntry = null;
+  let command = null;
+  const nowMs = now();
+  try {
+    const { readersRoot } = cloneLockDirs(root, env.WE_DAEMON_CLONE_LOCK_ROOT);
+    const entry = JSON.parse(io.readFileSync(join(readersRoot, lockIdFor(r.heldBy), 'lock.json'), 'utf8'));
+    if (entry?.owner === r.heldBy) readerEntry = entry;
+  } catch { /* unreadable reader evidence stays null */ }
+  const initial = buildReaderWaitOutcome(r, { nowMs });
+  if (initial.detail.pid && r.heldBy === `${host}:${initial.detail.pid}`) {
+    try {
+      command = exec('ps', ['-o', 'command=', '-p', String(initial.detail.pid)], {
+        encoding: 'utf8', timeout: 5000, maxBuffer: 65536, stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch { /* exited / unreadable process evidence stays null */ }
+  }
+  const outcome = buildReaderWaitOutcome(r, { command, readerEntry, nowMs });
+  const kind = 'reader-wait-timeout-needs-you';
+  try { event(root, { kind, ...outcome.detail }, { env }); } catch { /* alert still attempted */ }
+  try {
+    const file = alertsFilePath(root, env);
+    io.mkdirSync(dirname(file), { recursive: true });
+    io.appendFileSync(file, `${JSON.stringify({ at: new Date(nowMs).toISOString(), kind, detail: outcome.detail })}\n`);
+  } catch { /* best-effort audit trail; the result file still carries the timeout */ }
+  return outcome;
+}
+
+export async function jobMain({
+  runChild = runRebuildChild, reportTimeout = reportReaderWaitTimeout, env = process.env,
+  ppid = process.ppid, host = hostname(),
+} = {}) {
   let child = null;
   for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, () => { try { child?.kill('SIGTERM'); } catch { /* gone */ } process.exit(143); });
   }
-  const dir = process.env.OPERATION_RUNS_DIR;
+  const dir = env.OPERATION_RUNS_DIR;
   const out = await runJob({
     steps: [{
       name: 'rebuild',
       run: async ({ jobId, input }) => {
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} building ${input.target ?? 'main + overlays'} for ${input.root}\n`);
-        const childEnv = { ...process.env, [REBUILD_AS_JOB_ENV]: '0' };
-        for (const k of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'DAEMON_JOB_HEARTBEAT_MS', 'OPERATION_RUNS_DIR']) delete childEnv[k];
-        const r = await runRebuildChild({ input, env: childEnv, onChild: (c) => { child = c; } });
+        const childEnv = rebuildChildEnv(env, { ppid, host });
+        const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
+        const timeout = reportTimeout({ root: input.root, env, r });
         const result = {
           finishedAt: Date.now(), reason: r.reason ?? null, readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
           alerts: (r.alerts || []).map((a) => a.kind),
+          ...(timeout ?? {}),
         };
         writeFileSync(join(dir, `${jobId}${RESULT_SUFFIX}`), `${JSON.stringify(result)}\n`);
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);

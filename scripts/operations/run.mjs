@@ -29,7 +29,9 @@ import { execFileSync } from 'node:child_process';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
@@ -82,7 +84,10 @@ import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './h
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
-import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
+import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
+import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
+import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
@@ -430,6 +435,17 @@ export const OPERATIONS = Object.freeze({
     declaration: resourceStatusOperation({ collect: () => ({ snapshot: readSnapshot(), ...loadResourcePolicy(), nowMs: Date.now() }) }),
     sinks: {},
     finish: finishResourceStatus,
+  }),
+  // R313/R349 — SHADOW measured worker cap beside the step rule; reads resource history, logs one jsonl row per run.
+  [WORKER_CAPACITY_OP]: () => ({
+    declaration: workerCapacityOperation({ collect: () => {
+      const paths = resourcePaths();
+      let historyText = ''; try { historyText = readFileSync(paths.history, 'utf8'); } catch { /* no history yet */ }
+      return { historyText, load1: loadavg()[0], nowMs: Date.now(),
+        settings: resolveWorkerCapacitySettings({ settings: readSettings(), env: process.env }) };
+    } }),
+    sinks: {},
+    finish: finishWorkerCapacity({ log: (row) => appendResourceLog(join(dirname(resourcePaths().history), 'worker-capacity-shadow.jsonl'), row) }),
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
