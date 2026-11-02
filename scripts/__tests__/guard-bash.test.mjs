@@ -3695,6 +3695,18 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason('git fetch --update-head-ok origin main:main', { cwd: LANE, roots })).toBeNull();
   });
 
+  it('DENIES clean, GIT_DIR/GIT_WORK_TREE env, attached -C, and configured/refmap branch-writing fetch', () => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} clean -fd`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`GIT_DIR=${CLONE}/.git GIT_WORK_TREE=${CLONE} git reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`env GIT_DIR=${CLONE}/.git git reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C${CLONE} reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --refmap 'refs/heads/*:refs/heads/other/*' origin main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -c 'remote.origin.fetch=+refs/heads/*:refs/heads/other/*' fetch origin`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --refmap=refs/heads/*:refs/remotes/origin/* origin main`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} config --get remote.origin.url`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} remote -v`, { cwd: LANE, roots })).toBeNull();
+  });
+
   it('reaches reason()/decide() — the real enforcement points, not just the pure predicate', () => {
     const ctx = { cwd: CLONE, daemonCloneRoots: roots };
     expect(reason('git reset --hard origin/main', ctx)).toMatch(/DAEMON CLONE/);

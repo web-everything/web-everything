@@ -1979,9 +1979,18 @@ function gitTargetDirs(segment, cwd) {
   let dir = cwd || '.';
   let gitDir = null;
   let workTree = null;
+  // `GIT_DIR=… GIT_WORK_TREE=… git …` / `env GIT_DIR=… git …`: leading assignments, read from the RAW tokens
+  // (the canonical view peels them). Same targets as the flags; an `export` in an EARLIER segment is not visible.
+  for (const t of shellTokens(String(segment || '')).filter((x) => !x.op).map((x) => x.text)) {
+    const m = /^(GIT_DIR|GIT_WORK_TREE)=(.*)$/.exec(t);
+    if (m) { if (m[1] === 'GIT_DIR') gitDir = m[2]; else workTree = m[2]; continue; }
+    if (t === 'env' || t.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue;
+    break;
+  }
   for (let i = 1; i < toks.length; i++) {
     const t = toks[i];
     if (t === '-C' && i + 1 < toks.length) { dir = abs(dir, toks[++i]); continue; }
+    if (t.length > 2 && t.startsWith('-C')) { dir = abs(dir, t.slice(2)); continue; } // not valid git, fail closed
     if (t === '--git-dir' && i + 1 < toks.length) { gitDir = toks[++i]; continue; }
     if (t === '--work-tree' && i + 1 < toks.length) { workTree = toks[++i]; continue; }
     if (t.startsWith('--git-dir=')) { gitDir = t.slice('--git-dir='.length); continue; }
@@ -1999,7 +2008,7 @@ function gitTargetDirs(segment, cwd) {
 /** git fetch options that SWALLOW the next token, so their value is never read as the remote or a refspec. */
 const GIT_FETCH_VALUE_FLAGS = new Set([
   '--depth', '--deepen', '--jobs', '-j', '--upload-pack', '--server-option', '-o', '--shallow-since',
-  '--shallow-exclude', '--negotiation-tip', '--refmap', '--filter', '--receive-pack', '--submodule-prefix',
+  '--shallow-exclude', '--negotiation-tip', '--filter', '--receive-pack', '--submodule-prefix',
 ]);
 
 /** Does this `git fetch` segment WRITE a local branch (so, possibly, the clone's checked-out one)? True for
@@ -2010,23 +2019,30 @@ const GIT_FETCH_VALUE_FLAGS = new Set([
  *  is skipped (an scp-style `git@host:org/repo` there is not a refspec). */
 function fetchWritesLocalBranch(segment) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const dstIsBranch = (spec) => {
+    const sp = spec.replace(/^\+/, '');
+    if (sp.startsWith('^')) return false;
+    const colon = sp.indexOf(':');
+    const dst = colon < 0 ? '' : sp.slice(colon + 1);
+    return !!dst && !/^refs\/(?!heads\/)/.test(dst);
+  };
   let i = 1;
-  while (i < toks.length && toks[i] !== 'fetch') i += GIT_VALUE_FLAGS.has(toks[i]) ? 2 : 1;
+  while (i < toks.length && toks[i] !== 'fetch') {
+    // `git -c remote.<n>.fetch=<refspec> fetch <n>` injects a configured refspec
+    const cfg = toks[i] === '-c' ? /^remote\.[^=]*\.fetch=(.*)$/s.exec(toks[i + 1] || '') : null;
+    if (cfg && dstIsBranch(cfg[1])) return true;
+    i += GIT_VALUE_FLAGS.has(toks[i]) ? 2 : 1;
+  }
   let remoteSeen = false;
   for (i += 1; i < toks.length; i++) {
     const t = toks[i];
     if (t === '--update-head-ok' || t === '-u' || /^-[a-z]*u[a-z]*$/.test(t)) return true;
+    if (t === '--refmap') { if (dstIsBranch(toks[i + 1] || '')) return true; i += 1; continue; }
+    if (t.startsWith('--refmap=')) { if (dstIsBranch(t.slice(9))) return true; continue; }
     if (GIT_FETCH_VALUE_FLAGS.has(t)) { i += 1; continue; }
     if (t.startsWith('-')) continue;
     if (!remoteSeen) { remoteSeen = true; continue; }
-    const spec = t.replace(/^\+/, '');
-    if (spec.startsWith('^')) continue;
-    const colon = spec.indexOf(':');
-    if (colon < 0) continue;
-    const dst = spec.slice(colon + 1);
-    if (!dst) continue;
-    if (/^refs\/(?!heads\/)/.test(dst)) continue;
-    return true;
+    if (dstIsBranch(t)) return true;
   }
   return false;
 }
@@ -4509,6 +4525,7 @@ const GIT_STATE_SUBCOMMANDS = new Set([
   'add', 'commit', 'tag', 'stash', 'apply', 'am', 'cherry-pick', 'revert', 'merge', 'rebase', 'push',
   'mv', 'rm', 'reset', 'restore', 'checkout', 'switch', 'branch', 'worktree', 'clone', 'init',
   'update-ref', 'notes', 'fetch', 'pull',
+  'clean', 'read-tree', 'checkout-index', 'gc', 'prune', 'repack',
 ]);
 
 /** Programs whose whole job is to change the filesystem. Same shape and same reasoning as the git set: a
