@@ -140,14 +140,6 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
-      - name: Resolve FUI SHA
-        id: fui-sha
-        run: |
-          set -euo pipefail
-          sha="$(git -C frontierui rev-parse HEAD)"
-          test -n "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -156,19 +148,8 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
-      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
-      - name: Cache FUI tools
-        id: fui-tools
-        if: ${{ steps.fui-sha.outcome == 'success' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            frontierui/node_modules
-            frontierui/dist/tools
-          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
-
+      # Base-branch Actions caches are readable by fork PRs. Keep private FUI code on the runner.
       - name: Install + build FUI tools
-        if: ${{ steps.fui-tools.outputs.cache-hit != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
@@ -249,15 +230,6 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
-      - name: Resolve FUI SHA
-        id: fui-sha
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        run: |
-          set -euo pipefail
-          sha="$(git -C frontierui rev-parse HEAD)"
-          test -n "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-node@v4
         if: ${{ needs.changes.outputs.light != 'true' }}
         with:
@@ -269,19 +241,9 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
       # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
-      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
-      - name: Cache FUI tools
-        id: fui-tools
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            frontierui/node_modules
-            frontierui/dist/tools
-          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
-
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
-        if: ${{ needs.changes.outputs.light != 'true' && steps.fui-tools.outputs.cache-hit != 'true' }}
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
@@ -292,17 +254,7 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
-      # Vite keys content-hash its own entries, so reuse across WE commits is safe.
-      - name: Cache Vite transforms
-        id: vite-cache
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: web-everything/node_modules/.vite
-          key: ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-
-
+      # Vite can transform private sibling imports; its cache must also stay on the runner.
       # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
       # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
@@ -505,15 +457,6 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
-      - name: Resolve FUI SHA
-        id: fui-sha
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        run: |
-          set -euo pipefail
-          sha="$(git -C frontierui rev-parse HEAD)"
-          test -n "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-node@v4
         if: ${{ steps.gate.outputs.run == 'true' }}
         with:
@@ -523,19 +466,9 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
-      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
-      - name: Cache FUI tools
-        id: fui-tools
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            frontierui/node_modules
-            frontierui/dist/tools
-          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
-
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
-        if: ${{ steps.gate.outputs.run == 'true' && steps.fui-tools.outputs.cache-hit != 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: frontierui
         run: |
           npm ci
@@ -546,17 +479,7 @@ jobs:
         working-directory: web-everything
         run: npm ci
 
-      # Vite keys content-hash its own entries, so reuse across WE commits is safe.
-      - name: Cache Vite transforms
-        id: vite-cache
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: web-everything/node_modules/.vite
-          key: ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-
-
+      # Vite can transform private sibling imports; its cache must also stay on the runner.
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
@@ -757,15 +680,6 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
-      - name: Resolve FUI SHA
-        id: fui-sha
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        run: |
-          set -euo pipefail
-          sha="$(git -C frontierui rev-parse HEAD)"
-          test -n "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
       - uses: actions/setup-node@v4
         if: ${{ needs.changes.outputs.light != 'true' }}
         with:
@@ -777,19 +691,9 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): the `@frontierui/*` alias resolves to sibling source and
       # `build:docs` calls the pinned component-render CLI produced by build:tools.
-      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
-      - name: Cache FUI tools
-        id: fui-tools
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            frontierui/node_modules
-            frontierui/dist/tools
-          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
-
+      # Fork PRs can restore base-branch caches, so private FUI tools must be built on each run.
       - name: Install + build FUI tools
-        if: ${{ needs.changes.outputs.light != 'true' && steps.fui-tools.outputs.cache-hit != 'true' }}
+        if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
