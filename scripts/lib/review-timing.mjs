@@ -8,6 +8,8 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
   startBeforeCi: false, startAfter: 'fast-checks', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
+  earlyStartShadow: false, earlyStartCare: Object.freeze(['none', 'low']),
+  earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: Object.freeze(['code']),
 });
 const checkNames = v => Array.isArray(v) && v.length > 0 && v.every(n => typeof n === 'string' && n.trim());
 /** A repo's fast checks (repo key or slug). An array applies to every repo; null means "use its required checks". */
@@ -60,6 +62,54 @@ export function ciRedOnHead({ headSha, checks, requiredChecks = null } = {}) {
   return collapseRollupToLatestPerName(checks).some(row => isHealable(row, requiredChecks)
     && (!row.head_sha || row.head_sha === headSha)
     && RED.has(String(row.conclusion ?? row.state ?? '').toLowerCase()));
+}
+/** Diagnostic only, including drafts: a wait retains the existing review gates; never grants merge permission. */
+export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen, care, lines, files, kinds,
+  policy = REVIEW_TIMING_DEFAULTS } = {}) {
+  const result = (reason, wouldStartEarly = false) => ({ wouldStartEarly, reason, mergeAllowed: false });
+  const dense = a => Array.isArray(a) && Array.from({ length: a.length }, (_, i) => i in a).every(Boolean);  // .every skips sparse holes
+  const nonnegative = v => Number.isSafeInteger(v) && v >= 0;
+  if (policy?.earlyStartShadow !== true) return result('shadow-off');
+  if (!dense(policy.earlyStartCare) || !dense(policy.earlyStartKinds) || !checkNames(policy.earlyStartCare) || !checkNames(policy.earlyStartKinds)
+    || !policy.earlyStartCare.every(v => ['none', 'low', 'elevated', 'high'].includes(v))
+    || !policy.earlyStartKinds.every(v => ['code', 'docs', 'config', 'data'].includes(v))
+    || !nonnegative(policy.earlyStartMaxLines) || !nonnegative(policy.earlyStartMaxFiles)) return result('invalid-policy');
+  if (typeof headSha !== 'string' || !headSha.trim()) return result('missing-head');
+  if (care == null || care === '') return result('missing-care');
+  if (!['none', 'low', 'elevated', 'high'].includes(care) || !policy.earlyStartCare.includes(care)) return result('care-not-eligible');
+  if (!nonnegative(lines) || !nonnegative(files)) return result('missing-size');
+  if (lines > policy.earlyStartMaxLines || files > policy.earlyStartMaxFiles) return result('size-limit: wait for normal review');
+  if (!dense(kinds) || !checkNames(kinds) || !kinds.every(v => policy.earlyStartKinds.includes(v))) return result('kinds-not-eligible');
+  if (verifyGreen !== true) return result('verify-not-green');
+  if (!dense(checks) || !checks.length || !checks.every(row => row && typeof row === 'object' && !Array.isArray(row)
+    && typeof (row.name ?? row.context) === 'string' && (row.name ?? row.context).trim())) return result('missing-checks');
+  if (!dense(requiredChecks) || !checkNames(requiredChecks)) return result('missing-required-checks');
+  try {
+    // Every required check needs a readable row on THIS head; anything else is incomplete evidence and waits.
+    const low = v => (typeof v === 'string' ? v : '');  // exact lowercase tokens only, as ciRedOnHead compares
+    const STATUS = ['queued', 'in_progress', 'pending', 'waiting', 'requested', 'completed'];
+    const CONCLUSION = ['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale', 'error'];
+    const STATE = ['pending', 'success', 'failure', 'error', 'expected'];
+    const readable = row => {
+      // An explicit kind fixes the required shape: a CheckRun needs a status, a StatusContext needs a state. Unknown kinds wait.
+      const kind = row.__typename ?? row.type;
+      if (kind != null && !['CheckRun', 'StatusContext'].includes(kind)) return false;
+      if (kind === 'CheckRun' && row.status == null) return false;
+      if (kind === 'StatusContext' && (row.state == null || row.status != null)) return false;
+      if (row.head_sha != null && (typeof row.head_sha !== 'string' || !row.head_sha.trim())) return false;
+      if (row.conclusion != null && !CONCLUSION.includes(low(row.conclusion))) return false;
+      if (row.state != null && !STATE.includes(low(row.state))) return false;
+      if (row.status != null) return STATUS.includes(low(row.status)) && ((low(row.status) === 'completed') === (row.conclusion != null));
+      return row.state != null;  // a CheckRun needs a status; a conclusion alone is incomplete
+    };
+    // Judge every RAW row (before rollup collapse or head filtering) so a malformed or contradictory row cannot vanish.
+    if (!checks.every(row => readable(row) && !(row.state != null && (row.conclusion != null || row.status != null)))) return result('incomplete-checks');
+    const rows = collapseRollupToLatestPerName(checks).filter(row => !row.head_sha || row.head_sha === headSha);
+    if (!requiredChecks.every(name => rows.some(row => (row.name ?? row.context) === name && readable(row)))) return result('incomplete-checks');
+    if (rows.some(row => !readable(row))) return result('incomplete-checks');
+    if (ciRedOnHead({ headSha, checks, requiredChecks })) return result('ci-red');
+  } catch { return result('unreadable-checks'); }
+  return result('eligible', true);
 }
 export function reviewStartGate({ headSha, checks, requiredChecks, repo, verifyGreen, policy = REVIEW_TIMING_DEFAULTS } = {}) {
   if (!policy.startBeforeCi && policy.startAfter === 'ci-green') return reviewCiGate({ headSha, checks, requiredChecks });
