@@ -12,6 +12,10 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
   it('a bare multi-path entry stays bare per piece', () => {
     expect(normalizeScope(['heavy-admission.mjs remote-exec.mjs'])).toEqual(['heavy-admission.mjs', 'remote-exec.mjs']);
   });
+  it('keeps a multi-path entry holding a glob UNSPLIT, so dispatch refuses it (fail closed)', () => {
+    expect(normalizeScope(['we:scripts/a*b.mjs we:docs/x.md'])).toEqual(['we:scripts/a*b.mjs we:docs/x.md']);
+    expect(normalizeScope(['we:scripts/a*b.mjs'])).toEqual(['we:scripts/a*b.mjs']);
+  });
   it('keeps the single-entry shape and the absent/empty/blank collapse', () => {
     expect(normalizeScope(['we:scripts/lib/'])).toEqual(['we:scripts/lib/']);
     expect(normalizeScope([' , ', ''])).toBeUndefined();

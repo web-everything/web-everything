@@ -77,7 +77,12 @@ const normalizeScope = (v) => {
   const list = [];
   for (const entry of v) {
     let repo = '';
-    for (const piece of (entry == null ? '' : String(entry)).split(/[\s,]+/).filter(Boolean)) {
+    const text = entry == null ? '' : String(entry).trim();
+    const pieces = text.split(/[\s,]+/).filter(Boolean);
+    // A glob inside a multi-path entry stays UNSPLIT, so dispatch-lane refuses it (fail closed): the lease matcher
+    // does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
+    if (pieces.length > 1 && pieces.some((piece) => /[*?]/.test(piece))) { list.push(text); continue; }
+    for (const piece of pieces) {
       const own = /^[a-z][a-z0-9-]*:/i.exec(piece)?.[0] ?? '';
       if (own) repo = own;
       list.push(own ? piece : repo + piece);
