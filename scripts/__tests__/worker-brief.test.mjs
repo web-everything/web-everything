@@ -38,6 +38,20 @@ describe('renderWorkerBrief', () => {
     expect(codex).not.toContain('never wrapped in a wait');
   });
 
+  it('stops polling on success or terminal failure in both worker and runner instructions', () => {
+    const brief = renderWorkerBrief(params);
+    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
+    for (const text of [brief, runner]) {
+      expect(text).toContain('Repeat only on exit 75');
+      expect(text).toContain('exit 0 = success');
+      expect(text).toContain('any other exit = stop and report the failure');
+      expect(text).not.toContain('until it exits 0');
+      expect(text).toContain('check --wait=150000 --json');
+      expect(text).toContain('Repeat only for a timeout with lastStatus=running');
+      expect(text).toContain('stop and report red, infrastructure-failure, or any other non-running result');
+    }
+  });
+
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {
     const brief = renderWorkerBrief(params);
     const speed = brief.slice(brief.indexOf('**Speed.**'), brief.indexOf('1. **Free-scope pre-check.**'));

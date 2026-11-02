@@ -121,7 +121,8 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    Do small fixes (a few lines, a known finding) yourself. For a follow-up fix on the same work, add
    \`--resume=<threadId>\` (the \`threadId\` from the previous run's report) so Codex keeps its context instead of re-reading files.
    Add \`--detach\` to the command above, then repeat \`node scripts/codex-direct-task.mjs wait --job=<id> --wait=150000\`
-   in separate foreground calls until it exits 0 (exit 75 = still running, call again); don't start a second copy.
+   in separate foreground calls. Repeat only on exit 75 (still running); exit 0 = success;
+   any other exit = stop and report the failure. Don't start a second copy.
    Even with \`timeout: 600000\`, agent Bash calls over ~180s are auto-backgrounded. Such a call is harness-tracked,
    but never end the turn while a task is running. Use the bounded waits to follow the detached job to completion.
    Do not use \`&\`, \`nohup\`, or \`setsid\` to create an untracked child. Review the diff before you commit.
@@ -138,8 +139,10 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
 
 6. **One PR.** Commit with a tight pathspec (your files only), verify ONCE at the end with
    \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it).
-   While verification is running, repeat \`node scripts/verify-lane.mjs check --wait=150000\` in separate foreground calls
-   from the lane until it settles; never end the turn while a task is running. Then open exactly one PR:
+   While verification is running, repeat \`node scripts/verify-lane.mjs check --wait=150000 --json\` in separate foreground calls
+   from the lane until it settles. Repeat only for a timeout with lastStatus=running;
+   stop and report red, infrastructure-failure, or any other non-running result. Open a PR only after green;
+   never end the turn while a task is running. Then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:

@@ -1800,6 +1800,31 @@ describe('detached jobs', () => {
     expect(child.status).toBe(2);
   });
 
+  it.each([250, 150000])('wait CLI uses --wait=%s as the actual job IO deadline', waitMs => {
+    // A completed record cannot expose an ignored alias. Stall a real CLI read
+    // and inspect the timer it arms, using a fixed clock to avoid host jitter.
+    const preload = `
+      import fs from 'node:fs/promises';
+      const readFile = fs.readFile;
+      fs.readFile = (...args) => String(args[0]).endsWith('/blocked.json')
+        ? new Promise(() => {}) : readFile(...args);
+      Date.now = () => 1000000;
+      const timer = globalThis.setTimeout;
+      globalThis.setTimeout = (callback, ms, ...args) => {
+        process.stderr.write('deadline-ms=' + ms + '\\n');
+        return timer(callback, 0, ...args);
+      };`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      'scripts/codex-direct-task.mjs', 'wait', '--job=blocked', `--wait=${waitMs}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(75);
+    expect(child.stderr).toBe(`deadline-ms=${waitMs}\n`);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'running', exitCode: null, resultPath: null });
+  });
+
   it('bounds a never-resolving reader by the requested 250 ms deadline', async () => {
     const maxMs = 250;
     const readRecord = vi.fn(() => new Promise(() => {}));
