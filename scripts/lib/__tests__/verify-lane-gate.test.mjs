@@ -11,10 +11,12 @@
  *   being correct can never silently drift from what ships.
  */
 import { describe, it, expect } from 'vitest';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
@@ -1066,7 +1068,7 @@ describe('#5128 — bounded related-test selection', () => {
     const selectedTestCommand = new RegExp(pattern[1]);
     for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
     expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
-    expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
+    expect(source).toMatch(/const retryableGate = isSelectedTestCommand\(resolvedGate\?\.testCommand \?\? ''\)/);
   });
 });
 
@@ -1196,5 +1198,159 @@ describe('skipLocalForCardOnly — card-only diffs skip the local gate (CI keeps
   it('an untracked non-litter file breaks card-only; lane litter does not', () => {
     expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: ['scripts/new.mjs'] }) })).toBe(false);
     expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: [LANE_RELEASE_LITTER_ALLOWLIST[0]] }) })).toBe(true);
+  });
+});
+
+describe('explicit-list sharding', () => {
+  it.each([
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", true],
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=3 -- npx vitest run 'a.test.mjs'", false],
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'b.test.mjs'", false],
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs' && true", false],
+    ["node '/checkout A/other/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", false],
+    ["node 'relative/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", false],
+    ["node '<checkout>/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", false],
+  ])('normalizes only the absolute wrapper prefix: %s', (gate, matches) => {
+    const command = "node '/checkout B/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'";
+    const resolved = { command, testCommand: command, decision: { changedFiles: ['scripts/hub.mjs'], relatedMode: 'all', testTimeoutFactor: 1 } };
+    expect(matchRequestedDefaultGate({ gate, env: TODAY, resolved, resolveUnder: () => resolved, variants: false })).toBe(matches ? resolved : null);
+  });
+
+  it.each(['checkout B', "checkout B's"])("recognizes a stamp from checkout A in executing %s and executes a failing always-run guard", executingName => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-cross-checkout-'));
+    try {
+      const checkoutA = join(root, "checkout A's", 'scripts/lib');
+      const checkoutB = join(root, executingName);
+      const copiedPaths = ['scripts/verify-lane.mjs', 'scripts/lib/verify-lane-gate.mjs', 'scripts/lib/verify-remote-routing.mjs'];
+      mkdirSync(join(checkoutB, 'scripts/lib'), { recursive: true });
+      // Run the real entry and both path-sensitive modules from B. Keep other dependencies
+      // at their original locations; preserve the dynamic admission-module lookup too.
+      symlinkSync(resolve('scripts/readiness'), join(checkoutB, 'scripts/readiness'), 'dir');
+      for (const path of copiedPaths) {
+        const originalUrl = pathToFileURL(resolve(path));
+        const copied = readFileSync(originalUrl, 'utf8').replace(/(from\s+|import\s+)'(\.\.?\/[^']+)'/g,
+          (_, prefix, specifier) => {
+            const dependency = new URL(specifier, originalUrl);
+            const local = copiedPaths.find(p => pathToFileURL(resolve(p)).href === dependency.href);
+            return prefix + JSON.stringify(local ? pathToFileURL(join(checkoutB, local)).href : dependency.href);
+          });
+        writeFileSync(join(checkoutB, path), copied);
+      }
+      const repo = join(root, 'target');
+      for (const directory of [checkoutA, repo, join(repo, 'scripts'), join(root, 'bin'), join(root, 'state')]) mkdirSync(directory, { recursive: true });
+      // Load the real resolver at another absolute root, keeping its dependencies unchanged.
+      const moduleUrl = pathToFileURL(resolve('scripts/lib/verify-lane-gate.mjs'));
+      const source = readFileSync(moduleUrl, 'utf8').replace(/from '(\.\.?\/[^']+)'/g,
+        (_, specifier) => `from '${new URL(specifier, moduleUrl).href}'`);
+      const copy = join(checkoutA, 'verify-lane-gate.mjs');
+      writeFileSync(copy, source);
+      const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/deep.test.mjs': "import './mid.mjs'", 'guard.test.mjs': '// guard' };
+      for (let i = 0; i < 24; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
+      for (const [file, content] of Object.entries(files)) writeFileSync(join(repo, file), content);
+      const env = { ...process.env, WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
+        WE_VERIFY_SELECTION: 'pr', WE_VERIFY_RELATED: 'all', WE_VERIFY_RELATED_MAX_TESTS: '1', WE_VERIFY_RELATED_DEPTH: '2',
+        WE_VERIFY_TEST_TIMEOUT_FACTOR: '1', WE_VERIFY_STANDARDS: 'ci-only', WE_VERIFY_REVERT_RED: 'off',
+        WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3',
+        WE_VERIFY_PHASE_TIMEOUT_MS: '10000', WE_VERIFY_ALWAYS_RUN_TESTS: 'guard.test.mjs', WE_VERIFY_PHASE_ADMISSION: '1',
+        WE_TOOLS_ROOT: '', PATH: `${join(root, 'bin')}:${process.env.PATH}`, TMPDIR: root, LANE_POOL_ROOT: join(root, 'pool') };
+      const git = fakeGit(['scripts/hub.mjs']);
+      const options = { env, fileConfig: null, scripts: ['test:unit'], readRepoFile: p => files[p],
+        runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) };
+      // Native Node preserves import.meta.url at A; Vite's module loader cannot load this temporary copy.
+      const stamp = spawnSync(process.execPath, ['--input-type=module', '-e', `
+import { resolveDefaultGate } from ${JSON.stringify(pathToFileURL(copy).href)};
+const files = ${JSON.stringify(files)};
+const runGit = args => {
+  if (args[0] === 'merge-base') return 'deadbeef';
+  if (args[0] === 'diff') return args.includes('--diff-filter=D') ? '' : 'scripts/hub.mjs';
+  if (args[0] === 'ls-files') return args.includes('--cached') ? Object.keys(files).join('\\n') : '';
+  throw Error('no grep matches');
+};
+process.stdout.write(JSON.stringify(resolveDefaultGate({ env: process.env, fileConfig: null, scripts: ['test:unit'], readRepoFile: p => files[p], runGit })));`],
+        { env, encoding: 'utf8', timeout: 10000 });
+      expect(stamp.status, stamp.stderr).toBe(0);
+      const stamped = JSON.parse(stamp.stdout);
+      const resolveUnder = env => resolveDefaultGate({ ...options, env });
+      const resolved = resolveUnder(env);
+      expect(stamped.command).not.toBe(resolved.command);
+      const resolvedGate = matchRequestedDefaultGate({ gate: stamped.command, env, resolved, resolveUnder });
+      expect.soft(resolvedGate).toBeTruthy();
+      expect.soft(resolvedGate?.testCommand).toBe(resolved.testCommand);
+
+      // Stub git reads and command execution only. No real repository or .git writes are needed.
+      const executable = (name, body) => writeFileSync(join(root, 'bin', name), `#!${process.execPath}\n${body}`, { mode: 0o755 });
+      const quote = s => `'${s.replaceAll("'", "'\\''")}'`;
+      writeFileSync(join(root, 'bin/git'), `#!/bin/sh
+case " $* " in
+  *' rev-parse '*) case " $* " in
+    *' --absolute-git-dir '*) printf '%s' ${quote(join(root, 'state'))};;
+    *) printf '%s' ${quote('a'.repeat(40))};; esac;;
+  *' merge-base '*) printf deadbeef;;
+  *' diff '*) case " $* " in
+    *' --diff-filter=D '*) :;;
+    *' --name-only '*) printf scripts/hub.mjs;;
+    *) printf 'changed hub';; esac;;
+  *' ls-files '*) case " $* " in
+    *' --cached '*) printf '%s' ${quote(Object.keys(files).join('\n'))};; esac;;
+  *' status '*) printf ' M scripts/hub.mjs';;
+  *) exit 1;;
+esac`, { mode: 0o755 });
+      const calls = join(root, 'calls.jsonl');
+      const logCall = `const fs = require('node:fs'); const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');`;
+      executable('node', `${logCall}\nprocess.exit(0);`);
+      executable('npx', `${logCall}
+const report = args.find(a => a.startsWith('--outputFile.json='));
+if (report) fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: [{ name: ${JSON.stringify(join(repo, 'guard.test.mjs'))}, status: 'failed', assertionResults: [{ status: 'failed' }] }] }));
+process.exit(1);`);
+      writeFileSync(join(repo, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'vitest run' } }));
+      const preferences = join(root, 'preferences.json');
+      writeFileSync(preferences, JSON.stringify({ heavyAdmission: { cap: 1, fastSlots: 1, remote: { enabled: false } } }));
+      env.WE_PLATFORM_PREFERENCES = preferences;
+      const child = spawnSync(process.execPath, [join(checkoutB, 'scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${stamped.command}`, '--run-id=cross-checkout', '--json'],
+        { env, encoding: 'utf8', timeout: 60000 });
+      expect(child.error, child.stderr).toBeUndefined();
+      const result = JSON.parse(child.stdout.trim().split('\n').at(-1));
+      expect.soft(child.status, child.stderr).toBe(2);
+      // Phase admission proves the dispatcher's resolvedGate and retryableGate were both set.
+      expect.soft(result.phases?.admissionMode).toBe('phase');
+      expect.soft(result.phases?.alwaysRun).toMatchObject({ executed: true, result: 'failed', planned: ['guard.test.mjs'] });
+      const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
+      expect.soft(commands[0][0]).toBe(join(checkoutB, 'scripts/lib/verify-shard-run.mjs'));
+      expect(commands.some(args => args.includes('guard.test.mjs'))).toBe(true);
+
+      // #66: checkout A's sharded gate that B cannot match must still announce and record the whole-gate fallback,
+      // even though its wrapper root is not B's own.
+      const unmatched = stamped.command.replace(/--parallel=\d+/, '--parallel=1');
+      expect(unmatched).not.toBe(stamped.command);
+      const fallback = spawnSync(process.execPath, [join(checkoutB, 'scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${unmatched}`, '--run-id=cross-checkout-unmatched', '--json'],
+        { env, encoding: 'utf8', timeout: 60000 });
+      expect(fallback.error, fallback.stderr).toBeUndefined();
+      expect(fallback.stderr).toContain('⚠ verify-lane: whole-gate admission');
+      const fallbackResult = JSON.parse(fallback.stdout.trim().split('\n').at(-1));
+      expect(fallbackResult.phases?.admissionMode).toBe('gate');
+      expect(fallbackResult.phases?.admissionFallback).toMatch(/not this checkout's default selection/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 90000);
+
+  function gate(count, settings = {}) {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < count; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
+    files['scripts/deep.test.mjs'] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2, phaseTimeoutMs: 10000, ...settings }, readRepoFile: p => files[p],
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
+  }
+  it('wraps at threshold, with 75 files producing seven shards and a 90% budget', () => {
+    const result = gate(75);
+    expect(result.testCommand).toMatch(/^node '[^']*\/scripts\/lib\/verify-shard-run\.mjs' --shards=7 --parallel=3 --budget-ms=9000 -- npx vitest run /);
+    expect(result.decision.selection.shards).toEqual({ count: 7, size: 12, parallel: 3 });
+    expect(describeGate(result)).toContain('7 shards');
+    expect(gate(24).testCommand).toContain('--shards=2');
+  });
+  it('below threshold and disabled commands are byte-identical', () => {
+    expect(gate(23).testCommand).toBe(gate(23, { shardMinTests: 0 }).testCommand);
+    expect(gate(75, { shardMinTests: 0 }).testCommand).toMatch(/^npx vitest run /);
   });
 });

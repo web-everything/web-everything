@@ -1,12 +1,27 @@
 {
   "daemons": {
-    "review": { "label": "com.we.review-daemon" },
-    "fix": { "label": "com.we.fix-dispatch-daemon" },
-    "build": { "label": "com.we.build-dispatch-daemon" },
-    "verify": { "label": "com.we.verify-daemon" },
-    "health-watch": { "label": "com.we.health-watch" },
-    "lease-reaper": { "label": "com.we.lease-reaper" },
-    "control": { "label": "com.we.control", "clone": "wev-control" },
+    "review": {
+      "label": "com.we.review-daemon"
+    },
+    "fix": {
+      "label": "com.we.fix-dispatch-daemon"
+    },
+    "build": {
+      "label": "com.we.build-dispatch-daemon"
+    },
+    "verify": {
+      "label": "com.we.verify-daemon"
+    },
+    "health-watch": {
+      "label": "com.we.health-watch"
+    },
+    "lease-reaper": {
+      "label": "com.we.lease-reaper"
+    },
+    "control": {
+      "label": "com.we.control",
+      "clone": "wev-control"
+    },
     "drain": {
       "label": "com.plateau.drain-daemon",
       "clone": ".lanes/we-drain-daemon/code",
@@ -15,9 +30,42 @@
   },
   "launchAgentsDir": "~/Library/LaunchAgents",
   "workspaceRoot": "~/workspace",
-  "adoption": { "timeoutMs": 600000, "pollMs": 15000 },
+  "adoption": {
+    "timeoutMs": 600000,
+    "pollMs": 15000
+  },
   "recordPath": "~/workspace/.operations/coordination/prototype-loads.jsonl",
   "readyRecordPath": "~/workspace/.operations/coordination/fix-ready.jsonl",
   "auditRecordPath": "~/workspace/.operations/coordination/audits.jsonl",
-  "loaderCli": "scripts/daemon-overlay.mjs"
+  "loaderCli": "scripts/daemon-overlay.mjs",
+  "ruledWeakened": [
+    {
+      "ref": "lane/verify-forge-route",
+      "sha": "2b6ac7d67b5e4fc1b7137c6d7e59d202eb45a41b",
+      "ruling": "R396",
+      "findings": [
+        "excluded-file drop made loud (config-excluded selected test files are named and not run, previously skipped silently)",
+        "focusRefs entry for lane/verify-forge-route added to scripts/settings/pr-limit.json"
+      ]
+    },
+    {
+      "ref": "lane/rebuild-spawner-reader-thin",
+      "sha": "d2c55f72173c6da0c88612507fc86e144cf176a4",
+      "ruling": "R384+R396",
+      "findings": [
+        "rebuild.mjs accepts inherited ignore-owner env for any readyOnly caller (feature-scope, PR 6222 body)",
+        "acquireWrite accepts explicit ignoreOwners that can bypass a listed foreign live reader (feature-scope)",
+        "preparation still writes refs/objects before the ref guard; read-only does not cover all clone bytes (feature-scope)",
+        "lock exclusion weakens the previous reader-exclusion guarantee (inherent to the feature)"
+      ]
+    },
+    {
+      "ref": "lane/dispatch-scope-multi",
+      "sha": "2fe6208f8409668f0a74a637c5b53ac46f5031cf",
+      "ruling": "R396",
+      "findings": [
+        "scripts/operations/dispatch-lane.mjs:429 \u2014 Glob refusal applies only within multi-path entries; separate glob entries remain accepted despite the pre-existing overlap-check limitation. Probe: `we:src/a*b.mjs` and `we:src/ab*.mjs` both cover `we:src/abb.mjs`, but `scopesOverlap` returns false, allowing conflicting work through lease/rival exclusion."
+      ]
+    }
+  ]
 }
