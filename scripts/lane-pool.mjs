@@ -2904,7 +2904,11 @@ async function cmdReleaseAllPools(repo) {
         salvageRepo ??= name === repo.name ? repo
           : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
         const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
-        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        if (salvage.status === 'failed') {
+          log(`  ERROR ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; release refused — lane kept held, fix the cause and retry`);
+          process.exitCode = 1;
+          continue;
+        }
         else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
       }
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
@@ -3087,7 +3091,11 @@ async function cmdRelease(repo) {
         log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
       } else {
         const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
-        if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        if (salvage.status === 'failed') {
+          log(`  ERROR lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; release refused — lane kept held, fix the cause and retry`);
+          process.exitCode = 1;
+          continue;
+        }
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }
     }
