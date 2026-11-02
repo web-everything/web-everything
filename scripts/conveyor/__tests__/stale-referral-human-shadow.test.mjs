@@ -133,7 +133,8 @@ describe('CLI production evidence adapter', () => {
     'security category %s produces a present security finding', async category => {
       const { pr, options, io } = setup();
       const run = io.readRun();
-      run.findings.referralVerdict.findings = [{ category, summary: 'Authorization bypass' }];
+      run.findings.referralVerdict.findings = [{ category, summary: 'Authorization bypass',
+        verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }];
       io.readRun.mockReturnValue(run);
       checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }),
         'security-finding', 'present');
@@ -156,6 +157,20 @@ describe('CLI production evidence adapter', () => {
       const { pr, options, io } = setup();
       const run = io.readRun();
       run.findings.referralVerdict[field] = [[]];
+      io.readRun.mockReturnValue(run);
+      const readers = createLiveShadowReaders(io);
+      expect(await readers.readHoldEvidence(pr)).not.toHaveProperty('findings');
+      const decision = await decideStaleReferralHumanHold(pr, { ...options, ...readers });
+      for (const cause of ['security-finding', 'mandatory-referral-finding', 'advisory-push']) {
+        checked(decision, cause, 'unknown');
+      }
+    });
+
+  it.each(['findings', 'deferredAdvisory'])(
+    '%s with incomplete finding content leaves production findings unknown', async field => {
+      const { pr, options, io } = setup();
+      const run = io.readRun();
+      run.findings.referralVerdict[field] = [{ verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }];
       io.readRun.mockReturnValue(run);
       const readers = createLiveShadowReaders(io);
       expect(await readers.readHoldEvidence(pr)).not.toHaveProperty('findings');
@@ -304,13 +319,42 @@ describe('decideStaleReferralHumanHold: stale referral must be the ONLY cause', 
   it.each([
     ['no-verdict', { noVerdict: true }], ['same-head-hold', { sameHeadHold: true }],
     ['escalation', { escalations: [{ head: fixture.headRefOid, reason: 'operator decision required' }] }],
-    ['security-finding', { findings: [{ head: fixture.headRefOid, lens: 'security', severity: 'broken', summary: 'Open security issue' }] }],
+    ['security-finding', { findings: [{ head: fixture.headRefOid, lens: 'security', verdict: 'CONFIRMED', impactIfUnfixed: 'broken', summary: 'Open security issue' }] }],
     ['mandatory-referral-finding', { findings: [{ head: fixture.headRefOid, verdict: 'CONFIRMED', impactIfUnfixed: 'broken', summary: 'Unruled live finding' }] }],
-    ['advisory-push', { findings: [{ head: fixture.headRefOid, advisory: true, requiresPush: true, summary: 'Repair requires a push' }] }],
+    ['advisory-push', { findings: [{ head: fixture.headRefOid, advisory: true, requiresPush: true, verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded', summary: 'Repair requires a push' }] }],
   ])('%s in persisted evidence independently retains the human hold', async (cause, patch) => {
     const { pr, evidence, options } = clean();
     Object.assign(evidence, patch);
     checked(await decideStaleReferralHumanHold(pr, options), cause, 'present');
+  });
+
+  it('confirmed broken finding without summary leaves findings unknown and wouldClear false', async () => {
+    const { pr, evidence, options } = clean();
+    evidence.findings = [{ head: pr.headRefOid, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }];
+    const decision = await decideStaleReferralHumanHold(pr, options);
+    for (const cause of ['security-finding', 'mandatory-referral-finding', 'advisory-push']) {
+      checked(decision, cause, 'unknown');
+    }
+  });
+
+  it.each([
+    ['non-string summary', { summary: 42 }],
+    ['blank summary', { summary: '   ' }],
+    ['missing verdict', { verdict: undefined }],
+    ['non-string verdict', { verdict: ['CONFIRMED'] }],
+    ['missing impactIfUnfixed', { impactIfUnfixed: undefined }],
+    ['non-string impactIfUnfixed', { impactIfUnfixed: ['broken'] }],
+    ['non-string category', { category: ['security'] }],
+    ['non-string lens', { lens: ['security'] }],
+    ['non-boolean security', { security: 'true' }],
+  ])('%s leaves findings unknown and wouldClear false', async (_name, patch) => {
+    const { pr, evidence, options } = clean();
+    evidence.findings = [{ head: pr.headRefOid, summary: 'Live-head defect',
+      verdict: 'CONFIRMED', impactIfUnfixed: 'broken', ...patch }];
+    const decision = await decideStaleReferralHumanHold(pr, options);
+    for (const cause of ['security-finding', 'mandatory-referral-finding', 'advisory-push']) {
+      checked(decision, cause, 'unknown');
+    }
   });
 
   it('no referral provenance -> no, even with clean live referrals', async () => {
@@ -497,9 +541,9 @@ const independentCauses = [
   { cause: 'operator-ruling-needed', present: ({ evidence }) => { evidence.operatorRulingNeeded = true; }, field: 'operatorRulingNeeded' },
   { cause: 'no-verdict', present: ({ evidence }) => { evidence.noVerdict = true; }, field: 'noVerdict' },
   { cause: 'same-head-hold', present: ({ evidence }) => { evidence.sameHeadHold = true; }, field: 'sameHeadHold' },
-  { cause: 'security-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, lens: 'security' }]; }, field: 'findings' },
+  { cause: 'security-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, lens: 'security', summary: 'Open security issue', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }]; }, field: 'findings' },
   { cause: 'mandatory-referral-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, verdict: 'CONFIRMED', impactIfUnfixed: 'broken', summary: 'Unruled live finding' }]; }, field: 'findings' },
-  { cause: 'advisory-push', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, advisory: true, requiresPush: true }]; }, field: 'findings' },
+  { cause: 'advisory-push', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, advisory: true, requiresPush: true, summary: 'Repair requires a push', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' }]; }, field: 'findings' },
 ];
 
 describe('referral-only safety predicate: every independent cause fails closed', () => {

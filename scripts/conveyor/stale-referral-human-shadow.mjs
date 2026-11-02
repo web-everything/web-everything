@@ -21,6 +21,13 @@ const SETTING = new URL('../settings/stale-referral-human-shadow.json', import.m
 const SHA = /^[a-f0-9]{40}$/;
 const isPlainObject = value => value !== null && typeof value === 'object'
   && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+// Do not let normalization discard incomplete findings and imply that no referral is owed.
+const isReadableFinding = value => isPlainObject(value)
+  && typeof value.summary === 'string' && value.summary.trim().length > 0
+  && typeof value.verdict === 'string' && typeof value.impactIfUnfixed === 'string'
+  && (!Object.hasOwn(value, 'category') || typeof value.category === 'string')
+  && (!Object.hasOwn(value, 'lens') || typeof value.lens === 'string')
+  && (!Object.hasOwn(value, 'security') || typeof value.security === 'boolean');
 // Keep the event name assembled separately from any operational command vocabulary.
 const EVENT_KIND = ['would', 'clear', 'human', 'hold'].join('-');
 const CAUSES = ['round-cap', 'block-ruling', 'requested-changes', 'red-team-blocked', 'draft',
@@ -144,7 +151,7 @@ export async function decideStaleReferralHumanHold(pr, options = {}) {
     check('escalation', has('escalation') || escalationsKnown,
       has('escalation') || evidence?.escalations?.some(e => e.head === head), 'live-head escalations checked');
     const findingsKnown = Array.isArray(evidence?.findings)
-      && evidence.findings.every(f => isPlainObject(f) && SHA.test(f.head ?? ''));
+      && evidence.findings.every(f => isReadableFinding(f) && SHA.test(f.head ?? ''));
     const findings = findingsKnown ? evidence.findings.filter(f => f.head === head) : [];
     check('security-finding', findingsKnown, findings.some(f => f.lens === 'security' || f.security === true), 'independent live-head security findings checked');
     check('mandatory-referral-finding', findingsKnown, findings.some(requiresMandatoryReferral), 'independent live-head mandatory referral findings checked');
@@ -308,7 +315,7 @@ export function createLiveShadowReaders({ repo, gh, readRuns = readShadowRuns, r
         if (run?.id === current.id && read?.repo === repo && Number(read.pr) === pr.number
           && read?.netBasis?.rev === pr.headRefOid && Array.isArray(final?.findings)
           && Array.isArray(final?.deferredAdvisory)
-          && [...final.findings, ...final.deferredAdvisory].every(isPlainObject)) {
+          && [...final.findings, ...final.deferredAdvisory].every(isReadableFinding)) {
           evidence.findings = [...final.findings, ...final.deferredAdvisory].map(f => ({ ...f,
             head: pr.headRefOid, ...(typeof f.category === 'string' && /^security(?:\/|$)/i.test(f.category)
               ? { security: true } : {}) }));
