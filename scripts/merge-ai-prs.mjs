@@ -1186,23 +1186,40 @@ export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN
 export function markStuckUnknown(marks, { repo, num, now }) {
   const next = new Map(marks);
   const key = `${repo}#${num}`;
-  if (!next.has(key)) next.set(key, { repo, num, since: now });
+  if (!next.has(key) || next.get(key).resolved) next.set(key, { repo, num, since: now });
   return next;
 }
 
-export function pruneStuckUnknown(marks, { prs }) {
+export function pruneStuckUnknown(marks, { prs, listedRepos = [], retainPriority = false }) {
   const next = new Map(marks);
+  // Absence is evidence only from a complete, live candidate listing, before --only narrowing.
+  const complete = new Set(listedRepos);
+  const present = new Set(prs.map(pr => `${pr.repo}#${pr.num}`));
+  for (const [key, mark] of next) if (complete.has(mark.repo) && !present.has(key)) next.delete(key);
   for (const pr of prs) {
-    if (['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable) || ['CLOSED', 'MERGED'].includes(pr.state)) {
-      next.delete(`${pr.repo}#${pr.num}`);
+    const key = `${pr.repo}#${pr.num}`;
+    if (['CLOSED', 'MERGED'].includes(pr.state)) next.delete(key);
+    else if (['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable)) {
+      // Recompute resolved state independently from starvation priority. Keep the latter across processes
+      // until a confirmed merge/close or departure from the complete candidate listing.
+      if (retainPriority && next.has(key)) next.set(key, { ...next.get(key), resolved: true });
+      else next.delete(key);
     }
   }
   return next;
 }
 
-export function orderStuckUnknownFirst(prs, marks) {
+export function orderStuckUnknownFirst(prs, marks, { classOf = () => null } = {}) {
   const marked = pr => marks.has(`${pr.repo}#${pr.num}`);
-  return [...prs.filter(marked), ...prs.filter(pr => !marked(pr))];
+  // The caller already ordered delivery classes. Stable partition only within each class, preserving
+  // that outer order (and the downstream main-fix/couple cascade's stronger precedence).
+  const groups = new Map();
+  for (const pr of prs) {
+    const cls = classOf(pr);
+    if (!groups.has(cls)) groups.set(cls, []);
+    groups.get(cls).push(pr);
+  }
+  return [...groups.values()].flatMap(rows => [...rows.filter(marked), ...rows.filter(pr => !marked(pr))]);
 }
 
 export function nudgeMergeability({ repo, num, read }) {
@@ -1211,7 +1228,7 @@ export function nudgeMergeability({ repo, num, read }) {
 
 export function decideStuckUnknownAlert(marks, { now, afterMinutes = 30 }) {
   const bound = Number.isFinite(afterMinutes) && afterMinutes > 0 ? afterMinutes : 30;
-  return [...marks.values()].filter(mark => now - mark.since > bound * 60_000)
+  return [...marks.values()].filter(mark => !mark.resolved && now - mark.since > bound * 60_000)
     .map(mark => ({ kind: 'stuck-unknown-mergeability', ...mark, ageMinutes: (now - mark.since) / 60_000,
       reason: 'mergeability remains UNKNOWN; inspect the PR on GitHub and retry the drain; merge remains refused' }));
 }
@@ -1221,7 +1238,8 @@ function loadStuckUnknown(path) {
     const rows = JSON.parse(readFileSync(path, 'utf8'));
     if (!Array.isArray(rows)) return new Map();
     return new Map(rows.filter(row => typeof row?.repo === 'string' && Number.isInteger(row.num) && row.num > 0
-      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since }]));
+      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since,
+        ...(row.resolved === true ? { resolved: true } : {}) }]));
   } catch { return new Map(); }
 }
 
@@ -1262,7 +1280,7 @@ export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, 
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
-export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map() }) {
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map(), onPersistentUnknown, nudge }) {
   const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
   const marked = [...prsByRepo].flatMap(([repo, prs]) => prs
     .filter(pr => marks.has(`${repo}#${pr.number}`)).map(pr => ({ repo, pr })));
@@ -1281,6 +1299,13 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, setting = 
     });
     pending = unresolved.filter(Boolean);
   }
+  // A PR already UNKNOWN in the listing never reaches merge-site revalidation. Recover here too,
+  // otherwise that sibling path can remain refused forever without a durable mark, nudge or alert.
+  await mapWithConcurrency(pending, concurrency, async ({ repo, pr }) => {
+    const payload = { repo, num: pr.number };
+    try { await onPersistentUnknown?.(payload); } catch { /* advisory */ }
+    try { await nudge?.(payload); } catch { /* advisory */ }
+  });
 }
 
 /**
@@ -2773,23 +2798,29 @@ const ET_CLOCK = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York'
  * PURE (the IO arrives through `infoOf`). Order the ready set: `card-number` = the legacy order (card NNN, a hash or
  * no card last, then PR #); `ready-age` = delivery-priority class first when `priority.mode === 'enforce'` (shadow
  * only reports it), then the ready-label time (oldest first; unknown last), then PR #. Stable; the input is untouched.
- * The merge-queue class (main-fix first) is applied after this by `prioritizeMainFix`, and blockedBy/stack order is
- * realized across passes, as before.
+ * The merge-queue class (main-fix first) is applied through `prioritize`, using the cascade's same rule;
+ * blockedBy/stack order is realized across passes, as before.
  * @param {Array} ready
  * @param {{order:string, priority:object, now:number, infoOf:(c:object)=>({readyAtMs:number|null, facts:object})}} ctx
  * @returns {{ordered:Array, reasons:Array<{num:number, repo:(string|null), class:string, readyAtMs:(number|null), reason:string}>}}
  */
-export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }) } = {}) {
+export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }), stuckUnknownMarks = new Map(), prioritize = rows => rows } = {}) {
   const list = Array.isArray(ready) ? ready : [];
   const settings = resolvePrioritySettings(priority);
   const infos = list.map((c) => { try { return infoOf(c) ?? {}; } catch { return {}; } });
   const ranked = rankByDeliveryPriority(list.map((c, i) => ({ id: i, facts: infos[i].facts ?? {} })), settings, now);
   const prio = new Map(ranked.map((r) => [r.id, r]));
-  const rows = list.map((c, i) => ({ c, i, readyAtMs: Number.isFinite(infos[i].readyAtMs) ? infos[i].readyAtMs : null, p: prio.get(i) }));
+  let rows = list.map((c, i) => ({ c, i, readyAtMs: Number.isFinite(infos[i].readyAtMs) ? infos[i].readyAtMs : null, p: prio.get(i) }));
   const enforce = order === 'ready-age' && settings.mode === 'enforce';
   const cls = (r) => PRIORITY_CLASSES.indexOf(r.p.class);
   const age = (r) => (r.readyAtMs == null ? Infinity : r.readyAtMs);
   if (order === 'ready-age') rows.sort((a, b) => (enforce ? cls(a) - cls(b) : 0) || (age(a) - age(b)) || (a.c.num - b.c.num) || (a.i - b.i));
+  const byCandidate = new Map(rows.map(row => [row.c, row]));
+  rows = orderStuckUnknownFirst(rows.map(row => row.c), stuckUnknownMarks, {
+    classOf: c => enforce ? byCandidate.get(c).p.class : null,
+  }).map(c => byCandidate.get(c));
+  // Apply the queue's main-fix precedence before producing reasons, so the plan and its log agree.
+  rows = prioritize(rows.map(row => row.c)).map(c => byCandidate.get(c));
   const reasons = rows.map((r) => {
     const when = r.readyAtMs == null ? 'ready time unknown'
       : `ready ${ET_CLOCK.format(new Date(r.readyAtMs))} ET, waited ${Math.max(0, Math.floor((now - r.readyAtMs) / 60_000))} min`;
@@ -4850,11 +4881,8 @@ async function runCli() {
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
       if (!data || (!fields && data.number !== num)) return null;
-      const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
-      if (pruned.size !== stuckUnknownMarks.size) {
-        stuckUnknownMarks = pruned;
-        if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
-      }
+      // A mergeable-only nudge is advisory: it cannot resolve durable state without matching PR identity.
+      if (!fields) updateStuckUnknown({ prs: [{ ...data, repo: repo || localSlug, num }] });
       if (fields) return data;
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
@@ -4877,6 +4905,16 @@ async function runCli() {
   });
   process.stderr.write(`merge-ai-prs: stuckUnknownMergeability.afterMinutes=${stuckUnknownSetting.value.afterMinutes} (${stuckUnknownSetting.sources.afterMinutes})\n`);
   const stuckUnknownAlerts = new Map();
+  const updateStuckUnknown = (evidence) => {
+    const next = pruneStuckUnknown(stuckUnknownMarks, { ...evidence, retainPriority: true });
+    const changed = next.size !== stuckUnknownMarks.size
+      || [...next].some(([key, mark]) => mark.resolved !== stuckUnknownMarks.get(key)?.resolved);
+    stuckUnknownMarks = next;
+    for (const key of stuckUnknownAlerts.keys()) {
+      if (!next.has(key) || next.get(key).resolved) stuckUnknownAlerts.delete(key);
+    }
+    if (changed && !DRY_RUN) saveStuckUnknown(stuckUnknownPath, next);
+  };
   const emitStuckUnknownAlerts = () => {
     for (const alert of decideStuckUnknownAlert(stuckUnknownMarks, { now: Date.now(), ...stuckUnknownSetting.value })) {
       const key = `${alert.repo}#${alert.num}`;
@@ -4884,6 +4922,13 @@ async function runCli() {
       stuckUnknownAlerts.set(key, alert);
     }
   };
+  const onPersistentUnknown = ({ repo, num }) => {
+    stuckUnknownMarks = markStuckUnknown(stuckUnknownMarks, { repo: repo || localSlug, num, now: Date.now() });
+    if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+    emitStuckUnknownAlerts();
+  };
+  const nudgeStuckUnknown = ({ repo, num }) => nudgeMergeability({ repo: repo || localSlug, num,
+    read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) });
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -5407,7 +5452,7 @@ async function runCli() {
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
       // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', readLiveRows: listLive };
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5437,6 +5482,12 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
+  updateStuckUnknown({
+    // Use candidate rows before --only filtering. Snapshot, truncated and failed repos cannot prove absence.
+    prs: listings.flatMap(l => l.prs.map(pr => ({ repo: l.repo || localSlug, num: pr.number,
+      ...(pr.state ? { state: pr.state } : {}) }))),
+    listedRepos: listings.filter(l => l.complete).map(l => l.repo || localSlug),
+  });
   // #4108 — reuse only this pass's live listings; round snapshot rows never serve context.
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
@@ -5452,7 +5503,7 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: async () => { await repollUnknownListings({ marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
+    repoll: async () => { await repollUnknownListings({ marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), onPersistentUnknown, nudge: nudgeStuckUnknown }); emitStuckUnknownAlerts(); },
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
@@ -5668,13 +5719,8 @@ async function runCli() {
   // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
   const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
     repo: repo || localSlug, num,
-    onPersistentUnknown: ({ repo: slug, num }) => {
-      stuckUnknownMarks = markStuckUnknown(stuckUnknownMarks, { repo: slug, num, now: Date.now() });
-      if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
-      emitStuckUnknownAlerts();
-    },
-    nudge: ({ repo: slug, num }) => nudgeMergeability({ repo: slug, num,
-      read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) }),
+    onPersistentUnknown,
+    nudge: nudgeStuckUnknown,
     read: async () => {
       const pr = await fetchFreshPrForRevalidation(repo, num);
       return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
@@ -6517,6 +6563,9 @@ async function runCli() {
   })();
   const drainPriority = { ...readDeliveryPrioritySettings(), mode: drainOrder.priorityMode };
   delete drainPriority.invalid;
+  const MERGE_QUEUE = loadMergeQueueSettings();
+  const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
+  const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
   const drainMainFix = (() => { try { return readMainFixPriority(); } catch { return null; } })();
   // The open PRs of c's repo: the context listing (has `files`) when collected, plus this pass's own listed verdicts
   // (always present; a dry-run / non-reconcile pass has no context listing), deduped by PR number.
@@ -6562,7 +6611,11 @@ async function runCli() {
     const repoKey = isLocalRepo(c.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(c.repo);
     return { readyAtMs: info.readyAtMs, facts: drainPriorityFacts(c, { ...info, mainFix: drainMainFix, repoKey }) };
   };
-  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf });
+  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf,
+    stuckUnknownMarks: passStuckUnknownMarks(),
+    prioritize: ordered => prioritizeMainFix(ordered, { mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue,
+      isCoupleHalf: c => isImplHalf(c) || isCoupleCarrier(c), repoKeyOf: repoKeyOfVerdict }),
+  });
   let lastDrainOrderLog = null;
   const logDrainOrder = (plan) => {
     if (AS_JSON || !Array.isArray(plan?.readyOrder) || !plan.readyOrder.length) return;
@@ -6607,7 +6660,6 @@ async function runCli() {
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
-    p.ready = orderStuckUnknownFirst(p.ready, passStuckUnknownMarks());
     logDrainOrder(p);
     return p;
   };
@@ -6682,11 +6734,9 @@ async function runCli() {
   const requiredWorkflowsRefusals = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
-  const MERGE_QUEUE = loadMergeQueueSettings();
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
-  const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
    * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per pass, through
@@ -6761,7 +6811,6 @@ async function runCli() {
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
   const coupleSplit = [];
-  const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
   const repoKeyOfSlug = (slug) => (isLocalRepo(slug) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(slug));
   // All non-CI gates and the couple/dependency plan have now run. Provisional pending candidates
   // leave the real cascade here: preparation NEVER authorizes an enqueue (or a direct merge).
@@ -6985,6 +7034,7 @@ async function runCli() {
         // those steps are idempotent, and once merged a PR drops off every later pass's open-PR listing.
         const recordAlreadyMerged = () => {
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null });
+          updateStuckUnknown({ prs: [{ repo: c.repo || localSlug, num: c.num, state: 'MERGED' }] });
           progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c));
           for (const id of landedIdsForCandidate(c, { isLocalRepo, openPrNums: otherOpenPrNums(c.repo, c.num) })) landedThisPass.add(id);
@@ -7164,6 +7214,7 @@ async function runCli() {
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
+          updateStuckUnknown({ prs: [{ repo: c.repo || localSlug, num: c.num, state: 'MERGED' }] });
           await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
