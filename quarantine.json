@@ -10,5 +10,8 @@
       "expiresAt": 1793735600963
     }
   ],
-  "mode": "quarantine"
+  "mode": "quarantine",
+  "fixPrs": [
+    6268
+  ]
 }
