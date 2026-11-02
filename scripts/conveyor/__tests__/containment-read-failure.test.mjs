@@ -17,6 +17,7 @@ const failures = [
   ['missing merge-base', { readMergeBase: () => null }],
   ['unreadable diff', { readChanges: () => [] }],
   ['throwing read', { readMergeBase: () => { throw new Error('unreadable'); } }],
+  ['throwing diff', { readChanges: () => { throw new Error('unreadable'); } }],
   ['unreadable file history', { findMatchingCommit: (c, options) => defaultFindMatchingMainCommit(c, {
     ...options, readEntryAt: () => { throw new Error('unreadable'); },
   }) }],
@@ -35,11 +36,40 @@ it.each(failures)('refuses unlabelled conflicting-rebase after %s', (_name, fail
   expect(REFUSAL_KINDS).toContain('containment-unreadable');
 });
 
-it('keeps label-carrying PRs unchanged on missing merge-base and unreadable diff', () => {
-  const original = pr({ mergeable: 'CONFLICTING' }, 'main', [{ name: 'merge-status:conflicting' }]);
-  for (const [, failure] of failures.slice(0, 2)) {
-    expect(enrichPrsWithAlreadyLandedFacts([original], { ...reads, ...failure })[0]).toBe(original);
+it.each(failures)('holds labelled never-bounced conflicting-rebase after %s', (_name, failure) => {
+  for (const defaultBranch of ['main', 'trunk']) {
+    for (const conflict of [{ mergeable: 'CONFLICTING' }, { mergeStateStatus: 'DIRTY' }]) {
+      const original = pr(conflict, defaultBranch, [{ name: 'merge-status:conflicting' }]);
+      const prs = enrichPrsWithAlreadyLandedFacts([original], { ...reads, ...failure, defaultBranch });
+      expect(prs[0].containmentUnreadable).toBe(true);
+      const plan = planReconcile({ prs, agents: [], defaultBranch });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toMatchObject([{ kind: 'containment-unreadable' }]);
+      expect(plan.refusals[0].why).toMatch(/retry|person/i);
+    }
   }
+});
+
+const bounced = () => ({
+  ...pr({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }, 'main',
+    [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }]),
+  comments: [{ body: '🔁 human review — changes requested\n\nResolve the conflict.' }],
+});
+
+it('still dispatches a labelled BOUNCED PR with the unreadable containment flag', () => {
+  const plan = planReconcile({ prs: [{ ...bounced(), containmentUnreadable: true }], agents: [] });
+  expect(plan.refusals).toEqual([]);
+  expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', isConflict: true }]);
+  expect(plan.dispatch[0].mode).not.toBe('conflicting-rebase');
+});
+
+it.each(failures)('still dispatches a labelled BOUNCED PR after enrichment encounters %s', (_name, failure) => {
+  const prs = enrichPrsWithAlreadyLandedFacts([bounced()], { ...reads, ...failure });
+  expect(prs[0].containmentUnreadable).toBe(true);
+  const plan = planReconcile({ prs, agents: [] });
+  expect(plan.refusals).toEqual([]);
+  expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', isConflict: true }]);
+  expect(plan.dispatch[0].mode).not.toBe('conflicting-rebase');
 });
 
 it('still dispatches conflicting-rebase when readable content is not landed', () => {

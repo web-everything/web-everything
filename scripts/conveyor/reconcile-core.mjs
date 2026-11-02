@@ -2013,8 +2013,9 @@ const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRo
  *   `alreadyLandedInMain` (optional, `{carrierPr:(number|null)}`) is the ALREADY-LANDED verdict (live incident
  *   PR #2752) computed by the IO shell's per-file blob-identity check against `main`'s own history; its absence
  *   means every PR falls through unaffected, exactly as before this branch existed.
- *   `containmentUnreadable` holds unlabelled default-base conflict repair when the IO shell could
- *   not read containment evidence; a later pass retries the read before allowing repair.
+ *   `containmentUnreadable` holds only the conflicting-rebase route, labelled or not, when the IO shell
+ *   could not read containment evidence; a later pass retries the read before allowing repair.
+ *   The existing labelled BOUNCED conflict-fix route does not consume this flag.
  * @param {Array<object>} [o.agents] - `claude agents --json` entries, each optionally carrying the two facts the
  *   listing cannot supply and the IO shell resolves: `laneHeadOid` (the `HEAD` of the lane at `cwd`) and
  *   `pidAlive` (`process.kill(pid, 0)` → `true`/`false`; absent = not probed = UNKNOWN).
@@ -3784,7 +3785,7 @@ export function planReconcile({
     // DIRTY PRs already classify as conflicted (#6193); the drain never rebases them either.
     const dirtyConflict = phase === 'conflicted' && pr?.mergeStateStatus === 'DIRTY';
     if ((mergeableConflict || dirtyConflict) && pr?.baseRefName === defaultBranch) {
-      if (!withPhase.labels.includes(CONFLICT_LABEL) && pr?.containmentUnreadable) {
+      if (pr?.containmentUnreadable) {
         refuse('containment-unreadable', { ...withPhase,
           why: `could not read whether this PR's content is already on ${defaultBranch}; retry containment reads on the next pass, or have a person inspect the repository before repair` });
         continue;

@@ -505,7 +505,7 @@ it('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attrib
   expect(readMergeBase).toHaveBeenCalledWith(HEAD_2752, 'origin/main', {});
   expect(readChanges).toHaveBeenCalledWith(BASE_2752, HEAD_2752, {});
   // Every change is searched only within `<merge-base>..origin/main`.
-  expect(findMatchingCommit).toHaveBeenCalledWith(changes[0], { base: BASE_2752, mainRef: 'origin/main' });
+  expect(findMatchingCommit).toHaveBeenCalledWith(changes[0], { base: BASE_2752, mainRef: 'origin/main', strictRead: true });
   expect(out[0].alreadyLandedInMain).toEqual({ carrierPr: 2759 });
   // one pulls lookup per DISTINCT matched commit, never one per file.
   expect(readPulls).toHaveBeenCalledTimes(1);
@@ -539,7 +539,8 @@ it('enrichPrsWithAlreadyLandedFacts never guesses containment with no merge-base
     .alreadyLandedInMain).toBeUndefined();
   const readMergeBase = vi.fn();
   const hostile = { ...pr, headRefOid: '--output=/x' };
-  expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0]).toBe(hostile);
+  expect(enrichPrsWithAlreadyLandedFacts([hostile], { fetchRef: vi.fn(), readMergeBase })[0])
+    .toEqual({ ...hostile, containmentUnreadable: true });
   expect(readMergeBase).not.toHaveBeenCalled();
 });
 

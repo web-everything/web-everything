@@ -1092,8 +1092,9 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * Pays the extra reads for PRs carrying `merge-status:conflicting`, plus default-base PRs whose
  * mergeable is CONFLICTING or mergeStateStatus is DIRTY. The latter population can dispatch a
  * conflicting-rebase without the label, and needs the same containment guard before repair.
- * Unreadable evidence marks only that unlabelled population `containmentUnreadable`, so the
- * planner holds repair until a later pass can read it. Label-based repair retains its existing behavior.
+ * Unreadable evidence marks labelled and unlabelled PRs `containmentUnreadable`. Only the
+ * conflicting-rebase route holds repair until a later pass can read it; the existing labelled
+ * BOUNCED conflict-fix route does not consume this flag and retains its dispatch behavior.
  * Other PRs cost no extra IO; `defaultReadPrs` already fetched all eligibility fields.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
@@ -1112,7 +1113,7 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
       && (pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY');
     const labelled = hasLabel(pr?.labels, CONFLICT_LABEL);
     if (!labelled && !defaultBaseConflict) return pr;
-    const unreadable = () => labelled ? pr : { ...pr, containmentUnreadable: true };
+    const unreadable = () => ({ ...pr, containmentUnreadable: true });
     const prNumber = Number(pr?.number);
     const headSha = pr?.headRefOid;
     if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return unreadable();
@@ -1127,11 +1128,10 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
 
       fileMatches = changes.map((change) => ({
         file: change.path, matchedCommit: findMatchingCommit(change, {
-          base, mainRef, ...(!labelled ? { strictRead: true } : {}),
+          base, mainRef, strictRead: true,
         }),
       }));
-    } catch (error) {
-      if (labelled) throw error;
+    } catch {
       return unreadable();
     }
 
