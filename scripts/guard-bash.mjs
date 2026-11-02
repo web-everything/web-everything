@@ -1964,22 +1964,71 @@ export function primaryTreeWriteReason(segment) {
 // why a hand-edit here is worse than a primary edit (it silently BLOCKS the daemon's own next rebuild until a
 // person notices, #xpt9fvd; caught+reverted 3x on 2026-09-26).
 
-/** git's `-C <path>` global-flag value, resolved against `cwd` — the effective directory a git invocation
- *  targets when it is NOT simply `cwd` itself (`git -C wev-review-daemon log` reads/writes that clone from
- *  wherever the shell actually sits). Pure — string-only, no fs. Returns `null` when `segment` is not a git
- *  invocation or carries no `-C`, so the caller falls back to `cwd`. Reads the SAME wrapper-peeled,
- *  basename-resolved `canonicalCommand` view `gitSubcommand` does, so a path-qualified/wrapped git
- *  (`/usr/bin/git -C … log`, `env git -C … log`) still resolves.
- *  KNOWN RESIDUAL: git allows REPEATED `-C` (each one relative to the previous); only the first is honoured
- *  here. Every daemon-clone-diagnosis shape this guard has ever seen (`git -C <clone> log`) is a single `-C`,
- *  so this is a documented simplification, not a hole any live shape has hit. */
-function gitDashCTarget(segment, cwd) {
-  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op);
-  if (!toks.length || toks[0].text !== 'git') return null;
-  for (let i = 1; i < toks.length - 1; i++) {
-    if (toks[i].text === '-C') return resolve(cwd || '.', toks[i + 1].text);
+/** Every directory a git invocation TARGETS, from its GLOBAL options only (those before the subcommand): the
+ *  effective dir after applying ALL `-C <path>` in order exactly as git does (each relative to the previous,
+ *  an absolute one resets), plus `--git-dir` / `--work-tree` (both `=` and separate-arg spellings, resolved
+ *  against that effective dir). Pure — string-only, no fs. Returns `[]` when `segment` is not git. A
+ *  subcommand's own `-C` (`git commit -C HEAD`) is NOT a global option and is never read here. Reads the
+ *  SAME wrapper-peeled, basename-resolved `canonicalCommand` view `gitSubcommand` does. A leading `~` is
+ *  expanded from HOME (the shell would have, before git saw it). */
+function gitTargetDirs(segment, cwd) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  if (!toks.length || toks[0] !== 'git') return [];
+  const home = process.env.HOME || '';
+  const abs = (base, p) => resolve(base || '.', p === '~' ? home : p.startsWith('~/') ? home + p.slice(1) : p);
+  let dir = cwd || '.';
+  let gitDir = null;
+  let workTree = null;
+  for (let i = 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === '-C' && i + 1 < toks.length) { dir = abs(dir, toks[++i]); continue; }
+    if (t === '--git-dir' && i + 1 < toks.length) { gitDir = toks[++i]; continue; }
+    if (t === '--work-tree' && i + 1 < toks.length) { workTree = toks[++i]; continue; }
+    if (t.startsWith('--git-dir=')) { gitDir = t.slice('--git-dir='.length); continue; }
+    if (t.startsWith('--work-tree=')) { workTree = t.slice('--work-tree='.length); continue; }
+    if (GIT_VALUE_FLAGS.has(t)) { i += 1; continue; }
+    if (t.startsWith('-')) continue;
+    break; // the subcommand — everything after it is the subcommand's own options
   }
-  return null;
+  const out = [dir];
+  if (gitDir !== null) out.push(abs(dir, gitDir));
+  if (workTree !== null) out.push(abs(dir, workTree));
+  return out;
+}
+
+/** git fetch options that SWALLOW the next token, so their value is never read as the remote or a refspec. */
+const GIT_FETCH_VALUE_FLAGS = new Set([
+  '--depth', '--deepen', '--jobs', '-j', '--upload-pack', '--server-option', '-o', '--shallow-since',
+  '--shallow-exclude', '--negotiation-tip', '--refmap', '--filter', '--receive-pack', '--submodule-prefix',
+]);
+
+/** Does this `git fetch` segment WRITE a local branch (so, possibly, the clone's checked-out one)? True for
+ *  `--update-head-ok` / `-u` (the flag exists only to let fetch overwrite the checked-out branch) and for any
+ *  refspec whose destination is a local branch: under `refs/heads/`, or unqualified (git resolves a bare
+ *  destination to a branch). Destinations under `refs/remotes/`, `refs/tags/` and other `refs/` namespaces,
+ *  and refspecs with no destination (`fetch origin main`), are fine. The first positional is the remote and
+ *  is skipped (an scp-style `git@host:org/repo` there is not a refspec). */
+function fetchWritesLocalBranch(segment) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  let i = 1;
+  while (i < toks.length && toks[i] !== 'fetch') i += GIT_VALUE_FLAGS.has(toks[i]) ? 2 : 1;
+  let remoteSeen = false;
+  for (i += 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === '--update-head-ok' || t === '-u' || /^-[a-z]*u[a-z]*$/.test(t)) return true;
+    if (GIT_FETCH_VALUE_FLAGS.has(t)) { i += 1; continue; }
+    if (t.startsWith('-')) continue;
+    if (!remoteSeen) { remoteSeen = true; continue; }
+    const spec = t.replace(/^\+/, '');
+    if (spec.startsWith('^')) continue;
+    const colon = spec.indexOf(':');
+    if (colon < 0) continue;
+    const dst = spec.slice(colon + 1);
+    if (!dst) continue;
+    if (/^refs\/(?!heads\/)/.test(dst)) continue;
+    return true;
+  }
+  return false;
 }
 
 /** The deny message for a write inside daemon clone `dir`. A plain function (not a template literal alone) so
@@ -2018,7 +2067,9 @@ function daemonCloneWriteMessage(dir) {
  * it is allowed EVEN WHEN targeting a daemon clone by `-C`/cwd. It only updates remote-tracking refs, never
  * the working tree or the index, so it cannot dirty a clone or race its rebuild — exactly the read-only
  * "diagnose from outside" shape the card asks to keep open. Every OTHER `GIT_STATE_SUBCOMMANDS` entry
- * (including `pull`, which fetches AND merges into the working tree) is denied. A pure READ op (`log`/
+ * (including `pull`, which fetches AND merges into the working tree) is denied. The effective target is every
+ * directory `gitTargetDirs` finds (ALL `-C` in order, `--git-dir`, `--work-tree`); `fetch` into a daemon clone is
+ * denied only when `fetchWritesLocalBranch` (a local-branch refspec destination or `--update-head-ok`). A pure READ op (`log`/
  * `status`/`diff`/`show`/`rev-parse`/…) is never in scope at all: `gitSubcommand` still returns it, but this
  * function only denies subcommands present in `GIT_STATE_SUBCOMMANDS`, so `git -C <clone> log` and `cat`
  * never match either arm below and pass through unmentioned.
@@ -2034,10 +2085,13 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [] } = {})
   const s = String(segment || '');
   const sub = gitSubcommand(s);
   if (sub) {
-    if (sub === 'fetch') return null; // #xpt9fvd — diagnosis stays allowed; fetch never touches the working tree
     if (!GIT_STATE_SUBCOMMANDS.has(sub)) return null; // a read op (log/status/diff/show/…) — never denied
-    const effectiveDir = gitDashCTarget(s, cwd) || cwd;
-    return isDaemonCloneRealpath(effectiveDir, roots) ? daemonCloneWriteMessage(effectiveDir) : null;
+    const hit = gitTargetDirs(s, cwd).find((d) => isDaemonCloneRealpath(d, roots));
+    if (!hit) return null;
+    // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
+    // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
+    if (sub === 'fetch' && !fetchWritesLocalBranch(s)) return null;
+    return daemonCloneWriteMessage(hit);
   }
   const prog = programWord(s);
   const isWrite = isFileWriteRedirect(s);
