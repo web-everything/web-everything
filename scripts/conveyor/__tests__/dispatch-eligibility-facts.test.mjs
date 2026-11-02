@@ -22,8 +22,9 @@ const clearComments = (() => {
   const r = result(head, false);
   return [r, bot(`${redTeamGateMarker(pr, head, 'no-send-back', liveResultGateState([r], pr, head).resultId)}\ngate`)];
 })();
-const build = (over = {}) => buildEligibilityFacts({
-  pr: prState, comments: clearComments, commentsComplete: true, population: 'fix', locals: goodLocals(), ...over });
+const withNone = f => ({ ...f, redTeam: { status: 'known', value: { state: 'none', resultId: null, sendBackResultId: null } } });
+const build = (over = {}) => withNone(buildEligibilityFacts({
+  pr: prState, comments: clearComments, commentsComplete: true, population: 'fix', locals: goodLocals(), ...over }));
 
 describe('buildEligibilityFacts', () => {
   it('a fully read PR yields facts the gate dispatches on', () => {
@@ -74,11 +75,14 @@ describe('buildEligibilityFacts', () => {
 const gateFor = (comments, rev, outcome, who = bot) => who(`${redTeamGateMarker(pr, rev, outcome, liveResultGateState(comments, pr, rev).resultId)}\ngate`);
 describe('redTeamFact (gate store only; everything unmapped is unread)', () => {
   const unreadFact = { status: 'unread' };
-  it('a gate record of no-send-back (clear) for the current head is clear', () => {
+  it('a no-send-back record is unread: the producer never writes it and it is not a digest-bound clearance', () => {
     const comments = [result(head, false)];
     comments.push(gateFor(comments, head, 'no-send-back'));
-    const id = liveResultGateState(comments, pr, head).resultId;
-    expect(redTeamFact(comments, pr, head)).toEqual({ status: 'known', value: { state: 'clear', resultId: id, sendBackResultId: null } });
+    expect(redTeamFact(comments, pr, head)).toEqual({ status: 'unread' });
+  });
+  it('the real red-team fact stays unread, so the gate is unknown on redTeam', () => {
+    const facts = buildEligibilityFacts({ pr: prState, comments: clearComments, commentsComplete: true, population: 'fix', locals: goodLocals() });
+    expect(eligibility({ ...prState, commentsComplete: true }, facts)).toEqual({ unknown: 'redTeam' });
   });
   it('a gate record for an OLDER head only is unread', () => {
     const comments = [result(oldHead, false)];
