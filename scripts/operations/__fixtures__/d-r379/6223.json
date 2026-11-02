@@ -1,0 +1,21 @@
+{
+  "provenance": "SYNTHETIC scenario from task expectations; NOT a captured PR. Network capture prohibited by task rules. Head, metadata and paths are invented.",
+  "pr": 6223,
+  "title": "Implement story #379",
+  "body": "Implements R379",
+  "labels": [
+    "review:accepted",
+    "red-team:clear"
+  ],
+  "headRefOid": "6666666666666666666666666666666666666666",
+  "netDiffPaths": [
+    "docs/examples/example-0.md",
+    "docs/examples/example-1.md",
+    "docs/examples/example-2.md",
+    "docs/examples/example-3.md",
+    "docs/examples/example-4.md",
+    "docs/examples/example-5.md",
+    "docs/examples/example-6.md"
+  ],
+  "auditSynthetic": true
+}
