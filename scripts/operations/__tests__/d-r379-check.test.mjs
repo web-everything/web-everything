@@ -1280,3 +1280,12 @@ describe('round 11 equal-time hold and executable examples', () => {
     expect(condition(r, 4).status).toBe('PASS');
   });
 });
+
+describe('round 14 clear-human acceptance', () => {
+  it('a clear-human ledger clearance is not delegated acceptance', async () => {
+    const f = fixture(6223);
+    const r = await checkPr(1, deps(f, { readReviewLedger: async pr => [verdict(pr, f.headRefOid, { verdict: 'clear-human', approval: 'clear-human' })] }));
+    expect(condition(r, 2).status).not.toBe('PASS');
+    expect(r.eligible).toBe(false);
+  });
+});

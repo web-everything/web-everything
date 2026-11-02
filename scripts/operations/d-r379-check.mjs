@@ -156,6 +156,8 @@ async function reviewed(pr, head, base, deps) {
   if (!current?.clears || current.coverage?.headSha?.toLowerCase() !== head.toLowerCase()) {
     return result(2, name, 'FAIL', ['acceptance not in ledger']);
   }
+  if (state.verdict === 'clear-human' || current?.verdict === 'clear-human') return result(2, name, 'FAIL',
+    ['ledger acceptance is a clear-human ceremony; it needs a companion approval, not delegated approval']);
   if (!state.clears || state.reviewExempt || !state.verdict) return result(2, name, 'FAIL',
     ['verdict ledger does not accept the current head', ...state.holds.map(h => `${h.code}: ${h.reason}`)]);
   const liveHolds = labels.filter(label => ['review:pending', REVIEW_LABELS.human].includes(label));
