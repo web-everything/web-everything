@@ -66,8 +66,16 @@ import { disjoint } from './lane-partition.mjs';
 /** Normalize a file/scope list → deduped array of non-empty repo-qualified strings. Mirrors
  *  `overlap-chain.mjs` `normFiles` (not exported there) — same contract, kept in sync by the test. */
 export function normScope(list) {
-  // R372 — one entry may name several paths (`we:a.mjs b.mjs`); split so overlap is judged per path. A piece with
-  // no `repo:` prefix inherits the nearest earlier prefix of the same entry.
+  return [...new Set((Array.isArray(list) ? list : []).filter(Boolean).map((f) => String(f)).filter(Boolean))];
+}
+
+/**
+ * R372 — normScope for a DECLARED scope (a card's `scope:`), where one entry may name several paths
+ * (`we:a.mjs b.mjs`). Split on whitespace/commas so overlap is judged per path; a piece with no `repo:` prefix
+ * inherits the nearest earlier prefix of the same entry. NOT for observed git filenames (a real file name may
+ * hold a comma — splitting those would hide a breach), which stay on {@link normScope}.
+ */
+export function normDeclaredScope(list) {
   const out = [];
   for (const entry of Array.isArray(list) ? list : []) {
     let repo = '';
@@ -206,8 +214,9 @@ export function scopeEntriesOverlap(x, y) {
 
 /** Do two predicted scopes (arrays of module/glob entries) overlap at all? */
 export function scopesOverlap(scopeA, scopeB) {
-  const a = normScope(scopeA);
-  const b = normScope(scopeB);
+  // both sides are PREDICTED (declared) scopes, so a multi-path entry is judged per path (R372)
+  const a = normDeclaredScope(scopeA);
+  const b = normDeclaredScope(scopeB);
   return a.some((x) => b.some((y) => scopeEntriesOverlap(x, y)));
 }
 
