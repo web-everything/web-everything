@@ -135,7 +135,7 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = 
 }
 
 /** Single-quote a string for safe inclusion in a shell command (handles an embedded `'`). */
-function shellQuote(str) {
+export function shellQuote(str) {
   return `'${String(str).replace(/'/g, `'\\''`)}'`;
 }
 

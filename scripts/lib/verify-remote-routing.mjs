@@ -6,6 +6,7 @@ import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPoli
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { shellQuote } from './verify-lane-gate.mjs';
 
 function simpleShellWords(command) {
   if (/[\r\n]/.test(command)) return null;
@@ -86,7 +87,7 @@ function wrappedChain(command) {
 // Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
 export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
-  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node '${SHARD_RUN_SCRIPT}' `)) {
+  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
   }
   if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {

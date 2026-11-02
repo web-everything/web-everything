@@ -86,6 +86,7 @@ import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
+import { shellQuote } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
@@ -351,7 +352,7 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
 // The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
 const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
 // The sharded form of the same selected-test gate (still retryable, still runs the always-run guards).
-const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).startsWith(`node '${SHARD_RUN_SCRIPT}' `);
+const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `);
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';

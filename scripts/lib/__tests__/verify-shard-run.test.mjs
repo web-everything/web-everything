@@ -43,6 +43,26 @@ function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () =>
   return { run, calls, lines, releases: () => releases };
 }
 describe('fail-closed wrapper', () => {
+  it.each([
+    ['report.success=false', { success: false }, 'passed', 'passed'],
+    ['failed suite', { success: true }, 'failed', 'passed'],
+    ['failed assertion', { success: true }, 'passed', 'failed'],
+  ])('%s cannot turn green even when the process exits zero', async (_label, summary, status, assertionStatus) => {
+    const reportText = JSON.stringify({ ...summary, testResults: [
+      { name: 'a', status, assertionResults: [{ status: assertionStatus }] },
+    ] });
+    expect(inventoryVerdict(reportText, ['a'])).toBe('FAIL');
+    const lines = [];
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs: 1000 }, {
+      discover: () => null, env: {}, log: line => lines.push(line),
+      tmpdir: () => '/scratch',
+      fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: () => { throw Error('missing'); } },
+      execute: async () => ({ exitCode: 0, reportText }),
+    });
+    expect(code).toBe(1);
+    expect(lines.join('\n')).toContain('FAIL');
+    expect(lines.join('\n')).not.toContain('GREEN');
+  });
   it('all pass exits zero and prints GREEN plus a line per shard', async () => {
     const f = fixture(); expect(await f.run()).toBe(0);
     expect(f.lines.join('')).toContain('GREEN (all 3 shards, 3 files executed and passed)');

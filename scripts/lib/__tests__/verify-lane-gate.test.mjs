@@ -13,7 +13,7 @@
 import { describe, it, expect } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -1216,10 +1216,26 @@ describe('explicit-list sharding', () => {
     expect(matchRequestedDefaultGate({ gate, env: TODAY, resolved, resolveUnder: () => resolved, variants: false })).toBe(matches ? resolved : null);
   });
 
-  it('recognizes a stamp from checkout A in checkout B and executes a failing always-run guard', () => {
+  it.each(['checkout B', "checkout B's"])("recognizes a stamp from checkout A in executing %s and executes a failing always-run guard", executingName => {
     const root = mkdtempSync(join(tmpdir(), 'verify-cross-checkout-'));
     try {
       const checkoutA = join(root, "checkout A's", 'scripts/lib');
+      const checkoutB = join(root, executingName);
+      const copiedPaths = ['scripts/verify-lane.mjs', 'scripts/lib/verify-lane-gate.mjs', 'scripts/lib/verify-remote-routing.mjs'];
+      mkdirSync(join(checkoutB, 'scripts/lib'), { recursive: true });
+      // Run the real entry and both path-sensitive modules from B. Keep other dependencies
+      // at their original locations; preserve the dynamic admission-module lookup too.
+      symlinkSync(resolve('scripts/readiness'), join(checkoutB, 'scripts/readiness'), 'dir');
+      for (const path of copiedPaths) {
+        const originalUrl = pathToFileURL(resolve(path));
+        const copied = readFileSync(originalUrl, 'utf8').replace(/(from\s+|import\s+)'(\.\.?\/[^']+)'/g,
+          (_, prefix, specifier) => {
+            const dependency = new URL(specifier, originalUrl);
+            const local = copiedPaths.find(p => pathToFileURL(resolve(p)).href === dependency.href);
+            return prefix + JSON.stringify(local ? pathToFileURL(join(checkoutB, local)).href : dependency.href);
+          });
+        writeFileSync(join(checkoutB, path), copied);
+      }
       const repo = join(root, 'target');
       for (const directory of [checkoutA, repo, join(repo, 'scripts'), join(root, 'bin'), join(root, 'state')]) mkdirSync(directory, { recursive: true });
       // Load the real resolver at another absolute root, keeping its dependencies unchanged.
@@ -1290,7 +1306,7 @@ process.exit(1);`);
       const preferences = join(root, 'preferences.json');
       writeFileSync(preferences, JSON.stringify({ heavyAdmission: { cap: 1, fastSlots: 1, remote: { enabled: false } } }));
       env.WE_PLATFORM_PREFERENCES = preferences;
-      const child = spawnSync(process.execPath, [resolve('scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${stamped.command}`, '--run-id=cross-checkout', '--json'],
+      const child = spawnSync(process.execPath, [join(checkoutB, 'scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${stamped.command}`, '--run-id=cross-checkout', '--json'],
         { env, encoding: 'utf8', timeout: 60000 });
       expect(child.error, child.stderr).toBeUndefined();
       const result = JSON.parse(child.stdout.trim().split('\n').at(-1));
@@ -1299,7 +1315,7 @@ process.exit(1);`);
       expect.soft(result.phases?.admissionMode).toBe('phase');
       expect.soft(result.phases?.alwaysRun).toMatchObject({ executed: true, result: 'failed', planned: ['guard.test.mjs'] });
       const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect.soft(commands[0][0]).toBe(resolve('scripts/lib/verify-shard-run.mjs'));
+      expect.soft(commands[0][0]).toBe(join(checkoutB, 'scripts/lib/verify-shard-run.mjs'));
       expect(commands.some(args => args.includes('guard.test.mjs'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
