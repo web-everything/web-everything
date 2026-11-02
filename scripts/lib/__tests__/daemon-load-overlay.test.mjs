@@ -1470,3 +1470,73 @@ describe('legacy explicit load — bounded busy wait', () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 });
+
+describe('adoption requires EVERY registered overlay tip (stale ready-candidate, wev-review-daemon 2026-10)', () => {
+  const fakeGit = ({ inHead = [], tips = {}, ancestryStatus = null } = {}) => (args) => {
+    if (args[0] === 'rev-parse') {
+      const last = args[args.length - 1];
+      if (last === 'HEAD^{commit}') return { status: 0, stdout: 'head1\n' };
+      const m = /^refs\/remotes\/origin\/(.+)\^\{commit\}$/.exec(last);
+      return tips[m?.[1]] ? { status: 0, stdout: `${tips[m[1]]}\n` } : { status: 1, stdout: '' };
+    }
+    if (args[0] === 'merge-base') {
+      if (ancestryStatus !== null) return { status: ancestryStatus, stdout: '' };
+      return { status: inHead.includes(args[2]) ? 0 : 1, stdout: '' };
+    }
+    return { status: 0, stdout: '' };
+  };
+  const tips = { 'lane/a': 'tipA', 'lane/b': 'tipB' };
+
+  it('refuses a candidate that lacks another registered overlay tip', () => {
+    const r = overlayInstalled({ root: '/r', ref: 'lane/a', refs: ['lane/a', 'lane/b'], run: fakeGit({ tips, inHead: ['tipA'] }) });
+    expect(r.inHead).toBe(false);
+    expect(r.missing).toEqual([{ ref: 'lane/b', tip: 'tipB', reason: 'not-in-head' }]);
+  });
+
+  it('adopts a candidate that contains every registered overlay tip', () => {
+    const r = overlayInstalled({ root: '/r', ref: 'lane/a', refs: ['lane/a', 'lane/b'], run: fakeGit({ tips, inHead: ['tipA', 'tipB'] }) });
+    expect(r).toMatchObject({ inHead: true, missing: [] });
+  });
+
+  it('an ancestry-check error on any overlay refuses (fail closed)', () => {
+    const r = overlayInstalled({ root: '/r', ref: 'lane/a', refs: ['lane/a', 'lane/b'], run: fakeGit({ tips, ancestryStatus: 128 }) });
+    expect(r.inHead).toBe(false);
+    expect(r.missing.map((m) => m.reason)).toContain('check-failed');
+  });
+
+  it('an unresolvable registered tip refuses (shallow/pruned clone)', () => {
+    const r = overlayInstalled({ root: '/r', ref: 'lane/a', refs: ['lane/a', 'lane/gone'], run: fakeGit({ tips, inHead: ['tipA'] }) });
+    expect(r.inHead).toBe(false);
+    expect(r.missing).toEqual([{ ref: 'lane/gone', tip: null, reason: 'ref-unresolved' }]);
+  });
+
+  const base = {
+    clone: '/c', ref: 'lane/a', pr: 1, versions: null, log: quietLog, addOverlayFn: vi.fn(),
+    settings: overlaySafetySettings({ WE_OVERLAY_DISPATCH_SMOKE: 'off' }, { readSettings: () => null }),
+  };
+
+  it('runDaemonLoadOverlay passes every registered ref to the installed check and does not report adopted when one is missing', async () => {
+    const seen = [];
+    const rebuild = vi.fn(async () => ({ moved: true, adopted: true, head: 'h', reason: 'ready-adopted' }));
+    const result = await runDaemonLoadOverlay({
+      ...base, rebuild, followUpRebuilds: 0,
+      readOverlayStateFn: () => ({ overlays: [{ ref: 'lane/a' }, { ref: 'lane/b' }], corrupt: false }),
+      installed: (o) => { seen.push(o.refs); return { inHead: false, tip: 'tipA', head: 'h', reason: 'not-in-head', missing: [{ ref: 'lane/b' }] }; },
+    });
+    expect(seen[0]).toEqual(['lane/a', 'lane/b']);
+    expect(result.adopted).toBe(false);
+    expect(result.reason).toBe('installed-build-lacks-overlay');
+  });
+
+  it('an unreadable overlay registry refuses adoption (fail closed)', async () => {
+    const rebuild = vi.fn(async () => ({ moved: true, adopted: true, head: 'h', reason: 'ready-adopted' }));
+    const seen = [];
+    const result = await runDaemonLoadOverlay({
+      ...base, rebuild, followUpRebuilds: 0,
+      readOverlayStateFn: () => ({ overlays: [], corrupt: true }),
+      installed: (o) => { seen.push(o.refs); return o.refs === null ? { inHead: false, tip: null, head: 'h', reason: 'registry-unreadable' } : { inHead: true, tip: 't', head: 'h', reason: 'in-head' }; },
+    });
+    expect(seen[0]).toBe(null);
+    expect(result.adopted).toBe(false);
+  });
+});
