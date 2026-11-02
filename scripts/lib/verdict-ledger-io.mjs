@@ -26,13 +26,14 @@
  * `WE_VERDICT_LEDGER_READ_MAX_BYTES`); the effective value and its source are logged once per process.
  */
 import { execFileSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { readSettings } from './settings-files.mjs';
 import {
   assertPushRef,
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
+import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows, ledgerWriteErrorSummary } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 
@@ -113,7 +114,12 @@ const defaultLog = (line) => { try { process.stderr.write(`${line}\n`); } catch 
 
 export class LedgerAppendExhaustedError extends Error {
   constructor({ repo, attempts, errors }) {
-    super(`verdict-ledger-io: append to ${repo} FAILED after ${attempts} attempts; last error: ${errors.at(-1)?.message ?? 'unknown'}`);
+    const last = errors.at(-1);
+    // Keep the actionable Git line ahead of command/ref/repo boilerplate so the
+    // bounded F4 diagnostic retains e.g. "[rejected] ... (fetch first)".
+    const reason = String(last?.stderr ?? '').split(/\r?\n/)
+      .map((line) => line.trim()).find((line) => /\[rejected\]|^(fatal:|error:)/.test(line));
+    super(`verdict-ledger-io: append FAILED after ${attempts} attempts; last error: ${reason ?? last?.message ?? 'unknown'}; repo=${repo}`);
     this.name = 'LedgerAppendExhaustedError';
     this.repo = repo;
     this.attempts = attempts;
@@ -165,6 +171,7 @@ export function appendLedgerRows({
   message = `verdict-ledger: append ${repo}`,
   sleep = defaultSleep,
   random = Math.random,
+  clock = () => performance.now(),
   onRetry = null,
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
@@ -176,6 +183,7 @@ export function appendLedgerRows({
   const path = ledgerGitPath(repo);
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const started = clock();
     try {
       let written = 0;
       let duplicates = 0;
@@ -207,7 +215,13 @@ export function appendLedgerRows({
       errors.push(e);
       if (attempt < attempts) {
         if (onRetry) onRetry({ attempt, error: e });
-        const cap = Math.min(100 * 2 ** (attempt - 1), 6400);
+        // A loaded checkout/parse/commit/push can take longer than the entire old
+        // backoff schedule. Yield at least one failed attempt's duration so rival
+        // writers can finish, retaining jitter and the eight-attempt fail-closed cap.
+        // Exhaustion still refuses the clearing row; the operator retries with the
+        // last Git cause reported rather than silently clearing without durability.
+        const duration = Math.max(0, clock() - started);
+        const cap = Math.max(Math.min(100 * 2 ** (attempt - 1), 6400), Math.min(2 * duration, 60_000));
         sleep(cap / 2 + random() * cap / 2);
       }
     }
@@ -227,7 +241,8 @@ export function appendGitRowsSync(rows, ctx = {}, { appendRows = appendLedgerRow
     const result = appendRows({ ...rest, repo: check.repo, records: check.records });
     return { ok: true, appended: result.rows ?? rows.length, duplicates: result.duplicates ?? 0 };
   } catch (e) {
-    return { ok: false, appended: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
+    // Redact BEFORE truncating so a cut can never strand a secret fragment.
+    return { ok: false, appended: 0, error: ledgerWriteErrorSummary(String(e?.message ?? e)).slice(0, 300) };
   }
 }
 

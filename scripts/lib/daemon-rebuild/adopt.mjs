@@ -41,7 +41,7 @@ import { launchQuickSoak } from './quick-soak-job.mjs';
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
-  liveApplied, carries = () => false, leftForMain = () => false,
+  liveApplied, carries = () => false, leftForMain = () => false, contentInBuild = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -83,12 +83,21 @@ export function matchReadyCandidate({
   // not count — Codex audit).
   // No exemption for "landed on main": the CURRENT main having it says nothing about the record's (possibly older)
   // main — the record itself must contain it (Codex round 2). A squash-landed overlay just refuses superseded (fail closed).
-  void leftForMain;
-  const omitted = liveApplied.filter((a) => a?.ref && !(a.sha && carries(a.sha, ready.adopt.finalSha)));
+  // The ONE exemption (live 2026-10-31 ET, perf5/perf-fetch overlays): an omitted overlay that this tick's plan itself
+  // auto-removed as `pr-merged`/`in-main` (`leftForMain`) AND whose applied sha is provably contained in THE RECORD'S
+  // OWN BUILD by content (`contentInBuild`: merging it onto that build changes nothing) is not lost — the candidate
+  // already has it. Its registration is already removed by the plan. Any other omission refuses.
+  const retired = [];
+  const omitted = liveApplied.filter((a) => {
+    if (!a?.ref) return false;
+    if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
+    if (a.sha && leftForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    return true;
+  });
   if (omitted.length > 0) {
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
-  return { adopt: ready.adopt, dropRefs: [], match: 'superseded' };
+  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
 /**

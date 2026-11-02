@@ -155,7 +155,7 @@ import {
 // its own writer. NOTHING MERGES ON IT YET — the drain still reads labels; `we:scripts/review-ledger-check.mjs`
 // reports any ledger/label disagreement, and that evidence is what decides whether Phase 2 is safe.
 import {
-  buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES,
+  buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES, ledgerWriteErrorSummary,
 } from './lib/verdict-ledger.mjs';
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
@@ -1975,6 +1975,7 @@ export function runReviewLabelCli({
 
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
+  let clearingLedgerError;
   try {
     const appended = appendVerdict(buildVerdictRecord({
       repo,
@@ -2002,6 +2003,7 @@ export function runReviewLabelCli({
       // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
       // a holding target still swaps (the hold must apply even when the ledger is down).
       clearingLedgerMiss = verdictClears(ledgerVerdict);
+      clearingLedgerError = appended.git?.error ?? appended.errors.join('; ');
     } else if (to === 'clear-human') {
       // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
       // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
@@ -2025,6 +2027,7 @@ export function runReviewLabelCli({
       if (!approval?.ok) {
         process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
         clearingLedgerMiss = true;
+        clearingLedgerError = approval?.git?.error ?? approval?.errors?.join('; ');
       }
     }
   } catch (e) {
@@ -2032,7 +2035,7 @@ export function runReviewLabelCli({
   }
   // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
   if (clearingLedgerMiss) {
-    fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
+    fail(`verdict-ledger write refused for a clearing verdict (F4): ${ledgerWriteErrorSummary(clearingLedgerError)}; the label is NOT swapped; retry once the ledger transport is reachable`, 1);
   }
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
