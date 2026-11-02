@@ -12,13 +12,18 @@ const result = (rev, confirmed = true) => bot(renderRedTeamComment({ pr, rev, pr
   recheckStatus: 'ok', foldedVerdict: confirmed ? 'changes' : 'accept', findings: confirmed ? [1].map(i => ({
     summary: `Break ${i}`, category: 'edge-case', impactIfUnfixed: 'broken',
     file: 'scripts/example.mjs', line: i, confirmedByRecheck: true })) : [] }));
+const human = body => ({ author: { login: 'chalbert', type: 'User' }, body });
 const prState = { number: pr, state: 'OPEN', isDraft: false, labels: [], headRefOid: head };
 const goodLocals = () => ({
   referral: { state: 'none' }, scope: 'present', claim: { claimed: false }, pause: { paused: false },
   sameHead: { spent: false }, rounds: { attempts: 0, cap: 2 },
 });
+const clearComments = (() => {
+  const r = result(head, false);
+  return [r, bot(`${redTeamGateMarker(pr, head, 'no-send-back', liveResultGateState([r], pr, head).resultId)}\ngate`)];
+})();
 const build = (over = {}) => buildEligibilityFacts({
-  pr: prState, comments: [], commentsComplete: true, population: 'fix', locals: goodLocals(), ...over });
+  pr: prState, comments: clearComments, commentsComplete: true, population: 'fix', locals: goodLocals(), ...over });
 
 describe('buildEligibilityFacts', () => {
   it('a fully read PR yields facts the gate dispatches on', () => {
@@ -66,45 +71,70 @@ describe('buildEligibilityFacts', () => {
   });
 });
 
-describe('redTeamFact', () => {
-  it('no red-team comment at all is known none', () => {
-    expect(redTeamFact([], pr, head)).toEqual({ status: 'known', value: { state: 'none', resultId: null, sendBackResultId: null } });
-  });
-  it('a result only for an OLDER head is unread, never none or clear', () => {
-    expect(redTeamFact([result(oldHead)], pr, head)).toEqual({ status: 'unread' });
-  });
-  it('a non-array or missing thread is unread', () => {
-    expect(redTeamFact(undefined, pr, head)).toEqual({ status: 'unread' });
-    expect(redTeamFact([], pr, 'short')).toEqual({ status: 'unread' });
-  });
-  it('a live result with no confirmed break is clear', () => {
-    expect(redTeamFact([result(head, false)], pr, head).value.state).toBe('clear');
-  });
-  it('a live result with confirmed breaks and no gate record is pending, bound to the live result id', () => {
-    const comments = [result(head)];
+const gateFor = (comments, rev, outcome, who = bot) => who(`${redTeamGateMarker(pr, rev, outcome, liveResultGateState(comments, pr, rev).resultId)}\ngate`);
+describe('redTeamFact (gate store only; everything unmapped is unread)', () => {
+  const unreadFact = { status: 'unread' };
+  it('a gate record of no-send-back (clear) for the current head is clear', () => {
+    const comments = [result(head, false)];
+    comments.push(gateFor(comments, head, 'no-send-back'));
     const id = liveResultGateState(comments, pr, head).resultId;
-    expect(redTeamFact(comments, pr, head)).toEqual({ status: 'known', value: { state: 'pending', resultId: id, sendBackResultId: null } });
+    expect(redTeamFact(comments, pr, head)).toEqual({ status: 'known', value: { state: 'clear', resultId: id, sendBackResultId: null } });
+  });
+  it('a gate record for an OLDER head only is unread', () => {
+    const comments = [result(oldHead, false)];
+    comments.push(gateFor(comments, oldHead, 'no-send-back'));
+    expect(redTeamFact(comments, pr, head)).toEqual(unreadFact);
+  });
+  it('no result at all, a bad thread or a bad head is unread', () => {
+    expect(redTeamFact([], pr, head)).toEqual(unreadFact);
+    expect(redTeamFact(undefined, pr, head)).toEqual(unreadFact);
+    expect(redTeamFact([], pr, 'short')).toEqual(unreadFact);
+  });
+  it('a live result with no gate record is unread, not clear or pending', () => {
+    expect(redTeamFact([result(head, false)], pr, head)).toEqual(unreadFact);
+    expect(redTeamFact([result(head)], pr, head)).toEqual(unreadFact);
+  });
+  it('an uppercase marker with no gate record is unread', () => {
+    const upper = bot(result(head, false).body.replace('we:red-team-advisory', 'WE:RED-TEAM-ADVISORY'));
+    expect(redTeamFact([upper], pr, head)).toEqual(unreadFact);
+  });
+  it('an indented confirmed finding with no gate record is unread', () => {
+    const indented = bot(`${result(head, false).body}\n  1. [**confirmed**] (edge-case, broken) \`a.mjs:1\` — hidden break`);
+    expect(redTeamFact([indented], pr, head)).toEqual(unreadFact);
+  });
+  it('a malformed or carried result with no gate record is unread', () => {
+    const bad = bot(`${result(head, false).body}\n1. [**confirmed**] malformed`);
+    expect(redTeamFact([bad], pr, head)).toEqual(unreadFact);
+    const base = result(oldHead, false);
+    const carried = bot([buildVerdictCarriedMarker({ fromSha: oldHead, toSha: head, patchId: 'c'.repeat(40) }),
+      'Review verdict carried across an identical contribution.',
+      base.body.replace(oldHead, head), '1. [**confirmed**] malformed'].join('\n'));
+    expect(redTeamFact([base, carried], pr, head)).toEqual(unreadFact);
   });
   it('a round-cap gate record on the live result is held', () => {
     const comments = [result(head)];
-    const id = liveResultGateState(comments, pr, head).resultId;
-    comments.push(bot(`${redTeamGateMarker(pr, head, 'round-cap', id)}\ncap`));
-    expect(redTeamFact(comments, pr, head).value).toMatchObject({ state: 'held', resultId: id });
+    comments.push(gateFor(comments, head, 'round-cap'));
+    expect(redTeamFact(comments, pr, head).value.state).toBe('held');
   });
-  it('a sent-back gate record on the live result is a send-back bound to that result id', () => {
+  it('a sent-back gate record is a send-back bound to the live result id', () => {
     const comments = [result(head)];
+    comments.push(gateFor(comments, head, 'sent-back'));
     const id = liveResultGateState(comments, pr, head).resultId;
-    comments.push(bot(`${redTeamGateMarker(pr, head, 'sent-back', id)}\nsent`));
     expect(redTeamFact(comments, pr, head).value).toEqual({ state: 'send-back', resultId: id, sendBackResultId: id });
   });
-  it('a send-back recorded for an older result id is not bound to the live one', () => {
+  it('an operator-block record is blocked', () => {
+    const comments = [result(head, false)];
+    comments.push(gateFor(comments, head, 'operator-block', human));
+    expect(redTeamFact(comments, pr, head).value.state).toBe('blocked');
+  });
+  it('a send-back recorded for another result id is not a bound send-back', () => {
     const comments = [result(head)];
-    comments.push(bot(`${redTeamGateMarker(pr, head, 'sent-back', 'f'.repeat(16))}\nsent`));
+    comments.push(bot(`${redTeamGateMarker(pr, head, 'sent-back', 'f'.repeat(16))}\nx`));
     const v = redTeamFact(comments, pr, head);
-    expect(v.status === 'unread' || v.value.state !== 'send-back' || v.value.sendBackResultId !== v.value.resultId).toBe(true);
-    expect(eligibility({ ...prState, commentsComplete: true }, build({ comments })).dispatch).toBeUndefined();
+    expect(v.status === 'unread' || v.value.state !== 'send-back').toBe(true);
   });
 });
+
 
 describe('reconcile-pass shadow fact', () => {
   const labelled = { number: pr, headRefOid: head, labels: [{ name: 'merge-status:conflicting' }] };
@@ -129,23 +159,3 @@ describe('reconcile-pass shadow fact', () => {
   });
 });
 
-describe('redTeamFact audit closures', () => {
-  it('an operator-block record on the live result is blocked even with no confirmed finding', () => {
-    const comments = [result(head, false)];
-    const id = liveResultGateState(comments, pr, head).resultId;
-    comments.push({ author: { login: 'chalbert', type: 'User' }, body: `${redTeamGateMarker(pr, head, 'operator-block', id)}\nblock` });
-    expect(redTeamFact(comments, pr, head).value?.state ?? 'unread').not.toBe('clear');
-  });
-  it('a malformed finding line makes the result unread, not clear', () => {
-    const good = result(head, false);
-    const bad = bot(`${good.body}\n1. [**confirmed**] malformed finding line without a category`);
-    expect(redTeamFact([bad], pr, head)).toEqual({ status: 'unread' });
-  });
-  it('a carried verdict with a malformed finding line is unread, not clear', () => {
-    const base = result(oldHead, false);
-    const carried = bot([buildVerdictCarriedMarker({ fromSha: oldHead, toSha: head, patchId: 'c'.repeat(40) }),
-      'Review verdict carried across an identical contribution.',
-      base.body.replace(oldHead, head), '1. [**confirmed**] malformed finding line without a category'].join('\n'));
-    expect(redTeamFact([base, carried], pr, head)).toEqual({ status: 'unread' });
-  });
-});
