@@ -40,6 +40,20 @@ export default {
     const plan = planCatchUp({ prs: [{ num: 42, labels: [{ name: 'ready-to-merge' }], baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', isDraft: false, inQueue: false, readyAt: 0 }],
       queued: 0, capacity: 5, pendingNums: [42], pendingSince: new Map([[42, 0]]), pendingExpiryMinutes: 15, repo: 'example/web', now });
     if (!plan.run.some((r) => r.num === 42)) violations.push('an 80-minute stale pending catch-up entry was never retried');
+    // PR #6224 send-back: resolving the early read must not surrender the next
+    // cascade slot; only confirmed landing/departure retires recovery priority.
+    const repo = 'example/web';
+    const marks = drain.markStuckUnknown(new Map(), { repo, num: 42, now: 0 });
+    const resolved = drain.pruneStuckUnknown(marks, { prs: [{ repo, num: 42, mergeable: 'MERGEABLE' }] });
+    if (!resolved.has(`${repo}#42`)) violations.push('the early resolved read surrendered starvation priority before landing');
+    if (drain.decideStuckUnknownAlert(resolved, { now }).length) violations.push('resolved mergeability retained a stale UNKNOWN alert');
+    const candidates = [1, 2, 42].map(num => ({ repo, num, decision: 'merge' }));
+    const ordered = drain.planLabelDrain(candidates, { readyOrder: { order: 'ready-age', priority: { mode: 'enforce' },
+      stuckUnknownMarks: resolved, now, infoOf: c => ({ readyAtMs: c.num, facts: { incident: { open: true, owner: c.num === 2 } } }) } });
+    if (ordered.ready.map(c => c.num).join(',') !== '2,42,1') violations.push('recovery failed to keep its cascade slot behind the main-fix delivery class');
+    if (ordered.readyOrder.map(c => c.num).join(',') !== ordered.ready.map(c => c.num).join(',')) violations.push('readyOrder described a different merge order');
+    const departed = drain.pruneStuckUnknown(marks, { prs: [], listedRepos: [repo] });
+    if (departed.size || drain.decideStuckUnknownAlert(departed, { now }).length) violations.push('a departed PR retained its UNKNOWN mark or alert');
     return { violations };
   },
   judge(report) { return report.violations; },

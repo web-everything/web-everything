@@ -1186,23 +1186,35 @@ export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN
 export function markStuckUnknown(marks, { repo, num, now }) {
   const next = new Map(marks);
   const key = `${repo}#${num}`;
-  if (!next.has(key)) next.set(key, { repo, num, since: now });
+  if (!next.has(key) || next.get(key).resolved) next.set(key, { repo, num, since: now });
   return next;
 }
 
-export function pruneStuckUnknown(marks, { prs }) {
+export function pruneStuckUnknown(marks, { prs, listedRepos = [], now = Date.now() }) {
   const next = new Map(marks);
+  // Absence is evidence only for a successful, complete live candidate listing.
+  const complete = new Set(listedRepos);
+  const present = new Set(prs.map(pr => `${pr.repo}#${pr.num}`));
+  for (const [key, mark] of next) if (complete.has(mark.repo) && !present.has(key)) next.delete(key);
   for (const pr of prs) {
-    if (['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable) || ['CLOSED', 'MERGED'].includes(pr.state)) {
-      next.delete(`${pr.repo}#${pr.num}`);
+    const key = `${pr.repo}#${pr.num}`;
+    if (['CLOSED', 'MERGED'].includes(pr.state)) {
+      next.delete(key);
+    } else if (next.has(key) && ['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable)) {
+      // Resolution silences the alert, but must not reintroduce ready-not-reached
+      // starvation on this or a subsequent drain invocation.
+      next.set(key, { ...next.get(key), resolved: true });
+    } else if (next.get(key)?.resolved && pr.mergeable === 'UNKNOWN') {
+      // A new UNKNOWN episode must age even if another hold prevents revalidation.
+      next.set(key, { repo: pr.repo, num: pr.num, since: now });
     }
   }
   return next;
 }
 
-export function orderStuckUnknownFirst(prs, marks) {
+export function orderStuckUnknownFirst(prs, marks, { priorityOf = () => 0 } = {}) {
   const marked = pr => marks.has(`${pr.repo}#${pr.num}`);
-  return [...prs.filter(marked), ...prs.filter(pr => !marked(pr))];
+  return [...prs].sort((a, b) => priorityOf(a) - priorityOf(b) || Number(marked(b)) - Number(marked(a)));
 }
 
 export function nudgeMergeability({ repo, num, read }) {
@@ -1211,7 +1223,7 @@ export function nudgeMergeability({ repo, num, read }) {
 
 export function decideStuckUnknownAlert(marks, { now, afterMinutes = 30 }) {
   const bound = Number.isFinite(afterMinutes) && afterMinutes > 0 ? afterMinutes : 30;
-  return [...marks.values()].filter(mark => now - mark.since > bound * 60_000)
+  return [...marks.values()].filter(mark => !mark.resolved && now - mark.since > bound * 60_000)
     .map(mark => ({ kind: 'stuck-unknown-mergeability', ...mark, ageMinutes: (now - mark.since) / 60_000,
       reason: 'mergeability remains UNKNOWN; inspect the PR on GitHub and retry the drain; merge remains refused' }));
 }
@@ -1221,7 +1233,8 @@ function loadStuckUnknown(path) {
     const rows = JSON.parse(readFileSync(path, 'utf8'));
     if (!Array.isArray(rows)) return new Map();
     return new Map(rows.filter(row => typeof row?.repo === 'string' && Number.isInteger(row.num) && row.num > 0
-      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since }]));
+      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since,
+        ...(row.resolved === true ? { resolved: true } : {}) }]));
   } catch { return new Map(); }
 }
 
@@ -2779,7 +2792,7 @@ const ET_CLOCK = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York'
  * @param {{order:string, priority:object, now:number, infoOf:(c:object)=>({readyAtMs:number|null, facts:object})}} ctx
  * @returns {{ordered:Array, reasons:Array<{num:number, repo:(string|null), class:string, readyAtMs:(number|null), reason:string}>}}
  */
-export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }) } = {}) {
+export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }), stuckUnknownMarks = new Map() } = {}) {
   const list = Array.isArray(ready) ? ready : [];
   const settings = resolvePrioritySettings(priority);
   const infos = list.map((c) => { try { return infoOf(c) ?? {}; } catch { return {}; } });
@@ -2790,14 +2803,20 @@ export function orderReadyCandidates(ready, { order = 'ready-age', priority, now
   const cls = (r) => PRIORITY_CLASSES.indexOf(r.p.class);
   const age = (r) => (r.readyAtMs == null ? Infinity : r.readyAtMs);
   if (order === 'ready-age') rows.sort((a, b) => (enforce ? cls(a) - cls(b) : 0) || (age(a) - age(b)) || (a.c.num - b.c.num) || (a.i - b.i));
-  const reasons = rows.map((r) => {
+  const byCandidate = new Map(rows.map(r => [r.c, r]));
+  const ordered = orderStuckUnknownFirst(rows.map(r => r.c), stuckUnknownMarks, {
+    priorityOf: c => enforce ? cls(byCandidate.get(c)) : 0,
+  });
+  const reasons = ordered.map(c => {
+    const r = byCandidate.get(c);
     const when = r.readyAtMs == null ? 'ready time unknown'
       : `ready ${ET_CLOCK.format(new Date(r.readyAtMs))} ET, waited ${Math.max(0, Math.floor((now - r.readyAtMs) / 60_000))} min`;
     const why = r.p.reasons.join('; ');
     const head = order === 'card-number' ? `card ${r.c.item ?? 'none'} · ${r.p.class}` : (enforce ? `${r.p.class} (${why})` : r.p.class);
-    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}` };
+    const recovery = stuckUnknownMarks.has(`${c.repo}#${c.num}`) ? ' · persistent UNKNOWN recovery priority' : '';
+    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: (enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}`) + recovery };
   });
-  return { ordered: rows.map((r) => r.c), reasons };
+  return { ordered, reasons };
 }
 
 /** PURE. The pass's order log: a header line, then one line per ready PR with its reason. */
@@ -4851,10 +4870,7 @@ async function runCli() {
       const data = JSON.parse(raw || '{}');
       if (!data || (!fields && data.number !== num)) return null;
       const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
-      if (pruned.size !== stuckUnknownMarks.size) {
-        stuckUnknownMarks = pruned;
-        if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
-      }
+      updateStuckUnknown(pruned);
       if (fields) return data;
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
@@ -4865,6 +4881,16 @@ async function runCli() {
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
   const stuckUnknownPath = join(dirname(refreshedStatePath()), 'stuck-unknown-mergeability.json');
   let stuckUnknownMarks = loadStuckUnknown(stuckUnknownPath);
+  const updateStuckUnknown = next => {
+    const changed = next.size !== stuckUnknownMarks.size || [...next].some(([key, mark]) => mark.resolved !== stuckUnknownMarks.get(key)?.resolved);
+    if (!changed) return;
+    stuckUnknownMarks = next;
+    if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+    for (const [key] of stuckUnknownAlerts) if (!next.has(key) || next.get(key).resolved) stuckUnknownAlerts.delete(key);
+  };
+  const clearLandedStuckUnknown = c => updateStuckUnknown(pruneStuckUnknown(stuckUnknownMarks, {
+    prs: [{ repo: c.repo || localSlug, num: c.num, state: 'MERGED' }],
+  }));
   // Persist canonical slugs; adapt keys to the pass's null-for-local convention without changing candidates.
   const passStuckUnknownMarks = () => new Map([...stuckUnknownMarks.values()].flatMap(mark =>
     [mark.repo, ...REPOS.filter(repo => (repo || localSlug) === mark.repo)]
@@ -5407,7 +5433,7 @@ async function runCli() {
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
       // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', readLiveRows: listLive };
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5437,6 +5463,15 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
+  // Do not prune against failed, truncated or round-snapshot listings, nor the
+  // later --pr narrowing: none proves that another marked PR left the queue.
+  for (const listing of listings) {
+    if (!listing.complete) continue;
+    const repo = listing.repo || localSlug;
+    updateStuckUnknown(pruneStuckUnknown(stuckUnknownMarks, {
+      prs: listing.prs.map(pr => ({ repo, num: pr.number })), listedRepos: [repo],
+    }));
+  }
   // #4108 — reuse only this pass's live listings; round snapshot rows never serve context.
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
@@ -6562,7 +6597,7 @@ async function runCli() {
     const repoKey = isLocalRepo(c.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(c.repo);
     return { readyAtMs: info.readyAtMs, facts: drainPriorityFacts(c, { ...info, mainFix: drainMainFix, repoKey }) };
   };
-  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf });
+  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf, stuckUnknownMarks: passStuckUnknownMarks() });
   let lastDrainOrderLog = null;
   const logDrainOrder = (plan) => {
     if (AS_JSON || !Array.isArray(plan?.readyOrder) || !plan.readyOrder.length) return;
@@ -6607,7 +6642,6 @@ async function runCli() {
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
-    p.ready = orderStuckUnknownFirst(p.ready, passStuckUnknownMarks());
     logDrainOrder(p);
     return p;
   };
@@ -6984,6 +7018,7 @@ async function runCli() {
         // revalidation). Recorded into `merged` so its numbering / resolve-on-land / derived regen runs this pass —
         // those steps are idempotent, and once merged a PR drops off every later pass's open-PR listing.
         const recordAlreadyMerged = () => {
+          clearLandedStuckUnknown(c);
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null });
           progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c));
@@ -7164,6 +7199,7 @@ async function runCli() {
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
+          clearLandedStuckUnknown(c);
           await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
@@ -7544,7 +7580,10 @@ async function runCli() {
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
-  const alerts = [...stuckUnknownAlerts.values()].filter(alert => stuckUnknownMarks.has(`${alert.repo}#${alert.num}`));
+  const alerts = [...stuckUnknownAlerts.values()].filter(alert => {
+    const mark = stuckUnknownMarks.get(`${alert.repo}#${alert.num}`);
+    return mark && !mark.resolved;
+  });
   const result = { alerts, ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
