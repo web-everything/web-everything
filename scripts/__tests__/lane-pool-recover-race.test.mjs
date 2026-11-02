@@ -326,9 +326,9 @@ describe('automatic reclaim backup-to-reset guard', () => {
     const guard = 'if (process.env.WE_LANE_RECOVERY_BACKUP !== undefined) {';
     const source = readFileSync(script, 'utf8');
     expect(source.split(guard)).toHaveLength(2);
-    // Keep imports pointed at the real modules; only the destructive-boundary guard is disabled.
-    const mutant = source.replace(guard, 'if (false) {').replace(/from '(\.[^']+)'/g,
-      (_, specifier) => `from '${pathToFileURL(resolve(dirname(script), specifier)).href}'`);
+    // Relocate static, side-effect and dynamic imports; only the destructive-boundary guard is disabled.
+    const mutant = source.replace(guard, 'if (false) {').replace(/(from\s+|import\s*\(\s*|import\s+)(['"])(\.[^'"]+)\2/g,
+      (_, prefix, quote, specifier) => `${prefix}${quote}${pathToFileURL(resolve(dirname(script), specifier)).href}${quote}`);
     const lanePoolPath = join(base, 'lane-pool-mutant.mjs');
     writeFileSync(lanePoolPath, mutant);
     const observed = await recoverWithRace({ lanePoolPath });

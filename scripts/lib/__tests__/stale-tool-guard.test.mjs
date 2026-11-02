@@ -75,7 +75,7 @@ describe('importClosure', () => {
           named
         } from "./fixture/multiline.mjs";
         import fs from 'node:fs';
-        import pkg from 'external-package';
+        import pkg from 'typescript';
         const lazy = import('./fixture/dynamic.mjs');
       `,
       'scripts/fixture/dep.mjs': "import '../fixture/../fixture-tool.mjs'; export * from '../../shared/leaf.mjs';",
