@@ -283,7 +283,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   rulingLookup = rulingNeeded,
   liveGate = true } = {}) {
   const actorLines = [];
-  loadActorSettings({ env, readSettings: () => readSettings(checkoutRoot), log: line => actorLines.push(line) });
+  const actorSettings = loadActorSettings({ env, readSettings: () => readSettings(checkoutRoot), log: line => actorLines.push(line) });
   logSettings(settings, line => log(line.startsWith('needs-you-feed enabled=')
     ? `${line}; ${actorLines.join('; ')}` : line));
   assertProducerCheckout(checkoutRoot, { env, settings });
@@ -339,7 +339,8 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
       const repos = new Set(items.map(item => item.repo).filter(repo => typeof repo === 'string' && repo));
       const rows = ['rulingNeeded', 'stoodDown', 'needsPerson'].flatMap(key => report[key] ?? []);
       for (const repo of repos) {
-        ledgers[repo] = recordSweep({ ledger: previous[repo], sweepId: new Date(now).toISOString(),
+        ledgers[repo] = recordSweep({ ledger: previous[repo], sweepId: new Date(now).toISOString(), now: new Date(now).getTime(),
+          maxStreakAgeMinutes: actorSettings.maxStreakAgeMinutes,
           items: items.filter(item => item.repo === repo && item.kind !== 'needs-you' && rulingGate.confirmed.has(item)).map(item => {
             const row = rows.find(row => row.repo === repo && (row.number ?? row.pr) === item.pr);
             return { pr: item.pr, head: rulingGate.confirmed.get(item), cause: row?.kind || item.kind };

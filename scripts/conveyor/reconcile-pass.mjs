@@ -1595,7 +1595,8 @@ export function runReconcilePass({
       .filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
   }
   const escalationStreaks = actor.enabled ? owedTakeovers({ ledger: ledger[CONSTELLATION_REPOS[repoKey].slug],
-    threshold: actor.threshold, cap: actor.takeoverCapPerHead, takeoverCountsByHead }) : [];
+    threshold: actor.threshold, cap: actor.takeoverCapPerHead, takeoverCountsByHead, now,
+    maxStreakAgeMinutes: actor.maxStreakAgeMinutes }) : [];
   const plan = planReconcile({
     escalationStreaks, escalationTakeoverCapPerHead: actor.takeoverCapPerHead,
     reviewTiming: timing.review, fixTiming: timing.fix,

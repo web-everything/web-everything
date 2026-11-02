@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 // Phase 1 deliberately imports the absent module: no implementation or substitute lives in this fixture.
-import { recordSweep, owedTakeovers, resolveEscalationActorSettings } from '../escalation-actor.mjs';
+import { recordSweep as recordSweepWithClock, owedTakeovers as owedTakeoversWithClock, resolveEscalationActorSettings } from '../escalation-actor.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { planTakeover, threadMayBeTruncated } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverMarkers } from '../fix-takeover.mjs';
@@ -8,8 +8,12 @@ import { LIST_COMMENTS_PAGE_SIZE } from '../pr-comments-complete.mjs';
 
 const HEAD = 'a'.repeat(40);
 const NEXT = 'b'.repeat(40);
+const NOW = Date.parse('2026-11-02T12:00:00Z');
+const SEEN_AT = new Date(NOW).toISOString();
+const recordSweep = options => recordSweepWithClock({ now: NOW, ...options });
+const owedTakeovers = options => owedTakeoversWithClock({ now: NOW, ...options });
 const item = (over = {}) => ({ pr: 6023, head: HEAD, cause: 'fix-cap-exhausted', ...over });
-const entry = (over = {}) => ({ head: HEAD, cause: 'fix-cap-exhausted', streak: 2, lastSweepId: 's2', ...over });
+const entry = (over = {}) => ({ head: HEAD, cause: 'fix-cap-exhausted', streak: 2, lastSweepId: 's2', seenAt: SEEN_AT, ...over });
 const deepFreeze = value => {
   if (value && typeof value === 'object') {
     Object.values(value).forEach(deepFreeze);
@@ -19,6 +23,24 @@ const deepFreeze = value => {
 };
 
 describe('recordSweep', () => {
+  it('audit: records the injected sweep time and never refreshes it when replaying the same sweep', () => {
+    const ledger = { 6023: entry() };
+    expect(recordSweep({ ledger, items: [item()], sweepId: 's2', now: NOW + 60000 })).toEqual(ledger);
+    expect(recordSweep({ ledger, items: [item()], sweepId: 's3', now: NOW + 60000 }))
+      .toEqual({ 6023: entry({ streak: 3, lastSweepId: 's3', seenAt: new Date(NOW + 60000).toISOString() }) });
+  });
+
+  it.each(['2020-01-01T00:00:00Z', undefined])('audit: an expired or legacy streak (%s) restarts at one on a new sweep', seenAt => {
+    expect(recordSweep({ ledger: { 6023: entry({ seenAt }) }, items: [item()], sweepId: 's3' }))
+      .toEqual({ 6023: entry({ streak: 1, lastSweepId: 's3' }) });
+  });
+
+  it('audit: replaying an expired sweep cannot refresh its persisted observation time', () => {
+    const ledger = { 6023: entry({ seenAt: '2020-01-01T00:00:00Z' }) };
+    const replayed = recordSweep({ ledger, items: [item()], sweepId: 's2' });
+    expect(replayed).toEqual(ledger);
+    expect(owedTakeovers({ ledger: replayed, cap: 1, takeoverCountsByHead: {} })).toEqual([]);
+  });
   it('starts at one and increments the same PR, head and cause on the next sweep without mutation', () => {
     const items = deepFreeze([item()]);
     const first = deepFreeze(recordSweep({ ledger: {}, items, sweepId: 's1' }));
@@ -67,6 +89,32 @@ describe('recordSweep', () => {
 });
 
 describe('owedTakeovers', () => {
+  it('audit: ignores a persisted 2020 streak and honours a fresh streak using the injected clock', () => {
+    const ledger = { 6023: entry({ seenAt: '2020-01-01T00:00:00Z' }), 6024: entry() };
+    expect(owedTakeovers({ ledger, cap: 1, takeoverCountsByHead: {} }))
+      .toEqual([item({ pr: 6024, streak: 2 })]);
+  });
+
+  it.each([undefined, null, '', 'invalid', false, [], Infinity, '2026-11-02T12:01:00Z'])
+    ('audit: unknown, invalid or future seenAt %j grants no takeover', seenAt => {
+      expect(owedTakeovers({ ledger: { 6023: entry({ seenAt }) }, cap: 1, takeoverCountsByHead: {} })).toEqual([]);
+    });
+
+  it('audit: enforces the default 30-minute boundary and a configured freshness age', () => {
+    const options = { ledger: { 6023: entry({ seenAt: new Date(NOW - 30 * 60000).toISOString() }) }, cap: 1, takeoverCountsByHead: {} };
+    expect(owedTakeovers(options)).toEqual([item({ streak: 2 })]);
+    expect(owedTakeovers({ ...options, now: NOW + 1 })).toEqual([]);
+    expect(owedTakeovers({ ...options, now: NOW + 1, maxStreakAgeMinutes: 31 })).toEqual([item({ streak: 2 })]);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, '30', false])('audit: invalid max streak age %j grants no allowance', maxStreakAgeMinutes => {
+    expect(owedTakeovers({ ledger: { 6023: entry() }, cap: 1, takeoverCountsByHead: {}, maxStreakAgeMinutes })).toEqual([]);
+  });
+
+  it.each([undefined, null, NaN, Infinity, false])('audit: an unknown injected clock %j cannot refresh or authorize a streak', now => {
+    expect(recordSweep({ ledger: { 6023: entry() }, items: [item()], sweepId: 's3', now })).toEqual({});
+    expect(owedTakeovers({ ledger: { 6023: entry() }, cap: 1, takeoverCountsByHead: {}, now })).toEqual([]);
+  });
   it('defaults to two consecutive sweeps and emits only the contracted fields without mutation', () => {
     const ledger = deepFreeze({ 6023: entry(), 6024: entry({ streak: 1 }), 6025: entry({ streak: 3 }) });
     expect(owedTakeovers({ ledger, takeoverCountsByHead: {}, cap: 1 }))
@@ -98,7 +146,7 @@ describe('owedTakeovers', () => {
 });
 
 describe('resolveEscalationActorSettings', () => {
-  const defaults = { enabled: true, threshold: 2, takeoverCapPerHead: 1 };
+  const defaults = { enabled: true, threshold: 2, takeoverCapPerHead: 1, maxStreakAgeMinutes: 30 };
   const resolve = (env = {}, actor = {}) => resolveEscalationActorSettings({ env,
     readSettings: () => ({ escalation: { actor } }) });
   const provenance = (result, pattern) => {
@@ -112,15 +160,16 @@ describe('resolveEscalationActorSettings', () => {
   });
 
   it('reads escalation.actor settings and names their source', () => {
-    const result = resolve({}, { enabled: false, threshold: 4, takeoverCapPerHead: 0 });
-    expect(result).toMatchObject({ enabled: false, threshold: 4, takeoverCapPerHead: 0 });
+    const result = resolve({}, { enabled: false, threshold: 4, takeoverCapPerHead: 0, maxStreakAgeMinutes: 15 });
+    expect(result).toMatchObject({ enabled: false, threshold: 4, takeoverCapPerHead: 0, maxStreakAgeMinutes: 15 });
     provenance(result, /settings|tool/i);
   });
 
   it('environment overrides settings, including explicit false and zero', () => {
     const result = resolve({ WE_ESCALATION_ACTOR_ENABLED: 'false', WE_ESCALATION_ACTOR_THRESHOLD: '3',
-      WE_ESCALATION_ACTOR_TAKEOVER_CAP: '0' }, { enabled: true, threshold: 7, takeoverCapPerHead: 5 });
-    expect(result).toMatchObject({ enabled: false, threshold: 3, takeoverCapPerHead: 0 });
+      WE_ESCALATION_ACTOR_TAKEOVER_CAP: '0', WE_ESCALATION_ACTOR_MAX_STREAK_AGE_MINUTES: '12' },
+    { enabled: true, threshold: 7, takeoverCapPerHead: 5, maxStreakAgeMinutes: 15 });
+    expect(result).toMatchObject({ enabled: false, threshold: 3, takeoverCapPerHead: 0, maxStreakAgeMinutes: 12 });
     provenance(result, /env/i);
   });
 
@@ -133,6 +182,10 @@ describe('resolveEscalationActorSettings', () => {
     ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', '-1'],
     ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', '1.5'],
     ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', 'Infinity'],
+    ['maxStreakAgeMinutes', 'WE_ESCALATION_ACTOR_MAX_STREAK_AGE_MINUTES', '0'],
+    ['maxStreakAgeMinutes', 'WE_ESCALATION_ACTOR_MAX_STREAK_AGE_MINUTES', '-1'],
+    ['maxStreakAgeMinutes', 'WE_ESCALATION_ACTOR_MAX_STREAK_AGE_MINUTES', '1.5'],
+    ['maxStreakAgeMinutes', 'WE_ESCALATION_ACTOR_MAX_STREAK_AGE_MINUTES', 'Infinity'],
   ])('invalid env %s=%s (%s) disables the actor and names the invalid source', (key, variable, value) => {
     const result = resolve({ [variable]: value }, { enabled: false, threshold: 8, takeoverCapPerHead: 8 });
     expect(result.enabled).toBe(false);
@@ -141,7 +194,8 @@ describe('resolveEscalationActorSettings', () => {
     expect(String(result.sources[key])).toMatch(/env|WE_ESCALATION_ACTOR/i);
   });
 
-  it.each([['enabled', 'perhaps'], ['threshold', 0], ['threshold', 1.5], ['takeoverCapPerHead', -1], ['takeoverCapPerHead', Infinity]])
+  it.each([['enabled', 'perhaps'], ['threshold', 0], ['threshold', 1.5], ['takeoverCapPerHead', -1], ['takeoverCapPerHead', Infinity],
+    ['maxStreakAgeMinutes', 0], ['maxStreakAgeMinutes', '30'], ['maxStreakAgeMinutes', Infinity]])
     ('invalid settings %s=%j disables the actor with provenance', (key, value) => {
       const result = resolve({}, { [key]: value });
       expect(result.enabled).toBe(false);
@@ -149,6 +203,22 @@ describe('resolveEscalationActorSettings', () => {
       expect(String(result.sources[key])).toMatch(/invalid/i);
       expect(String(result.sources[key])).toMatch(/settings|tool/i);
     });
+
+  it.each([
+    ['enabled', 'perhaps', 'WE_ESCALATION_ACTOR_ENABLED', 'true'],
+    ['threshold', 'bad', 'WE_ESCALATION_ACTOR_THRESHOLD', '3'],
+    ['takeoverCapPerHead', -1, 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', '2'],
+    ['maxStreakAgeMinutes', 0, 'WE_ESCALATION_ACTOR_MAX_STREAK_AGE_MINUTES', '30'],
+  ])('audit: invalid %s at any lower layer remains disabling after a valid higher override', (key, bad, variable, good) => {
+    for (const layer of ['tool', 'platform']) {
+      const result = resolveEscalationActorSettings({ env: { [variable]: good },
+        readPlatform: () => layer === 'platform' ? { [key]: bad } : {},
+        readSettings: () => ({ escalation: { actor: layer === 'tool' ? { [key]: bad } : defaults } }) });
+      expect(result.enabled).toBe(false);
+      expect(result.sources.enabled).toMatch(new RegExp(`${layer}.*invalid`));
+      expect(result.sources[key]).toMatch(new RegExp(`${layer}.*invalid`));
+    }
+  });
 
   it.each([
     ['enabled', 'WE_ESCALATION_ACTOR_ENABLED', 'perhaps'],

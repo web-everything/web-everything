@@ -2774,7 +2774,10 @@ export function planReconcile({
         continue;
       }
       const redTeamHold = labelNames(pr.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
-      const redTeamSendBack = redTeamHold && labelNames(pr.labels).includes('review:changes');
+      const redTeamRound = redTeamHold && phase === 'bounced' && currentRound(pr.comments, pr.headRefOid, { strict: true });
+      const redTeamSendBack = redTeamHold && phase === 'bounced' && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN'
+        && /^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') && redTeamRound?.head && sameHeadSha(redTeamRound.head, pr.headRefOid)
+        && openDefects(pr.comments, pr.headRefOid)?.count >= 1;
       if (redTeamHold && !redTeamSendBack) {
         refuse('draft', { ...withPhase, why: `${redTeamHold} — a draft held by red team is never promoted` });
         continue;

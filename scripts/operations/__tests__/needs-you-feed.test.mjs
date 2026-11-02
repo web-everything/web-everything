@@ -33,7 +33,8 @@ describe('feed', () => {
     const options = { home, checkoutRoot: home, settings, env: {}, log: () => {}, gh,
       exec: () => JSON.stringify(report), rulingLookup: async () => ({ pending: true }) };
     await runOnce({ ...options, now: '2026-11-02T12:00:00Z' });
-    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023].streak).toBe(1);
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023])
+      .toMatchObject({ streak: 1, seenAt: '2026-11-02T12:00:00.000Z' });
     readable = false;
     const failed = await runOnce({ ...options, now: '2026-11-02T12:02:00Z' });
     expect(failed.openKeys).toContain(`${repo}#6023@${head}:ruling-needed`);
