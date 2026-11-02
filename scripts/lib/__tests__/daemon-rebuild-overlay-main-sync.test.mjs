@@ -1539,4 +1539,45 @@ describe('R372 genuine merge conflict stops retrying', () => {
     tick(f, { spawnFn, git });
     expect(spawnFn).not.toHaveBeenCalled();
   });
+  it('migrates the legacy .main-sync.json state once: its push cooldown still holds', () => {
+    const f = fixture({ conflict: true });
+    fs.writeFileSync(`${overlayFilePath(f.root, f.env)}.main-sync.json`, JSON.stringify({
+      lastSyncedMain: {}, pushRetryMain: { [ref]: f.mainSha }, pushRetryAfter: { [ref]: Date.now() + 600_000 },
+    }));
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [] });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
+  it('a legacy file that is corrupt still fails closed', () => {
+    const f = fixture({ conflict: true });
+    fs.writeFileSync(`${overlayFilePath(f.root, f.env)}.main-sync.json`, '{not json');
+    const spawnFn = spawner();
+    tick(f, { spawnFn });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
+  it('the stale-record pruner never treats a sidecar named <key>.json.* as an overlay record', () => {
+    const f = fixture({ conflict: true });
+    const legacy = `${overlayFilePath(f.root, f.env)}.main-sync.json`;
+    fs.writeFileSync(legacy, JSON.stringify({ lastSyncedMain: {} }));
+    pruneStaleOverlayRecords(f.base, { env: f.env, log: () => {} });
+    expect(fs.existsSync(legacy)).toBe(true);
+  });
+
+  it('clears the remembered conflict pair as soon as the ref tip moves, so the retry cap applies to later failures', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    moveRefTip(f);
+    tick(f, { spawnFn: spawner() });
+    const state = json(sidecar(f));
+    expect(state.conflictMain[ref]).toBeUndefined();
+    expect(state.conflictTip[ref]).toBeUndefined();
+    expect(state.attemptedMain[ref]).toBeUndefined();
+    // A later non-conflict failure exhausts the cap and is remembered like any other failure.
+    fs.writeFileSync(sidecar(f), JSON.stringify({ ...state, attemptedMain: { [ref]: f.mainSha } }));
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [] });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
 });

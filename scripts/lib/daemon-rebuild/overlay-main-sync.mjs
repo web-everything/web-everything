@@ -100,7 +100,12 @@ function readSyncState(file, io = fs) {
   let data;
   try {
     data = JSON.parse(io.readFileSync(file, 'utf8'));
-  } catch (error) { if (error.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw error; }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    // One-time migration: the pre-rename state file (retry caps, cooldowns) is read when no new file exists yet.
+    try { data = JSON.parse(io.readFileSync(file.replace(/\.state$/, '.json'), 'utf8')); }
+    catch (legacy) { if (legacy.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw legacy; }
+  }
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
   for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
@@ -282,10 +287,18 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
       // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
       if (pairKnown) { result.skipped.push(ref); continue; }
-      // A moved ref tip (owner rebased) re-opens a conflict-marked main.
-      const tipMoved = Object.hasOwn(synced.conflictMain, ref) && synced.conflictMain[ref] === main;
+      if (Object.hasOwn(synced.conflictMain, ref)) {
+        // Either sha moved: forget the pair now, so the normal retry cap governs any later failure.
+        const old = synced.conflictMain[ref];
+        updateSyncState(sidecar(root, env), state => {
+          delete state.conflictMain[ref]; delete state.conflictTip[ref];
+          if (state.attemptedMain[ref] === old) delete state.attemptedMain[ref];
+        });
+        delete synced.conflictMain[ref]; delete synced.conflictTip[ref];
+        if (synced.attemptedMain[ref] === old) delete synced.attemptedMain[ref];
+      }
       const last = synced.lastSyncedMain[ref];
-      const attemptedHere = synced.attemptedMain[ref] === main && !tipMoved;
+      const attemptedHere = synced.attemptedMain[ref] === main;
       if (attemptedHere && Object.hasOwn(synced.firstFailureAt, ref)
         && !Object.hasOwn(synced.failureAlertedAt, ref)) failureAlert(root, env, ref);
       if (last === main || attemptedHere || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
