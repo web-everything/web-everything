@@ -9,6 +9,8 @@ import { resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
 import { runRemote } from '../../readiness/remote-exec.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
+import { pidIdentity } from '../pid-alive.mjs';
 import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES } from '../verify-shard-run.mjs';
 
 describe('shard split', () => {
@@ -196,18 +198,26 @@ describe('review regressions: Forge and supervisor wiring', () => {
     const directory = mkdtempSync(resolve(tmpdir(), 'shard-cancel-'));
     const pidFile = resolve(directory, 'pids');
     const moduleUrl = pathToFileURL(resolve('scripts/lib/verify-shard-run.mjs')).href;
-    const childCode = `const {spawn}=require('node:child_process'); const grandchild=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid,grandchild.pid])); setInterval(()=>{},1000);`;
+    // Anchor both sleepers to the test runner, so losing their parent cannot
+    // satisfy the signal assertion. The lifetime bound still cleans up a crash.
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 30_000 });
+    const childCode = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 30_000,
+      prelude: `const {spawn}=require('node:child_process'); const grandchild=spawn(process.execPath,['-e',${JSON.stringify(sleeper)}],{stdio:'ignore'}); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid,grandchild.pid]));`,
+    });
     const wrapper = spawn(process.execPath, ['--input-type=module', '-e',
       `import {executeShard} from ${JSON.stringify(moduleUrl)}; await executeShard({command:process.execPath,args:['-e',${JSON.stringify(childCode)}],timeoutMs:10000,prefix:'',log:()=>{}});`],
     { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
     let errors = ''; wrapper.stderr.on('data', chunk => { errors += chunk; });
     let pids = [];
-    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
     const waitFor = async predicate => { const end = Date.now() + 5000; while (Date.now() < end) { if (predicate()) return true; await new Promise(r => setTimeout(r, 20)); } return false; };
     try {
       expect(await waitFor(() => { try { pids = JSON.parse(readFileSync(pidFile, 'utf8')); return true; } catch { return false; } }), errors).toBe(true);
+      expect(pids).toHaveLength(2);
+      expect(pids.map(pid => pidIdentity(pid).alive)).toEqual([true, true]);
       process.kill(-wrapper.pid, signal);
-      expect(await waitFor(() => pids.every(pid => !alive(pid)))).toBe(true);
+      // Linux may retain a killed orphan as a zombie until its subreaper exits.
+      // Require positive death evidence; an unreadable identity is never enough.
+      expect(await waitFor(() => pids.every(pid => pidIdentity(pid).alive === false))).toBe(true);
     } finally {
       for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
       try { process.kill(-wrapper.pid, 'SIGKILL'); } catch {}
