@@ -110,7 +110,7 @@ import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-s
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, currentRound, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { decideReviewChurn } from './review-churn.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
@@ -2111,6 +2111,7 @@ export function planReconcile({
   // `takeover` (a takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting and the
   // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
   roundCapAction = 'person', takeoverBudget = 1,
+  escalationStreaks = [], escalationTakeoverCapPerHead = 1,
   owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 },
   // `fix.staleCiRerun` (`off` | `once-per-head`): a red required check on a head that main's green CI did NOT cause
   // (no red window explains it) still gets ONE mechanical re-run of the failed jobs per head, never a heal first.
@@ -2335,7 +2336,7 @@ export function planReconcile({
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
     // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
     if (threadMayBeTruncated(pr)) {
-      refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
+      refuse('thread-truncated', { why: `the comment thread has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be truncated, so the markers after it cannot be counted; nothing is decided on this view` });
       continue;
     }
     // xilx617 (epic #4075/#3383) — EVERY `cap-exhausted` refusal EXCEPT the `ci-red` one above (which already
@@ -3815,7 +3816,9 @@ export function planReconcile({
     if (findings === 0) {
       refuse('no-findings', {
         ...withPhase, findings: 0, comments: Array.isArray(pr?.comments) ? pr.comments.length : 0,
-        why: 'no reviewer finding on this PR — a fix agent would invent work. A review, not a fix, is what an unreviewed PR is owed.',
+        why: !Array.isArray(pr?.comments)
+          ? 'comments are unreadable — no finding can authorize a fix; a person must inspect the thread'
+          : 'no reviewer finding on this PR — a fix agent would invent work. A review, not a fix, is what an unreviewed PR is owed.',
       });
       continue;
     }
@@ -3869,6 +3872,39 @@ export function planReconcile({
       continue;
     }
 
+    // Shared with the final dispatch: an extraction route must never become an in-place escalation fix.
+    const isCardBatch = cardBatchExtract && !(attempts >= effectiveRoundCap && sendBackRound)
+      && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
+
+    // R392(1): only the ordinary fix population reaches here, after phase, findings and mechanical-route guards.
+    // openDefects has a historical fallback; require a round explicitly naming this head before using its tally.
+    const escalation = Array.isArray(escalationStreaks) && escalationStreaks.find(row =>
+      row?.pr === prNumber && /^[a-f0-9]{40}$/i.test(row.head ?? '') && row.head === pr.headRefOid
+      && Number.isSafeInteger(row.streak) && row.streak > 0 && typeof row.cause === 'string' && row.cause.trim());
+    const defectRound = escalation && currentRound(pr.comments, pr.headRefOid, { strict: true });
+    const defects = defectRound?.head && sameHeadSha(defectRound.head, pr.headRefOid)
+      ? openDefects(pr.comments, pr.headRefOid) : null;
+    // At the ordinary cap, fall through to its shared handler unchanged (including review grants and human parking).
+    if (!isCardBatch && attempts < effectiveRoundCap
+      && escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN' && defects?.count >= 1) {
+      const used = takeoverMarkers(pr.comments).filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
+      const capAllows = Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used;
+      const takeover = capAllows ? planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch }) : null;
+      if (takeover?.ok) {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: defects.count,
+          takeover: { attempts, cap: effectiveRoundCap, rung: takeover.rung, route: takeover.route,
+            n: takeover.n, budget: takeover.budget, ...(takeover.previous ? { previous: takeover.previous } : {}) },
+          why: `repeated escalation (${escalation.cause}, ${escalation.streak} sweeps) owes an actor — automatic takeover ${takeover.n} of ${takeover.budget}` });
+      } else {
+        refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: capAllows
+            ? `escalation takeover refused: ${takeover.reason}; a person must resolve the escalation`
+            : 'the per-head escalation takeover cap is exhausted or invalid; a person must resolve the escalation',
+        }, { allowTakeover: capAllows });
+      }
+      continue;
+    }
+
     // ── REFUSAL 3 — the cap, from the PR and ONLY from the PR. `durableCounts` is what the shell read back off
     // the PR's comment thread; `countRearmComments` re-reads the same thread here so a shell that forgot to
     // supply the map cannot silently reset a burned PR to zero. NO in-process tally is consulted, by design:
@@ -3897,8 +3933,6 @@ export function planReconcile({
     // A rejected card batch (`lane/card-batch-*`, #4703) is not repaired in place: the one rejected card is extracted
     // into its own PR (`we:scripts/operations/card-batch-extract.mjs`) and the rest are re-sealed. Only this plain
     // bounce routes there; conflict/advisory/ruling fixes above keep their own `fix` kind.
-    const isCardBatch = cardBatchExtract && !(attempts >= effectiveRoundCap && sendBackRound)
-      && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
     dispatch.push({
       ...base, ...withPhase, kind: isCardBatch ? 'card-batch-extract' : 'fix', findings, attempts,
       ...(attempts >= effectiveRoundCap ? sendBackRoundFields : {}),

@@ -83,7 +83,6 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
-import { prFactKey, readThroughShadow } from './planner-fact-cache.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
@@ -126,6 +125,9 @@ import { enrichPrsWithReviewChurn } from './review-churn.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { resolveFixSettings } from './fix-takeover.mjs';
+import { takeoverMarkers, sameHeadSha } from './fix-takeover.mjs';
+import { owedTakeovers, escalationLedgerPath, loadEscalationLedger, resolveEscalationActorSettings } from './escalation-actor.mjs';
+import { feedPath as needsYouFeedPath } from '../operations/needs-you-feed.mjs';
 import { resolveTakeoverBudget, PLATFORM_PREFERENCES_PATH, REPO_FIX_SETTINGS_PATH } from './takeover-budget.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
 import { loadPrOwnershipSettings } from './pr-ownership-settings.mjs';
@@ -313,44 +315,8 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null } = {}) {
-  const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
-  const enrich = rows => {
-    if (factCache?.mode !== 'shadow') return enrichFresh(rows);
-    const out = [];
-    for (const pr of rows) {
-      const key = prFactKey({ ...pr, repo: attributionRepo ?? repo });
-      let freshPr;
-      const { shadow } = readThroughShadow({
-        cache: factCache, key,
-        // Keep time-sensitive annotations outside the stored heavy-read facts.
-        readFresh: () => {
-          const hydrated = enrichFresh([pr], { annotate: row => row });
-          if (hydrated.length !== 1) return { discoveryIncomplete: true };
-          freshPr = hydrated[0];
-          const { commits, comments, commentsComplete } = freshPr;
-          return { repo: attributionRepo ?? repo, number: pr.number,
-            ...(commits !== undefined ? { commits } : {}),
-            ...(comments !== undefined ? { comments } : {}),
-            ...(commentsComplete !== undefined ? { commentsComplete } : {}) };
-        },
-        complete: row => rows.discoveryIncomplete !== true && !rows.deferred
-          && !pr.discoveryIncomplete && !pr.deferred && !pr.readFailed && !pr['read-failed']
-          && !['deferred-low-budget', 'read-failed'].includes(pr.outcome)
-          && row.discoveryIncomplete !== true
-          && (!Object.hasOwn(freshPr ?? {}, 'commits') || Array.isArray(freshPr.commits)),
-      });
-      if (!shadow.same) console.error(`planner-cache-diff ${JSON.stringify({ repo: attributionRepo ?? repo, number: pr.number, diffs: shadow.diffs })}`);
-      if (!freshPr) continue;
-      // Annotate only the fresh hydrated row; the cache never supplies planner input.
-      const annotated = enrichPrsWithCompleteComments([freshPr], {
-        repo: attributionRepo ?? repo, readComments: () => freshPr.comments,
-      });
-      out.push(...annotated);
-    }
-    if (rows.discoveryIncomplete === true || out.length !== rows.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
-    return out;
-  };
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments } = {}) {
+  const enrich = rows => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}) });
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
@@ -1524,6 +1490,9 @@ export function runReconcilePass({
   loadStaleCiRerunSetting = resolveStaleCiRerunSetting,
   // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
   loadTakeoverBudget = resolveTakeoverBudget,
+  loadEscalationActorSettings = resolveEscalationActorSettings,
+  loadEscalationStreaks = loadEscalationLedger,
+  resolveNeedsYouFeedPath = needsYouFeedPath,
   // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
   loadOperatorRulingRounds = loadOperatorRulingExtraRounds,
   loadRoundExtensionAnchorSetting = loadRoundExtensionAnchor,
@@ -1616,7 +1585,20 @@ export function runReconcilePass({
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
   const prs = enrichVerifyGreen(rulingPrs, { policy: timing.review, env });
+  const actor = loadEscalationActorSettings({ env, log: line => console.error(line) });
+  const ledger = loadEscalationStreaks(escalationLedgerPath(resolveNeedsYouFeedPath({ env })));
+  const takeoverCountsByHead = {};
+  for (const pr of prs) {
+    // Unknown threads are rejected again in the pure core; never infer an unused allowance from them.
+    if (!Array.isArray(pr.comments)) continue;
+    takeoverCountsByHead[`${pr.number}@${pr.headRefOid}`] = takeoverMarkers(pr.comments)
+      .filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
+  }
+  const escalationStreaks = actor.enabled ? owedTakeovers({ ledger: ledger[CONSTELLATION_REPOS[repoKey].slug],
+    threshold: actor.threshold, cap: actor.takeoverCapPerHead, takeoverCountsByHead, now,
+    maxStreakAgeMinutes: actor.maxStreakAgeMinutes }) : [];
   const plan = planReconcile({
+    escalationStreaks, escalationTakeoverCapPerHead: actor.takeoverCapPerHead,
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,

@@ -145,6 +145,19 @@ describe('owedTakeovers', () => {
     });
 });
 
+describe('replay of #6023 (R392(1))', () => {
+  const REAL = '0f3b973e'.padEnd(40, '0');
+  it('sweep 1 owes nothing, sweep 2 owes one takeover for the head, then nothing once it is used', () => {
+    const row = { pr: 6023, head: REAL, cause: 'fix-cap-exhausted' };
+    const s1 = recordSweep({ ledger: {}, items: [row], sweepId: 's1' });
+    expect(owedTakeovers({ ledger: s1, takeoverCountsByHead: {}, cap: 1 })).toEqual([]);
+    const s2 = recordSweep({ ledger: s1, items: [row], sweepId: 's2' });
+    expect(owedTakeovers({ ledger: s2, takeoverCountsByHead: {}, cap: 1 }))
+      .toEqual([expect.objectContaining({ pr: 6023, head: REAL, streak: 2 })]);
+    expect(owedTakeovers({ ledger: s2, takeoverCountsByHead: { [`6023@${REAL}`]: 1 }, cap: 1 })).toEqual([]);
+  });
+});
+
 describe('resolveEscalationActorSettings', () => {
   const defaults = { enabled: true, threshold: 2, takeoverCapPerHead: 1, maxStreakAgeMinutes: 30 };
   const resolve = (env = {}, actor = {}) => resolveEscalationActorSettings({ env,
