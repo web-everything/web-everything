@@ -71,9 +71,10 @@ export function resolveBreakClassStopSetting({ env = process.env, path = ROUND_J
 
 /** Later prompt wiring must record the enumeration in a trusted review comment before round 1. */
 /** Hash of the thread and file evidence the verdict was computed from, so corrected evidence is never suppressed. */
-function evidenceHash(subject) {
+function evidenceHash(subject, cfg) {
   const h = createHash('sha256');
-  for (const c of Array.isArray(subject?.comments) ? subject.comments : []) h.update(`${c?.author?.login ?? c?.user?.login ?? ''}\0${c?.authorAssociation ?? ''}\0${c?.createdAt ?? ''}\0${c?.body ?? ''}\0`);
+  h.update(`${cfg?.mode}\0${cfg?.consecutive}\0${cfg?.enumerateFirst}\0${subject?.commentsComplete === true}\0`);
+  for (const c of Array.isArray(subject?.comments) ? subject.comments : []) h.update(`${c?.author?.login ?? c?.user?.login ?? ''}\0${c?.authorAssociation ?? ''}\0${c?.viewerDidAuthor === true}\0${c?.createdAt ?? ''}\0${c?.body ?? ''}\0`);
   for (const f of Array.isArray(subject?.files) ? subject.files : []) h.update(`${typeof f === 'string' ? f : f?.path}\0`);
   return h.digest('hex');
 }
@@ -84,6 +85,7 @@ export function enumerateFirstPrompt() {
 
 /** Shadow only, including mode=on: live stopping/needs-you/dispatch actions require a later flip. Never throws. */
 export function observeBreakClassStop({ pr, repo = null, subject = {}, env = process.env, now = Date.now(), dir, log = l => console.error(l) } = {}) {
+  let outDir = null;
   try {
     if (isUnderTest(env) && !dir) return { skipped: 'under-test' };
     const cfg = resolveBreakClassStopSetting({ env });
@@ -94,8 +96,8 @@ export function observeBreakClassStop({ pr, repo = null, subject = {}, env = pro
     const incomplete = result.reason ?? (threadMayBeTruncated(subject) ? 'comment list may be cut at one page; human review of the full thread and diff required'
       : (!head ? 'unreadable head; human review of the full thread and diff required' : null));
     if (!incomplete && !result.applies) return { skipped: 'not-applicable' };
-    const outDir = dir ?? roundJudgeDir(env);
-    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head ?? 'unknown', evidenceHash(subject)]);
+    outDir = dir ?? roundJudgeDir(env);
+    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head ?? 'unknown', evidenceHash(subject, cfg)]);
     if (seenKeys(outDir, now).has(key)) return { skipped: 'already-logged', key };
     const record = { ts: new Date(now).toISOString(), kind: 'break-class-stop', key, pr: Number(pr), repo,
       head, mode: cfg.mode, modeSource: cfg.source, setting: cfg, ...result,
@@ -106,7 +108,16 @@ export function observeBreakClassStop({ pr, repo = null, subject = {}, env = pro
     seenKeys(outDir, now).add(key);
     try { log(`break-class-stop: #${Number(pr)} wouldStop=${record.wouldStop}${incomplete ? ' INCOMPLETE-EVIDENCE' : ''} mode=${cfg.mode} source=${cfg.source} · ${cfg.line}`); } catch { /* log only */ }
     return record;
-  } catch { return { skipped: 'error', reason: 'observer unreadable; human review of full thread and diff required' }; }
+  } catch (e) {
+    const reason = 'observer error; human review of full thread and diff required';
+    try { log(`break-class-stop: #${Number(pr)} observer error (${String(e?.message ?? e).slice(0, 120)}) — human review of the full thread and diff required`); } catch { /* log only */ }
+    try {
+      const d = outDir ?? dir ?? roundJudgeDir(env);
+      mkdirSync(d, { recursive: true });
+      appendFileSync(monthFile(d, now), `${JSON.stringify({ ts: new Date(now).toISOString(), kind: 'break-class-stop', observerError: true, pr: Number(pr), repo, reason })}\n`);
+    } catch { /* best effort: the log line above already surfaced it */ }
+    return { skipped: 'error', reason };
+  }
 }
 
 const DIR_NAME = 'round-judge-shadow';
