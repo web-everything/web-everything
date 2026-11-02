@@ -71,9 +71,9 @@ async function simulate({ rounds, readerPriorityAfter }) {
 }
 
 describe('reader fairness — the livelock', () => {
-  // These pin the LEGACY reader-priority protocol: hard writer promotion (clone single-owner) is switched off here,
+  // These pin the LEGACY reader-priority protocol: hard writer promotion (clone single-owner) is pushed out of reach here (HARD_AFTER=1000000),
   // and covered by daemon-clone-lock-hard-writer.test.mjs.
-  beforeEach(() => { vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', '0'); });
+  beforeEach(() => { vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', '1000000'); });
   afterEach(() => { vi.unstubAllEnvs(); });
   it('REPRODUCES with reader priority off: the reader is refused every single round', async () => {
     const { log, readerIn } = await simulate({ rounds: 12, readerPriorityAfter: 0 });
