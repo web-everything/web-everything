@@ -42,7 +42,7 @@ The decision is how that use is switched. **Bold default: Fork 1 (a), its own de
 
 ## Fork 1 - own setting, or ride on `scopedRereview`?
 
-*Fork-existence:* the excluded branch is (b): it is blocked while #xl28gd8 (the B1 flip) stays `shadow` - with `scopedRereview`
+*Fork-existence:* the excluded branch is (b): it is blocked while #7602 (the B1 flip) stays `shadow` - with `scopedRereview`
 at `shadow` or `off`, a heal on an accepted PR would keep paying a full round, so A1 b-d could never ship, and the delta review
 of a heal would be held hostage by an unrelated ruling about later-round findings. Both settings read the same `reviewScope`,
 so they cannot be one switch without coupling two different risks (heal delta: narrow, one commit; scoped re-review: every later round).
@@ -93,4 +93,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 Operator chalbert, 2026-11-01 18:05 ET, verbatim: "Ratify all three".
 
-Decision: its own setting `healDeltaReview`, default off, independent of the B1 flip (xl28gd8). Open as a build-ready story.
+Decision: its own setting `healDeltaReview`, default off, independent of the B1 flip (7602). Open as a build-ready story.
