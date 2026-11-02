@@ -1040,7 +1040,7 @@ describe('round 8 malformed audit evidence', () => {
 });
 
 
-describe('round 8 audit structure validation before question filtering', () => {
+describe('audit structure validation for the canonical question', () => {
   const malformed = [
     ['missing timestamp', {at: undefined}], ['null timestamp', {at: null}],
     ['numeric timestamp', {at: 0}], ['unparseable timestamp', {at: 'not-a-date'}],
@@ -1070,13 +1070,13 @@ describe('round 8 audit structure validation before question filtering', () => {
     expect(condition(r, 2).status).toBe('PASS');
   });
   it.each(malformed.filter(([, extra]) => !Object.hasOwn(extra, 'questionHash')))
-  ('rejects foreign-question same-head %s before ignoring its question hash', async (_name, extra) => {
+  ('ignores foreign-question same-head %s', async (_name, extra) => {
     const head = fixture(6223).headRefOid;
     const r = await checkPr(6223, deps(undefined, {
       readAudits: () => [audit(head), audit(head, {questionHash: 'foreign', ...extra})],
     }));
-    expect(condition(r, 2).status).toBe('UNKNOWN');
-    expect(r.eligible).toBe(false);
+    expect(condition(r, 2).status).toBe('PASS');
+    expect(r.eligible).toBe(true);
   });
   it('ignores a structurally valid foreign-question weakened audit', async () => {
     const head = fixture(6223).headRefOid;
@@ -1085,6 +1085,43 @@ describe('round 8 audit structure validation before question filtering', () => {
         at: '2026-11-02T11:00:00Z'})],
     }));
     expect(condition(r, 2).status).toBe('PASS');
+  });
+});
+
+describe('round 9 rejected canonical audits', () => {
+  it.each([
+    ['opposite verdict line', 'WEAKENED', ['NOT WEAKENED']],
+    ['opposite clear verdict line', 'NOT WEAKENED', ['WEAKENED']],
+    ['embedded verdict line', 'WEAKENED', ['file:1 finding\nNOT WEAKENED']],
+    ['disguised verdict line', 'WEAKENED', ['NOT\u200b WEAKENED']],
+    ['bad findings shape', 'WEAKENED', null],
+  ])('keeps %s UNKNOWN instead of reviving older clearance', async (_name, verdict, findings) => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, {readAudits: () => [
+      audit(head), audit(head, {at: '2026-11-02T11:00:00Z', verdict, findings}),
+    ]}));
+    expect(condition(r, 2).status).toBe('UNKNOWN');
+    expect(condition(r, 2).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+});
+
+describe('round 9 agent and review instruction enforcement', () => {
+  it.each(['skills-src/review/SKILL.md', 'skills-src/review/review-agent-system-prompt.md',
+    'packages/reviewer/SKILL.md', 'packages/reviewer/CLAUDE.md',
+    'agent-memory-src/mandatory-guards.md', '.claude-plugin/review/instructions.md',
+    'prompts/review.md', 'packages/reviewer/prompts/review.md',
+    '.claude/commands/review.md', '.github/prompts/review.prompt.md',
+    'skills/review/instructions.md', 'packages/reviewer/skills/review/instructions.md'])
+  ('keeps instruction Markdown %s UNKNOWN with operator fallback', async path => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
+    expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
+      evidence: [`unclassified enforcement-tree path: ${path}; operator review`]});
+    expect(r.eligible).toBe(false);
+  });
+  it('keeps ordinary example Markdown PASS', async () => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md']}));
+    expect(condition(r, 4).status).toBe('PASS');
   });
 });
 

@@ -60,8 +60,10 @@ function latestAudit(records, head, base) {
   const valid = [];
   for (const record of records) {
     if (record?.head !== head) continue;
-    // Validate this head's evidence before ignoring a foreign question. Otherwise
-    // a malformed record can silently revive an older clearance.
+    // Only evidence for this head and question participates. Malformed canonical
+    // evidence must never silently revive an older clearance.
+    if (typeof record.questionHash === 'string' && record.questionHash.trim()
+      && record.questionHash !== QUESTION_HASH) continue;
     if (typeof record.at !== 'string' || !Number.isFinite(Date.parse(record.at))
       || typeof record.base !== 'string' || record.base.length !== 40 || !SHA.test(record.base)
       || !['NOT WEAKENED', 'WEAKENED'].includes(record.verdict)
@@ -69,8 +71,10 @@ function latestAudit(records, head, base) {
       || typeof record.questionHash !== 'string' || !record.questionHash.trim()) {
       throw new Error('malformed audit record for this head');
     }
-    if (record.questionHash === QUESTION_HASH
-      && findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH })) valid.push(record);
+    if (!findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH })) {
+      throw new Error('rejected canonical audit record for this head');
+    }
+    valid.push(record);
   }
   const newer = (record, previous) => !previous || Date.parse(record.at) >= Date.parse(previous.at);
   let latest = null, accepting = null;
