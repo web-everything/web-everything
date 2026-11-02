@@ -12,59 +12,19 @@ import { globToRegExp } from '../lib/standards-sections.mjs';
 const SHA = /^[a-f\d]{40}$/i;
 const MAX_PATHS = 10_000;
 const MAX_AUDITS = 100_000;
-// Safety-critical seed policy is code-owned; checkout settings may only add protection.
-const PROTECTED_PATHS = Object.freeze([
-  'scripts/**/*gate*',
-  'scripts/**/*guard*',
-  'scripts/**/*verdict*',
-  'scripts/**/*ledger*',
-  'scripts/**/*codeql*',
-  'scripts/**/*secret*',
-  'scripts/**/*approval*',
-  'scripts/**/*permission*',
-  'scripts/**/*label*',
-  'scripts/**/*policy*',
-  '.github/**/*gate*',
-  '.github/**/*guard*',
-  '.github/**/*verdict*',
-  '.github/**/*ledger*',
-  '.github/**/*codeql*',
-  '.github/**/*secret*',
-  '.github/**/*approval*',
-  '.github/**/*permission*',
-  '.github/**/*label*',
-  '.github/**/*policy*',
-  '**/guard-*.mjs',
-  '.claude/hooks/**',
-  '.githooks/**',
-  'scripts/hooks/**',
-  '**/settings.json',
-  '**/review-set-label*',
-  '**/*red-team*',
-  '**/*referral*',
-  '**/jury-core*',
-  '**/secret-scrub*',
-  '**/github-app-token*',
-  'scripts/readiness/forge-setup.sh',
-  'scripts/readiness/forge-exec-limits.mjs',
-  '**/forge-exec/limits.json',
-  '**/migrations/**',
-  'scripts/settings/d-r379-protected-paths.json',
-  '**/d-r379-check*.mjs',
-  'scripts/operations/__fixtures__/d-r379/**',
-  '.github/workflows/**',
-  'scripts/lib/pr-state.mjs',
-  'scripts/lib/pr-state/**',
-  'scripts/lib/standards-sections.mjs',
-  'scripts/operations/codex-audit*.mjs',
-  'vitest.config.*',
-  'package.json',
-  'scripts/test-cache/**',
-  'scripts/readiness/heavy-admission*.mjs',
-  'scripts/verify-lane.mjs',
-  'scripts/lib/hermetic-tests.mjs',
-  'scripts/operations/d-r379-check*.mjs',
-  'scripts/operations/__tests__/d-r379-check*',
+// Code-owned, case-insensitive patterns cover basenames and directory components.
+// Settings may add glob exclusions, but cannot remove this minimum protection.
+const PROTECTED_PATTERNS = Object.freeze([
+  /guard|gate|review|red-team|approval|audit|check-standards|enforcement|readiness|lint|hooks?/i,
+  /pr-state|standards-sections|codex-audit|verdict|ledger|codeql|secret|permission|label|policy|jury|migrations/i,
+  /test-cache|verify-lane|heavy-admission|hermetic-tests|d-r379/i,
+  /(?:^|\/)(?:settings(?:\/|\.json$)|\.github(?:\/|$)|\.claude(?:\/|$))/i,
+  /(?:^|\/)[^/]*\.config\.[^/]+$/i,
+  /(?:^|\/)package(?:-lock)?\.json$/i,
+  /(?:^|\/)\.?forge(?:-exec)?(?:rc)?(?:\.(?:json|ya?ml|toml))?$/i,
+  // Retain the earlier minimum exclusions as well as the structural patterns.
+  /referral|github-app-token/i,
+  /(?:^|\/)forge-exec\/limits\.json$/i,
 ]);
 const DIRECTION_PATHS = Object.freeze([
   '**/AGENTS.md',
@@ -77,12 +37,6 @@ const DIRECTION_PATHS = Object.freeze([
   'wrapper-conformance/**',
   'src/_data/**',
   'src/_includes/*-descriptions/**',
-]);
-const PROTECTED_CANARIES = Object.freeze([
-  'scripts/guard-bash.mjs', 'scripts/review-set-label.mjs',
-  'scripts/lib/red-team-gate.mjs', 'scripts/lib/jury-core.mjs',
-  'scripts/lib/secret-scrub.mjs', 'scripts/lib/github-app-token.mjs',
-  '.claude/hooks/x.mjs',
 ]);
 const USAGE = 'usage: node scripts/operations/d-r379-check.mjs --pr=N [--json] [--rulings=<path>]\nRulings path: --rulings overrides D_R379_RULINGS_FILE; required for the R391 exception.\n';
 const DIRECTION = /\bD-R\d+\b|\bR\d{2,4}\b|#\d+\b|\b(?:card|story|item|focus(?:\s+item)?)\s*#?\d+\b/i;
@@ -115,13 +69,9 @@ function validateSettings(settings) {
     || records.some(path => !validPath(path) || /[*?\[\]]/.test(path))
     || new Set(records).size !== records.length) throw new Error('invalid ruling record paths');
   settings = { ...settings,
-    protectedPaths: [...new Set([...PROTECTED_PATHS, ...(settings.protectedPaths ?? [])])],
+    protectedPaths: settings.protectedPaths ?? [],
     directionPaths: [...new Set([...DIRECTION_PATHS, ...(settings.directionPaths ?? [])])],
   };
-  if (PROTECTED_CANARIES.some(path =>
-    !settings.protectedPaths.some(glob => matchesGlob(path, glob)))) {
-    throw new Error('path policy fails trusted minimum canary probes');
-  }
   return settings;
 }
 
@@ -298,11 +248,11 @@ function operatorRulingEntries(text) {
   for (const line of text.split(/\r?\n/)) {
     const entry = /^- \*\*R(\d+)\*\*(?:[ \t]|$)/.exec(line);
     if (entry) {
-      current = { text: line.trim() };
+      current = { text: line };
       if (!entries.has(entry[1])) entries.set(entry[1], []);
       entries.get(entry[1]).push(current);
     } else if (current && /^[ \t]+\S/.test(line)) {
-      current.text += `\n${line.trim()}`;
+      current.text += `\n${line}`;
     } else {
       current = undefined;
     }
@@ -313,26 +263,31 @@ function operatorRulingEntries(text) {
 function isCitedRulingEntry(lines, metadata, rulings) {
   const cited = new Set([...`${metadata.title}\n${metadata.body}`.matchAll(/\b(?:D-)?R(\d+)\b/gi)]
     .map(match => match[1]));
-  let candidates = [], excerpt = [], entries = 0;
-  const matchesExcerpt = () => {
-    const text = excerpt.join('\n');
-    return candidates.some(entry => entry.text.includes(text));
+  let candidates = [], addedEntry = [], entries = 0;
+  const matchesWholeEntry = () => {
+    const text = addedEntry.join('\n');
+    return candidates.some(entry => entry.text === text);
   };
-  for (const line of lines) {
-    if (!line.trim()) continue;
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '');
+    if (!line.trim()) {
+      if (addedEntry.length && !matchesWholeEntry()) return false;
+      addedEntry = [];
+      continue;
+    }
     const entry = /^- \*\*(?:D-)?R(\d+)\*\*(?:[ \t]|$)/.exec(line);
     if (entry) {
-      if (entries && !matchesExcerpt()) return false;
+      if (addedEntry.length && !matchesWholeEntry()) return false;
       if (!cited.has(entry[1])) return false;
       candidates = rulings.get(entry[1]) ?? [];
-      excerpt = [];
+      addedEntry = [];
       entries++;
-    } else if (!entries || !/^(?: {2,}|\t)/.test(line)) {
+    } else if (!addedEntry.length || !/^[ \t]+\S/.test(line)) {
       return false;
     }
-    excerpt.push(line.trim());
+    addedEntry.push(line);
   }
-  return entries > 0 && matchesExcerpt();
+  return entries > 0 && (!addedEntry.length || matchesWholeEntry());
 }
 
 async function directionPaths(paths, settings, metadata, head, base, deps) {
@@ -411,7 +366,8 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
 
 function protectedPaths(paths, settings) {
   const patterns = settings.protectedPaths;
-  const hits = paths.filter(path => patterns.some(glob => matchesGlob(path, glob)));
+  const hits = paths.filter(path => PROTECTED_PATTERNS.some(pattern => pattern.test(path.normalize('NFC')))
+    || patterns.some(glob => matchesGlob(path, glob)));
   if (hits.length) return result(4, 'Not guard-loosening / hard to undo', 'FAIL',
     hits.map(path => `protected path: ${path}`));
   return result(4, 'Not guard-loosening / hard to undo', 'PASS', ['no protected paths']);

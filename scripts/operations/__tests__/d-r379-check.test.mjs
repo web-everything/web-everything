@@ -708,7 +708,7 @@ describe('round 6 ruling-entry content evidence', () => {
     expect(condition(await check(added),3).status).toBe('FAIL');
   });
   it('accepts a cited entry with verified indented continuations', async () => {
-    const added = '- **R999** (date) Operator: "..."\n\n  Continuation.\n';
+    const added = '- **R999** (date) Operator: "..."\n  Continuation.\n';
     const r = await check(added, {readRulings:()=>'- **R999** (date) Operator: "..."\n  Continuation.\n'});
     expect(condition(r,3)).toMatchObject({status:'PASS',
       evidence:expect.arrayContaining(['operator rulings verified'])});
@@ -1000,9 +1000,13 @@ describe('R391 operator ruling provenance', () => {
   it('rejects an empty operator rulings file', async () => {
     expect(condition(await check(`${realEntry}\n`, {readRulings:()=>''}), 3).status).toBe('FAIL');
   });
-  it.each([realEntry, realEntry.split('. D-R379')[0]])('accepts a verbatim substring of the real R391 entry: %s', async line => {
-    const r = await check(`${line}\n`);
+  it('accepts the whole real R391 entry verbatim', async () => {
+    const r = await check(`${realEntry}\n`);
     expect(condition(r, 3)).toMatchObject({status:'PASS', evidence:expect.arrayContaining(['operator rulings verified'])});
+  });
+  it.each([realEntry.split('. D-R379')[0], realEntry.replace(' and is delegable if the other conditions hold.', '')])
+  ('rejects a truncated R391 entry even when it is a verbatim substring: %s', async line => {
+    expect(condition(await check(`${line}\n`), 3).status).toBe('FAIL');
   });
   it('rejects altered text with the same real R391 id', async () => {
     expect(condition(await check(`${realEntry.replace('"Yes"', '"No"')}\n`), 3).status).toBe('FAIL');
@@ -1019,8 +1023,22 @@ describe('R391 operator ruling provenance', () => {
     const added = `${realEntry}\n  D-R379 condition 3 amended:\n  is delegable if the other conditions hold.\n`;
     expect(condition(await check(added), 3).status).toBe('FAIL');
   });
-  it('accepts trimmed continuation text from its own operator entry', async () => {
-    expect(condition(await check('- **R392** Synthetic continuation fixture.\n    Only this indented continuation belongs to R392.  \n'), 3).status).toBe('PASS');
+  it('accepts a whole entry including its verbatim indented continuation', async () => {
+    expect(condition(await check('- **R392** Synthetic continuation fixture.\n  Only this indented continuation belongs to R392.\n'), 3).status).toBe('PASS');
+  });
+  it('accepts whole entries with only line endings normalized', async () => {
+    const added = `${realEntry}\n\n- **R392** Synthetic continuation fixture.\n  Only this indented continuation belongs to R392.\n`;
+    expect(condition(await check(added, {readRulings:()=>rulings.replace(/\n/g, '\r\n')}), 3).status).toBe('PASS');
+    expect(condition(await check(added.replace(/\n/g, '\r\n')), 3).status).toBe('PASS');
+  });
+  it.each([
+    '- **R392** Synthetic continuation fixture.\n',
+    '- **R392** Synthetic continuation fixture.\n  Only this indented continuation\n',
+    '- **R392** Synthetic continuation fixture.\n    Only this indented continuation belongs to R392.  \n',
+    '- **R392** Synthetic continuation fixture.  \n  Only this indented continuation belongs to R392.\n',
+    '- **R392** Synthetic continuation fixture.\n\n  Only this indented continuation belongs to R392.\n',
+  ])('rejects incomplete or whitespace-altered whole entries: %s', async added => {
+    expect(condition(await check(added), 3).status).toBe('FAIL');
   });
   it.each(['This continuation belongs to R393.', 'Unindented text outside the entry.'])
   ('rejects continuation text outside the cited entry: %s', async text => {
@@ -1130,6 +1148,24 @@ describe('condition 4 operator exclusions', () => {
   const minimal = {rulingRecordPaths: settings.rulingRecordPaths};
   const empty = {...minimal, protectedPaths: [], directionPaths: []};
   const protectedCases = [
+    'scripts/check-standards.mjs', 'scripts/lib/enforcement/rule-x.mjs',
+    'scripts/readiness/x.mjs', 'scripts/lint-x.mjs',
+    'docs/gate-policy.md', 'scripts/settings/pr-limit.json',
+    'package-lock.json', 'playwright.config.ts',
+    'skills-src/review/SKILL.md', 'packages/reviewer/CLAUDE.md',
+    'prompts/review.md', '.claude/commands/review.md', '.github/helper.yml',
+    '.github/image.png', 'config/settings/x.json', 'nested/.github/x.txt',
+    'nested/.claude/x.txt', 'nested/package.json', 'nested/package-lock.json',
+    'custom.config.json', 'nested/widget.config.ts', 'forge.config.json',
+    'forge-exec.toml', 'forge-exec.yaml', 'nested/.FORGERC',
+    'tools/D-R379-check-helper.txt', 'tools/d-r379-fixtures/x.json',
+    ...['guard', 'gate', 'review', 'red-team', 'approval', 'audit',
+      'check-standards', 'enforcement', 'readiness', 'lint', 'hook', 'hooks',
+      'pr-state', 'standards-sections', 'codex-audit', 'verdict', 'ledger',
+      'codeql', 'secret', 'permission', 'label', 'policy', 'jury', 'migrations',
+      'test-cache', 'verify-lane', 'heavy-admission', 'hermetic-tests']
+      .flatMap(name => [`other/prefix${name.toUpperCase()}suffix.txt`,
+        `other/prefix${name.toUpperCase()}suffix/x.txt`]),
     'scripts/guard-bash.mjs', 'scripts/review-set-label.mjs',
     'scripts/lib/red-team-gate-core.mjs', 'scripts/lib/red-team-gate.mjs',
     'scripts/lib/jury-core.mjs', 'scripts/lib/secret-scrub.mjs',
@@ -1176,18 +1212,13 @@ describe('condition 4 operator exclusions', () => {
     'scripts/conveyor/foo.mjs', 'docs/examples/x.md', 'tests/a/b.test.mjs',
     'scripts/lib/__tests__/format-date.test.mjs', 'widget.spec.ts',
     'lib/__tests__/assertions.mjs', 'tests/helper.js', 'tests/a11y/helper.ts',
-    'blocks/__tests__/e2e/helper.js', 'blocks/widget.js', 'blocks/foo/README.md',
+    'blocks/__tests__/e2e/helper.js', 'blocks/widget.js', 'blocks/foo.ts', 'blocks/foo/README.md',
     'src/assets/js/runtime.js', 'src/assets/active.svg', 'src/content.md',
-    'docs/examples/access-control.tsx', 'docs/agent/testing.md', 'docs/gate-policy.md',
+    'docs/examples/access-control.tsx', 'docs/agent/testing.md',
     'scripts/lib/format-date.mjs',
-    'scripts/check-standards.mjs',
     'scripts/gen-inventory.mjs', 'scripts/lib/gh-throttle.mjs',
-    'scripts/settings/pr-limit.json',
     'scripts/ci/shard-runner.mjs',
-    'package-lock.json', 'playwright.config.ts',
-    'skills-src/review/SKILL.md', 'packages/reviewer/CLAUDE.md',
-    'prompts/review.md', '.claude/commands/review.md', '.github/helper.yml',
-    'scripts/image.svg', '.github/image.png', 'new-tree/future.code',
+    'scripts/image.svg', 'new-tree/future.code',
     'LICENSE.txt', 'backlog/nested/story.md', 'image.jpg',
   ])('passes non-protected path %s with explicit evidence', async path => {
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
