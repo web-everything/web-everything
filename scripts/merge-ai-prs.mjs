@@ -2,9 +2,9 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { mqLiveReadOptions, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
-import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
+import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
@@ -4832,7 +4832,9 @@ async function runCli() {
       // with fresh evidence at H, before the refresh's label read or once-per-head claim.
       enqueueAllowed: () => {
         const repo = c.repo ?? localSlug;
-        const exec = execFileSyncThrottled;
+        const exec = createMqLiveReader();
+        const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
+          maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { personalRoute: false } });
         const log = line => process.stderr.write(`  ${line}\n`);
         try {
           const comments = readCompletePrComments(c.num, { repo, exec });
@@ -4840,7 +4842,11 @@ async function runCli() {
           const safety = readDrainQueueSafety({ log });
           if (safety.value.waitForRedTeamBeforeEnqueue) {
             const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
-            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } });
+            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } }, {
+              readRuling: slug => readStandingRuling(slug, { readIssues: target => readOperatorIssues(target, { gh }) }),
+              cardOnly: target => headIsCardOnly(target, { belongs: identity => headBelongsToPr(identity, { gh }) }),
+              unedited: target => readUneditedCommentIds(target, { gh }),
+            });
             if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
           }
           // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
@@ -5358,7 +5364,7 @@ async function runCli() {
       // Refresh authorization must observe approval added since the memo was populated.
       const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
         expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
-          ? readGh(args, strict ? { ...opts, ...mqLiveReadOptions() } : opts)
+          ? (strict ? createMqLiveReader((_file, argv, options) => readGh(argv, options))('gh', args, opts) : readGh(args, opts))
           : execFileSync(file, args, { ...opts, cwd }) });
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;

@@ -8,13 +8,35 @@ import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReas
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
-import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
-import { enqueuePr } from '../merge-queue-enqueue.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker, parseLatestHumanClearedSha } from '../review-escalation.mjs';
+import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds } from '../../conveyor/standing-ruling-io.mjs';
+import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+import { proveHumanOnlyLicense } from '../human-only-enqueue-license.mjs';
+import { enqueuePr, readPinnedChangedFiles, workflowEditHold } from '../merge-queue-enqueue.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold } from '../approved-human-surface-hold.mjs';
 import { decideDrainWorkflowEditHold } from '../drain-workflow-edit-hold.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
+
+describe('shared same-head live reader', () => {
+  it('strips both memo environments while preserving caller options and non-GitHub IO', () => {
+    const exec = vi.fn(() => 'live');
+    const reader = queueSafety.createMqLiveReader(exec);
+    const opts = { env: { WE_GH_READ_MEMO_DIR: 'child-memo', PATH: 'child-path' },
+      throttle: { env: { WE_GH_READ_MEMO_DIR: 'throttle-memo', GH_TOKEN: 'fixture' },
+        personalRoute: false, maxAttempts: 1 }, timeout: 123, maxBuffer: 456 };
+    expect(reader('gh', ['api', 'fixture'], opts)).toBe('live');
+    expect(exec).toHaveBeenLastCalledWith('gh', ['api', 'fixture'], {
+      ...opts, env: { PATH: 'child-path' },
+      throttle: { ...opts.throttle, env: { GH_TOKEN: 'fixture' } },
+    });
+    expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('child-memo');
+    expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('throttle-memo');
+    reader('git', ['diff'], opts);
+    expect(exec.mock.calls[1][2]).toBe(opts);
+  });
+});
 
 describe('merge-queue same-head failure admission', () => {
   const pr = 6215, repo = 'fixture/drain';
@@ -73,6 +95,118 @@ describe('merge-queue same-head failure admission', () => {
       f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
     }
+    it.each(['allowed', 'moved base/head', 'unreadable evidence', 'red-team hold', 'workflow hold', 'license disabled', 'approval hold'])(
+      'whole production refresh path ignores seeded stale memo: %s', outcome => fixture(f => {
+        const memoDir = mkdtempSync(join(process.env.TMPDIR, 'refresh-memo-'));
+        const memoPath = join(memoDir, 'stale.json');
+        // The spy models gh-throttle's memo lookup independently of the child environment.
+        const stale = { headRefOid: prior, baseRefName: 'obsolete-base' };
+        writeFileSync(memoPath, JSON.stringify(stale));
+        const previous = process.env.WE_GH_READ_MEMO_DIR;
+        process.env.WE_GH_READ_MEMO_DIR = memoDir;
+        const calls = [], stages = [];
+        const original = f.exec.getMockImplementation();
+        const exec = vi.fn((file, args, opts) => {
+          if (file === 'git') {
+            if (args[0] === 'ls-tree') return '';
+            if (args[0] === 'merge-base' || args[0] === 'rev-parse') return prior;
+            if (args.includes('--name-only')) return args.includes('--end-of-options')
+              ? '.github/workflows/test.yml\0' : outcome === 'approval hold' ? '.github/workflows/test.yml\0' : 'README.md\0';
+            return '';
+          }
+          const cached = (opts?.throttle?.env ?? process.env).WE_GH_READ_MEMO_DIR;
+          calls.push({ args, opts, cached });
+          if (args.includes('headRefOid,baseRefName')) {
+            stages.push('head/base');
+            return cached ? readFileSync(memoPath, 'utf8') : JSON.stringify({
+              headRefOid: outcome === 'moved base/head' ? prior : head, baseRefName: 'main',
+            });
+          }
+          if (args.includes('headRefOid,labels,mergeable') || args.includes('headRefOid,labels')) {
+            stages.push('approval');
+            return JSON.stringify({ headRefOid: head, labels: ['review:accepted'], mergeable: 'MERGEABLE' });
+          }
+          if (args.some(a => a.includes('commits/') && a.endsWith('/pulls'))) return String(pr);
+          if (args.some(a => a.includes('issues(first:100'))) return JSON.stringify({ data: { repository: {
+            issues: { nodes: [], pageInfo: { hasNextPage: false } },
+          } } });
+          if (args.some(a => a.includes('lastEditedAt'))) return JSON.stringify({ data: { repository: { pullRequest: {
+            comments: { nodes: [], pageInfo: { hasNextPage: false } },
+          } } } });
+          if (args.includes('--paginate')) return `<!-- reviewed-sha: ${outcome === 'workflow hold' ? prior : head} -->\\n<!-- cleared-human: operator -->\t2026-11-01T12:00:00Z\tchalbert\tIC_fixture\thttps://example.test/comment\n`;
+          if (args.some(a => a.includes('comments{totalCount}'))) return JSON.stringify({
+            data: { repository: { pullRequest: { comments: { totalCount: 1 } } } },
+          });
+          return original(file, args, opts);
+        });
+        const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+        const holdStart = source.indexOf('  const approvedHeadHold = ');
+        const holdEnd = source.indexOf('  const prestageSetting = ', holdStart);
+        const dependencies = {
+          approvedHeadSetting: { value: 'on', source: 'settings' },
+          mergeStrategy: { queueOwnsFreshness: () => true }, isLocalRepo: () => true,
+          siblingCloneDir: () => null, readApprovedHumanSurfaceHold, AS_JSON: false,
+          process: { cwd: () => '/fixture', stderr: { write: vi.fn() } },
+          repoTag: () => '', localSlug: repo, readGh: (args, opts) => exec('gh', args, opts),
+          execFileSync: exec, ...queueSafety,
+        };
+        const approvedHeadHold = new Function(...Object.keys(dependencies),
+          source.slice(holdStart, holdEnd) + '\nreturn approvedHeadHold;')(...Object.values(dependencies));
+        const start = source.indexOf('  function enqueueWithSameHeadGuard(');
+        const end = source.indexOf('  // xym8nt4 — post-approval', start);
+        const wiring = { ...dependencies, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
+          execFileSyncThrottled: exec, createMqLiveReader: (reader = exec) => queueSafety.createMqLiveReader(reader),
+          readCompletePrComments, readPinnedChangedFiles,
+          readDrainQueueSafety: () => ({ value: { waitForRedTeamBeforeEnqueue: true } }),
+          readDrainRedTeamEvidence: () => {
+            stages.push('red-team');
+            if (outcome === 'unreadable evidence') throw Error('red-team evidence unreadable');
+            return { scheduled: outcome === 'red-team hold', skipCardOnly: false };
+          },
+          // Exercise all nested standing-ruling read adapters even without a grant in this thread.
+          readStandingRuling, readOperatorIssues, headBelongsToPr, readUneditedCommentIds,
+          headIsCardOnly: (target, options) => headIsCardOnly(target, {
+            ...options, readNet: () => ({ ok: true, files: ['backlog/123-fixture.md'] }),
+          }),
+          standingRulingScope: (target, readers) => {
+            stages.push('standing ruling');
+            readers.readRuling(repo);
+            readers.cardOnly({ repo, number: pr, head });
+            readers.unedited({ repo, number: pr });
+            return null;
+          }, redTeamEnqueueHold: evidence => redTeamEnqueueHold({ ...evidence, env: {} }),
+          resolveDrainWorkflowEditHuman: () => { stages.push('workflow setting'); return { value: 'on', source: 'settings' }; },
+          decideDrainWorkflowEditHold, parseLatestHumanClearedSha, workflowEditHold,
+          resolveApprovalLicensesEnqueue: () => { stages.push('license setting'); return { value: outcome !== 'license disabled', source: 'settings' }; },
+          proveHumanOnlyLicense,
+          mqSameHeadGuard: opts => mqSameHeadGuard({ ...opts, exec, log: f.log }),
+        };
+        try {
+          const enqueue = new Function(...Object.keys(wiring), source.slice(start, end)
+            + '\nreturn enqueueWithSameHeadGuard;')(...Object.values(wiring));
+          expect(enqueue({ repo, num: pr }, head, {}, approvedHeadHold).kind).toBe('mq-same-head-failed');
+          expect(calls.length).toBeGreaterThan(3);
+          for (const { opts, cached } of calls) {
+            expect(cached).toBeUndefined();
+            expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+            expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+          }
+          expect(stages).toContain('red-team');
+          if (outcome === 'allowed') {
+            expect(stages).toEqual(expect.arrayContaining(['head/base', 'workflow setting', 'license setting', 'approval', 'standing ruling']));
+            expect(calls.filter(c => c.args.includes('PUT'))).toHaveLength(1);
+          } else {
+            expect(calls.filter(c => c.args.includes('PUT'))).toHaveLength(0);
+            expect(existsSync(f.path)).toBe(false);
+          }
+          expect(JSON.parse(readFileSync(memoPath, 'utf8'))).toEqual(stale);
+          expect(process.env.WE_GH_READ_MEMO_DIR).toBe(memoDir);
+        } finally {
+          if (previous === undefined) delete process.env.WE_GH_READ_MEMO_DIR;
+          else process.env.WE_GH_READ_MEMO_DIR = previous;
+          rmSync(memoDir, { recursive: true, force: true });
+        }
+      }));
     it.each([undefined, null, '', '   ', 'future_failure', 'ALREADY_MERGED'])(
       'unconfirmed removal reason %s stays operator-only without refresh or ledger spend', reason => fixture(f => {
         const event = { ...removed(), reason };
@@ -161,11 +295,11 @@ describe('merge-queue same-head failure admission', () => {
         expect(end).toBeGreaterThan(start);
         const stderr = { write: vi.fn() };
         const makeHold = new Function('approvedHeadSetting', 'mergeStrategy', 'isLocalRepo', 'siblingCloneDir',
-          'readApprovedHumanSurfaceHold', 'AS_JSON', 'process', 'repoTag', 'localSlug', 'readGh', 'execFileSync', 'mqLiveReadOptions',
+          'readApprovedHumanSurfaceHold', 'AS_JSON', 'process', 'repoTag', 'localSlug', 'readGh', 'execFileSync', 'createMqLiveReader',
           source.slice(start, end) + '\nreturn approvedHeadHold;');
         f.approvedHeadHold = makeHold({ value: 'on', source: 'settings' }, { queueOwnsFreshness: () => true },
           () => true, () => null, readApprovedHumanSurfaceHold, false, { cwd: () => '/fixture', stderr },
-          () => '', repo, readGh, git, queueSafety.mqLiveReadOptions);
+          () => '', repo, readGh, git, queueSafety.createMqLiveReader);
         try {
           // Legacy callers still see the memo's missing approval, with unchanged read options.
           expect(f.approvedHeadHold({ repo, num: pr }, head)).toBe(false);

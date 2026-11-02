@@ -17,11 +17,19 @@ const mqFailureReasons = new Set(['failed_checks', 'ci_failure', 'merge_conflict
   'branch_protection_failure', 'invalid_merge_commit']);
 const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reason.trim().toLowerCase() : '';
 
-export function mqLiveReadOptions() {
-  const env = { ...process.env };
-  delete env.WE_GH_READ_MEMO_DIR;
-  // gh-throttle consults throttle.env for memoization independently of the child env.
-  return { env, throttle: { env } };
+/** One live reader for every same-head authorization dependency, including nested readers.
+ * Strip the smoke memo from BOTH gh-throttle's environment and the child environment.
+ * Preserve caller options and non-GitHub IO without mutating shared process state.
+ */
+export function createMqLiveReader(exec = execFileSyncThrottled) {
+  return (file, args, opts = {}) => {
+    if (file !== 'gh') return exec(file, args, opts);
+    const env = { ...(opts.env ?? process.env) };
+    const throttleEnv = { ...(opts.throttle?.env ?? process.env) };
+    delete env.WE_GH_READ_MEMO_DIR;
+    delete throttleEnv.WE_GH_READ_MEMO_DIR;
+    return exec(file, args, { ...opts, env, throttle: { ...opts.throttle, env: throttleEnv } });
+  };
 }
 
 function mqSameHeadHold({ pr, head }, reason) {
@@ -75,9 +83,9 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
         }
       }}
     }`;
-    const result = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`,
+    const result = JSON.parse(createMqLiveReader(exec)('gh', ['api', 'graphql', '-f', `query=${query}`,
       '-f', `owner=${parts[0]}`, '-f', `name=${parts[1]}`, '-F', `number=${pr}`],
-    { ...mqLiveReadOptions(), encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
     const items = result?.data?.repository?.pullRequest?.timelineItems;
     if (result?.errors?.length || !Array.isArray(items?.nodes) || typeof items?.pageInfo?.hasPreviousPage !== 'boolean')
       return { error: 'unreadable merge-queue timeline' };
@@ -127,9 +135,9 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
   const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
   const unavailable = () => log(`${prefix}state unavailable; not requesting; inspect shared refresh ledger and lock before retrying`);
   try { if (store.has(key)) return; } catch { unavailable(); return; }
-  const liveOptions = mqLiveReadOptions();
-  const opts = { ...liveOptions, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'], throttle: { ...liveOptions.throttle, maxAttempts: 1 } };
+  exec = createMqLiveReader(exec);
+  const opts = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
   try {
     const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
       '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
@@ -169,8 +177,9 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
   // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
+  exec = createMqLiveReader(exec);
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
-    { ...mqLiveReadOptions(), encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
   let timeline;
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
