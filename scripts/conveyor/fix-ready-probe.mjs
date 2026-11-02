@@ -13,7 +13,9 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { fmtAge } from './health-watch-core.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const run = (cmd, args, { timeoutMs }) => execFileSync(cmd, args, { timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] });
+// Repository-selection env must not redirect `git -C <root>` at another repository (false ancestry evidence).
+const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|CONFIG.*)$/.test(k)));
+const run = (cmd, args, { timeoutMs }) => execFileSync(cmd, args, { timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv() });
 let settings = FIX_NOT_LOADED_BUILT_IN;
 try { settings = resolveFixNotLoadedSettings(readSettings()); } catch { /* built-in */ }
 

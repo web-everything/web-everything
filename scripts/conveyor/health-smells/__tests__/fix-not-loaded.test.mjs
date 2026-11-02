@@ -25,7 +25,7 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
  describe('fix-not-loaded', () => {
   it('has a valid auto-discovered smell descriptor', () => {
     expect(validateSmellShape(smell, 'fix-not-loaded.mjs')).toBe(smell);
-    expect(smell).toMatchObject({ id: 'fix-not-loaded', scope: 'host', cadence: 'every-tick', probes: ['fixReady', 'selfSync'], openAfter: 1, closeAfter: 2, severity: 'high', action: 'alert' });
+    expect(smell).toMatchObject({ id: 'fix-not-loaded', scope: 'host', cadence: 'every-tick', probes: ['fixReady'], openAfter: 1, closeAfter: 2, severity: 'high', action: 'alert' });
   });
   it('alerts beyond 30 minutes with actionable evidence', () => {
     const [row] = notLoadedFixes([record()], [], options);
@@ -381,5 +381,27 @@ describe('fix-ready CLI', () => {
     const store = join(temp(), 'ready.jsonl');
     expect(cli(['mark', `--store=${store}`, ...args]).status).toBe(1);
     expect(existsSync(store)).toBe(false);
+  });
+});
+
+describe('audit round 2: fail-closed probe plumbing', () => {
+  it('does not require selfSync: a failed selfSync probe still evaluates and alerts', () => {
+    expect(smell.probes).toEqual(['fixReady']);
+    const at = new Date(Date.UTC(2026, 10, 2, 0, 0)).toISOString();
+    const rows = smell.evaluate({ fixReady: [{ ref: 'r', sha: 'abcdef1', at, audit: 'NOT WEAKENED', ancestorOf: [] }] }, { now: Date.parse(at) + 3 * 60 * 60_000 });
+    expect(rows).toHaveLength(1);
+  });
+  it('the default git runner ignores inherited repository-selection env (GIT_DIR)', () => {
+    const saved = process.env.GIT_DIR;
+    process.env.GIT_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../../../.git');
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'fixready-env-'));
+      const store = join(dir, 'store.jsonl');
+      const head = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', env: { ...process.env, GIT_DIR: process.env.GIT_DIR } }).stdout.trim();
+      writeFileSync(store, JSON.stringify({ at: new Date().toISOString(), ref: 'r', sha: head, tests: 'green', audit: 'ok' }) + '\n');
+      const out = probeFixReady({ storePath: store, roots: [dir] });
+      expect(out[0].ancestorOf ?? []).toEqual([]);
+      rmSync(dir, { recursive: true, force: true });
+    } finally { if (saved === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = saved; }
   });
 });

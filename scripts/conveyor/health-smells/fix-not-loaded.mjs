@@ -59,10 +59,11 @@ export function notLoadedFixes(records, selfSync, { now, readyMs }) {
 }
 
 export default {
-  id: 'fix-not-loaded', scope: 'host', cadence: 'every-tick', probes: ['fixReady', 'selfSync'],
+  id: 'fix-not-loaded', scope: 'host', cadence: 'every-tick', probes: ['fixReady'],
   openAfter: 1, closeAfter: 2, severity: 'high', action: 'alert',
   readyMs: settings.readyMinutes * MINUTE,
   evaluate({ fixReady, selfSync }, { now }) {
-    return notLoadedFixes(fixReady, selfSync, { now, readyMs: this.readyMs });
+    // selfSync is optional evidence: its absence must never silence an overdue-fix or unreadable-store alert.
+    return notLoadedFixes(fixReady, selfSync ?? [], { now, readyMs: this.readyMs });
   },
 };
