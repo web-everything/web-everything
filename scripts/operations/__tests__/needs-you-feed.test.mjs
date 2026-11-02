@@ -402,6 +402,23 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
     expectUndecided(kept);
   });
+  it.each([
+    ['a marker-only comment', c => c.body.split('\n')[0]],
+    ['a confirmed finding the parser cannot read', c => c.body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ')],
+  ])('%s is red-team-undecided, never all gates pass', async (_n, mutate) => {
+    const comments = gateComments({ broken: true }).slice(0, 1).map(c => ({ ...c, body: mutate(c) }));
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
+  it('an open confirmed-break alert survives the PR leaving the queue (absence is not resolution)', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${head}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [], notReady: [{ repo: 'r', number: 5768, head, title: 't' }] }),
+      gh: async () => '[[]]', settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+    expect(result.lines.join('\n')).not.toContain('NEEDS-YOU-CLEARED');
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });
