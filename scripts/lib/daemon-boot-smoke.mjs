@@ -52,8 +52,10 @@
  * runtime call.
  */
 
+import { cloneRuntimeEntries } from './daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './daemon-rebuild/closure-scope-settings.mjs';
 import { randomBytes } from 'node:crypto';
-import { closeSync, constants, fchmodSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeSync } from 'node:fs';
+import { closeSync, constants, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeSync } from 'node:fs';
 import { join, posix } from 'node:path';
 
 import { resolveChildTimeoutMs, runBounded } from './bounded-child.mjs';
@@ -305,16 +307,20 @@ export const DAEMON_ENTRY_MODULES = Object.freeze([
   'skills-src/conveyor/pass-daemon.mjs',
 ]);
 
-/** Resolve the entry list a call should use: `env`'s override when set (test/soak only), else the real list.
+/** Resolve the entry list: override (test/soak only), else the fixed list while on-mode is locked.
  *  `overridden:true` whenever the override actually supplied the list — the check surfaces this loudly in its
  *  own `detail` (never silently), so an override that leaked into a real daemon's environment shows up in the
  *  smoke's own result instead of quietly narrowing what gets boot-checked. */
-export function resolveDaemonEntries(env = process.env) {
+export function resolveDaemonEntries(env = process.env, { root, runtimeEntries = cloneRuntimeEntries, fixedEntriesOnly = false } = {}) {
+  // Resolve even for overrides/fixed lists so every on request reports the shared lock.
+  const mode = resolveClosureScopeMode(env).mode;
   const raw = env?.[DAEMON_ENTRIES_ENV];
   if (typeof raw === 'string' && raw.trim()) {
     return { entries: raw.split(',').map((s) => s.trim()).filter(Boolean), overridden: true };
   }
-  return { entries: DAEMON_ENTRY_MODULES, overridden: false };
+  const cloneRoot = env?.WE_SMOKE_LIVE_CLONE || root;
+  const discover = cloneRoot && !fixedEntriesOnly && mode === 'on';
+  return { entries: discover ? runtimeEntries({ root: cloneRoot, entries: [], env }) : DAEMON_ENTRY_MODULES, overridden: false };
 }
 
 /** A fixed, never-real marker base — resolving `rel` against THIS exact base is how {@link isSafeRelativeEntry}
@@ -439,7 +445,7 @@ function entrySummary(r) {
  * @returns {Promise<{ok:boolean, detail:string, entries?:Array<object>}>}
  */
 export async function checkDaemonEntriesBoot({
-  root, budgets = {}, runChild = runBounded, env = process.env, log = console, diagnosticsDir = smokeDiagnosticsDir(env), clock,
+  root, runtimeEntries, budgets = {}, runChild = runBounded, env = process.env, log = console, diagnosticsDir = smokeDiagnosticsDir(env), clock,
   // The live smoke's injected clock (ctx.clock) times the attempts, so a replayed smoke reports the same start times.
   now = typeof clock === 'function' ? clock : Date.now,
 }) {
@@ -449,7 +455,19 @@ export async function checkDaemonEntriesBoot({
       log.error?.(`daemon-boot-smoke: rebuildSmoke ${JSON.stringify(settings)}`);
     }
   } catch { /* diagnostics only */ }
-  const { entries, overridden } = resolveDaemonEntries(env);
+  let entries, overridden;
+  // `root` is the tree to boot, often a disposable candidate, not evidence of a live clone. Production
+  // Discovery plumbing is retained for an eventual unlock; on currently resolves to off and never calls it.
+  // Unlocked discovery uses WE_SMOKE_LIVE_CLONE; an injected resolver selects discovery against root.
+  // When the boot tree has none of the fixed entries, boot that list directly: real imports must fail,
+  // while injected-child fixtures need no host LaunchAgents. Inspect the boot tree, not the live root,
+  // so an unreadable live root cannot bypass discovery when a real candidate's entries are present.
+  try {
+    const discover = runtimeEntries ?? (DAEMON_ENTRY_MODULES.some(entry => existsSync(join(root, entry)))
+      ? cloneRuntimeEntries : () => DAEMON_ENTRY_MODULES);
+    ({ entries, overridden } = resolveDaemonEntries(env, { root: runtimeEntries ? root : undefined, runtimeEntries: discover }));
+  }
+  catch { return { ok: false, detail: 'runtime entries unreadable — inspect clone LaunchAgents before retrying smoke' }; }
   // #4468 review — never silently trust an override-or-real entry's shape; a traversal/absolute/scheme
   // specifier resolves OUTSIDE the candidate tree via `new URL(rel, 'file://' + cwd + '/')`. Refuse loud,
   // before spawning anything.

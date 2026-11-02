@@ -86,6 +86,8 @@ const git = (args, cwd = clone) => execFileSync('git', args, { cwd, encoding: 'u
 beforeAll(() => {
   clone = mkdtempSync(join(tmpdir(), 'we-scope-reconcile-'));
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true });
+  cpSync(join(WE_ROOT, 'skills-src/conveyor/daemon-manifest.mjs'),
+    join(clone, 'skills-src/conveyor/daemon-manifest.mjs'));
   // The transcript check imports this skill module during CLI startup.
   cpSync(join(WE_ROOT, 'skills-src', 'inspect-codex-transcript'),
     join(clone, 'skills-src', 'inspect-codex-transcript'), { recursive: true });
