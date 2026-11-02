@@ -1,8 +1,8 @@
 /** GitHub/file observations for judge-sweep-facts. No GitHub mutations or agent dispatches. */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -124,6 +124,52 @@ function readRows(repo) {
   return rows;
 }
 
+const staleFailure = (behind, what) => failure(`checkout-stale (${behind} behind): ${what}`);
+
+/** Fetch origin/main and count how far this checkout is behind it. Any doubt throws (fail closed). */
+export function readCheckoutState({ exec = execFileSync, root = rootDir() } = {}) {
+  const git = args => String(exec('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 120_000,
+    maxBuffer: 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })).trim();
+  git(['fetch', '--quiet', 'origin', 'main']);
+  const count = git(['rev-list', '--count', 'HEAD..origin/main']);
+  // An empty or odd count must read as unknown, never as 0 behind.
+  if (!/^\d+$/.test(count)) throw new Error('unreadable behind count');
+  return { behind: Number(count) };
+}
+
+/** Run the reader from a throwaway worktree of origin/main so code and cards never come from a stale checkout. */
+export function readFromFreshOrigin({ repo, checkCoverage, root = rootDir(), exec = execFileSync } = {}) {
+  const tmp = mkdtempSync(join(tmpdir(), 'judge-facts-fresh-'));
+  const tree = join(tmp, 'tree');
+  const git = args => exec('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 300_000, maxBuffer: 1024 * 1024 });
+  try {
+    git(['worktree', 'add', '--detach', '--quiet', tree, 'origin/main']);
+    // Dependencies are installed per checkout; reuse this one's (the fresh tree has the same lockfile family).
+    if (!existsSync(join(root, 'node_modules'))) throw new Error('node_modules missing in this checkout');
+    symlinkSync(join(root, 'node_modules'), join(tree, 'node_modules'));
+    const script = `import(${JSON.stringify(join(tree, 'scripts/operations/judge-sweep-facts-io.mjs'))})`
+      + `.then(m => process.stdout.write(JSON.stringify(m.createJudgeSweepFactsReader({ checkoutState: () => ({ behind: 0 }) })(${JSON.stringify({ repo, checkCoverage })}))))`;
+    try {
+      return JSON.parse(String(exec(process.execPath, ['--input-type=module', '-e', script], { cwd: tree, encoding: 'utf8',
+        timeout: 600_000, maxBuffer: 64 * 1024 * 1024 })));
+    } catch (error) {
+      const lines = String(error?.stderr ?? '').split('\n').map(l => l.trim()).filter(l => l && !/^Node\.js v/.test(l));
+      const detail = (lines.find(l => /Error/.test(l)) ?? lines.at(-1) ?? error?.message ?? '').slice(0, 300);
+      throw new Error(`fresh reader failed: ${detail}`);
+    }
+  } finally {
+    try { git(['worktree', 'remove', '--force', tree]); } catch { /* directory deleted, then registration pruned, below */ }
+    rmSync(tmp, { recursive: true, force: true });
+    // A registration that cannot be pruned is a refusal, not a silent leak.
+    try { git(['worktree', 'prune']); } catch (error) { throw new Error(`worktree cleanup failed: ${String(error?.message ?? error).slice(0, 200)}`); }
+  }
+}
+
+const validFreshPr = p => p && typeof p === 'object' && Number.isSafeInteger(p.number) && p.number > 0
+  && /^[a-f0-9]{40}$/i.test(p.headSha ?? '') && Array.isArray(p.labels) && Array.isArray(p.evidenceErrors)
+  && Number.isFinite(p.minutesSinceUpdate);
+const validFreshFacts = facts => facts && typeof facts === 'object' && Array.isArray(facts.prs) && facts.prs.every(validFreshPr);
+
 /** Injectable at every boundary; tests never need the host's credentials, process table, or ledgers. */
 export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.now(),
   readFile = readFileSync,
@@ -140,6 +186,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   })),
   baseCap = resolveRoundCap(process.env),
   readStallThresholds = resolveStallThresholds,
+  checkoutState = readCheckoutState, readFresh = readFromFreshOrigin,
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
     // Remote card verification would break this operation's list + comments-only call budget.
     throw failure('remote referral card requires operator verification');
@@ -147,6 +194,20 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
 } = {}) {
   return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
     if (repo.length > 200 || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw failure('repo must be owner/name (at most 200 characters)');
+    // Evidence never depends on this checkout's age: behind origin/main means read from origin/main, else refuse.
+    {
+      let behind;
+      try { behind = checkoutState()?.behind; } catch { behind = undefined; }
+      if (!Number.isSafeInteger(behind) || behind < 0) throw staleFailure('unknown', 'cannot prove this checkout is current with origin/main');
+      if (behind > 0) {
+        let facts;
+        try { facts = readFresh({ repo, checkCoverage, behind }); } catch (error) {
+          throw staleFailure(behind, `fresh origin/main read failed (${String(error?.message ?? error).slice(0, 200)})`);
+        }
+        if (!validFreshFacts(facts)) throw staleFailure(behind, 'fresh origin/main read malformed');
+        return facts;
+      }
+    }
     const start = now();
     const thresholds = readStallThresholds();
     let calls = 0;
@@ -252,9 +313,14 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         result.verdictHistory = parseAdvisories(trusted).map(a => commentVerdict(trusted[a.index], a));
         const latest = result.verdictHistory[0];
         const current = mine.filter(r => r.type === 'verdict').at(-1);
-        result.latestVerdict = latest && advisoryCoversHead({ head: latest.headSha }, headSha) ? latest
-          : current?.coverage?.headSha === headSha ? { accepted: verdictClears(current.verdict), findings: null, lensVerdicts: null, evidence: 'ledger-only' } : null;
-        if (result.latestVerdict?.evidence === 'ledger-only') evidenceErrors.push('verdict details unavailable');
+        result.latestVerdict = latest && advisoryCoversHead({ head: latest.headSha }, headSha) ? latest : null;
+        // No published advisory for this head: the ledger row at this head is the verdict. Any doubt fails closed.
+        if (!result.latestVerdict && current?.coverage?.headSha === headSha) {
+          if (typeof current.verdict === 'string' && current.verdict && Number.isFinite(Date.parse(current.at))) {
+            result.latestVerdict = { accepted: verdictClears(current.verdict), findings: null, lensVerdicts: null,
+              at: new Date(current.at).toISOString(), headSha, evidence: 'ledger' };
+          } else evidenceErrors.push('verdict ledger row malformed');
+        }
         if (!result.latestVerdict && labels.some(l => ['advisory:accepted', 'review:accepted'].includes(l))) evidenceErrors.push('accepted label lacks live verdict evidence');
         if (result.latestVerdict && current?.coverage?.headSha === headSha && Date.parse(current.at) >= Date.parse(result.latestVerdict.at)
           && !verdictClears(current.verdict)) result.latestVerdict = { ...result.latestVerdict, accepted: false };

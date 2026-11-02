@@ -43,7 +43,7 @@ function fixture(overrides = {}) {
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const readComments = vi.fn(() => []);
   const shape = vi.fn(() => ({ humanRequired: false }));
-  const options = { gh, now: () => NOW, readLedgerRows: () => [], readFixRows: () => [],
+  const options = { checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: () => [], readFixRows: () => [],
     readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 5, cardReadable: () => false, ...overrides };
   return { ...options, read: createJudgeSweepFactsReader(options) };
 }
