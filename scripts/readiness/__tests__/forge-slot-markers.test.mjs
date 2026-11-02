@@ -3,6 +3,7 @@ import {describe, it, expect, afterEach} from 'vitest';
 import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import * as pidProbe from '../pid-liveness.mjs';
 import {lockDirFor} from '../file-locks.mjs';
 import {parseTelemetry, easternTimestamp} from '../forge-exec-run.mjs';
 import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun, runVerdict} from '../forge-slot-markers.mjs';
@@ -28,6 +29,72 @@ const liveness = dead => pid => (dead.includes(pid) ? 'dead' : 'alive');
 const names = root => ['0', '1', '2'].filter(i => existsSync(join(root, `slot-${i}.unconfirmed`)));
 
 describe('stale remote slot markers (perf10)', () => {
+  it('reclaims a dead run-less owner with a clean covered window despite unrelated active runs', async () => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(tel(5, undefined, [done(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
+    expect(names(root)).toEqual([]);
+  });
+  it.each(['null', 'throws'])('keeps dead-owner markers when Forge is unreachable: %s', async failure => {
+    const root = setup({0: {pid: 111}, 1: {pid: 111, run: RUN_A}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(async () => { if (failure === 'throws') throw new Error('unreachable'); return null; })).toEqual([]);
+    expect(names(root)).toEqual(['0', '1']);
+  });
+  it.each([
+    {start: NOW - 594_999, reap: true}, {start: NOW - 595_000, reap: false},
+    {start: NOW - 700_000, reap: false}, {start: null, reap: false}, {start: NaN, reap: false},
+  ])('requires proof of PID reuse beyond the five-second tolerance: %j', async ({start, reap}) => {
+    const root = setup({0: {pid: 222}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), startMs: () => start});
+    expect(await reaper.step(tel(0))).toEqual(reap ? ['slot-0.unconfirmed'] : []);
+    expect(names(root)).toEqual(reap ? [] : ['0']);
+  });
+  it.each([
+    {stageMs: {install: 0, run: 0}, ageMs: 7_800_001, reap: true},
+    {stageMs: {install: 0, run: 0}, ageMs: 7_800_000, reap: false},
+    {stageMs: {install: 0, run: 1}, ageMs: 7_800_001, reap: false},
+    {stageMs: {install: 1, run: 0}, ageMs: 7_800_001, reap: false},
+    {stageMs: undefined, ageMs: 7_800_001, reap: false},
+  ])('only discounts strictly abandoned stage-zero entries inside the marker window: %j', async ({stageMs, ageMs, reap}) => {
+    const root = setup({0: {pid: 111, ageMs: 10_800_000}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    const recent = [done(RUN_B), {...going(RUN_A, NOW + 120_000 - ageMs), stageMs},
+      {...done(RUN_C), startedAtET: iso(NOW - 10_860_000)}];
+    expect(await reaper.step(tel(5, undefined, recent))).toEqual(reap ? ['slot-0.unconfirmed'] : []);
+    expect(names(root)).toEqual(reap ? [] : ['0']);
+  });
+  it('retains markers when recent exceeds the producer cap, requiring operator-confirmed cleanup', async () => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    const recent = Array.from({length: 51}, (_, i) => ({...done(RUN_A), runId: `r-${i.toString(16).padStart(32, '0')}`}));
+    expect(await reaper.step(tel(0, undefined, recent))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it('logs one line for each reclaimed marker', async () => {
+    const root = setup({0: {pid: 111}, 1: {pid: 112}}), logs = [];
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112]), log: line => logs.push(line)});
+    expect(await reaper.step(tel(0))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    expect(logs).toHaveLength(2);
+    for (const [i, line] of logs.entries()) {
+      expect(line.trim().split('\n')).toHaveLength(1);
+      expect(line).toContain(`slot-${i}.unconfirmed`);
+      expect(line).not.toContain(`slot-${1 - i}.unconfirmed`);
+    }
+  });
+  it('probes process start time with bounded argv-based ps and fails closed on unknown evidence', () => {
+    expect(pidProbe.probePidStartMs(123, (file, args, options) => {
+      expect(file).toBe('ps'); expect(args).toEqual(['-o', 'lstart=', '-p', '123']);
+      expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBeGreaterThan(0);
+      return 'Sun Nov  1 12:00:00 2026\n';
+    })).toBe(Date.parse('Sun Nov 1 12:00:00 2026'));
+    for (const output of ['', 'invalid']) expect(pidProbe.probePidStartMs(123, () => output)).toBeNull();
+    expect(pidProbe.probePidStartMs(123, () => { throw new Error('ps unavailable'); })).toBeNull();
+    for (const pid of [null, -1, 0, 1.5, '123']) {
+      expect(pidProbe.probePidStartMs(pid, () => { throw new Error('must not execute'); })).toBeNull();
+    }
+  });
+
   it.each([97, 254])('does not classify supervisor failure code %s as confirmed cleanup while Forge is active', async code => {
     const telemetry = await tel(1, undefined, [done(RUN_A, code)])();
     expect(runVerdict(telemetry, RUN_A)).toBe('unknown');
@@ -108,7 +175,7 @@ describe('stale remote slot markers (perf10)', () => {
   });
   it('never reaps a live owner', async () => {
     const root = setup({0: {pid: 222}});
-    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([])});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([]), startMs: () => null});
     expect(await reaper.step(tel(0))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
@@ -170,7 +237,7 @@ describe('stale remote slot markers (perf10)', () => {
     expect(names(root)).toEqual(['0']);
     expect([...blockedSlots(root, 1)]).toEqual([0]);
   });
-  it.each([0, 1])('keeps a run-less marker when an unfinished run starts within clock skew after observed owner death (activeRuns=%s)', async activeRuns => {
+  it.each([0, 1])('keeps a run-less marker when an unfinished run starts inside its dispatch window (activeRuns=%s)', async activeRuns => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
     expect(await reaper.step(tel(activeRuns, undefined, [going(RUN_A, NOW + 29_000)]))).toEqual([]);
@@ -180,12 +247,13 @@ describe('stale remote slot markers (perf10)', () => {
   it.each([
     {startedMs: NOW - 660_001, keep: false}, {startedMs: NOW - 660_000, keep: true},
     {startedMs: NOW, keep: true}, {startedMs: NOW + 60_000, keep: true},
-    {startedMs: NOW + 60_001, keep: false},
+    {startedMs: NOW + 7_260_000, keep: true},
+    {startedMs: NOW + 7_260_001, keep: false},
   ])('applies clock-skew allowance inclusively to both ends of a run-less marker window: %j', async ({startedMs, keep}) => {
     const root = setup({0: {pid: 111}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-    // A consumed prepare can leave an unfinished receipt even after activeRuns drops to zero.
-    const result = await reaper.step(tel(0, undefined, [going(RUN_A, startedMs)]));
+    // A settled receipt covers the window start even when the unfinished entry is newer.
+    const result = await reaper.step(tel(1, undefined, [done(RUN_B), going(RUN_A, startedMs)]));
     expect(result).toEqual(keep ? [] : ['slot-0.unconfirmed']);
     expect([...blockedSlots(root, 1)]).toEqual(keep ? [0] : []);
   });
@@ -199,14 +267,13 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(tel(0, undefined, [done(RUN_C)]))).toEqual(['slot-1.unconfirmed', 'slot-2.unconfirmed']);
     expect(names(root)).toEqual([]);
   });
-  it('keeps a run-less marker while Forge is active or a possible matching receipt is unfinished', async () => {
+  it('reaps a run-less marker with a covered clean window but keeps a possible matching unfinished receipt', async () => {
     const root = setup({0: {pid: 111}, 1: {pid: 112}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112])});
     const early = going('r-' + 'd'.repeat(32), NOW - 5_000_000); // began long before either marker: not theirs
     const mine = going('r-' + 'e'.repeat(32), NOW - 590_000);
-    expect(await reaper.step(tel(1, undefined, [early]))).toEqual([]);
-    expect(names(root)).toEqual(['0', '1']);
-    expect(await reaper.step(tel(0, undefined, [early]))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    expect(await reaper.step(tel(1, undefined, [early]))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    expect(names(root)).toEqual([]);
     const again = setup({0: {pid: 111}});
     const r2 = createMarkerReaper({root: again, host: 'forge', clock: () => NOW, liveness: liveness([111])});
     expect(await r2.step(tel(1, undefined, [mine]))).toEqual([]);

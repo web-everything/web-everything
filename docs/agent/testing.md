@@ -3818,3 +3818,14 @@ churn or unreadable credentials deliberately retain reservations. In `forge-exec
 keep the live host busy probe, but pin the idle probe's PID listing to the test process and read
 its real status file. Inject process churn, unreadable entries, and settled scans separately to
 verify the production scanner's fail-closed behavior without relying on host quiescence.
+
+## Run-less Forge slot recovery
+
+`forge-slot-markers.test.mjs` covers the 130-minute dispatch window, inclusive clock-skew
+bounds, capped-recent coverage, and strictly older stage-zero leaked prepares. Unknown
+start timestamps, unreachable telemetry, and unknown PID birth times retain markers.
+When the newest 50 receipts no longer cover a marker's window start, retain quarantine
+until zero-active telemetry or operator-confirmed remote cleanup; never infer cleanup
+from marker age. PID reuse requires birth more than five seconds after marker creation
+and is checked again after the atomic claim. Run the marker and heavy-admission remote
+suites through heavy-admission when changing recovery or its per-marker log format.

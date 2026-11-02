@@ -759,7 +759,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 124});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.sleep).not.toHaveBeenCalled();
-    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('reaped stale remote slot marker(s) slot-0.unconfirmed');
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('reaped stale remote slot marker slot-0.unconfirmed');
     const replacement = JSON.parse(readFileSync(marker, 'utf8'));
     expect(replacement.owner).not.toBe('dead');
     expect(replacement.pid).toBe(process.pid);

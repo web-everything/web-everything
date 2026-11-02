@@ -7,7 +7,7 @@ import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSyn
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
 import {readLockEntry, lockDirFor} from './file-locks.mjs';
-import {probePidLiveness} from './pid-liveness.mjs';
+import {probePidLiveness, probePidStartMs} from './pid-liveness.mjs';
 
 export const MARKER_GRACE_MS = 120_000;
 // The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
@@ -22,6 +22,8 @@ export function markerContent({owner, pid, nowMs, host, run}) {
 }
 
 const CLOCK_SKEW_MS = 60_000;
+// Client admission is capped at 120 minutes; allow ten more before discounting leaked prepares.
+export const ABANDON_MS = 130 * 60_000;
 const LEGACY_TEXT = 'remote termination unconfirmed';
 const RUN = /^r-[a-f0-9]{32}(?![\s\S])/;
 
@@ -69,7 +71,7 @@ export function runVerdict(telemetry, run) {
 // executing outside that window. A finished prepare can leave code:null in recent, so matching counts do not prove
 // membership. Without an authoritative list of active run IDs, only zero active runs can establish completeness.
 function recentEvidence(telemetry) {
-  if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0 || !Array.isArray(telemetry.recent)) return null;
+  if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0 || !Array.isArray(telemetry.recent) || telemetry.recent.length > 50) return null;
   const runs = new Set();
   for (const item of telemetry.recent) {
     if (!item || typeof item.runId !== 'string' || !RUN.test(item.runId)
@@ -153,7 +155,7 @@ function ownerPid(root, index, file) {
 }
 
 /** True only on proof the owner is gone. A bare marker with provably no slot-lock holder has no live local owner. */
-function ownerGone(root, index, file, liveness, selfPid) {
+function ownerGone(root, index, file, liveness, selfPid, startMs) {
   const marker = readMarker(file);
   if (marker.unreadable) return false;
   if (marker.legacy) {
@@ -161,7 +163,14 @@ function ownerGone(root, index, file, liveness, selfPid) {
     if (holder.state === 'absent') return true;
     return holder.state === 'held' && liveness(holder.pid, selfPid) === 'dead';
   }
-  return liveness(ownerPid(root, index, file), selfPid) === 'dead';
+  const pid = ownerPid(root, index, file), state = liveness(pid, selfPid);
+  if (state === 'dead') return true;
+  if (state !== 'alive' || !Number.isFinite(marker.at)) return false;
+  try {
+    const started = startMs(pid);
+    return Number.isFinite(started) && started > marker.at + 5000;
+  } catch { return false; }
+
 }
 
 /**
@@ -173,12 +182,13 @@ function ownerGone(root, index, file, liveness, selfPid) {
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
  * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
- * was never recorded (the client died before prepare returned) is kept while Forge reports any active runs or any
- * run started inside its own possible window ([at - skew, first-seen-dead + skew]) is still unfinished.
+ * was never recorded uses [at - skew, at + ABANDON_MS + skew]: recent must cover its start (or activeRuns be zero),
+ * and no unfinished receipt may fall inside it, except stage-zero prepares older than ABANDON_MS at sampling.
+ * If the capped recent window cannot cover the marker, retain it for operator-confirmed remote cleanup.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run binding: retain it
  * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
  */
-export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
+export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, startMs = probePidStartMs, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
   const firstDead = new Map();
   const sidecar = file => file + '.dead';
@@ -201,7 +211,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     try {
       const seen = statSync(tomb);
       judged = seen.ino === entry.ino && seen.mtimeMs === entry.mtimeMs
-        && ownerGone(root, held, tomb, liveness, selfPid);
+        && ownerGone(root, held, tomb, liveness, selfPid, startMs);
     } catch { /* unreadable claim: treat as not judged */ }
     if (judged) {
       // The tombstone still blocks the slot here, so no successor can have written its own sidecar yet.
@@ -232,12 +242,13 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         }
         // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.
         if (marker.host !== host || host === undefined) continue;
-        if (!ownerGone(root, index, file, liveness, selfPid)) { forget(file, key); continue; }
+        if (!ownerGone(root, index, file, liveness, selfPid, startMs)) { forget(file, key); continue; }
         stampFor(file, key);
         dead.push({name, key, file, mtimeMs, ino, index, run: marker.run, at: marker.at, owner: marker.owner});
       }
       if (dead.length) {
-        const telemetry = await getTelemetry();
+        let telemetry;
+        try { telemetry = await getTelemetry(); } catch { return []; }
         const sampledAt = Date.parse(telemetry?.sampledAtET), evidence = recentEvidence(telemetry);
         if (Number.isFinite(sampledAt) && evidence) {
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
@@ -246,7 +257,12 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) continue;
             if (entry.run) {
               if (!['finished', 'absent'].includes(runVerdict(telemetry, entry.run))) continue;
-            } else if (!evidence.complete || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;
+            } else {
+              const at = entry.at;
+              if (!Number.isFinite(at)) continue;
+              const coversStart = telemetry.recent.some(item => Date.parse(item.startedAtET) <= at - CLOCK_SKEW_MS);
+              if ((!evidence.complete && !coversStart) || maybeOwnsInflight(telemetry, at, sampledAt)) continue;
+            }
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
             // swapped in meanwhile is put straight back (or kept as a held tombstone that still blocks its slot), so no
             // dispatch marker is ever lost, whatever the timing and without any lease or lock.
@@ -256,16 +272,20 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
           }
         }
       }
-      if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished or absent)\n`);
+      for (const name of reaped) log(`heavy-admission: reaped stale remote slot marker ${name} (owner gone; Forge evidence clears its run window)\n`);
       return reaped;
     },
   };
 }
 
-// A run-less marker's run could only have started between dispatch and owner death; Forge timestamps can skew either way.
-function maybeOwnsInflight(telemetry, atMs, diedByMs) {
+// The client ceiling bounds dispatch even when death was first observed much later.
+function maybeOwnsInflight(telemetry, atMs, sampledAtMs) {
   return telemetry.recent.some(item => {
     const started = Date.parse(item?.startedAtET);
-    return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS));
+    if (!Number.isFinite(started)) return true;
+    const abandoned = item.code === null && item.stageMs?.install === 0 && item.stageMs?.run === 0
+      && started < sampledAtMs - ABANDON_MS;
+    return !Number.isInteger(item.code) && !abandoned
+      && started >= atMs - CLOCK_SKEW_MS && started <= atMs + ABANDON_MS + CLOCK_SKEW_MS;
   });
 }
