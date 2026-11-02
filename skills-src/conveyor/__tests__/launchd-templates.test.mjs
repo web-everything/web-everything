@@ -18,6 +18,14 @@ describe('launchd templates', () => {
     }
   });
 
+  it('turns self-sync on for every pass daemon (R365)', () => {
+    const passDaemons = templates.filter(({ name }) => /^com\.we\.(conveyor-pass-daemon\..*|health-watch)\.plist\.example$/.test(name));
+    expect(passDaemons.length).toBeGreaterThanOrEqual(7);
+    for (const { name, text } of passDaemons) {
+      expect(environment(text), name).toMatch(/<key>PASS_DAEMON_SELF_SYNC<\/key>\s*<string>1<\/string>/);
+    }
+  });
+
   it('launches the PR postmortem watcher with portable placeholders', () => {
     const template = templates.find(({name}) => name === 'com.we.conveyor-pass-daemon.pr-postmortem.plist.example')?.text ?? '';
     expect(template).toContain('INSTALL');
