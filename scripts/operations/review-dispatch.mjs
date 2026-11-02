@@ -570,6 +570,8 @@ export function dispatchReview({
   spawnAgent = defaultSpawnAgent,
   extraArgs = [],
   checkStaleness,
+  // Trusted callers may supply a classifier backed by their own proven closure.
+  reviewCodePath = isReviewCodePath,
   judgeProvider = 'claude',
   careLevel = 'none', escalationReason = [], scopePaths = [],
   checkoutExists = existsSync, home = homedir(),
@@ -599,7 +601,7 @@ export function dispatchReview({
   // #3439 — refuse (not silently spawn) when this checkout is behind origin/main: see `assertMainNotStale`.
   // `checkStaleness` undefined here falls straight through to that function's own default — no need to
   // duplicate it. #4387 — a managed clone refuses only when a behind file is on the review code path.
-  assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
+  assertMainNotStale(root, checkStaleness, { dispatchPath: reviewCodePath });
   // #xqa9ttq — validated HERE, before the brief is ever filled: an unrecognised name would otherwise reach
   // `review-loop-cli.mjs`'s own `--provider` parse INSIDE the dispatched session, where the refusal happens
   // minutes into a real dispatch instead of at the command line that requested it.

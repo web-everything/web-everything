@@ -1338,6 +1338,7 @@ function runReviewArc({
 export function dispatchReviewJob({
   ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
+  reviewCodePath = isReviewCodePath,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
@@ -1350,7 +1351,7 @@ export function dispatchReviewJob({
   // The job path is the DEFAULT review dispatch (the daemon calls it), so it must narrow a managed clone's
   // refusal to the review code path exactly like `dispatchReview` does (#4387). Without this the narrowing
   // never applied and every landed code file made the clone stale (live 2026-10-03: 21 commits behind).
-  assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
+  assertMainNotStale(root, checkStaleness, { dispatchPath: reviewCodePath });
   const slug = planned.sessionSlug;
   const logPath = jobLogPath(slug, dir);
   const base = { mode: 'job', pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, sessionSlug: slug, agentId: null, logPath };

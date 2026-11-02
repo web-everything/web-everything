@@ -18,7 +18,8 @@
  * SCENARIO (no simulator; real git, real modules from `sourceRoot`):
  *   A. a managed clone (WE_DAEMON_MANAGED_CLONE=1) is 1 commit behind its origin, the commit touching only
  *      `scripts/operations/cli-adapter.mjs`; the promote pass runs from it with a planned green draft and a fake
- *      `gh pr ready` — the draft must be promoted;
+ *      `gh pr ready` — the draft must be promoted when a complete fixture graph proves the file unrelated.
+ *      The default graph's unwalked CommonJS dependencies must refuse before any ready call;
  *   B. a daemon tick whose promote half throws must produce a log line naming the promote half and its reason.
  */
 import { execFileSync } from 'node:child_process';
@@ -35,15 +36,27 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 const src = process.env.SOAK_SOURCE_ROOT;
 const promote = await import(pathToFileURL(join(src, 'scripts/operations/promote-draft-pr-dispatch.mjs')).href);
+const { collectImportClosure } = await import(pathToFileURL(join(src, 'scripts/lib/import-closure.mjs')).href);
 const daemon = await import(pathToFileURL(join(src, 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).href);
-const out = { ready: [], threw: null, lines: [] };
+const out = { ready: [], threw: null, lines: [], defaultReady: [], defaultRefusal: null };
+const options = {
+  root: process.env.SOAK_CLONE, repo: null,
+  reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: ${PR}, headRefOid: 'a'.repeat(40) }], refusals: [] }),
+  readHeadCheckState: () => ({ state: 'green', why: 'all required checks succeeded', counts: {} }),
+  readPrLabels: () => [], clearAwaitingCi: () => {},
+};
+out.defaultComplete = promote.promoteCodeClosure()?.complete;
+try {
+  promote.runReconcilePromoteDraftDispatch({ ...options, provider: { ready: n => out.defaultReady.push(n) } });
+} catch (e) { out.defaultRefusal = String(e.message).split('\\n')[0]; }
+const closure = collectImportClosure({ root: process.env.SOAK_CLONE, entries: ['scripts/operations/promote-draft-pr-dispatch.mjs'] });
+out.fixtureComplete = closure?.complete;
+out.fixtureFiles = [...(closure?.files ?? [])].sort();
 try {
   promote.runReconcilePromoteDraftDispatch({
-    root: process.env.SOAK_CLONE, repo: null,
-    reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: ${PR}, headRefOid: 'a'.repeat(40) }], refusals: [] }),
+    ...options,
+    promoteCodePath: path => promote.isPromoteCodePath(path, { closure }),
     provider: { ready: (n) => out.ready.push(n) },
-    readHeadCheckState: () => ({ state: 'green', why: 'all required checks succeeded', counts: {} }),
-    readPrLabels: () => [], clearAwaitingCi: () => {},
   });
 } catch (e) { out.threw = String(e.message).split('\\n')[0]; }
 const empty = () => ({ dispatched: [], refusals: [] });
@@ -87,8 +100,11 @@ export default {
       git(seed, 'config', 'user.email', 'soak@example.invalid');
       git(seed, 'config', 'user.name', 'soak');
       mkdirSync(join(seed, 'scripts/operations'), { recursive: true });
+      mkdirSync(join(seed, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(seed, 'scripts/operations/promote-draft-pr-dispatch.mjs'), "import '../lib/fixture-sandbox.mjs';\n");
+      writeFileSync(join(seed, 'scripts/lib/fixture-sandbox.mjs'), 'export {};\n');
       writeFileSync(join(seed, 'scripts/operations/cli-adapter.mjs'), '// v1\n');
-      git(seed, 'add', 'scripts/operations/cli-adapter.mjs');
+      git(seed, 'add', 'scripts/operations/cli-adapter.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs', 'scripts/lib/fixture-sandbox.mjs');
       git(seed, 'commit', '-q', '-m', 'seed');
       git(seed, 'push', '-q', 'origin', 'HEAD:main');
       git(dir, 'clone', '-q', origin, clone); // the daemon's managed clone, at the seed commit
@@ -110,6 +126,14 @@ export default {
         return { violations };
       }
       log?.(`promoted: ${JSON.stringify(out.ready)}; threw: ${out.threw}`);
+      if (out.fixtureComplete !== true || JSON.stringify(out.fixtureFiles) !== JSON.stringify([
+        'scripts/lib/fixture-sandbox.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs',
+      ])) {
+        violations.push({ invariant: 'fixture-closure-proven', detail: `expected the complete two-module fixture graph: ${JSON.stringify(out)}` });
+      }
+      if (out.defaultComplete !== false || out.defaultReady.length !== 0 || !/STALE code/.test(out.defaultRefusal ?? '')) {
+        violations.push({ invariant: 'unknown-commonjs-closure-refuses', detail: `unwalked default dependencies must refuse before promotion: ${JSON.stringify(out)}` });
+      }
       if (!out.ready.includes(PR)) {
         violations.push({
           invariant: 'green-draft-promoted-despite-off-path-lag',

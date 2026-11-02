@@ -11,6 +11,9 @@ import { decideRestart } from '../daemon-self-sync.mjs';
 import { checkCodeUnchanged } from '../daemon-live-smoke.mjs';
 import { loadReadOnlyOps } from '../read-only-ops.mjs';
 import * as importClosureModule from '../import-closure.mjs';
+import { isReviewCodePath } from '../../operations/review-dispatch.mjs';
+import { isPromoteCodePath } from '../../operations/promote-draft-pr-dispatch.mjs';
+import { isFixCodePath } from '../../conveyor/reconcile-fix-dispatch.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -25,7 +28,7 @@ function fixture() {
 const plistJSON = (f, plist) => JSON.stringify({ WorkingDirectory: f.root, ...plist });
 
 it('keeps clone discovery unwired pending inert-source proof', () => {
-  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
   const references = [];
   const visit = directory => {
     for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
@@ -78,12 +81,8 @@ it.each(['collectRunClosure', 'makeSkipCheck', 'decideRestart', 'checkCodeUnchan
         expect(await loadReadOnlyOps(root, options)).toEqual(new Set(['heavy-queue']));
       } finally { spy.mockRestore(); }
     } else {
-      const modules = {
-        isReviewCodePath: '../../operations/review-dispatch.mjs',
-        isPromoteCodePath: '../../operations/promote-draft-pr-dispatch.mjs',
-        isFixCodePath: '../../conveyor/reconcile-fix-dispatch.mjs',
-      };
-      const classify = (await import(modules[consumer]))[consumer];
+      // Load the consumers during collection, outside this fixture's test timeout.
+      const classify = { isReviewCodePath, isPromoteCodePath, isFixCodePath }[consumer];
       expect(classify(changedFiles[0], { closure })).toBe(true);
       expect(classify(changedFiles[0], { closure: collectImportClosure({ root, entries: ['readable.mjs'] }) })).toBe(false);
     }

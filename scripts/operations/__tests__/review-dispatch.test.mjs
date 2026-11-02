@@ -22,7 +22,9 @@ import {
   reviewDispatchDisallowedToolsArgs, reviewSessionSlug, REVIEW_BRIEF_PLACEHOLDERS,
   REVIEW_DISPATCH_DISALLOWED_TOOLS, REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
   REVIEW_SANDBOX_ROOTS, TOOL_FREE_ONLY_JUDGE_PROVIDERS,
+  reviewSandboxClosure,
 } from '../review-dispatch.mjs';
+import { collectImportClosure } from '../../lib/import-closure.mjs';
 import { buildReviewJudgeRequest, DEFAULT_LENS } from '../review-pr.mjs';
 import { dispatchSessionCwd } from '../dispatch-lane-io.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
@@ -675,18 +677,21 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     git(dir, 'clone', '-q', 'origin.git', 'upstream');
     const up = join(dir, 'upstream');
     commit(up, 'a.txt', 'one\n');
+    commit(up, 'scripts/lib/fixture-sandbox.mjs', 'export {};\n');
+    commit(up, 'scripts/operations/review-pr.mjs', "import '../lib/fixture-sandbox.mjs';\n");
     git(up, 'push', '-q', 'origin', 'main');
     git(dir, 'clone', '-q', '-b', 'main', 'origin.git', 'clone');
     for (const f of behindFiles) commit(up, f, 'two\n');
     git(up, 'push', '-q', 'origin', 'main');
     return join(dir, 'clone');
   }
-  const run = (root) => {
+  const run = (root, { reviewCodePath, spawnAgent } = {}) => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234, repo: 'web-everything/web-everything', root, home: '/home/test', checkoutExists: () => true,
       readBrief: () => REAL_TEMPLATE_STUB, mintSessionId: () => '11111111-1111-4111-8111-111111111111',
-      spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+      spawnAgent: spawnAgent ?? ((argv, opts) => { calls.push({ argv, opts }); return ''; }),
+      reviewCodePath,
       resolveSettingsEnv: () => ({}), sessionCwdFor: () => join(dir, 'session'), ensureSessionCwd: () => {},
       isolateSession: () => ({}),
     });
@@ -700,15 +705,29 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
   });
   const managed = () => { prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1'; };
 
-  it('behind only in code OFF the review path: the review dispatches (before #4387: refused)', () => {
+  it('behind only in code OFF a proven-complete review path: the review dispatches (before #4387: refused)', () => {
     const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
+    const closure = collectImportClosure({ root, entries: ['scripts/operations/review-pr.mjs'] });
+    expect(closure.complete).toBe(true);
+    expect([...closure.files].sort()).toEqual(['scripts/lib/fixture-sandbox.mjs', 'scripts/operations/review-pr.mjs']);
+    const reviewCodePath = path => isReviewCodePath(path, { closure });
     managed();
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      expect(run(root)).toHaveLength(1);
+      expect(run(root, { reviewCodePath })).toHaveLength(1);
       expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/capacity\.mjs.*tolerating the lag/);
     } finally { stderr.mockRestore(); }
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
+  });
+
+  it('refuses unrelated code lag before spawning when the default sandbox graph has unwalked CommonJS', () => {
+    const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
+    managed();
+    expect(reviewSandboxClosure().complete).toBe(false);
+    const spawnAgent = vi.fn();
+    expect(() => run(root, { spawnAgent })).toThrow(/3 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3');
   });
 
   it('behind in a review-path file: still refuses, before spawning', () => {

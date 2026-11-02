@@ -3765,3 +3765,17 @@ polling sleep, then adoption and cleanup; immediate adoption alone does not exer
 For new operation refusal branches, use table-driven cases for every bad-input detail and invalid numeric
 shape, and assert the operator-facing fallback text. Pair state producers with a consumer integration test;
 test failed persistence warnings explicitly so callers cannot promise an event that was never tracked.
+
+## Unwalked CommonJS dependencies in closure fixtures
+
+`collectImportClosure` now marks CommonJS files, require/createRequire references and Unicode escapes
+incomplete. This supersedes the earlier admission-import assertion that the live daemon graph is complete:
+the native client adapter remains lazy, but its dependencies have no static proof. Shape/admission boundary
+tests retain their forbidden-module checks, independently audit ESM edges with the TypeScript parser,
+and assert unknown relevance through `closureHits`. Computed imports, unparseable source and local ESM
+dependencies absent from the graph fail that boundary audit, even when CommonJS already makes it incomplete.
+Review session/job and draft-promotion lag scenarios use real two-module ESM fixture graphs for the positive
+off-path case, passed through their trusted classifier seams. They separately require the default incomplete
+graph to refuse before spawning or promoting. Keep both cases; do not mark the live graph complete or
+disable the staleness guard to preserve an old permissive fixture. Load consumer modules during test collection
+when checking missing-entry behavior, so cold module transformation cannot consume the fixture's timeout.

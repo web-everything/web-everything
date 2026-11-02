@@ -6,9 +6,10 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collectImportClosure } from '../../lib/import-closure.mjs';
+import { closureHits, collectImportClosure } from '../../lib/import-closure.mjs';
 import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import { createRemoteExec, resolveAdmissionPolicy, resolveRemoteClient } from '../heavy-admission.mjs';
+import { esmBoundaryViolations } from '../../lib/__tests__/helpers/esm-boundary.mjs';
 
 const admissionUrl = new URL('../heavy-admission.mjs', import.meta.url);
 const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
@@ -98,9 +99,11 @@ describe('admission import boundary', () => {
     expect(existsSync(f.eventPath)).toBe(false);
   }, 10_000);
 
-  it('keeps daemon closures complete without importing the client loader or handoff push CLI', () => {
+  it('keeps the client loader lazy and the handoff push CLI out, without claiming CommonJS completeness', () => {
     const closure = collectImportClosure({ root: repoRoot, entries: ['scripts/readiness/heavy-admission.mjs'] });
-    expect(closure.complete).toBe(true);
+    expect(esmBoundaryViolations({ root: repoRoot, files: closure.files })).toEqual([]);
+    expect(closure.complete).toBe(false);
+    expect(closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toBeNull();
     expect(closure.files.has('scripts/lib/daemon-events.mjs')).toBe(true);
     expect(closure.files.has('scripts/readiness/remote-exec.mjs')).toBe(true);
     expect(closure.files.has('scripts/operations/handoff-home.mjs')).toBe(false);

@@ -14,6 +14,7 @@ import { compute, effect } from '../operations/step-kinds.mjs';
 import { verifyOperation } from '../operations/verify.mjs';
 import { createChecksRunner, VERIFY_LANE_CLI } from '../operations/verify-io.mjs';
 import { execFileSync } from 'node:child_process';
+import { esmBoundaryViolations } from '../lib/__tests__/helpers/esm-boundary.mjs';
 
 const runner = 'scripts/operations/run.mjs';
 // Self-contained registration is provable without stored-array consumer evidence.
@@ -55,12 +56,27 @@ describe('R131 direction-aware shape wiring', () => {
     expect(buildShapePlan).toBe(sharedShapePlan);
     expect(isBlastRadiusPath('scripts/lib/review-shape.mjs')).toBe(true);
     const closure = importClosure.collectImportClosure({ root: resolve('.'), entries: ['scripts/operations/review-pr.mjs'] });
-    expect(closure?.complete).toBe(true);
+    expect(esmBoundaryViolations({ root: resolve('.'), files: closure.files })).toEqual([]);
+    // Sharing pure shape code does not prove the operation's CommonJS dependencies.
+    // Preserve the CLI boundary below and require conservative relevance for unknown edges.
+    expect(closure?.complete).toBe(false);
+    expect(closure.files.has('scripts/lib/backlog-status.cjs')).toBe(true);
+    expect(importClosure.closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toBeNull();
     expect(closure.files.has('scripts/lib/review-shape.mjs')).toBe(true);
     for (const file of ['scripts/review-core-cli.mjs', 'scripts/lib/read-only-ops.mjs',
       'scripts/operations/run.mjs', 'scripts/operations/cli-adapter.mjs']) {
       expect(closure.files.has(file)).toBe(false);
     }
+  });
+  it('detects computed or missing ESM edges that could hide CLI evidence loading', () => {
+    for (const source of ['import(target);', "import './review-core-cli.mjs';"]) {
+      expect(esmBoundaryViolations({ root: '/fixture', files: new Set(['entry.mjs']), readFile: () => source }))
+        .toEqual([expect.objectContaining({ file: 'entry.mjs', line: 1 })]);
+    }
+    expect(esmBoundaryViolations({ root: '/fixture', files: new Set(['entry.mjs']),
+      readFile: () => '// import(target);\nexport {};\n' })).toEqual([]);
+    expect(esmBoundaryViolations({ root: '/fixture', files: new Set(['entry.mjs']),
+      readFile: () => 'export const =' })).toEqual([{ file: 'entry.mjs', reason: 'unparseable source' }]);
   });
   it('keeps the entire current no-hunks shape for a readable harmless runner edit', () => {
     const harmless = `diff --git a/${runner} b/${runner}\n--- a/${runner}\n+++ b/${runner}\n@@ -1 +1 @@\n-// old note\n+// new note\n`;

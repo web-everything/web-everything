@@ -15,8 +15,9 @@
  * recorded as `skipped: busy pool` (never failed) when the pool and host are provably busy.
  *
  * SCENARIO (real git, real modules from `sourceRoot`):
- *   A. a managed clone is 21 commits behind its origin, every commit touching only code a review never runs —
- *      `dispatchReviewJob` must start the job;
+ *   A. a managed clone is 21 commits behind its origin, every commit touching only code outside a proven
+ *      complete fixture review graph — `dispatchReviewJob` must start the job. The default graph's
+ *      unwalked CommonJS dependencies must instead retain the stale refusal, before spawning;
  *   B. a smoke whose `lane-pool list` hits its cap on a busy host must pass with that row skipped, not fail.
  */
 import { execFileSync } from 'node:child_process';
@@ -32,14 +33,27 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 const src = process.env.SOAK_SOURCE_ROOT;
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
+const dispatch = await import(pathToFileURL(join(src, 'scripts/operations/review-dispatch.mjs')).href);
+const { collectImportClosure } = await import(pathToFileURL(join(src, 'scripts/lib/import-closure.mjs')).href);
 const smoke = await import(pathToFileURL(join(src, 'scripts/lib/daemon-live-smoke.mjs')).href);
 const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(src, 'scripts/lib/constellation-repos.mjs')).href);
-const out = { spawned: null, threw: null, smoke: null };
+const out = { spawned: null, threw: null, smoke: null, defaultSpawns: 0, defaultRefusal: null };
+const options = {
+  ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 3771, repo: CONSTELLATION_REPOS.we.slug,
+  root: process.env.SOAK_CLONE, dir: process.env.SOAK_JOBS, readCompletion: () => null,
+  resolveSettingsEnv: () => null,
+};
+out.defaultComplete = dispatch.reviewSandboxClosure()?.complete;
+try {
+  job.dispatchReviewJob({ ...options, spawnJob: () => { out.defaultSpawns++; return 4242; } });
+} catch (e) { out.defaultRefusal = String(e.message).split('\\n')[0]; }
+const closure = collectImportClosure({ root: process.env.SOAK_CLONE, entries: ['scripts/operations/review-pr.mjs'] });
+out.fixtureComplete = closure?.complete;
+out.fixtureFiles = [...(closure?.files ?? [])].sort();
 try {
   const r = job.dispatchReviewJob({
-    ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 3771, repo: CONSTELLATION_REPOS.we.slug,
-    root: process.env.SOAK_CLONE, dir: process.env.SOAK_JOBS, readCompletion: () => null,
-    resolveSettingsEnv: () => null, spawnJob: () => 4242,
+    ...options, spawnJob: () => 4242,
+    reviewCodePath: path => dispatch.isReviewCodePath(path, { closure }),
   });
   out.spawned = r.jobPid ?? null;
 } catch (e) { out.threw = String(e.message).split('\\n')[0]; }
@@ -69,7 +83,7 @@ export default {
   },
   fixPresent(root) {
     const p = join(root, 'scripts/operations/review-job.mjs');
-    return existsSync(p) && /dispatchPath: isReviewCodePath/.test(readFileSync(p, 'utf8'));
+    return existsSync(p) && /dispatchPath: (?:isReviewCodePath|reviewCodePath)/.test(readFileSync(p, 'utf8'));
   },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-review-stale-'));
@@ -84,6 +98,10 @@ export default {
       git(seed, 'config', 'user.email', 'soak@example.invalid');
       git(seed, 'config', 'user.name', 'soak');
       writeFileSync(join(seed, 'seed.txt'), 'seed\n');
+      mkdirSync(join(seed, 'scripts/operations'), { recursive: true });
+      mkdirSync(join(seed, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(seed, 'scripts/operations/review-pr.mjs'), "import '../lib/fixture-sandbox.mjs';\n");
+      writeFileSync(join(seed, 'scripts/lib/fixture-sandbox.mjs'), 'export {};\n');
       git(seed, 'add', '.');
       git(seed, 'commit', '-q', '-m', 'seed');
       git(seed, 'push', '-q', 'origin', 'HEAD:main');
@@ -115,6 +133,14 @@ export default {
         return { violations };
       }
       log?.(`job pid: ${out.spawned}; threw: ${out.threw}; smoke: ${JSON.stringify(out.smoke)}`);
+      if (out.fixtureComplete !== true || JSON.stringify(out.fixtureFiles) !== JSON.stringify([
+        'scripts/lib/fixture-sandbox.mjs', 'scripts/operations/review-pr.mjs',
+      ])) {
+        violations.push({ invariant: 'fixture-closure-proven', detail: `expected the complete two-module fixture graph: ${JSON.stringify(out)}` });
+      }
+      if (out.defaultComplete !== false || out.defaultSpawns !== 0 || !/STALE code/.test(out.defaultRefusal ?? '')) {
+        violations.push({ invariant: 'unknown-commonjs-closure-refuses', detail: `unwalked default dependencies must refuse before spawning: ${JSON.stringify(out)}` });
+      }
       if (out.spawned !== 4242) {
         violations.push({
           invariant: 'review-dispatches-despite-off-path-lag',

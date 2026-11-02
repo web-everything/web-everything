@@ -22,6 +22,7 @@ import { assessLiveness, bindAgents } from '../../conveyor/reconcile-core.mjs';
 import { deriveReviewStatus, tagReviewStatus } from '../../conveyor/review-status-tag.mjs';
 import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
+import { collectImportClosure } from '../../lib/import-closure.mjs';
 
 const REPO = 'web-everything/web-everything';
 // Landing-freeze fix (lane-leftover-reclaim) — `we`'s lane-pool `--repo=` value is now ALWAYS an absolute path
@@ -321,9 +322,9 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
   let root;
   let prevEnv;
   const git = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  const commit = (cwd, file) => {
+  const commit = (cwd, file, text = 'x\n' + Math.random()) => {
     mkdirSync(dirname(join(cwd, file)), { recursive: true });
-    writeFileSync(join(cwd, file), 'x\n' + Math.random());
+    writeFileSync(join(cwd, file), text);
     git(cwd, 'add', file);
     git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', `edit ${file}`);
   };
@@ -331,7 +332,10 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
     git(dir, 'init', '-q', '--bare', '-b', 'main', 'origin.git');
     git(dir, 'clone', '-q', 'origin.git', 'up');
     const up = join(dir, 'up');
-    commit(up, 'a.txt'); git(up, 'push', '-q', 'origin', 'main');
+    commit(up, 'a.txt');
+    commit(up, 'scripts/lib/fixture-sandbox.mjs', 'export {};\n');
+    commit(up, 'scripts/operations/review-pr.mjs', "import '../lib/fixture-sandbox.mjs';\n");
+    git(up, 'push', '-q', 'origin', 'main');
     git(dir, 'clone', '-q', '-b', 'main', 'origin.git', 'clone');
     for (const f of files) commit(up, f);
     git(up, 'push', '-q', 'origin', 'main');
@@ -339,18 +343,31 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
     prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1';
   }
   afterEach(() => { if (prevEnv === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE; else process.env.WE_DAEMON_MANAGED_CLONE = prevEnv; prevEnv = undefined; });
-  const go = () => dispatchReviewJob({
+  const go = (options = {}) => dispatchReviewJob({
     ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root, dir: join(dir, 'jobs'),
     readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob: () => 77,
+    ...options,
   });
 
-  it('behind only in code OFF the review path: dispatches and logs the tolerated files', () => {
+  it('behind only in code OFF a proven-complete review path: dispatches and logs the tolerated files', () => {
     behind('scripts/lane-pool.mjs', 'scripts/backlog/capacity.mjs');
+    const closure = collectImportClosure({ root, entries: ['scripts/operations/review-pr.mjs'] });
+    expect(closure.complete).toBe(true);
+    expect([...closure.files].sort()).toEqual(['scripts/lib/fixture-sandbox.mjs', 'scripts/operations/review-pr.mjs']);
     const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      expect(go()).toMatchObject({ jobPid: 77 });
+      expect(go({ reviewCodePath: path => reviewDispatch.isReviewCodePath(path, { closure }) })).toMatchObject({ jobPid: 77 });
       expect(err.mock.calls.map((c) => String(c[0])).join('')).toMatch(/2 commit\(s\) behind.*scripts\/lane-pool\.mjs.*tolerating the lag/);
     } finally { err.mockRestore(); }
+  });
+
+  it('refuses unrelated code lag before spawning or claiming a job with the default incomplete graph', () => {
+    behind('scripts/lane-pool.mjs', 'scripts/backlog/capacity.mjs');
+    expect(reviewDispatch.reviewSandboxClosure().complete).toBe(false);
+    const spawnJob = vi.fn();
+    expect(() => go({ spawnJob })).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'jobs'))).toBe(false);
   });
 
   it('behind in a file the review runs (review-loop-cli, or review-job\'s own imports): still refuses', () => {

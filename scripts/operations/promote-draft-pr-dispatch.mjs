@@ -271,6 +271,7 @@ export function runReconcilePromoteDraftDispatch({
   prsFile,
   provider,
   checkStaleness,
+  promoteCodePath = isPromoteCodePath,
   // #2811 — the fresh per-sha re-read, injectable so a test can pin the exact race (plan says green, a fresh
   // read says red/pending) with no `gh` on PATH. Defaults to the real `gh api commits/<sha>/check-runs` read.
   readHeadCheckState = defaultReadHeadCheckState,
@@ -302,7 +303,7 @@ export function runReconcilePromoteDraftDispatch({
   // fallback) and this guard threw for the WHOLE pass. The two commits touched no file this pass imports, so a
   // managed clone behind only in files off `isPromoteCodePath` is fresh enough to promote (#4387's rule; the
   // write is `gh pr ready` after a fresh per-sha re-check, never agent code).
-  assertMainNotStale(root, checkStaleness, { label: 'promote-draft', dispatchPath: isPromoteCodePath });
+  assertMainNotStale(root, checkStaleness, { label: 'promote-draft', dispatchPath: promoteCodePath });
   const repoSlug = CONSTELLATION_REPOS[repoKey].slug;
   // #4285-cwd-repo (we:backlog/x4ua3v8) — explicit `--repo` for every non-WE dispatch; `undefined` for WE
   // keeps the WE-default path byte-identical to before this fix (still relies on `cwd` inference there, same
