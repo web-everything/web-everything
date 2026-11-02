@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { runInNewContext } from 'node:vm';
+import { findPrimaryForPool, poolNameFromLanePath } from '../lib/lane-alternates.mjs';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'overload-')); dirs.push(d); return d; };
 afterEach(() => { vi.unstubAllEnvs(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -19,8 +20,10 @@ function poolFunction(name, seams) {
 it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc and continues to the next lane', (damage) => {
   let broken = true;
   const config = vi.fn((_args, dir) => { if (broken && dir.endsWith('lane-1')) throw Error(damage); });
+  const laneDir = (_repo, n) => `/pool/lane-${n}`;
+  const ensureAlternatesFor = vi.fn(poolFunction('ensureAlternatesFor', { laneDir }));
   const heal = poolFunction('fetchOriginHealing', {
-    laneDir: (_repo, n) => `/pool/lane-${n}`,
+    laneDir, ensureAlternatesFor,
     fetchOriginPruneWithRetry: (dir) => { if (broken && dir.endsWith('lane-1')) throw Error('not a git repository'); },
     healSharedStoreFor: () => false, diagnoseLane: () => ({ ok: !broken, problems: [damage] }),
     looksLikeCorruption: () => false, msgOf: (e) => e.message, log: () => {}, healLaneRefs: () => {},
@@ -35,6 +38,7 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
   });
   for (const n of [1, 2]) expect(refresh({ branch: 'main' }, n).skipped).toBe(true);
   expect(broken).toBe(false);
+  expect(ensureAlternatesFor.mock.calls.map(([, n]) => n)).toEqual([1, 2]);
   expect(scrub.mock.calls).toEqual([
     ['/pool/lane-1', 'before refresh fetch'],
     ['/pool/lane-2', 'before refresh fetch'],
@@ -142,6 +146,7 @@ it.each(['lane', 'linked lane worktree', 'unreadable owner', 'primary', 'explici
       resolveReal: value => value, POOL_ROOT: '/pool', CWD_TOP_LEVEL: true, CHECKOUT_ROOT: '/primary/project',
       process: { env: {} }, laneGitHardeningEnv: value => value, scrubGitRepoEnv: value => value,
       LOCAL_GIT_TIMEOUT_MS: 1000, tryGit, fail: message => { throw Error(message); },
+      findPrimaryForPool, poolNameFromLanePath,
     })();
     expect(repo.poolDir).toBe('/pool/project');
     expect(repo.originUrl).toBe(['primary', 'explicit origin'].includes(kind) ? origin : null);

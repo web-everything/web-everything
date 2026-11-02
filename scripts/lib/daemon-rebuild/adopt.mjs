@@ -40,6 +40,7 @@ export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
+  removedForMain = () => false, contentInBuild = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -75,18 +76,71 @@ export function matchReadyCandidate({
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
   // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
-  // Each one's applied sha must be an ancestor of the record's build. Unknown live set (`liveApplied` not given) refuses: fail closed.
+  // Each one's applied sha must be carried by ancestry or proven graduated into the record's own build.
+  // Unknown live set (`liveApplied` not given) refuses: fail closed.
   if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
-  // No exemption for "landed on main": the CURRENT main having it says nothing about the record's (possibly older)
-  // main — the record itself must contain it (Codex round 2). A squash-landed overlay just refuses superseded (fail closed).
-  void leftForMain;
-  const omitted = liveApplied.filter((a) => a?.ref && !(a.sha && carries(a.sha, ready.adopt.finalSha)));
+  // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
+  // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
+  // with independent content proof. Current main containing an overlay alone never satisfies either path.
+  const retired = [];
+  const omitted = liveApplied.filter((a) => {
+    if (!a?.ref) return false;
+    if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
+    if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
+    if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    return true;
+  });
   if (omitted.length > 0) {
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
-  return { adopt: ready.adopt, dropRefs: [], match: 'superseded' };
+  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
+}
+
+/** Prove a removed overlay graduated into this build, including squash-merged content. Unknown evidence refuses. */
+export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
+  try {
+    if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
+    const last = events.findLast((event) => event?.ref === ref);
+    if (last?.kind === 'auto-dropped' && last.reason === 'in-main') {
+      const timeMs = (value) => typeof value === 'number' ? value
+        : typeof value === 'string' ? Date.parse(value) : NaN;
+      const droppedMs = timeMs(last.at);
+      const readyMs = timeMs(readyAt);
+      if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;
+    } else {
+      if (last?.kind !== 'removed' || typeof last.reason !== 'string') return false;
+      const merged = /^graduated #\d+ \(merged ([a-f0-9]{7,40})\)$/.exec(last.reason)?.[1];
+      if (!merged) return false;
+      const resolved = git(['rev-parse', '--verify', `${merged}^{commit}`]);
+      if (resolved?.status !== 0 || typeof resolved.stdout !== 'string') return false;
+      const mergeSha = resolved.stdout.trim();
+      if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
+      if (git(['merge-base', '--is-ancestor', mergeSha, build])?.status !== 0) return false;
+    }
+    // Custom drivers can discard overlay changes while reporting an unchanged merge tree.
+    if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
+    const tree = git(['rev-parse', `${build}^{tree}`]);
+    const mergedTree = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+    if (tree?.status !== 0 || mergedTree?.status !== 0
+      || typeof tree.stdout !== 'string' || typeof mergedTree.stdout !== 'string') return false;
+    const buildTree = tree.stdout.trim();
+    return /^[a-f0-9]{40}$/.test(buildTree) && mergedTree.stdout.split('\n')[0].trim() === buildTree;
+  } catch { return false; }
+}
+
+/** Preserve the discard alert and escalate every refusal except routine candidate expiry/base churn. */
+export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
+  const detail = {
+    target: ready?.adopt?.finalSha,
+    reason: match?.reason,
+    refs: match?.omitted ?? (ready?.adopt?.applied ?? []).map((a) => a.ref),
+  };
+  try { alert('ready-candidate-discarded', detail); } catch { /* still attempt escalation */ }
+  if (!['expired', 'other-base', 'already-head'].includes(detail.reason)) {
+    try { needsYou({ kind: 'ready-candidate-discarded', ...detail }); } catch { /* best-effort reporting */ }
+  }
 }
 
 /**

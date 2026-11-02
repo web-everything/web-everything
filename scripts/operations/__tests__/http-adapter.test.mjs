@@ -24,7 +24,7 @@
  */
 
 import { types } from 'node:util';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -40,6 +40,7 @@ import { inFlight } from '../effect-executor.mjs';
 import { validateInput } from '../registry.mjs';
 import { buildCliSpec, judgeOutcome, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { OPERATIONS, resolveOperation } from '../run.mjs';
+import * as auditIo from '../codex-audit-io.mjs';
 import { reviewPrOperation, REVIEW_PR_OP, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { suggestNextOperation, SUGGEST_NEXT_OP } from '../suggest-next.mjs';
 import { GATE_HEALTH_OP } from '../gate-health.mjs';
@@ -78,6 +79,7 @@ import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
 import { HOST_CAPACITY_OP } from '../host-capacity.mjs';
 import { RESOURCE_STATUS_OP } from '../resource-status.mjs';
+import { WORKER_CAPACITY_OP } from '../worker-capacity.mjs';
 import { PRE_PR_CHECK_OP } from '../pre-pr-check.mjs';
 import { FREE_SCOPE_OP } from '../free-scope.mjs';
 import { MAINTENANCE_OP } from '../maintenance.mjs';
@@ -104,6 +106,63 @@ import {
   runReadOnly,
   segmentsUnder,
 } from '../http-adapter.mjs';
+
+describe('codex-audit runner output', () => {
+  const cases = [
+    { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: '' },
+    { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
+      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
+    { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
+      stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' },
+    { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
+      stderr: 'Audit record write failed; repair the record path and retry.\n' },
+    { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
+      stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+    { name: 'invalid audit arguments', head: 'invalid', code: 2, stdout: '',
+      stderr: 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+  ];
+  for (const json of [true, false]) {
+    it.each(cases)(`captures $name in ${json ? 'JSON' : 'text'} mode without leaking to process streams`, async (testCase) => {
+      // Exercise the production registration, audit main and CLI adapter; only external audit IO is replaced.
+      const deps = {
+        resolveSha: ref => {
+          if (testCase.resolveError) throw new Error('unknown ref');
+          return (ref === 'origin/main' ? 'a' : 'b').repeat(40);
+        },
+        runCodex: async () => testCase.answer,
+        appendRecord: vi.fn(() => { if (testCase.recordError) throw new Error('read-only store'); }),
+        now: () => '2026-11-02T12:00:00.000Z',
+        stdout: text => process.stdout.write(text), stderr: text => process.stderr.write(text),
+      };
+      let leakedOut = '', leakedErr = '';
+      const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(text => { leakedOut += text; return true; });
+      const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(text => { leakedErr += text; return true; });
+      const depsSpy = vi.spyOn(auditIo, 'createAuditDeps').mockReturnValue(deps);
+      let outcome, rendered;
+      try {
+        const { declaration, registry, sinks, finish } = resolveOperation('codex-audit', { json });
+        outcome = await runOperationCli({ declaration, registry, sinks, store: createMemoryRunStore(),
+          argv: ['--base=origin/main', `--head=${testCase.head ?? 'b'.repeat(40)}`, ...(json ? ['--json'] : [])],
+          newRunId: () => 'codex-audit-output',
+        });
+        rendered = finish({ ...outcome, json });
+      } finally {
+        depsSpy.mockRestore(); outSpy.mockRestore(); errSpy.mockRestore();
+      }
+      const output = `${leakedOut}${rendered.lines.join('\n')}\n`;
+      if (json) {
+        expect(JSON.parse(output).verdict).toEqual({ ok: testCase.code === 0, code: testCase.code,
+          stdout: testCase.stdout, stderr: testCase.stderr });
+      } else {
+        expect(output).toContain((testCase.stdout || testCase.stderr).trimEnd());
+      }
+      expect(leakedOut).toBe('');
+      expect(leakedErr).toBe('');
+      expect(rendered.code).toBe(testCase.code);
+      expect(deps.appendRecord).toHaveBeenCalledTimes(testCase.code === 0 || testCase.code === 1 || testCase.recordError ? 1 : 0);
+    });
+  }
+});
 
 // ── fixtures ────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -414,6 +473,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // Card xkuflno — READ-ONLY: both steps are `compute`; the declaring module imports only `registry.mjs`,
     // `step-kinds.mjs` and the pure `../lib/resource-policy.mjs`. The snapshot/policy-file read is bound in run.mjs.
     [RESOURCE_STATUS_OP]: 'resource-status.mjs',
+    // R313/R349 — READ-ONLY shadow: compute-only; the history read and the jsonl log are bound in run.mjs.
+    [WORKER_CAPACITY_OP]: 'worker-capacity.mjs',
     // xcbwt4r — READ-ONLY: both steps are `compute`; the declaring module imports only `registry.mjs`, `step-kinds.mjs` and
     // the pure `../lib/pre-pr-commands.mjs`. The git/receipt read lives in `pre-pr-check-io.mjs` behind the injected `check` reader.
     [PRE_PR_CHECK_OP]: 'pre-pr-check.mjs',
@@ -422,6 +483,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // reads live in `free-scope-io.mjs` behind the injected `collect` reader.
     [FREE_SCOPE_OP]: 'free-scope.mjs',
     'prototype-load': 'prototype-load.mjs',
+    // Runs Codex and appends an audit record: effectful, never read-only.
+    'codex-audit': 'codex-audit.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's
@@ -530,7 +593,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP].sort());
+    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, PR_TRACE_OP, AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, HOST_CAPACITY_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, WORKER_CAPACITY_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP, PR_SIZE_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)

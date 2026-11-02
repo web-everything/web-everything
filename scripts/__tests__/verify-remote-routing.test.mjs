@@ -16,19 +16,29 @@ describe('timeout preservation', () => {
     '--testTimeout=15000 --hookTimeout=30000',
     '--hookTimeout=30000 --testTimeout=15000 --passWithNoTests',
     '--testTimeout=5000 --hookTimeout=10000',
+    '--passWithNoTests',
+    '--testTimeout=4999',
+    '--passWithNoTests scripts/other.test.mjs',
+    '--testTimeout=15000 --reporter=dot',
+  ])('hands the nested wrapper every gate option under remote policy: %s', flags => {
+    const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
+      .toEqual({ command: `npm run test:unit -- 'scripts/changed test.test.mjs' ${flags}`, takeLocalSlot: false, setHeld: false });
+  });
+  it.each([
     "'--testTimeout=15000' --hookTimeout='30000'",
     "--test'Timeout'=15000",
     '--testTimeout 15000 --hookTimeout 30000',
-    '--testTimeout=15000 --testTimeout=30000',
-    '--testTimeout=15000 --reporter=dot',
-    '--passWithNoTests',
+    '--testTimeout=abc',
+    '--testTimeout=3600001',
+    '--reporter=x',
   ])('keeps unsupported gate options intact under remote policy: %s', flags => {
     const command = `npx vitest run 'scripts/changed test.test.mjs' ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } }))
       .toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
 
-  it.each([false, true])('runs the edited test once with its original timeouts and local admission (phase=%s)', async phaseAdmission => {
+  it.each([false, true])('a Forge-dispatched phase that falls back locally still runs with its original timeouts (phase=%s)', async phaseAdmission => {
     const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
     const admissionStart = source.indexOf('async function acquireAdmission(');
     const admissionEnd = source.indexOf('const admission = await acquireAdmission(', admissionStart);
@@ -43,9 +53,9 @@ describe('timeout preservation', () => {
     const decidePhaseRemote = vi.fn(async () => ({ remote: true }));
     // Simulate Forge becoming unavailable: the child runs locally and needs the requested
     // timeout for a six-second edited test. A stripped command produces the original red.
-    const runGate = vi.fn(async childCommand => ({
+    const runGate = vi.fn(async (childCommand, _args, { forgeDispatch }) => ({
       exitCode: childCommand.includes('--testTimeout=15000') && childCommand.includes('--hookTimeout=30000') ? 0 : 1,
-      ranOn: { location: 'local' },
+      remoteAttempt: forgeDispatch, ranOn: { location: 'local' },
     }));
     const context = {
       phaseAdmission, phaseAdmissionPlan, decidePhaseRemote, acquireSlotBlocking,
@@ -69,41 +79,127 @@ describe('timeout preservation', () => {
     const result = await timedRunGate('vitestMs', command);
     expect(result.exitCode).toBe(0);
     expect(runGate).toHaveBeenCalledTimes(1);
-    expect(runGate).toHaveBeenCalledWith(command, undefined, { forgeDispatch: false });
-    expect(acquireSlotBlocking).toHaveBeenCalledTimes(1);
-    expect(decidePhaseRemote).not.toHaveBeenCalled();
+    expect(runGate).toHaveBeenCalledWith('npm run test:unit -- scripts/changed.test.mjs --testTimeout=15000 --hookTimeout=30000',
+      undefined, { forgeDispatch: true });
+    expect(acquireSlotBlocking).not.toHaveBeenCalled();
+    expect(decidePhaseRemote).toHaveBeenCalledTimes(1);
     expect(context.vitestAdmittedLocally).toBe(true);
   });
 });
 
 describe('proven local fallback verdict', () => {
+  it('retains a local red after a receiptless remote completion', () => {
+    const root = mkdtempSync(join(tmpdir(), 'receiptless-chain-'));
+    const report = join(root, 'report.jsonl');
+    try {
+      appendVerifyRemoteReport({ WE_VERIFY_REMOTE_REPORT: report }, { location: 'remote', exitCode: 0 });
+      appendVerifyRemoteReport({ WE_VERIFY_REMOTE_REPORT: report }, { location: 'local-fallback', exitCode: 1 });
+      const ranOn = phaseRunLocation(readRemoteReport(report), { remoteAttempt: true });
+      expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn })).toBe(false);
+      expect(ranOn).toMatchObject({ location: 'mixed', failureLocation: 'local' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    [['local-fallback', 0]],
+    [['remote', 0], ['local-fallback', 0]],
+    [['local-fallback', 0], ['remote', 0]],
+  ])('successful prefix cannot confirm termination of a later segment: %j', (...segments) => {
+    const reports = segments.map(([location, exitCode]) => ({ location, exitCode }));
+    const ranOn = phaseRunLocation(reports, { remoteAttempt: true });
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn }))
+      .toMatchObject({ reason: 'remote-termination-unconfirmed' });
+  });
+
   it.each([1, 2, 75, 124])('never confirms an already local failure (exit %i)', exitCode => {
     const ranOn = phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode })));
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode, ranOn })).toBe(false);
   });
 
-  it.each(['remote', 'mixed', 'unknown', undefined])('preserves confirmation for unproven local execution: %s', location => {
+  it('preserves confirmation for a proven remote failure', () => {
     expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
-      ...(location ? { ranOn: { location } } : {}) })).toBe(true);
+      ranOn: phaseRunLocation([{ location: 'remote', exitCode: 1 }]) })).toBe(true);
+  });
+
+  it.each(['remote', 'unknown', undefined])('requires failure evidence before confirmation: %s', location => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+      ...(location ? { ranOn: { location } } : {}) })).toBe(false);
+  });
+
+  it.each(['{', '', JSON.stringify({ location: 'remote', receiptId: 'bad receipt', exitCode: 0 })])(
+    'an invalid sibling report cannot authorize retrying away a local failure: %s', invalid => {
+      const reports = readRemoteReport('report', () => `${invalid}\n${JSON.stringify({ location: 'local-fallback', exitCode: 1 })}`);
+      expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+        ranOn: phaseRunLocation(reports, { remoteAttempt: true }) })).toBe(false);
+    });
+
+  it.each([
+    [{ location: 'local-fallback', exitCode: 124 }],
+    [{ location: 'remote', exitCode: 0 }, { location: 'local-fallback', exitCode: 124 }],
+  ])('a terminal local exit 124 remains a test verdict: %j', (...reports) => {
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
+      ranOn: phaseRunLocation(reports, { remoteAttempt: true }) })).toBeNull();
+  });
+
+  it('inconsistent reports do not prove a terminal local exit 124', () => {
+    const reports = [{ location: 'local-fallback', exitCode: 1 }, { location: 'local-fallback', exitCode: 124 }];
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
+      ranOn: phaseRunLocation(reports, { remoteAttempt: true }) }))
+      .toMatchObject({ reason: 'remote-termination-unconfirmed' });
+  });
+
+  it.each([
+    { segments: [['remote', 0], ['local-fallback', 1]], confirm: false },
+    { segments: [['local-fallback', 0], ['remote', 1]], confirm: true },
+    { segments: [['remote', 0], ['local-fallback', 0], ['local-fallback', 1]], confirm: false },
+    { segments: [['remote', 0], ['local-fallback', 0], ['remote', 1]], confirm: true },
+    // Inconsistent reports must never permit a retry to erase a reported local red.
+    { segments: [['local-fallback', 1], ['remote', 1]], confirm: false },
+    { segments: [['remote', 1], ['local-fallback', 1]], confirm: false },
+    { segments: [['local-fallback', 0], ['remote', 0]], confirm: false },
+  ])('confirms a mixed chain only when its failure is remote: $segments', ({ segments, confirm }) => {
+    const reports = readRemoteReport('report', () => segments.map(([location, exitCode]) =>
+      JSON.stringify({ location, exitCode, ...(location === 'remote' ? { receiptId: 'run-123456' } : {}) })).join('\n'));
+    const ranOn = phaseRunLocation(reports, { remoteAttempt: true });
+    expect(ranOn.location).toBe('mixed');
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn })).toBe(confirm);
+  });
+
+  it('retains an ambiguous mixed verdict without failure evidence', () => {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1,
+      ranOn: { location: 'mixed' } })).toBe(false);
   });
 
   // Execute the production orchestration with admission and child IO injected. No fixture Git writes.
   // A second (passing) child is deliberately available to expose an unconditional retry into green.
-  it.each([false, true].flatMap(phaseAdmission => [
-    ['vitestMs', 'npx vitest run scripts/changed.test.mjs'],
-    ['standardsMs', 'npm run check:standards'],
-  ].map(([phase, command]) => ({ phaseAdmission, phase, command }))))(
-    'retains the failed child and its evidence: $phase, phaseAdmission=$phaseAdmission', async ({ phaseAdmission, phase, command }) => {
+  it.each([false, true].flatMap(phaseAdmission => [false, true].flatMap(withReceipt => [
+    ['vitestMs', 'npx vitest run scripts/changed.test.mjs', ['local-fallback']],
+    ['standardsMs', 'npm run check:standards', ['local-fallback']],
+    ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000 && npx vitest run scripts/changed.test.mjs --passWithNoTests --testTimeout=15000 --hookTimeout=30000', ['remote', 'local-fallback']],
+    ['vitestMs', 'npx vitest run a.test.mjs --testTimeout=15000 && npx vitest run scripts/changed.test.mjs --testTimeout=15000', ['local-fallback', 'remote']],
+    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run b.test.mjs && npx vitest run scripts/changed.test.mjs', ['remote', 'local-fallback', 'remote']],
+    ['vitestMs', 'npx vitest run a.test.mjs --passWithNoTests && npx vitest run b.test.mjs --passWithNoTests', ['local-fallback', 'unconfirmed']],
+    ['vitestMs', 'npx vitest run a.test.mjs && npx vitest run b.test.mjs && npx vitest run c.test.mjs', ['remote', 'local-fallback', 'unconfirmed']],
+  ].flatMap(([phase, command, locations]) => {
+    const confirm = locations.length > 1 && locations.at(-1) === 'remote';
+    return (confirm ? [0, 1] : [0]).map(confirmationExitCode => ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, withReceipt }));
+  }))))(
+    'preserves local reds and confirms remote reds: $phase, $locations, phaseAdmission=$phaseAdmission, confirmation=$confirmationExitCode, receipt=$withReceipt', async ({ phaseAdmission, phase, command, locations, confirm, confirmationExitCode, withReceipt }) => {
       const source = readFileSync(resolve(repo, 'scripts/verify-lane.mjs'), 'utf8');
       const start = source.indexOf('async function timedRunGate(');
       const end = source.indexOf('// runVitestOnBase', start);
       expect(start).toBeGreaterThan(-1);
       expect(end).toBeGreaterThan(start);
-      const failure = { exitCode: 1, remoteAttempt: true,
-        ranOn: phaseRunLocation(readRemoteReport('report', () => JSON.stringify({ location: 'local-fallback', exitCode: 1 }))),
+      const unconfirmed = locations.at(-1) === 'unconfirmed';
+      const failure = { exitCode: unconfirmed ? 124 : 1, remoteAttempt: true,
+        ranOn: phaseRunLocation(readRemoteReport('report', () => locations.filter(location => location !== 'unconfirmed').map((location, i) => JSON.stringify({
+          location, exitCode: i === locations.length - 1 ? 1 : 0,
+          ...(location === 'remote' && withReceipt ? { receiptId: 'run-123456' } : {}),
+        })).join('\n'))),
         failureDetails: { summary: 'local failure in scripts/changed.test.mjs' },
         output: { stdout: '', stderr: 'FAIL scripts/changed.test.mjs' } };
-      const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: 0, ranOn: { location: 'local' } });
+      const runGate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValue({ exitCode: confirmationExitCode,
+        failureDetails: { summary: 'local confirmation evidence' }, ranOn: { location: 'local' } });
       const acquireAdmission = vi.fn(async () => ({ ok: true }));
       const recordOutcome = vi.fn();
       const context = {
@@ -120,19 +216,46 @@ describe('proven local fallback verdict', () => {
       };
       const timedRunGate = runInNewContext(`${source.slice(start, end)}; timedRunGate`, context);
       const result = await timedRunGate(phase, command);
+      if (confirm) {
+        expect(runGate).toHaveBeenCalledTimes(2);
+        expect(runGate).toHaveBeenNthCalledWith(1, phaseAdmissionPlan({ command, decision: { remote: true } }).command,
+          undefined, { forgeDispatch: true });
+        expect(runGate).toHaveBeenNthCalledWith(2, command, undefined);
+        expect(acquireAdmission).toHaveBeenCalledTimes(1);
+        expect(acquireAdmission).toHaveBeenCalledWith('vitest', command, { forceLocal: true });
+        expect(result.exitCode).toBe(confirmationExitCode);
+        expect(result.ranOn).toEqual({ location: 'local', remoteRedConfirmedLocally: true });
+        expect(result.failureDetails).toEqual({ summary: 'local confirmation evidence' });
+        expect(recordOutcome).toHaveBeenCalledWith('vitest', expect.objectContaining({ exitCode: confirmationExitCode,
+          failureDetails: result.failureDetails }));
+        expect(context.vitestAdmittedLocally).toBe(true);
+        expect(context.ranOnPhases.vitest).toEqual(result.ranOn);
+        expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+        return;
+      }
       expect(result).toBe(failure);
       expect(runGate).toHaveBeenCalledTimes(1);
       expect(runGate).toHaveBeenCalledWith(phaseAdmissionPlan({ command, decision: { remote: true } }).command,
         undefined, { forgeDispatch: true });
       expect(acquireAdmission).not.toHaveBeenCalled();
-      expect(recordOutcome).toHaveBeenCalledWith(phase.replace(/Ms$/, ''), expect.objectContaining({ exitCode: 1,
+      expect(recordOutcome).toHaveBeenCalledWith(phase.replace(/Ms$/, ''), expect.objectContaining({ exitCode: failure.exitCode,
         failureDetails: failure.failureDetails }));
-      expect(context.ranOnPhases[phase.replace(/Ms$/, '')]).toEqual({ location: 'local' });
+      expect(context.remoteUnconfirmed).toBe(unconfirmed);
+      if (unconfirmed) expect(recordOutcome).toHaveBeenCalledWith('vitest', expect.objectContaining({
+        reason: 'remote-termination-unconfirmed', infrastructure: expect.objectContaining({ reason: 'remote-termination-unconfirmed' }),
+      }));
+      expect(context.ranOnPhases[phase.replace(/Ms$/, '')]).toEqual(failure.ranOn);
       expect(context.process.stderr.write).not.toHaveBeenCalled();
     });
 });
 
 describe('verify remote routing', () => {
+  it('pins heavy-admission wrappers for the npm scripts accepted by wrappedNpmScript', () => {
+    const { scripts } = JSON.parse(readFileSync(resolve(repo, 'package.json'), 'utf8'));
+    for (const name of ['test:unit', 'check:standards']) {
+      expect(scripts[name]).toMatch(/^node scripts\/readiness\/heavy-admission\.mjs run --/);
+    }
+  });
   it.each([
     ['remote green never reruns', false, 0, false],
     ['remote red confirms locally', false, 1, true],
@@ -143,7 +266,8 @@ describe('verify remote routing', () => {
     ['missing exit code never reruns', false, undefined, false],
     ['unreadable exit code never reruns', false, '1', false],
   ])('%s', (_name, takeLocalSlot, exitCode, expected) => {
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot }, exitCode })).toBe(expected);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot }, exitCode,
+      ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(expected);
     if (exitCode === 124) expect(remoteInfrastructureFailure({ exitCode, remoteAttempt: !takeLocalSlot })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
   });
   it.each([
@@ -152,7 +276,8 @@ describe('verify remote routing', () => {
     ['signal normalized to exit 2', { exitCode: 2, signal: 'SIGTERM' }],
     ['shell-inferred signal', { exitCode: 143 }],
   ])('remote infrastructure failure never confirms locally: %s', (_name, result) => {
-    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, ...result })).toBe(false);
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, ...result,
+      ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(false);
   });
   it.each([
     'npm run test:unit',
@@ -220,12 +345,55 @@ describe('verify remote routing', () => {
     '--hookTimeout=30000',
     '--testTimeout=5000 --hookTimeout=10000',
     '--reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
-  ])('selected Vitest run retains unsupported trailing gate flags with local admission: %s', flags => {
+  ])('selected Vitest run with trailing gate flags goes to the wrapper with every flag intact: %s', flags => {
     const files = "'scripts/path with spaces.test.mjs' 'scripts/two.test.mjs'";
-    const command = `npx vitest run ${files} ${flags}`;
-    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({
-      command, takeLocalSlot: true, setHeld: true,
+    expect(phaseAdmissionPlan({ command: `npx vitest run ${files} ${flags}`, decision: { remote: true } })).toEqual({
+      command: `npm run test:unit -- ${files} ${flags}`, takeLocalSlot: false, setHeld: false,
     });
+  });
+  it('the daemon selected-tests gate chain is remote-eligible segment by segment', () => {
+    const one = "npx vitest run 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000";
+    const two = "TZ=UTC npx vitest run 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000";
+    expect(phaseAdmissionPlan({ command: `${one} && ${two}`, decision: { remote: true } })).toEqual({
+      command: "npm run test:unit -- 'a.test.mjs' --passWithNoTests --testTimeout=15000 --hookTimeout=30000"
+        + " && TZ=UTC npm run test:unit -- 'b.test.mjs' --testTimeout=15000 --hookTimeout=30000",
+      takeLocalSlot: false, setHeld: false,
+    });
+    expect(phaseAdmissionPlan({ command: `${one} && ${two}`, decision: { remote: false } }))
+      .toEqual({ command: `${one} && ${two}`, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([
+    [`npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["x.mjs","src/y.ts"]' npx vitest run 'scan.test.mjs' --testTimeout=15000`,
+      `npm run test:unit -- a.test.mjs && VERIFY_SCAN_FILES='["x.mjs","src/y.ts"]' npm run test:unit -- 'scan.test.mjs' --testTimeout=15000`],
+    ['VERIFY_SCAN_FILES=x.mjs npx vitest run scan.test.mjs', 'VERIFY_SCAN_FILES=x.mjs npm run test:unit -- scan.test.mjs'],
+    ["VERIFY_SCAN_FILES='[]' npx vitest run scan.test.mjs --passWithNoTests", "VERIFY_SCAN_FILES='[]' npm run test:unit -- scan.test.mjs --passWithNoTests"],
+  ])('a scan segment carrying a safe VERIFY_SCAN_FILES goes to the wrapper with its list (R309): %s', (command, expected) => {
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command: expected, takeLocalSlot: false, setHeld: false });
+  });
+  it.each([
+    // Forge refuses an unsafe scan list, so the scoped scanner stays local.
+    `npx vitest run a.test.mjs && VERIFY_SCAN_FILES='["/etc/passwd"]' npx vitest run scan.test.mjs --testTimeout=15000`,
+    "VERIFY_SCAN_FILES='/etc/passwd' npx vitest run scan.test.mjs",
+    'VERIFY_SCAN_FILES=../x npx vitest run scan.test.mjs',
+    "VERIFY_SCAN_FILES='a;rm' npx vitest run scan.test.mjs",
+    'VERIFY_SCAN_FILES=$(id) npx vitest run scan.test.mjs',
+    'WE_VITEST_MAX_WORKERS=0 npx vitest run a.test.mjs',
+    // CI bypasses the nested wrapper's admission; with no outer slot it would run unslotted.
+    'CI=true npx vitest run a.test.mjs --testTimeout=15000',
+    'npx vitest run a.test.mjs && CI=1 npx vitest run b.test.mjs',
+    'NODE_ENV=test npx vitest run a.test.mjs',
+    'WE_VITEST_MAX_WORKERS=2 npx vitest run a.test.mjs',
+    'DIFF_COVERAGE_BASE=origin/main npx vitest run a.test.mjs',
+    "'TZ'=UTC npx vitest run a.test.mjs",
+    'TZ=UTC npx vitest related a.mjs --run',
+    'npx vitest run a.test.mjs && npx vitest related b.mjs --run --passWithNoTests',
+    'npx vitest run a.test.mjs && npx vitest run b.test.mjs --unknown',
+    'npx vitest run a.test.mjs && npx vitest run',
+    'npx vitest run a.test.mjs &&  npx vitest run b.test.mjs',
+    'npx vitest run a.test.mjs --testTimeout=abc',
+    'npx vitest run a.test.mjs --reporter=x',
+  ])('a chain or env segment Forge cannot run as written keeps the whole command local: %s', command => {
+    expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
   it('local selected Vitest run retains its command, slot and HELD', () => {
     const command = "npx vitest run 'scripts/one.test.mjs' --testTimeout=15000 --hookTimeout=30000 --passWithNoTests";
@@ -234,7 +402,7 @@ describe('verify remote routing', () => {
   });
   it.each([
     'node scan.mjs',
-    "VERIFY_SCAN_FILES='one.mjs' npx vitest run scan.test.mjs",
+    "VERIFY_SCAN_FILES='../one.mjs' npx vitest run scan.test.mjs",
     'npx vitest run guard.test.mjs --reporter=default --reporter=json --outputFile.json=report.json',
     "npx vitest run guard.test.mjs --reporter json --outputFile 'report.json'",
     'npx vitest run guard.test.mjs --outputFile.json=report.json',
@@ -249,20 +417,16 @@ describe('verify remote routing', () => {
     '--unknown --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
     '--reporter=json --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
     '--testTimeout=fast --passWithNoTests',
-    '--testTimeout=1',
-    '--testTimeout=4999 --hookTimeout=30000 --passWithNoTests',
-    '--hookTimeout=1',
-    '--testTimeout=15000 --hookTimeout=9999 --passWithNoTests',
+    '--testTimeout=0',
+    '--testTimeout=3600001 --hookTimeout=30000 --passWithNoTests',
+    '--hookTimeout=030000',
     '--hookTimeout=30000ms --passWithNoTests',
     '--passWithNoTests=true --testTimeout=15000',
-    '--testTimeout=15000 --reporter=dot',
-    '--passWithNoTests other.test.mjs',
   ])('unknown or non-trailing local flags keep the original command and local admission: %s', flags => {
     const command = `npx vitest run scripts/one.test.mjs ${flags}`;
     expect(phaseAdmissionPlan({ command, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
   it.each([
-    "'one.test.mjs' && npm run check:standards",
     'one.test.mjs && node scripts/readiness/heavy-admission.mjs run -- vitest run two.test.mjs',
     'one.test.mjs | tee output',
     'one.test.mjs; echo done',
@@ -282,7 +446,7 @@ describe('verify remote routing', () => {
   });
   it('claims remote only with a completed remote report and preserves the receipt', () => {
     expect(phaseRunLocation([{ location: 'remote', receiptId: 'run-123456', exitCode: 0 }])).toEqual({ location: 'remote', receiptId: 'run-123456' });
-    expect(phaseRunLocation([{ location: 'local-fallback', exitCode: 0 }])).toEqual({ location: 'local' });
+    expect(phaseRunLocation([{ location: 'local-fallback', exitCode: 0 }])).toEqual({ location: 'local', localExitCode: 0 });
     expect(overallRunLocation({ vitest: { location: 'remote' }, scan: { location: 'local' } }).location).toBe('mixed');
   });
   it('an unknown phase location makes the overall location unknown, never mixed or local', () => {
@@ -335,7 +499,6 @@ describe('verify remote routing', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it.each([
-    { location: 'remote', exitCode: 0 },
     ...['', ' ', null, 123].map(receiptId => ({ location: 'remote', receiptId, exitCode: 0 })),
     ...[undefined, null, '0', 0.5, -1, 255].map(exitCode => ({ location: 'remote', receiptId: 'run-123456', exitCode })),
   ])('incomplete remote report fails closed to unknown: %j', report => {
@@ -343,10 +506,10 @@ describe('verify remote routing', () => {
     expect(reports).toEqual([]);
     expect(phaseRunLocation(reports, { remoteAttempt: true })).toEqual({ location: 'unknown' });
   });
-  it('accepts a completed remote report only with receipt and integer exit code', () => {
-    const report = { location: 'remote', receiptId: 'run-123456', exitCode: 0 };
+  it.each([undefined, 'run-123456'])('accepts a completed remote report with integer exit code and optional receipt: %s', receiptId => {
+    const report = { location: 'remote', ...(receiptId ? { receiptId } : {}), exitCode: 0 };
     expect(phaseRunLocation(readRemoteReport('report', () => JSON.stringify(report))))
-      .toEqual({ location: 'remote', receiptId: 'run-123456' });
+      .toEqual({ location: 'remote', ...(receiptId ? { receiptId } : {}) });
   });
   it('exit 124 is infrastructure/unconfirmed rather than a test verdict', () => {
     expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'unknown' } })).toMatchObject({ reason: 'remote-termination-unconfirmed' });
@@ -357,7 +520,8 @@ describe('verify remote routing', () => {
   it('a local exit 124 (never dispatched, a local confirmation, or a proven local fallback) is not remote-unconfirmed', () => {
     expect(remoteInfrastructureFailure({ exitCode: 124 })).toBeNull();
     expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: false, ranOn: { location: 'local', remoteRedConfirmedLocally: true } })).toBeNull();
-    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true, ranOn: { location: 'local' } })).toBeNull();
+    expect(remoteInfrastructureFailure({ exitCode: 124, remoteAttempt: true,
+      ranOn: phaseRunLocation([{ location: 'local-fallback', exitCode: 124 }]) })).toBeNull();
   });
   it('report writes are best effort and heartbeat of a non-owned slot is harmless', () => {
     const root = mkdtempSync(join(tmpdir(), 'verify-report-'));
@@ -393,8 +557,8 @@ describe('verify-lane remote phase spawn', () => {
     ['unreadable', 0, 'unknown', false],
     ['raw', 0, 'local', true],
     ['raw', 0, 'local', true, 'npm run test:unit && node raw.cjs'],
-    ['raw', 0, 'local', true, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
-      ['vitest', 'run', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot', '--passWithNoTests', '--testTimeout=15000', '--hookTimeout=30000']],
+    ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot --passWithNoTests --testTimeout=15000 --hookTimeout=30000",
+      ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot', '--passWithNoTests', '--testTimeout=15000', '--hookTimeout=30000']],
     ['remote', 0, 'remote', false, "npx vitest run 'one.test.mjs' 'path with spaces.test.mjs' --reporter=dot",
       ['run', 'test:unit', '--', 'one.test.mjs', 'path with spaces.test.mjs', '--reporter=dot']],
     ['raw', 0, 'local', true, 'npx vitest run one.test.mjs --unknown --passWithNoTests --testTimeout=15000 --hookTimeout=30000',
@@ -405,7 +569,7 @@ describe('verify-lane remote phase spawn', () => {
       ['vitest', 'run', 'guard.test.mjs', '--reporter=json', '--outputFile.json=report.json']],
     ['raw', 0, 'local', true, 'npx vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism retry.test.mjs',
       ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism', 'retry.test.mjs']],
-    ['raw', 0, 'local', true, "VERIFY_SCAN_FILES='one.mjs' npx vitest run scan.test.mjs", ['vitest', 'run', 'scan.test.mjs']],
+    ['raw', 0, 'local', true, "VERIFY_SCAN_FILES='../one.mjs' npx vitest run scan.test.mjs", ['vitest', 'run', 'scan.test.mjs']],
     ...[false, true].map(phaseAdmission => ['remote', 0, 'remote', false,
       "npx vitest run 'one.test.mjs'",
       ['run', 'test:unit', '--', 'one.test.mjs'], phaseAdmission]),
@@ -567,7 +731,7 @@ process.exit(again?0:1);`);
           ]);
         expect(marker.ranOn.phases.standards).toEqual(confirmed && !baseCompared
           ? { location: 'local', remoteRedConfirmedLocally: true }
-          : mode === 'local-fallback' ? { location: 'local' } : { location: 'remote', receiptId: 'run-123456' });
+          : mode === 'local-fallback' ? { location: 'local', localExitCode: 0 } : { location: 'remote', receiptId: 'run-123456' });
         if (confirmed) expect(observed.filter(e => e.event === 'acquire').map(e => e.kind)).toEqual(
           baseCompared ? (phaseAdmission ? ['files', 'files', 'files'] : ['selected', 'selected', 'selected'])
             : phaseAdmission ? (retryExit !== undefined ? ['files', 'files', 'other'] : ['files', 'other']) : ['selected', 'selected']);
@@ -657,5 +821,95 @@ process.exit(again?0:1);`);
   }, 20000);
   it('local confirmation killed by a signal is a local verify-signal, never remote-unconfirmed', () => {
     verifyRemotePhase('remote', 2, 'local', false, 'npm run test:unit', undefined, undefined, 1, 0, undefined, 'signal');
+  });
+});
+
+describe('R332: scan phases and whole-gate chains route to Forge', () => {
+  const scan = (files = ['scripts/a.mjs', 'dir/b-c.mjs']) => `VERIFY_SCAN_FILES='${JSON.stringify(files).replaceAll("'", "'\\''")}'`;
+  const remote = { remote: true };
+  it('bounds classification of repeated quoted assignments without losing local refusals or remote routing', () => {
+    const prefix = "TZ='UTC' ".repeat(40);
+    const cases = [
+      { command: `${prefix}node scripts/x.mjs`, remote: true, local: true },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs`, remote: true, local: false },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs`, remote: false, local: true },
+      { command: `${prefix}' npx vitest run scripts/x.test.mjs`, remote: true, local: true },
+      { command: `${prefix}npx vitest run scripts/x.test.mjs && node scripts/x.mjs`, remote: true, local: true },
+    ];
+    // A child timeout bounds even synchronous regexp backtracking; a Vitest timeout cannot interrupt it.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { phaseAdmissionPlan } from ${JSON.stringify(pathToFileURL(resolve(repo, 'scripts/lib/verify-remote-routing.mjs')).href)};
+      const plans = ${JSON.stringify(cases)}.map(({ command, remote }) => phaseAdmissionPlan({ command, decision: { remote } }));
+      process.stdout.write(JSON.stringify(plans));
+    `], { encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(cases.map(({ command, local }) => ({
+      command: local ? command : command.replace('npx vitest run', 'npm run test:unit --'),
+      takeLocalSlot: local, setHeld: local,
+    })));
+  }, 10000);
+  it('routes a repo-scan command whose changed-file JSON is single-quoted', () => {
+    const prefix = scan();
+    const command = `${prefix} npx vitest run 'scripts/lib/__tests__/lane-git-diet.test.mjs' scripts/x.test.mjs --testTimeout=15000 --hookTimeout=30000`;
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({
+      command: `${prefix} npm run test:unit -- 'scripts/lib/__tests__/lane-git-diet.test.mjs' scripts/x.test.mjs --testTimeout=15000 --hookTimeout=30000`,
+      takeLocalSlot: false, setHeld: false });
+    expect(phaseAdmissionPlan({ command, decision: { remote: false } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([
+    ["VERIFY_SCAN_FILES='{\"a\":1}'", 'non-array JSON'],
+    ["VERIFY_SCAN_FILES='[\"/etc/passwd\"]'", 'absolute path'],
+    ["VERIFY_SCAN_FILES='[\"a\"]' VERIFY_SCAN_ROOT=/tmp/x", 'unlisted env key'],
+    ["SECRET_TOKEN='x'", 'secret-shaped env key'],
+    ["VERIFY_SCAN_FILES='[\"a\"]\ntouch /tmp/pwn'", 'newline in value'],
+  ])('keeps a scan command with %s local (%s)', (prefix) => {
+    const command = `${prefix} npx vitest run scripts/x.test.mjs`;
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it.each([['dir/b c.mjs'], ["d'e.mjs"]])('keeps a scan command naming a path Forge refuses local: %s', path => {
+    const command = `${scan([path])} npx vitest run scripts/x.test.mjs`;
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it('keeps a scan command with a stray quote or trailing shell syntax local', () => {
+    for (const command of [`${scan()}' npx vitest run x.test.mjs`, `${scan()} npx vitest run x.test.mjs; rm -rf x`,
+      `${scan()} node scripts/x.mjs`]) {
+      expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+    }
+  });
+  it('routes the whole verify gate chain and keeps its original text', () => {
+    for (const command of ['npm run test:unit && npm run check:standards', 'npm run test:unit',
+      'npm test && npm run check:standards'.replace('npm test', 'npm run test:unit -- scripts/a.test.mjs'),
+      'npm run test:unit && npm run check:standards -- --local --files=a.md,b.mjs']) {
+      expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: false, setHeld: false });
+      expect(phaseAdmissionPlan({ command, decision: { remote: false } }).takeLocalSlot).toBe(true);
+    }
+  });
+  it('wraps vitest segments of a mixed chain and leaves npm segments alone', () => {
+    const command = 'npx vitest run scripts/a.test.mjs && npm run check:standards';
+    expect(phaseAdmissionPlan({ command, decision: remote }))
+      .toEqual({ command: 'npm run test:unit -- scripts/a.test.mjs && npm run check:standards', takeLocalSlot: false, setHeld: false });
+  });
+  it('a quoted vitest file in a mixed chain is wrapped like an unquoted one (formerly a keep-local case)', () => {
+    expect(phaseAdmissionPlan({ command: "npx vitest run 'one.test.mjs' && npm run check:standards", decision: { remote: true } }))
+      .toEqual({ command: "npm run test:unit -- 'one.test.mjs' && npm run check:standards", takeLocalSlot: false, setHeld: false });
+  });
+  it.each([
+    'npm run test:unit && node scripts/x.mjs',
+    'npm run test:unit && npm run build',
+    'npm run test:unit || npm run check:standards',
+    'npm run test:unit; npm run check:standards',
+    'npm run test:unit && npm run check:standards -- --bogus',
+    'npm run test:unit && npm run check:standards && echo done',
+    'npm run test:unit -- --coverage && npm run check:standards',
+    'npm run check:standards -- --files=a$(id)',
+  ])('keeps a chain with an ineligible segment local: %s', command => {
+    expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+  });
+  it('keeps the always-run guard (json report read locally) and soak (--config) local', () => {
+    for (const command of [
+      "npx vitest run a.test.mjs --reporter=default --reporter=json --outputFile.json='/tmp/r/report.json' --testTimeout=15000",
+      'npx vitest run --config vitest.soak.config.ts scripts/conveyor/soak/breaks/x.soak.test.mjs',
+    ]) expect(phaseAdmissionPlan({ command, decision: remote })).toEqual({ command, takeLocalSlot: true, setHeld: true });
   });
 });

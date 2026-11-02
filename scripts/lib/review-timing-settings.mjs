@@ -8,6 +8,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const readJson = (path, read) => { try { return JSON.parse(read(path, 'utf8')); } catch { return {}; } };
 const nonnegative = v => Number.isSafeInteger(v) && v >= 0;
 const boolean = v => typeof v === 'boolean';
+const enumList = choices => v => Array.isArray(v) && v.length > 0 && v.every(item => choices.includes(item));
 export function resolveTimingPolicy({ env = process.env, read = readFileSync, review, fix, platformReview, platformFix, log } = {}) {
   const envValues = (prefix, defaults) => Object.fromEntries(Object.keys(defaults).map(key => {
     const raw = env[`${prefix}_${key.replace(/[A-Z]/g, x => `_${x}`).toUpperCase()}`];
@@ -33,6 +34,8 @@ export function resolveTimingPolicy({ env = process.env, read = readFileSync, re
       startAfter: v => ['fast-checks', 'ci-green', 'push'].includes(v),
       fastChecks: validFastChecks,
       startBeforeCi: boolean, cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
+      earlyStartShadow: boolean, earlyStartCare: enumList(['none', 'low', 'elevated', 'high']),
+      earlyStartMaxLines: nonnegative, earlyStartMaxFiles: nonnegative, earlyStartKinds: enumList(['code', 'docs', 'config', 'data']),
     },
   });
   const fixResult = cascadePolicy('fix', pick(fix ?? readJson(join(HERE, '..', 'settings', 'fix.json'), read)?.fix, FIX_TIMING_DEFAULTS), {

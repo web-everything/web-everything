@@ -1336,16 +1336,31 @@ function finishGitMiss({ home, g, store, loud, record }) {
   return { ...home, ok: home.ok, store, git: g, ledgerWriteMiss: true, errors: [...(home.errors ?? [])] };
 }
 
+/** The operator-facing cause of a refused ledger write: the first line of the git text, credential-scrubbed BEFORE it
+ *  is truncated. Raw git text can carry secrets in URL authority, query strings, fragments or headers, so each is
+ *  dropped, and a credential-looking keyword drops the rest of the line (fail closed). */
+export function ledgerWriteErrorSummary(error) {
+  return String(error ?? 'unknown ledger write failure').split(/\r?\n/)[0]
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s]*/gi, '$1[redacted]')
+    .replace(/[?#]\S*/g, '[redacted]')
+    .replace(/\b(gh[pousr]_|github_pat_|glpat-|xox[abprs]-|sk-)[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(/(?:authorization|bearer|basic\s|token|passw|secret|credential|api[_-]?key|signature|cookie)[\s\S]*$/i, '[redacted]')
+    .replace(/[A-Za-z0-9+/_=-]{32,}/g, '[redacted]')
+    .slice(0, 200);
+}
+
 /** The F4 write-miss posture, CLEARING half. A clearing verdict that missed git does NOT clear, and it leaves NO
  *  home row behind: home is what every fold reads, so a row there would stand in for the missing git row (the fold
  *  says "already decided", the retry never reaches git). Nothing is lost: the caller keeps the operation resumable
  *  (`ok: false`, `ledgerWriteMiss: true`) and a retry is a clean re-append. Every caller must honour `ok` before it
  *  swaps a label (`review-pr-io`, `merge-ai-prs` and `review-set-label` do). */
 function refuseClearingOnGitMiss({ g, store, loud, record }) {
-  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; the git transport write failed (cause above), a retry re-appends cleanly`);
+  const cause = ledgerWriteErrorSummary(g.error);
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${cause} — clearing event does NOT clear (F4) and NO home row was written; the git transport write failed (cause above), a retry re-appends cleanly`);
   return {
     ok: false, path: null, record: null, locked: false, store, git: g, ledgerWriteMiss: true,
-    errors: [`ledger-write-miss: ${g.error}`],
+    errors: [`ledger-write-miss: ${cause}`],
   };
 }
 

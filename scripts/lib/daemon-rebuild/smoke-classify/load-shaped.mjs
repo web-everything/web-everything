@@ -31,6 +31,20 @@ export const LOAD_CONTENTION_SIGNATURES = Object.freeze([
   /\(lock contention\)/,
   /gave up waiting for the shared acquirability-scan lock/,
 ]);
+/** Our own shared gh semaphore refusing: another caller's slot, never the tree under test. Anchored on the exact
+ *  refusal text, and applied per failure segment (see {@link isGhThrottleOnlyDetail}). */
+const GH_THROTTLE_SEGMENT = /^(?:dispatch dry-run failed \(\d+\/\d+\): )?(?:[\w-]+(?: PR #\d+)?: )?gh-throttle: throttled — no gh slot within [\d.]+s(?: \(class=[\w-]+\))?(?: — (?:[\w-]+ (?:\d+ms|[\d.]+s|unknown)(?:, )?)+)?$/;
+const TIMINGS = '(?: — (?:[\\w-]+ (?:\\d+ms|[\\d.]+s|unknown)(?:, )?)+)?';
+const GH_THROTTLE_TAIL = new RegExp(`^retry next tick${TIMINGS}$`);
+
+/** PURE: the WHOLE detail is gh-throttle refusals (each `; `-joined segment fully anchored, optional "retry next
+ *  tick" tail). Any other text — a code failure, a newline — makes it NOT throttle-only. */
+function isGhThrottleOnlyDetail(detail) {
+  if (/[\r\n]/.test(detail)) return false;
+  const segs = detail.split('; ');
+  return segs.some((seg) => GH_THROTTLE_SEGMENT.test(seg))
+    && segs.every((seg) => GH_THROTTLE_SEGMENT.test(seg) || GH_THROTTLE_TAIL.test(seg));
+}
 
 export function loadDifferentialEnabled(env) {
   return String(env?.[SMOKE_LOAD_DIFFERENTIAL_ENV] ?? '').trim() !== '0';
@@ -51,5 +65,7 @@ export function isLoadShapedRow(row, env = {}) {
   if (isEnvTimeoutRow(row, { minElapsedMs })) return true;
   const detail = String(row.detail ?? '');
   if (LOAD_CONTENTION_SIGNATURES.some((re) => re.test(detail))) return true;
+  // Our slot refusal is load contention even for code checks such as dispatch-dry-run.
+  if (isGhThrottleOnlyDetail(detail)) return true;
   return row.mayBeTransient !== false && TRANSIENT_FAILURE_PATTERNS.some((re) => re.test(detail));
 }

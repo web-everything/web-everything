@@ -81,7 +81,10 @@ function poolEnv(extra = {}) {
   // LANE_POOL_ROOT MUST be this test's private tmp dir — matches the sibling lane-pool spawn tests: without it
   // every command falls back to the real default pool root, colliding with the LIVE pool this task runs under.
   // VITEST is already set by the runner; `guardedPoolRoot` accepts that because LANE_POOL_ROOT is explicit.
-  return { ...process.env, LANE_POOL_ROOT: poolRoot, ...extra };
+  // Pin fresh status probes for provisioning AND both measurements: provision warms the default 45 s cache,
+  // which can expire while filler heads are created. Comparing warm and expired reads measures cache age,
+  // not remote-head fan-out, and can also hide extra git work behind cache hits.
+  return { ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_STATUS_MAX_AGE_MS: '0', ...extra };
 }
 
 function provision(count) {

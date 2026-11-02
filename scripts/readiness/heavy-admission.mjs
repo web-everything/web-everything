@@ -147,7 +147,7 @@ import '../lib/tools-root-guard.mjs';
 import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
-import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
+import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -172,6 +172,7 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
+import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -788,7 +789,7 @@ export async function runWithRemoteDecision({
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
+  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
@@ -803,13 +804,21 @@ export async function runWithRemoteDecision({
   const waitAt = clock();
   let slot;
   let healthAt = waitAt;
+  let reapedAt = -Infinity;
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log});
   let overloadWaitLogged = false;
   try {
     for (;;) {
       const nowMs = clock();
       // The extended overload wait never acquires a slot past the run's own timeout.
       if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
-      const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
+      // Dead clients' markers must not wall off the cap: reap by owner liveness plus Forge's own state for that run.
+      // Throttled and cheap (one readdir) when no marker is stale, so it runs on every pass, not only once the pool is full.
+      if(nowMs-reapedAt>=2000){
+        reapedAt=nowMs;
+        await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs).catch(()=>[]);
+      }
+      const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
       if(slot.ok)break;
       const waited = nowMs - waitAt;
@@ -857,7 +866,12 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      writeFileSync(executionMarker,'remote termination unconfirmed\n',{flag:'wx',mode:0o600});
+      // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
+      if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+      // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
+      // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
+      if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {
@@ -866,7 +880,7 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal }));
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {
       const termination = await Promise.race([
@@ -901,7 +915,7 @@ export async function runWithRemoteDecision({
       // Unconfirmed results, throws and client death leave the pre-dispatch
       // marker intact across PID reclaim and lease expiry. Only confirmed
       // completion/termination can make this index available again.
-      try {unlinkSync(executionMarker);outstanding = false;}
+      try {try{unlinkSync(`${executionMarker}.run`);}catch{/* none */}unlinkSync(executionMarker);outstanding = false;}
       catch {log(`heavy-admission: remote slot-${slot.slot} retained; execution confirmed terminated but its .unconfirmed marker could not be removed; operator cleanup required\n`);}
       if(!outstanding)releaseOwnedSlot({...slotOptions,fastSlots:0});
     }
@@ -2185,6 +2199,14 @@ export function poolRootOf(lockRoot) {
  * @param {(ms:number) => Promise<void>} [opts.sleep]
  * @returns {Promise<{ exitCode:number, admission:object }>}
  */
+// A child killed by a signal has status null: report the shell convention 128+signal so callers' infrastructure-failure
+// guards see a killed runner, never a plain test failure (exit 1).
+function childExitCode(e) {
+  if (Number.isFinite(e && e.status)) return e.status;
+  const n = e && typeof e.signal === 'string' ? osConstants.signals[e.signal] : undefined;
+  return Number.isInteger(n) ? 128 + n : 1;
+}
+
 export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
@@ -2196,7 +2218,7 @@ export async function runUnderAdmission({
   if (bypass) {
     let exitCode = 0;
     try { exec(command, { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv }); }
-    catch (e) { exitCode = Number.isFinite(e && e.status) ? e.status : 1; }
+    catch (e) { exitCode = childExitCode(e); }
     return { exitCode, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
   }
   mkdirSync(lockRoot, { recursive: true });
@@ -2218,7 +2240,7 @@ export async function runUnderAdmission({
     if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
     exec(command, execOpts);
   } catch (e) {
-    exitCode = Number.isFinite(e && e.status) ? e.status : 1;
+    exitCode = childExitCode(e);
     if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
   } finally {
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });

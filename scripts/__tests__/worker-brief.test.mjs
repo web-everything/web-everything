@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
@@ -15,6 +16,35 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('runs the printed plateau-app check outside WE and reports JSON for the explicit target', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-verify-'));
+    const target = path.join(root, 'plateau lane');
+    fs.mkdirSync(target);
+    try {
+      const brief = renderWorkerBrief({ ...params, repo: 'plateau-app' });
+      const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)[1]
+        .replace('<lane>', `'${target}'`);
+      const result = spawnSync(command, { shell: true, cwd: root, encoding: 'utf8', timeout: 10000 });
+      expect(result.error).toBeUndefined();
+      expect(result.stderr).not.toContain('MODULE_NOT_FOUND');
+      // A non-Git target must fail closed with JSON naming that target, not fail to locate WE's CLI.
+      expect(result.status).toBe(3);
+      expect(JSON.parse(result.stdout)).toMatchObject({ status: 'error', reason: 'no-head' });
+      expect(JSON.parse(result.stdout).detail).toContain(target);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['we', 'plateau-app'])('uses WE’s absolute verification CLI and an explicit lane for %s', repo => {
+    const brief = renderWorkerBrief({ ...params, repo });
+    const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)?.[1];
+    expect(command).toBeDefined();
+    expect(command).toContain(path.resolve('scripts/verify-lane.mjs'));
+    expect(command).toContain('check --wait=150000 --json --repo=<lane>');
+    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
+    expect(runner).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
+    expect(runner).toContain('absolute path');
+  });
+
   it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
     const brief = renderWorkerBrief(params);
     const lane = brief.slice(brief.indexOf('3. **Lane.**'), brief.indexOf('4. **Codex'));
@@ -26,7 +56,43 @@ describe('renderWorkerBrief', () => {
     const brief = renderWorkerBrief(params);
     const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
     for (const text of ['timeout: 600000', "don't start a second copy", 'harness-tracked', '~180s',
-      'nohup', 'setsid', 'SYNCHRONOUS']) expect(codex).toContain(text);
+      'nohup', 'setsid']) expect(codex).toContain(text);
+  });
+
+  it('tells workers to detach Codex, repeat short waits, and never end the turn while a task runs', () => {
+    const brief = renderWorkerBrief(params);
+    const codex = brief.slice(brief.indexOf('4. **Codex'), brief.indexOf('5. **Red-green'));
+    for (const text of ['--detach', 'wait --job=<id> --wait=150000', 'separate foreground calls',
+      'check --wait=150000', 'never end the turn while a task is running']) expect(brief).toContain(text);
+    expect(codex).not.toContain('SYNCHRONOUS');
+    expect(codex).not.toContain('never wrapped in a wait');
+  });
+
+  it('stops polling on success or terminal failure in both worker and runner instructions', () => {
+    const brief = renderWorkerBrief(params);
+    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
+    for (const text of [brief, runner]) {
+      expect(text).toContain('Repeat only on exit 75');
+      expect(text).toContain('exit 0 = success');
+      expect(text).toContain('status=failed is a terminal worker failure');
+      expect(text).toContain('status=wait-error');
+      expect(text).toContain('does not prove the worker stopped');
+      expect(text).toContain('retain the lane and scope');
+      expect(text).toContain('keep renewing leases');
+      expect(text).toContain('missing/unreadable JSON');
+      expect(text).toContain('retry the same job');
+      expect(text).toContain('confirmed terminal');
+      expect(text).toContain('supervised termination');
+      expect(text).toContain('confirm the worker stopped before cleanup');
+      expect(text).not.toContain('any other exit = stop and report the failure');
+      expect(text).not.toContain('until it exits 0');
+      expect(text).toContain('check --wait=150000 --json');
+      expect(text).toContain('Repeat only for a timeout with lastStatus=running');
+      expect(text).toContain('stop and report red, infrastructure-failure, or any other non-running result');
+      expect(text).toContain('If settled is not true');
+      expect(text).toContain('recover observation of the same verification');
+      expect(text).toContain('until verification is confirmed terminal');
+    }
   });
 
   it('prints the four R302 speed rules before step 1 and keeps no contradicting Codex or verify line', () => {

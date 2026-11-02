@@ -50,3 +50,7 @@ and the two candidate angles, not the implementation.
    genuine backgrounded Agent/Task-type call that the harness itself tracks (generates a real completion
    notification), or a `notify_when_idle`-style subscription established via `SendMessage`. Confirm this
    against at least one fixture per legitimate pattern.
+
+## Held-card additions (2026-11-01, themes: worker-process guards)
+
+- Recurred 3x on 2026-11-01 (perf10, perf5, perf2) despite the pinned rule. Ship a Stop hook for worker subagents that refuses to end while a run_in_background Bash or Monitor the worker started is still live (naming the task), and have we:scripts/worker-brief.mjs state it in the rules block. #6182 did part of this; file the remainder here. See also the async job-id card xqkquxb, which removes the root cause.

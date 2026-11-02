@@ -29,12 +29,16 @@ import { execFileSync } from 'node:child_process';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
-import { createRegistry } from './registry.mjs';
+import { createRegistry, op } from './registry.mjs';
+import { compute, effect } from './step-kinds.mjs';
+import { main as codexAuditMain } from './codex-audit.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -82,7 +86,10 @@ import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './h
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
-import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
+import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
+import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
+import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
@@ -190,6 +197,29 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * validation — `--help` prints `[--tier=A|B, default A] …` because the declaration says so. The same
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
+
+// Capture both audit streams as the operation result. The CLI adapter owns the JSON envelope;
+// plain mode prints the captured verdict/findings or refusal diagnostic, preserving the audit exit code.
+export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = {}) {
+  return async ({ base, head }) => {
+    let stdout = '', stderr = '';
+    const deps = makeDeps ? makeDeps() : (await import('./codex-audit-io.mjs')).createAuditDeps();
+    const code = await auditMain([`--base=${base}`, `--head=${head}`], {
+      ...deps,
+      stdout: text => { stdout += text; },
+      stderr: text => { stderr += text; },
+    });
+    return { ok: code === 0, code, stdout, stderr };
+  };
+}
+
+export function finishCodexAudit({ run, code, lines, json }) {
+  const v = run?.verdict;
+  const outCode = v?.code ?? code;
+  return { code: outCode, lines: json || !v ? lines
+    : [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd()) };
+}
+
 
 export const OPERATIONS = Object.freeze({
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
@@ -431,6 +461,17 @@ export const OPERATIONS = Object.freeze({
     sinks: {},
     finish: finishResourceStatus,
   }),
+  // R313/R349 — SHADOW measured worker cap beside the step rule; reads resource history, logs one jsonl row per run.
+  [WORKER_CAPACITY_OP]: () => ({
+    declaration: workerCapacityOperation({ collect: () => {
+      const paths = resourcePaths();
+      let historyText = ''; try { historyText = readFileSync(paths.history, 'utf8'); } catch { /* no history yet */ }
+      return { historyText, load1: loadavg()[0], nowMs: Date.now(),
+        settings: resolveWorkerCapacitySettings({ settings: readSettings(), env: process.env }) };
+    } }),
+    sinks: {},
+    finish: finishWorkerCapacity({ log: (row) => appendResourceLog(join(dirname(resourcePaths().history), 'worker-capacity-shadow.jsonl'), row) }),
+  }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
   [PRE_PR_CHECK_OP]: () => ({
@@ -449,6 +490,22 @@ export const OPERATIONS = Object.freeze({
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  'codex-audit': () => ({
+    declaration: op('codex-audit', {
+      input: { base: { type: 'string' }, head: { type: 'string' } },
+      verdictFrom: 'assess',
+      audit: effect({ reads: ['input.base', 'input.head'], effects: ({ input }) => [{
+        type: 'codex-audit.run', payload: input, idempotent: false,
+      }] }),
+      assess: compute({ reads: ['findings.audit'], fn: ({ findings }) => {
+        const entry = findings.audit?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('codex-audit: audit did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'codex-audit.run': createCodexAuditSink() },
+    finish: finishCodexAudit,
   }),
   [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
     sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },

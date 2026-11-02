@@ -112,7 +112,7 @@ function entropy(text) {
 }
 // Content scan for a name-flagged file (R323: EVERY type, no type-based skip).
 // JSON gets the full structural scan; other UTF-8 text gets raw token patterns
-// and keyed-field entropy checks. Unknown encodings stay excluded.
+// and fail-closed secret assignments. Unknown encodings stay excluded.
 // A file that fails (scrubbers, docs spelling out secrets) stays
 // excluded, so a run that needs it falls back to the Mac. Returns the first
 // finding or null when clean.
@@ -130,12 +130,18 @@ export function credentialContentFinding(path,content) {
   // This is a conservative exclusion heuristic, not a parser for arbitrary formats.
   for(const [,field,value] of text.matchAll(/(?:^|[\r\n])[\t ]*(?:-[\t ]+)?["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[\t ]*[:=][\t ]*([^\r\n]*)/g)) {
     if(secretField.test(field)&&value.length>=20&&entropy(value)>=3.5)return `high-entropy-${field}`;
+    if(/password|passwd|secret|token|api[_-]?key/i.test(field)) {
+      // Only whole, explicit placeholders qualify; expressions and suffixes do not.
+      const trimmed=value.trim(),literal=/^(["'])(.*)\1$/.exec(trimmed)?.[2]??trimmed;
+      if(!/^(?:example|<placeholder>|<redacted>|\[REDACTED\])?$/i.test(literal))return `secret-assignment-${field}`;
+    }
   }
   return null;
 }
 // Returns the first secret-like finding, or null when the content is clean.
 export function designTokenSecretFinding(content) {
-  const text=Buffer.from(content).toString('utf8');
+  let text;
+  try {text=new TextDecoder('utf-8',{fatal:true}).decode(content);} catch {return 'unsupported-text-encoding';}
   const raw=textFinding(text);
   if(raw)return raw;
   let json;

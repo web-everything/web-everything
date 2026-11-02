@@ -458,6 +458,6 @@ it('prepare discovery reads through the shared throttle by default on the sync p
   execFileSyncThrottled.mockImplementation(() => { throw new Error('throttled-stub'); });
   try {
     expect(() => createPrepareStatusReader().resolveCard({ num: '4413' })).toThrow('throttled-stub');
-    expect(execFileSyncThrottled).toHaveBeenCalledWith('git', ['fetch', '-q', 'origin', 'main'], expect.any(Object));
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('git', ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main'], expect.any(Object));
   } finally { execFileSyncThrottled.mockImplementation(real); }
 });

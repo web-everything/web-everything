@@ -7,7 +7,7 @@ import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { allowedCommand, allowedEnv, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
+import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
@@ -77,7 +77,11 @@ export function isAllowedCommand(argv) {
 export function filterEnv(env = {}) {
   if (Object.hasOwn(env, 'DIFF_COVERAGE_BASE') && !allowedEnv({DIFF_COVERAGE_BASE:env.DIFF_COVERAGE_BASE}))
     throw Object.assign(new Error('Invalid DIFF_COVERAGE_BASE: use local fallback'), {code:'invalid-diff-coverage-base'});
-  return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value})));
+  // A dropped scan list would widen the remote scan; refuse it so the run stays local instead.
+  if (Object.hasOwn(env, 'VERIFY_SCAN_FILES') && !allowedEnv({VERIFY_SCAN_FILES:env.VERIFY_SCAN_FILES}))
+    throw Object.assign(new Error('Invalid VERIFY_SCAN_FILES: use local fallback'), {code:'invalid-scan-files'});
+  return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value}))
+    .map(([key,value]) => [key,key === 'VERIFY_SCAN_FILES' ? normalizeScanFilesValue(value) : value]));
 }
 
 // Project only verified report bytes; the staged manifest is rehashed below.
@@ -1048,7 +1052,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, onRun, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
@@ -1121,6 +1125,13 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
+      // Scanners may skip nonexistent paths. Require the entire requested scope
+      // in the final snapshot, including warm-base leaves, before remote admission.
+      if (Object.hasOwn(executionEnv, 'VERIFY_SCAN_FILES')) {
+        const shipped = new Set(manifest.entries.map(entry => entry.path.toString('hex')));
+        const missing = JSON.parse(executionEnv.VERIFY_SCAN_FILES).find(path => !shipped.has(Buffer.from(path).toString('hex')));
+        if (missing !== undefined) return fallback('unshipped-scan-file', missing);
+      }
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
       const selectedKeys=new Set(selected.map(path=>path.toString('hex')));
       const stageDone=begin('mac-stage-and-rehash');
@@ -1177,6 +1188,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const preparation = JSON.parse(protocolText(prepared.stdout,4096));
       run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
+      // Tell the admission wrapper which Forge run this client now owns, so a stale slot marker can be judged per run.
+      try {onRun?.(run);} catch { /* advisory only */ }
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
       const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
@@ -1219,7 +1232,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1252,7 +1265,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }

@@ -5,6 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
+import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
 export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
@@ -14,10 +15,36 @@ export const validSha = (sha) => /^[a-f0-9]{40}$/i.test(sha || '');
 export function jsonLines(text) {
   return String(text).split(/\r?\n/).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
 }
-export function readyEvidence(records, input) {
+/** A WEAKENED fix-ready record loads ONLY as a ruled exception (operator R396): the record must carry
+ *  `auditRuling` and a non-empty `auditDisclosed`, AND the settings allowlist `ruledWeakened` must hold an entry whose
+ *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
+ *  never claim it. Never a blanket bypass. */
+const RULING = /^R\d+(?:\+R\d+)*$/;
+export function readyEvidence(records, input, ruledWeakened = []) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
-  return record ? { source: 'ready-record', record } : null;
+  if (record) return { source: 'ready-record', record };
+  const ruled = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && r.audit === 'WEAKENED'
+    && validSha(r.sha) && RULING.test(r.auditRuling || '')
+    && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
+    && Array.isArray(ruledWeakened) && ruledWeakened.some((e) => e && e.ref === r.ref && e.sha === r.sha && e.ruling === r.auditRuling
+      && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
+      && e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
+  return ruled ? { source: 'ready-record', record: ruled, ruledWeakened: { ruling: ruled.auditRuling, findings: ruled.auditDisclosed } } : null;
+}
+/** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
+ * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
+ * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
+ * whole change, not just its last commit). */
+export function canonicalAuditEvidence(records, sha, covers = () => true) {
+  const bases = new Set(records.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base));
+  let pass = null;
+  for (const base of bases) {
+    const record = findAudit(records, { head: sha, base, questionHash: QUESTION_HASH });
+    if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+    if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+  }
+  return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 export function changedPaths(text) {
@@ -45,13 +72,15 @@ export function refusal(records, ref, since, alerts = false) {
     && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(r.kind || r.event || r.type || '')));
 }
 export function prototypeLoadOperation() {
-  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit'].map((key) => [key, { type: 'string', required: false, default: '' }]));
+  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms'].map((key) => [key, { type: 'string', required: false, default: '' }]));
   input['dry-run'] = { type: 'boolean', required: false, default: false };
+  // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
+  input.retire = { type: 'boolean', required: false, default: false };
   return op(PROTOTYPE_LOAD_OP, {
     input, verdictFrom: 'assess',
     load: effect({ reads: Object.keys(input).map((key) => `input.${key}`),
       effects: ({ input: values }) => [{ type: PROTOTYPE_LOAD_EFFECT,
-        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'] }, idempotent: false }] }),
+        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'], waitAdoptionMs: values['wait-adoption-ms'] }, idempotent: false }] }),
     assess: compute({ reads: ['findings.load'], fn: ({ findings }) => {
       const entry = findings.load?.effects?.[0];
       if (entry?.status !== 'applied' || !entry.result) throw new Error('prototype-load: transaction did not complete');

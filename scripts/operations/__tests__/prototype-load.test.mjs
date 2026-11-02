@@ -4,7 +4,7 @@
  * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,14 +13,22 @@ import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import * as prototypeLoad from '../prototype-load.mjs';
+import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
+import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
-import { parseOperationArgv } from '../cli-adapter.mjs';
+import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
+import { checkPendingAdoptions, readPendingAdoptions, recordPendingAdoption } from '../../lib/overlay-adoption.mjs';
+// Exercise the real runner binding without spawning an auditor or writing audit records.
+vi.mock('../codex-audit.mjs', async (importOriginal) => ({
+  ...await importOriginal(), main: vi.fn(async () => 0),
+}));
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
-const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control' };
+const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control', waitAdoptionMs: 30 };
 const settings = {
   daemons: { control: { label: 'com.we.control', clone: 'wev-control' }, review: { label: 'com.we.review-daemon' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } },
   workspaceRoot: '~/workspace', launchAgentsDir: '~/Library/LaunchAgents', recordPath: '~/records', readyRecordPath: '~/ready',
@@ -44,11 +52,17 @@ function fixture(options = {}) {
   const fs = {
     readFileSync(p) {
       reads.push(p);
+      if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
+      if (p === '/home/test/canonical-audits.jsonl') {
+        if (options.auditReadError) throw Object.assign(new Error('audit file unreadable'), { code: options.auditReadError });
+        return options.audits ?? '';
+      }
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
       if (p.endsWith('.events.jsonl')) return options.events || '';
+      if (p.endsWith('.drop-pending') && options.pendingDrops) return options.pendingDrops;
       if (p.endsWith('.rebuild.json')) {
         if (options.rebuildStateReadError) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
         if (options.rebuildStateRaw !== undefined) return options.rebuildStateRaw;
@@ -70,6 +84,25 @@ function fixture(options = {}) {
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
       if (action === 'list') return options.listRaw ?? JSON.stringify({ list: [...registrations.values()] });
+      if (action === 'recover-drops') return options.recoverRaw ?? JSON.stringify({ settled: [{ ref: 'lane/x', outcome: 'restored' }], pending: [] });
+      if (action === 'retire') {
+        if (options.retireRefuses === ref) return fail(3, JSON.stringify({ retired: false, refused: 'tip-moved' }));
+        registrations.delete(ref);
+        return JSON.stringify({ retired: true, refused: null });
+      }
+      if (action === 'replace') {
+        const old = args.find((a) => a.startsWith('--replaces='))?.slice(11);
+        const contained = (options.contained || []).includes(old);
+        const check = { ok: true, clean: true, candSha: remoteTip };
+        if (args.includes('--check')) {
+          return contained ? JSON.stringify({ check, containment: { ok: true, contained: true }, wouldReplace: true, refused: null })
+            : fail(3, JSON.stringify({ check: null, containment: { ok: true, contained: false }, wouldReplace: false, refused: 'not-contained' }));
+        }
+        admitted.push({ ref, replaces: old });
+        registrations.delete(old);
+        registrations.set(ref, { ref });
+        return JSON.stringify({ replaced: true, registered: true, conflictCheck: check, list: [...registrations.values()] });
+      }
       if (action === 'add' && overlaySafetySettings(config.env, { readSettings: () => options.safetySettings || {} }).noPr === 'refuse') {
         return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
       }
@@ -157,6 +190,7 @@ function fixture(options = {}) {
     }
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
+      if (options.auditBaseInMain && args[3] === 'origin/main' && args[2] === options.auditBaseInMain) return '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
       if ([...establishedTips.values()].includes(args[2])) {
         if (options.refreshError === 'ancestry') return fail(128);
@@ -197,12 +231,268 @@ function fixture(options = {}) {
     ? options.combinedTest(input)
     : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
   if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
-  const load = createPrototypeLoader({ exec, fs, env, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
+  if (options.pendingFs) {
+    const readFixture = fs.readFileSync;
+    const mkdirFixture = fs.mkdirSync;
+    for (const method of ['writeFileSync', 'renameSync', 'rmSync', 'rmdirSync', 'statSync']) fs[method] = options.pendingFs[method];
+    fs.readFileSync = (p, ...args) => String(p).endsWith('.pending')
+      ? options.pendingFs.readFileSync(p, ...args) : readFixture(p, ...args);
+    fs.mkdirSync = (p, ...args) => String(p).includes('/adoption-pending')
+      ? options.pendingFs.mkdirSync(p, ...args) : mkdirFixture(p, ...args);
+  }
+  // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
+  const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+const auditRecord = (overrides = {}) => ({
+  at: '2026-10-20T12:00:00Z', base: TREE, head: SHA, baseRef: 'origin/main',
+  questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], ...overrides,
+});
+const auditLines = (records) => records.map(record => JSON.stringify(record)).join('\n') + '\n';
+function auditedFixture(mode, options = {}) {
+  return fixture({ ...options, settings: {
+    auditRecordPath: '~/canonical-audits.jsonl',
+    ...(mode === undefined ? {} : { canonicalAuditMode: mode }), ...options.settings,
+  } });
+}
+
+describe('codex-audit runner registration', () => {
+  it('declares base and head inputs and binds execution to codex-audit main', async () => {
+    vi.mocked(auditMain).mockClear();
+    const { declaration, registry, sinks } = resolveOperation('codex-audit');
+    expect(declaration.name).toBe('codex-audit');
+    expect(declaration.input).toMatchObject({ base: { type: 'string' }, head: { type: 'string' } });
+    const parsed = parseOperationArgv(declaration, ['--base=origin/main', `--head=${SHA}`]);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.input).toMatchObject({ base: 'origin/main', head: SHA });
+    await runOperationCli({ declaration, registry, sinks,
+      argv: ['--base=origin/main', `--head=${SHA}`],
+      store: createMemoryRunStore(), newRunId: () => 'canonical-audit-registration',
+    });
+    expect(auditMain).toHaveBeenCalledTimes(1);
+    const [argv] = vi.mocked(auditMain).mock.calls[0];
+    expect(argv).toEqual(expect.arrayContaining(['--base=origin/main', `--head=${SHA}`]));
+  });
+});
+
+describe('canonicalAuditEvidence', () => {
+  it('exports a pure selector returning the matching NOT WEAKENED record', () => {
+    const record = Object.freeze(auditRecord());
+    const records = Object.freeze([record]);
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: true, record });
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA).record).toBe(record);
+  });
+  it.each([
+    ['empty records', []],
+    ['foreign question hash', [auditRecord({ questionHash: 'foreign-question' })]],
+    ['other head', [auditRecord({ head: MERGE })]],
+    ['invalid date', [auditRecord({ at: 'not-a-date' })]],
+    ['missing date', [auditRecord({ at: undefined })]],
+  ])('returns no-record for %s', (_, records) => {
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('returns weakened for a matching WEAKENED record', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it.each([false, true])('latest timestamp defeats an older pass regardless of file order (reverse=%s)', reverse => {
+    const records = [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })];
+    expect(prototypeLoad.canonicalAuditEvidence(reverse ? records.reverse() : records, SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('a pass over another base never masks a WEAKENED audit of a different base (fail closed)', () => {
+    const later = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
+    expect(prototypeLoad.canonicalAuditEvidence([later, auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('equal timestamps resolve by append order, so a later WEAKENED beats an earlier pass', () => {
+    const records = [auditRecord(), auditRecord({ verdict: 'WEAKENED' })];
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('ignores newer foreign hashes, other heads and invalid dates when selecting a canonical record', () => {
+    const record = auditRecord();
+    const newer = { at: '2026-10-22T12:00:00Z', verdict: 'WEAKENED' };
+    expect(prototypeLoad.canonicalAuditEvidence([record,
+      auditRecord({ ...newer, questionHash: 'foreign-question' }),
+      auditRecord({ ...newer, head: MERGE }),
+      auditRecord({ ...newer, at: 'not-a-date' }),
+    ], SHA)).toEqual({ ok: true, record });
+  });
+});
+
+describe('canonicalAuditEvidence hardening', () => {
+  it('ignores an empty-diff audit (base equals head) that would mask a WEAKENED audit of the real change', () => {
+    const weak = auditRecord({ verdict: 'WEAKENED' });
+    const empty = auditRecord({ base: SHA, at: '2026-10-22T12:00:00Z' });
+    expect(prototypeLoad.canonicalAuditEvidence([weak, empty], SHA)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('rejects a NOT WEAKENED record whose findings contradict the verdict', () => {
+    const bad = auditRecord({ findings: ['WEAKENED'] });
+    expect(prototypeLoad.canonicalAuditEvidence([bad], SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+});
+
+describe('prototype-load ruled-WEAKENED admission', () => {
+  const findings = ['operator-disclosed weakening'];
+  const ready = {
+    ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED',
+    auditRuling: 'R396', auditDisclosed: findings,
+  };
+  const allowed = { ref: BASE.branch, sha: SHA, ruling: 'R396', findings };
+
+  it('loads an exact ruled-WEAKENED record and warns with its ruling, head and findings', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture('warn', {
+        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] },
+      });
+      expect(await f.run()).toMatchObject({
+        ok: true, registered: true, adopted: true, stopReason: null,
+        gate: { source: 'ready-record', ruledWeakened: { ruling: 'R396', findings } },
+      });
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining(`RULED-WEAKENED EXCEPTION R396: loading ${BASE.branch}@${SHA}`),
+      );
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(`Disclosed findings: ${findings[0]}`));
+      expect(mutations(f, 'add')).toHaveLength(1);
+    } finally { warning.mockRestore(); }
+  });
+
+  it.each([
+    ['unlisted', []],
+    ['different ref', [{ ...allowed, ref: 'lane/other' }]],
+    ['different sha', [{ ...allowed, sha: TREE }]],
+    ['different ruling', [{ ...allowed, ruling: 'R999' }]],
+    ['different findings', [{ ...allowed, findings: ['unrelated'] }]],
+  ])('stops a %s WEAKENED record with no-ready before admission and without an exception warning', async (_, ruledWeakened) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture('warn', { ready: auditLines([ready]), settings: { ruledWeakened } });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready', gate: null });
+      expect(f.calls).toHaveLength(0);
+      expect(warning.mock.calls.flat().join('\n')).not.toMatch(/RULED-WEAKENED EXCEPTION/);
+    } finally { warning.mockRestore(); }
+  });
+});
+
+describe('prototype-load canonical audit admission', () => {
+  it('keeps the warn default in the standard cascade layer, not the tool file, so a platform refuse is not overridden', () => {
+    const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
+    expect(shipped).not.toHaveProperty('canonicalAuditMode');
+  });
+  it.each([
+    ['explicit warn', 'warn', [], 'no-record'],
+    ['absent mode', undefined, [], 'no-record'],
+    ['weakened in warn', 'warn', [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
+    ['weakened with absent mode', undefined, [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
+    ['unreadable in warn', 'warn', [], 'no-record', 'EACCES'],
+    ['missing file with absent mode', undefined, [], 'no-record', 'ENOENT'],
+  ])('%s proceeds with failed canonical evidence and a loud warning line', async (_, mode, records, reason, auditReadError) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const f = auditedFixture(mode, { audits: auditLines(records), auditReadError });
+      const out = await f.run();
+      expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode: 'warn', ok: false, reason } });
+      expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+      const lines = [...warning.mock.calls, ...error.mock.calls, ...stderr.mock.calls]
+        .map(args => args.map(String).join(' ')).join('\n');
+      expect(lines).toMatch(/WARNING[^\n]*canonical[ -]audit/i);
+      expect(mutations(f, 'add')).toHaveLength(1);
+    } finally { warning.mockRestore(); error.mockRestore(); stderr.mockRestore(); }
+  });
+  it.each([
+    ['no records', [], 'no-record'],
+    ['foreign question hash', [auditRecord({ questionHash: 'foreign-question' })], 'no-record'],
+    ['other head', [auditRecord({ head: MERGE })], 'no-record'],
+    ['invalid date', [auditRecord({ at: 'not-a-date' })], 'no-record'],
+    ['latest record weakened', [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })], 'weakened'],
+  ])('refuse stops before git or registration on %s and names the worker fallback', async (_, records, reason) => {
+    const f = auditedFixture('refuse', { audits: auditLines(records) });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+    expect(f.records[0]).toMatchObject({ stopReason: 'no-canonical-audit' });
+  });
+  it.each(['ENOENT', 'EACCES', 'EIO'])('refuse fails closed on unreadable audit records (%s)', async auditReadError => {
+    const f = auditedFixture('refuse', { auditReadError });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['warn', 'refuse'])('%s accepts a canonical NOT WEAKENED audit read from the configured JSONL path', async mode => {
+    const record = auditRecord();
+    const f = auditedFixture(mode, { auditBaseInMain: TREE, audits: `malformed json\n${auditLines([record])}` });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode, ok: true } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('refuse rejects a pass whose base is not in origin/main (it audited only part of the change)', async () => {
+    const f = auditedFixture('refuse', { audits: auditLines([auditRecord()]) });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('checks ready evidence before reading canonical audits, including when explicit ready arguments pass', async () => {
+    const f = auditedFixture('refuse', { ready: '', auditReadError: 'EACCES' });
+    expect((await f.run()).stopReason).toBe('no-ready');
+    expect(f.reads).not.toContain('/home/test/canonical-audits.jsonl');
+    const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
+    expect(out).toMatchObject({ stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(f.calls).toEqual([]);
+  });
+  it('uses input.sha rather than a fixed or unrelated audit head', async () => {
+    const f = auditedFixture('refuse', { sha: MERGE, audits: auditLines([auditRecord()]) });
+    const out = await f.run();
+    expect(out).toMatchObject({ stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`--head=${MERGE}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['invalid', '', null, false, 0, {}, { nested: {} }, { nested: 'warn' }, [], ['warn']].map(mode => [mode]))('unknown mode %j is treated as refuse', async mode => {
+    const f = auditedFixture(mode);
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each([
+    ['platform empty object', {}, undefined, 'refuse'],
+    ['platform nested empty object', { nested: {} }, undefined, 'refuse'],
+    ['platform nested warn', { nested: 'warn' }, undefined, 'refuse'],
+    ['platform array', [], undefined, 'refuse'],
+    ['platform refuse', 'refuse', undefined, 'refuse'],
+    ['tool empty object over platform warn', 'warn', {}, 'refuse'],
+    ['tool empty object over platform refuse', 'refuse', {}, 'refuse'],
+    ['explicit tool warn over invalid platform', {}, 'warn', 'warn'],
+    ['explicit tool refuse over invalid platform', {}, 'refuse', 'refuse'],
+  ])('%s preserves scalar mode precedence', async (_, platformMode, toolMode, expectedMode) => {
+    const f = auditedFixture(toolMode, {
+      env: { WE_PLATFORM_PREFERENCES_FILE: '/home/test/platform-preferences.json' },
+      platformSettings: { canonicalAuditMode: platformMode },
+    });
+    const out = await f.run();
+    expect(out.canonicalAudit).toMatchObject({ mode: expectedMode, ok: false, reason: 'no-record' });
+    if (expectedMode === 'refuse') {
+      expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit' });
+      expect(f.calls).toEqual([]);
+    } else {
+      expect(out).toMatchObject({ ok: true, registered: true });
+    }
+  });
+});
 describe('default combined-tree test proof', () => {
   const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
   const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
@@ -1183,14 +1473,14 @@ describe('prototype-load', () => {
   it.each([
     ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
     ['refusal event', { events: refusedAlert }, 'adoption-refused'],
-    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['timeout', { timeout: true }, null],
     ['probe error 128', { adoptionError: 128 }, 'check-unverifiable'],
     ['probe error -1', { adoptionError: -1 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
   ])('retains every clean prior registration until the replacement is adopted: %s', async (_, options, stopReason) => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(r).toMatchObject({ ok: stopReason === null, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
   });
@@ -1198,13 +1488,13 @@ describe('prototype-load', () => {
   it.each([
     ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
     ['refusal event', { events: refusedAlert }, 'adoption-refused'],
-    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['timeout', { timeout: true }, null],
     ['probe error', { adoptionError: 128 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
   ])('retains stale and clean registrations through failed adoption: %s', async (_, options, stopReason) => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'], ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(r).toMatchObject({ ok: stopReason === null, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
     expect(r.staleChecks['lane/old']).toEqual({ skipped: 'contained', included: true, landed: false });
@@ -1302,14 +1592,112 @@ describe('prototype-load', () => {
     const r = await f.run(); expect(r.stopReason).toBe('swap-remove-failed'); expect(r.registered).toBe(true); expect(r.adopted).toBe(true); expect(r.removed).toEqual([]); expect(r.swap.retained).toEqual(['lane/a', 'lane/b', 'lane/c']); expect(mutations(f, 'remove')).toHaveLength(0);
   });
   it('adoption-timeout bounds injected polling and retains registration', async () => {
-    const f = fixture({ timeout: true }); const r = await f.run(); expect(r.stopReason).toBe('adoption-timeout'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+    const f = fixture({ timeout: true }); const r = await f.run(); expect(r.result).toBe('registered-pending'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+  });
+  it('returns registered-pending at once by default: ok, not adopted, no polling, no FAIL', async () => {
+    const f = fixture({ timeout: true }); const r = await f.run({ waitAdoptionMs: undefined });
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false, stopReason: null });
+    expect(r.message).toContain('overlay-adopted');
+    expect(f.sleeps).toEqual([]);
+  });
+  it.each([[false, undefined], [true, undefined], [false, 30]])('wires loader registration to a rebuild adoption event (generated merge: %s, wait: %s)', async (behind, waitAdoptionMs) => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-pending-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: dir };
+    try {
+      const f = fixture({ timeout: true, behind, pendingFs: nodeFs, env });
+      const r = await f.run({ waitAdoptionMs });
+      expect(r).toMatchObject({ ok: true, result: 'registered-pending', adoptionEventTracked: true,
+        clone: '/home/test/workspace/wev-control', effectiveRef: behind ? 'lane/new-m1' : BASE.branch, effectiveSha: behind ? MERGE : SHA });
+      expect(r.message).toContain('up to 7 days');
+      expect(r.message).toContain('newest 128 registrations');
+      expect(r.message).toContain('check the daemon rebuild state');
+      expect(readPendingAdoptions(r.clone, { env })).toEqual([expect.objectContaining({ ref: r.effectiveRef, sha: r.effectiveSha, loadedBy: 'tester' })]);
+      const events = [];
+      const isAncestor = vi.fn(() => true);
+      await checkPendingAdoptions({ root: r.clone, env, now: () => 0, daemon: BASE.daemon, isAncestor, emit: (e) => events.push(e) });
+      expect(isAncestor).toHaveBeenCalledWith(r.clone, r.effectiveSha);
+      expect(events).toEqual([expect.objectContaining({ kind: 'overlay-adopted', daemon: BASE.daemon,
+        detail: expect.objectContaining({ ref: r.effectiveRef, sha: r.effectiveSha }) })]);
+      expect(readPendingAdoptions(r.clone, { env })).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('warns when the pending-adoption tracking write fails', async () => {
+    const r = await fixture({ timeout: true }).run({ waitAdoptionMs: undefined });
+    expect(r.adoptionEventTracked).toBe(false);
+    expect(r.message).toContain('pending-adoption record could not be written');
+    expect(r.message).toContain('no overlay-adopted event will follow');
+  });
+  it.each([
+    ['adoption-refused', { alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: BASE.branch, kind: 'conflict-dropped' }) }, false],
+    ['check-unverifiable', { adoptionError: 2 }, false],
+    ['adopted immediately', {}, true],
+    ['adopted in wait', { timeout: true }, true],
+    ['adopted before swap refusal', { list: ['lane/old'], contained: ['lane/old'] }, true],
+  ])('clears pending adoption on terminal outcome: %s', async (_, options, adopted) => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-terminal-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: dir };
+    const clone = '/home/test/workspace/wev-control';
+    try {
+      recordPendingAdoption(clone, { ref: 'lane/unrelated', sha: TREE, at: new Date(0).toISOString() }, { env });
+      const writes = vi.fn(nodeFs.renameSync);
+      const loadOptions = { ...options, pendingFs: { ...nodeFs, renameSync: writes }, env };
+      if (options.timeout) loadOptions.onSleep = () => {
+        // Prove that this is adoption during the wait, with the registration already persisted.
+        expect(readPendingAdoptions(clone, { env })).toEqual(expect.arrayContaining([
+          expect.objectContaining({ ref: BASE.branch, sha: SHA }),
+        ]));
+        loadOptions.timeout = false;
+      };
+      const f = fixture(loadOptions);
+      const r = await f.run();
+      expect(r.registered).toBe(true);
+      expect(r.adoptionEventTracked).toBe(true);
+      expect(r.adopted).toBe(adopted);
+      expect(f.sleeps).toEqual(options.timeout ? [10] : []);
+      if (options.adoptionError) expect(r.stopReason).toBe('check-unverifiable');
+      if (options.alerts) expect(r.stopReason).toBe('adoption-refused');
+      expect(writes).toHaveBeenCalled();
+      expect(readPendingAdoptions(clone, { env }).map((rec) => rec.ref)).toEqual(['lane/unrelated']);
+      const events = [];
+      await checkPendingAdoptions({ root: clone, env, now: () => 16 * 60000, isAncestor: () => true, emit: (e) => events.push(e) });
+      expect(events.map((e) => e.detail.ref)).toEqual(['lane/unrelated']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['bad-sha', { sha: 'abc1234' }, {}, 'full 40-character sha'],
+    ['bad-branch', { branch: 'main' }, {}, 'Pass --branch=lane/<name>'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: -1, pollMs: 10 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: 30, pollMs: 0 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: Infinity, pollMs: 10 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: 30, pollMs: NaN } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: -1 }, {}, 'number of milliseconds'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: 'NaN' }, {}, 'number of milliseconds'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: 'Infinity' }, {}, 'number of milliseconds'],
+  ])('explains bad-input refusal %s (%j, %j)', async (detail, input, overrides, fallback) => {
+    const f = fixture({ settings: overrides });
+    expect(await f.run(input)).toMatchObject({ ok: false, stopReason: 'bad-input', detail, fallback: expect.stringContaining(fallback) });
+    expect(f.calls).toEqual([]);
+  });
+  it('--wait-adoption-ms opts into a bounded wait and is capped under 170 s', async () => {
+    const f = fixture({ timeout: true, settings: { adoption: { timeoutMs: 600000, pollMs: 50000 } } });
+    const r = await f.run({ waitAdoptionMs: 900000 });
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending' });
+    expect(f.sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(160000);
+    expect(f.sleeps.length).toBeGreaterThan(0);
+  });
+  it('explains refusals in plain words', async () => {
+    expect(await fixture({}).run({ sha: 'abc1234' })).toMatchObject({ stopReason: 'bad-input', fallback: expect.stringContaining('full 40-character sha') });
+    const noReady = await fixture({ ready: '' }).run();
+    expect(noReady.stopReason).toBe('no-ready'); expect(noReady.fallback).toMatch(/fix-ready record.*"tests":"green".*"audit":"NOT WEAKENED"/);
+    const moved = await fixture({ tip: 'e'.repeat(40) }).run();
+    expect(moved).toMatchObject({ stopReason: 'no-ready', fallback: expect.stringContaining(`branch tip is ${'e'.repeat(40)}`) });
   });
   it.each([undefined, '/custom/rebuild-state'])('adoption timeout reports the active build from the daemon state directory: %s', async (directory) => {
     const target = 'd'.repeat(40), startedAt = '2026-10-26T11:59:00.000Z';
     const f = fixture({ timeout: true, env: directory ? { WE_DAEMON_STATE_DIR: directory } : {},
       rebuildState: { building: { target, startedAt, pid: 123 } } });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'rebuild-building' } });
     expect(r.fallback).toContain(target.slice(0, 7));
     expect(r.fallback).toContain(startedAt);
@@ -1321,7 +1709,7 @@ describe('prototype-load', () => {
     const adoptedAt = '2026-10-26T11:00:00.000Z';
     const f = fixture({ timeout: true, rebuildState: { ...state, adopted: { at: adoptedAt, head: TREE } } });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'daemon-not-refreshing' } });
     expect(r.fallback).toContain('catch-up');
     expect(r.fallback).toContain(adoptedAt);
@@ -1334,7 +1722,7 @@ describe('prototype-load', () => {
   ])('adoption timeout reports unreadable rebuild evidence: %s', async (_, options) => {
     const f = fixture({ timeout: true, ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'rebuild-state-unreadable' } });
     expect(r.fallback).toMatch(/rebuild.state.*unreadable|unreadable.*rebuild.state/i);
     expect(f.reads).toContain('/home/test/.claude/daemon-self-sync-state/test-clone-key.rebuild.json');
@@ -1346,7 +1734,7 @@ describe('prototype-load', () => {
   });
   it('a missing daemon commit remains pending until the adoption deadline', async () => {
     const f = fixture({ missingCandidate: true, missingForever: true });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+    expect(await f.run()).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false });
     expect(f.sleeps).toEqual([10, 10, 10]);
   });
   it.each([false, true])('real Git keeps a fresh origin commit pending until daemon fetch/adoption or deadline (adopts: %s)', async (adopts) => {
@@ -1361,7 +1749,7 @@ describe('prototype-load', () => {
       });
       expect(await f.run()).toMatchObject(adopts
         ? { ok: true, registered: true, adopted: true }
-        : { ok: false, registered: true, adopted: false, stopReason: 'adoption-timeout' });
+        : { ok: true, registered: true, adopted: false, result: 'registered-pending' });
       expect(f.sleeps).toEqual(adopts ? [10] : [10, 10, 10]);
     });
   });
@@ -1381,7 +1769,7 @@ describe('prototype-load', () => {
     } });
     expect(await f.run()).toMatchObject(retryCode === 0
       ? { ok: true, registered: true, adopted: true }
-      : { ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+      : { ok: true, result: 'registered-pending', registered: true, adopted: false });
     expect(probes).toBe(retryCode === 0 ? 2 : 5);
     expect(f.sleeps).toEqual(retryCode === 0 ? [] : [10, 10, 10]);
   });
@@ -1438,6 +1826,92 @@ describe('prototype-load', () => {
   });
   it('ignores old refusals and unrelated events', async () => {
     const f = fixture({ events: JSON.stringify({ at: new Date(-1).toISOString(), ref: BASE.branch, event: 'removed' }), alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: 'lane/else', event: 'refused' }) }); expect((await f.run()).ok).toBe(true);
+  });
+  // R310 (incident 2026-11-01): a superseded registration and old tops froze two daemons for hours.
+  describe('auto-retire and replace (R310)', () => {
+    const retireOld = (extra = {}) => ({ retirePlan: ({ rows }) => rows.map((row) => (row.ref === 'lane/old'
+      ? { ref: 'lane/old', action: 'retire', reason: 'superseded', tip: TREE, pr: 6056, evidence: { supersededBy: 6132 }, ...extra }
+      : { ref: row.ref, action: 'keep', reason: 'unique-commits-not-on-main' })) });
+    it('retires a proved registration before staleness checks, so it no longer blocks the load', async () => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': 'M\0x\0' }, ...retireOld() });
+      const r = await f.run();
+      expect(r).toMatchObject({ ok: true, adopted: true, retired: [{ ref: 'lane/old', reason: 'superseded', tip: TREE, pr: 6056 }], stale: [] });
+      expect(f.retirePlanner).toHaveBeenCalledWith(expect.objectContaining({ rows: [{ ref: 'lane/old' }] }));
+      const [call] = mutations(f, 'retire');
+      expect(call.args).toEqual(expect.arrayContaining(['--ref=lane/old', `--expected-tip=${TREE}`, `--expected-entry=${JSON.stringify({ ref: 'lane/old' })}`, '--reason=superseded']));
+      expect(r.staleChecks).toEqual({});
+    });
+    it('the same blocked load without a proved retirement still stops on the stale registration', async () => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': 'M\0x\0' } });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', retired: [] });
+      expect(mutations(f, 'retire')).toEqual([]);
+    });
+    it('settles drop intents left by an interrupted retire before planning', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], pendingDrops: '{"pending":[{"ref":"lane/x"}]}' });
+      await f.run();
+      expect(f.reads).toContain('/home/test/.claude/daemon-overlays/test-clone-key.json.drop-pending');
+      expect(mutations(f, 'recover-drops')).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ dropRecovery: { settled: [{ ref: 'lane/x', outcome: 'restored' }] } });
+      // The settle runs before the listing, so a restored registration takes part in every later check.
+      const settleAt = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'recover-drops');
+      expect(settleAt).toBeLessThan(f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'list'));
+      const quiet = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      await quiet.run();
+      expect(mutations(quiet, 'recover-drops')).toEqual([]);
+    });
+    it('stops before planning or registering when drop intents stay unsettled', async () => {
+      const f = fixture({ list: ['lane/old'], pendingDrops: '{"pending":[{"ref":"lane/x"}]}', recoverRaw: JSON.stringify({ settled: [], pending: [{ ref: 'lane/x' }] }), ...retireOld() });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'drop-recovery-failed', registered: false });
+      expect(f.retirePlanner).not.toHaveBeenCalled();
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('dry-run reports wouldRetire and retires nothing', async () => {
+      const f = fixture({ list: ['lane/old'], ...retireOld() });
+      expect(await f.run({ dryRun: true })).toMatchObject({ ok: true, wouldRetire: [{ ref: 'lane/old', reason: 'superseded', tip: TREE }] });
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.registrations.has('lane/old')).toBe(true);
+    });
+    it('stops without registering when the loader refuses a proved retirement', async () => {
+      const f = fixture({ list: ['lane/old'], retireRefuses: 'lane/old', ...retireOld() });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'retire-refused', retireRefused: [{ ref: 'lane/old', refused: 'tip-moved' }], registered: false });
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('ignores planner decisions for unlisted refs, the candidate itself, or without a full tip', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], retirePlan: () => [
+        { ref: 'lane/ghost', action: 'retire', reason: 'in-main', tip: TREE },
+        { ref: 'lane/old', action: 'retire', reason: 'in-main', tip: 'short' },
+      ] });
+      await f.run();
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.retirePlanner.mock.calls[0][0].rows.map((row) => row.ref)).not.toContain(BASE.branch);
+    });
+    it('retire-only mode drops proved registrations with no candidate and no ready record', async () => {
+      const f = fixture({ list: ['lane/old', 'lane/live'], ready: '', ...retireOld() });
+      const r = await f.run({ branch: '', sha: '', retire: true });
+      expect(r).toMatchObject({ ok: true, retired: [{ ref: 'lane/old' }], registered: false });
+      expect([...f.registrations.keys()]).toEqual(['lane/live']);
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('replace swaps a contained old top in one loader command, with no retained-registration stop', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      const r = await f.run({ replace: 'lane/old' });
+      expect(r).toMatchObject({ ok: true, adopted: true, replaced: 'lane/old', registered: true, stopReason: null });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(mutations(f, 'replace')[0].args).toEqual(expect.arrayContaining(['--ref=lane/new', '--replaces=lane/old', `--expected-sha=${SHA}`]));
+      expect([...f.registrations.keys()]).toEqual(['lane/new']);
+    });
+    it('replace refuses an old top whose commits the new top lacks, and changes nothing', async () => {
+      const f = fixture({ list: ['lane/old'] });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, stopReason: 'replace-not-contained', registered: false });
+      expect(mutations(f, 'replace')).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual(['lane/old']);
+    });
+    it('replace refuses an unregistered old ref', async () => {
+      const f = fixture({ list: [] });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, stopReason: 'bad-input' });
+      expect(mutations(f, 'replace')).toEqual([]);
+    });
   });
   it('happy path pins full command sequence, safe env and recorded provenance', async () => {
     const f = fixture(); const r = await f.run({ why: 'load tested patch' }); expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, cloneSource: 'settings:prototype-load.json#daemons.control.clone' });
