@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, CLEAR_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
@@ -144,7 +144,7 @@ describe('feed', () => {
   });
   it.each(['red-team-undecided', 'confirmed-break-owed-send-back'])('clears report kind %s by absence while retaining event-only stalled keys', kind => {
     const first = diffFeed([], [{ ...item, kind }, { ...item, kind: 'stalled' }], at);
-    const cleared = diffFeed(first.openKeys, [], at, { clearKinds: REPORT_KINDS });
+    const cleared = diffFeed(first.openKeys, [], at, { clearKinds: CLEAR_KINDS });
     expect(cleared.openKeys).toEqual(['owner/repo#12@abc:stalled']);
     expect(cleared.lines.map(parseFeedLine)).toEqual([expect.objectContaining({ kind: 'cleared', was: kind })]);
   });
@@ -343,10 +343,10 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
   const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
   const items = () => itemsFromReport(report);
-  const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false } = {}) => {
+  const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false, impact = 'broken' } = {}) => {
     const body = renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok',
       foldedVerdict: broken ? 'changes' : 'accepted', findings: broken ? [{ summary: 'confirmed break',
-        category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 3,
+        category: 'edge-case', impactIfUnfixed: impact, file: 'scripts/x.mjs', line: 3,
         confirmedByRecheck: true, recheckReason: 'real' }] : [] });
     return [
       { user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
@@ -357,7 +357,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const expectUndecided = (kept, pr = 5768) => {
     const row = kept.find(i => i.pr === pr);
     expect(row.kind).toBe('red-team-undecided');
-    expect(row.reason).toMatch(/red team.*no explicit pass.*live head/i);
+    expect(row.reason).toMatch(/red team.*no result.*live head/i);
     expect(row.reason).not.toContain('all gates pass');
     return row;
   };
@@ -379,9 +379,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   it.each([
     ['no record', () => []],
     ['an older head only', () => gateComments({ rev: '2'.repeat(40) })],
-    ['a result without a gate record', () => gateComments().slice(0, 1)],
     ['a gate record without a result', () => gateComments().slice(1)],
-    ['card-queued only', () => gateComments({ outcome: GATE_OUTCOMES.CARD_QUEUED })],
     ['an untrusted pass record', () => gateComments().map(c => ({ ...c, user: { login: 'mallory' } }))],
   ])('keeps red-team-undecided for clear labels with %s', async (_name, comments) => {
     const { kept, held } = await gateReadyItems(items(), report, {
@@ -393,6 +391,35 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(kept.find(i => i.pr === 9)).toEqual(items()[1]);
   });
 
+  it.each(['broken', 'degraded'])('a confirmed %s break with no gate record yet still blocks all gates pass', async impact => {
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+      gateComments({ broken: true, impact }).slice(0, 1)), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  it('a clean result on the live head alerts without any gate record', async () => {
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+      gateComments().slice(0, 1)), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+  });
+  it('a confirmed break on an older head is ignored when the live head is clear', async () => {
+    const old = gateComments({ rev: '2'.repeat(40), broken: true });
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
+      [...old, ...gateComments({ outcome: GATE_OUTCOMES.NOTHING_TO_SEND })]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768)).toEqual({ ...items()[0], head });
+  });
+  it('REPORT_KINDS is unchanged for other producers: gate kinds only clear through CLEAR_KINDS', () => {
+    expect(REPORT_KINDS.has('red-team-undecided')).toBe(false);
+    expect(REPORT_KINDS.has('confirmed-break-owed-send-back')).toBe(false);
+    expect(CLEAR_KINDS.has('confirmed-break-owed-send-back')).toBe(true);
+  });
+  it('a stale report head cannot clear an open confirmed-break alert when evidence is unreadable', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${'b'.repeat(40)}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo: 'r', number: 5768, head, title: 't' }] }),
+      gh: async () => { throw new Error('rate limited'); }, settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+  });
   it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
     const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });

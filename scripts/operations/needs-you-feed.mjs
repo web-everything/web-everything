@@ -9,7 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
-import { GATE_OUTCOMES, liveResultGateState } from '../lib/red-team-gate.mjs';
+import { GATE_OUTCOMES, liveResultGateState, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
@@ -69,9 +69,11 @@ const sectionReasons = {
 // Only these kinds can be represented (and therefore resolved by absence) by the report and its live gates.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
-export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down', 'confirmed-break-owed-send-back', 'red-team-undecided']);
+export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 // Gate verdicts are new evidence about a head, never a repeat of the stall question: they are not suppressed by it.
 const GATE_KINDS = new Set(['confirmed-break-owed-send-back', 'red-team-undecided']);
+// REPORT_KINDS stays what other producers dedupe against; absence clears also cover the live gate verdicts.
+export const CLEAR_KINDS = new Set([...REPORT_KINDS, ...GATE_KINDS]);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -93,6 +95,9 @@ export function itemsFromReport(report) {
   items.incomplete = !!report.incomplete;
   return items;
 }
+// For the approval alert every confirmed break (degraded as well as broken) counts, whatever the send-back policy;
+// a break the gate already released (recorded card/advisory/ruling) no longer holds.
+const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory' });
 const keyOf = i => `${i.repo}#${i.pr}@${i.head}:${i.kind}`;
 /** Queue text is display data: bound it and remove terminal controls, line separators and bidi/invisible formatting. */
 export function sanitizeForFeed(text, max) {
@@ -202,7 +207,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
   const undecided = item => ({ ...item, kind: 'red-team-undecided',
-    reason: 'the red team has no explicit pass recorded on the live head' });
+    reason: 'the red team has no result recorded on the live head' });
   const out = new Array(items.length); const held = [];
   const judge = async (index) => {
     const item = items[index];
@@ -218,12 +223,16 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       if (reasons.length) { held.push({ item, reasons }); return; }
       const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
-      if (state.sendBackOutcome === GATE_OUTCOMES.SENT_BACK || state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP) {
+      // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
+      const disposition = state.result === null ? null
+        : readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
+      const owed = state.sendBackOutcome === GATE_OUTCOMES.SENT_BACK || state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP
+        || (disposition !== null && (disposition.sendBack.length > 0 || disposition.held.length > 0));
+      if (owed) {
         out[index] = { ...checked, kind: 'confirmed-break-owed-send-back',
           reason: 'a confirmed red-team break is owed a send-back on the live head' };
-      } else if (state.result !== null && state.outcomes.has(GATE_OUTCOMES.NOTHING_TO_SEND) && state.sendBackOutcome === null) {
-        out[index] = checked;
-      } else out[index] = undecided(checked);
+      } else if (state.result !== null) out[index] = checked;
+      else out[index] = undecided(checked);
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };
   let next = 0;
@@ -311,9 +320,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const asked = i => !GATE_KINDS.has(i.kind) && !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     // Unreadable or missing evidence (red-team-undecided) never clears an open confirmed-break alert on that head.
-    const undecided = new Set(fresh.filter(i => i.kind === 'red-team-undecided').map(i => `${i.repo}#${i.pr}@${i.head}`));
-    const retainKeys = prev.openKeys.filter(k => k.endsWith(':confirmed-break-owed-send-back') && undecided.has(k.slice(0, -':confirmed-break-owed-send-back'.length)));
-    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete, retainKeys });
+    const undecided = new Set(fresh.filter(i => i.kind === 'red-team-undecided').map(i => `${i.repo}#${i.pr}`));
+    const retainKeys = prev.openKeys.filter(k => k.endsWith(':confirmed-break-owed-send-back') && undecided.has(k.slice(0, k.lastIndexOf('@'))));
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: CLEAR_KINDS, incomplete: items.incomplete, retainKeys });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;
