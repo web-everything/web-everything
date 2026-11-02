@@ -60,6 +60,10 @@ function latestAudit(records, head, base) {
   const valid = records.filter(record => record?.head === head
     && Array.isArray(record.findings) && record.findings.every(line => typeof line === 'string')
     && findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH }));
+  // Malformed evidence for this head must never silently revive an older clearance.
+  if (records.some(record => record?.head === head) && records.filter(record => record?.head === head).length !== valid.length) {
+    throw new Error('malformed audit record for this head');
+  }
   const newer = (record, previous) => !previous || Date.parse(record.at) >= Date.parse(previous.at);
   let latest = null, accepting = null;
   for (const record of valid) {

@@ -1029,3 +1029,12 @@ describe('round 7 live hold chronology', () => {
     expect(calls).toBe(kind === 'page cap' ? 10 : 1);
   });
 });
+
+describe('round 8 malformed audit evidence', () => {
+  it('a newer malformed WEAKENED record for the head does not revive the older clearance', async () => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(1, deps(undefined, { readAudits: () => [audit(head), audit(head, { at: '2026-11-02T11:00:00Z', verdict: 'WEAKENED', findings: null })] }));
+    expect(condition(r, 2).status).toBe('UNKNOWN');
+    expect(r.eligible).toBe(false);
+  });
+});
