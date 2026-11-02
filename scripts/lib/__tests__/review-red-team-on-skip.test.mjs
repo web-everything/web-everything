@@ -1397,6 +1397,10 @@ describe('R100 recovery regressions', () => {
       expect(o.dispatch).not.toHaveBeenCalled();
       expect(o.syncLabels).not.toHaveBeenCalled();
     });
+  it('ran with completed seat retains effects-only resume instead of fresh retry or clear', () => {
+    expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true, failedSeatCount: 1 }),
+      readStatus: () => ({ status: 'finished', result: 'ran' }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
   it.each([undefined, 0, 1, 2])('ran with completed seat retains effects-only resume with retryCount=%s', retryCount => {
     expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true, failedSeatCount: 1 }),
       readStatus: () => ({ status: 'finished', result: 'ran', retryCount }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });

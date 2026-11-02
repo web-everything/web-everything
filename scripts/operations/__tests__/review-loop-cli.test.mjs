@@ -34,13 +34,13 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
-import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint } from '../../lib/review-loop-policy.mjs';
+import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint, postAcceptAdvisoryShadowReport } from '../../lib/review-loop-policy.mjs';
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
-import { createReviewPrSinks } from '../review-pr-io.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating, createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
@@ -50,7 +50,7 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 // explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
 // lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
 const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
-const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, ...options });
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, recordAdvisoryRating: () => null, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -1577,5 +1577,304 @@ describe('unattended accept reads the live head', () => {
     expect(seen.some(s => s.type === REVIEW_EFFECTS.LABEL)).toBe(cleared);
     expect(fileItem).toHaveBeenCalledTimes(verdict === 'prevention-outstanding' && cleared ? 1 : 0);
     if (!cleared) expect(out.lines.join('\n')).toMatch(/mandatory referrals remain open/);
+  });
+});
+
+
+describe('post-accept advisory shadow wiring', () => {
+  it.each(['CONFIRMED', 'PLAUSIBLE', 'writer-error', 'logger-error'])(
+    'CLI records later %s broken ratings and preserves off/shadow/on live effects', async scenario => {
+      const execute = async mode => {
+        const rows = [], effects = [], outcomes = [], logs = [];
+        const io = { readLedgerRows: () => structuredClone(rows),
+          appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+        const store = createMemoryRunStore();
+        const review = async (head, id, later) => {
+          const { declaration, registry } = registryFor({ rev: head });
+          const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+            sinks: recordingSinks(effects), mintRunId: () => id,
+            makeJudge: () => async request => judgeOutcome(request.lens === 'correctness' ? {
+              summary: 'review', findings: [{ file: NET_PATHS[0], line: 4,
+                summary: later ? 'a fresh description of the defect' : 'improve diagnostic',
+                disposition: later ? 'bug' : 'nit', category: 'correctness/correctness',
+                verdict: scenario === 'PLAUSIBLE' ? 'PLAUSIBLE' : 'CONFIRMED',
+                introduced: true, worseThanBase: true, parallelizable: true,
+                impactIfUnfixed: later ? 'broken' : 'cosmetic' }],
+            } : CLEAN_ANSWER, {}),
+            advisorySettings: () => ({ value: { mode } }),
+            recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+            recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+            recordAdvisoryRating: facts => {
+              if (later && scenario.endsWith('error')) throw new Error('rating writer unavailable\n');
+              return recordPostAcceptAdvisoryRating({ ...facts, ...io });
+            },
+            advisoryLog: line => { logs.push(line); if (scenario === 'logger-error') throw new Error('logger unavailable'); },
+          });
+          outcomes.push({ code: out.code, stopped: out.stopped, lines: out.lines, verdict: out.run.verdict });
+          return out;
+        };
+        const accepted = await review(HEAD_A, 'cosmetic-accept', false);
+        expect(accepted.run.findings.confirm).toBe('accept');
+        if (mode !== 'off') expect(rows.find(row => row.wouldCard)).toMatchObject({
+          findings: [expect.objectContaining({ impactIfUnfixed: 'cosmetic' })],
+        });
+        await review(HEAD_B, 'broken-review', true);
+        const beforeReplay = structuredClone(rows);
+        await review(HEAD_B, 'broken-review', true);
+        expect(rows).toEqual(beforeReplay);
+        return { effects, outcomes, rows, logs };
+      };
+      const baseline = await execute('off');
+      expect(baseline.rows).toEqual([]);
+      for (const mode of ['shadow', 'on']) {
+        const result = await execute(mode);
+        expect(result.effects).toEqual(baseline.effects);
+        expect(result.outcomes).toEqual(baseline.outcomes);
+        expect(postAcceptAdvisoryShadowReport(result.rows)).toMatchObject({
+          wouldCard: 1, findings: 1, loopsAfter: 1,
+          laterBroken: scenario === 'CONFIRMED' ? 1 : 0,
+          unconfirmedBroken: scenario === 'PLAUSIBLE' ? 1 : 0, skipped: 0, unresolved: 0,
+        });
+        expect(result.rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(scenario.endsWith('error') ? 0 : 1);
+        if (scenario.endsWith('error')) expect(result.logs.join('\n')).toContain('live review unaffected');
+      }
+    });
+
+  it.each([null, {}, { value: [] }, { value: { mode: undefined } },
+    { value: { mode: 'off' }, invalid: true }, { value: { mode: 'off' }, invalid: 'false' }])(
+    'fails closed on malformed resolved settings %j while preserving a completed accept', async settings => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const decisions = [], logs = [];
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER),
+        mintRunId: () => 'malformed-settings', advisorySettings: () => settings,
+        recordAdvisoryLoops: async () => null,
+        recordAdvisoryShadow: facts => { decisions.push(facts.decision); }, advisoryLog: line => logs.push(line),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
+      expect(logs.join('\n')).toContain('invalid resolved settings; using shadow');
+    });
+
+  it.each(['shadow', 'on', 'recorder-error', 'logging-error'])(
+    '%s measures later review runs once per run ID and preserves mode-off live effects', async scenario => {
+      const execute = async mode => {
+        const rows = [], effects = [], outcomes = [], logs = [];
+        const io = { readLedgerRows: () => structuredClone(rows),
+          appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+        const store = createMemoryRunStore();
+        const review = async (rev, id, answer = CLEAN_ANSWER) => {
+          const { declaration, registry } = registryFor({ rev });
+          const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+            sinks: recordingSinks(effects), makeJudge: cannedJudge(answer), mintRunId: () => id,
+            advisorySettings: () => ({ value: { mode: mode === 'off' ? 'off' : mode === 'on' ? 'on' : 'shadow' } }),
+            recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+            recordAdvisoryLoops: facts => {
+              if (facts.head !== HEAD_A && (mode === 'recorder-error' || mode === 'logging-error')) throw new Error('loops ledger unavailable');
+              return recordPostAcceptAdvisoryLoops({ ...facts, ...io });
+            },
+            advisoryLog: line => { logs.push(line); if (mode === 'logging-error') throw new Error('logger failed'); },
+          });
+          outcomes.push({ code: out.code, stopped: out.stopped, lines: out.lines, verdict: out.run.verdict });
+          return out;
+        };
+        // An actual accepted earlier head, followed by later reviews that need not accept.
+        await review(HEAD_A, 'accepted');
+        if (mode !== 'off') {
+          expect(rows).toHaveLength(2);
+          expect(rows[0]).toMatchObject({ kind: 'advisory-run', headSha: HEAD_A, runId: 'accepted' });
+          expect(rows[1]).toMatchObject({ headSha: HEAD_A, loopsAfter: null });
+        }
+        await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
+        if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops'))
+          .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }]);
+        await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
+        if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops')).toHaveLength(1);
+        await review(HEAD_B, 'later-2', BLOCKING_ANSWER);
+        return { rows, effects, outcomes, logs };
+      };
+      const baseline = await execute('off');
+      const result = await execute(scenario);
+      expect(result.effects).toEqual(baseline.effects);
+      expect(result.outcomes).toEqual(baseline.outcomes);
+      if (['shadow', 'on'].includes(scenario)) expect(result.rows.filter(row => row.kind === 'loops'))
+        .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }, { headSha: HEAD_A, loopsAfter: 2, runId: 'later-2' }]);
+      else expect(result.logs.join('\n')).toContain('live review unaffected');
+    });
+
+  it('normalization-poisoned rows from another PR preserve live effects and recording across replay', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 9999,
+      headSha: 'poison', wouldCard: true, wouldPush: false, loopsAfter: null,
+      findings: [{ category: 'correctness/correctness', summary: 'poison', impactIfUnfixed: 'cosmetic',
+        rootCause: { toString: null } }] }];
+    const logs = [], effects = [], store = createMemoryRunStore();
+    const io = { readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+    const review = async (rev, id) => {
+      const { declaration, registry } = registryFor({ rev });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks(effects), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => id,
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: line => logs.push(line),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+        recordAdvisoryRating: facts => recordPostAcceptAdvisoryRating({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+    };
+    await review(HEAD_A, 'safe-A');
+    const firstCount = effects.length;
+    await review(HEAD_B, 'safe-B');
+    const before = structuredClone(rows), applied = structuredClone(effects);
+    const secondEffects = applied.slice(firstCount);
+    expect(secondEffects.length).toBeGreaterThan(0);
+    await review(HEAD_B, 'safe-B');
+    expect(rows).toEqual(before);
+    expect(effects.slice(applied.length)).toEqual(secondEffects);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([{ headSha: HEAD_A, loopsAfter: 1 }]);
+    expect(rows.filter(row => row.kind === 'we.post-accept-advisory-shadow')).toHaveLength(3);
+    expect(postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 1, wouldPush: 2, loopsAfter: 1, skipped: 1, unresolved: 1,
+    });
+    expect(logs).toEqual([]);
+  });
+
+  it('corrupt persisted loops refuse telemetry on both heads while the live review still completes', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A,
+      wouldCard: false, wouldPush: true, findings: [], loopsAfter: null },
+    { kind: 'loops', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A, runId: 'R', loopsAfter: 99 }];
+    const before = structuredClone(rows), logs = [];
+    for (const rev of [HEAD_A, HEAD_B]) {
+      const { declaration, registry } = registryFor({ rev });
+      const io = { readLedgerRows: () => structuredClone(rows),
+        appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'R',
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: line => logs.push(line),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(rows).toEqual(before);
+    }
+    expect(logs.filter(line => line.includes('invalid loop history; inspect shadow ledger'))).toHaveLength(4);
+  });
+
+  it('replaying accepted run A after accepted run B never counts A against B', async () => {
+    const rows = [], store = createMemoryRunStore();
+    const io = { readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    const review = async (rev, id) => {
+      const { declaration, registry } = registryFor({ rev });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => id,
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: () => {},
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+    };
+    await review(HEAD_A, 'accept-A');
+    await review(HEAD_B, 'accept-B');
+    const before = structuredClone(rows);
+    await review(HEAD_A, 'accept-A');
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: HEAD_A, runId: 'accept-B', loopsAfter: 1 },
+    ]);
+  });
+
+  it.each(['shadow', 'on', 'invalid-settings', 'settings-error', 'recorder-error'])(
+    '%s preserves all live effects for an advisory-bearing would-card accept', async scenario => {
+      const execute = async mode => {
+        const { declaration, registry } = registryFor({ rev: HEAD_A });
+        const effects = [], rows = [], decisions = [];
+        const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+        const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+          store: createMemoryRunStore(), sinks: recordingSinks(effects), fileItem,
+          makeJudge: () => async request => judgeOutcome(request.lens === 'correctness' ? { summary: 'advisory only', findings: [{ file: NET_PATHS[0], line: 4,
+            summary: 'improve diagnostic', disposition: 'nit', category: 'correctness/correctness',
+            introduced: true, worseThanBase: true, parallelizable: true,
+            impactIfUnfixed: 'cosmetic' }] } : CLEAN_ANSWER, {}), mintRunId: () => 'r-advisory-effects',
+          advisorySettings: () => {
+            if (mode === 'settings-error') throw new Error('settings unavailable');
+            return { value: { mode: ['off', 'on'].includes(mode) ? mode : 'shadow' }, invalid: mode === 'invalid-settings' };
+          },
+          recordAdvisoryShadow: facts => {
+            decisions.push(facts.decision);
+            if (mode === 'recorder-error') throw new Error('ledger unavailable');
+            return recordPostAcceptAdvisoryShadow({ ...facts, readLedgerRows: () => rows,
+              appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+          }, advisoryLog: () => {},
+        });
+        return { out, effects, rows, decisions, filings: fileItem.mock.calls };
+      };
+      const baseline = await execute('off');
+      const result = await execute(scenario);
+      expect(result.out.code).toBe(0);
+      expect(result.out.stopped).toBe('complete');
+      expect(result.out.run.findings.confirm).toBe('accept');
+      expect(result.out.run.verdict).toEqual(baseline.out.run.verdict);
+      expect(result.out.lines).toEqual(baseline.out.lines);
+      expect(result.effects).toEqual(baseline.effects);
+      expect(result.filings).toEqual(baseline.filings);
+      expect(baseline.rows).toHaveLength(0);
+      expect(result.rows).toHaveLength(['shadow', 'on', 'invalid-settings'].includes(scenario) ? 1 : 0);
+      if (scenario !== 'settings-error') expect(result.decisions[0]).toMatchObject({
+        wouldCard: scenario !== 'invalid-settings', wouldPush: scenario === 'invalid-settings',
+      });
+      if (result.rows.length) expect(result.rows.find(row => row.kind === 'we.post-accept-advisory-shadow').loopsAfter).toBeNull();
+    });
+
+  it.each(['off', 'shadow', 'on'])('%s preserves acceptance and effects, recording only when enabled', async mode => {
+    const execute = async currentMode => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const rows = [];
+      const effects = [];
+      const fileItem = vi.fn(() => { throw new Error('shadow must not file'); });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks(effects),
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-advisory-shadow', fileItem,
+        advisorySettings: () => ({ value: { mode: currentMode } }),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts,
+          readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } }),
+      });
+      expect(fileItem).not.toHaveBeenCalled();
+      return { out, rows, effects };
+    };
+    const baseline = await execute('off');
+    const result = await execute(mode);
+    expect(result.out.code).toBe(0);
+    expect(result.out.stopped).toBe('complete');
+    expect(result.out.run.findings.confirm).toBe('accept');
+    expect(result.out.lines).toEqual(baseline.out.lines);
+    expect(result.effects.map(effect => effect.type)).toEqual(baseline.effects.map(effect => effect.type));
+    expect(result.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL))
+      .toEqual(baseline.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL));
+    expect(result.rows).toHaveLength(mode === 'off' ? 0 : 1);
+    if (mode !== 'off') expect(result.rows.find(row => row.kind === 'we.post-accept-advisory-shadow')).toMatchObject({ pr: 1234, headSha: HEAD_A, wouldPush: true });
+  });
+
+  it.each(['settings', 'ledger', 'logging'])('%s failure never changes a completed accept', async failure => {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const log = vi.fn(() => { if (failure === 'logging') throw new Error('logger failed'); });
+    const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+      store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'r-advisory-error',
+      advisorySettings: () => { if (failure === 'settings') throw new Error('unreadable'); return { value: { mode: 'shadow' } }; },
+      recordAdvisoryShadow: () => { throw new Error('ledger unavailable'); }, advisoryLog: log,
+    });
+    expect(out.code).toBe(0);
+    expect(out.stopped).toBe('complete');
+    expect(out.run.findings.confirm).toBe('accept');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('live review unaffected'));
   });
 });

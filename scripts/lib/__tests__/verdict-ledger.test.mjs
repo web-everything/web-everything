@@ -23,7 +23,7 @@ import {
   verdictClears, verdictLabel, verdictForLabelTarget, labelVerdictOf, foldVerdictLedger, ledgerCoversHead,
   compareLedgerToLabels, summarizeAgreement, summarizeShadowAgreement,
   NON_BEARING, verdictBears,
-  appendVerdictAsync, ledgerEventId, checkLedgerAppendRows, homeLedgerStore, appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
+  appendVerdictAsync, ledgerWriteErrorSummary, ledgerEventId, checkLedgerAppendRows, homeLedgerStore, appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
   listLedgerRepos, DEFAULT_VERDICT_LEDGER_READ_STORE, resolveLedgerReadStore, readLedgerEventsFromStore, foldRepoFromStore,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
@@ -1072,6 +1072,47 @@ describe('#3255 C2 dual-write: appendVerdict behind verdictLedger.store', () => 
     expect(r.errors.join()).toMatch(/ledger-write-miss: push exhausted/);
     expect(warns.join()).toMatch(/GIT WRITE MISS/);
     expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(0);
+  });
+
+  it('F4: a long multiline git cause is bounded to its first 200 characters and writes no home row', () => {
+    const cause = `fatal: permission denied ${'word '.repeat(50)}\nprivate second line`;
+    const warns = [];
+    const r = appendVerdict(mk('accepted'), {
+      store: 'dual', board: '/board', gitAppend: () => { throw new Error(cause); }, warn: (m) => warns.push(m),
+    });
+    expect(r).toMatchObject({ ok: false, ledgerWriteMiss: true, record: null, path: null });
+    expect(r.errors).toEqual([`ledger-write-miss: ${cause.slice(0, 200)}`]);
+    expect(warns.join()).toContain(`${cause.slice(0, 200)} — clearing event does NOT clear (F4)`);
+    expect(warns.join()).not.toContain('private second line');
+    expect(readVerdictLedger('web-everything/web-everything')).toHaveLength(0);
+  });
+
+  it('F4: a credential-bearing git cause is redacted in the error and the warning', () => {
+    const cause = "fatal: unable to access 'https://user:ghp_ABCDEF123456@example.invalid/r.git/': token=sekret123";
+    const warns = [];
+    const r = appendVerdict(mk('accepted'), {
+      store: 'dual', board: '/board', gitAppend: () => { throw new Error(cause); }, warn: (m) => warns.push(m),
+    });
+    expect(r).toMatchObject({ ok: false, ledgerWriteMiss: true });
+    const seen = `${r.errors.join()} ${warns.join()}`;
+    expect(seen).not.toMatch(/ghp_ABCDEF|user:|sekret123/);
+    expect(seen).toContain('[redacted]');
+  });
+
+  it('F4: bearer headers, query-string and fragment tokens, URL userinfo and opaque long strings are redacted', () => {
+    for (const cause of [
+      'fatal: unable to access https://h.invalid/r.git/?auth=SYNTHCRED2',
+      'fatal: Authorization: Bearer SYNTHETIC_CREDENTIAL_ONE failed',
+      'fatal: unable to access https://h.invalid/r.git/?access_token=SYNTHCRED2&x=1',
+      'error: bearer SYNTHCRED3 rejected',
+      `fatal: https://alice:s.e.c.r.e.t${'!'.repeat(400)}@example.invalid/r.git`,
+      'fatal: Authorization: "Bearer SYNTHETIC_CREDENTIAL_ONE" shortsecret',
+      `fatal: bad ${'A1b2'.repeat(10)} value`,
+    ]) {
+      const out = ledgerWriteErrorSummary(cause);
+      expect(out).not.toMatch(/SYNTHETIC_CREDENTIAL_ONE|SYNTHCRED2|SYNTHCRED3|A1b2A1b2A1b2|s\.e\.c\.r\.e\.t/);
+      expect(out).toContain('[redacted]');
+    }
   });
 
   it('F4: a HOLDING row that misses git still holds (ok) but flags ledgerWriteMiss', () => {
