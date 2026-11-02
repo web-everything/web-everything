@@ -415,7 +415,6 @@ export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
  * checked against {@link BRIEF_SCOPE_VALUE_RE}, then refused if it carries a `..` segment or is absolute (with or
  * without a `repo:` prefix). FAIL CLOSED: one bad piece throws for the whole scope.
  */
-const BRIEF_SCOPE_REPO_PREFIXES = new Set(['we:', 'fui:', 'plateau:']);
 export function normalizeBriefScope(raw) {
   if (!Array.isArray(raw)) return [];
   const out = [];
@@ -440,11 +439,8 @@ export function normalizeBriefScope(raw) {
         );
       }
       const prefix = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
-      // only the CANONICAL lowercase prefixes: the lease matcher compares prefixes literally, so an alias
-      // (`frontierui:`) or an unqualified path would escape overlap exclusion against the canonical spelling.
-      if (!BRIEF_SCOPE_REPO_PREFIXES.has(prefix)) {
-        throw new Error(`dispatch-lane: unsafe scope entry ${JSON.stringify(piece)} — a scope path needs a canonical \`we:\`, \`fui:\` or \`plateau:\` prefix.`);
-      }
+      // Preserve the existing repo spelling (including aliases/case) and unqualified paths, as the loader
+      // does. This shell-safety boundary must not introduce a new repo-prefix policy for dispatch.
       const segments = piece.slice(prefix.length).split('/');
       if (segments.at(-1) === '') segments.pop(); // one trailing slash = "this directory"
       // absolute, empty (`//`), `.` and `..` segments are refused: the lease matcher compares literal paths, so a

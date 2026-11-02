@@ -502,11 +502,35 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(shaped.prompt).toContain('scope: we:scripts/readiness/heavy-admission.mjs,we:scripts/readiness/remote-exec.mjs,we:a.mjs,we:b.mjs,we:c.mjs');
   });
 
+  it.each([
+    'plateau-app', 'frontierui', 'webeverything', 'FUI', 'WE', 'PLATEAU',
+    'FrontierUI', 'WebEverything', 'Plateau-App', 'custom-repo', '',
+  ])('preserves legacy scope spelling %j for individual and grouped dispatches', (repo) => {
+    const prefix = repo ? `${repo}:` : '';
+    const read = tickRead();
+    for (const scope of [
+      [`${prefix}src/a.mjs`],
+      [`${prefix}src/a.mjs src/b.mjs,${prefix}src/c.mjs`],
+    ]) {
+      const expected = scope.length === 1 && scope[0].includes(' ')
+        ? ['src/a.mjs', 'src/b.mjs', 'src/c.mjs'].map((path) => prefix + path)
+        : scope;
+      const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' });
+      expect(shaped.dispatching).toBe(true);
+      expect(shaped.scope).toEqual(expected);
+      expect(shaped.prompt).toContain(`scope: ${expected.join(',')}`);
+      const grouped = shapeDispatchRead(tickRead({ groupItems: [
+        { num: '3038', specPath: 'backlog/3038-member.md', scope },
+      ] }), { num: '3037', groupMembers: '3038' });
+      expect(grouped.scope).toEqual(['we:scripts/operations/', ...expected]);
+    }
+  });
+
   it('R372 — fails closed when ANY entry of a multi-path scope is unsafe (metachar, `..`, absolute)', () => {
     const read = tickRead();
     for (const bad of [
       'we:a.mjs b;c', 'we:a.mjs $(id)', 'we:a.mjs `id`', 'we:a.mjs ../x.mjs', 'we:a.mjs we:../../x', 'we:a.mjs /etc/passwd',
-      'we:a.mjs we:/abs/x', 'we:a.mjs bogus:src/t.mjs', 'we:s/a*b.mjs we:docs/x.md', 'we:a.mjs FUI:src/t.mjs', 'we:a.mjs frontierui:src/t.mjs', 'src/a.ts src/b.ts', 'we:a.mjs ./src/t.mjs', 'we:a.mjs src//t.mjs', "we:a.mjs b'c", 'we:a.mjs\nb|c',
+      'we:a.mjs we:/abs/x', 'we:s/a*b.mjs we:docs/x.md', 'we:a.mjs ./src/t.mjs', 'we:a.mjs src//t.mjs', "we:a.mjs b'c", 'we:a.mjs\nb|c',
     ]) {
       expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
         .toThrow(/characters the brief cannot carry|unsafe scope entry/);
@@ -524,14 +548,26 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it.each([
     ['we', 'webeverything'], ['fui', 'frontierui'], ['plateau', 'plateau-app'],
-  ])('R372 — accepts canonical %s scope and refuses its %s alias', (canonical, alias) => {
+  ])('R372 — preserves both canonical %s scope and its legacy %s alias', (canonical, alias) => {
     const read = tickRead();
     const withScope = (prefix) => ({ ...read, item: { ...read.item, scope: [`${prefix}:src/a.mjs`] } });
     const shaped = shapeDispatchRead(withScope(canonical), { num: '3037' });
     expect(shaped.dispatching).toBe(true);
     expect(shaped.scope).toEqual([`${canonical}:src/a.mjs`]);
-    expect(() => shapeDispatchRead(withScope(alias), { num: '3037' }))
-      .toThrow(/unsafe scope entry.*canonical/);
+    const legacy = shapeDispatchRead(withScope(alias), { num: '3037' });
+    expect(legacy.dispatching).toBe(true);
+    expect(legacy.scope).toEqual([`${alias}:src/a.mjs`]);
+  });
+
+  it('still refuses unsafe paths with legacy prefixes or no prefix', () => {
+    const read = tickRead();
+    for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', '']) {
+      for (const path of ['/abs/x', '../x', './x', 'src//x', 'src/../x', "src/a'b", 'src/`id`', 'src/$(id)', 'src/a|b', 'src/\u200bx']) {
+        const scope = [`${prefix}src/safe.mjs ${prefix}${path}`];
+        expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' }), JSON.stringify(scope))
+          .toThrow(/cannot carry|unsafe scope/);
+      }
+    }
   });
 
   it('R372 — an unprefixed piece inherits the entry repo prefix (lease overlap stays correct)', () => {

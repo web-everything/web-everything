@@ -44,6 +44,22 @@ export default {
       if (JSON.stringify(shaped.scope) !== JSON.stringify(want)) violations.push(`the dispatched scope is ${JSON.stringify(shaped.scope)}, not ${JSON.stringify(want)}`);
       if (!String(shaped.prompt).includes(`scope: ${want.join(',')}`)) violations.push('the brief does not carry the comma-joined lease scope');
     } catch (e) { violations.push(`dispatch refused the flattened scope: ${String(e.message).slice(0, 120)}`); }
+    // PR #6244: adding multi-path support must preserve the scope spellings already accepted by dispatch.
+    for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', '']) {
+      const input = [`${prefix}src/a.mjs src/b.mjs`];
+      const expected = [`${prefix}src/a.mjs`, `${prefix}src/b.mjs`];
+      try {
+        const loadedScope = normalizeScope(input);
+        if (JSON.stringify(loadedScope) !== JSON.stringify(expected)) violations.push(`loader changed legacy prefix ${JSON.stringify(prefix)}`);
+        for (const scope of [input, loadedScope]) {
+          const shaped = read(scope);
+          if (shaped.dispatching !== true || JSON.stringify(shaped.scope) !== JSON.stringify(expected)
+            || !String(shaped.prompt).includes(`scope: ${expected.join(',')}`)) {
+            violations.push(`legacy scope ${JSON.stringify(prefix)} was not carried into the brief`);
+          }
+        }
+      } catch (e) { violations.push(`legacy scope ${JSON.stringify(prefix)} refused: ${String(e.message).slice(0, 120)}`); }
+    }
     try { read(['we:a.mjs ../b.mjs']); violations.push('an unsafe piece (`..`) was accepted'); } catch { /* fail closed */ }
     return { violations };
   },
