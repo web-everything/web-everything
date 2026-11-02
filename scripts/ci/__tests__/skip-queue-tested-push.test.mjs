@@ -378,6 +378,14 @@ describe.each([
     expect(result.reason).toMatch(/changed near or after/);
   });
 
+  it.each(['failure', 'cancelled', 'timed_out'])('keeps full CI when a newer %s run exists on the matched SHA', async (conclusion) => {
+    const older = run(sha, { created_at: '2026-10-31T12:02:00Z' });
+    const newer = run(sha, { conclusion, created_at: '2026-10-31T12:10:00Z' });
+    const result = await decideQueueTestedSkip(input({ listMergeGroupRuns: vi.fn().mockResolvedValue([older, newer]) }));
+    expectClosed(result);
+    expect(result.reason).toMatch(/did not succeed/);
+  });
+
   it('also guards an exact-head match', async () => {
     const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([run(sha)]),
       [reader]: vi.fn().mockResolvedValue(state(push(tip, { timestamp: '2026-10-31T12:05:00Z' }))) });

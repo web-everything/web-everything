@@ -95,7 +95,13 @@ export async function decideQueueTestedSkip({
     .slice(0, MAX_RUNS_CHECKED);
   if (!candidates.length) return full('no valid successful merge-group runs');
 
+  // A newer non-success run on the same head SHA (a re-run that failed) overrides an older success.
+  const newerNonSuccess = (run) => runs.some((r) => r && r !== run && isSha(r.head_sha)
+    && r.head_sha.toLowerCase() === run.head_sha.toLowerCase()
+    && r.conclusion !== 'success' && typeof r.created_at === 'string'
+    && Date.parse(r.created_at) > Date.parse(run.created_at));
   const accept = async (run, reason) => {
+    if (newerNonSuccess(run)) return full('a newer merge-group run on the same SHA did not succeed');
     const unproven = await queueRunUnproven({ readQuarantineState, readSiblingState }, run, now);
     return unproven ? full(unproven) : { skip: true, matchedSha: run.head_sha, reason };
   };
