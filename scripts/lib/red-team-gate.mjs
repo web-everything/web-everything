@@ -51,7 +51,8 @@ const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
 // Any line that LOOKS like a finding (leading whitespace, any case, loose punctuation). Used only to key the result
 // digest, never to decide what blocks: a line the strict FINDING_RE skips still changes the digest.
-const FINDING_SHAPED_RE = /^\s*\d+\s*[.)]\s*\[\s*(?:\*\*)?\s*(?:confirmed|not confirmed|unverifiable)\b/i;
+// Include repeated/mixed Markdown emphasis; a closing underscore is a word character, so also allow it at the boundary.
+const FINDING_SHAPED_RE = /^\s*\d+\s*[.)]\s*\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.

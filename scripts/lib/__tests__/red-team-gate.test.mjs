@@ -349,7 +349,62 @@ describe('redTeamResultId digest covers every finding-shaped line (card 43)', ()
     });
   }
   it('a result with no extra finding-shaped lines keeps its pre-change v1 id (existing records still apply)', () => {
-    expect(ID).toBe(redTeamResultId({ findings: parseRedTeamComment(BODY_4722).findings }));
+    // Computed with redTeamResultId from 29f8bc0100, before finding-shaped lines keyed the digest.
+    expect(ID).toBe('d2c3f139283ef987');
+  });
+  for (const emphasis of ['__confirmed__', '*confirmed*', '_confirmed_']) {
+    it(`an appended [${emphasis}] finding changes the digest and invalidates the old sent-back record`, () => {
+      const line = `2. [${emphasis}] (security, broken) -- New break.`;
+      const edited = added(line);
+      const parsed = parseRedTeamComment(edited);
+      expect(parsed.shapedLines).toEqual([line]);
+      expect(parsed.findings).toEqual(parseRedTeamComment(BODY_4722).findings);
+      expect(redTeamResultId(parsed)).not.toBe(ID);
+      const record = bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.SENT_BACK, ID));
+      expect(liveResultGateState([bot(BODY_4722), record], 4722, HEAD).outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(true);
+      expect(liveResultGateState([bot(edited), record], 4722, HEAD).outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(false);
+    });
+  }
+  it('changing a skipped finding-shaped line changes a v2 id without altering blocking classification', () => {
+    const before = parseRedTeamComment(added(FORGED[0]));
+    const after = parseRedTeamComment(added(FORGED[0].replace('extra finding', 'edited finding')));
+    expect(before.shapedLines).toHaveLength(1);
+    expect(after.shapedLines).toHaveLength(1);
+    expect(redTeamResultId(before)).not.toBe(ID);
+    expect(redTeamResultId(after)).not.toBe(ID);
+    expect(redTeamResultId(after)).not.toBe(redTeamResultId(before));
+    expect(before.findings.map(breakClass)).toEqual(['broken', 'degraded']);
+    expect(after.findings.map(breakClass)).toEqual(before.findings.map(breakClass));
+    expect(planRedTeamActions(after)).toEqual(planRedTeamActions(before));
+  });
+  it('skipped finding-shaped lines do not alter blocking classification', () => {
+    const before = parseRedTeamComment(BODY_4722);
+    expect(before.findings.map(breakClass)).toEqual(['broken', 'degraded']);
+    const lines = [...FORGED];
+    for (const verdict of ['confirmed', 'not confirmed', 'unverifiable']) {
+      for (const emphasis of ['*', '_', '__', '***', '*_']) {
+        lines.push(`3. [${emphasis}${verdict}${emphasis}] (security, broken) — New break.`);
+      }
+    }
+    for (const line of lines) {
+      const after = parseRedTeamComment(added(line));
+      expect(after.shapedLines).toEqual([line.trim()]);
+      expect(after.findings.map(breakClass)).toEqual(before.findings.map(breakClass));
+      expect(planRedTeamActions(after)).toEqual(planRedTeamActions(before));
+    }
+  });
+  it('shapedLines preserves the compared and serialized parsed shape while keying the digest', () => {
+    const before = parseRedTeamComment(BODY_4722);
+    const after = parseRedTeamComment(added(FORGED[0]));
+    const expected = { pr: 4722, rev: HEAD, findings: before.findings };
+    expect(before.shapedLines).toEqual([]);
+    expect(after.shapedLines).toEqual([FORGED[0].trim()]);
+    expect(after).toEqual(expected);
+    expect(Object.keys(after)).toEqual(['pr', 'rev', 'findings']);
+    expect(Object.getOwnPropertyDescriptor(after, 'shapedLines').enumerable).toBe(false);
+    expect(JSON.stringify(after)).toBe(JSON.stringify(expected));
+    expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+    expect(redTeamResultId(after)).not.toBe(redTeamResultId(before));
   });
   it('a removed or changed finding changes the digest', () => {
     expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace('Restarting with', 'Restarted with')))).not.toBe(ID);
