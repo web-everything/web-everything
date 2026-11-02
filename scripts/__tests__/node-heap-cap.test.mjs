@@ -14,7 +14,8 @@ describe('review child heap caps', () => {
     const settings = JSON.parse(readFileSync(new URL('../settings/node-heap-cap.json', import.meta.url), 'utf8'));
     expect(settings.description).toEqual(expect.any(String));
     expect(settings.floorMb).toBe(1024);
-    expect(settings.caps).toEqual({ 'review-job': 2400, 'review-set-label': 1024, 'review-extra-seats': 1536 });
+    expect(settings.caps).toEqual({ 'review-job': 2400, 'review-set-label': 1024, 'review-extra-seats': 1536,
+      'review-daemon': 4608, 'fix-daemon': 4096 });
     for (const cap of Object.values(settings.caps)) expect(cap).toBeGreaterThanOrEqual(settings.floorMb);
   });
 
