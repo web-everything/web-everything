@@ -1842,6 +1842,12 @@ export async function recordPostAcceptAdvisoryRating(options = {}) {
 // Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
 const advisoryWrites = new Map();
 async function recordAdvisoryObservation(recorder, options) {
+  try {
+    return await recordAdvisoryObservationContained(recorder, options);
+  } catch { return null; }
+}
+
+async function recordAdvisoryObservationContained(recorder, options) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
   const injected = Object.hasOwn(options, 'readLedgerRows') || Object.hasOwn(options, 'appendLedgerRow');
   const path = options.ledgerPath ?? join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');

@@ -53,6 +53,39 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 const CTX = { key: 'run-1#4#0', runId: 'run-1', type: 'x', stepIndex: 4, step: 'record', index: 0 };
 
 describe('post-accept advisory persisted ledger', () => {
+  it('refuses producer poison without changing persisted history and contains option getters', async () => {
+    const policy = await import('../../lib/review-loop-policy.mjs');
+    const io = await import('../review-pr-io.mjs');
+    const ledgerPath = join(root, 'producer-poison.jsonl');
+    const finding = { findingId: 'one', file: 'scripts/a.mjs', line: 4,
+      category: 'correctness/correctness', summary: 'diagnostic', impactIfUnfixed: 'cosmetic' };
+    const decision = { wouldCard: true, wouldPush: false, findings: [finding] };
+    const facts = { repo: 'o/r', pr: 7, head: 'A', ledgerPath, decision };
+    await io.recordPostAcceptAdvisoryShadow(facts);
+    const original = readFileSync(ledgerPath, 'utf8');
+    expect(await io.recordPostAcceptAdvisoryShadow({ ...facts, head: 'B',
+      decision: { ...decision, findings: [{ ...finding, rootCause: { toString: null } }] } })).toBeNull();
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(original);
+    const cyclic = {}; cyclic.self = cyclic;
+    let calls = 0;
+    await io.recordPostAcceptAdvisoryLoops({ ...facts, head: 'B', runId: 'R',
+      now: () => ++calls === 1 ? 'first-valid-row' : cyclic });
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(original);
+    for (const name of ['recordPostAcceptAdvisoryShadow', 'recordPostAcceptAdvisoryLoops', 'recordPostAcceptAdvisoryRating']) {
+      await expect(io[name](Object.defineProperty({ ...facts }, 'ledgerPath', {
+        get() { throw new Error('hostile path getter'); },
+      }))).resolves.toBeNull();
+    }
+    await io.recordPostAcceptAdvisoryLoops({ ...facts, head: 'B', runId: 'R' });
+    await io.recordPostAcceptAdvisoryRating({ ...facts, head: 'B', runId: 'R',
+      findings: [{ ...finding, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] });
+    const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(JSON.parse);
+    for (const row of rows) expect(policy.validatePostAcceptAdvisoryRow(row)).toEqual(row);
+    expect(policy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 1, wouldCard: 1, laterBroken: 1, loopsAfter: 1, skipped: 0, unresolved: 0,
+    });
+  });
+
   it('reopens normalization-poisoned JSONL while unrelated decisions, loops and ratings persist under lock', async () => {
     const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } = await import('../review-pr-io.mjs');
     const { postAcceptAdvisoryShadowReport } = await import('../../lib/review-loop-policy.mjs');

@@ -238,6 +238,7 @@ describe('post-accept advisory shadow ledger', () => {
   const finding = { findingId: 'finding-1', file: 'scripts/a.mjs', line: 4,
     category: 'correctness/correctness', summary: 'improve diagnostic', impactIfUnfixed: 'degraded' };
   const decision = { action: 'push', wouldCard: true, wouldPush: false, findings: [finding] };
+  const accepted = (findings = [finding]) => ({ verdict: VERDICTS.ACCEPT, admittedFindings: findings, findings });
 
   it('contains deterministic malformed-row fuzz through report, replay and all three unrelated-PR recorders', async () => {
     const boom = () => { throw new Error('hostile persisted value'); };
@@ -295,6 +296,52 @@ describe('post-accept advisory shadow ledger', () => {
         prs: 1, wouldCard: 1, findings: 1, loopsAfter: 2, laterBroken: 1,
       });
     }
+    // Producer x reader probe: persist exactly what the append sink receives, then replay it.
+    const producers = [reviewLoopPolicy.recordPostAcceptAdvisoryShadow,
+      reviewLoopPolicy.recordPostAcceptAdvisoryLoops, reviewLoopPolicy.recordPostAcceptAdvisoryRating];
+    for (const value of values) {
+      for (const input of [value, { verdict: value }, { verdict: accepted(), guards: { humanRequired: value } },
+        { verdict: accepted([value]) }, { verdict: Object.defineProperty({}, 'findings', { get: boom }) }]) {
+        let result;
+        expect(() => { result = reviewLoopPolicy.postAcceptAdvisoryDecision(input); }).not.toThrow();
+        expect(result).toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+      }
+    }
+    for (const row of corpus) {
+      const input = { verdict: row };
+      // Getter reads themselves belong inside the producer boundary.
+      if (row && typeof row === 'object') input.verdict = row;
+      expect(() => reviewLoopPolicy.postAcceptAdvisoryDecision(input)).not.toThrow();
+      const written = [];
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head: 'probe',
+        get decision() { return { ...decision, findings: row?.findings }; },
+        readLedgerRows: () => written, appendLedgerRow: candidate => { written.push(candidate); return { ok: true }; },
+      })).resolves.toBeDefined();
+      for (const candidate of written) expect(reviewLoopPolicy.validatePostAcceptAdvisoryRow(candidate)).toEqual(candidate);
+      expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(JSON.parse(JSON.stringify(written))))
+        .toMatchObject({ skipped: 0, unresolved: 0 });
+    }
+    const seed = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      headSha: 'A', ...decision, loopsAfter: null };
+    for (const value of values) {
+      for (const producer of producers) {
+        for (const key of ['decision', 'findings', 'loopsAfter', 'now', 'repo', 'head', 'runId']) {
+          const rows = [structuredClone(seed), { kind: 'advisory-run', repo: 'o/r', pr: 7, headSha: 'B', runId: 'R' }], logs = [];
+          const io = { repo: 'o/r', pr: 7, head: 'B', runId: 'R', decision, findings: [finding],
+            readLedgerRows: () => rows, out: line => logs.push(line),
+            appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+          const baseline = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+          const options = { ...io, [key]: value };
+          if (key === 'now') options.now = () => value;
+          await expect(producer(options)).resolves.toBeDefined();
+          for (const row of rows) expect(reviewLoopPolicy.validatePostAcceptAdvisoryRow(row)).toEqual(row);
+          expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(JSON.parse(JSON.stringify(rows))))
+            .toMatchObject({ skipped: 0, unresolved: 0 });
+          expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows).prs).toBeGreaterThanOrEqual(baseline.prs);
+          await expect(producer(Object.defineProperty({ ...io }, key, { get: boom }))).resolves.toBeNull();
+        }
+      }
+    }
     expect({}.polluted).toBeUndefined();
   });
 
@@ -329,6 +376,46 @@ describe('post-accept advisory shadow ledger', () => {
     expect(logs).toHaveLength(2);
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport([{ ...facts, kind: 'we.post-accept-advisory-shadow', ...decision }]))
       .toMatchObject({ prs: 0, skipped: 1 });
+  });
+
+  it('contains throwing decision evidence and marks the fail-closed result invalid', () => {
+    const boom = () => { throw new Error('hostile'); };
+    const cyclic = {}; cyclic.self = cyclic;
+    for (const input of [cyclic, Object.defineProperty({}, 'verdict', { get: boom, enumerable: true }),
+      { verdict: accepted([{ ...finding, rootCause: { toString: boom } }]) },
+      { verdict: accepted(), guards: Object.defineProperty({}, 'humanRequired', { get: boom, enumerable: true }) }]) {
+      expect(reviewLoopPolicy.postAcceptAdvisoryDecision(input)).toMatchObject({
+        action: 'push', wouldPush: true, wouldCard: false, invalid: true, findings: [],
+      });
+    }
+  });
+
+  it('refuses normalization-poisoned decisions and invalid whole batches before any append', async () => {
+    const cyclic = {}; cyclic.self = cyclic;
+    for (const key of ['rootCause', 'prevention', 'line', 'file', 'quote', 'reproCommand', 'failure_scenario']) {
+      const rows = [], logs = [];
+      const io = { repo: 'o/r', pr: 7, head: 'A', readLedgerRows: () => rows,
+        appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io,
+        decision: { ...decision, findings: [{ ...finding, [key]: { toString: null } }] } })).toBeNull();
+      expect(rows).toEqual([]);
+      expect(logs).toHaveLength(1);
+    }
+    for (const name of ['recordPostAcceptAdvisoryShadow', 'recordPostAcceptAdvisoryLoops', 'recordPostAcceptAdvisoryRating']) {
+      const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: 'A',
+        ...decision, loopsAfter: null }];
+      if (name.endsWith('Rating')) rows.push({ kind: 'advisory-run', repo: 'o/r', pr: 7, headSha: 'B', runId: 'R' });
+      const before = structuredClone(rows), logs = [];
+      let calls = 0;
+      const result = await reviewLoopPolicy[name]({ repo: 'o/r', pr: 7, head: 'B', runId: 'R', decision,
+        findings: [{ ...finding, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }],
+        now: () => ++calls === 1 && name.endsWith('Loops') ? 'valid-first-measurement' : cyclic,
+        readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+        out: line => logs.push(line) });
+      expect(result).toBeNull();
+      expect(rows).toEqual(before);
+      expect(logs).toHaveLength(1);
+    }
   });
 
   it('reads historical head rows idempotently and writes canonical non-SHA head identities', async () => {
