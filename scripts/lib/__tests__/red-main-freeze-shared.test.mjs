@@ -12,7 +12,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import {
-  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit,
+  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, prepareDrainFreeze, resolveDrainFreezeSettings, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit,
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
@@ -837,5 +837,50 @@ describe('A6 shared text sanitized on read and merge-gate output', () => {
     single(line.slice(0, -1));
     const source = readFileSync(resolve(HERE, '../../merge-gate-check.mjs'), 'utf8');
     expect(source).toContain('process.stderr.write(formatRedMainFreeze(redMain))');
+  });
+});
+
+describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
+  const settings = resolveDrainFreezeSettings({ env: {}, tool: {} });
+  const T = { error: 'branch unreadable: spawnSync git ETIMEDOUT' };
+  const CLEAR = { source: 's', frozen: false, kind: 'manual', reason: null };
+  const FROZEN = { source: 's', frozen: true, kind: 'manual', reason: 'red main' };
+  const mk = () => ({ file: join(mkdtempSync(join(tmpdir(), 'lkg-')), 'lkg.json'), t: 1_000_000 });
+  const run = async (readShared, { file, t }, extra = {}) => {
+    const logs = [];
+    const s = await prepareDrainFreeze({ settings, readShared, stderr: x => logs.push(x), logSettings: false, lkg: { file, now: () => t, sleepSync: () => {}, ...extra } });
+    return { s, log: logs.join('') };
+  };
+  it('retries a timeout (bounded) and takes the successful read', async () => {
+    const m = mk(); let n = 0;
+    const { s } = await run(() => (++n < 3 ? T : CLEAR), m);
+    expect(n).toBe(3); expect(s.frozen).toBe(false);
+  });
+  it('gives up after 2 retries', async () => {
+    const m = mk(); let n = 0;
+    const { s } = await run(() => { n++; return T; }, m);
+    expect(n).toBe(3); expect(s.frozen).toBe(true); expect(s.error).toMatch(/ETIMEDOUT/);
+  });
+  it('timeout + fresh last-known-good not-frozen: proceeds with the logged fallback', async () => {
+    const m = mk(); await run(() => CLEAR, m);
+    const { s, log } = await run(() => T, { ...m, t: m.t + 60_000 });
+    expect(s.frozen).toBe(false); expect(log).toMatch(/freeze read timed out — using last-known-good from 60s/);
+  });
+  it('timeout + last-known-good frozen: holds', async () => {
+    const m = mk(); await run(() => FROZEN, m);
+    const { s } = await run(() => T, { ...m, t: m.t + 1000 });
+    expect(s.frozen).toBe(true); expect(s.error).toBeTruthy();
+  });
+  it('timeout + stale or missing cache: holds', async () => {
+    const m = mk();
+    expect((await run(() => T, m)).s.frozen).toBe(true);
+    await run(() => CLEAR, m);
+    expect((await run(() => T, { ...m, t: m.t + 6 * 60_000 })).s.frozen).toBe(true);
+  });
+  it('a successful read always overrides the cache; non-timeout errors never use it', async () => {
+    const m = mk(); await run(() => CLEAR, m);
+    expect((await run(() => FROZEN, { ...m, t: m.t + 1000 })).s.frozen).toBe(true);
+    await run(() => CLEAR, m);
+    expect((await run(() => ({ error: 'freeze.json is not JSON' }), { ...m, t: m.t + 1000 })).s.frozen).toBe(true);
   });
 });

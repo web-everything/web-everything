@@ -34,7 +34,8 @@
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { RED_MAIN_HOLD_SETTINGS_FILE, redMainSignal } from './red-main-hold.mjs';
 import { execFileSync } from 'node:child_process';
@@ -342,9 +343,49 @@ export function dequeueUnpublishedFreeze({ repo, branch, dryRun = false, exec = 
 }
 
 /** One pass of IO around the pure decision. Retry once, then reuse the new shared read. */
-export async function prepareDrainFreeze({ local = null, settings = resolveDrainFreezeSettings(), shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true } = {}) {
+const TIMEOUT_RE = /ETIMEDOUT|timed out/i;
+const LKG_RETRIES = 2;
+const LKG_BACKOFF_MS = 1000;
+const LKG_DEFAULT_MINUTES = 5;
+const lkgMemory = new Map(); // per drain process; the disk copy below survives a restart
+
+/**
+ * Drain-side shared-freeze read: a git TIMEOUT is retried (at most {@link LKG_RETRIES}, backoff) and, if it persists, a FRESH
+ * last-known-good "not frozen" read (younger than WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES, default 5; 0 = off) stands in.
+ * Any successful read wins and replaces the cache; a cached "frozen", a stale/missing cache, or a non-timeout error stay fail-closed.
+ */
+function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
+  const now = lkg.now ?? Date.now;
+  const sleepSync = lkg.sleepSync ?? (ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
+  const file = lkg.file ?? env.WE_RED_MAIN_FREEZE_LKG_FILE ?? resolve(tmpdir(), 'we-red-main-freeze-lkg.json');
+  const minutesRaw = lkg.minutes ?? Number(env.WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES ?? LKG_DEFAULT_MINUTES);
+  const minutes = Number.isFinite(minutesRaw) && minutesRaw >= 0 ? minutesRaw : LKG_DEFAULT_MINUTES;
+  const once = () => { try { return readShared(); } catch (e) { return { error: flatText(e?.message ?? e) }; } };
+  let r = once();
+  for (let i = 0; i < LKG_RETRIES && r?.error && TIMEOUT_RE.test(r.error); i++) {
+    sleepSync((lkg.backoffMs ?? LKG_BACKOFF_MS) * (i + 1));
+    r = once();
+  }
+  if (typeof r?.frozen === 'boolean' && !r.error) {
+    const rec = { at: now(), result: r };
+    lkgMemory.set(file, rec);
+    try { mkdirSync(dirname(file), { recursive: true }); const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(rec)); renameSync(tmp, file); } catch { /* cache is best-effort */ }
+    return r;
+  }
+  if (!r?.error || !TIMEOUT_RE.test(r.error) || minutes === 0) return r;
+  let rec = lkgMemory.get(file);
+  if (!rec) { try { rec = JSON.parse(readFileSync(file, 'utf8')); } catch { rec = null; } }
+  const age = rec ? now() - rec.at : Infinity;
+  if (rec?.result?.frozen === false && !rec.result.error && age >= 0 && age <= minutes * 60_000) {
+    stderr(`red-main freeze: freeze read timed out — using last-known-good from ${Math.round(age / 1000)}s ago\n`);
+    return { ...rec.result, lastKnownGood: true };
+  }
+  return r;
+}
+
+export async function prepareDrainFreeze({ local = null, settings = resolveDrainFreezeSettings(), shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true, lkg = {} } = {}) {
   if (logSettings) for (const [key, setting] of Object.entries(settings)) stderr(`red-main freeze: ${key} setting ${setting.value} via ${setting.source}\n`);
-  const read = () => { try { return readShared(); } catch (e) { return { error: flatText(e?.message ?? e) }; } };
+  const read = () => readSharedWithFallback({ readShared, env, stderr, lkg });
   if (settings.redMainFreezeReader.value === 'shared-first' && shared === undefined) shared = read();
   let state = evaluateDrainFreeze({ local, shared, settings });
   if (state.unpublished) {
