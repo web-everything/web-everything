@@ -13,7 +13,7 @@ const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
 // Check whole verdict lines, including controls/Unicode that can disguise a contradiction.
 function hasConflictingVerdict(verdict, findings) {
   const opposite = verdict === 'NOT WEAKENED' ? 'WEAKENED' : 'NOT WEAKENED';
-  return findings.some(line => typeof line === 'string' && [...line.split(LINE_BREAK), clean(line)].some(part =>
+  return findings.some(line => typeof line === 'string' && [...line.split(LINE_BREAK), ...clean(line).split(LINE_BREAK)].some(part =>
     clean(part).normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').trim() === opposite));
 }
 

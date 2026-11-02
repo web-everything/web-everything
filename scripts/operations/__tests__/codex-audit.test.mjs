@@ -109,6 +109,8 @@ describe('canonical audit', () => {
     'NOT WEAKENED\nＷＥＡＫＥＮＥＤ',
     'NOT WEAKENED\nWEAK\u200bENED',
     'NOT WEAKENED\nWEAK\rENED',
+    'NOT WEAKENED\nscripts/gate.mjs:12 guard removed\nWEAK\rENED',
+    'WEAKENED\nNOT WEAK\rENED',
     'WEAKENED\nＮＯＴ ＷＥＡＫＥＮＥＤ',
   ];
 
