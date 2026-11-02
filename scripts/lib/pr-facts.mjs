@@ -105,8 +105,31 @@ function bucketStorage(buckets) {
   return {
     getProjection: (bucket, key) => structuredClone(b(bucket)[key] ?? null),
     putProjection: (bucket, key, value) => { b(bucket)[key] = structuredClone(value); },
-    listProjection: (bucket) => Object.values(b(bucket)).map((v) => structuredClone(v)),
+    deleteProjection: (bucket, key) => { delete b(bucket)[key]; },
+    listProjection: (bucket, withKeys = false) => Object.entries(b(bucket))
+      .map(([key, value]) => withKeys ? { key, value: structuredClone(value) } : structuredClone(value)),
   };
+}
+
+/** Unknown identity cannot be attributed to another repo; reject it rather than blessing incomplete evidence. */
+function validateServedRows(rows, repo) {
+  const r = repoKey(repo);
+  if (!Array.isArray(rows)) throw new Error('malformed /prs rows');
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.repo !== 'string' || !isSlug(row.repo))
+      throw new Error('malformed /prs row');
+    if (repoKey(row.repo) !== r) continue;
+    if (!Number.isInteger(row.number)) throw new Error('malformed /prs row');
+    for (const [field, type] of [['checks', 'check_run'], ['suites', 'check_suite']]) {
+      const checks = row[field] === undefined ? [] : row[field];
+      if (!Array.isArray(checks)) throw new Error('malformed /prs checks');
+      for (const c of checks) {
+        if (!c || typeof c !== 'object' || Array.isArray(c) || typeof c.repo !== 'string' || !isSlug(c.repo) ||
+            repoKey(c.repo) !== r || c.type !== type ||
+            (c.prs != null && (!Array.isArray(c.prs) || !c.prs.every(Number.isInteger)))) throw new Error('malformed /prs check');
+      }
+    }
+  }
 }
 
 /**
@@ -115,6 +138,7 @@ function bucketStorage(buckets) {
  */
 export function seedMirror({ repo, body, nowMs }) {
   const r = repoKey(repo);
+  validateServedRows(body.prs, r);
   const buckets = { prs: {}, checks: {}, shas: {} };
   for (const row of body.prs || []) {
     if (repoKey(row.repo) !== r || !Number.isInteger(row.number)) continue;
@@ -279,6 +303,7 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
       if (after != null) q.set('prsAfter', after);
       const body = await getJson(`${url}/prs?${q}`, token, io);
       if (!body || !Array.isArray(body.prs) || typeof body.prsMore !== 'boolean') throw new Error('malformed /prs page');
+      validateServedRows(body.prs, repo);
       if ((body.truncated?.repos?.[repoKey(repo)] || 0) > 0 ||
           (body.truncated?.malformed > 0 && body.repos?.[repoKey(repo)]?.coverage === false))
         throw new Error('incomplete /prs coverage');

@@ -112,6 +112,28 @@ describe('/prs response budget', () => {
 });
 
 describe('/prs legacy storage', () => {
+  it.each([null, {}, 'legacy', [null], [1, 'two']].map((value) => [value]))('counts malformed SHA attachment maps (%j) once and clears only their repo coverage', (invalid) => {
+    const h = fixture(); h.put(1); h.put(2, 'open', 'o/b');
+    h.storage.putProjection('shas', JSON.stringify(['o/a', 'o/a-1']), invalid);
+    for (const type of ['check_run', 'check_suite']) h.storage.putProjection('checks', type, {
+      repo: 'o/a', sha: 'o/a-1', prs: [], type, seq: 3,
+    });
+    const body = h.read();
+    expect(body.truncated.malformed).toBe(1);
+    expect(body.repos['o/a'].coverage).toBe(false);
+    expect(body.repos['o/b'].coverage).toBe(true);
+    expect(body.prs.find((r) => r.repo === 'o/a').checks).toHaveLength(1);
+  });
+
+  it('accepts a missing or empty SHA map for checks that have not yet acquired PR associations', () => {
+    const h = fixture(); h.put(1);
+    h.storage.putProjection('checks', 'unmatched', { repo: 'o/a', sha: 'unknown', prs: [], type: 'check_run' });
+    expect(h.read().truncated.malformed).toBe(0);
+    h.storage.putProjection('shas', JSON.stringify(['o/a', 'unknown']), []);
+    expect(h.read().truncated.malformed).toBe(0);
+    expect(h.read().repos['o/a'].coverage).toBe(true);
+  });
+
   it('skips malformed PR and check rows, counts them and isolates lost coverage', () => {
     const h = fixture(); h.put(1, 'open', 'o/b');
     const bad = [null, 'legacy', [], { repo: 'o/a' }, { repo: 'o/a', number: 1.5 }, { repo: 42, number: 1 }];

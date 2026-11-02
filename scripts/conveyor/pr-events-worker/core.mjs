@@ -53,6 +53,7 @@ export function classifyPrComment(body) {
 export const DEFAULT_MAX_EVENTS = 5000;
 export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const DEFAULT_PR_RETENTION_MS = DEFAULT_RETENTION_MS;
+export const DEFAULT_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const PROJECTION_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_PAGE_LIMIT = 200;
 export const MAX_PAGE_LIMIT = 500;
@@ -162,8 +163,12 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
   const numbers = [...new Set([...(event.prs || []), ...((type === 'check_run' || type === 'check_suite') ? associated : [])])];
   for (const number of numbers) {
     const rowKey = key(repo, number);
+    const tombstone = get('tombstones', rowKey);
+    // Pruning must not erase the close clock that rejects a delayed listing, even across restarts.
+    if (type === 'bootstrap' && tombstone && event.baseCursor < tombstone.closedSeq) continue;
     const row = get('prs', rowKey) || { repo, number, sha: null, draft: null, labels: null,
-      state: null, merged: null, review: null, checks: [], suites: [], seq: 0, fields: {}, labelChanges: {} };
+      state: tombstone ? 'closed' : null, merged: tombstone?.merged ?? null, review: null, checks: [], suites: [],
+      seq: tombstone?.closedSeq ?? 0, fields: tombstone ? { state: tombstone.closedSeq, merged: tombstone.closedSeq } : {}, labelChanges: {} };
     const assign = (field, value) => {
       if (value !== undefined && (type !== 'bootstrap' || (row.fields[field] || 0) <= event.baseCursor)) {
         row[field] = value; row.fields[field] = seq;
@@ -195,21 +200,27 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
     if (type === 'pull_request_review') row.review = { sha, state: event.state, action: event.action, seq };
     row.seq = Math.max(row.seq, seq);
     if (Number.isFinite(now)) row.updatedAt = now;
+    if (tombstone && row.state === 'open') storage.deleteProjection('tombstones', rowKey);
     put('prs', rowKey, row);
   }
 }
 
 /** Remove expired closed rows and their exclusive evidence; shared SHA/check attachments survive. */
-function pruneProjection(storage, now, retentionMs) {
+function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
   const last = numOrNull(storage.getMeta('lastProjectionPruneAt'));
   if (last != null && now >= last && now - last < PROJECTION_PRUNE_INTERVAL_MS) return;
   storage.setMeta('lastProjectionPruneAt', String(now));
+  for (const { key, value: t } of storage.listProjection('tombstones', true)) {
+    if (!Number.isFinite(t?.prunedAt) || t.prunedAt < now - tombstoneRetentionMs) storage.deleteProjection('tombstones', key);
+  }
   const expired = new Map(), deadShas = new Set();
   for (const { key, value: row } of storage.listProjection('prs', true)) {
     if (!isPrRow(row) || row.state !== 'closed' || (Number.isFinite(row.updatedAt) && row.updatedAt >= now - retentionMs)) continue;
     if (!expired.has(row.repo)) expired.set(row.repo, new Set());
     expired.get(row.repo).add(row.number);
     if (row.sha) deadShas.add(JSON.stringify([row.repo, row.sha]));
+    storage.putProjection('tombstones', key, { repo: row.repo, number: row.number, state: 'closed', merged: row.merged ?? null,
+      closedSeq: row.fields?.state ?? row.seq ?? 0, prunedAt: now });
     storage.deleteProjection('prs', key);
   }
   if (!expired.size) return;
@@ -243,6 +254,16 @@ export function projectPrRows(storage, malformed = () => {}) {
   // One pass over checks, one SHA→PRs lookup per distinct (repo, sha): bounded by distinct SHAs, never PRs × checks.
   const byPr = new Map();
   const shaPrs = new Map();
+  // Walking stored keys distinguishes an absent (unmatched check) map from an explicitly corrupt null map.
+  for (const { key, value: numbers } of storage.listProjection('shas', true)) {
+    let identity;
+    try { identity = JSON.parse(key); } catch { /* Count the unreadable map below. */ }
+    if (!Array.isArray(identity) || identity.length !== 2 || typeof identity[0] !== 'string' || typeof identity[1] !== 'string' ||
+        !Array.isArray(numbers) || !numbers.every(Number.isInteger)) {
+      malformed({ repo: typeof identity?.[0] === 'string' ? identity[0] : undefined });
+      shaPrs.set(key, []);
+    } else shaPrs.set(key, numbers);
+  }
   const attach = (c, number) => {
     const k = JSON.stringify([c.repo, number]);
     if (!byPr.has(k)) byPr.set(k, new Set());
@@ -255,11 +276,7 @@ export function projectPrRows(storage, malformed = () => {}) {
     for (const number of c.prs || []) attach(c, number);
     if (!c.sha) continue;
     const shaKey = JSON.stringify([c.repo, c.sha]);
-    if (!shaPrs.has(shaKey)) {
-      const numbers = storage.getProjection('shas', shaKey);
-      shaPrs.set(shaKey, Array.isArray(numbers) ? numbers : []);
-    }
-    for (const number of shaPrs.get(shaKey)) attach(c, number);
+    for (const number of shaPrs.get(shaKey) || []) attach(c, number);
   }
   return storage.listProjection('prs').flatMap((stored) => {
     if (!isPrRow(stored)) { malformed(stored); return []; }
@@ -295,7 +312,8 @@ export function validateBootstrap(input) {
  *            listProjection(bucket, withKeys = false) } // withKeys returns { key, value } entries for pruning
  */
 export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS,
-  prsBudgetBytes = PRS_RESPONSE_BUDGET_BYTES, prRetentionMs = DEFAULT_PR_RETENTION_MS } = {}) {
+  prsBudgetBytes = PRS_RESPONSE_BUDGET_BYTES, prRetentionMs = DEFAULT_PR_RETENTION_MS,
+  tombstoneRetentionMs = DEFAULT_TOMBSTONE_RETENTION_MS } = {}) {
   const head = () => Number(storage.getMeta('head') || 0);
   storage.transaction(() => {
     if (!storage.getMeta('projectionVersion')) {
@@ -319,7 +337,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // Per-repo clock: only this repo's own events ever move it (R417).
       if (typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
       foldObservation(storage, stored, now);
-      pruneProjection(storage, now, prRetentionMs);
+      pruneProjection(storage, now, prRetentionMs, tombstoneRetentionMs);
       storage.prune(seq - maxEvents, now - retentionMs);
       return { seq, duplicate: false };
     }); },

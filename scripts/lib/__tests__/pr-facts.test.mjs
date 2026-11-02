@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { createEventLog, createMemoryStorage, handleRequest, parseGithubEvent } from '../../conveyor/pr-events-worker/core.mjs';
 import {
   PR_FACTS_DEFAULTS, lookupPrFacts, readPrFacts, readPrFactsFromGithub, readPrFactsOrGithub, readRepoFacts,
-  resolvePrFactsConfig, refreshMirror, mirrorRows, lookupInMirror,
+  resolvePrFactsConfig, refreshMirror, mirrorRows, lookupInMirror, seedMirror,
 } from '../pr-facts.mjs';
 
 const REPO = 'Web-Everything/web-everything';
@@ -76,6 +76,30 @@ describe('full mirror pagination', () => {
   const row = (number) => ({ repo: REPO.toLowerCase(), number, seq: number, sha: HEAD, draft: false, state: 'open', labels: [], checks: [], suites: [] });
   const first = { stateCursor: 9, lastDeliveryAt: T0, coverage: { bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0 }] } };
   const options = { repo: REPO, url: 'https://w.local', token: 'read', nowMs: T0, pageLimit: 1 };
+
+  it.each([
+    ['missing PR number', { ...row(7), number: null }],
+    ['null PR', null],
+    ['check without repo', { ...row(7), checks: [{ type: 'check_run', sha: HEAD, name: 'ci' }] }],
+    ['check with unusable repo', { ...row(7), checks: [{ repo: '', type: 'check_run', sha: HEAD }] }],
+    ['null check', { ...row(7), checks: [null] }],
+    ['null suite', { ...row(7), suites: [null] }],
+    ['non-array checks', { ...row(7), checks: 'legacy' }],
+  ])('rejects malformed served evidence (%s) instead of retaining complete coverage', async (_name, invalid) => {
+    const body = { ...first, prs: [invalid], prsCursor: 7, prsMore: false };
+    expect(() => seedMirror({ repo: REPO, body, nowMs: T0 })).toThrow(/malformed/);
+    const result = await refreshMirror(null, { ...options, fetchImpl: async () => new Response(JSON.stringify(body)) });
+    expect(result.mode).toBe('failed');
+    expect(lookupInMirror(result.mirror, { number: 7, nowMs: T0 })).toEqual({ facts: null, reason: 'feed-unreachable' });
+  });
+
+  it('falls back to GitHub when a served check has no usable repo', async () => {
+    const result = await readPrFactsOrGithub({ repo: REPO, number: 7, dir, env: {}, now: () => T0,
+      url: options.url, token: 'read', exec: fakeGh(githubFixture()), fetchImpl: async () => new Response(JSON.stringify({
+        ...first, prsMore: false, prs: [{ ...row(7), checks: [{ type: 'check_run', sha: HEAD, name: 'ci' }] }],
+      })) });
+    expect(result).toMatchObject({ source: 'github', reason: 'feed-unreachable' });
+  });
 
   it('retains every PR when an already-returned tied bootstrap row advances between pages', async () => {
     const w = worker();

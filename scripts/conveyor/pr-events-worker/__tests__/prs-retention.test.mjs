@@ -7,6 +7,56 @@ const event = (number, action = 'opened', sha = `sha-${number}`) => ({
   repo: 'o/r', prs: [number], type: 'pull_request', action, sha, at: new Date(0).toISOString(),
 });
 const write = (log, now) => log.append({ repo: 'o/other', type: 'check_run', prs: [], sha: null }, now);
+const seed = (baseCursor, importId = 'stale') => ({ repo: 'o/r', importId, baseCursor, status: 'complete',
+  prs: [{ number: 1, sha: 'seed', draft: false, labels: [], state: 'open' }] });
+
+it('keeps an unserved tombstone with the close clock and rejects stale bootstrap after pruning and restart', () => {
+  const storage = core.createMemoryStorage();
+  let log = core.createEventLog(storage, { prRetentionMs: 0 });
+  log.append(event(1), T);
+  log.append({ ...event(1, 'closed'), merged: true }, T);
+  log.append({ repo: 'o/r', prs: [1], sha: 'sha-1', type: 'check_run', name: 'ci' }, T);
+  write(log, T + INTERVAL);
+  expect(storage.getProjection('tombstones', key('o/r', 1))).toEqual({ repo: 'o/r', number: 1, state: 'closed',
+    merged: true, closedSeq: 2, prunedAt: T + INTERVAL });
+  expect(log.readPrs().prs).toEqual([]);
+  log = core.createEventLog(storage, { prRetentionMs: 0 });
+  log.bootstrap(seed(1), T + INTERVAL + 1);
+  expect(log.readPrs().prs).toEqual([]);
+  expect(storage.getProjection('prs', key('o/r', 1))).toBeNull();
+});
+
+it('preserves the close clock when later check events recreate a pruned row, while genuine reopens retire the tombstone', () => {
+  const storage = core.createMemoryStorage(), log = core.createEventLog(storage, { prRetentionMs: 0 });
+  log.append(event(1, 'closed'), T);
+  write(log, T + INTERVAL);
+  log.append({ repo: 'o/r', prs: [1], sha: 'sha-1', type: 'check_run', name: 'ci' }, T + INTERVAL + 1);
+  log.bootstrap(seed(0), T + INTERVAL + 2);
+  expect(log.readPrs().prs[0]).toMatchObject({ number: 1, state: 'closed' });
+  log.append(event(1, 'reopened'), T + INTERVAL + 3);
+  expect(log.readPrs().prs[0].state).toBe('open');
+  expect(storage.getProjection('tombstones', key('o/r', 1))).toBeNull();
+});
+
+it('permits a fresh bootstrap after the close clock and removes its obsolete tombstone', () => {
+  const storage = core.createMemoryStorage(), log = core.createEventLog(storage, { prRetentionMs: 0 });
+  log.append(event(1, 'closed'), T);
+  write(log, T + INTERVAL);
+  log.bootstrap(seed(2, 'fresh'), T + INTERVAL + 1);
+  expect(log.readPrs().prs[0].state).toBe('open');
+  expect(storage.getProjection('tombstones', key('o/r', 1))).toBeNull();
+});
+
+it.each([undefined, INTERVAL])('expires tombstones on writes after their retention period (%s), even without another PR to prune', (tombstoneRetentionMs) => {
+  const storage = core.createMemoryStorage(), log = core.createEventLog(storage, { prRetentionMs: 0, tombstoneRetentionMs });
+  log.append(event(1, 'closed'), T);
+  write(log, T + INTERVAL);
+  const duration = tombstoneRetentionMs ?? 30 * 24 * 3600_000;
+  write(log, T + INTERVAL + duration);
+  expect(storage.getProjection('tombstones', key('o/r', 1))).not.toBeNull();
+  write(log, T + 2 * INTERVAL + duration);
+  expect(storage.getProjection('tombstones', key('o/r', 1))).toBeNull();
+});
 
 it('defaults to seven days, records write time, expires closed/merged and legacy rows, and preserves open/recent rows', () => {
   const storage = core.createMemoryStorage(), log = core.createEventLog(storage);
