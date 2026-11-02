@@ -411,6 +411,8 @@ export const BOOKKEEPING_MARKERS = Object.freeze([
  * comments exceed `roundCap`. At the cap its final review still runs; another fixer is refused.
  */
 const OWED = Object.freeze({ bounced: 'fix', 'needs-review': 'review', 'needs-human': 'review' });
+// Residual conflicted states (e.g. unknown base or BEHIND); known-base DIRTY conflicts
+// dispatch bounded repairs in planReconcile.
 const OWED_ELSEWHERE = Object.freeze({
   conflicted: 'the branch needs a rebase before it can merge',
 });
@@ -2006,7 +2008,7 @@ const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRo
  * @param {Array<object>} [o.prs] - open PRs as `gh pr list --json number,headRefName,headRefOid,baseRefName,
  *   labels,statusCheckRollup,mergeStateStatus,comments` returns them, each optionally carrying `transcriptMtimeMs`
  *   (EVIDENCE ONLY — no decision reads it). `baseRefName` is what the STACKED-BASE CONFLICT branch keys on
- *   (#3383); its absence just means every `conflicted` PR falls through to the pre-#3383 `owed-elsewhere` path.
+ *   (#3383); an unknown base still refuses `owed-elsewhere` because no rebase target is known.
  *   `alreadyLandedInMain` (optional, `{carrierPr:(number|null)}`) is the ALREADY-LANDED verdict (live incident
  *   PR #2752) computed by the IO shell's per-file blob-identity check against `main`'s own history; its absence
  *   means every PR falls through unaffected, exactly as before this branch existed.
@@ -3696,11 +3698,11 @@ export function planReconcile({
     }
 
     // ── STACKED-BASE CONFLICT (#3383) — its OWN branch, ahead of the generic `OWED`/`OWED_ELSEWHERE` table, for
-    // the ONE `conflicted`-phase population that table's blanket "owed-elsewhere: the branch needs a rebase
-    // before it can merge" answer describes a rebase NOBODY will ever perform. A PR whose `baseRefName` is not
+    // the stacked `conflicted`-phase population whose former blanket "owed-elsewhere" refusal left a rebase
+    // NOBODY would ever perform. A PR whose `baseRefName` is not
     // `defaultBranch` is STACKED (built on another lane/PR, per `#poc-branch-declared-delivery-mode` clause 5:
-    // "base is not <default>") — the drain will never land it regardless of label, so `OWED_ELSEWHERE.conflicted`
-    // naming "a rebase… owed to the drain" is simply wrong for this population: nobody is coming.
+    // "base is not <default>") — the drain will never land it regardless of label. The former
+    // `OWED_ELSEWHERE.conflicted` naming "a rebase… owed to the drain" is simply wrong for this population: nobody is coming.
     // `we:scripts/conveyor/parked-pr-conflict-watch.mjs`'s own queued-conflict grace path independently defers to
     // THIS branch for the identical reason (see that file's own `graceDue` block) rather than bouncing it via
     // `postFinding`, which would strip `review:accepted` and force a fresh human review for what is ordinarily a
@@ -3726,9 +3728,9 @@ export function planReconcile({
     // round, this PR was never bounced to `review:changes` in the first place, so there is nothing to "re-arm";
     // `review:accepted` (or whatever it already carried) rides through this repair completely untouched.
     //
-    // NEVER FIRES for `baseRefName === defaultBranch` (including a `null`/unknown base) — that population falls
-    // straight through, unchanged, to the existing `OWED_ELSEWHERE.conflicted` refusal below, exactly as it did
-    // before this branch existed. It also never fires for any OTHER phase — a stacked PR that is `bounced`,
+    // NEVER FIRES for `baseRefName === defaultBranch` or a `null`/unknown base. DIRTY default-base PRs
+    // belong to the bounded conflicting-rebase branch below; an unknown base still refuses via
+    // `OWED_ELSEWHERE.conflicted`. It also never fires for any OTHER phase — a stacked PR that is `bounced`,
     // `needs-human`, etc. is handled entirely by that phase's own existing branch, unaffected by this one.
     if (phase === 'conflicted') {
       const baseRefName = pr?.baseRefName ?? null;
@@ -3776,13 +3778,15 @@ export function planReconcile({
 
     // Stacked bases were handled above. A definite mergeability conflict on the default
     // base needs the same bounded mechanical repair as a stale base, with the same holds.
-    if (mergeableConflict && pr?.baseRefName === defaultBranch) {
+    // DIRTY PRs already classify as conflicted (#6193); the drain never rebases them either.
+    const dirtyConflict = phase === 'conflicted' && pr?.mergeStateStatus === 'DIRTY';
+    if ((mergeableConflict || dirtyConflict) && pr?.baseRefName === defaultBranch) {
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
       const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
         currentRef: defaultBranch, currentSha: mainSha,
       });
-      const why = `GitHub mergeable is CONFLICTING — rebase onto current ${defaultBranch}`;
+      const why = `GitHub ${dirtyConflict ? 'mergeStateStatus is DIRTY' : 'mergeable is CONFLICTING'} — rebase onto current ${defaultBranch}`;
       if (attempts >= conflictFixCapHere || total >= CONFLICT_FIX_ABSOLUTE_CEILING) {
         refuseCapExhausted({ ...withPhase, attempts, cap: conflictFixCapHere, capKind: 'conflicting-rebase',
           why: `${why}; durable conflict-fix count ${attempts}/${conflictFixCapHere}, total ${total}/${CONFLICT_FIX_ABSOLUTE_CEILING} — mechanical repair exhausted; a person must take it` });
@@ -3977,10 +3981,10 @@ export function planReconcile({
  * `dispatch`/`refusals` output.
  *
  * EVERY PR THIS PASS HAS AN OPINION ABOUT — including `nothing-owed`. `owed-elsewhere` never meant "unrelated
- * PR": it fires for a `needs-human`/`conflicted` phase alike (`ci-red` moved OFF this table at multi-repo
- * slice 7 — it is a real `dispatch` entry, `kind:'ci-heal'`, now, not a refusal), which are real
- * conveyor-dispatched PRs stuck on something this pass does not run (a human clear, a rebase) — NOT unrelated
- * PRs. Before this function existed, `we:skills-src/conveyor/runner.mjs`'s own inline filter excluded
+ * PR": residual `conflicted` refusals (e.g. an unknown base) still describe real conveyor PRs.
+ * `needs-human` and `ci-red` now dispatch review and CI-heal respectively; known-base DIRTY conflicts
+ * dispatch a mechanical repair. These phase owners do not make the remaining refusals unrelated PRs.
+ * Before this function existed, `we:skills-src/conveyor/runner.mjs`'s own inline filter excluded
  * `owed-elsewhere` wholesale on the mistaken premise that it "covers every unrelated human PR" — confirmed
  * live 2026-09-05 on PR #1920: its `needs-human` refusal (kind `owed-elsewhere`) was excluded from every
  * tick's refresh sweep, so its stale `review-status:reviewing` label — left over from a session that no

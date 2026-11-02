@@ -1451,8 +1451,9 @@ export function watchParkedPrConflicts({
     // labelled, STILL conflicting, and carries NO live `review:changes` bounce right now. Before this, such a PR
     // was invisible to every sweep after the first (this file's own "IDEMPOTENCY, NO SEPARATE STORE" header rule
     // — a comment posts only on the absent→present label transition, never again while the label sits on the
-    // PR), while `reconcile-core.mjs`'s `OWED_ELSEWHERE.conflicted` refusal assumes THIS file owns re-attempting
-    // it — a ping-pong with no owner. Confirmed live: `web-everything/web-everything#2793` sat exactly here
+    // PR), while `reconcile-core.mjs`'s former blanket `OWED_ELSEWHERE.conflicted` refusal assumed THIS file
+    // owned re-attempting it — a ping-pong with no owner. Known-base DIRTY PRs now dispatch bounded repairs.
+    // Confirmed live: `web-everything/web-everything#2793` sat exactly here
     // (`review:pending` + `review-round:2` + `merge-status:conflicting`, `mergeable: CONFLICTING`, no
     // `review:changes`) — the finding that once bounced it to `review:changes` had already been rearmed
     // (`review:changes → review:pending`) by a completed mechanical conflict-fix round that did not actually

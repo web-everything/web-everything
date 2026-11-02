@@ -2,7 +2,8 @@
  * @file scripts/conveyor/health-smells/pr-no-owner.mjs
  * @description Landing-freeze fix, web-everything/web-everything#2793 (2026-09-27) — a PR with NO live session, whose
  * fix-dispatch daemon's OWN planner keeps refusing it with a reason that means "someone else owns this"
- * (`reconcile-refused owed-elsewhere` — `reconcile-core.mjs`'s `OWED_ELSEWHERE.conflicted` — or
+ * (`reconcile-refused owed-elsewhere` — residual `OWED_ELSEWHERE.conflicted` states such as an unknown base;
+ * known-base DIRTY conflicts now dispatch bounded repairs in `reconcile-core.mjs` — or
  * `refused missing-run-cap-exhausted` — `ci-red-recovery-watch.mjs`'s missing-run pass giving up and handing off
  * to "a human/ci-heal look"), with nothing else ever actually picking it up. Both refusal kinds are, BY THEIR OWN
  * DESIGN, an explicit "not my job, ask elsewhere" — never a correct terminal no-op like `nothing-owed` or

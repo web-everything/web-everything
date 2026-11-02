@@ -2549,10 +2549,10 @@ describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose ba
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'cap-exhausted', cap: 1, capKind: 'stacked-rebase' })]);
   });
 
-  it('REGRESSION — a `conflicted` PR whose base IS `main` (or unknown) is UNCHANGED: still `owed-elsewhere`', () => {
+  it('REGRESSION — a DIRTY main-base PR dispatches conflicting-rebase; an unknown base stays refused', () => {
     const planMainBase = planReconcile({ prs: [prStacked({ baseRefName: 'main' })], agents: [], now: NOW });
-    expect(planMainBase.dispatch).toHaveLength(0);
-    expect(planMainBase.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', prNumber: 2578 })]);
+    expect(planMainBase.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'conflicting-rebase', isConflict: true, prNumber: 2578 })]);
+    expect(planMainBase.refusals).toEqual([]);
 
     const planNoBase = planReconcile({ prs: [prStacked({ baseRefName: undefined })], agents: [], now: NOW });
     expect(planNoBase.dispatch).toHaveLength(0);
@@ -2565,14 +2565,14 @@ describe('case 5i — STACKED-BASE CONFLICT dispatch, a `conflicted` PR whose ba
     // no special-casing was needed for this transition.
     const retargeted = prStacked({ baseRefName: 'main' });
     const plan = planReconcile({ prs: [retargeted], agents: [], now: NOW });
-    expect(plan.dispatch).toHaveLength(0);
-    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', why: 'the branch needs a rebase before it can merge' })]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'conflicting-rebase', isConflict: true })]);
+    expect(plan.refusals).toEqual([]);
   });
 
   it('a caller-supplied `defaultBranch` overrides `main` — a PR based on the repo\'s ACTUAL default is not "stacked"', () => {
     const plan = planReconcile({ prs: [prStacked({ baseRefName: 'trunk' })], agents: [], now: NOW, defaultBranch: 'trunk' });
-    expect(plan.dispatch).toHaveLength(0);
-    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-elsewhere', prNumber: 2578 })]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'conflicting-rebase', isConflict: true, prNumber: 2578 })]);
+    expect(plan.refusals).toEqual([]);
   });
 
   it('never fires for a non-`conflicted` phase — a stacked, BOUNCED PR is handled by the existing conflict-fix branch instead', () => {
@@ -4654,7 +4654,7 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
 });
 
 
-describe('CONFLICTING mergeability outside DIRTY still owes a mechanical rebase', () => {
+describe('main-base conflicts owe a bounded mechanical rebase', () => {
   const mainSha = 'b'.repeat(40);
   const pr = (over = {}) => pr1563({ baseRefName: 'main', labels: lbl('review:accepted', 'ready-to-merge'),
     mergeStateStatus: 'BLOCKED', mergeable: 'CONFLICTING', comments: [], ...over });
@@ -4662,7 +4662,7 @@ describe('CONFLICTING mergeability outside DIRTY still owes a mechanical rebase'
   const roundAt = sha => ({ author: AUTOMATION,
     body: `${CONFLICT_FIX_COMMENT_MARKER}\n<!-- conveyor-conflict-fix-target: main@${sha} -->` });
 
-  it.each(['BLOCKED', 'UNKNOWN'])('dispatches queued CONFLICTING + %s as conflicting-rebase', mergeStateStatus => {
+  it.each(['BLOCKED', 'UNKNOWN', 'DIRTY'])('dispatches CONFLICTING + %s as conflicting-rebase', mergeStateStatus => {
     const result = plan({ mergeStateStatus });
     expect(result.refusals).toEqual([]);
     expect(result.dispatch).toMatchObject([{ phase: 'conflicted', kind: 'fix', isConflict: true,
@@ -4681,25 +4681,25 @@ describe('CONFLICTING mergeability outside DIRTY still owes a mechanical rebase'
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ phase: 'queued', kind: 'nothing-owed' }]);
   });
-  it.each(['DIRTY', 'BEHIND'])('leaves existing %s main-base conflicts owed to the drain', mergeStateStatus => {
-    const result = plan({ mergeStateStatus });
+  it('leaves BEHIND main-base conflicts owed elsewhere', () => {
+    const result = plan({ mergeStateStatus: 'BEHIND' });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ phase: 'conflicted', kind: 'owed-elsewhere' }]);
   });
-  it('counts repairs against the current main SHA toward the conflict cap', () => {
-    const result = plan({ comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => roundAt(mainSha)) });
+  it.each(['BLOCKED', 'DIRTY'])('counts repairs against the current main SHA toward the conflict cap (%s)', mergeStateStatus => {
+    const result = plan({ mergeStateStatus, comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => roundAt(mainSha)) });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'conflicting-rebase',
       attempts: CONFLICT_FIX_ROUND_CAP, cap: CONFLICT_FIX_ROUND_CAP }]);
     expect(result.refusals[0].why).toContain('a person must take it');
   });
-  it('does not spend the current-target cap on repairs against older main tips', () => {
-    const result = plan({ comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => roundAt('a'.repeat(40))) });
+  it.each(['BLOCKED', 'DIRTY'])('does not spend the current-target cap on repairs against older main tips (%s)', mergeStateStatus => {
+    const result = plan({ mergeStateStatus, comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => roundAt('a'.repeat(40))) });
     expect(result.refusals).toEqual([]);
     expect(result.dispatch).toMatchObject([{ mode: 'conflicting-rebase', attempts: 0 }]);
   });
-  it('enforces the absolute ceiling even when every repair targeted an older tip', () => {
-    const result = plan({ comments: Array.from({ length: CONFLICT_FIX_ABSOLUTE_CEILING }, () => roundAt('a'.repeat(40))) });
+  it.each(['BLOCKED', 'DIRTY'])('enforces the absolute ceiling even when every repair targeted an older tip (%s)', mergeStateStatus => {
+    const result = plan({ mergeStateStatus, comments: Array.from({ length: CONFLICT_FIX_ABSOLUTE_CEILING }, () => roundAt('a'.repeat(40))) });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'conflicting-rebase', attempts: 0 }]);
     expect(result.refusals[0].why).toContain('a person must take it');
@@ -4712,9 +4712,11 @@ describe('CONFLICTING mergeability outside DIRTY still owes a mechanical rebase'
     ['referral', { referralHold: { why: 'waiting for referral' } }, 'review-referrals-pending'],
     ['scope', { scopeBloat: { why: 'oversized diff' } }, 'scope-bloat'],
   ])('preserves the %s hold before mechanical dispatch', (_name, over, kind) => {
-    const result = plan(over);
-    expect(result.dispatch).toEqual([]);
-    expect(result.refusals).toMatchObject([{ kind }]);
+    for (const mergeStateStatus of ['BLOCKED', 'DIRTY']) {
+      const result = plan({ ...over, mergeStateStatus });
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toMatchObject([{ kind }]);
+    }
   });
   it('carries fetched mergeable through discovery enrichment into the planner', () => {
     const { exec } = spyExec(JSON.stringify([pr()]));
