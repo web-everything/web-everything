@@ -38,14 +38,15 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     }
     return rel;
   };
-  const out = new Set(DAEMON_ENTRY_MODULES);
-  for (const entry of entries) {
+  const out = new Set();
+  const add = entry => {
     const rel = inside(resolve(realRoot, entry));
     if (!rel) throw new Error('runtime entry outside clone');
     out.add(rel);
-  }
+  };
+  for (const entry of [...DAEMON_ENTRY_MODULES, ...entries]) add(entry);
   for (const name of readdirSync(launchAgentsDir).sort()) {
-    if (!/^com\.(we|plateau|webeverything)\..+\.plist$/.test(name)) continue;
+    if (!name.endsWith('.plist')) continue;
     const result = run('plutil', ['-convert', 'json', '-o', '-', '--', join(launchAgentsDir, name)], {
       encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
     });
@@ -57,6 +58,8 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     }
     // Fail closed on launchd inputs that can run code this scan cannot see.
     const refuse = why => { throw new Error(`LaunchAgents unsupported dynamic execution refused: ${name}: ${why}`); };
+    if (typeof plist.WorkingDirectory !== 'string' || !isAbsolute(plist.WorkingDirectory)
+      || canonicalArgument(plist.WorkingDirectory) !== realRoot) refuse('WorkingDirectory must be the clone root');
     if (plist.Program !== undefined && plist.Program !== args[0]) refuse('Program differs from ProgramArguments[0]');
     if (plist.EnvironmentVariables && Object.keys(plist.EnvironmentVariables).some(key => /^NODE_/.test(key))) {
       refuse('NODE_* environment variable');
@@ -78,6 +81,12 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
           && [path, rel].some(entry => !['.mjs', '.js'].includes(extname(entry)))) {
           throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
         }
+        // Node's first positional token is a script even when it has no extension
+        // or is missing. Never use existence to decide whether that token is code.
+        if (!scriptSeen && index >= (args[0] === '/usr/bin/env' ? 2 : 1)
+          && !isAbsolute(arg)) {
+          throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
+        }
       }
       // Allowlist, not denylist: before the script, only these inert node flags are accepted.
       if (!scriptSeen && index >= (args[0] === '/usr/bin/env' ? 2 : 1) && arg.startsWith('-')
@@ -94,13 +103,13 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
       }
     }
     const paths = args.filter(isAbsolute).map(inside).filter(Boolean);
-    for (const path of paths) out.add(path);
+    for (const path of paths) add(path);
     if (paths.some(path => basename(path) === 'pass-daemon.mjs')) {
       const passes = args.filter(arg => arg.startsWith('--pass='));
       const pass = passes.length === 1 ? passes[0].slice('--pass='.length) : null;
       const script = Object.hasOwn(DAEMON_MANIFEST, pass) && DAEMON_MANIFEST[pass].script;
       if (!script) throw new Error(`LaunchAgents pass unknown: ${name}`);
-      out.add(script);
+      add(script);
     }
   }
   return [...out];

@@ -604,11 +604,16 @@ describe('isReviewCodePath (#4387)', () => {
       'scripts/backlog/frontmatter.mjs', 'scripts/lib/card-number-allocator.mjs',
     ].every(isReviewCodePath)).toBe(true);
   });
-  it('rejects unrelated code, backlog cards, nested dirs, and non-strings', () => {
+  it('rejects unrelated code, backlog cards, nested dirs, and non-strings when the closure is complete', () => {
+    const closure = { complete: true, files: new Set(), bareDeps: false, jsonNames: new Set() };
     expect([
       'scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/4387-review.md',
       'scripts/lib/__tests__/review-core.test.mjs', 'docs/review/x.mjs', '', null, undefined,
-    ].some(isReviewCodePath)).toBe(false);
+    ].some(path => isReviewCodePath(path, { closure }))).toBe(false);
+  });
+  it('keeps unrelated code relevant when the real sandbox graph has unwalked CommonJS dependencies', () => {
+    expect(isReviewCodePath('scripts/lane-pool.mjs')).toBe(true);
+    expect(isReviewCodePath('backlog/4387-review.md')).toBe(false);
   });
   // PR #2916 review: the dispatcher's own direct imports (provider routing, session isolation, the gh shim in
   // dispatch-lane-io) were left off the path, so a clone behind only in those files dispatched with stale

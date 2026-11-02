@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, statSync } from 'node:fs';
-import { dirname, resolve as resolvePath, relative, isAbsolute, basename } from 'node:path';
+import { dirname, resolve as resolvePath, relative, isAbsolute, basename, extname } from 'node:path';
 
 const IMPORT_SPEC_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\1/g;
 const JSON_LITERAL_RE = /['"`]([^'"`\n]*\.json)['"`]/g;
@@ -28,8 +28,9 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * NON-literal dynamic `import(expr)` in code (its target can't be known statically) — the caller then falls back
  * to "any code file changed". `bareDeps` = some file imports a package (a `package*.json` change is relevant).
  * `jsonNames` = basenames of `.json` string literals in closure files (a config read at runtime by name).
- * A missing entry returns `null`; a read failure marks the closure incomplete. Both use the caller's
- * conservative fallback, even when other entries are readable.
+ * CommonJS files, require/createRequire references and Unicode escapes are also incomplete:
+ * this walker does not prove their dependencies. A missing entry returns `null`; a read failure marks
+ * the closure incomplete. Both use the caller's conservative fallback, even when other entries are readable.
  * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
  * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
  * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map}} o
@@ -67,6 +68,10 @@ export function collectImportClosure({
       let src;
       try { src = readFile(file); } catch { info.complete = false; }
       if (src !== undefined) {
+        // This walker only proves ESM edges. CommonJS, createRequire (including
+        // aliases), and escaped source need a different proof. Conservatively
+        // include comments/strings too; this is no claim of a general JS grammar.
+        if (extname(file) === '.cjs' || /\b(?:require|createRequire)\b|\\u/.test(src)) info.complete = false;
         for (const m of src.matchAll(IMPORT_SPEC_RE)) {
           const spec = m[2];
           if (spec.startsWith('./') || spec.startsWith('../')) {

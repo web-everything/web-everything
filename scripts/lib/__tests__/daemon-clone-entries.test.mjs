@@ -1,11 +1,16 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
-import { collectRunClosure, decideSkipRebuild } from '../daemon-rebuild/skip-unrelated.mjs';
+import { collectRunClosure, decideSkipRebuild, makeSkipCheck } from '../daemon-rebuild/skip-unrelated.mjs';
+import { decideRestart } from '../daemon-self-sync.mjs';
+import { checkCodeUnchanged } from '../daemon-live-smoke.mjs';
+import { loadReadOnlyOps } from '../read-only-ops.mjs';
+import * as importClosureModule from '../import-closure.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -17,6 +22,171 @@ function fixture() {
   mkdirSync(root); mkdirSync(launchAgentsDir);
   return { dir, root, launchAgentsDir };
 }
+const plistJSON = (f, plist) => JSON.stringify({ WorkingDirectory: f.root, ...plist });
+
+it('keeps clone discovery unwired pending inert-source proof', () => {
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const references = [];
+  const visit = directory => {
+    for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
+      const path = `${directory}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!['__tests__', 'soak', 'node_modules'].includes(entry.name)) visit(path);
+      } else if (entry.isFile() && /\.[cm]?[jt]s$/.test(path) && !/\.(test|spec)\./.test(path)
+        && path !== 'scripts/lib/daemon-clone-entries.mjs') {
+        if (/daemon-clone-entries|\bcloneRuntimeEntries\b/.test(readFileSync(join(root, path), 'utf8'))) references.push(path);
+      }
+    }
+  };
+  visit('scripts'); visit('skills-src');
+  expect(references).toEqual([]);
+});
+
+it.each(['collectRunClosure', 'makeSkipCheck', 'decideRestart', 'checkCodeUnchanged', 'loadReadOnlyOps',
+  'isReviewCodePath', 'isPromoteCodePath', 'isFixCodePath'])(
+  'missing runtime roots remain unknown at every closure consumer: %s', async consumer => {
+    const { root } = fixture();
+    writeFileSync(join(root, 'readable.mjs'), 'export {};');
+    const entries = ['readable.mjs', 'missing.mjs'];
+    const changedFiles = ['scripts/unrelated.mjs'];
+    const closure = collectImportClosure({ root, entries });
+    expect(closure).toBeNull();
+    if (consumer === 'collectRunClosure') {
+      const graph = collectRunClosure({ root, entries, byName: () => [] });
+      expect(graph).toBeNull();
+      expect(decideSkipRebuild({ closure: graph, changedFiles }).skip).toBe(false);
+    } else if (consumer === 'makeSkipCheck') {
+      expect(makeSkipCheck({ root, entries, surface: () => [],
+        env: { WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' } })(changedFiles).skip).toBe(false);
+    } else if (consumer === 'decideRestart') {
+      expect(decideRestart({ closure, changedFiles, uptimeMs: 100, minIntervalMs: 0 }).restart).toBe(true);
+    } else if (consumer === 'checkCodeUnchanged') {
+      expect(checkCodeUnchanged({ root, check: { codeEntries: entries }, changedFiles })).toBe(false);
+    } else if (consumer === 'loadReadOnlyOps') {
+      // This consumer scans trusted code, never the proposed checkout. Feed the actual
+      // missing-sibling result through that boundary and prove it reached the collector.
+      const spy = vi.spyOn(importClosureModule, 'collectImportClosure').mockReturnValue(closure);
+      const options = {
+        importModule: async () => ({ OPERATIONS: { 'heavy-queue': {} },
+          resolveOperation: async () => ({ declaration: { steps: [{ step: { kind: 'compute' } }] } }) }),
+        lstat: () => ({ isFile: () => true, size: 1 }), readFile: () => Buffer.from('x'),
+      };
+      try {
+        expect(await loadReadOnlyOps(root, options)).toEqual(new Set());
+        expect(spy).toHaveBeenCalledOnce();
+        spy.mockReturnValue({ complete: true, files: new Set(['readable.mjs']), jsonNames: new Set() });
+        expect(await loadReadOnlyOps(root, options)).toEqual(new Set(['heavy-queue']));
+      } finally { spy.mockRestore(); }
+    } else {
+      const modules = {
+        isReviewCodePath: '../../operations/review-dispatch.mjs',
+        isPromoteCodePath: '../../operations/promote-draft-pr-dispatch.mjs',
+        isFixCodePath: '../../conveyor/reconcile-fix-dispatch.mjs',
+      };
+      const classify = (await import(modules[consumer]))[consumer];
+      expect(classify(changedFiles[0], { closure })).toBe(true);
+      expect(classify(changedFiles[0], { closure: collectImportClosure({ root, entries: ['readable.mjs'] }) })).toBe(false);
+    }
+  });
+
+it.each(['absent', 'relative', 'subdirectory', 'external', 'malformed'])(
+  'refuses an absolute entry with unsupported WorkingDirectory=%s', cwd => {
+    const f = fixture();
+    const WorkingDirectory = { relative: '.', subdirectory: join(f.root, 'scripts'), external: f.dir, malformed: 42 }[cwd];
+    writeFileSync(join(f.launchAgentsDir, 'com.we.cwd.plist'), 'plist');
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: JSON.stringify({
+      WorkingDirectory, ProgramArguments: ['node', join(f.root, 'worker.mjs')],
+    }) }) })).toThrow('WorkingDirectory must be the clone root');
+  });
+
+it('permits a WorkingDirectory alias of the clone root', () => {
+  const f = fixture();
+  const alias = join(f.dir, 'alias');
+  symlinkSync(f.root, alias);
+  writeFileSync(join(f.launchAgentsDir, 'com.we.cwd.plist'), 'plist');
+  expect(cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
+    WorkingDirectory: alias, ProgramArguments: ['node', join(alias, 'worker.mjs')],
+  }) }) })).toContain('worker.mjs');
+});
+
+it.each(['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock',
+  'bun.lock', 'bun.lockb', 'scripts/daemon-rebuild-settings.json', '.npmrc', '.node-version',
+  '.nvmrc', 'skills-src/conveyor/prompt.md', '.claude/settings.json', 'config/runtime.json'])(
+  'retains conservative treatment for non-source runtime inputs: %s', path => {
+    const { root } = fixture();
+    writeFileSync(join(root, 'entry.mjs'), "export const dataFile = 'runtime.json';");
+    const closure = collectImportClosure({ root, entries: ['entry.mjs'] });
+    expect(closure.complete).toBe(true);
+    expect(decideSkipRebuild({ closure, changedFiles: [path] }).skip).toBe(false);
+    expect(decideSkipRebuild({ closure, changedFiles: ['docs/a.md'] }).skip).toBe(true);
+  });
+
+it.each([false, true])('missing hop-zero roots are incomplete (stopWhenIncomplete=%s)', stopWhenIncomplete => {
+  const { root } = fixture();
+  writeFileSync(join(root, 'readable.mjs'), 'export {};');
+  const options = { root, entries: ['readable.mjs', 'missing.mjs'], byName: () => [], stopWhenIncomplete };
+  const closure = collectRunClosure(options);
+  expect(closure).toBeNull();
+  expect(decideSkipRebuild({ closure, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(false);
+  expect(decideSkipRebuild({ closure, changedFiles: ['docs/a.md'] }).skip).toBe(true);
+  writeFileSync(join(root, 'missing.mjs'), 'export {};');
+  expect(collectRunClosure(options).complete).toBe(true);
+});
+
+it.each(['js', 'mjs', 'cjs'])('a changed required dependency remains relevant: %s', extension => {
+  const f = fixture();
+  const { root } = f;
+  for (const entry of DAEMON_ENTRY_MODULES) {
+    mkdirSync(dirname(join(root, entry)), { recursive: true });
+    writeFileSync(join(root, entry), 'export {};');
+  }
+  for (const source of ["require('./dep.js');", "const load = require; load('./dep.js');",
+    "import { createRequire as make } from 'node:module'; const load = make(import.meta.url); load('./dep.js');",
+    String.raw`const load = requ\u0069re; load('./dep.js');`]) {
+    writeFileSync(join(root, `worker.${extension}`), source);
+    writeFileSync(join(root, 'dep.js'), 'module.exports = 1;');
+    for (const mode of ['entry', 'imported', 'spawned', ...(extension === 'cjs' ? [] : ['discovered', 'LaunchAgent'])]) {
+      writeFileSync(join(root, 'entry.mjs'), mode === 'imported'
+        ? `import './worker.${extension}';` : `spawn(process.execPath, ['./worker.${extension}']);`);
+      let entries = mode === 'discovered' ? cloneRuntimeEntries({ ...f, entries: [`worker.${extension}`] })
+        : [mode === 'entry' ? `worker.${extension}` : 'entry.mjs'];
+      if (mode === 'LaunchAgent') {
+        const plist = join(f.launchAgentsDir, 'org.example.worker.plist');
+        writeFileSync(plist, 'plist');
+        entries = cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
+          ProgramArguments: ['node', join(root, `worker.${extension}`)],
+        }) }) });
+        rmSync(plist);
+      }
+      const closure = mode === 'spawned' ? collectRunClosure({ root, entries, byName: () => [] })
+        : collectImportClosure({ root, entries });
+      const hits = closureHits({ closure, changedFiles: ['dep.js'] });
+      expect(hits === null || hits.includes('dep.js')).toBe(true);
+    }
+  }
+});
+
+it.each(['boot entry', 'mapped pass'])('refuses CommonJS targets for default boot and manifest-mapped roots: %s', source => {
+  const f = fixture();
+  const entry = source === 'boot entry' ? DAEMON_ENTRY_MODULES[0] : 'scripts/conveyor/branch-drift.mjs';
+  mkdirSync(dirname(join(f.root, entry)), { recursive: true });
+  writeFileSync(join(f.root, 'worker.cjs'), "require('./dep.js');");
+  symlinkSync(join(f.root, 'worker.cjs'), join(f.root, entry));
+  if (source === 'mapped pass') writeFileSync(join(f.launchAgentsDir, 'com.we.pass.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
+    ProgramArguments: ['node', join(f.root, 'skills-src/conveyor/pass-daemon.mjs'), '--pass=branch-drift'],
+  }) }) })).toThrow('CommonJS runtime entry unsupported');
+});
+
+it.each(['absent', 'clone', 'subdirectory', 'external'])(
+  'refuses a missing bare Node entry with WorkingDirectory=%s', cwd => {
+    const f = fixture();
+    writeFileSync(join(f.launchAgentsDir, 'com.we.bare.plist'), 'plist');
+    const WorkingDirectory = { clone: f.root, subdirectory: join(f.root, 'scripts'), external: f.dir }[cwd];
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: JSON.stringify({
+      WorkingDirectory, ProgramArguments: ['node', 'runner'],
+    }) }) })).toThrow();
+  });
 
 it.each([
   [1, false], [1, true], [2, false], [2, true],
@@ -81,7 +251,7 @@ it.each(['caller', 'LaunchAgent', 'mapped pass', 'boot entry', 'dangling caller 
     }
     if (args) writeFileSync(join(f.launchAgentsDir, 'com.we.missing.plist'), 'plist');
     const runtimeEntries = cloneRuntimeEntries({ ...f, entries,
-      run: () => ({ status: 0, stdout: JSON.stringify({ ProgramArguments: args }) }),
+      run: () => ({ status: 0, stdout: plistJSON(f, { ProgramArguments: args }) }),
     });
     expect(runtimeEntries).toContain(missing);
     const closure = collectImportClosure({ root: f.root, entries: runtimeEntries });
@@ -117,19 +287,19 @@ it('unions clone-realpath LaunchAgents, mapped passes, caller entries and boot e
     'com.we.drain.plist': ['/usr/bin/node', join(real, 'scripts/drain.mjs')],
     'com.plateau.pass.plist': ['/usr/bin/node', join(real, 'skills-src/conveyor/pass-daemon.mjs'), '--pass=branch-drift'],
     'com.webeverything.other.plist': ['/usr/bin/node', `${real}-other/foreign.mjs`],
-    'org.other.plist': ['/usr/bin/node', join(real, 'ignored.mjs')],
+    'org.other.plist': ['/usr/bin/node', join(real, 'other-label.mjs')],
   };
   for (const name of Object.keys(programs)) writeFileSync(join(f.launchAgentsDir, name), 'plist');
   const calls = [];
   const result = cloneRuntimeEntries({ ...f, root: alias, entries: ['scripts/caller.mjs', 'scripts/drain.mjs'],
     run(bin, args, opts) {
       calls.push([bin, args, opts]);
-      return { status: 0, stdout: JSON.stringify({ ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) };
+      return { status: 0, stdout: plistJSON(f, { ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) };
     },
   });
   expect(new Set(result)).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'scripts/drain.mjs',
-    'skills-src/conveyor/pass-daemon.mjs', 'scripts/conveyor/branch-drift.mjs', 'scripts/caller.mjs']));
-  expect(calls).toHaveLength(3);
+    'skills-src/conveyor/pass-daemon.mjs', 'scripts/conveyor/branch-drift.mjs', 'scripts/caller.mjs', 'other-label.mjs']));
+  expect(calls).toHaveLength(4);
   expect(calls[0][0]).toBe('plutil');
   expect(calls[0][1].slice(0, 5)).toEqual(['-convert', 'json', '-o', '-', '--']);
   expect(calls[0][2].timeout).toBeGreaterThan(0);
@@ -161,7 +331,7 @@ it('discovers aliased LaunchAgent and caller entries and mapped passes while exc
   };
   for (const name of Object.keys(programs)) writeFileSync(join(f.launchAgentsDir, name), 'plist');
   const run = (_bin, args) => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) });
+    stdout: plistJSON(f, { ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) });
   for (const root of [f.root, alias]) {
     expect(new Set(cloneRuntimeEntries({ ...f, root, run })))
       .toEqual(new Set([...DAEMON_ENTRY_MODULES, 'scripts/worker.mjs',
@@ -184,7 +354,7 @@ it('discovers entries in the supplied environment HOME without changing the proc
   const result = cloneRuntimeEntries({ root: f.root, env: { HOME: home },
     run(bin, args) {
       calls.push(args.at(-1));
-      return { status: 0, stdout: JSON.stringify({
+      return { status: 0, stdout: plistJSON(f, {
         ProgramArguments: ['node', join(realpathSync(f.root), 'isolated.mjs')],
       }) };
     },
@@ -199,7 +369,7 @@ it('fails closed on a cyclic LaunchAgent path instead of silently omitting it', 
   symlinkSync('cycle', join(f.root, 'cycle'));
   writeFileSync(join(f.launchAgentsDir, 'com.we.cycle.plist'), 'plist');
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, 'cycle/worker.mjs')] }),
+    stdout: plistJSON(f, { ProgramArguments: ['node', join(f.root, 'cycle/worker.mjs')] }),
   }) })).toThrow();
 });
 
@@ -225,7 +395,7 @@ it('refuses an unknown pass for this clone', () => {
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.pass.plist'), 'plist');
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['node', join(realpathSync(f.root), 'skills-src/conveyor/pass-daemon.mjs'), '--pass=unknown'] }),
+    stdout: plistJSON(f, { ProgramArguments: ['node', join(realpathSync(f.root), 'skills-src/conveyor/pass-daemon.mjs'), '--pass=unknown'] }),
   }) })).toThrow();
 });
 
@@ -235,7 +405,7 @@ it.each([{ passes: [] }, { passes: ['--pass=branch-drift', '--pass=branch-drift'
     const f = fixture();
     writeFileSync(join(f.launchAgentsDir, 'com.we.pass.plist'), 'plist');
     expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-      stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, 'skills-src/conveyor/pass-daemon.mjs'), ...passes] }),
+      stdout: plistJSON(f, { ProgramArguments: ['node', join(f.root, 'skills-src/conveyor/pass-daemon.mjs'), ...passes] }),
     }) })).toThrow('LaunchAgents pass unknown');
   });
 
@@ -243,7 +413,7 @@ it('permits Program equal to ProgramArguments[0]', () => {
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.program.plist'), 'plist');
   expect(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ Program: '/usr/bin/node', ProgramArguments: ['/usr/bin/node', join(f.root, 'worker.mjs')] }),
+    stdout: plistJSON(f, { Program: '/usr/bin/node', ProgramArguments: ['/usr/bin/node', join(f.root, 'worker.mjs')] }),
   }) })).toContain('worker.mjs');
 });
 
@@ -254,7 +424,7 @@ it.each(['--no-warnings', '--enable-source-maps', '--trace-warnings'])(
     for (const prefix of [['node'], ['/usr/bin/env', 'node']]) {
       for (const argument of ['-e', '-pe', '--eval=1']) {
         expect(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-          stdout: JSON.stringify({ ProgramArguments: [...prefix, flag, join(f.root, 'worker.mjs'), argument] }),
+          stdout: plistJSON(f, { ProgramArguments: [...prefix, flag, join(f.root, 'worker.mjs'), argument] }),
         }) })).toContain('worker.mjs');
       }
     }
@@ -279,7 +449,7 @@ it.each(['caller', 'LaunchAgent', 'relative LaunchAgent', 'aliased caller', 'ali
     const caller = source === 'caller' || source === 'aliased caller';
     if (!caller) writeFileSync(join(f.launchAgentsDir, 'com.we.cjs.plist'), 'plist');
     expect(() => cloneRuntimeEntries({ ...f, entries: caller ? [entry] : [],
-      run: () => ({ status: 0, stdout: JSON.stringify({ ProgramArguments: ['node', entry] }) }),
+      run: () => ({ status: 0, stdout: plistJSON(f, { ProgramArguments: ['node', entry] }) }),
     })).toThrow('CommonJS runtime entry unsupported');
   });
 
@@ -293,7 +463,7 @@ it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.ts', 'relative/runner', '.
     const f = fixture();
     writeFileSync(join(f.launchAgentsDir, 'com.we.relative.plist'), 'plist');
     expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', entry] }),
+      stdout: plistJSON(f, { ProgramArguments: ['/usr/bin/env', 'node', entry] }),
     }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.relative.plist: ${entry}`);
   });
 
@@ -305,7 +475,7 @@ it.each(['runner', 'daemon.mts', 'daemon.py'])('refuses an existing unsupported 
   symlinkSync(f.root, alias);
   for (const arg of [entry, join(realpathSync(f.root), entry)]) {
     expect(() => cloneRuntimeEntries({ ...f, root: alias, run: () => ({ status: 0,
-      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', arg] }),
+      stdout: plistJSON(f, { ProgramArguments: ['/usr/bin/env', 'node', arg] }),
     }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.file.plist: ${arg}`);
   }
 });
@@ -320,7 +490,7 @@ it.each([
   symlinkSync(target, arg);
   writeFileSync(join(f.launchAgentsDir, 'com.we.symlink.plist'), 'plist');
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['node', arg] }),
+    stdout: plistJSON(f, { ProgramArguments: ['node', arg] }),
   }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.symlink.plist: ${arg}`);
 });
 
@@ -328,7 +498,7 @@ it('refuses a node flag that takes a script-shaped value (then eval)', () => {
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.title.plist'), 'plist');
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--title', '/tmp/title.js', '-e', 'console.log(43)'] }),
+    stdout: plistJSON(f, { ProgramArguments: ['/usr/bin/env', 'node', '--title', '/tmp/title.js', '-e', 'console.log(43)'] }),
   }) })).toThrow('LaunchAgents unsupported entrypoint/module argument refused: com.we.title.plist: --title');
 });
 
@@ -340,7 +510,7 @@ it.each([
 ])('refuses launchd inputs that hide executable code: %j', (plist, why) => {
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.hidden.plist'), 'plist');
-  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: JSON.stringify(plist) }) }))
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, plist) }) }))
     .toThrow(`LaunchAgents unsupported dynamic execution refused: com.we.hidden.plist: ${why}`);
 });
 
@@ -349,7 +519,7 @@ it('refuses --import=./x even when its target exists in the clone', () => {
   writeFileSync(join(f.root, 'x'), 'export {};');
   writeFileSync(join(f.launchAgentsDir, 'com.we.loader.plist'), 'plist');
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['node', '--import=./x'] }),
+    stdout: plistJSON(f, { ProgramArguments: ['node', '--import=./x'] }),
   }) })).toThrow('LaunchAgents unsupported entrypoint/module argument refused: com.we.loader.plist: --import=./x');
 });
 
@@ -358,7 +528,7 @@ it('fails closed on non-ENOENT filesystem errors for a bare argument', () => {
   symlinkSync('runner', join(f.root, 'runner'));
   writeFileSync(join(f.launchAgentsDir, 'com.we.cycle.plist'), 'plist');
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['node', 'runner'] }),
+    stdout: plistJSON(f, { ProgramArguments: ['node', 'runner'] }),
   }) })).toThrow(expect.objectContaining({ code: 'ELOOP' }));
 });
 
@@ -366,9 +536,9 @@ it('R230 permits bare interpreters, option flags and numeric argument tokens', (
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
   expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--pass=x', '--pass=',
+    stdout: plistJSON(f, { ProgramArguments: ['/usr/bin/env', 'node', join(f.root, 'worker.mjs'), '--pass=x', '--pass=',
       '--repo=owner/repo', '--path=relative/file.js', '42'] }),
-  }) }))).toEqual(new Set(DAEMON_ENTRY_MODULES));
+  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs']));
 });
 
 it('permits --repo=owner/repo on a LaunchAgent with an absolute entrypoint', () => {
@@ -376,7 +546,7 @@ it('permits --repo=owner/repo on a LaunchAgent with an absolute entrypoint', () 
   writeFileSync(join(f.launchAgentsDir, 'com.we.postmortem.plist'), 'plist');
   const entry = 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs';
   expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, entry), '--repo=owner/repo', '--watch'] }),
+    stdout: plistJSON(f, { ProgramArguments: ['node', join(f.root, entry), '--repo=owner/repo', '--watch'] }),
   }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, entry]));
 });
 
@@ -385,7 +555,7 @@ it('permits node paths, absolute scripts, plain flags, pass names and numeric ar
   for (const entry of ['worker.mjs', 'worker.js']) writeFileSync(join(f.root, entry), 'export {};');
   writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
   expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '/usr/bin/node',
+    stdout: plistJSON(f, { ProgramArguments: ['/usr/bin/env', 'node', '/usr/bin/node',
       join(f.root, 'worker.mjs'), join(f.root, 'worker.js'), '-e', '--no-warnings', '--pass=NAME', '42'] }),
   }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs', 'worker.js']));
 });
@@ -397,7 +567,7 @@ it('refuses an extensionless in-clone LaunchAgent script entry instead of silent
   writeFileSync(join(f.launchAgentsDir, 'com.we.ext.plist'), 'plist');
   for (const arg of [join(realpathSync(f.root), 'scripts/some-daemon'), 'scripts/some-daemon']) {
     expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/node', arg] }),
+      stdout: plistJSON(f, { ProgramArguments: ['/usr/bin/node', arg] }),
     }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.ext.plist: ${arg}`);
   }
 });

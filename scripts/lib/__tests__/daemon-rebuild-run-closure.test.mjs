@@ -27,13 +27,14 @@ function fixture(contents) {
 }
 
 describe('collectRunClosure filesystem reads', () => {
-  it('keeps the registry reader closure complete when its child imports a base-ref copy', () => {
+  it('keeps the registry reader conservative when createRequire loads an unwalked dependency', () => {
     const root = resolve(fileURLToPath(import.meta.url), '../../../..');
     const entry = 'scripts/lib/gate-config.mjs';
     const closure = collectImportClosure({ root, entries: [entry] });
     expect(closure.files.has(entry)).toBe(true);
-    expect(closure.complete).toBe(true);
-    expect(decideSkipRebuild({ closure, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(true);
+    expect(closure.complete).toBe(false);
+    expect(decideSkipRebuild({ closure, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(false);
+    expect(decideSkipRebuild({ closure, changedFiles: ['scripts/lib/rules-loader.cjs'] }).skip).toBe(false);
     expect(decideSkipRebuild({ closure, changedFiles: [entry] }).skip).toBe(false);
   });
 

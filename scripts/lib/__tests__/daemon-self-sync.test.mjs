@@ -970,13 +970,15 @@ describe('collectImportClosure — real tmpdir', () => {
   it('an entry outside root (or missing) yields null — the caller falls back conservatively', () => {
     expect(collectImportClosure({ root: '/nonexistent-root-xyz', entries: ['/elsewhere/entry.mjs'] })).toBeNull();
   });
-  it('the real review/fix/pass daemons each have a complete closure that excludes backlog and tests', () => {
+  it('the real review/fix/pass daemons retain conservative restart decisions for CommonJS dependencies', () => {
     const root = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
     for (const entry of ['skills-src/conveyor/review-daemon.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', 'skills-src/conveyor/pass-daemon.mjs']) {
       const c = collectImportClosure({ root, entries: [entry] });
       expect(c.files.has(entry)).toBe(true);
       expect(c.files.has('scripts/lib/daemon-self-sync.mjs')).toBe(true);
-      expect(c.complete).toBe(true);
+      expect(c.complete).toBe(false);
+      expect(decideRestart({ closure: c, changedFiles: ['scripts/lib/under-test.cjs'], uptimeMs: 100, minIntervalMs: 0 }).restart).toBe(true);
+      expect(decideRestart({ closure: c, changedFiles: ['backlog/card.md'], uptimeMs: 100, minIntervalMs: 0 }).restart).toBe(false);
       expect([...c.files].some((f) => f.startsWith('backlog/') || f.includes('__tests__/'))).toBe(false);
     }
   });
