@@ -154,3 +154,62 @@ export function observeRoundCap({ pr, repo = null, state = null, subject = {}, e
     return { skipped: 'error', error };
   }
 }
+
+/** Observe structured round evidence only; STOP is logged, never enforced. `io` is a hermetic test seam. */
+export async function observeBreakClassStop({ pr, head, env = process.env, now = Date.now(), dir,
+  log = line => console.error(line), threshold = 3, ledgerDir: inputDir, io = {} } = {}) {
+  let outDir, fs, record;
+  const report = message => {
+    try { log(message); }
+    catch (error) { return String(error?.message ?? error); }
+    return null;
+  };
+  try {
+    const [nativeFs, ledger, judge, crypto] = await Promise.all([
+      import('node:fs'), import('../lib/round-ledger.mjs'), import('../lib/break-class-stop.mjs'), import('node:crypto'),
+    ]);
+    fs = { ...nativeFs, ...io };
+    outDir = dir ?? roundJudgeDir(env);
+    record = { ts: new Date(now).toISOString(), pr, head, inputDigest: null,
+      verdict: 'UNKNOWN', consecutive: 0, newClasses: [], malformed: 0, reason: 'observer error', newHead: true, shadow: true };
+    const path = join(outDir, 'break-class-stop.jsonl');
+    let history = '';
+    try { history = fs.readFileSync(path, 'utf8'); }
+    catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    const prior = history.split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
+      .filter(row => row.pr === pr && row.head === head);
+    record.newHead = prior.length === 0;
+    const slice = (io.readSlice ?? ledger.readSlice)(inputDir ?? ledger.ledgerDir(env), pr, fs);
+    const canonical = value => {
+      if (Array.isArray(value)) return value.map(canonical);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+      return value;
+    };
+    record.inputDigest = crypto.createHash('sha256').update(JSON.stringify(canonical({ records: slice.records,
+      malformed: slice.malformed, complete: slice.complete, threshold }))).digest('hex');
+    const duplicate = prior.find(row => row.inputDigest === record.inputDigest);
+    if (duplicate) return { skipped: 'deduped', verdict: prior.some(row => row.verdict === 'STOP') ? 'STOP' : duplicate.verdict };
+    Object.assign(record, (io.classify ?? judge.classify)(slice.records, { malformed: slice.malformed, complete: slice.complete, threshold }));
+    if (prior.some(row => row.verdict === 'STOP')) record.verdict = 'STOP';
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.appendFileSync(path, `${JSON.stringify(record)}\n`);
+    if (record.verdict === 'STOP') log(`round-stop (shadow): #${pr} would STOP at round ${slice.records.length} ${record.reason}`);
+    return record;
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    record = { ...record, ts: record?.ts ?? new Date().toISOString(), pr, head,
+      inputDigest: record?.inputDigest ?? null, verdict: 'UNKNOWN', consecutive: 0, newClasses: [],
+      malformed: record?.malformed ?? 0, reason: `observer error: ${message}`, error: message,
+      newHead: record?.newHead ?? true, shadow: true };
+    try {
+      if (!fs || !outDir) throw new Error('observer output unavailable');
+      fs.mkdirSync(outDir, { recursive: true });
+      fs.appendFileSync(join(outDir, 'break-class-stop.jsonl'), `${JSON.stringify(record)}\n`);
+      return record;
+    } catch (writeError) {
+      const failure = `${message}; UNKNOWN append failed: ${String(writeError?.message ?? writeError)}`;
+      const logError = report(`round-stop (shadow): #${pr} UNKNOWN: ${failure}`);
+      return { verdict: 'UNKNOWN', error: failure, ...(logError ? { logError } : {}) };
+    }
+  }
+}
