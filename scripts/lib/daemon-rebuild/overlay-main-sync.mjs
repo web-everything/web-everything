@@ -102,7 +102,7 @@ function readSyncState(file, io = fs) {
   // is authoritative, so its cooldowns and retry stops are never bypassed. The next write lands in the new file.
   const legacyFile = file.replace(/\.state$/, '.json');
   const mtime = path => { try { return io.statSync(path).mtimeMs; } catch (error) { if (error.code === 'ENOENT') return -1; throw error; } };
-  const source = mtime(legacyFile) > mtime(file) ? legacyFile : file;
+  const source = mtime(legacyFile) >= mtime(file) && mtime(legacyFile) >= 0 ? legacyFile : file;
   // Both files are fully validated: a corrupt or invalid one fails closed whichever is newer.
   const load = path => {
     let raw;
@@ -161,7 +161,8 @@ function transaction(file, fn, io = fs) {
   // The shared fence covers the entire callback, including read and rename. Even an
   // expired holder cannot resume a write after a successor has acquired the fence.
   for (let attempt = 0; attempt < 100; attempt++) {
-    const lease = tryLease({ path: `${file}.lock`, owner: { pid: process.pid, host: hostname() },
+    const lease = tryLease({ path: `${file.replace(/\.state$/, '.json')}.lock`, // pre-rename lock name: old and new workers share it
+      owner: { pid: process.pid, host: hostname() },
       staleMs: 30_000, fs: io });
     if (!lease.ok) { Atomics.wait(transactionWait, 0, 0, 10); continue; }
     try {

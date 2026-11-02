@@ -1644,4 +1644,16 @@ describe('R372 genuine merge conflict stops retrying', () => {
       tick(f, { spawnFn });
       expect(spawnFn).not.toHaveBeenCalled();
     });
+  it('state transactions use the pre-rename lock, and on equal mtimes the legacy file wins', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    const legacy = `${overlayFilePath(f.root, f.env)}.main-sync.json`;
+    expect(fs.existsSync(`${sidecar(f)}.lock`)).toBe(false);
+    fs.writeFileSync(legacy, JSON.stringify({ lastSyncedMain: {}, pushRetryMain: { [ref]: f.mainSha }, pushRetryAfter: { [ref]: Date.now() + 600_000 } }));
+    const t = new Date(); fs.utimesSync(legacy, t, t); fs.utimesSync(sidecar(f), t, t);
+    moveRefTip(f);
+    const spawnFn = spawner();
+    tick(f, { spawnFn });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
 });
