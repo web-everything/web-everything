@@ -58,6 +58,22 @@ describe('canonicalRepoSlug', () => {
     expect(canonicalRepoSlug('someone/else')).toBe('someone/else');
     expect(canonicalRepoSlug(undefined)).toBeUndefined();
   });
+  it.each([
+    'chalbert/unknown-repository',
+    'chalbert/unknown-repository.git',
+    'someone/web-everything',
+  ])('does not alias an unlisted owner/repository pair: %s', slug => {
+    expect(canonicalRepoSlug(slug)).toBe(slug);
+  });
+  it.each([
+    [' \tChalbert/Web-Everything\r\n', NEW_REPO],
+    [' \tWeb-Everything/Web-Everything\r\n', NEW_REPO],
+    [' \tChalbert/Unknown-Repository\r\n', 'chalbert/unknown-repository'],
+    [' \tSomeone/Else\r\n', 'someone/else'],
+    [' \t\r\n', ''],
+  ])('trims and lower-cases %j without widening alias membership', (slug, expected) => {
+    expect(canonicalRepoSlug(slug)).toBe(expected);
+  });
 });
 
 describe('operator ruling repo spelling (#6170)', () => {
