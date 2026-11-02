@@ -419,6 +419,20 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(result.openKeys).toContain(key);
     expect(result.lines.join('\n')).not.toContain('NEEDS-YOU-CLEARED');
   });
+  it('a malformed confirmed finding inside a carried-verdict wrapper is not a clean pass', async () => {
+    const [res] = gateComments({ broken: true }), bad = res.body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ');
+    const from = 'c'.repeat(40), carried = `<!-- review-verdict-carried from=${from} to=${head} patch-id=${'d'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${bad}`;
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [{ ...res, body: carried }]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).not.toBe('needs-you');
+  });
+  it('a needs-your-merge row (never live-read) cannot retire an open confirmed-break alert', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#9@${head}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [], needsYourMerge: [{ repo: 'r', number: 9, head, title: 't' }] }),
+      gh: async () => '[[]]', settings, env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });

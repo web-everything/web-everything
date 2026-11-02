@@ -9,7 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
-import { GATE_OUTCOMES, liveResultGateState, parseRedTeamComment, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { GATE_OUTCOMES, liveResultGateState, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
@@ -103,16 +103,28 @@ const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-
 function headlineAgrees(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   return (Array.isArray(comments) ? comments : []).every(c => {
-    const body = typeof c === 'string' ? c : c?.body;
-    const parsed = typeof body === 'string' ? parseRedTeamComment(body) : null;
-    if (!parsed || parsed.pr !== Number(pr) || parsed.rev !== live) return true;
+    const whole = typeof c === 'string' ? c : c?.body;
+    const lines = typeof whole === 'string' ? whole.replace(/\r\n/g, '\n').split('\n') : [];
+    // Every embedded result counts, carried wrappers included (liveResultGateState reads those too).
+    return lines.every((line, at) => {
+      if (!line.startsWith(RED_TEAM_COMMENT_MARKER)) return true;
+      const body = lines.slice(at).join('\n'), parsed = parseRedTeamComment(body);
+      return !parsed || parsed.pr !== Number(pr) || parsed.rev !== live || resultAgrees(body, parsed);
+    });
+  });
+}
+function resultAgrees(body, parsed) {
+  {
     const clean = /^### Post-accept red team — no break found$/m.test(body);
     const counted = /^### Post-accept red team — (\d+) possible break\(s\), (\d+) confirmed/m.exec(body);
     if (clean) return parsed.findings.length === 0;
     return !!counted && Number(counted[1]) === parsed.findings.length
       && Number(counted[2]) === parsed.findings.filter(f => f.confirmed).length;
-  });
+  }
 }
+// Items whose verdict came from a live read of the PR (the only evidence that may retire a confirmed-break alert).
+const LIVE_VERIFIED = new WeakSet();
+const verified = item => { LIVE_VERIFIED.add(item); return item; };
 const keyOf = i => `${i.repo}#${i.pr}@${i.head}:${i.kind}`;
 /** Queue text is display data: bound it and remove terminal controls, line separators and bidi/invisible formatting. */
 export function sanitizeForFeed(text, max) {
@@ -244,9 +256,9 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const owed = state.sendBackOutcome === GATE_OUTCOMES.SENT_BACK || state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP
         || (disposition !== null && (disposition.sendBack.length > 0 || disposition.held.length > 0));
       if (owed) {
-        out[index] = { ...checked, kind: 'confirmed-break-owed-send-back',
-          reason: 'a confirmed red-team break is owed a send-back on the live head' };
-      } else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = checked;
+        out[index] = verified({ ...checked, kind: 'confirmed-break-owed-send-back',
+          reason: 'a confirmed red-team break is owed a send-back on the live head' });
+      } else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable') && headlineAgrees(view.comments, item.pr, view.headRefOid)) out[index] = verified(checked);
       else out[index] = undecided(checked);
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };
@@ -336,7 +348,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     // An open confirmed-break alert clears only on positive evidence for that PR (a later live pass or a newer-head
     // verdict). Absence from the queue, unreadable evidence or an undecided verdict never clear it.
-    const proven = new Set(fresh.filter(i => i.kind === 'needs-you' || i.kind === 'confirmed-break-owed-send-back').map(i => `${i.repo}#${i.pr}`));
+    const proven = new Set(fresh.filter(i => LIVE_VERIFIED.has(i) && (i.kind === 'needs-you' || i.kind === 'confirmed-break-owed-send-back')).map(i => `${i.repo}#${i.pr}`));
     const retainKeys = prev.openKeys.filter(k => k.endsWith(':confirmed-break-owed-send-back') && !proven.has(k.slice(0, k.lastIndexOf('@'))));
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: CLEAR_KINDS, incomplete: items.incomplete, retainKeys });
     appendLines(path, result.lines);
