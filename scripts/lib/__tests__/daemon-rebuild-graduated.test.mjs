@@ -33,6 +33,7 @@ function fixture() {
 function graduation(overrides = {}) {
   const build = fixture().ready.adopt.finalSha;
   const responses = new Map([
+    [JSON.stringify(['config', '--get-regexp', '^merge\\..*\\.driver$']), { status: 1, stdout: '' }],
     [JSON.stringify(['rev-parse', '--verify', `${merged}^{commit}`]), { status: 0, stdout: `${mergeSha}\n` }],
     [JSON.stringify(['merge-base', '--is-ancestor', mergeSha, build]), { status: 0, stdout: '' }],
     [JSON.stringify(['rev-parse', `${build}^{tree}`]), { status: 0, stdout: `${buildTree}\n` }],
@@ -270,6 +271,36 @@ describe('overlayGraduated evidence', () => {
     const success = evidence.git;
     evidence.git = (args) => args[0] === command && args[1] === argument ? response : success(args);
     expect(adoption.overlayGraduated(evidence)).toBe(false);
+  });
+});
+
+describe.each([
+  ['graduated-merged', graduation],
+  ['auto-dropped in-main', autoDropped],
+])('overlayGraduated %s merge driver evidence', (_name, makeEvidence) => {
+  const configArgs = ['config', '--get-regexp', '^merge\\..*\\.driver$'];
+
+  it.each([
+    ['a custom merge driver is configured', { status: 0, stdout: 'merge.ours.driver true\n' }],
+    ['config fails with status 128', { status: 128, stdout: '' }],
+    ['config status is undefined', { stdout: '' }],
+    ['config response is undefined', undefined],
+  ])('fails closed before merge-tree when %s', (_reason, response) => {
+    const evidence = makeEvidence();
+    const success = evidence.git;
+    evidence.git = vi.fn((args) => JSON.stringify(args) === JSON.stringify(configArgs) ? response : success(args));
+    expect(adoption.overlayGraduated(evidence)).toBe(false);
+    expect(evidence.git).toHaveBeenCalledWith(configArgs);
+    expect(evidence.git.mock.calls.some(([args]) => args[0] === 'merge-tree')).toBe(false);
+  });
+
+  it('accepts content proof when config status is exactly 1', () => {
+    const evidence = makeEvidence();
+    expect(adoption.overlayGraduated(evidence)).toBe(true);
+    const calls = evidence.git.mock.calls.map(([args]) => args);
+    const configIndex = calls.findIndex((args) => JSON.stringify(args) === JSON.stringify(configArgs));
+    expect(configIndex).toBeGreaterThanOrEqual(0);
+    expect(calls.findIndex((args) => args[0] === 'merge-tree')).toBeGreaterThan(configIndex);
   });
 });
 

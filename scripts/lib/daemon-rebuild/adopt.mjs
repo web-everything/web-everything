@@ -119,6 +119,8 @@ export function overlayGraduated({ ref, sha, build, registered, events, git, rea
       if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
       if (git(['merge-base', '--is-ancestor', mergeSha, build])?.status !== 0) return false;
     }
+    // Custom drivers can discard overlay changes while reporting an unchanged merge tree.
+    if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
     const tree = git(['rev-parse', `${build}^{tree}`]);
     const mergedTree = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
     if (tree?.status !== 0 || mergedTree?.status !== 0
