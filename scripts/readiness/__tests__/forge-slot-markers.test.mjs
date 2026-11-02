@@ -125,23 +125,62 @@ describe('stale remote slot markers (perf10)', () => {
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
     expect(await reaper.step(tel(8, undefined, [done(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
   });
-  it('decides per run: a busy Forge does not keep a marker whose own run finished or is absent', async () => {
+  it.each([RUN_A, undefined].flatMap(run => [1, 50].map(size => ({run, size}))))('keeps an evicted active run despite matching counts from an inactive unfinished receipt: %j', async ({run, size}) => {
+    const root = setup({0: {pid: 111, run}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    const recent = Array.from({length: size}, (_, i) => ({
+      runId: `r-${i.toString(16).padStart(32, '0')}`,
+      startedAtET: easternTimestamp(NOW + 30_000), code: i === 0 ? null : 0,
+      stageMs: {install: 0, run: 0},
+    }));
+    // A prepare finished without execution leaves code:null behind, while A is still active outside recent.
+    const parsed = parseTelemetry(JSON.stringify({sampledAtET: easternTimestamp(NOW + 120_000),
+      cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 1, recent}));
+    expect(await reaper.step(async () => parsed)).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+  });
+  it.each([0, 1])('keeps a run-less marker when an unfinished run starts within clock skew after observed owner death (activeRuns=%s)', async activeRuns => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(tel(activeRuns, undefined, [going(RUN_A, NOW + 29_000)]))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+  });
+  it.each([
+    {startedMs: NOW - 660_001, keep: false}, {startedMs: NOW - 660_000, keep: true},
+    {startedMs: NOW, keep: true}, {startedMs: NOW + 60_000, keep: true},
+    {startedMs: NOW + 60_001, keep: false},
+  ])('applies clock-skew allowance inclusively to both ends of a run-less marker window: %j', async ({startedMs, keep}) => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    // A consumed prepare can leave an unfinished receipt even after activeRuns drops to zero.
+    const result = await reaper.step(tel(0, undefined, [going(RUN_A, startedMs)]));
+    expect(result).toEqual(keep ? [] : ['slot-0.unconfirmed']);
+    expect([...blockedSlots(root, 1)]).toEqual(keep ? [0] : []);
+  });
+  it('decides per run: a busy Forge releases finished receipts but retains absent and unfinished runs', async () => {
     const root = setup({0: {pid: 111, run: RUN_A}, 1: {pid: 112, run: RUN_B}, 2: {pid: 113, run: RUN_C}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112, 113])});
-    // A finished (code), B absent (evicted), C still running; seven other runs keep Forge busy.
+    // A finished (code), B absent (possibly evicted while still active), C still running.
     const busy = [done(RUN_A, 1), going(RUN_C), ...Array.from({length: 7}, (_, i) => going('r-' + String(i).repeat(32)))];
-    expect(await reaper.step(tel(8, undefined, busy))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
-    expect(names(root)).toEqual(['2']);
+    expect(await reaper.step(tel(8, undefined, busy))).toEqual(['slot-0.unconfirmed']);
+    expect(names(root)).toEqual(['1', '2']);
+    expect(await reaper.step(tel(0, undefined, [done(RUN_C)]))).toEqual(['slot-1.unconfirmed', 'slot-2.unconfirmed']);
+    expect(names(root)).toEqual([]);
   });
-  it('keeps a run-less marker only while a run that could be its own is unfinished', async () => {
+  it('keeps a run-less marker while Forge is active or a possible matching receipt is unfinished', async () => {
     const root = setup({0: {pid: 111}, 1: {pid: 112}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112])});
     const early = going('r-' + 'd'.repeat(32), NOW - 5_000_000); // began long before either marker: not theirs
     const mine = going('r-' + 'e'.repeat(32), NOW - 590_000);
-    expect(await reaper.step(tel(1, undefined, [early]))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    expect(await reaper.step(tel(1, undefined, [early]))).toEqual([]);
+    expect(names(root)).toEqual(['0', '1']);
+    expect(await reaper.step(tel(0, undefined, [early]))).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
     const again = setup({0: {pid: 111}});
     const r2 = createMarkerReaper({root: again, host: 'forge', clock: () => NOW, liveness: liveness([111])});
     expect(await r2.step(tel(1, undefined, [mine]))).toEqual([]);
+    expect(await r2.step(tel(0, undefined, [mine]))).toEqual([]);
   });
   it('reaps a bare legacy marker once no live local process holds its slot lock', async () => {
     const root = setup({0: {}, 1: {}});

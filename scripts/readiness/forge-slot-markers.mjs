@@ -49,7 +49,7 @@ function sidecarRun(file, owner) {
 
 /**
  * What Forge's recent-run telemetry says about one run: `finished` (a result code was published), `inflight` (listed
- * without a code), `absent` (not listed, with every active run accounted for) or `unknown` (incomplete evidence).
+ * without a code), `absent` (not listed, with no active runs) or `unknown` (incomplete evidence).
  * The caller guarantees the sample postdates the owner's death by a margin.
  */
 export function runVerdict(telemetry, run) {
@@ -61,19 +61,18 @@ export function runVerdict(telemetry, run) {
 }
 
 // Forge caps `recent` at the newest 50 receipts (forge-exec-run.mjs#parseTelemetry). An older run can still be
-// executing outside that window. Absence proves completion only when every active run is represented here.
+// executing outside that window. A finished prepare can leave code:null in recent, so matching counts do not prove
+// membership. Without an authoritative list of active run IDs, only zero active runs can establish completeness.
 function recentEvidence(telemetry) {
   if (!Number.isSafeInteger(telemetry?.activeRuns) || telemetry.activeRuns < 0 || !Array.isArray(telemetry.recent)) return null;
   const runs = new Set();
-  let inflight = 0;
   for (const item of telemetry.recent) {
     if (!item || typeof item.runId !== 'string' || !RUN.test(item.runId)
       || runs.has(item.runId) || typeof item.startedAtET !== 'string' || !Number.isFinite(Date.parse(item.startedAtET))
       || !(item.code === null || (Number.isInteger(item.code) && item.code >= 0 && item.code <= 255))) return null;
     runs.add(item.runId);
-    if (item.code === null) inflight++;
   }
-  return {complete: inflight === telemetry.activeRuns};
+  return {complete: telemetry.activeRuns === 0};
 }
 
 /**
@@ -163,13 +162,13 @@ function ownerGone(root, index, file, liveness, selfPid) {
 /**
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
- * Decided PER RUN; the active-run count checks whether the recent window accounts for all active runs. A dead-owner,
+ * Decided PER RUN; a matching finished receipt suffices even while Forge is busy. A dead-owner,
  * host-bound marker is reaped when it is past the grace window, the telemetry sample was taken at least
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
- * a result keeps the marker; an absent run is unknown if active runs are missing from the window. A marker whose run id
- * was never recorded (the client died before prepare returned) is kept while the active-run listing is incomplete or any
- * run started inside its own possible window ([at - skew, first-seen-dead]) is still unfinished.
+ * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
+ * was never recorded (the client died before prepare returned) is kept while Forge reports any active runs or any
+ * run started inside its own possible window ([at - skew, first-seen-dead + skew]) is still unfinished.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run to ask Forge about: it is
  * reaped past the grace window once no live local process holds its slot lock.
  */
@@ -259,10 +258,10 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   };
 }
 
-// A run-less marker's run could only have started between the marker's dispatch and the owner's death.
+// A run-less marker's run could only have started between dispatch and owner death; Forge timestamps can skew either way.
 function maybeOwnsInflight(telemetry, atMs, diedByMs) {
   return telemetry.recent.some(item => {
     const started = Date.parse(item?.startedAtET);
-    return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs));
+    return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS));
   });
 }
