@@ -817,7 +817,8 @@ export function postAcceptAdvisoryShadowReport(rows = []) {
   const { accepts, skipped, unresolved } = replayAdvisoryLedger(rows);
   const observations = [...accepts.values()].map(accept => accept.row);
   const report = { prs: new Set(observations.map(row => `${row.repo}#${row.pr}`)).size,
-    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0, skipped, unresolved: unresolved.size };
+    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0,
+    unconfirmedBroken: 0, skipped, unresolved: unresolved.size };
   for (const row of observations) {
     if (row.wouldPush === true) report.wouldPush++;
     const count = accepts.get(advisoryKey(row)).count;
@@ -828,13 +829,19 @@ export function postAcceptAdvisoryShadowReport(rows = []) {
     else report.unmeasured++;
     if (row.wouldCard !== true) continue;
     report.wouldCard++;
-    const findings = row.findings;
+    // Repeated IDs are one finding; historical findings without IDs remain separate observations.
+    const findings = [...new Map(row.findings.map((finding, index) => [finding.findingId ?? index, finding])).values()];
     report.findings += findings.length;
-    const broken = new Set((row.laterRatings ?? []).filter(rating => rating.impactIfUnfixed === 'broken')
-      .map(rating => rating.findingId).filter(Boolean));
-    report.laterBroken += new Set(findings.map(finding => finding.findingId).filter(id => id && broken.has(id))).size;
+    const brokenRatings = (row.laterRatings ?? []).filter(rating => rating.impactIfUnfixed === 'broken');
+    const confirmed = new Set(brokenRatings.filter(rating => rating.verdict === 'CONFIRMED').map(rating => rating.findingId));
+    const unconfirmed = new Set(brokenRatings.filter(rating => rating.verdict !== 'CONFIRMED').map(rating => rating.findingId));
+    for (const finding of findings) {
+      if (!nonemptyAdvisoryString(finding.findingId)) continue;
+      if (confirmed.has(finding.findingId)) report.laterBroken++;
+      else if (unconfirmed.has(finding.findingId)) report.unconfirmedBroken++;
+    }
   }
-  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nSkipped: ${report.skipped}\nUnresolved: ${report.unresolved}` };
+  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nUnconfirmed broken: ${report.unconfirmedBroken}\nSkipped: ${report.skipped}\nUnresolved: ${report.unresolved}` };
 }
 
 /**

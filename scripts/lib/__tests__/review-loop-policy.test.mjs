@@ -620,22 +620,86 @@ describe('post-accept advisory shadow ledger', () => {
     expect(logs.every(line => line.includes('unknown historical run head; inspect shadow ledger'))).toBe(true);
   });
 
-  it('prints counts and counts only shadow-carded findings later re-rated broken, matched by identity', () => {
+  it('prints counts and counts only shadow-carded findings later re-rated CONFIRMED broken, matched by identity', () => {
     const rows = [
       { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: 3,
-        laterRatings: [{ findingId: 'finding-1', impactIfUnfixed: 'broken' },
-          { findingId: 'unrelated', impactIfUnfixed: 'broken' }] },
+        laterRatings: [{ findingId: 'finding-1', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' },
+          { findingId: 'unrelated', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] },
       { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 8, headSha: head, ...decision, loopsAfter: 2,
-        laterRatings: [{ findingId: 'finding-1', impactIfUnfixed: 'cosmetic' }] },
+        laterRatings: [{ findingId: 'finding-1', verdict: 'CONFIRMED', impactIfUnfixed: 'cosmetic' }] },
       { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 9, headSha: head, wouldCard: false, wouldPush: true, findings: [finding], loopsAfter: 1,
-        laterRatings: [{ findingId: 'finding-1', impactIfUnfixed: 'broken' }] },
+        laterRatings: [{ findingId: 'finding-1', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] },
     ];
     const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
     expect(report).toMatchObject({ prs: 3, wouldCard: 2, wouldPush: 1, findings: 2,
-      loopsAfter: 6, laterBroken: 1 });
+      loopsAfter: 6, laterBroken: 1, unconfirmedBroken: 0 });
     expect(report.text).toMatch(/would.?card[^\n]*2/i);
     expect(report.text).toMatch(/would.?push[^\n]*1/i);
     expect(report.text).toMatch(/broken[^\n]*1/i);
+  });
+
+  it.each([
+    ['plausible', { verdict: 'PLAUSIBLE' }],
+    ['absent', {}],
+    ['undefined', { verdict: undefined }],
+    ['null', { verdict: null }],
+    ['lowercase', { verdict: 'confirmed' }],
+    ['padded', { verdict: 'CONFIRMED ' }],
+    ['unknown', { verdict: 'UNKNOWN' }],
+    ['number', { verdict: 42 }],
+    ['object', { verdict: { verdict: 'CONFIRMED' } }],
+    ['array', { verdict: ['CONFIRMED'] }],
+  ])('reports %s broken re-rates as unconfirmed without overstating confirmed evidence', (_name, verdict) => {
+    const rating = { findingId: finding.findingId, impactIfUnfixed: 'broken', ...verdict };
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, loopsAfter: 3, laterRatings: [rating, structuredClone(rating),
+        { ...rating, findingId: 'unrelated' }] }];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 1, loopsAfter: 3,
+      laterBroken: 0, unconfirmedBroken: 1, skipped: 0 });
+    expect(report.text).toContain('Later broken: 0\nUnconfirmed broken: 1');
+  });
+
+  it.each([
+    ['absent', {}],
+    ['undefined', { findingId: undefined }],
+    ['null', { findingId: null }],
+    ['empty', { findingId: '' }],
+    ['whitespace', { findingId: '  ' }],
+    ['number', { findingId: 42 }],
+  ])('keeps anonymous findings counted without matching broken ratings with %s identities', (_name, identity) => {
+    const { findingId, ...anonymous } = finding;
+    const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, findings: [anonymous, structuredClone(anonymous)], loopsAfter: null,
+      laterRatings: [
+        { findingId: 'unrelated-confirmed', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' },
+        { findingId: 'unrelated-plausible', verdict: 'PLAUSIBLE', impactIfUnfixed: 'broken' },
+      ] };
+    // Unidentified ratings already fail ledger validation. Preserve that closed path
+    // while keeping the earlier valid observation and its anonymous finding count.
+    const rows = [accept, { ...accept, laterRatings: [
+      { ...identity, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' },
+      { ...identity, verdict: 'PLAUSIBLE', impactIfUnfixed: 'broken' },
+      { ...identity, impactIfUnfixed: 'broken' },
+    ] }];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 2, unmeasured: 1,
+      laterBroken: 0, unconfirmedBroken: 0, skipped: 1 });
+    expect(report.text).toContain('Findings: 2');
+    expect(report.text).toContain('Later broken: 0\nUnconfirmed broken: 0');
+  });
+
+  it('counts repeated finding IDs and confirmed re-rates once while preserving anonymous findings', () => {
+    const { findingId, ...anonymous } = finding;
+    const confirmed = { findingId, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, findings: [finding, structuredClone(finding), anonymous, structuredClone(anonymous)],
+      loopsAfter: 0, laterRatings: [confirmed, structuredClone(confirmed),
+        { ...confirmed, verdict: 'PLAUSIBLE' }, { ...confirmed, findingId: 'unrelated' }] }];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 3,
+      laterBroken: 1, unconfirmedBroken: 0, skipped: 0 });
+    expect(report.text).toContain('Findings: 3');
   });
 
   it('adversarial replay: accept A, accept B, replay A, and replay an earlier nonaccept after restart', async () => {
