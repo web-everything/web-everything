@@ -1,4 +1,5 @@
 ---
+bornAs: x88kfkb
 kind: story
 size: 3
 parent: "7504"

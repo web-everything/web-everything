@@ -1,17 +1,18 @@
 ---
+bornAs: xx6qupe
 kind: story
 size: 3
 parent: "7504"
 status: open
-blockedBy: ["7504"]
-scope: ["we:scripts/lib/daemon-plugins.mjs", "we:scripts/settings/daemon-plugins.json", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
+blockedBy: ["7504", "7595"]
+scope: ["we:scripts/lib/daemon-plugins.mjs", "we:scripts/settings/daemon-plugins.json", "we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Daemon plugin six: fix-dispatch daemon descriptor and switch
+# Daemon plugin two: build-dispatch daemon descriptor and switch (replaces --max-concurrent=0 as the off lever)
 
-Child of 7504 (R357). fix daemon clone wev-fix-daemon has 3 overlays today; descriptor and switch after they graduate.
+Child of 7504 (R357). Second plugin, after the build daemon has its own clone (sibling story) and card 3984 is no longer active. Register a build descriptor and read the switch in the build daemon.
 
 ## Acceptance
 

@@ -1,17 +1,18 @@
 ---
+bornAs: x71628r
 kind: story
 size: 3
 parent: "7504"
 status: open
 blockedBy: ["7504"]
-scope: ["we:scripts/lib/daemon-plugins.mjs", "we:scripts/settings/daemon-plugins.json", "we:scripts/settings/prototype-load.json", "we:skills-src/conveyor/daemon-manifest.mjs"]
+scope: ["we:scripts/lib/daemon-clone-registry.mjs", "we:scripts/settings/prototype-load.json", "we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Daemon plugin four: merge passes descriptor and switch, after the loader knows wev-merge-daemon
+# Daemon plugin: give the build daemon its own clone so verify and build stop sharing wev-control
 
-Child of 7504 (R357). wev-merge-daemon is not in we:scripts/settings/prototype-load.json, so its fixes cannot be prototype-loaded. Add it, graduate or drop the stale 171-file proto-daemon-resources overlay, then the descriptor and switch.
+Child of 7504 (R357). verify and build share clone wev-control, so one loaded overlay or a rebuild conflict hits both (2026-11-01 review-clone 5h deadlock, #6184). Give build-dispatch its own clone and seed entry before the build plugin.
 
 ## Acceptance
 
@@ -36,5 +37,3 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
-
-Statute check (found 2026-11-01): we:docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clause 5(e) keeps `merge-orphan-sweep` `main`-only. `wev-merge-daemon` carries 1 overlay today, so clear it (or take the 5(e) amendment to the operator) before building this.

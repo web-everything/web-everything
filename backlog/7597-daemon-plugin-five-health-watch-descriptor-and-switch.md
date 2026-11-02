@@ -1,17 +1,18 @@
 ---
+bornAs: xa4ggq9
 kind: story
 size: 3
 parent: "7504"
 status: open
 blockedBy: ["7504"]
-scope: ["we:scripts/lib/daemon-clone-registry.mjs", "we:scripts/settings/prototype-load.json", "we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs"]
+scope: ["we:scripts/lib/daemon-plugins.mjs", "we:scripts/settings/daemon-plugins.json", "we:skills-src/conveyor/pass-daemon.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Daemon plugin: give the build daemon its own clone so verify and build stop sharing wev-control
+# Daemon plugin five: health-watch descriptor and switch
 
-Child of 7504 (R357). verify and build share clone wev-control, so one loaded overlay or a rebuild conflict hits both (2026-11-01 review-clone 5h deadlock, #6184). Give build-dispatch its own clone and seed entry before the build plugin.
+Child of 7504 (R357). health-watch clone has 4 overlays today (top 1101c, smoke-gh-throttle, 2 loader-fast-return); descriptor and switch only after they graduate or land.
 
 ## Acceptance
 

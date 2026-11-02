@@ -176,9 +176,9 @@ What this changes:
    the `verify` clone from the plist `WorkingDirectory` (we:scripts/operations/prototype-load-io.mjs:312).
 6. **One daemon at a time.** Each later daemon is its own card: register its descriptor, wire its gate. A daemon's
    code moves into a plugin directory only once its clone has zero live overlays (graduate them first, or in the
-   same change). Order (fewest overlays and fewest shared-file overlays first): verify (this card) → build clone split (x71628r) → build (xx6qupe, after #3984 settles) → drain (xthh394) → merge passes (xqr1g9u: add
+   same change). Order (fewest overlays and fewest shared-file overlays first): verify (this card) → build clone split (7595) → build (7601, after #3984 settles) → drain (7600) → merge passes (7599: add
    `wev-merge-daemon` to the loader settings, graduate or drop the stale 171-file `proto-daemon-resources` overlay first) →
-   health-watch (xa4ggq9; after its shared-file overlays land) → fix (xisvn49) → review (x88kfkb; first split its 12 jobs onto their own
+   health-watch (7597; after its shared-file overlays land) → fix (7598) → review (7596; first split its 12 jobs onto their own
    clones). Each later plugin needs its own clone first (Risk and sequencing ruling).
 
 **Rollback.** To intentionally re-enable verify while retaining plugin support, use
@@ -221,15 +221,15 @@ fix and merge each have one daemon per clone.
 **Default order (kept, with the clone rule added).**
 1. Verify first on `wev-control`, as designed. Its sibling job is the build daemon on `--max-concurrent=0`, so the exposure is one
    extra idle job for one merge window; verify is the only slice whose files no overlay touches.
-2. Each later plugin needs its own clone first: story x71628r (build off `wev-control`) blocks the build plugin xx6qupe; the review
-   plugin x88kfkb starts by splitting its 12 jobs onto their own clones.
-3. The default order stands and does not gate 7504; moving x71628r ahead of 7504 is an optional reorder that changes no card text.
+2. Each later plugin needs its own clone first: story 7595 (build off `wev-control`) blocks the build plugin 7601; the review
+   plugin 7596 starts by splitting its 12 jobs onto their own clones.
+3. The default order stands and does not gate 7504; moving 7595 ahead of 7504 is an optional reorder that changes no card text.
 
 **Statute drift found while checking.** Clause 5(e) says the drain daemon and `merge-orphan-sweep` "stay `main`-only and never share a
 clone that runs overlays". Today `we-drain-daemon/code` carries 2 overlays and `wev-merge-daemon` carries 1. Their plugin stories
-(xthh394, xqr1g9u) must either clear those overlays or take the 5(e) amendment to the operator first. It is not slice 1's problem.
+(7600, 7599) must either clear those overlays or take the 5(e) amendment to the operator first. It is not slice 1's problem.
 
-Skeptic: classification REFUTED (it is sequencing, not a fork: dissolved to this ruling); merit SURVIVES (verify first; the card overstated "rebuild conflict stops both jobs": clause 5(c)/(d) drop the overlay, the real failure was #6184: corrected); statute-overlap found clause 5(e) drift (assigned to xthh394, xqr1g9u); citations SURVIVE.
+Skeptic: classification REFUTED (it is sequencing, not a fork: dissolved to this ruling); merit SURVIVES (verify first; the card overstated "rebuild conflict stops both jobs": clause 5(c)/(d) drop the overlay, the real failure was #6184: corrected); statute-overlap found clause 5(e) drift (assigned to 7600, 7599); citations SURVIVE.
 Screen: clear (fresh-context reviewer; one optional wording fix applied).
 
 Real-life occurrences: the 2026-11-01 review-clone deadlock (#6184, R351); the 2026-10-29 review-daemon overlay-conflict freeze.
