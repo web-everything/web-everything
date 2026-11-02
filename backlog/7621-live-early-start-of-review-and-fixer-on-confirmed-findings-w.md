@@ -1,9 +1,10 @@
 ---
+bornAs: x5ph0t2
 kind: story
 size: 5
 parent: "5467"
 status: open
-blockedBy: ["xtxt36v"]
+blockedBy: ["7620"]
 scope: ["we:scripts/lib/review-timing.mjs", "we:scripts/lib/review-timing-settings.mjs", "we:scripts/operations/fix-run.mjs", "we:scripts/lib/__tests__/review-timing.test.mjs"]
 dateOpened: "2026-11-01"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # Live early start of review and fixer on confirmed findings while CI runs
 
-Build the live half of decision xrz0ezn (R359), after the shadow story xtxt36v has its evidence. Eligible reviews start while CI runs; the fixer starts on confirmed findings (red team confirmed, or at least two seats agree, each naming the exact head sha) but holds its push until the previous head CI is complete, folding CI findings into the same push, and never pushes into a running CI. A started review keeps findings when CI goes red and joins one fix round. Settings default off; the flip is a human settings change. Acceptance: vitest cases for fixer starts on confirmed findings only, single-seat findings never start it, push held while previous CI runs, push only after CI complete at the hold bound, red CI joins findings into one round, head move voids early review and fix, hold timer not reset by polls, merge refuses with CI pending.
+Build the live half of decision 7619 (R359), after the shadow story 7620 has its evidence. Eligible reviews start while CI runs; the fixer starts on confirmed findings (red team confirmed, or at least two seats agree, each naming the exact head sha) but holds its push until the previous head CI is complete, folding CI findings into the same push, and never pushes into a running CI. A started review keeps findings when CI goes red and joins one fix round. Settings default off; the flip is a human settings change. Acceptance: vitest cases for fixer starts on confirmed findings only, single-seat findings never start it, push held while previous CI runs, push only after CI complete at the hold bound, red CI joins findings into one round, head move voids early review and fix, hold timer not reset by polls, merge refuses with CI pending.
 
 ## Acceptance
 

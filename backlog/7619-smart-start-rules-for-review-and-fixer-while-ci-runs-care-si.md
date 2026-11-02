@@ -1,4 +1,5 @@
 ---
+bornAs: xrz0ezn
 kind: decision
 size: 5
 parent: "5467"
@@ -84,7 +85,7 @@ Nothing new is trusted: the early start reads the same verify ledger and check s
 
 ## Ratified — 2026-11-01 (R359)
 
-Operator chalbert, 2026-11-01 17:46 ET, verbatim: "Ratify xrz0ezn".
+Operator chalbert, 2026-11-01 17:46 ET, verbatim: "Ratify 7619".
 
 Fork 1 ruled at the bold default **(b)**: the fixer starts on confirmed findings while CI runs, holds the push until the previous head's CI is complete, then folds CI findings into the same push. It never pushes into a running CI. Confirmed = red-team confirmed, or at least two review seats agree, each naming the exact head sha.
 
