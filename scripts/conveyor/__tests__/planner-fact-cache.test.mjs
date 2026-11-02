@@ -306,11 +306,18 @@ describe('persisted shadow promotion evidence', () => {
     [48, 100, 1, false], [48, 100, 0, true],
   ])('at %sh / %s passes / %s diffs, met=%s', (hours, passes, diffs, met) => {
     const { cache, setNow } = harness();
-    for (let i = 0; i < passes; i++) cache.recordPass({ diffCount: i === 0 ? diffs : 0 });
+    for (let i = 0; i < passes; i++) cache.recordPass({ diffCount: i === 0 ? diffs : 0, compared: 1 });
     setNow(START + hours * HOUR);
     const result = cache.shadowEndRule({ now: START + hours * HOUR });
     expect(result).toMatchObject({ met, hours, passes, diffs, reason: expect.any(String) });
     expect(result.reason.length).toBeGreaterThan(0);
+  });
+
+  it('never promotes on passes that compared no rows (empty shadow evidence)', () => {
+    const { cache, setNow } = harness();
+    for (let i = 0; i < 100; i++) cache.recordPass({ diffCount: 0, compared: 0 });
+    setNow(START + 48 * HOUR);
+    expect(cache.shadowEndRule({ now: START + 48 * HOUR })).toMatchObject({ met: false, passes: 100, comparedPasses: 0 });
   });
 
   it('persists firstShadowAt and cumulative passes/diffs across restart and stats reset', async () => {
@@ -325,7 +332,7 @@ describe('persisted shadow promotion evidence', () => {
     const second = harness(options);
     second.setNow(START + 48 * HOUR);
     await second.cache.loadSnapshot();
-    second.cache.recordPass({ diffCount: 0 });
+    second.cache.recordPass({ diffCount: 0, compared: 1 });
     expect(second.cache.shadowEndRule({ now: START + 48 * HOUR }))
       .toMatchObject({ met: false, hours: 48, passes: 3, diffs: 3 });
   });

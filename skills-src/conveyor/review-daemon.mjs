@@ -1718,7 +1718,7 @@ export function buildCliDaemonEffects({
       if (factCache) {
         const stats = factCache.stats();
         const diffCount = factCache.diffCount;
-        factCache.recordPass({ diffCount });
+        factCache.recordPass({ diffCount, compared: stats.hits });
         try { await factCache.saveSnapshot(); }
         catch (e) { log.error(`review-daemon: planner-cache snapshot failed: ${String(e?.message ?? e).split('\n')[0]}`); }
         cacheTiming = ` · planner-cache hits=${stats.hits} misses=${stats.misses} diffs=${diffCount} shadowEndRule=${JSON.stringify(factCache.shadowEndRule())}`;

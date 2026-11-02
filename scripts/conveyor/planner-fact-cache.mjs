@@ -86,16 +86,19 @@ export function createPlannerFactCache({ now = Date.now, ttlMs = 600_000, mode =
       diffCount += diffs.length;
       return { same: diffs.length === 0, diffs };
     },
-    recordPass({ diffCount: count = 0 } = {}) {
+    recordPass({ diffCount: count = 0, compared = 0 } = {}) {
       if (evidence.firstShadowAt === null) evidence.firstShadowAt = now();
       evidence.passes++;
+      if (Number.isSafeInteger(compared) && compared > 0) evidence.comparedPasses = (evidence.comparedPasses ?? 0) + 1;
       evidence.diffs += Number.isSafeInteger(count) && count >= 0 ? count : 1;
     },
     shadowEndRule({ now: at = now() } = {}) {
       const hours = evidence.firstShadowAt === null ? 0 : Math.max(0, at - evidence.firstShadowAt) / 3_600_000;
       const { passes, diffs } = evidence;
-      const met = hours >= 48 && passes >= 100 && diffs === 0;
-      return { met, hours, passes, diffs, reason: diffs ? 'shadow differences observed; do not promote' : met ? 'shadow evidence meets promotion rule' : 'awaiting 48 hours and 100 passes' };
+      const comparedPasses = evidence.comparedPasses ?? 0;
+      // Passes with zero cache-vs-fresh comparisons prove nothing: promotion needs 100 passes that really compared rows.
+      const met = hours >= 48 && passes >= 100 && comparedPasses >= 100 && diffs === 0;
+      return { met, hours, passes, comparedPasses, diffs, reason: diffs ? 'shadow differences observed; do not promote' : met ? 'shadow evidence meets promotion rule' : 'awaiting 48 hours and 100 passes with cache comparisons' };
     },
     async saveSnapshot() {
       if (!snapshotPath) return;
