@@ -1,17 +1,38 @@
 // R372 — the loader flattens a multi-path `scope:` entry so routing, locus and lease arbitration all see one path per entry.
 import { describe, it, expect } from 'vitest';
 import { createRequire } from 'node:module';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { withFrozenBacklogDir } from './frozen-backlog';
 import { normalizeBriefScope } from '../../../scripts/operations/dispatch-lane.mjs';
 import { dispatchPlan } from '../../../scripts/readiness/dispatch-plan.mjs';
 
 const require = createRequire(import.meta.url);
 const { normalizeScope } = require('../backlog.js');
+const matter = require('gray-matter');
 
 describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
+  it('accepts every open backlog card scope through the dispatcher', () => {
+    const dir = join(dirname(require.resolve('../backlog.js')), '../../backlog');
+    const open = readdirSync(dir).filter((file) => file.endsWith('.md')).map((file) => ({
+      file, data: matter(readFileSync(join(dir, file), 'utf8'), {}).data,
+    })).filter(({ data }) => data.status === 'open');
+    expect(open.length).toBeGreaterThan(0);
+    for (const { file, data } of open) {
+      expect.soft(() => normalizeBriefScope(data.scope), file).not.toThrow();
+      expect.soft(() => normalizeBriefScope(normalizeScope(data.scope)), file).not.toThrow();
+    }
+  });
+
+  it('inherits fui for the last path after switching from we within one entry', () => {
+    const scope = ['we:a.mjs fui:b.mjs c.mjs'];
+    const expected = ['we:a.mjs', 'fui:b.mjs', 'fui:c.mjs'];
+    expect(normalizeScope(scope)).toEqual(expected);
+    expect(normalizeBriefScope(scope)).toEqual(expected);
+    expect(normalizeBriefScope(normalizeScope(scope))).toEqual(expected);
+  });
+
   it('retains authored scope only as display data while loading canonical scheduling scope', () => {
     const dir = mkdtempSync(join(tmpdir(), 'scope-prefix-'));
     const modulePath = require.resolve('../backlog.js');
@@ -70,6 +91,8 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
   );
   it('keeps a multi-path entry holding a glob UNSPLIT, so dispatch refuses it (fail closed)', () => {
     expect(normalizeScope(['we:scripts/a*b.mjs we:docs/x.md'])).toEqual(['we:scripts/a*b.mjs we:docs/x.md']);
+    expect(() => normalizeBriefScope(normalizeScope(['we:scripts/a*b.mjs we:docs/x.md'])))
+      .toThrow(/unsafe scope.*glob/);
     expect(normalizeScope(['we:scripts/a*b.mjs'])).toEqual(['we:scripts/a*b.mjs']);
   });
   it('keeps the single-entry shape and the absent/empty/blank collapse', () => {

@@ -419,11 +419,11 @@ function canonicalScopePrefix(value) {
   return Object.hasOwn(SCOPE_PREFIX_ALIASES, key) ? SCOPE_PREFIX_ALIASES[key] : key;
 }
 
-function refuseMultiPathGlobs(scope) {
-  // Check the complete flattened list (also the union of grouped cards), not individual input strings.
-  // Refusing any glob in a multi-path scope conservatively covers every pair without quadratic matching.
-  if (scope.length > 1 && scope.some((piece) => /[*?]/.test(piece))) {
-    throw new Error('dispatch-lane: unsafe scope entry — a glob in a multi-path scope is refused for {{SCOPE}}; use explicit paths or a directory scope.');
+function refuseMultiPathGlobs(parts) {
+  // Only a single authored entry containing multiple paths is subject to this restriction.
+  // Separate file/glob entries remain supported (#4701), including across grouped cards.
+  if (parts.length > 1 && parts.some((piece) => /[*?]/.test(piece))) {
+    throw new Error('dispatch-lane: unsafe scope entry — a glob in a multi-path scope entry is refused for {{SCOPE}}; use explicit paths or a directory scope.');
   }
 }
 
@@ -441,6 +441,7 @@ export function normalizeBriefScope(raw, dispatchRepo = 'we') {
     // is `we:a.mjs,we:b.mjs` and the lease overlap check sees both paths in the repo they belong to.
     let inherited = '';
     const parts = String(entry ?? '').split(/[\s,]+/).filter(Boolean);
+    refuseMultiPathGlobs(parts);
     for (const raw0 of parts) {
       const own = /^[A-Za-z][\w-]*:/.exec(raw0)?.[0] ?? '';
       if (own) inherited = own;
@@ -465,7 +466,6 @@ export function normalizeBriefScope(raw, dispatchRepo = 'we') {
       out.push(`${repo}:${piece.slice(prefix.length)}`);
     }
   }
-  refuseMultiPathGlobs(out);
   return out;
 }
 
@@ -1176,7 +1176,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
       }
     }
   }
-  refuseMultiPathGlobs(scope);
+  // Each build/repair card was checked by normalizeBriefScope before flattening; the union has no entry boundaries.
   if (blocked('scope', (launchKind === 'build' || repairsExistingPr) && !itemScope.length, { launchKind, scope })) {
     // Unreachable through the core (`dispatch-plan` holds an unscoped item `unshaped-no-scope` and auto-prepares
     // it, so it never reaches `spawnBuilds`, `spawnFixes` or `spawnCiHeals`) — refused anyway, because an empty

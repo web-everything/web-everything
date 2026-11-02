@@ -24,10 +24,12 @@ export default {
     if (loaded.length !== 2) violations.push('the loader left a multi-path scope entry unsplit');
     const { shapeDispatchRead } = await import(pathToFileURL(join(root, 'scripts/operations/dispatch-lane.mjs')).href);
     const { dispatchPlan } = await import(pathToFileURL(join(root, 'scripts/readiness/dispatch-plan.mjs')).href);
+    const { briefTokensForRepo } = await import(pathToFileURL(join(root, 'scripts/lib/repo-profile.mjs')).href);
     const read = (scope, launchKind = 'build') => shapeDispatchRead({
       launchKind,
       resolvedNum: '3037',
-      launch: { num: '3037', lane: 8 },
+      launch: { num: '3037', lane: 8, pr: 6244, reason: 'red-ci' },
+      laneRef: 'lane/dispatch-scope-multi',
       suppressed: null,
       item: { num: '3037', slug: 'x', specPath: 'backlog/3037-x.md', scope },
       briefTemplate: 'scope: {{SCOPE}}',
@@ -37,7 +39,7 @@ export default {
       inFlightDispatches: { runs: [], unreadable: 0, livenessSource: 'not-needed' },
       bookkeepingSource: 'file',
       observedAt: '2026-08-13T10:00:00.000Z',
-      repoTokens: { WE_ROOT: root },
+      repoTokens: { ...briefTokensForRepo('we', { itemNum: '3037' }), WE_ROOT: root },
     }, { num: '3037' });
     const want = ['we:scripts/readiness/heavy-admission.mjs', 'we:scripts/readiness/remote-exec.mjs'];
     try {
@@ -70,10 +72,20 @@ export default {
     for (const scope of [
       ['we:src/a*b.mjs', 'we:src/ab*.mjs'],
       ['we:src/a.mjs', 'we:src/ab*.mjs'],
-      ['we:src/a*b.mjs we:src/ab*.mjs'],
     ]) {
       for (const kind of ['build', 'fix', 'ci-heal']) {
-        try { read(scope, kind); violations.push(`${kind} accepted a glob across multi-path scope entries`); } catch { /* fail closed */ }
+        try {
+          const shaped = read(scope, kind);
+          if (!shaped.dispatching || JSON.stringify(shaped.scope) !== JSON.stringify(scope)
+            || !String(shaped.prompt).includes(`scope: ${scope.join(',')}`)) {
+            violations.push(`${kind} did not preserve separate file/glob entries`);
+          }
+        } catch (e) { violations.push(`${kind} refused separate file/glob entries: ${String(e.message).slice(0, 120)}`); }
+      }
+    }
+    for (const separator of [' ', ',', '\t', '\n']) {
+      for (const kind of ['build', 'fix', 'ci-heal']) {
+        try { read([`we:a*b.mjs${separator}we:docs/x.md`], kind); violations.push(`${kind} accepted a glob inside a multi-path entry`); } catch { /* fail closed */ }
       }
     }
     // Preparation repairs the card itself, including malformed scope; it must remain dispatchable.
