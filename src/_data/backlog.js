@@ -83,7 +83,8 @@ const normalizeScope = (v) => {
     // does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
     if (pieces.length > 1 && pieces.some((piece) => /[*?]/.test(piece))) { list.push(text); continue; }
     for (const piece of pieces) {
-      const own = /^[a-z][a-z0-9-]*:/i.exec(piece)?.[0] ?? '';
+      // Match dispatch-lane's prefix grammar, including underscores, without changing authored spelling.
+      const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
       if (own) repo = own;
       list.push(own ? piece : repo + piece);
     }

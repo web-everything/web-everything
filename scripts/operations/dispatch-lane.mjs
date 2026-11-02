@@ -1114,7 +1114,6 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   }
   const item = raw.item && typeof raw.item === 'object' ? raw.item : null;
   const specPath = String(item?.specPath || '').trim();
-  const itemScope = normalizeBriefScope(item?.scope);
   if (blocked('item-spec', !specPath, specPath)) {
     throw new Error(`dispatch-lane.read: no backlog file resolved for #${resolvedNum} — the brief needs the item's spec path`);
   }
@@ -1142,6 +1141,9 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   // so that is the scope the lane ends up holding; this value is what the run record says was declared. The
   // card (#3165) sets one rule for both prepare kinds, so this is recorded rather than silently widened.
   const repairsExistingPr = launchKind === 'fix' || launchKind === 'ci-heal';
+  // Preparation/investigation lease the card itself and may be repairing its malformed scope.
+  // Validate item.scope only when it supplies the lane lease and the brief's SCOPE value.
+  const itemScope = launchKind === 'build' || repairsExistingPr ? normalizeBriefScope(item?.scope) : [];
   const scope = launchKind === 'build' || repairsExistingPr ? [...itemScope] : [`we:${specPath}`];
   if (launchKind === 'prepare-item' || launchKind === 'build') {
     for (const member of groupMembers) {

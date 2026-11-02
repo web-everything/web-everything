@@ -23,7 +23,8 @@ export default {
     const loaded = normalizeScope?.(['we:scripts/readiness/heavy-admission.mjs scripts/readiness/remote-exec.mjs']) ?? [];
     if (loaded.length !== 2) violations.push('the loader left a multi-path scope entry unsplit');
     const { shapeDispatchRead } = await import(pathToFileURL(join(root, 'scripts/operations/dispatch-lane.mjs')).href);
-    const read = (scope) => shapeDispatchRead({
+    const read = (scope, launchKind = 'build') => shapeDispatchRead({
+      launchKind,
       resolvedNum: '3037',
       launch: { num: '3037', lane: 8 },
       suppressed: null,
@@ -45,7 +46,7 @@ export default {
       if (!String(shaped.prompt).includes(`scope: ${want.join(',')}`)) violations.push('the brief does not carry the comma-joined lease scope');
     } catch (e) { violations.push(`dispatch refused the flattened scope: ${String(e.message).slice(0, 120)}`); }
     // PR #6244: adding multi-path support must preserve the scope spellings already accepted by dispatch.
-    for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', '']) {
+    for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', 'custom_repo:', '']) {
       const input = [`${prefix}src/a.mjs src/b.mjs`];
       const expected = [`${prefix}src/a.mjs`, `${prefix}src/b.mjs`];
       try {
@@ -59,6 +60,18 @@ export default {
           }
         }
       } catch (e) { violations.push(`legacy scope ${JSON.stringify(prefix)} refused: ${String(e.message).slice(0, 120)}`); }
+    }
+    // Preparation repairs the card itself, including malformed scope; it must remain dispatchable.
+    for (const kind of ['prepare', 'prepare-item', 'prepare-decision', 'investigate']) {
+      for (const bad of ['we:../x', 'we:src/./a', 'we:src/a*b.mjs we:docs/x.md', 'we:a;id']) {
+        try {
+          const shaped = read(normalizeScope([bad]), kind);
+          if (shaped.dispatching !== true || JSON.stringify(shaped.scope) !== JSON.stringify(['we:backlog/3037-x.md'])
+            || !String(shaped.prompt).includes('scope: we:backlog/3037-x.md')) {
+            violations.push(`${kind} did not dispatch with the card-only scope`);
+          }
+        } catch (e) { violations.push(`${kind} refused a repairable card scope: ${String(e.message).slice(0, 120)}`); }
+      }
     }
     try { read(['we:a.mjs ../b.mjs']); violations.push('an unsafe piece (`..`) was accepted'); } catch { /* fail closed */ }
     return { violations };

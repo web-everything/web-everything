@@ -581,6 +581,44 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [' , '] } }, { num: '3037' })).toThrow(/no `scope:`/);
   });
 
+  it('does not inherit a repository prefix across scope entries', () => {
+    const read = tickRead();
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:a.mjs b.mjs', 'c.mjs'] } }, { num: '3037' });
+    expect(shaped.scope).toEqual(['we:a.mjs', 'we:b.mjs', 'c.mjs']);
+  });
+
+  it.each([
+    ['build', true], ['fix', true], ['ci-heal', true],
+    ['prepare', false], ['prepare-item', false], ['prepare-decision', false], ['investigate', false],
+  ])('%s validates unsafe item scope only when it uses that scope', (launchKind, refuses) => {
+    for (const bad of ['we:../x', 'we:src/./a', 'we:src/a*b.mjs we:docs/x.md', 'we:a;id']) {
+      const read = tickRead({ launchKind });
+      read.item.scope = [bad];
+      const shape = () => shapeDispatchRead(read, { num: '3037' });
+      if (refuses) {
+        expect(shape, bad).toThrow(/cannot carry|unsafe scope/);
+      } else {
+        const shaped = shape();
+        expect(shaped.dispatching, bad).toBe(true);
+        expect(shaped.scope, bad).toEqual([`we:${read.item.specPath}`]);
+        expect(shaped.prompt, bad).toContain(`scope: we:${read.item.specPath}`);
+        expect(shaped.prompt, bad).not.toContain(bad);
+      }
+    }
+  });
+
+  it('grouped prepare-item dispatches despite unsafe scopes on the primary and member cards', () => {
+    const read = tickRead({ launchKind: 'prepare-item', groupItems: [
+      { num: '3038', specPath: 'backlog/3038-member.md', scope: ['we:a*b.mjs b.mjs'] },
+    ] });
+    read.item.scope = ['we:../x'];
+    const shaped = shapeDispatchRead(read, { num: '3037', groupMembers: '3038' });
+    const expected = [`we:${read.item.specPath}`, 'we:backlog/3038-member.md'];
+    expect(shaped.dispatching).toBe(true);
+    expect(shaped.scope).toEqual(expected);
+    expect(shaped.prompt).toContain(`scope: ${expected.join(',')}`);
+  });
+
   it('refuses an unscoped item — an empty scope declares a lane that owns no paths', () => {
     const read = tickRead();
     expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [] } }, { num: '3037' }))
