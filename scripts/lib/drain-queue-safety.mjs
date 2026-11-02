@@ -1,6 +1,11 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
@@ -68,18 +73,98 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
   }
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSync, log = () => {}, allowAlreadyQueued = true } = {}) {
+export const mqSameHeadRefreshStatePath = (env = process.env) => env.WE_DRAIN_MQ_REFRESH_STATE_PATH
+  || join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json');
+
+/** Append-only spent heads. All readers/writers share a lock, never a cached snapshot. */
+export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath() } = {}) {
+  const load = () => {
+    let saved;
+    try { saved = JSON.parse(readFileSync(path, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return new Set(); throw error; }
+    if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid refresh ledger');
+    return new Set(saved);
+  };
+  return {
+    has: key => load().has(key),
+    claim(key) {
+      // Contention never falls back to an unlocked write. A failed request also spends its head.
+      mkdirSync(dirname(path), { recursive: true });
+      return withFileLock(`${path}.lock`, () => {
+        const keys = load();
+        if (keys.has(key)) return false;
+        keys.add(key);
+        writeJsonAtomic(path, [...keys], { mode: 0o600 });
+        return true;
+      }, { timeoutMs: 0 });
+    },
+  };
+}
+
+export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, repo, pr, head }) {
+  return { store, allow: () => approvedHeadHold({ repo, num: pr }, head, { strict: true }) === false };
+}
+
+function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
+  if (!store) return;
+  const key = `${repo}#${pr}@${head}`;
+  const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+  const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
+  const unavailable = () => log(`${prefix}state unavailable; not requesting; inspect shared refresh ledger and lock before retrying`);
+  try { if (store.has(key)) return; } catch { unavailable(); return; }
+  const opts = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
+  try {
+    const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
+      '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
+    if (mqOid(live?.headRefOid) !== head || live.mergeStateStatus !== 'CLEAN') return;
+    const checks = live.statusCheckRollup;
+    if (!Array.isArray(checks) || !checks.length || !checks.every(check => check
+      && (check.status == null || check.status === 'COMPLETED')
+      && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state))) return;
+    // Unreadable approval evidence is never permission to refresh.
+    if (allow?.() !== true) return;
+    // Read labels LIVE after approval and before spending the claim. Recheck the head too.
+    const labeled = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
+      '--json', 'labels,headRefOid'], opts));
+    if (mqOid(labeled?.headRefOid) !== head || !Array.isArray(labeled.labels)) return;
+    const names = queueLabels(labeled.labels);
+    if (names.some(name => typeof name !== 'string' || !name.trim())
+      || sendBackReason(names) || redTeamLabelHoldReason(names)) return;
+  } catch { return; }
+  try { if (store.claim(key) !== true) { unavailable(); return; } }
+  catch { unavailable(); return; }
+  try {
+    exec('gh', ['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`,
+      '-f', `expected_head_sha=${head}`], opts);
+    log(`${prefix}update-branch requested`);
+  } catch (error) {
+    const message = safe(String(error?.stderr || error?.message || error).split('\n')[0]).slice(0, 240);
+    log(`${prefix}update-branch refused (${message}); not retrying at this head`);
+  }
+}
+
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
   // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
+  let timeline;
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
     ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
-      : decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
-  if (decision.hold) log(decision.line);
+      : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })) });
+  if (decision.hold) {
+    log(decision.line);
+    // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
+    const confirmed = !timeline?.error && timeline?.hasPreviousPage === false && timeline.nodes.some(event =>
+      event?.__typename === 'RemovedFromMergeQueueEvent'
+      && !['manual', 'merged'].includes(String(event.reason ?? '').trim().toLowerCase())
+      && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);
+    if (refresh && confirmed) mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh });
+  }
   return decision;
 }
 

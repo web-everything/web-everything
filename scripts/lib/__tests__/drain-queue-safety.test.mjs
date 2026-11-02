@@ -1,6 +1,9 @@
 // @vitest-environment node
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard } from '../drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -38,6 +41,107 @@ describe('merge-queue same-head failure admission', () => {
   } } });
   const withQueue = read => vi.fn((command, args) => args.some(arg => arg.includes('isInMergeQueue'))
     ? queueResponse() : read(command, args));
+
+  describe('once-per-head refresh', () => {
+    function fixture(test) {
+      const dir = mkdtempSync(join(process.env.TMPDIR, 'mq-refresh-'));
+      const path = join(dir, 'state.json');
+      const store = createMqSameHeadRefreshStore({ path });
+      const f = { path, store, labels: ['ready-to-merge'], live: {
+        headRefOid: head, mergeStateStatus: 'CLEAN',
+        statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      }, log: vi.fn(), approvedHeadHold: vi.fn(() => false) };
+      f.exec = vi.fn((_command, args) => {
+        if (args.includes('PUT')) {
+          if (f.refused) throw new Error('HTTP 422: head moved');
+          return '{}';
+        }
+        if (args.includes('labels,headRefOid')) {
+          if (f.labels === null) throw new Error('offline');
+          return JSON.stringify({ labels: f.labels, headRefOid: f.labelHead ?? head });
+        }
+        if (args.includes('mergeStateStatus,headRefOid,statusCheckRollup')) return JSON.stringify(f.live);
+        if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse();
+        return response(timeline(removed()));
+      });
+      f.run = (selectedStore = store) => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
+        refresh: createMqSameHeadRefreshOptions({ store: selectedStore, approvedHeadHold: f.approvedHeadHold, repo, pr, head }) });
+      f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
+      try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+    it('uses shared home state with an explicit test override', () => {
+      expect(mqSameHeadRefreshStatePath({})).toBe(join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json'));
+      expect(mqSameHeadRefreshStatePath({ WE_DRAIN_MQ_REFRESH_STATE_PATH: '/fixture/state.json' })).toBe('/fixture/state.json');
+    });
+    it('held CLEAN green requests exactly once across passes and a second store instance', () => fixture(f => {
+      expect(f.run().hold).toBe(true);
+      f.run();
+      f.run(createMqSameHeadRefreshStore({ path: f.path }));
+      expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
+      expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
+    }));
+    it.each(['review:changes', 'red-team:blocked', 'review:human', 'review:pending', 'red-team:pending', 'missing-ready', null, [null]])(
+      'live label hold/unreadable %s does not spend state or request', label => fixture(f => {
+        // A send-back arriving during the approved-head read must win.
+        f.approvedHeadHold.mockImplementation(() => {
+          f.labels = label === null ? null : Array.isArray(label) ? label : label === 'missing-ready' ? [] : ['ready-to-merge', label];
+          return false;
+        });
+        f.run();
+        expect(f.requests()).toHaveLength(0);
+        expect(existsSync(f.path)).toBe(false);
+        f.approvedHeadHold.mockReturnValue(false);
+        f.labels = ['ready-to-merge'];
+        f.run();
+        expect(f.requests()).toHaveLength(1);
+      }));
+    it.each([
+      ['red checks', { statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'FAILURE' }] }],
+      ['missing checks', { statusCheckRollup: null }],
+      ['pending checks', { statusCheckRollup: [{ status: 'IN_PROGRESS' }] }],
+      ['not CLEAN', { mergeStateStatus: 'BEHIND' }],
+      ['moved head', { headRefOid: prior }],
+    ])('%s refuses without spending state', (_name, live) => fixture(f => {
+      Object.assign(f.live, live); f.run();
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+    }));
+    it('head moving at the live label read refuses without a claim', () => fixture(f => {
+      f.labelHead = prior; f.run();
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each(['held', 'unreadable'])('approved-head %s refuses without spending state', kind => fixture(f => {
+      f.approvedHeadHold.mockImplementation(() => { if (kind === 'unreadable') throw new Error('offline'); return true; });
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it('a competing claim after the initial ledger read prevents a second request', () => fixture(f => {
+      f.approvedHeadHold.mockImplementation(() => {
+        expect(createMqSameHeadRefreshStore({ path: f.path }).claim(`${repo}#${pr}@${head}`)).toBe(true);
+        return false;
+      });
+      f.run(); expect(f.requests()).toHaveLength(0);
+    }));
+    it('422 is logged and never retried, including by another store', () => fixture(f => {
+      f.refused = true; f.run(); f.run(createMqSameHeadRefreshStore({ path: f.path }));
+      expect(f.requests()).toHaveLength(1);
+      expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch refused (HTTP 422: head moved); not retrying at this head`);
+    }));
+    it('claim re-reads shared state and returns true for exactly one store', () => fixture(f => {
+      const other = createMqSameHeadRefreshStore({ path: f.path });
+      const key = `${repo}#${pr}@${head}`;
+      expect(f.store.claim(key)).toBe(true);
+      expect(other.claim(key)).toBe(false);
+      expect(other.claim(`${repo}#${pr}@${prior}`)).toBe(true);
+      expect(f.store.claim(`${repo}#${pr + 1}@${head}`)).toBe(true);
+      expect(f.store.claim(`other/repo#${pr}@${head}`)).toBe(true);
+    }));
+    it.each(['locked', 'malformed'])('%s ledger refuses with operator fallback', kind => fixture(f => {
+      writeFileSync(kind === 'locked' ? `${f.path}.lock` : f.path, kind === 'locked' ? `${process.pid}\n` : '{}');
+      f.run(); expect(f.requests()).toHaveLength(0);
+      expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/state unavailable;.*inspect.*ledger/));
+    }));
+  });
 
   it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
     expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
