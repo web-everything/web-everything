@@ -115,6 +115,18 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it('a fresh same-head admission hold records no enqueue success or retry backoff', () => {
+    const h = harness({ strategy: 'github-merge-queue' });
+    const reason = `mq-same-head-failed: #42 head ${HEAD} — failed_checks`;
+    const sameHeadAdmission = vi.fn(() => ({ hold: true, line: reason }));
+    expect(h.s.enqueue({ num: 42 }, HEAD, { comments: [], sameHeadAdmission })).toEqual({
+      enqueued: false, kind: 'mq-same-head-failed', reason,
+    });
+    expect(sameHeadAdmission).toHaveBeenCalledTimes(1);
+    expect(h.calls.some(c => c.some(arg => typeof arg === 'string' && arg.includes('enqueuePullRequest')))).toBe(false);
+    expect(h.state()).toBeNull();
+    expect(h.calls.some(c => c.includes('comment') && c.some(arg => typeof arg === 'string' && arg.includes('we-drain-enqueue-clearance')))).toBe(false);
+  });
   it.each([true, false])('R212: setting %s controls enqueue with exact operator approval', enabled => {
     const read = vi.spyOn(completeComments, 'readCompletePrComments').mockReturnValue([
       { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: operator -->` },

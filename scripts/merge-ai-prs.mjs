@@ -4824,7 +4824,11 @@ async function runCli() {
     const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
-    return mergeStrategy.enqueue(c, sha, options);
+    return mergeStrategy.enqueue(c, sha, { ...options,
+      // The early queued bypass authorizes bookkeeping only. If membership disappears during the
+      // strategy's other checks, require fresh timeline admission immediately before any mutation.
+      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+        allowAlreadyQueued: false, log: line => process.stderr.write(`${line}\n`) }) });
   }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),

@@ -5,6 +5,7 @@ import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
+import { enqueuePr } from '../merge-queue-enqueue.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
@@ -77,17 +78,17 @@ describe('merge-queue same-head failure admission', () => {
     });
   // Prevention owed: add recorded GitHub merge_conflict and branch_protection_failure payloads here.
   // These null-beforeCommit fixtures are synthetic; this repair runs without live GitHub access.
-  it('releases old unbound failures after a server-timestamped force push to the current head', () => {
+  it('a server-timestamped force push cannot bind an old unbound failure to a different head', () => {
     for (const reason of ['merge_conflict', 'branch_protection_failure', 'invalid_merge_commit']) {
-      expect(decide(timeline({ ...removed(reason), beforeCommit: null }, pushed()))).toEqual(released);
+      expectHold(decide(timeline({ ...removed(reason), beforeCommit: null }, pushed())), /no commit binding/i);
     }
   });
-  it('property: any number of older unbound failures cannot hold a proven new head forever', () => {
+  it('property: any number of failures bound to older heads cannot hold a different current head', () => {
     // Deterministically vary heads, event counts, timestamps and payload order.
     for (let seed = 1; seed <= 64; seed++) {
       const currentHead = seed.toString(16).padStart(40, '0');
       const events = Array.from({ length: seed % 20 + 1 }, (_, i) => ({
-        ...removed(i % 2 ? 'merge_conflict' : 'branch_protection_failure'), beforeCommit: null,
+        ...removed(i % 2 ? 'merge_conflict' : 'branch_protection_failure', prior),
         createdAt: new Date(Date.UTC(2026, 10, 1, 0, 0, i)).toISOString(),
       }));
       events.push(pushed(currentHead));
@@ -112,7 +113,7 @@ describe('merge-queue same-head failure admission', () => {
     expectHold(decide(timeline(pushed(), removed())), /failed_checks/);
     expectHold(decide(timeline({ ...removed(), beforeCommit: null }, pushed(),
       { ...removed(), beforeCommit: null, createdAt: '2026-11-01T14:00:00Z' })), /no commit binding/i);
-    expect(decide(timeline(pushed(head.toUpperCase()), { ...removed(), beforeCommit: null }))).toEqual(released);
+    expectHold(decide(timeline(pushed(head.toUpperCase()), { ...removed(), beforeCommit: null })), /no commit binding/i);
   });
   it('restoring a previously failed head does not erase its unbound failure', () => {
     const away = { ...pushed(prior, '2026-11-01T12:30:00Z'), beforeCommit: { oid: head } };
@@ -123,6 +124,11 @@ describe('merge-queue same-head failure admission', () => {
     expectHold(decide(timeline(failure, away, pushed())), /no commit binding/i);
     // A failure between the first introduction and a later restoration also stays held.
     expectHold(decide(timeline(pushed(head, '2026-11-01T11:00:00Z'), failure, pushed())), /no commit binding/i);
+  });
+  it('restoring a failed head after an invisible fast-forward detour retains its hold', () => {
+    // H -> J is a fast-forward, so the filtered timeline only records J -> H.
+    const failure = { ...removed('merge_conflict'), beforeCommit: null };
+    expectHold(decide(timeline(failure, pushed())), /no commit binding/i);
   });
   it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
     expectHold(decide(evidence), /unreadable/i);
@@ -202,6 +208,42 @@ describe('merge-queue same-head failure admission', () => {
     expect(exec).toHaveBeenCalledTimes(1);
     expect(exec.mock.calls[0][1].join(' ')).toContain('isInMergeQueue');
     expect(log).not.toHaveBeenCalled();
+  });
+  it('fresh admission cannot bypass failures even when another membership read reports queued', () => {
+    const exec = vi.fn((_command, args) => args.some(arg => arg.includes('isInMergeQueue'))
+      ? queueResponse(true) : response(timeline(removed()))), log = vi.fn();
+    expectHold(mqSameHeadGuard({ repo, pr, head, exec, log, allowAlreadyQueued: false }), /failed_checks/);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+  it.each([true, null, undefined, 'throws'])('mutation admission fails closed for decision %s', decision => {
+    const sameHeadAdmission = vi.fn(() => {
+      if (decision === 'throws') throw new Error('offline');
+      return decision === true ? { hold: true, line: 'mq-same-head-failed: failed_checks' } : decision;
+    });
+    const exec = vi.fn((command, args) => {
+      if (command === 'git') return `${prior}\trefs/heads/main\n`;
+      if (args.includes('view')) return JSON.stringify({ id: 'P', headRefOid: head, baseRefName: 'main' });
+      if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse(false);
+      throw new Error('unexpected mutation');
+    });
+    const result = enqueuePr({ repo, num: pr, headSha: head, cwd: '/fixture', exec, sameHeadAdmission,
+      preparedSurface: { headSha: head, base: 'main', baseSha: prior, files: ['README.md'] } });
+    expect(result).toMatchObject({ ok: false, held: true, reason: 'mq-same-head-failed' });
+    expect(sameHeadAdmission).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('enqueuePullRequest')))).toBe(false);
+  });
+  it('stable queued membership permits bookkeeping without consulting fresh mutation admission', () => {
+    const sameHeadAdmission = vi.fn(() => { throw new Error('must not run for bookkeeping'); });
+    const exec = vi.fn((command, args) => {
+      if (command === 'git') return `${prior}\trefs/heads/main\n`;
+      if (args.includes('view')) return JSON.stringify({ id: 'P', headRefOid: head, baseRefName: 'main' });
+      if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse(true);
+      throw new Error('unexpected mutation');
+    });
+    expect(enqueuePr({ repo, num: pr, headSha: head, cwd: '/fixture', exec, sameHeadAdmission,
+      preparedSurface: { headSha: head, base: 'main', baseSha: prior, files: ['README.md'] } })).toEqual({ ok: true, already: true });
+    expect(sameHeadAdmission).not.toHaveBeenCalled();
   });
   it.each([
     ['moved head', () => queueResponse(true, prior)],

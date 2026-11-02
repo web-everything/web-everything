@@ -368,7 +368,7 @@ export function createDrainMergeStrategy({
         return { allowed: !reason, reason, safety: safety.value, labels: labelSignature(live.labels), comments, preparedSurface };
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
-    enqueue(c, headSha, { comments = null, prepared = null } = {}) {
+    enqueue(c, headSha, { comments = null, prepared = null, sameHeadAdmission } = {}) {
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
@@ -563,7 +563,7 @@ export function createDrainMergeStrategy({
           return commented && labelled;
         } });
       if (poison) return poison;
-      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec,
+      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
         humanOnlyLicense: () => {
           const setting = resolveApprovalLicensesEnqueue({ env, readFile });
           say(`  human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
@@ -573,6 +573,7 @@ export function createDrainMergeStrategy({
         },
         ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
+        if (r.reason === 'mq-same-head-failed') return { enqueued: false, kind: r.reason, reason: r.error };
         if (r.humanOnly) {
           void appendDaemonEvent({ kind: 'needs-you', repo: slugOf(c.repo), pr: c.num, daemon: 'drain',
             detail: `Operator must re-approve the current head or queue it: ${r.licenseReason || r.error}` }, { env }).catch(() => {});

@@ -7,7 +7,6 @@ import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
-const mqEventTime = value => typeof value === 'string' ? Date.parse(value) : NaN;
 function mqSameHeadHold({ pr, head }, reason) {
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
   return { hold: true, line: `mq-same-head-failed: #${safe(pr)} head ${safe(head)} — ${safe(reason)}` };
@@ -22,15 +21,9 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
     return hold('unreadable merge-queue timeline; inspect timeline before retrying');
   if (timeline.hasPreviousPage)
     return hold('incomplete timeline at 100-event cap; operator must inspect full history before retrying');
-  // GitHub's force-push time proves a rebase happened after an unbound removal. Commit author/committer
-  // dates do not prove when the PR head changed. Use the first introduction, so restoring a previously
-  // failed SHA cannot erase its failure. Missing proof retains the operator-visible hold below.
-  const pushes = timeline.nodes.filter(event => event?.__typename === 'HeadRefForcePushedEvent').map(event => ({
-    before: mqOid(event.beforeCommit?.oid), after: mqOid(event.afterCommit?.oid), at: mqEventTime(event.createdAt),
-  }));
-  const firstIntroductionAt = Math.min(...pushes.filter(push => push.after === currentHead && push.before !== currentHead).map(push => push.at));
-  const newHeadAt = pushes.some(push => !push.before || !push.after || !Number.isFinite(push.at)
-    || (push.before === currentHead && push.at <= firstIntroductionAt)) ? NaN : firstIntroductionAt;
+  // Force-push events omit fast-forwards: a push TO this SHA can be a restoration of a failed head.
+  // Neither those events nor commit dates can bind an otherwise unbound removal to an older head.
+  // Retain the operator-visible hold; a live operator re-enqueue can still reach bookkeeping below.
   for (const event of timeline.nodes) {
     if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
@@ -38,9 +31,7 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
     if (reason === 'manual' || reason === 'merged') continue;
     const testedHead = mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid);
     if (!testedHead) {
-      const removedAt = mqEventTime(event.createdAt);
-      if (Number.isFinite(newHeadAt) && Number.isFinite(removedAt) && removedAt < newHeadAt) continue;
-      return hold('no commit binding for merge-queue removal; inspect timeline before retrying');
+      return hold('no commit binding for merge-queue removal; operator must inspect history and enqueue manually');
     }
     if (testedHead === currentHead) return hold(reason || 'unknown removal reason');
   }
@@ -77,15 +68,16 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
   }
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSync, log = () => {} } = {}) {
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSync, log = () => {}, allowAlreadyQueued = true } = {}) {
   // A human's live retry must reach the strategy's already-queued path and its follow-up/ledger writes.
-  // This only skips historical admission: the strategy still revalidates its normal safety evidence.
+  // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
+  // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
     ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
-    : queue.inQueue === true ? { hold: false, line: null }
+    : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
   if (decision.hold) log(decision.line);
   return decision;
