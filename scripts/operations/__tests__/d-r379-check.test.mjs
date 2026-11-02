@@ -911,7 +911,7 @@ describe('round 7 live hold chronology', () => {
   const event = (name, at, kind = 'labeled') => ({event:kind,label:{name},created_at:at});
   const check = (label, readLabelEvents) => checkPr(6223,deps({
     ...fixture(6223),labels:['red-team:clear','review:accepted',label],
-  },{readLabelEvents}));
+  },{readLabelEvents,readHeadPushedAt:async()=>'2026-11-02T09:45:00Z'}));
   it.each(['review:human','review:pending'])('%s applied after acceptance fails even before ledger mirror', async label => {
     const r = await check(label,()=>[
       event(label,'2026-11-02T09:00:00Z'),event(label,'2026-11-02T09:30:00Z','unlabeled'),
@@ -958,7 +958,11 @@ describe('round 7 live hold chronology', () => {
   it.each(['review:human','review:pending','red-team:blocked','review:changes','review:held-mechanical','advisory:x'])(
     'fails a %s hold applied after the head push and removed again', async label => {
     const r = await clean(()=>[event(label,'2026-11-02T09:40:00Z'),event(label,'2026-11-02T09:50:00Z','unlabeled')]);
-    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:[`hold applied since head push: ${label}`]});
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:[`hold applied or removed since head push: ${label}`]});
+  });
+  it('fails a hold applied before the head push and removed after it', async () => {
+    const r = await clean(()=>[event('red-team:blocked','2026-11-02T09:00:00Z'),event('red-team:blocked','2026-11-02T09:40:00Z','unlabeled')]);
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['hold applied or removed since head push: red-team:blocked']});
   });
   it('permits a hold applied and removed before the head push', async () => {
     const r = await clean(()=>[event('review:human','2026-11-02T09:00:00Z'),event('review:human','2026-11-02T09:10:00Z','unlabeled')]);
@@ -968,7 +972,7 @@ describe('round 7 live hold chronology', () => {
     const r = await checkPr(6223,deps({...fixture(6223),labels:['red-team:clear','review:accepted','review:pending']},{readLabelEvents:()=>[
       event('review:pending','2026-11-02T09:35:00Z'),event('review:pending','2026-11-02T09:36:00Z','unlabeled'),
       event('review:pending','2026-11-02T09:37:00Z')]}));
-    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['hold applied since head push: review:pending']});
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['hold applied or removed since head push: review:pending']});
   });
   it.each(['timeline throws','head time throws','head time malformed'])('is UNKNOWN when %s with no live hold', async kind => {
     const r = await clean(kind === 'timeline throws' ? ()=>{throw Error('x');} : ()=>[],

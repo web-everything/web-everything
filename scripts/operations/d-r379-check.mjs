@@ -173,7 +173,7 @@ async function reviewed(pr, head, base, deps) {
   if (!state.clears || state.reviewExempt || !state.verdict) return result(2, name, 'FAIL',
     ['verdict ledger does not accept the current head', ...state.holds.map(h => `${h.code}: ${h.reason}`)]);
   const liveHolds = labels.filter(isHold);
-  let applications = new Map(), sincePush = new Map();
+  let applications = new Map(), sincePush = new Map(), unlabeledSincePush = new Set();
   try {
     const pushed = Date.parse(await deps.readHeadPushedAt(pr, head));
     if (!Number.isFinite(pushed)) throw new Error('invalid head push time');
@@ -185,8 +185,9 @@ async function reviewed(pr, head, base, deps) {
         throw new Error('invalid label event');
       }
       const label = event.label.name;
-      if (event.event !== 'labeled' || !isHold(label)) continue;
+      if (!isHold(label)) continue;
       const at = Date.parse(event.created_at);
+      if (event.event === 'unlabeled') { if (at >= pushed) unlabeledSincePush.add(label); continue; }
       applications.set(label, Math.max(applications.get(label) ?? -Infinity, at));
       if (at >= pushed) sincePush.set(label, (sincePush.get(label) ?? 0) + 1);
     }
@@ -195,8 +196,10 @@ async function reviewed(pr, head, base, deps) {
     }
   } catch { return unknown(2, name, 'hold label timeline or head push time unavailable, incomplete or oversized'); }
   // A live hold accounts for its latest application; any other application since the push was removed again.
-  const removed = [...sincePush].filter(([label, count]) => count > (liveHolds.includes(label) ? 1 : 0)).map(([label]) => label);
-  if (removed.length) return result(2, name, 'FAIL', removed.map(label => `hold applied since head push: ${label}`));
+  // A hold removed since the push (even one applied before it) was lifted without a ledger release.
+  const removed = [...new Set([...unlabeledSincePush, ...[...sincePush]
+    .filter(([label, count]) => count > (liveHolds.includes(label) ? 1 : 0)).map(([label]) => label)])];
+  if (removed.length) return result(2, name, 'FAIL', removed.map(label => `hold applied or removed since head push: ${label}`));
   const later = liveHolds.filter(label => applications.get(label) >= Date.parse(current.at));
   if (later.length) return result(2, name, 'FAIL', later.map(label => `hold applied after acceptance: ${label}`));
   return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',
