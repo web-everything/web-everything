@@ -5,7 +5,7 @@
  *   global off allows, a per-branch allow-list entry allows, and under-limit allows — plus the smaller
  *   pure helpers (limit resolution, exemption matching, AI/label counting, override-state parse/expiry).
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -26,6 +26,7 @@ import {
   refusalReason, updateLimitState, writeLimitState,
 } from '../pr-limit.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
+import * as settingsFiles from '../settings-files.mjs';
 
 describe('resolvePrLimit', () => {
   it('defaults to the operator-set per-repo caps', () => {
@@ -217,7 +218,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, excludeCardOnly: true, cardOnly: 0, cardOnlyPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, excludeCardOnly: true, cardOnly: 0, cardOnlyPrNumbers: [], focus: 0, focusPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -251,7 +252,7 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   };
 
   it('defaults to excluding card-only PRs; the tool layer and env override it, in that order', () => {
-    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true, excludeStackedAwaitingBase: true });
+    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true, excludeStackedAwaitingBase: true, excludeFocus: true });
     expect(resolvePrLimitScope({})).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'default' } });
     expect(resolvePrLimitScope({ tool: { excludeCardOnly: false } })).toMatchObject({ excludeCardOnly: false, source: { excludeCardOnly: 'tool' } });
     expect(resolvePrLimitScope({ tool: { excludeCardOnly: 'no' } }).excludeCardOnly).toBe(true);
@@ -1120,7 +1121,7 @@ describe('non-implementing retry branch grants', () => {
 describe('excludeFocus — operator R384: focus PRs are exempt from the cap (explicit ref list or `focus` label, never the title)', () => {
   const row = (n, extra = {}) => ({ number: n, labels: [], isCrossRepository: false, headRefName: `lane/p${n}`, files: [{ path: 'scripts/x.mjs' }], ...extra });
   const commitsPage = (commits) => JSON.stringify({ data: { repository: { pullRequest: { commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: commits.map((commit) => ({ commit })) } } } } });
-  const aiCommit = { message: 'x\n\nCo-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } };
+  const aiCommit = { messageHeadline: 'Implement feature', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } };
   const execFor = (rows) => (args) => {
     if (args[1] === 'list') return JSON.stringify(rows);
     if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
@@ -1147,8 +1148,8 @@ describe('excludeFocus — operator R384: focus PRs are exempt from the cap (exp
   });
 
   it('never infers focus from the title or a ref that merely contains a listed one', () => {
-    const rows = [row(1, { title: 'focus: fix the thing' }), row(2, { headRefName: 'lane/p1-extra' })];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p1'] }) });
+    const rows = [row(1, { title: 'focus: fix the thing' }), row(2, { headRefName: 'lane/p5-extra' })];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p5'] }) });
     expect(r).toMatchObject({ count: 2, focus: 0, focusPrNumbers: [] });
   });
 
@@ -1172,5 +1173,90 @@ describe('excludeFocus — operator R384: focus PRs are exempt from the cap (exp
     expect(decideOpenPr({ ...base, branch: 'lane/g', focusRefs: ['lane/f'] }).allowed).toBe(false);
     expect(decideOpenPr({ ...base, branch: 'lane/f', focusRefs: ['lane/f'], excludeFocus: false }).allowed).toBe(false);
     expect(decideOpenPr({ ...base, branch: null, focusRefs: ['lane/f'] }).allowed).toBe(false);
+  });
+});
+
+
+describe('R384 focus regression guarantees', () => {
+  const row = (number, extra = {}) => ({ number, labels: [], isCrossRepository: false,
+    headRefName: `lane/r384-${number}`, baseRefName: 'main', files: [{ path: 'scripts/x.mjs' }], ...extra });
+  const scope = (extra = {}) => ({ excludeCardOnly: true, excludeStackedAwaitingBase: true,
+    excludeFocus: true, focusRefs: ['lane/r384-1'], ...extra });
+  const count = (rows, extra = {}) => {
+    const commitsReads = [];
+    const exec = (args) => {
+      if (args[1] === 'list') return JSON.stringify(rows);
+      if (args[0] === 'api' && args[1] === 'graphql') {
+        commitsReads.push(Number(args.find((arg) => arg.startsWith('number=')).slice(7)));
+        return JSON.stringify({ data: { repository: { pullRequest: { commits: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{ commit: { messageHeadline: 'Implement feature',
+            messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } } }],
+        } } } } });
+      }
+      throw new Error(`unexpected call: ${JSON.stringify(args)}`);
+    };
+    const result = countOpenPrsForRepo('we', { exec, env: {}, scope: scope(extra) });
+    return { result, commitsReads };
+  };
+
+  it('excludes exact upstream refs and focus labels without any commits lookup for either', () => {
+    const { result, commitsReads } = count([row(1), row(2, { labels: [{ name: 'focus' }] }), row(3)]);
+    expect(result).toMatchObject({ count: 1, prNumbers: [3], focus: 2, focusPrNumbers: [1, 2], unresolved: 0 });
+    expect(commitsReads).toEqual([3]);
+  });
+
+  it('counts fork heads, unknown repository identity, near-match refs and title-only matches', () => {
+    const { result, commitsReads } = count([
+      row(1, { isCrossRepository: true }), row(2, { headRefName: 'lane/r384-1-extra' }),
+      row(3, { title: 'focus: feature' }), row(4, { isCrossRepository: undefined, headRefName: 'lane/r384-1' }),
+    ]);
+    expect(result).toMatchObject({ count: 4, prNumbers: [1, 2, 3, 4], focus: 0, focusPrNumbers: [] });
+    expect(commitsReads).toEqual([1, 2, 3, 4]);
+  });
+
+  it('exempts a labelled fork independently of the upstream-only ref list', () => {
+    const { result, commitsReads } = count([row(1, { isCrossRepository: true, labels: [{ name: 'focus' }] })]);
+    expect(result).toMatchObject({ count: 0, prNumbers: [], focus: 1, focusPrNumbers: [1] });
+    expect(commitsReads).toEqual([]);
+  });
+
+  it('counts listed refs and labelled PRs when focus exclusion is disabled', () => {
+    const { result, commitsReads } = count([row(1), row(2, { labels: [{ name: 'focus' }] })], { excludeFocus: false });
+    expect(result).toMatchObject({ count: 2, prNumbers: [1, 2], focus: 0, focusPrNumbers: [] });
+    expect(commitsReads).toEqual([1, 2]);
+  });
+
+  it('counts a stacked child of a focus base without looking up the excluded base', () => {
+    const { result, commitsReads } = count([row(1), row(2, {
+      baseRefName: 'lane/r384-1', labels: [{ name: 'review-status:awaiting-base' }],
+    })]);
+    expect(result).toMatchObject({ count: 1, prNumbers: [2], focus: 1, focusPrNumbers: [1], stacked: 0, stackedPrNumbers: [] });
+    expect(commitsReads).toEqual([2]);
+  });
+
+  it('keeps accepted focus PRs in the accepted split and never reads their commits', () => {
+    const { result, commitsReads } = count([row(1, { labels: [{ name: 'focus' }, { name: 'review:accepted' }] })]);
+    expect(result).toMatchObject({ count: 0, prNumbers: [], focus: 0, focusPrNumbers: [], accepted: 1, acceptedPrNumbers: [1] });
+    expect(commitsReads).toEqual([]);
+  });
+
+  it.each([
+    ['tool setting', false, 'true'],
+    ['environment override', true, 'false'],
+  ])('default invocation respects disabled focus exclusion via %s with configured focusRefs', (_, enabled, override) => {
+    // The tool case must have no environment override; the other case overrides an enabled tool setting.
+    const read = vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({ prLimit: {
+      excludeFocus: enabled, focusRefs: ['lane/r384-1'],
+    } });
+    vi.stubEnv('WE_PR_LIMIT_EXCLUDE_FOCUS', enabled ? override : undefined);
+    try {
+      expect(decideOpenPr({ repoKey: 'we', limit: 15, openCount: 15, branch: 'lane/r384-1' }))
+        .toMatchObject({ allowed: false, exempt: false, overridden: false });
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      read.mockRestore();
+      vi.unstubAllEnvs();
+    }
   });
 });
