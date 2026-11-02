@@ -143,11 +143,71 @@ export function checkProjectionKey(event) {
     sha ? null : [...(event.prs || [])].sort((a, b) => a - b)]);
 }
 
+const isPrEvent = (e) => e.type === 'pull_request' || e.type === 'bootstrap';
+const fieldDelivered = (e, row, field) => isPrEvent(e) && row.fields[field] === e.seq;
+const checkKind = (field, type) => ({
+  present: (row) => Array.isArray(row[field]) && row[field].length > 0,
+  ids: (row) => row[field].map(checkProjectionKey),
+  rehydrates: (e, _row, loss) => e.type === type && checkProjectionKey(e) === loss.id,
+});
+
+/** All evidence carried by a PR projection. Null/default placeholders are not received evidence.
+ * Rehydration describes actual replacement, including bootstrap field-clock acceptance.
+ */
+export const EVIDENCE_KINDS = Object.freeze({
+  checks: checkKind('checks', 'check_run'),
+  suites: checkKind('suites', 'check_suite'),
+  review: { present: (r) => r.review != null, rehydrates: (e) => e.type === 'pull_request_review' },
+  labels: { present: (r) => Array.isArray(r.labels),
+    rehydrates: (e, r) => Array.isArray(e.labels) && fieldDelivered(e, r, 'labels') },
+  labelChanges: { present: (r) => Object.keys(r.labelChanges || {}).length > 0,
+    ids: (r) => Object.keys(r.labelChanges),
+    rehydrates: (e, r, loss) => isPrEvent(e) && ((Array.isArray(e.labels) && fieldDelivered(e, r, 'labels')) ||
+      (e.label === loss.id && !e.labels && r.fields.labels === e.seq)) },
+  draft: { present: (r) => typeof r.draft === 'boolean',
+    rehydrates: (e, r) => fieldDelivered(e, r, 'draft') },
+});
+export const NON_EVIDENCE_FIELDS = Object.freeze([
+  'repo', 'number', 'sha', 'state', 'merged', 'seq', 'fields', 'updatedAt', 'evidenceLost',
+]);
+
+const mergeLoss = (...lists) => [...new Map(lists.flat().map((loss) => [JSON.stringify(loss), loss])).values()];
+
+/** The single coverage predicate for Worker and mirrors; malformed persisted markers fail closed too. */
+export function evidenceCovered(row) {
+  return row != null && (row.evidenceLost === undefined ||
+    (Array.isArray(row.evidenceLost) && row.evidenceLost.length === 0));
+}
+
+/** Preserve existing losses as well as every kind of evidence about to be deleted. */
+export function markPrunedEvidence(row) {
+  const lost = [...(row.evidenceLost || [])];
+  for (const [kind, rule] of Object.entries(EVIDENCE_KINDS)) {
+    if (!rule.present(row)) continue;
+    if (rule.ids) for (const id of rule.ids(row)) lost.push({ kind, id });
+    else lost.push({ kind });
+  }
+  return mergeLoss(lost);
+}
+
+/** Resolve retained markers on reads too, including open rows persisted by older Worker versions. */
+const evidenceLossIndex = (storage) => new Map(storage.listProjection('evidenceLoss', true).map(({ key, value }) => [key, value]));
+
+function withEvidenceLoss(markers, row) {
+  const losses = [
+    markers.get(JSON.stringify([row.repo, row.number]))?.evidenceLost || [],
+    row.sha ? markers.get(JSON.stringify([row.repo, row.sha]))?.evidenceLost || [] : [],
+  ];
+  if (losses.some((list) => list.length)) return { ...row, evidenceLost: mergeLoss(row.evidenceLost || [], ...losses) };
+  return row;
+}
+
 /** Fold only received evidence. Field clocks protect concurrent bootstrap imports. */
 export function foldObservation(storage, observed, now = Date.parse(observed.at)) {
   // GitHub spells a repo one way, an operator may type another: the projection identifies a repo case-insensitively.
   const event = { ...observed, repo: String(observed.repo).toLowerCase() };
   const { repo, seq, sha, type } = event;
+  const evidenceLostByPr = {};
   const key = (...parts) => JSON.stringify(parts);
   const put = (bucket, k, value) => storage.putProjection(bucket, k, value);
   const get = (bucket, k) => storage.getProjection(bucket, k);
@@ -157,7 +217,16 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
     // A check run is identified by name AND app: two apps may report the same name for the same SHA.
     const checkKey = checkProjectionKey(event);
     const previous = get('checks', checkKey);
-    if (get('prunedEvidence', checkKey)) storage.deleteProjection('prunedEvidence', checkKey); // re-delivered: evidence is whole again
+    // Redelivery repairs this exact check identity everywhere, including unopened tombstones.
+    for (const bucket of ['evidenceLoss', 'tombstones']) {
+      for (const { key: markerKey, value: marker } of storage.listProjection(bucket, true)) {
+        if (marker.repo !== repo || !Array.isArray(marker.evidenceLost)) continue;
+        const evidenceLost = marker.evidenceLost.filter((loss) =>
+          !EVIDENCE_KINDS[loss.kind]?.rehydrates(event, {}, loss));
+        if (bucket === 'evidenceLoss' && !evidenceLost.length) storage.deleteProjection(bucket, markerKey);
+        else put(bucket, markerKey, { ...marker, evidenceLost });
+      }
+    }
     put('checks', checkKey, { ...event, prs: [...new Set([...(previous?.prs || []), ...(event.prs || [])])] });
   }
   const associated = sha ? get('shas', key(repo, sha)) || [] : [];
@@ -170,6 +239,16 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
     const row = get('prs', rowKey) || { repo, number, sha: null, draft: null, labels: null,
       state: tombstone ? 'closed' : null, merged: tombstone?.merged ?? null, review: null, checks: [], suites: [],
       seq: tombstone?.closedSeq ?? 0, fields: tombstone ? { state: tombstone.closedSeq, merged: tombstone.closedSeq } : {}, labelChanges: {} };
+    // PR markers outlive close-clock tombstones; SHA markers also fence later PR associations.
+    const inherited = mergeLoss(
+      tombstone?.evidenceLost || [], get('evidenceLoss', rowKey)?.evidenceLost || [],
+      sha ? get('evidenceLoss', key(repo, sha))?.evidenceLost || [] : [],
+      observed.evidenceLostByPr?.[number] || []);
+    if (inherited.length) {
+      row.evidenceLost = mergeLoss(row.evidenceLost || [], inherited);
+      // The append serializes this annotation after folding, so /events mirrors see the same loss.
+      evidenceLostByPr[number] = row.evidenceLost;
+    }
     const assign = (field, value) => {
       if (value !== undefined && (type !== 'bootstrap' || (row.fields[field] || 0) <= event.baseCursor)) {
         row[field] = value; row.fields[field] = seq;
@@ -199,11 +278,20 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
       } else assign('state', event.state);
     }
     if (type === 'pull_request_review') row.review = { sha, state: event.state, action: event.action, seq };
+    if (Array.isArray(row.evidenceLost)) {
+      row.evidenceLost = row.evidenceLost.filter((loss) => !EVIDENCE_KINDS[loss.kind]?.rehydrates(event, row, loss));
+      if (get('evidenceLoss', rowKey)) {
+        if (evidenceCovered(row)) storage.deleteProjection('evidenceLoss', rowKey);
+        else put('evidenceLoss', rowKey, { repo, number, evidenceLost: row.evidenceLost });
+      }
+      if (tombstone) put('tombstones', rowKey, { ...tombstone, evidenceLost: row.evidenceLost });
+    }
     row.seq = Math.max(row.seq, seq);
     if (Number.isFinite(now)) row.updatedAt = now;
     if (tombstone && row.state === 'open') storage.deleteProjection('tombstones', rowKey);
     put('prs', rowKey, row);
   }
+  return evidenceLostByPr;
 }
 
 /** Remove expired closed rows and their exclusive evidence; shared SHA/check attachments survive. */
@@ -223,8 +311,10 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
     if (!expired.has(row.repo)) expired.set(row.repo, new Set());
     expired.get(row.repo).add(row.number);
     if (row.sha) deadShas.add(JSON.stringify([row.repo, row.sha]));
+    const evidenceLost = markPrunedEvidence(row);
+    if (evidenceLost.length) storage.putProjection('evidenceLoss', key, { repo: row.repo, number: row.number, evidenceLost });
     storage.putProjection('tombstones', key, { repo: row.repo, number: row.number, state: 'closed', merged: row.merged ?? null,
-      closedSeq: row.fields?.state ?? row.seq ?? 0, prunedAt: now });
+      closedSeq: row.fields?.state ?? row.seq ?? 0, prunedAt: now, ...(evidenceLost.length ? { evidenceLost } : {}) });
     remember(row.fields?.state ?? row.seq ?? 0);
     storage.deleteProjection('prs', key);
   }
@@ -249,7 +339,17 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
     const associated = c.sha && storage.getProjection('shas', shaKey);
     if (!kept.length && !(Array.isArray(associated) && associated.length)) {
       // Deleting evidence must stay visible: a PR reopened on this SHA is not covered until the check is re-delivered.
-      if (c.sha) storage.putProjection('prunedEvidence', key, { repo: c.repo, sha: c.sha, prunedAt: now });
+      const evidenceLost = markPrunedEvidence({ [c.type === 'check_run' ? 'checks' : 'suites']: [c] });
+      const mark = (markerKey, identity) => {
+        const previous = storage.getProjection('evidenceLoss', markerKey);
+        storage.putProjection('evidenceLoss', markerKey, { ...identity,
+          evidenceLost: mergeLoss(previous?.evidenceLost || [], evidenceLost) });
+        const tombstone = storage.getProjection('tombstones', markerKey);
+        if (tombstone) storage.putProjection('tombstones', markerKey, { ...tombstone,
+          evidenceLost: mergeLoss(tombstone.evidenceLost || [], evidenceLost) });
+      };
+      if (c.sha) mark(shaKey, { repo: c.repo, sha: c.sha });
+      for (const number of prs) mark(JSON.stringify([c.repo, number]), { repo: c.repo, number });
       storage.deleteProjection('checks', key);
     }
     else storage.putProjection('checks', key, { ...c, prs: kept });
@@ -263,6 +363,7 @@ const isPrRow = (r) => isObject(r) && isRepo(r.repo) && Number.isInteger(r.numbe
 const comparePrKey = (a, b) => a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : a.number - b.number;
 
 export function projectPrRows(storage, malformed = () => { throw new Error('malformed PR projection'); }) {
+  const markers = evidenceLossIndex(storage);
   // One pass over checks, one SHA→PRs lookup per distinct (repo, sha): bounded by distinct SHAs, never PRs × checks.
   const byPr = new Map();
   const shaPrs = new Map();
@@ -292,7 +393,7 @@ export function projectPrRows(storage, malformed = () => { throw new Error('malf
   }
   return storage.listProjection('prs').flatMap((stored) => {
     if (!isPrRow(stored)) { malformed(stored); return []; }
-    const { fields, ...row } = stored;
+    const { fields, ...row } = withEvidenceLoss(markers, stored);
     const matches = [...(byPr.get(JSON.stringify([row.repo, row.number])) || [])];
     return [{ ...row, seq: matches.reduce((seq, c) => Math.max(seq, c.seq || 0), row.seq || 0),
       checks: matches.filter((c) => c.type === 'check_run'), suites: matches.filter((c) => c.type === 'check_suite') }];
@@ -328,6 +429,14 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
   tombstoneRetentionMs = DEFAULT_TOMBSTONE_RETENTION_MS } = {}) {
   const head = () => Number(storage.getMeta('head') || 0);
   storage.transaction(() => {
+    for (const { key, value: legacy } of storage.listProjection('prunedEvidence', true)) {
+      const [, , type] = JSON.parse(key);
+      const markerKey = JSON.stringify([legacy.repo, legacy.sha]);
+      const previous = storage.getProjection('evidenceLoss', markerKey);
+      storage.putProjection('evidenceLoss', markerKey, { repo: legacy.repo, sha: legacy.sha,
+        evidenceLost: mergeLoss(previous?.evidenceLost || [], [{ kind: type === 'check_suite' ? 'suites' : 'checks', id: key }]) });
+      storage.deleteProjection('prunedEvidence', key);
+    }
     if (!storage.getMeta('projectionVersion')) {
       const boundary = storage.minSeq();
       for (const body of storage.range(0, Number.MAX_SAFE_INTEGER)) foldObservation(storage, JSON.parse(body));
@@ -343,12 +452,13 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       if (record.id && storage.hasDelivery(record.id)) return { seq: null, duplicate: true };
       const seq = head() + 1;
       const stored = { ...record, seq };
-      storage.insert(seq, record.id || null, now, JSON.stringify(stored));
       storage.setMeta('head', String(seq));
       storage.setMeta('lastEventAt', String(now));
       // Per-repo clock: only this repo's own events ever move it (R417).
       if (typeof record.repo === 'string' && record.repo) storage.putProjection('repoEvents', record.repo.toLowerCase(), { repo: record.repo.toLowerCase(), lastEventAt: now });
-      foldObservation(storage, stored, now);
+      const evidenceLostByPr = foldObservation(storage, stored, now);
+      if (Object.keys(evidenceLostByPr).length) stored.evidenceLostByPr = evidenceLostByPr;
+      storage.insert(seq, record.id || null, now, JSON.stringify(stored));
       pruneProjection(storage, now, prRetentionMs, tombstoneRetentionMs);
       storage.prune(seq - maxEvents, now - retentionMs);
       return { seq, duplicate: false };
@@ -427,6 +537,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         response.repos[repo].coverage = false;
       };
       incomplete.forEach(failClosed);
+      projected.filter((r) => r.state === 'open' && !evidenceCovered(r)).forEach((r) => failClosed(r.repo));
       if (truncated.unattributed || badCoverage) Object.keys(response.repos).forEach(failClosed);
       const drop = (row) => {
         truncated.rows += 1;
@@ -489,8 +600,8 @@ function repoFreshness(storage, head, now) {
   const oldest = storage.minSeq();
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
   const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i]));
-  const openRows = storage.listProjection('prs').filter((r) => isPrRow(r) && r.state === 'open');
-  const pruned = new Set(storage.listProjection('prunedEvidence').filter(isObject).map((e) => JSON.stringify([e.repo, e.sha])));
+  const markers = evidenceLossIndex(storage);
+  const openRows = storage.listProjection('prs').filter((r) => isPrRow(r) && r.state === 'open').map((r) => withEvidenceLoss(markers, r));
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
   const out = {};
   for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
@@ -502,8 +613,8 @@ function repoFreshness(storage, head, now) {
     // Open rows the Worker holds that the latest COMPLETE listing left out (rows a later event touched are newer, not omitted).
     const omittedOpen = b && b.status === 'complete' ? openRows.filter((r) => r.repo === repo && (r.fields?.state || 0) <= b.baseCursor &&
       !(imports.get(repo)?.listed || []).includes(r.number)).map((r) => r.number).sort((x, y) => x - y) : [];
-    // An open row on a SHA whose check evidence was pruned cannot prove its checks: this repo is not covered.
-    const lostEvidence = openRows.some((r) => r.repo === repo && r.sha && pruned.has(JSON.stringify([r.repo, r.sha])));
+    // Any lost evidence on an open row makes the repository incomplete.
+    const lostEvidence = openRows.some((r) => r.repo === repo && !evidenceCovered(r));
     out[repo] = { bootstrapAt, lastEventAt, omittedOpen, coverage: !lostEvidence && !omittedOpen.length && !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
       (imports.get(repo)?.others || []).every((c) => c < b.baseCursor) };
   }

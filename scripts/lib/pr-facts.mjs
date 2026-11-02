@@ -48,9 +48,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry } from './gh-throttle.mjs';
 import { PR_EVENTS_DEFAULTS, PR_EVENTS_FLAG_ENV, classifyFeedHealth, resolvePrEventsConfig } from './pr-events.mjs';
-import { checkProjectionKey, foldObservation, projectPrRows } from '../conveyor/pr-events-worker/core.mjs';
+import { checkProjectionKey, foldObservation, projectPrRows, evidenceCovered } from '../conveyor/pr-events-worker/core.mjs';
 
-export const PR_FACTS_VERSION = 1;
+// Older mirrors could bless reopened rows without any loss annotation. Force a fresh baseline.
+export const PR_FACTS_VERSION = 2;
 export const PR_FACTS_DISABLE_ENV = 'WE_PR_FACTS';
 export const PR_FACTS_DIR_ENV = 'WE_PR_FACTS_DIR';
 export const PR_FACTS_TTL_ENV = 'WE_PR_FACTS_TTL_MS';
@@ -243,6 +244,7 @@ export function lookupInMirror(mirror, { number, nowMs, ttlMs, staleAfterMs }) {
   if (!verdict.ok) return { facts: null, reason: verdict.reason };
   const row = mirrorRows(mirror).find((r) => r.number === Number(number));
   if (!row) return { facts: null, reason: 'no-row' };
+  if (!evidenceCovered(row)) return { facts: null, reason: 'evidence-lost' };
   if (!row.sha || !row.state || row.draft == null || !Array.isArray(row.labels)) return { facts: null, reason: 'incomplete-row' };
   return { facts: { ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor } };
 }
@@ -325,7 +327,8 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
           continue retry; // Discard every row and cursor from the interrupted pull.
         }
         if (body.truncated?.unattributed > 0 || (body.truncated?.repos?.[repoKey(repo)] || 0) > 0 ||
-            current.coverage === false || body.repos[repoKey(repo)].omittedOpen?.length > 0) throw new Error('incomplete /prs coverage');
+            current.coverage === false || body.repos[repoKey(repo)].omittedOpen?.length > 0 ||
+            body.prs.some((row) => repoKey(row.repo) === repoKey(repo) && row.state === 'open' && !evidenceCovered(row))) throw new Error('incomplete /prs coverage');
         first ??= body; snapshot ??= current;
         prs.push(...body.prs);
         if (!body.prsMore) return seedMirror({ repo, body: { ...first, prs }, nowMs });
@@ -429,8 +432,10 @@ export async function readPrFacts(opts = {}) {
 export async function readRepoFacts({ repo, caller = null, env = process.env, now = () => Date.now(), ...o } = {}) {
   const { mirror, settings } = await loadMirror({ repo, env, now, ...o });
   if (!mirror || !judgeMirror(mirror, { nowMs: now(), ...settings }).ok) return null;
-  const prs = mirrorRows(mirror)
-    .filter((row) => row.sha && row.state && row.draft != null && Array.isArray(row.labels))
+  const rows = mirrorRows(mirror);
+  if (rows.some((row) => row.state === 'open' && !evidenceCovered(row))) return null;
+  const prs = rows
+    .filter((row) => evidenceCovered(row) && row.sha && row.state && row.draft != null && Array.isArray(row.labels))
     .map((row) => ({ ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor }))
     .sort((a, b) => a.number - b.number);
   logFactsHit(env, caller || deriveGhCaller({}, env), repoKey(repo), prs.length);
