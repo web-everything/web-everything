@@ -6,12 +6,42 @@
  * code touched".
  */
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import yaml from 'js-yaml';
 import { REPO_ROOT } from '../shard-files.mjs';
 
 const CI_YML = join(REPO_ROOT, '.github', 'workflows', 'ci.yml');
+
+function scopeStep() {
+  return yaml.load(readFileSync(CI_YML, 'utf8')).jobs['daemon-soak-scope'].steps.find(({ id }) => id === 'scope');
+}
+
+/** Execute the shipped scope script with hermetic Git diff evidence; never touch a Git repository. */
+function runScope({ event, light = '', changed = '', diffStatus = 0 }) {
+  const dir = mkdtempSync(join(tmpdir(), 'daemon-soak-scope-'));
+  const output = join(dir, 'output');
+  const calls = join(dir, 'git-calls');
+  try {
+    const result = spawnSync('bash', ['-e', '-c', `
+git() {
+  printf '%s\\n' "$*" >> "$GIT_CALLS"
+  printf '%s\\n' "$CHANGED_FILES"
+  return "$DIFF_STATUS"
+}
+${scopeStep().run}`], {
+      encoding: 'utf8',
+      env: { ...process.env, EVENT_NAME: event, LIGHT: light, BASE_SHA: 'base', HEAD_SHA: 'head',
+        CHANGED_FILES: changed, DIFF_STATUS: String(diffStatus), GITHUB_OUTPUT: output, GIT_CALLS: calls },
+    });
+    const read = (path) => existsSync(path) ? readFileSync(path, 'utf8') : '';
+    return { status: result.status, output: read(output), gitCalls: read(calls) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 /** The `run: |` body of the `daemon-soak` job's "Gate on shard results" step, de-indented. */
 function gateScript() {
@@ -98,8 +128,49 @@ describe('daemon-soak runs on main pushes, not only on PRs', () => {
     }
   });
 
-  it('on a non-PR event the scope step always says run (no path filter on main)', () => {
-    const yml = readFileSync(CI_YML, 'utf8');
-    expect(yml).toContain(`if [ "\${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi`);
+  it('passes event and skip evidence through env without interpolating expressions into shell', () => {
+    const step = scopeStep();
+    expect(step.env).toEqual({
+      EVENT_NAME: '${{ github.event_name }}',
+      LIGHT: '${{ needs.changes.outputs.light }}',
+      BASE_SHA: '${{ github.event.pull_request.base.sha }}',
+      HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
+    });
+    expect(step.run).not.toContain('${{');
+  });
+
+  it('skips the soak without a path diff for an explicitly queue-tested push', () => {
+    expect(runScope({ event: 'push', light: 'true' })).toEqual({
+      status: 0, output: 'run=false\n', gitCalls: '',
+    });
+  });
+
+  it.each(['', 'false', 'unknown'])('runs the soak on a push with light=%j (no path filter on main)', (light) => {
+    expect(runScope({ event: 'push', light })).toEqual({
+      status: 0, output: 'run=true\n', gitCalls: '',
+    });
+  });
+
+  it.each(['merge_group', 'schedule', 'workflow_dispatch'])('always runs the soak for %s even with light evidence', (event) => {
+    for (const light of ['', 'false', 'true']) {
+      expect(runScope({ event, light })).toEqual({ status: 0, output: 'run=true\n', gitCalls: '' });
+    }
+  });
+
+  it.each([
+    ['scripts/conveyor/worker.mjs', 'true'],
+    ['skills-src/conveyor/SKILL.md', 'true'],
+    ['backlog/card.md', 'false'],
+  ])('keeps the PR path filter for %s even with light evidence', (changed, run) => {
+    expect(runScope({ event: 'pull_request', light: 'true', changed })).toEqual({
+      status: 0, output: `run=${run}\n`, gitCalls: 'diff --name-only --no-renames base...head --\n',
+    });
+  });
+
+  it('fails closed if the PR diff fails, without emitting a skip', () => {
+    const result = runScope({ event: 'pull_request', diffStatus: 1 });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toBe('');
+    expect(result.gitCalls).toBe('diff --name-only --no-renames base...head --\n');
   });
 });
