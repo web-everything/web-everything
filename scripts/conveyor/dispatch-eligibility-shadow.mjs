@@ -12,7 +12,7 @@ const validMode = value => value === 'off' || value === 'shadow';
 let loggedMode = false;
 
 /** dispatch.eligibility.mode: standard → platform → tool → environment. */
-export function resolveShadowMode(env = process.env, { platform, tool, hermetic = isUnderTestEnv(), log = console.info } = {}) {
+export function resolveShadowMode(env = process.env, { platform, tool, hermetic = isUnderTestEnv(), log = console.error } = {}) {
   if (platform === undefined && !hermetic) platform = platformPreference('dispatch', { env })?.eligibility;
   if (tool === undefined) tool = readSettings()?.dispatch?.eligibility;
   const raw = env.WE_DISPATCH_ELIGIBILITY_MODE;

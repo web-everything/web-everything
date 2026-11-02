@@ -1,5 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 // Deliberately missing in slice 3 step 1: collection must fail here until implementation.
 import { resolveShadowMode, runEligibilityShadow, createBoundedShadowLog, eligibilityShadowDeps } from '../dispatch-eligibility-shadow.mjs';
@@ -297,5 +299,16 @@ describe('shadow wiring in existing dispatch paths', () => {
       expect(boom).toHaveBeenCalled();
       expect(shadowDeps.onError).toHaveBeenCalledTimes(1);
     }
+  });
+});
+
+describe('shadow mode line never pollutes machine-readable stdout', () => {
+  it('default logger writes to stderr so a JSON stdout still parses', () => {
+    const mod = fileURLToPath(new URL('../dispatch-eligibility-shadow.mjs', import.meta.url));
+    const code = `import(${JSON.stringify(mod)}).then(m => { m.resolveShadowMode({}, { platform: {}, tool: {}, hermetic: true }); process.stdout.write(JSON.stringify({ ok: true })); });`;
+    const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8' });
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ ok: true });
+    expect(r.stderr).toContain('dispatch.eligibility.mode=');
   });
 });
