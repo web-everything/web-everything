@@ -81,6 +81,7 @@
  *
  *   node scripts/codex-direct-task.mjs --task="…" --detach
  *   node scripts/codex-direct-task.mjs wait --job=<id> [--max-ms=540000]
+ *     Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms>.
  *
  * Flags: --detach (return a job id immediately), --task=<text> | --task-file=<path> (one required), --dir=<existing dir> (default: fresh scratch
  * clone), --repo-root=<path> (default: this script's own repo root — where a scratch clone is cloned FROM),
@@ -1562,6 +1563,7 @@ async function main() {
       + '    fix keeps its context. Requires --dir; not with --output-schema-file or --ephemeral.\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
+      + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
       + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
       + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
@@ -1581,12 +1583,12 @@ async function main() {
   }
   if (isWaitInvocation(args)) {
     let maxMs;
-    try { maxMs = jobWaitBudget(flags['max-ms']); }
+    try { maxMs = jobWaitBudget(flags['max-ms'] ?? flags.wait); }
     catch (error) {
       writeLineSync(2, error.message);
       process.exit(2);
     }
-    const { code, ...result } = await waitForJob({ jobId: flags.job, maxMs });
+    const { code, ...result } = await waitForJob({ jobId: flags.job ?? flags.id, maxMs });
     // Pending filesystem requests must not keep a timed-out wait CLI alive.
     writeLineSync(1, JSON.stringify(result));
     process.exit(code);

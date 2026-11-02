@@ -36,7 +36,7 @@
  *     IMMEDIATELY too — waiting longer can never change any of those. A bounded "timeout" is returned only if it is
  *     still `running` when <ms> elapses (clamped to the total verify budget — see MAX_SAFE_WAIT_MS /
  *     waitForVerifySettle in lib/lane-verify.mjs; a dispatched agent keeps each call under its Bash `timeout` by
- *     using `--wait=540000` and re-running on `timeout`). Replaces the old "request, then `check` again
+ *     using `--wait=150000` (150000 ms is the agent max) and re-running on `timeout`). Replaces the old "request, then `check` again
  *     next turn, repeat" loop with ONE blocking call per wait: same sanctioned `check` subcommand
  *     (`we:scripts/guard-bash.mjs`'s allowlist matches on the subcommand word, not the flags after it, so this needed
  *     no guard change), just a flag that does the polling for you instead of handing it back to the caller's own turn
@@ -219,6 +219,9 @@ if (MODE === 'check') {
     const requestedMs = typeof flags.wait === 'string' ? Number(flags.wait) : NaN;
     if (!Number.isFinite(requestedMs) || requestedMs <= 0) {
       emit({ sha: headSha, status: 'error', reason: 'bad-wait', ok: false, detail: `--wait must be given as --wait=<ms> (a positive number of milliseconds), got ${JSON.stringify(flags.wait)}.` }, 3);
+    }
+    if (requestedMs > 170000) {
+      process.stderr.write(`⚠ --wait=${requestedMs} exceeds 170000 ms: agent Bash calls over ~180s are auto-backgrounded. Use --wait=150000 repeated in separate foreground calls; this warning does not shorten the wait.\n`);
     }
     const ceilingMs = resolveWaitCeilingMs(requestedMs);
     if (ceilingMs < requestedMs) {
