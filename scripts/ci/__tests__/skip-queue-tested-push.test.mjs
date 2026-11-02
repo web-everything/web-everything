@@ -5,19 +5,31 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { decideQueueTestedSkip, MAX_RUNS_CHECKED } from '../skip-queue-tested-push.mjs';
+import { decideQueueTestedSkip, MAX_RUNS_CHECKED, QUARANTINE_SETTLE_MS } from '../skip-queue-tested-push.mjs';
 
 const sha = 'a'.repeat(40);
 const pushTree = 'b'.repeat(40);
 const otherSha = 'c'.repeat(40);
 const otherTree = 'd'.repeat(40);
+const quarantineTip = 'f'.repeat(40);
+const RUN_CREATED = '2026-10-31T12:00:00Z';
+const NOW = Date.parse('2026-10-31T12:30:00Z');
+const OLD_LIST_TIME = '2026-10-30T12:00:00Z';
 const run = (head_sha = otherSha, overrides = {}) => ({
-  head_sha, conclusion: 'success', created_at: '2026-10-31T12:00:00Z', ...overrides,
+  head_sha, conclusion: 'success', created_at: RUN_CREATED, ...overrides,
 });
+// A quarantine entry that passes validateQuarantineList (scripts/lib/red-main-quarantine.mjs).
+const entry = (overrides = {}) => ({
+  test: 'scripts/x/__tests__/flaky.test.mjs', brokenSha: '1234567', owner: 'red-main-safety-net',
+  reason: 'red on main', addedAt: 1, expiresAt: 2, ...overrides,
+});
+const quarantine = (list = { version: 1, entries: [], mode: 'stop' }, committedAt = OLD_LIST_TIME) => (
+  { ok: true, list, committedAt });
 const input = (overrides = {}) => ({
-  event: 'push', ref: 'refs/heads/main', sha, pushTree,
+  event: 'push', ref: 'refs/heads/main', sha, pushTree, now: NOW,
   listMergeGroupRuns: vi.fn().mockResolvedValue([run()]),
   getCommitTree: vi.fn().mockResolvedValue(otherTree),
+  readQuarantineState: vi.fn().mockResolvedValue(quarantine()),
   ...overrides,
 });
 const expectClosed = (result) => {
@@ -29,8 +41,12 @@ const expectClosed = (result) => {
 
 // Spawn the shipped entry point; only fixture binaries are on PATH. Each stub records
 // argv independently of its response, so a wrong API filter cannot silently pass.
+// The created_at the CLI fixtures use is far in the past relative to the real clock, and the list
+// time predates it by more than the settle margin, so the default fixture proves "nothing excluded".
+const CLI_LIST = JSON.stringify({ version: 1, entries: [], mode: 'quarantine' });
 function runCli({ args = {}, runs = JSON.stringify({ workflow_runs: [run()] }), tree = pushTree,
-  gitTree = pushTree, fail = '' } = {}) {
+  gitTree = pushTree, fail = '', qTip = quarantineTip, qTime = OLD_LIST_TIME, qListed = 'quarantine.json',
+  qList = CLI_LIST } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'queue-tested-cli-'));
   const callsFile = join(cwd, 'calls.jsonl');
   writeFileSync(callsFile, '');
@@ -41,9 +57,10 @@ const { appendFileSync } = require('node:fs');
 const command = ${JSON.stringify(command)};
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify([command, ...args]) + '\\n');
-const kind = command === 'git' ? 'git' : args[1]?.includes('/actions/workflows/') ? 'runs' : 'tree';
+const kind = command === 'gh' ? (args[1]?.includes('/actions/workflows/') ? 'runs' : 'tree')
+  : args[0] === 'rev-parse' ? (args[1] === '--verify' ? 'q-tip' : 'git') : \`q-\${args[0]}\`;
 if (kind === ${JSON.stringify(fail)}) process.exit(1);
-const responses = ${JSON.stringify({ git: gitTree, runs, tree })};
+const responses = ${JSON.stringify({ git: gitTree, runs, tree, 'q-fetch': '', 'q-tip': qTip, 'q-log': qTime, 'q-ls-tree': qListed, 'q-show': qList })};
 process.stdout.write(responses[kind] + '\\n');
 `, { mode: 0o755 });
     }
@@ -62,6 +79,14 @@ process.stdout.write(responses[kind] + '\\n');
   }
 }
 
+const quarantineCalls = [
+  ['git', 'fetch', '--quiet', '--no-tags', '--depth=1', 'origin', '+refs/heads/ops/quarantine:refs/remotes/origin/ops/quarantine'],
+  ['git', 'rev-parse', '--verify', 'refs/remotes/origin/ops/quarantine^{commit}'],
+  ['git', 'log', '-1', '--format=%cI', quarantineTip],
+  ['git', 'ls-tree', '--name-only', quarantineTip, '--', 'quarantine.json'],
+  ['git', 'show', `${quarantineTip}:quarantine.json`],
+];
+
 describe('queue-tested CLI adapter', () => {
   it('CLI queries only successful merge_group runs from ci.yml and emits the matching-tree decision', () => {
     const result = runCli();
@@ -69,6 +94,7 @@ describe('queue-tested CLI adapter', () => {
       ['git', 'rev-parse', `${sha}^{tree}`],
       ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
       ['gh', 'api', `repos/example/project/git/commits/${otherSha}`, '--jq', '.tree.sha'],
+      ...quarantineCalls,
     ]);
     expect(result.stdout).toBe('queue_tested=true\n');
     expect(result.stderr).toContain('push tree already passed merge-group CI');
@@ -79,6 +105,7 @@ describe('queue-tested CLI adapter', () => {
     expect(result.calls.slice(1)).toEqual([
       ['gh', 'api', 'repos/another-owner/another-repo/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
       ['gh', 'api', `repos/another-owner/another-repo/git/commits/${otherSha}`, '--jq', '.tree.sha'],
+      ...quarantineCalls,
     ]);
     expect(result.stdout).toBe('queue_tested=true\n');
   });
@@ -86,7 +113,41 @@ describe('queue-tested CLI adapter', () => {
   it('emits an exact-head match without requesting its tree', () => {
     const result = runCli({ runs: JSON.stringify({ workflow_runs: [run(sha)] }) });
     expect(result.stdout).toBe('queue_tested=true\n');
-    expect(result.calls).toHaveLength(2);
+    expect(result.calls).toEqual([
+      ['git', 'rev-parse', `${sha}^{tree}`],
+      ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
+      ...quarantineCalls,
+    ]);
+  });
+
+  it('treats a tip without a list file as an empty list and does not show it', () => {
+    const result = runCli({ qListed: '' });
+    expect(result.stdout).toBe('queue_tested=true\n');
+    expect(result.calls.slice(-1)).toEqual([quarantineCalls[3]]);
+  });
+
+  it('keeps full CI when the published list is in quarantine mode with an entry (red-team break, PR #6211)', () => {
+    const result = runCli({ qList: JSON.stringify({ version: 1, mode: 'quarantine', entries: [entry()] }) });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('quarantine mode has entries');
+  });
+
+  it.each([
+    ['quarantine fetch error', { fail: 'q-fetch' }],
+    ['quarantine tip error', { fail: 'q-tip' }],
+    ['invalid quarantine tip', { qTip: 'not-a-sha' }],
+    ['quarantine commit time error', { fail: 'q-log' }],
+    ['quarantine ls-tree error', { fail: 'q-ls-tree' }],
+    ['quarantine show error', { fail: 'q-show' }],
+    ['malformed quarantine JSON', { qList: '{' }],
+    ['invalid quarantine list', { qList: JSON.stringify({ version: 2, entries: [] }) }],
+    ['invalid quarantine entry', { qList: JSON.stringify({ version: 1, mode: 'stop', entries: [{ test: '../x' }] }) }],
+    ['quarantine list changed after the queue run', { qTime: '2026-10-31T11:55:00Z' }],
+    ['future quarantine commit time', { qTime: '2999-01-01T00:00:00Z' }],
+  ])('keeps full CI on %s', (_name, fixture) => {
+    const result = runCli(fixture);
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('running full CI');
   });
 
   it.each([
@@ -125,6 +186,83 @@ describe('queue-tested CLI adapter', () => {
     const result = runCli({ args });
     expect(result.stdout).toBe('queue_tested=false\n');
     expect(result.calls).toEqual([['git', 'rev-parse', `${sha}^{tree}`]]);
+  });
+});
+
+// Red-team break on heads c43fca82, bc9b5fc2 and f14e1e3d: in quarantine mode a merge_group run excludes
+// quarantined tests that a push to main would run, so its success is not proof that the full suite passed.
+describe('quarantine evidence: the matched queue run must have excluded nothing', () => {
+  const matchTree = (overrides = {}) => input({ getCommitTree: vi.fn().mockResolvedValue(pushTree), ...overrides });
+
+  it.each([
+    ['a live entry', entry({ expiresAt: NOW + 60_000 })],
+    ['an expired entry (it may have been live when the queue ran)', entry()],
+    ['a job-tagged entry', entry({ job: 'integration', expiresAt: NOW + 60_000 })],
+    ['a soak-shard entry', entry({ job: 'soak-shard (3)', expiresAt: NOW + 60_000 })],
+    ['a name-qualified entry', entry({ test: 'scripts/x/__tests__/flaky.test.mjs::one case', expiresAt: NOW + 60_000 })],
+  ])('keeps full CI in quarantine mode with %s', async (_name, quarantined) => {
+    for (const args of [
+      matchTree({ readQuarantineState: vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'quarantine', entries: [quarantined] })) }),
+      input({ listMergeGroupRuns: vi.fn().mockResolvedValue([run(sha)]),
+        readQuarantineState: vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'quarantine', entries: [quarantined] })) }),
+    ]) {
+      const result = await decideQueueTestedSkip(args);
+      expectClosed(result);
+      expect(result.reason).toMatch(/quarantine mode has entries/);
+      expect(args.readQuarantineState).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it.each([
+    ['quarantine mode with no entries', { version: 1, mode: 'quarantine', entries: [] }],
+    ['stop mode with entries', { version: 1, mode: 'stop', entries: [entry({ expiresAt: NOW + 60_000 })] }],
+    ['no mode stamp (stop) with entries', { version: 1, entries: [entry({ expiresAt: NOW + 60_000 })] }],
+  ])('skips when the list proves nothing was excluded: %s', async (_name, list) => {
+    const args = matchTree({ readQuarantineState: vi.fn().mockResolvedValue(quarantine(list)) });
+    expect(await decideQueueTestedSkip(args)).toMatchObject({ skip: true, matchedSha: otherSha });
+  });
+
+  it.each([
+    ['a read that throws', vi.fn().mockRejectedValue(new Error('fetch failed')), /read failed/],
+    ['ok:false', vi.fn().mockResolvedValue({ ok: false, error: 'unreachable' }), /unreadable/],
+    ['a missing state', vi.fn().mockResolvedValue(undefined), /unreadable/],
+    ['a missing list', vi.fn().mockResolvedValue({ ok: true, committedAt: OLD_LIST_TIME }), /unreadable/],
+    ['non-array entries', vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'stop', entries: null })), /entries unreadable/],
+    ['an unknown mode', vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'skip-all', entries: [] })), /unknown quarantine mode/],
+    ['a missing commit time', vi.fn().mockResolvedValue({ ok: true, list: { version: 1, entries: [] } }), /commit time unreadable/],
+    ['an unparseable commit time', vi.fn().mockResolvedValue(quarantine(undefined, 'yesterday-ish')), /commit time unreadable/],
+    ['a future commit time', vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T13:00:00Z')), /in the future/],
+    ['a list changed after the run started', vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T12:05:00Z')), /changed near or after/],
+  ])('fails closed on %s', async (_name, readQuarantineState, reason) => {
+    const result = await decideQueueTestedSkip(matchTree({ readQuarantineState }));
+    expectClosed(result);
+    expect(result.reason).toMatch(reason);
+  });
+
+  it('pins the settle margin to both sides of its boundary', async () => {
+    expect(QUARANTINE_SETTLE_MS).toBe(10 * 60 * 1000);
+    const at = (ms) => new Date(Date.parse(RUN_CREATED) - ms).toISOString();
+    expect(await decideQueueTestedSkip(matchTree({ readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, at(QUARANTINE_SETTLE_MS))) })))
+      .toMatchObject({ skip: true });
+    expectClosed(await decideQueueTestedSkip(matchTree({ readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, at(QUARANTINE_SETTLE_MS - 1000))) })));
+  });
+
+  it("judges the list against the MATCHED run's created_at, not the newest run's", async () => {
+    const newest = run('e'.repeat(40), { created_at: '2026-10-31T12:20:00Z' });
+    const matched = run(otherSha, { created_at: '2026-10-31T12:02:00Z' });
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([newest, matched]),
+      getCommitTree: vi.fn(async (head) => head === otherSha ? pushTree : otherTree),
+      // Old enough for the newest run, but inside the margin for the matched one.
+      readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T11:58:00Z')) });
+    const result = await decideQueueTestedSkip(args);
+    expectClosed(result);
+    expect(result.reason).toMatch(/changed near or after/);
+  });
+
+  it('does not read the quarantine list when no run matches', async () => {
+    const args = input();
+    expectClosed(await decideQueueTestedSkip(args));
+    expect(args.readQuarantineState).not.toHaveBeenCalled();
   });
 });
 
@@ -250,6 +388,10 @@ describe('decideQueueTestedSkip (pure function, no CLI or main export required)'
       { listMergeGroupRuns: vi.fn().mockResolvedValue({}) },
       { listMergeGroupRuns: vi.fn().mockResolvedValue([run(sha, { conclusion: 'failure' })]) },
       { getCommitTree: vi.fn().mockRejectedValue(new Error('tree failed')) }, {},
+      { getCommitTree: vi.fn().mockResolvedValue(pushTree),
+        readQuarantineState: vi.fn().mockResolvedValue(quarantine({ version: 1, mode: 'quarantine', entries: [entry()] })) },
+      { getCommitTree: vi.fn().mockResolvedValue(pushTree),
+        readQuarantineState: vi.fn().mockResolvedValue(quarantine(undefined, '2026-10-31T12:05:00Z')) },
     ];
     const reasons = [];
     for (const overrides of cases) {

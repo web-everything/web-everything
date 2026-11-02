@@ -47,6 +47,16 @@ describe('ci.yml queue-tested push relief and nightly full-run backstop', () => 
     expect(queue['continue-on-error']).toBe(true);
   });
 
+  it('bounds the queue step below the changes job timeout and keeps the git credentials its ops/quarantine fetch needs', () => {
+    const queue = jobs.changes.steps.find((step) => step.id === 'queue');
+    expect(queue['timeout-minutes']).toBe(3);
+    expect(queue['timeout-minutes']).toBeLessThan(jobs.changes['timeout-minutes']);
+    const checkout = jobs.changes.steps.find((step) => String(step.uses).startsWith('actions/checkout@'));
+    expect(jobs.changes.steps.indexOf(checkout)).toBeLessThan(jobs.changes.steps.indexOf(queue));
+    expect(checkout.with?.['persist-credentials']).not.toBe(false);
+    expect(jobs.changes.permissions).toEqual({ contents: 'read', actions: 'read' });
+  });
+
   it.each([
     ['true', 'true', 'true'],
     ['true', 'false', 'true'],
