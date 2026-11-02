@@ -877,7 +877,8 @@ export async function runDaemonLoadOverlay({
     try {
       const st = readOverlayStateFn(root, { env });
       if (!st || st.corrupt || !Array.isArray(st.overlays)) refs = null;
-      else refs = [...new Set([ref, ...st.overlays.map((o) => o?.ref).filter((r) => typeof r === 'string' && r)])];
+      else if (st.overlays.some((o) => !o || typeof o.ref !== 'string' || !o.ref)) refs = null; // malformed entry: refuse, never skip
+      else refs = [...new Set([ref, ...st.overlays.map((o) => o.ref)])];
     } catch { refs = null; }
     if (!refs) return { ...installedClosed(installed, { root, ref, refs: null }), inHead: false, reason: 'registry-unreadable' };
     return installedClosed(installed, { root, ref, refs });

@@ -1539,4 +1539,15 @@ describe('adoption requires EVERY registered overlay tip (stale ready-candidate,
     expect(seen[0]).toBe(null);
     expect(result.adopted).toBe(false);
   });
+
+  it.each([[null], [{}], [{ ref: '' }], [{ ref: 42 }]])('a malformed registry entry %j refuses adoption (fail closed)', async (bad) => {
+    const seen = [];
+    const result = await runDaemonLoadOverlay({
+      ...base, rebuild: vi.fn(async () => ({ moved: true, adopted: true, head: 'h', reason: 'ready-adopted' })), followUpRebuilds: 0,
+      readOverlayStateFn: () => ({ overlays: [{ ref: 'lane/a' }, bad], corrupt: false }),
+      installed: (o) => { seen.push(o.refs); return o.refs === null ? { inHead: false, tip: null, head: 'h', reason: 'x' } : { inHead: true, tip: 't', head: 'h', reason: 'in-head' }; },
+    });
+    expect(seen[0]).toBe(null);
+    expect(result.adopted).toBe(false);
+  });
 });
