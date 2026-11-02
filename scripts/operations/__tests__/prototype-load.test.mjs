@@ -335,6 +335,49 @@ describe('canonicalAuditEvidence hardening', () => {
   });
 });
 
+describe('prototype-load ruled-WEAKENED admission', () => {
+  const findings = ['operator-disclosed weakening'];
+  const ready = {
+    ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED',
+    auditRuling: 'R396', auditDisclosed: findings,
+  };
+  const allowed = { ref: BASE.branch, sha: SHA, ruling: 'R396', findings };
+
+  it('loads an exact ruled-WEAKENED record and warns with its ruling, head and findings', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture('warn', {
+        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] },
+      });
+      expect(await f.run()).toMatchObject({
+        ok: true, registered: true, adopted: true, stopReason: null,
+        gate: { source: 'ready-record', ruledWeakened: { ruling: 'R396', findings } },
+      });
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining(`RULED-WEAKENED EXCEPTION R396: loading ${BASE.branch}@${SHA}`),
+      );
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(`Disclosed findings: ${findings[0]}`));
+      expect(mutations(f, 'add')).toHaveLength(1);
+    } finally { warning.mockRestore(); }
+  });
+
+  it.each([
+    ['unlisted', []],
+    ['different ref', [{ ...allowed, ref: 'lane/other' }]],
+    ['different sha', [{ ...allowed, sha: TREE }]],
+    ['different ruling', [{ ...allowed, ruling: 'R999' }]],
+    ['different findings', [{ ...allowed, findings: ['unrelated'] }]],
+  ])('stops a %s WEAKENED record with no-ready before admission and without an exception warning', async (_, ruledWeakened) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture('warn', { ready: auditLines([ready]), settings: { ruledWeakened } });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready', gate: null });
+      expect(f.calls).toHaveLength(0);
+      expect(warning.mock.calls.flat().join('\n')).not.toMatch(/RULED-WEAKENED EXCEPTION/);
+    } finally { warning.mockRestore(); }
+  });
+});
+
 describe('prototype-load canonical audit admission', () => {
   it('keeps the warn default in the standard cascade layer, not the tool file, so a platform refuse is not overridden', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
