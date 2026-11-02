@@ -282,17 +282,6 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // webhook). Their field clock is the cursor the listing was taken at, so any later delivery wins.
       for (const pr of input.prs) foldObservation(storage, { ...pr, number: undefined, prs: [pr.number], repo: input.repo,
         type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor });
-      // A complete listing is the full open set at baseCursor: an open row it omits (and no later event touched)
-      // is closed, so a re-import cannot leave a stale open PR under coverage=true.
-      const prior = storage.getProjection('bootstrap', input.repo);
-      if (input.status === 'complete' && !(prior && prior.baseCursor >= input.baseCursor)) { // never reconcile from an older or same-cursor listing
-        const listed = new Set(input.prs.map((p) => p.number));
-        for (const row of storage.listProjection('prs')) {
-          if (row.repo !== input.repo || listed.has(row.number) || row.state !== 'open' || (row.fields.state || 0) > input.baseCursor) continue;
-          storage.putProjection('prs', JSON.stringify([row.repo, row.number]),
-            { ...row, state: 'closed', merged: null, fields: { ...row.fields, state: input.baseCursor } });
-        }
-      }
       const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
       // Import history for the NEW per-repo coverage only (fail closed); it changes no seeding behaviour.
       const seen = storage.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
