@@ -3830,6 +3830,7 @@ Strict clone traversal must resolve relative, absolute and file-URL ESM specifie
 containment and syntax. Exercise percent encoding, URL suffixes and symlink targets as well as plain relative
 imports; JavaScript string escapes that the scanner cannot decode must leave proof incomplete. Keep a positive
 ESM alias case proving both alias and real dependency paths remain relevant, alongside refusal cases.
+
 ## UID scanner idle proofs
 
 An absent UID does not guarantee an idle result from a shared host's `/proc`: repeated process
