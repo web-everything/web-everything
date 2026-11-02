@@ -4,6 +4,7 @@ import { tmpdir as nodeTmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readRemoteReport, shouldConfirmRemoteRed } from './verify-remote-routing.mjs';
+import { verificationInfrastructureFailure } from './lane-verify.mjs';
 import { killProcessTree } from './bounded-child.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
@@ -124,7 +125,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
     const deadline = now() + budgetMs, results = new Array(shards.length);
     directory = fs.mkdtempSync(join(tmpdir(), 'verify-shards-'));
-    let next = 0;
+    let next = 0, infraExit = 0;
     // The slot helpers identify holders by process. Serialize confirmation in
     // this process so one confirmation cannot release another's slot.
     let localTail = Promise.resolve();
@@ -183,6 +184,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             }
           }
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
+        // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
+        if (status !== 'PASS' && lastResult && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
         results[index] = status;
         log(`verify-shard ${index + 1}/${shards.length}: ${status} (${files.length} files, ${now() - started} ms)\n`);
       }
@@ -193,6 +196,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
       return 0;
     }
     log(`verify-shards: RED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; inspect shard output and rerun the affected selection)\n`);
+    if (infraExit > 0 && infraExit < 256 && infraExit !== 124) return infraExit;
     return results.some(r => !['PASS', 'TIMEOUT', 'NOT-RUN'].includes(r)) ? 1 : 124;
   } catch (error) {
     log(`verify-shards: RED (internal error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')})\n`);

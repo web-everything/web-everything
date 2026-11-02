@@ -126,5 +126,6 @@ describe('config-excluded selected files', () => {
     const f = fixture(['remote-red-137']);
     expect(await f.run()).not.toBe(0);
     expect(f.lines.join('')).not.toMatch(/confirming locally/);
+    expect(await fixture(['remote-red-137']).run()).toBe(137);
   });
 });

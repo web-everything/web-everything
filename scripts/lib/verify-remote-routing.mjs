@@ -83,7 +83,7 @@ function wrappedChain(command) {
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
-  if (!command.includes(' && ') && /^node (?:scripts\/lib\/|'[^'\r\n]*\/)verify-shard-run\.mjs'?(?=\s|$)/.test(command)) {
+  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && /^node (?:scripts\/lib\/|'[^'\r\n]*\/)verify-shard-run\.mjs'?(?=\s|$)/.test(command)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
   }
   if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
