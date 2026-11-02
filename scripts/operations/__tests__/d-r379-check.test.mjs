@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { resolve } from 'node:path';
@@ -43,6 +43,58 @@ describe('D-R379 synthetic PR scenarios (not captured PR evidence)', () => {
   });
   it.each([[6188,4],[6195,3]])('%s scenario fails condition %s', async (pr, id) => {
     expect(condition(await checkPr(pr, deps(fixture(pr))), id).status).toBe('FAIL');
+  });
+});
+describe('PR target branch evidence', () => {
+  it.each(['release', 'lane/stacked', undefined, null, '', 42, 'MAIN', 'main\n', ' main', 'ｍａｉｎ', 'ma\u200bin'])
+    ('refuses target %j before reading a main-based diff', async baseRefName => {
+      let fetched = false;
+      const f = {...fixture(6223), baseRefName};
+      const r = await checkPr(6223, deps(f, {fetchNetDiff: () => {
+        fetched = true;
+        return {paths:['docs/examples/example.md'],base};
+      }}));
+      expect(r.eligible).toBe(false);
+      expect(condition(r,3).status).toBe('UNKNOWN');
+      expect(condition(r,4).status).toBe('UNKNOWN');
+      expect(condition(r,4).evidence.join(' ')).toContain('human review');
+      expect(r.netDiffPaths).toEqual([]);
+      expect(fetched).toBe(false);
+    });
+
+  it.each(['main', 'release'])('wires live target %s from the adapter through the JSON CLI', async baseRefName => {
+    const f = {...fixture(6223), baseRefName};
+    const calls = [];
+    const adapter = createCheckDeps({exec:(bin,args) => {
+      calls.push([bin,...args]);
+      if (bin === 'gh') return JSON.stringify(f);
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return f.headRefOid;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'diff') return 'docs/examples/example.md\0';
+      throw Error('unexpected command');
+    }});
+    let output = '';
+    const code = await main(['--pr=6223','--json'],deps(f, {
+      readPr:adapter.readPr, readLabels:adapter.readLabels,
+      fetchNetDiff:adapter.fetchNetDiff, stdout:s=>{output+=s;},
+    }));
+    expect(code).toBe(baseRefName === 'main' ? 0 : 1);
+    expect(JSON.parse(output).eligible).toBe(baseRefName === 'main');
+    expect(calls[0].at(-1).split(',')).toContain('baseRefName');
+    expect(calls.some(([bin])=>bin === 'git')).toBe(baseRefName === 'main');
+  });
+
+  it.each(['release', undefined, null])('refuses a retargeted or missing live label target %j', async baseRefName => {
+    const f = fixture(6223), calls = [];
+    const adapter = createCheckDeps({exec:(bin,args)=>{
+      calls.push([bin,...args]);
+      return JSON.stringify({...f,baseRefName});
+    }});
+    const r = await checkPr(6223,deps(f,{readLabels:adapter.readLabels}));
+    expect(r.eligible).toBe(false);
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(calls[0].at(-1).split(',')).toContain('baseRefName');
   });
 });
 describe('fail-closed evidence', () => {
@@ -442,6 +494,54 @@ describe('current-head ledger acceptance regressions', () => {
     expect(condition(r,2).status).toBe('UNKNOWN');
     expect(r.eligible).toBe(false);
   });
+  it.each(['unreadable result', 'rejected read'])
+    ('does not fall back to home when configured Git ledger is unreadable: %s', async failure => {
+      // Home has an older acceptance but cannot establish the configured store's current state.
+      const content = Buffer.from(`${JSON.stringify(verdict(6223,fixture(6223).headRefOid))}\n`);
+      let position = 0;
+      const fs = {
+        constants:{O_RDONLY:0,O_NONBLOCK:2048},
+        openSync:vi.fn(path=>{
+          expect(String(path)).toMatch(/^fixture-ledger[\\/]/);
+          position = 0;
+          return 73;
+        }),
+        fstatSync:vi.fn(()=>({size:content.length,isFile:()=>true})),
+        readSync:vi.fn((_fd,buffer,offset,length)=>{
+          const count = Math.min(length,content.length-position);
+          content.copy(buffer,offset,position,position+count);position+=count;return count;
+        }),
+        closeSync:vi.fn(),
+      };
+      const env = {WE_VERDICT_LEDGER_READ_STORE:'git',WE_VERDICT_LEDGER_BOARD:'fixture-board',
+        WE_VERDICT_LEDGER_DIR:'fixture-ledger'};
+      const readGitLedger = vi.fn(async ()=>{
+        if (failure === 'rejected read') throw Error('configured Git ledger unavailable');
+        return {status:'unreadable',reason:'fetch-failed'};
+      });
+      const adapter = createCheckDeps({env,fs,readGitLedger,stderr:()=>{}});
+      const r = await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}));
+      expect(readGitLedger).toHaveBeenCalledTimes(1);
+      expect(readGitLedger).toHaveBeenCalledWith(expect.objectContaining({
+        board:'fixture-board',repo:CONSTELLATION_REPOS.we.slug,env,
+      }));
+      expect(fs.openSync).not.toHaveBeenCalled();
+      expect(fs.readSync).not.toHaveBeenCalled();
+      expect(condition(r,2).status).toBe('UNKNOWN');
+      expect(condition(r,2).evidence.join(' ')).toContain('human review');
+      expect(r.eligible).toBe(false);
+      expect(r.conditions.filter(c=>[1,3,4].includes(c.id)).map(c=>c.status)).toEqual(['PASS','PASS','PASS']);
+
+      // Prove the home fixture really is readable and would otherwise authorize this head.
+      const home = createCheckDeps({env:{...env,WE_VERDICT_LEDGER_READ_STORE:'home'},fs,readGitLedger,stderr:()=>{}});
+      const control = await checkPr(6223,deps(undefined,{readReviewLedger:home.readReviewLedger}));
+      expect(condition(control,2).status).toBe('PASS');
+      expect(control.eligible).toBe(true);
+      expect(fs.openSync).toHaveBeenCalledTimes(1);
+      expect(fs.readSync).toHaveBeenCalled();
+      expect(fs.closeSync).toHaveBeenCalledWith(73);
+      expect(readGitLedger).toHaveBeenCalledTimes(1);
+    });
   it('configured home path validates raw lines and closes the descriptor', async () => {
     const content = Buffer.from([verdict(6223,fixture(6223).headRefOid),
       {pr:6223,verdict:'human'}].map(row=>JSON.stringify(row)).join('\n'));

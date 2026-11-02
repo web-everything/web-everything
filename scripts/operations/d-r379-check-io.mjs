@@ -84,12 +84,13 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
   return {
     async readPr(pr) {
       checkPrNumber(pr);
-      return JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'title,body,headRefOid']));
+      return JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'title,body,headRefOid,baseRefName']));
     },
     async readLabels(pr, head) {
       checkPrNumber(pr);
-      const snapshot = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'labels,headRefOid']));
+      const snapshot = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'labels,headRefOid,baseRefName']));
       if (snapshot.headRefOid !== head) throw new Error('PR head moved; retry');
+      if (snapshot.baseRefName !== 'main') throw new Error('PR target is not main or is unavailable; human review required');
       return snapshot.labels;
     },
     async readLabelEvents(pr) {
