@@ -73,7 +73,7 @@ const ioOptions = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 const validId = id => /^[1-9]\d*$/.test(String(id)) && Number.isSafeInteger(Number(id));
 const validAttempt = e => e && validId(e.runId) && Number.isFinite(Date.parse(e.retriggeredAt)) &&
   (e.reserved === undefined || typeof e.reserved === 'boolean');
-const rowRunId = (row, repo) => {
+export const rowRunId = (row, repo) => {
   try {
     const url = new URL(row.detailsUrl);
     if (url.origin !== 'https://github.com' || url.username || url.password || url.search || url.hash) return;
@@ -306,15 +306,15 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     const ready = [];
     const candidates = newest.filter(target => target && !Object.hasOwn(attempts, target.workflowName) &&
       target.conclusion === 'cancelled');
-    if (jobsRead + candidates.length > maxPerTick || result.dispatch.length + candidates.length > maxPerTick) {
+    const cancelledHeadRuns = [...new Map(headRuns.filter(r => r.conclusion === 'cancelled')
+      .map(r => [String(r.databaseId), r])).values()];
+    if (jobsRead + cancelledHeadRuns.length > maxPerTick || result.dispatch.length + candidates.length > maxPerTick) {
       refuse('tick-cap', { ...detail, error: 'retry next tick with sufficient tick budget; no attempt consumed' });
       continue;
     }
-    // Validate the entire head before publishing dispatches or reserving any workflow.
-    for (const target of newest) {
-      if (!target) { refuse('workflow-unknown', detail); continue; }
-      if (Object.hasOwn(attempts, target.workflowName)) { alreadyAttempted(attempts[target.workflowName], detail); continue; }
-      if (target.conclusion !== 'cancelled') continue;
+    // Every cancelled run can conceal failed jobs, including non-required and older runs.
+    const jobsByRun = new Map();
+    for (const target of cancelledHeadRuns) {
       const runId = target.databaseId;
       let jobs;
       jobsRead++;
@@ -335,6 +335,16 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
         refuse('jobs-unreadable', detail);
         continue;
       }
+      jobsByRun.set(String(runId), jobs);
+    }
+    if (result.refusals.length !== refusalsBefore) continue;
+    // Validate the entire head before publishing dispatches or reserving any workflow.
+    for (const target of newest) {
+      if (!target) { refuse('workflow-unknown', detail); continue; }
+      if (Object.hasOwn(attempts, target.workflowName)) { alreadyAttempted(attempts[target.workflowName], detail); continue; }
+      if (target.conclusion !== 'cancelled') continue;
+      const runId = target.databaseId;
+      const jobs = jobsByRun.get(String(runId));
       const cancelReason = jobs.some(j => j?.conclusion === 'cancelled' &&
         Date.parse(j.completedAt) - Date.parse(j.startedAt) >= 595_000) ? 'job-timeout'
         : runs.some(r => r.headBranch === target.headBranch && Date.parse(r.createdAt) > Date.parse(target.createdAt))

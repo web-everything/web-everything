@@ -15,7 +15,7 @@ import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { latestCheckNamed, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
-import { parsePrCancelledRerunComment, readLiveRequiredChecks, safeRequiredBase } from './pr-cancelled-rerun.mjs';
+import { parsePrCancelledRerunComment, readLiveRequiredChecks, rowRunId, safeRequiredBase } from './pr-cancelled-rerun.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
@@ -362,13 +362,21 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
   if (!last || last.persistenceFailed) return null;
+  const wake = wakeTime(pr, last);
+  const noVerdict = verdictNeverLanded(pr, last, now);
+  // A CI marker only bypasses the same-head review count, never a spent persist budget.
+  const persistWake = operatorWakeTime(pr, last);
+  const persistAttempts = history.filter(r => r.startedAt >= persistWake && r.persistenceFailed);
+  const persistSpent = persistAttempts.some(persistRetryBudgetSpent) || persistAttempts.reduce((n, r) =>
+    n + 1 + (Number(r.persistRetries) || 0), 0) > REFERRAL_RETRY_MS.length;
   // The marker proves submission only; this head's current rollup must also prove CI recovered.
   // Only a completed accepted review covering this exact head may use it, at most once.
-  if (last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
+  if (!persistSpent && !noVerdict && last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
     Array.isArray(last.pending) && last.pending.length === 0) {
-    const rerunAt = Math.max(0, ...(pr.comments ?? []).filter(c =>
-      parsePrCancelledRerunComment(c, repo, pr.number, pr.headRefOid))
-      .map(c => Date.parse(c.createdAt)).filter(Number.isFinite));
+    const marker = (pr.comments ?? []).map(c => ({
+      ...parsePrCancelledRerunComment(c, repo, pr.number, pr.headRefOid), at: Date.parse(c.createdAt),
+    })).filter(c => c.runId && Number.isFinite(c.at)).sort((a, b) => b.at - a.at || b.runId - a.runId)[0];
+    const rerunAt = marker?.at;
     if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) {
       // Unknown, stale or partial requirements cannot prove recovery. Keep the normal hold and its
       // operator re-arm path when protection or current-head check evidence is unavailable.
@@ -377,20 +385,24 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
       }) : null;
       const recovered = Array.isArray(checks) && checks.length > 0 &&
         checks.every(name => !requiredCheckReadNeeded(pr, name) && (() => {
+          const matches = pr.statusCheckRollup.filter(row => (row?.name || row?.context) === name);
+          const green = row => row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion);
+          const ids = matches.map(row => rowRunId(row, repo));
+          if (ids.some(id => !/^[1-9]\d*$/.test(id ?? '') || !Number.isSafeInteger(Number(id)))) return false;
+          const sources = new Set(matches.map((row, i) => JSON.stringify([ids[i], row.app ?? null])));
+          if (sources.size > 1 && !matches.every(green)) return false;
           const row = latestCheckNamed(pr.statusCheckRollup, name);
           const finishedAt = Date.parse(row?.completedAt ?? row?.completed_at);
-          return row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion) &&
+          return green(row) && Number(rowRunId(row, repo)) >= marker.runId &&
             Number.isFinite(finishedAt) && finishedAt > rerunAt;
         })());
       if (recovered) return null;
     }
   }
-  const wake = wakeTime(pr, last);
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
   // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
   // bounded to VERDICT_RETRY_EXTRA extra runs, then bounded cool-down releases with exponential backoff.
-  const noVerdict = verdictNeverLanded(pr, last, now);
   // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
   // budget as soon as read identifies the head, even if the process dies before advise can finish.
   const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));

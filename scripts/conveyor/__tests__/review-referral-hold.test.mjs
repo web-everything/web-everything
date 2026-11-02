@@ -1081,6 +1081,7 @@ describe('R372 accepted same-head CI rerun release', () => {
   const acceptedPr = comments => pr({ baseRefName: 'main', labels: [{ name: 'review:accepted' }],
     statusCheckRollup: ['SUCCESS', 'SKIPPED', 'NEUTRAL'].map((conclusion, i) => ({
       name: `check-${i}`, status: 'COMPLETED', conclusion, completedAt: iso(at + 2),
+      detailsUrl: `https://github.com/${repo}/actions/runs/123/job/${i + 1}`,
     })), comments: [
     comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, at), ...comments,
   ] });
@@ -1089,6 +1090,45 @@ describe('R372 accepted same-head CI rerun release', () => {
     expect(decideSameHeadHold(p, [accepted()], { repo, readRequiredChecks: () => requiredChecks, now: at + 2 })).toBeNull();
     expect(decideSameHeadHold(p, [accepted(), { ...accepted(), startedAt: at + 2, completedAt: at + 3 }],
       { repo, readRequiredChecks: () => requiredChecks, now: at + 4 })).not.toBeNull();
+  });
+  it.each(['resumed', 'separate-runs'])('keeps an accepted head held after its persisted retry budget is spent (%s)', mode => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    const spent = mode === 'resumed'
+      ? [{ ...evidence({ failure: true, time: at - 1 }), persistRetries: REFERRAL_RETRY_MS.length }]
+      : Array.from({ length: REFERRAL_RETRY_MS.length + 1 }, (_, i) => evidence({ failure: true, time: at - 10 + i }));
+    expect(decideSameHeadHold(p, [...spent, accepted()], {
+      repo, now: at + 2, readRequiredChecks: () => requiredChecks,
+    })).not.toBeNull();
+  });
+  it('keeps a latest parked spent-budget run held despite recovered CI', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    const spent = { ...evidence({ failure: true }), persistRetries: REFERRAL_RETRY_MS.length };
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 2, readRuns: () => [spent],
+      readRequiredChecks: () => requiredChecks })[0].referralHold).toMatchObject({ exhausted: true });
+  });
+  it.each([undefined, 'not a URL', `https://github.com/${repo}/actions/runs/122`,
+    `https://example.com/${repo}/actions/runs/123`, `https://github.com/other/repo/actions/runs/123`])(
+    'keeps an unlinked or older green check held (%s)', detailsUrl => {
+      const p = acceptedPr([comment(marker(head), at + 1)]);
+      p.statusCheckRollup[0].detailsUrl = detailsUrl;
+      expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2,
+        readRequiredChecks: () => requiredChecks })).not.toBeNull();
+    });
+  it('allows a numerically newer green workflow run', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup.forEach(row => { row.detailsUrl = `https://github.com/${repo}/actions/runs/1000`; });
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2,
+      readRequiredChecks: () => requiredChecks })).toBeNull();
+  });
+  it.each(['other-run', 'other-app', 'missing-url'])('does not mix a failed duplicate from %s with green recovery', source => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    const duplicate = { ...p.statusCheckRollup[0], conclusion: 'FAILURE', completedAt: iso(at) };
+    if (source === 'other-run') duplicate.detailsUrl = `https://github.com/${repo}/actions/runs/122`;
+    if (source === 'other-app') duplicate.app = { id: 999 };
+    if (source === 'missing-url') delete duplicate.detailsUrl;
+    p.statusCheckRollup.unshift(duplicate);
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2,
+      readRequiredChecks: () => requiredChecks })).not.toBeNull();
   });
   it.each([
     ['quoted marker inside prose', `Cancelled required CI rerun submitted for head ${head}, run 123.\nExample: ${markerLine(head)}`],
@@ -1173,7 +1213,7 @@ describe('R372 accepted same-head CI rerun release', () => {
   });
   it('uses the latest required row when an older attempt failed', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
-    p.statusCheckRollup.unshift({ name: 'check-0', status: 'COMPLETED', conclusion: 'FAILURE' });
+    p.statusCheckRollup.unshift({ ...p.statusCheckRollup[0], conclusion: 'FAILURE', completedAt: iso(at) });
     expect(decideSameHeadHold(p, [accepted()], { repo, readRequiredChecks: () => requiredChecks, now: at + 2 })).toBeNull();
   });
   it.each(['QUEUED', 'IN_PROGRESS'])('keeps the hold while the rerun is %s', status => {

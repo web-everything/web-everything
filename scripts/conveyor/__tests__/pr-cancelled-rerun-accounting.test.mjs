@@ -540,6 +540,32 @@ describe('PR cancelled durable accounting regressions', () => {
     },
   );
 
+  it.each(['failure', 'timed_out', 'error', 'startup_failure', 'action_required', 'stale', 'unreadable'])(
+    'preflights non-required cancelled head runs with %s jobs before any rerun', conclusion => {
+      const f = fixture({ runs: [run(), run('Optional', 124)] });
+      f.options.readJobs.mockImplementation(id => id === 123 ? [] : conclusion === 'unreadable'
+        ? null : [{ status: 'completed', conclusion }]);
+      expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [{
+        reason: conclusion === 'unreadable' ? 'jobs-unreadable' : 'real-failure-in-run',
+      }] });
+      expect(f.options.readJobs.mock.calls.map(([id]) => id)).toEqual([123, 124]);
+      expect(f.options.rerunFailed).not.toHaveBeenCalled();
+      expect(f.options.writeRecord).not.toHaveBeenCalled();
+    });
+  it('counts every cancelled head run against the jobs read cap before rerunning', () => {
+    const f = fixture({ runs: [run(), run('Optional', 124)] });
+    f.options.maxPerTick = 1;
+    expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+      expect.objectContaining({ reason: 'tick-cap', error: expect.stringContaining('retry next tick') }),
+    ] });
+    expect(f.options.readJobs).not.toHaveBeenCalled();
+    expect(f.options.rerunFailed).not.toHaveBeenCalled();
+    expect(f.options.writeRecord).not.toHaveBeenCalled();
+    f.options.maxPerTick = 2;
+    expect(f.tick().dispatch.map(d => d.runId)).toEqual([123]);
+    expect(f.options.readJobs.mock.calls.map(([id]) => id)).toEqual([123, 124]);
+  });
+
   it('reserves and reruns both cancelled workflows once, deduplicates their checks, and remembers both after restart', () => {
     const f = fixture({ prs: [pr(42, sha, ['CI', 'CD', 'CD'])], runs: [run(), run('CD', 124)], checks: ['CI', 'CD'] });
     f.options.rerunFailed.mockImplementation(id => {
