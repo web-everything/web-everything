@@ -669,6 +669,20 @@ const loadFail = () => ({
   },
 });
 const PASS = () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+const reconcileSampleFail = () => ({
+  verdict: 'code', attempts: 1,
+  smoke: { results: [{
+    ok: false, name: 'reconcile-dry-run', mayBeTransient: false,
+    detail: 'reconcile-pass dry-run failed for 1/3 repo(s): web-everything/web-everything: exited 1: pr-snapshot: smoke sample failed',
+  }] },
+});
+const mixedLoadFail = () => ({
+  verdict: 'code', attempts: 1,
+  smoke: { results: [
+    { ok: false, name: 'gh-pr-list', ms: 30_000, mayBeTransient: false, detail: 'gh pr list --repo web-everything/web-everything failed: timed out after 30000ms (process group killed)' },
+    ...reconcileSampleFail().smoke.results,
+  ] },
+});
 
 async function loadFixture(ref = 'lane/verify-pool-scan-non-dir', pr = 3903) {
   const fx = makeFixture();
@@ -680,6 +694,78 @@ async function loadFixture(ref = 'lane/verify-pool-scan-non-dir', pr = 3903) {
 }
 
 describe('load-shaped smoke failure: an overlay is blamed only by a same-run differential', () => {
+  it('mixed gh-pr-list timeout + reconcile-dry-run sample failure, B passes, A2 passes: adopts A and keeps the overlay', async () => {
+    const { cloneDir, env, ref } = await loadFixture();
+    let aCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay.txt'))) return PASS();
+      aCalls += 1;
+      return aCalls === 1 ? mixedLoadFail() : PASS();
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.adopted).toBe(true);
+    expect(result.reason).toBe('smoke-load-confirm-passed');
+    expect(existsSync(join(cloneDir, 'overlay.txt'))).toBe(true);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual([ref]);
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-dropped-smoke-failed');
+    expect(runSmoke).toHaveBeenCalledTimes(3); // A, B, A2
+  });
+
+  it('mixed failures, B passes, A2 repeats the code-shaped reconcile-dry-run failure: drops the genuine overlay', async () => {
+    const { cloneDir, env, mainSha } = await loadFixture();
+    let aCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay.txt'))) return PASS();
+      aCalls += 1;
+      return aCalls === 1 ? mixedLoadFail() : reconcileSampleFail();
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.adopted).toBe(true);
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
+    expect(readOverlays(cloneDir, { env })).toEqual([]);
+    expect(result.alerts.map((a) => a.kind)).toContain('overlay-dropped-smoke-failed');
+    expect(runSmoke).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['load-shaped', 'different check', 'unavailable'])('mixed failures, B passes, A2 %s: keeps the overlay and backs off without reproduced code evidence', async (confirmation) => {
+    const { cloneDir, env, ref, mainSha } = await loadFixture();
+    const t = 5_000_000;
+    let aCalls = 0;
+    const runSmoke = vi.fn(async ({ root }) => {
+      if (!existsSync(join(root, 'overlay.txt'))) return PASS();
+      aCalls += 1;
+      if (aCalls === 1) return mixedLoadFail();
+      if (confirmation === 'unavailable') throw new Error('confirmation unavailable');
+      if (confirmation === 'load-shaped') return loadFail();
+      return { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'other-check', detail: 'code failure' }] } };
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t });
+
+    expect(result.adopted).toBe(true);
+    expect(result.reason).toBe('smoke-env-load');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual([ref]);
+    expect(result.alerts.map((a) => a.kind)).not.toContain('overlay-dropped-smoke-failed');
+    expect(readRebuildState(cloneDir, env).rejected).toMatchObject({
+      envLoad: true, attempts: 1, retryAt: new Date(t + 5 * 60_000).toISOString(),
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('mixed failures with B failing still smoke last-good as a control instead of taking the load-only hold', async () => {
+    const { cloneDir, env, ref } = await loadFixture();
+    const runSmoke = vi.fn(async () => mixedLoadFail());
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.reason).toBe('harness-broken-adopted-not-worse');
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual([ref]);
+    expect(result.alerts.map((a) => a.kind)).not.toContain('smoke-env-load');
+    expect(runSmoke).toHaveBeenCalledTimes(3); // A, B, last-good
+  });
+
   it('A fails under load, plain main passes, A re-smoked passes: adopts A and KEEPS the overlay', async () => {
     const { cloneDir, env, ref } = await loadFixture();
     let aCalls = 0;

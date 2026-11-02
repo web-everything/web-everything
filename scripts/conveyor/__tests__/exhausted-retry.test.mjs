@@ -159,6 +159,7 @@ describe('PR #5331 production wiring and complete threads', () => {
     refresh: vi.fn(() => ({ ok: false, error: 'conflict' })), postComment: vi.fn() });
   const cli = (sweepOptions, overrides = {}) => ({ sweepOptions, sweepHung: vi.fn(() => ({})),
     sweepMissingRun: vi.fn(() => ({})), sweepMainCancelled: vi.fn(() => ({})),
+    sweepPrCancelled: vi.fn(() => ({})),
     writeLine: vi.fn(), writeAll: vi.fn(), ...overrides });
 
   it.each([0, 2, 3])('signature and exhausted recovery honor unresolved holds with %s heals', healCount => {

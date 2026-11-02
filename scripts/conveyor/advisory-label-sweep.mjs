@@ -83,12 +83,12 @@ export function carriesAdvisoryLabel(pr) {
  * @param {{exec?: Function, repo?: string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultListPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
+export function defaultListPrs({ exec = execFileSyncThrottled, repo = null, fields = 'number,labels,headRefOid,comments' } = {}) {
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,labels,headRefOid,comments' }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields }); if (shared) return shared; }
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', 'number,labels,headRefOid,comments'];
+    '--json', fields];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
@@ -110,8 +110,8 @@ export function commentsMayBeTruncated(pr) {
  * read, so a partial thread never decides a write.
  * @param {{repo: string, number: number, exec?: Function, readComments?: Function}} o
  */
-export function defaultReadPr({ repo, number, exec = execFileSyncThrottled, readComments = readCompletePrComments }) {
-  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid'];
+export function defaultReadPr({ repo, number, exec = execFileSyncThrottled, readComments = readCompletePrComments, fields = 'number,state,labels,headRefOid' }) {
+  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', fields];
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   const pr = JSON.parse(String(out || '{}'));
   const comments = readComments(number, { repo });

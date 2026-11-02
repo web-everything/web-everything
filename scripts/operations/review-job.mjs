@@ -950,7 +950,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, runId: out.runId });
+          head, readHead, runId: out.runId, accepted: true });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
