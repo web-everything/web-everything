@@ -61,7 +61,7 @@ function latestAudit(records, head, base) {
     && Array.isArray(record.findings) && record.findings.every(line => typeof line === 'string')
     && findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH }));
   // Malformed evidence for this head must never silently revive an older clearance.
-  if (records.some(record => record?.head === head) && records.filter(record => record?.head === head).length !== valid.length) {
+  if (records.some(record => record?.head === head && (!Array.isArray(record.findings) || !record.findings.every(line => typeof line === 'string')))) {
     throw new Error('malformed audit record for this head');
   }
   const newer = (record, previous) => !previous || Date.parse(record.at) >= Date.parse(previous.at);

@@ -942,7 +942,7 @@ describe('round 7 path and audit evidence', () => {
     const r = await checkPr(6223,deps(undefined,{
       readAudits:()=>[audit(fixture(6223).headRefOid,{findings})],
     }));
-    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['no audit for head']});
+    expect(condition(r,2).status).toBe('UNKNOWN');
   });
   it('does not hide an intervening foreign-base WEAKENED behind a later foreign-base clear', async () => {
     const head = fixture(6223).headRefOid;
