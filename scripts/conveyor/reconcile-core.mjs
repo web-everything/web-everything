@@ -2073,9 +2073,9 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
 export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
 /** True when the newest completed check finished at least the grace ago (or no timestamp is readable). */
-export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS) {
+export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
   const times = (Array.isArray(rollup) ? rollup : []).map((c) => Date.parse(c?.completedAt)).filter(Number.isFinite);
-  if (!times.length || !Number.isFinite(now) || !now) return true;
+  if (!times.length || !Number.isFinite(now) || !now) return !strict; // strict: unknown timing is NOT settled
   return now - Math.max(...times) >= graceMs;
 }
 
@@ -2823,7 +2823,7 @@ export function planReconcile({
         && ((laneHead && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red')))
           || (!laneHead && botAuthored && withPhase.check === 'green'))
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, { strict: !laneHead })) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         why: 'open PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
