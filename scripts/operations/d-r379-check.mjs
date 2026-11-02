@@ -31,7 +31,7 @@ export function matchesGlob(path, glob) {
 }
 
 function validateSettings(settings) {
-  for (const key of ['directionPaths', 'protectedPaths', 'enforcementTrees', 'reviewedSafePaths']) {
+  for (const key of ['directionPaths', 'protectedPaths', 'harmlessPaths', 'enforcementTrees', 'reviewedSafePaths']) {
     const patterns = key === 'reviewedSafePaths' && settings?.[key] === undefined ? [] : settings?.[key];
     if (!Array.isArray(patterns) || (key !== 'reviewedSafePaths' && !patterns.length) || patterns.length > 1000
       || patterns.some(p => typeof p !== 'string' || !p.trim() || p.length > 4096)) {
@@ -300,13 +300,13 @@ function protectedPaths(paths, settings) {
   if (hits.length) return result(4, 'Not guard-loosening / hard to undo', 'FAIL',
     hits.map(path => `protected path: ${path}`));
   const unclassified = paths.filter(path => {
-    const rootContent = !path.includes('/') && /^(?:README|LICENSE|CHANGELOG)/.test(path);
-    return settings.enforcementTrees.some(glob => !(rootContent && glob === '*') && matchesGlob(path, glob))
-      && !settings.reviewedSafePaths.some(glob => matchesGlob(path, glob));
+    if (settings.reviewedSafePaths.some(glob => matchesGlob(path, glob))) return false;
+    return !settings.harmlessPaths.some(glob => matchesGlob(path, glob))
+      || settings.enforcementTrees.some(glob => matchesGlob(path, glob));
   });
   return result(4, 'Not guard-loosening / hard to undo', unclassified.length ? 'UNKNOWN' : 'PASS',
-    unclassified.length ? unclassified.map(path => `unclassified enforcement-tree path: ${path}; operator review`)
-      : ['no protected or unclassified enforcement-tree paths']);
+    unclassified.length ? unclassified.map(path => `unclassified path: ${path}; operator review`)
+      : ['all paths harmless or explicitly reviewed safe; no protected paths']);
 }
 
 /** Return all five conditions; seats are informational and never authorize approval. */

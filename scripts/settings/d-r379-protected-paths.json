@@ -4,10 +4,25 @@
     "docs/agent/platform-decisions.md",
     "standards/**",
     "contracts/**",
+    "schemas/**",
+    "conformance-vectors/**",
+    "conformance-evidence/**",
+    "wrapper-conformance/**",
     "src/_data/**",
     "src/_includes/*-descriptions/**"
   ],
   "rulingRecordPaths": ["docs/agent/platform-decisions.md"],
+  "harmlessPaths": [
+    "docs/examples/**",
+    "backlog/*.md",
+    "docs/*.md",
+    "docs/**/*.md",
+    "README*.md",
+    "**/*.png",
+    "**/*.svg",
+    "**/*.jpg",
+    "**/*.webp"
+  ],
   "enforcementTrees": [
     "scripts/**",
     ".github/**",
@@ -20,7 +35,6 @@
     "**/prompts/**",
     "**/skills/**",
     "docs/agent/**",
-    "*",
     "**/*.js",
     "**/*.ts",
     "**/*.mjs",
