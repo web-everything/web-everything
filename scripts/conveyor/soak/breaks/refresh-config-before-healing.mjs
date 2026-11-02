@@ -49,6 +49,8 @@ export default {
         log: () => {}, journalLaneEvent: () => {},
       });
       const fetchOriginHealing = fn('fetchOriginHealing', {
+        // Resolve lazily: historical replay roots predate alternates repair and never call this helper.
+        ensureAlternatesFor: (repo, n) => fn('ensureAlternatesFor', { laneDir })(repo, n),
         laneDir, fetchOriginPruneWithRetry: (dir) => { if (broken && dir.endsWith('lane-1')) throw Error(damage); },
         healSharedStoreFor: () => false, diagnoseLane: () => ({ ok: !broken, problems: [damage] }),
         looksLikeCorruption: () => false, msgOf: (e) => e.message, log: () => {}, healLaneRefs: () => {},
