@@ -204,11 +204,13 @@ export function stampedTimeoutFactor(gate) {
  * Keep every argument and remaining shell step exact; the matched plan executes our own wrapper.
  * The quoted path accepts shellQuote's escaped apostrophes as well as ordinary checkout names.
  */
+const SHARD_WRAPPER_PREFIX = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
+/** A sharded selected-test command from ANY checkout root (shellQuote'd absolute wrapper path). */
+export const isShardWrapperCommand = command => typeof command === 'string' && SHARD_WRAPPER_PREFIX.test(command);
 export function gateCommandsEqual(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
   if (left === right) return true;
-  const wrapper = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
-  const leftPrefix = wrapper.exec(left), rightPrefix = wrapper.exec(right);
+  const leftPrefix = SHARD_WRAPPER_PREFIX.exec(left), rightPrefix = SHARD_WRAPPER_PREFIX.exec(right);
   return !!leftPrefix && !!rightPrefix
     && left.slice(leftPrefix[0].length) === right.slice(rightPrefix[0].length);
 }

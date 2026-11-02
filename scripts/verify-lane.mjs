@@ -86,7 +86,7 @@ import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
-import { shellQuote } from './lib/verify-lane-gate.mjs';
+import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
@@ -477,7 +477,8 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   } catch { /* Unknown selection cannot authorize a retry. */ }
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
-  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && isSelectedTestCommand(GATE)) {
+  // A sharded gate stamped in another checkout carries that checkout's wrapper root, so recognize it root-agnostically.
+  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && (isSelectedTestCommand(GATE) || isShardWrapperCommand(GATE))) {
     admissionFallback = 'requested gate is not this checkout\'s default selection under any declared settings variant';
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }

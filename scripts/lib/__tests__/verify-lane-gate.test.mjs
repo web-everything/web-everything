@@ -1317,6 +1317,18 @@ process.exit(1);`);
       const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
       expect.soft(commands[0][0]).toBe(join(checkoutB, 'scripts/lib/verify-shard-run.mjs'));
       expect(commands.some(args => args.includes('guard.test.mjs'))).toBe(true);
+
+      // #66: checkout A's sharded gate that B cannot match must still announce and record the whole-gate fallback,
+      // even though its wrapper root is not B's own.
+      const unmatched = stamped.command.replace(/--parallel=\d+/, '--parallel=1');
+      expect(unmatched).not.toBe(stamped.command);
+      const fallback = spawnSync(process.execPath, [join(checkoutB, 'scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${unmatched}`, '--run-id=cross-checkout-unmatched', '--json'],
+        { env, encoding: 'utf8', timeout: 60000 });
+      expect(fallback.error, fallback.stderr).toBeUndefined();
+      expect(fallback.stderr).toContain('⚠ verify-lane: whole-gate admission');
+      const fallbackResult = JSON.parse(fallback.stdout.trim().split('\n').at(-1));
+      expect(fallbackResult.phases?.admissionMode).toBe('gate');
+      expect(fallbackResult.phases?.admissionFallback).toMatch(/not this checkout's default selection/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

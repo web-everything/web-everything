@@ -59,19 +59,29 @@ describe('fail-closed wrapper', () => {
       readFileSync: p => { if (p === '/scratch/shards/0.initial.json') return reportText; throw Error('missing'); } },
     tmpdir: () => '/scratch', execute: async () => ({ exitCode: 0 }) }),
     // A real child prints the JSON on stdout and exits 0; executeShard must stream it into the verdict.
+    // The result is returned, not asserted here: runShards catches anything thrown inside execute.
     'real child stdout': reportText => ({ fs, execute: async options => {
       const result = await executeShard({ ...options, command: process.execPath,
         args: ['-e', `console.log('install output'); console.log(${JSON.stringify(reportText)});`] });
-      expect(result).toMatchObject({ exitCode: 0, reportText });
-      return result;
+      return { ...result, observed: { exitCode: result.exitCode, reportText: result.reportText } };
     } }),
   };
-  const runOneShard = (deps, lines) => runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs: 10000 },
-    { discover: () => null, env: { PATH: process.env.PATH }, log: line => lines.push(line), ...deps });
+  const runOneShard = async ({ execute, ...deps }, lines, reportText) => {
+    const results = [];
+    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs: 10000 },
+      { discover: () => null, env: { PATH: process.env.PATH }, log: line => lines.push(line), ...deps,
+        execute: async options => { const result = await execute(options); results.push(result); return result; } });
+    // Exactly one attempt, it exited 0, and (for a real child) the inventory really arrived on stdout.
+    expect(results).toHaveLength(1);
+    expect(results[0].exitCode).toBe(0);
+    if (results[0].observed) expect(results[0].observed).toEqual({ exitCode: 0, reportText });
+    expect(lines.join('')).not.toContain('verify-shard error');
+    return code;
+  };
   it.each(Object.keys(EVIDENCE_CHANNELS))('%s: passing JSON with exit 0 is GREEN (control for the failure cases)', async channel => {
     const reportText = JSON.stringify({ success: true, testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] });
     const lines = [];
-    expect(await runOneShard(EVIDENCE_CHANNELS[channel](reportText), lines)).toBe(0);
+    expect(await runOneShard(EVIDENCE_CHANNELS[channel](reportText), lines, reportText)).toBe(0);
     expect(lines.join('')).toContain('verify-shard 1/1: PASS');
   });
   it.each(Object.keys(EVIDENCE_CHANNELS).flatMap(channel => JSON_FAILURE_SIGNALS.map(signal => [channel, ...signal])))(
@@ -81,7 +91,7 @@ describe('fail-closed wrapper', () => {
       ] });
       expect(inventoryVerdict(reportText, ['a'])).toBe('FAIL');
       const lines = [];
-      expect(await runOneShard(EVIDENCE_CHANNELS[channel](reportText), lines)).toBe(1);
+      expect(await runOneShard(EVIDENCE_CHANNELS[channel](reportText), lines, reportText)).toBe(1);
       // FAIL from the JSON evidence, not INVENTORY-INCOMPLETE from a lost or unreadable report.
       expect(lines.join('')).toMatch(/verify-shard 1\/1: FAIL /);
       expect(lines.join('')).not.toContain('GREEN');
