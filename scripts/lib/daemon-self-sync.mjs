@@ -2,7 +2,8 @@
  * @file scripts/lib/daemon-self-sync.mjs
  * Shared clones elect a heartbeat-backed rebuild owner; siblings keep read-locked ticks and HEAD restarts.
  * Overlay rebuild requests survive refusals/failures; concluded rebuilds acknowledge their observed ID
- * without deleting newer publications.
+ * without deleting newer publications. Owners request hard claims only for live requests or ready adoption;
+ * all siblings keep adoption-yield accounting, and stale-owner fallback alerts are bounded to 15 minutes.
  * @description xv6fciw (narrow slice of decision #3681) — keep a daemon's DEDICATED clone on `origin/main`
  *   without a human re-syncing it, and restart the daemon onto new code between ticks.
  *
@@ -712,9 +713,17 @@ export function withSelfSync(effects, {
   let tickOwnership = null;
   let pendingRebuildRequest = null;
   let lastOwnershipReason = null;
+  let lastOwnerStaleAlertAt = -Infinity;
   const rebuild = async (...args) => {
     if (tickOwnership && !tickOwnership.owner) return { moved: false, reason: 'clone-non-owner' };
-    const result = await rebuildImpl(...args);
+    // Pending work opts into priority explicitly. Ordinary discovery keeps legacy soft-writer fairness.
+    const liveRequest = readRebuildRequest(root, { ...cloneLockOpts(), env, nowMs: now() });
+    const candidate = readReady(root, env);
+    const readyToAdopt = candidate?.adopt?.finalSha && candidate.prevHead
+      && readHead(syncOpts()) === candidate.prevHead;
+    const result = liveRequest || readyToAdopt
+      ? await rebuildImpl({ ...args[0], lockOpts: { ...args[0]?.lockOpts, hardClaim: true } }, ...args.slice(1))
+      : await rebuildImpl(...args);
     if (pendingRebuildRequest && (result?.moved || result?.reason === 'up-to-date')) {
       clearRebuildRequest(root, { ...cloneLockOpts(), id: pendingRebuildRequest.id });
       pendingRebuildRequest = null;
@@ -914,10 +923,20 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
-      tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: now(), ...cloneLockOpts() });
+      const ownershipNowMs = now();
+      tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });
       if (tickOwnership.reason !== lastOwnershipReason) {
         lastOwnershipReason = tickOwnership.reason;
         log.error?.(`daemon-self-sync: clone ownership=${tickOwnership.reason}; rebuild=${tickOwnership.owner}`);
+      }
+      if (tickOwnership.reason === 'owner-stale-fallback' && typeof progress?.alert === 'function'
+        && ownershipNowMs - lastOwnerStaleAlertAt >= 15 * 60_000) {
+        // Count attempts too: an unavailable alert sink must not turn every tick into an alert storm.
+        lastOwnerStaleAlertAt = ownershipNowMs;
+        try {
+          progress.alert('clone-owner-stale', { clone: basename(root), entry: basename(String(entries?.[0] || '')),
+            reason: tickOwnership.reason }, ownershipNowMs);
+        } catch { /* alert delivery never freezes the legacy rebuild fallback */ }
       }
       // A fallback sibling must NOT impersonate the dead owner by refreshing its heartbeat.
       if (tickOwnership.reason === 'owner-entry') {
@@ -957,7 +976,7 @@ export function withSelfSync(effects, {
 
       // Only count candidates already smoke-passed at tick entry, still based on this clone's HEAD.
       // This is a tick-boundary policy: it never interrupts a running tick or changes the clone lock.
-      const ready = tickOwnership.owner ? readReady(root, env) : null;
+      const ready = readReady(root, env);
       const identity = ready && readHead(syncOpts()) === ready.prevHead
         ? JSON.stringify([ready.adopt?.finalSha, ready.passedAt, ready.prevHead]) : null;
       adoptWaitTicks = identity === null ? 0 : identity === readyIdentity ? adoptWaitTicks + 1 : 1;

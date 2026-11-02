@@ -157,12 +157,23 @@ describe('hard claims, deterministic priority boundaries', () => {
     expect(snapshot().writerLive).toBe(false);
     release('existing');
   });
-  it('two tick-in-progress give-ups promote a soft claim by default', async () => {
+  it('two tick-in-progress give-ups promote a soft claim when explicitly enabled', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', '2');
     expect(read('existing').ok).toBe(true);
     expect(await write()).toMatchObject({ reason: 'tick-in-progress' });
     expect(snapshot().writerClaim?.hard).not.toBe(true);
     expect(await write()).toMatchObject({ reason: 'tick-in-progress' });
     expect(snapshot().writerClaim).toMatchObject({ count: 2, hard: true });
+    release('existing');
+  });
+  it.each([undefined, '0'])('soft claims do not promote by default or when disabled (%s)', async (value) => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', value);
+    expect(read('existing').ok).toBe(true);
+    for (let i = 0; i < 4; i += 1) {
+      expect(await write()).toMatchObject({ reason: 'tick-in-progress' });
+      expect(snapshot().writerClaim?.hard).not.toBe(true);
+    }
+    expect(snapshot().writerClaim?.count).toBe(4);
     release('existing');
   });
   it('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER controls the promotion threshold', async () => {

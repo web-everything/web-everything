@@ -8,6 +8,7 @@
  * Single-owner heartbeat + rebuild requests coordinate shared clones; bounded hard claims drain readers
  * without skip-cap/older-reader backoff. Expiry restores ordinary fairness. Request acknowledgement
  * records the consumed ID separately, so acknowledgement never deletes a concurrent publication.
+ * Soft-to-hard promotion is disabled unless an explicit positive environment threshold enables it.
  *
  * WHY a reader/writer lock, not just the per-path lock `scripts/readiness/file-locks.mjs` already has: that
  * module guards individual FILES inside the shared central checkout so two lanes never edit the same path.
@@ -167,7 +168,15 @@ export function clearRebuildRequest(root, { lockRoot, id } = {}) {
   atomicSidecar(sidecar(root, 'rebuild-request-ack.json', lockRoot), { id });
 }
 function hardWindowMs() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', 15 * 60_000); }
-function hardAfter() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', 2, process.env, true); }
+function hardAfter() {
+  const key = 'WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER';
+  const raw = process.env[key];
+  const n = Number(raw);
+  const valid = raw != null && String(raw).trim() !== '' && Number.isInteger(n) && n >= 0;
+  const value = valid ? n : 0;
+  settingLog(key, value, valid ? 'environment' : 'standard');
+  return value;
+}
 function claimIsHard(rec, nowMs) {
   const since = Date.parse(rec?.since || '');
   return rec?.hard === true && Number.isFinite(since) && nowMs >= since && nowMs - since < hardWindowMs();
@@ -356,7 +365,8 @@ function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe
   const rec = {
     owner, pid, count: (same ? prev.count : 0) + (gaveUp ? 1 : 0), heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
   };
-  rec.hard = hardClaim || (same && prev.hard === true) || rec.count >= hardAfter();
+  const promoteAfter = hardAfter();
+  rec.hard = hardClaim || (same && prev.hard === true) || (promoteAfter > 0 && rec.count >= promoteAfter);
   try {
     const file = writerClaimFile(starvedRoot);
     mkdirSync(join(file, '..'), { recursive: true });

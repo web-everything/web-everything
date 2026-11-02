@@ -7,6 +7,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import * as lock from '../daemon-clone-lock.mjs';
+import { rebuildClone as publicRebuildClone } from '../daemon-rebuild.mjs';
+import { rebuildClone as coreRebuildClone } from '../daemon-rebuild/index.mjs';
 import { withSelfSync } from '../daemon-self-sync.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { retireRegistration } from '../../daemon-overlay.mjs';
@@ -145,6 +147,103 @@ function wrapper(entry, overrides = {}) {
   return { synced: withSelfSync({ tickOnce: tick }, options), rebuild, tick, onRestart };
 }
 describe('withSelfSync single owner', () => {
+  it('public rebuild facade leaves lock policy opt-in with a plain re-export', () => {
+    expect(publicRebuildClone).toBe(coreRebuildClone);
+  });
+  it('ordinary owner discovery never requests a hard claim', async () => {
+    const w = wrapper('review-daemon.mjs');
+    await expect(w.synced.tickOnce()).resolves.toBe('ticked');
+    expect(w.rebuild.mock.calls).toEqual([[]]);
+  });
+  it('owner requests a hard claim for a live request only until it is consumed', async () => {
+    request();
+    const w = wrapper('review-daemon.mjs');
+    await w.synced.tickOnce();
+    expect(readRequest()).toBeNull();
+    await w.synced.tickOnce();
+    expect(w.rebuild.mock.calls).toEqual([[{ lockOpts: { hardClaim: true } }], []]);
+  });
+  it('expired rebuild requests do not enable hard claims', async () => {
+    request(T - 30 * 60_000 - 1);
+    const w = wrapper('review-daemon.mjs');
+    await w.synced.tickOnce();
+    expect(w.rebuild.mock.calls).toEqual([[]]);
+  });
+  it('owner requests a hard claim for a ready smoke-passed candidate on the current HEAD', async () => {
+    const ready = { prevHead: 'boot', adopt: { finalSha: 'next' }, passedAt: 'smoke-passed' };
+    const w = wrapper('review-daemon.mjs', { readReady: () => ready });
+    await w.synced.tickOnce();
+    expect(w.rebuild).toHaveBeenCalledWith({ lockOpts: { hardClaim: true } });
+  });
+  it('a ready candidate for another HEAD does not enable a hard claim', async () => {
+    const ready = { prevHead: 'other', adopt: { finalSha: 'next' }, passedAt: 'smoke-passed' };
+    const w = wrapper('review-daemon.mjs', { readReady: () => ready });
+    await w.synced.tickOnce();
+    expect(w.rebuild.mock.calls).toEqual([[]]);
+  });
+  it('non-owner yields reader priority after maxAdoptWaitTicks for a ready candidate without rebuilding', async () => {
+    heartbeat();
+    const ready = { prevHead: 'boot', adopt: { finalSha: 'next' }, passedAt: 'smoke-passed' };
+    const readReady = vi.fn(() => ready);
+    const acquireRead = vi.fn((clone, opts) => opts.trackStarvation === false
+      ? lock.acquireRead(clone, opts) : { ok: false, reason: 'writer-active', starved: 5 });
+    const log = { error: vi.fn() };
+    const w = wrapper('other.mjs', { readReady, acquireRead, log, maxAdoptWaitTicks: 2,
+      readerPriorityAfter: 1, priorityWaitMs: 100, sleep: async () => {} });
+    await expect(w.synced.tickOnce()).resolves.toBe('ticked');
+    await expect(w.synced.tickOnce()).resolves.toBe('ticked');
+    acquireRead.mockClear();
+    await expect(w.synced.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'writer-active' });
+    expect(acquireRead).toHaveBeenCalledTimes(1);
+    expect(readReady).toHaveBeenCalledTimes(3);
+    expect(w.tick).toHaveBeenCalledTimes(2);
+    expect(w.rebuild).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/yielding this tick.*ready.*3.*2/));
+  });
+  it('configured stale owner fallback logs reason changes and alerts at most once per fifteen minutes', async () => {
+    let nowMs = T;
+    env.WE_DAEMON_CLONE_OWNER_STALE_MS = '1';
+    const alert = vi.fn();
+    const log = { error: vi.fn() };
+    const w = wrapper('other.mjs', { now: () => nowMs, log,
+      tickProgress: { alert, markTickDone: vi.fn() } });
+    await w.synced.tickOnce();
+    nowMs += 1;
+    await w.synced.tickOnce();
+    expect(alert).toHaveBeenCalledTimes(1);
+    heartbeat(nowMs);
+    await w.synced.tickOnce(); // Owner recovered: no fallback, no rebuild, and no alert.
+    nowMs += 2;
+    await w.synced.tickOnce(); // Fallback recurs within the window: log it, but do not alert again.
+    nowMs = T + 15 * 60_000 - 1;
+    await w.synced.tickOnce();
+    expect(alert).toHaveBeenCalledTimes(1);
+    nowMs += 1;
+    await w.synced.tickOnce();
+    expect(alert.mock.calls).toEqual([
+      ['clone-owner-stale', expect.objectContaining({ clone: 'wev-review-daemon', entry: 'other.mjs', reason: 'owner-stale-fallback' }), T],
+      ['clone-owner-stale', expect.objectContaining({ reason: 'owner-stale-fallback' }), T + 15 * 60_000],
+    ]);
+    expect(log.error.mock.calls.filter(([line]) => line.includes('clone ownership=owner-stale-fallback'))).toHaveLength(2);
+  });
+  it('failed stale-owner alert delivery does not freeze fallback or retry every tick', async () => {
+    const alert = vi.fn(() => { throw new Error('sink unavailable'); });
+    const w = wrapper('other.mjs', { tickProgress: { alert, markTickDone: vi.fn() } });
+    await expect(w.synced.tickOnce()).resolves.toBe('ticked');
+    await expect(w.synced.tickOnce()).resolves.toBe('ticked');
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(w.rebuild).toHaveBeenCalledTimes(2);
+  });
+  it('an unconfigured clone never emits a stale-owner alert', async () => {
+    root = join(scratch, 'unconfigured-clone');
+    mkdirSync(root);
+    const alert = vi.fn();
+    const w = wrapper('other.mjs', { tickProgress: { alert, markTickDone: vi.fn() } });
+    await expect(w.synced.tickOnce()).resolves.toBe('ticked');
+    expect(w.rebuild).toHaveBeenCalledTimes(1);
+    expect(alert).not.toHaveBeenCalled();
+  });
+
   it('non-owner runs every tick under a read lock without rebuild or a write reservation', async () => {
     heartbeat();
     const w = wrapper('other.mjs');

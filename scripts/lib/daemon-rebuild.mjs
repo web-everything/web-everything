@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/lib/daemon-rebuild.mjs
- * Public rebuild entry opts into a bounded hard writer claim for admission and adoption, including job children.
+ * Public rebuild entry preserves caller-selected lock policy; hard writer claims are opt-in.
  * @description Module C (card 4044/xgomze7, "the heart") of the daemon-clone rebuild
  *   (docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clauses 2-5) — REBUILDS a daemon clone
  *   fresh from `origin/main` plus its registered overlay list (`daemon-overlays.mjs`, Module B) every tick,
@@ -114,11 +114,7 @@ export { writeRebuildRequest } from './daemon-clone-lock.mjs';
 
 import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rebuildClone as rebuildCloneImpl, dryRunRebuild } from './daemon-rebuild/index.mjs';
-
-export function rebuildClone(options = {}) {
-  return rebuildCloneImpl({ ...options, lockOpts: { hardClaim: true, ...options.lockOpts } });
-}
+import { rebuildClone, dryRunRebuild } from './daemon-rebuild/index.mjs';
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────
 // `node scripts/lib/daemon-rebuild.mjs --clone=<path> [--dry-run] [--json] [--ready-only] [--entry=<script>]... [--main-only]`
