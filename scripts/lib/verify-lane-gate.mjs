@@ -429,11 +429,19 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
-    const vitestCmd = selection?.status === 'selection-truncated'
+    let vitestCmd = selection?.status === 'selection-truncated'
       ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests${timeoutFlags}`
       : targets.length
       ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests${timeoutFlags}`
       : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
+    if (selection?.status === 'selection-truncated' && settings.shardMinTests > 0
+      && selection.tests.length >= settings.shardMinTests) {
+      const shards = { count: Math.ceil(selection.tests.length / settings.shardSize), size: settings.shardSize, parallel: settings.shardParallel };
+      selection.shards = shards;
+      decision.shards = shards;
+      decision.reasons = [...decision.reasons, `${shards.count} shards (size ${shards.size}, parallel ${shards.parallel}); shardMinTests=${settings.shardMinTests} (${settingsSource.shardMinTests}), shardSize=${settings.shardSize} (${settingsSource.shardSize}), shardParallel=${settings.shardParallel} (${settingsSource.shardParallel}), phaseTimeoutMs=${settings.phaseTimeoutMs} (${settingsSource.phaseTimeoutMs})`];
+      vitestCmd = `node scripts/lib/verify-shard-run.mjs --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
+    }
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
     // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number
     // of changed files, never the whole repo); see scripts/lib/repo-scan-tests.mjs. Scanner reach is the full changed
@@ -870,6 +878,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
       ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
     // #5128 — what the related-test selection ran and why; `status: 'selection-truncated'` means farther tests were left to CI.
     selection: decision?.selection ? {
+      ...(decision.selection.shards ? { shards: decision.selection.shards } : {}),
       status: decision.selection.status, fullTestCount: decision.selection.fullTestCount,
       selectedTestCount: decision.selection.selectedTestCount, directTestCount: decision.selection.directTestCount,
       droppedCount: decision.selection.droppedCount, depth: decision.selection.depth, maxDepth: decision.selection.maxDepth,

@@ -22,6 +22,8 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // #5128 — over this many related tests (any import depth), run only tests within `relatedDepth` import hops (never
   // fewer than the direct importers) and mark the run `selection-truncated`. 0 = off (plain `vitest related`).
   relatedMaxTests: 0,
+  // Explicit-file selections shard at this threshold; zero disables sharding.
+  shardMinTests: 24, shardSize: 12, shardParallel: 3,
   relatedDepth: 2,
   // #99 — guard/contract/repo-scan test files the default gate ALWAYS runs, whatever the related selection picked
   // (they read the whole repo, import nothing the diff touches, and so were the CI-only reds). Repo-relative paths;
@@ -66,6 +68,9 @@ export function defaultVerifySettingsPath() {
 }
 
 const rules = {
+  shardMinTests: value => Number.isSafeInteger(value) && value >= 0,
+  shardSize: value => Number.isSafeInteger(value) && value >= 1,
+  shardParallel: value => Number.isSafeInteger(value) && value >= 1,
   relatedMode: value => ['all', 'import-only'].includes(value),
   testTimeoutFactor: value => typeof value === 'number' && Number.isFinite(value) && value >= 1,
   standards: value => ['always', 'auto', 'ci-only'].includes(value),
@@ -91,6 +96,7 @@ const rules = {
     && value.every(f => typeof f === 'string' && /^(?:\.\/)?[\w@][\w./@-]*\.test\.[cm]?[jt]sx?$/.test(f) && !f.split('/').includes('..')),
 };
 const envKeys = {
+  shardMinTests: 'WE_VERIFY_SHARD_MIN_TESTS', shardSize: 'WE_VERIFY_SHARD_SIZE', shardParallel: 'WE_VERIFY_SHARD_PARALLEL',
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
   standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
   matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE',
@@ -140,7 +146,7 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
     let value = env?.[envKeys[key]];
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
-    else if (['testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
+    else if (['shardMinTests', 'shardSize', 'shardParallel', 'testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {

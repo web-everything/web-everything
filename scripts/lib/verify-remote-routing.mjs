@@ -83,6 +83,9 @@ function wrappedChain(command) {
 }
 
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
+  if (/^node scripts\/lib\/verify-shard-run\.mjs(?=\s|$)/.test(command)) {
+    return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
+  }
   if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
     const wrapped = decision?.remote === true ? wrappedChain(command) : null;
     if (wrapped || command.split(' && ').some(isVitestSegment)) {
@@ -102,7 +105,7 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
   // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
   // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
-  return plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
+  return !plan?.shardWrapper && plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
     && ranOn.failureLocation === 'remote'
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
