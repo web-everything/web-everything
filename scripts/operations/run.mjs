@@ -39,6 +39,7 @@ import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry, op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
+import { createAuditDeps } from './codex-audit-io.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -482,8 +483,12 @@ export const OPERATIONS = Object.freeze({
       } }),
     }),
     sinks: { 'codex-audit.run': async ({ base, head }) => {
-      const code = await codexAuditMain([`--base=${base}`, `--head=${head}`]);
-      return { ok: code === 0, code };
+      let stdout = '';
+      // The runner owns stdout; carry the standalone audit's structured result in its envelope.
+      const code = await codexAuditMain([`--base=${base}`, `--head=${head}`, '--json'], {
+        ...createAuditDeps(), stdout: text => { stdout += text; },
+      });
+      return { ...(code === 0 || code === 1 ? JSON.parse(stdout) : {}), ok: code === 0, code };
     } },
     finish: ({ run, code, lines }) => ({ code: run?.verdict?.code ?? code, lines }),
   }),

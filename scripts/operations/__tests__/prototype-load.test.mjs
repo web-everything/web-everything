@@ -25,7 +25,10 @@ import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
 import { checkPendingAdoptions, readPendingAdoptions, recordPendingAdoption } from '../../lib/overlay-adoption.mjs';
 // Exercise the real runner binding without spawning an auditor or writing audit records.
 vi.mock('../codex-audit.mjs', async (importOriginal) => ({
-  ...await importOriginal(), main: vi.fn(async () => 0),
+  ...await importOriginal(), main: vi.fn(async (_argv, deps) => {
+    deps.stdout(JSON.stringify({ verdict: 'NOT WEAKENED' }));
+    return 0;
+  }),
 }));
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
 const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control', waitAdoptionMs: 30 };
@@ -268,13 +271,14 @@ describe('codex-audit runner registration', () => {
     const parsed = parseOperationArgv(declaration, ['--base=origin/main', `--head=${SHA}`]);
     expect(parsed.errors).toEqual([]);
     expect(parsed.input).toMatchObject({ base: 'origin/main', head: SHA });
-    await runOperationCli({ declaration, registry, sinks,
+    const outcome = await runOperationCli({ declaration, registry, sinks,
       argv: ['--base=origin/main', `--head=${SHA}`],
       store: createMemoryRunStore(), newRunId: () => 'canonical-audit-registration',
     });
     expect(auditMain).toHaveBeenCalledTimes(1);
     const [argv] = vi.mocked(auditMain).mock.calls[0];
-    expect(argv).toEqual(expect.arrayContaining(['--base=origin/main', `--head=${SHA}`]));
+    expect(argv).toEqual(expect.arrayContaining(['--base=origin/main', `--head=${SHA}`, '--json']));
+    expect(outcome.run.verdict).toEqual({ ok: true, code: 0, verdict: 'NOT WEAKENED' });
   });
 });
 

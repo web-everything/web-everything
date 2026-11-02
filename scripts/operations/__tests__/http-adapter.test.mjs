@@ -24,7 +24,7 @@
  */
 
 import { types } from 'node:util';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -40,6 +40,8 @@ import { inFlight } from '../effect-executor.mjs';
 import { validateInput } from '../registry.mjs';
 import { buildCliSpec, judgeOutcome, parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { OPERATIONS, resolveOperation } from '../run.mjs';
+import * as auditIo from '../codex-audit-io.mjs';
+import { QUESTION_HASH } from '../codex-audit.mjs';
 import { reviewPrOperation, REVIEW_PR_OP, REVIEW_EFFECTS } from '../review-pr.mjs';
 import { suggestNextOperation, SUGGEST_NEXT_OP } from '../suggest-next.mjs';
 import { GATE_HEALTH_OP } from '../gate-health.mjs';
@@ -105,6 +107,49 @@ import {
   runReadOnly,
   segmentsUnder,
 } from '../http-adapter.mjs';
+
+describe('codex-audit registered CLI JSON output', () => {
+  const base = 'a'.repeat(40), head = 'b'.repeat(40);
+
+  async function runAudit({ answer = 'NOT WEAKENED', resolveSha = ref => ref, appendRecord = () => {} } = {}) {
+    const stdout = [], stderr = [];
+    const deps = { resolveSha, runCodex: async () => answer, appendRecord,
+      now: () => '2026-11-02T00:00:00Z',
+      stdout: text => stdout.push(text), stderr: text => stderr.push(text) };
+    const spy = vi.spyOn(auditIo, 'createAuditDeps').mockReturnValue(deps);
+    try {
+      const { declaration, registry, sinks, finish } = resolveOperation('codex-audit', { json: true });
+      const outcome = await runOperationCli({ declaration, registry, sinks,
+        argv: [`--base=${base}`, `--head=${head}`, '--json'],
+        store: createMemoryRunStore(), newRunId: () => 'audit-json-test' });
+      const finished = finish({ ...outcome, json: true });
+      // Match the runner's final write, including any output leaked by its real audit sink.
+      stdout.push(`${finished.lines.join('\n')}\n`);
+      return { code: finished.code, payload: JSON.parse(stdout.join('')), stderr };
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it.each([['NOT WEAKENED', 0], ['WEAKENED', 1]])('emits one parseable envelope carrying %s', async (verdict, code) => {
+    const findings = ['scripts/example.mjs:1 — finding with "quotes" and \\slashes'];
+    const result = await runAudit({ answer: [verdict, ...findings].join('\n') });
+    expect(result.code).toBe(code);
+    expect(result.payload.verdict).toEqual({ ok: code === 0, code, verdict, findings, base, head, questionHash: QUESTION_HASH });
+    expect(result.stderr).toEqual([]);
+  });
+
+  it.each([
+    ['unresolved commit', { resolveSha: () => { throw new Error('unknown ref'); } }, 2],
+    ['unparseable audit', { answer: 'incomplete' }, 3],
+    ['record write failure', { appendRecord: () => { throw new Error('read-only'); } }, 3],
+  ])('keeps a JSON envelope and failure code for %s', async (_label, options, code) => {
+    const result = await runAudit(options);
+    expect(result.code).toBe(code);
+    expect(result.payload.verdict).toEqual({ ok: false, code });
+    expect(result.stderr.join('')).not.toBe('');
+  });
+});
 
 // ── fixtures ────────────────────────────────────────────────────────────────────────────────────────────────
 
