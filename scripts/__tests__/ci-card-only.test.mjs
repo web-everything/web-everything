@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'nod
 import { resolve, join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { classifyCardOnly, isCardPath, isCardOnlyDiff, resolveCardOnlyBase, SAFE_BASE_REF } from '../ci-card-only.mjs';
+import { classifyCardOnly, isCardPath, isCardOnlyDiff, isDocsPath, classifyLight, resolveCardOnlyBase, SAFE_BASE_REF } from '../ci-card-only.mjs';
 import { REVIEW_HOLD_LABELS } from '../lib/review-escalation.mjs';
 
 describe('ci-card-only detection', () => {
@@ -27,6 +27,93 @@ describe('ci-card-only detection', () => {
     expect(isCardPath('backlog/')).toBe(false);
     expect(isCardPath('backlog/tool.mjs')).toBe(false);
     expect(isCardPath('backlog/nested/card.md')).toBe(false);
+  });
+});
+
+describe('docs-only light path', () => {
+  it.each(['AGENTS.md', 'CLAUDE.md', 'README.md', 'docs/a.md', 'docs/agent/x.md', 'docs/agent/nested/x.md'])(
+    'recognizes docs path %s', (path) => {
+      expect(isDocsPath(path)).toBe(true);
+    });
+
+  it.each([
+    '../AGENTS.md', 'docs/../AGENTS.md', 'docs/agent/../x.md', 'docs/../../x.md', 'docs/..',
+    'AGENTS.md\0', 'docs/a\0.md', '', undefined, null, 42, {}, [],
+    'docs\\a.md', 'docs/agent\\x.md', 'docs/a.json', 'docs/a.ts',
+    'scripts/x.md', 'src/a.md', 'skills-src/x/SKILL.md', '.github/x.md',
+    'agent-memory-src/x.md', 'backlog/1-x.md', 'docs-tools/a.md', 'docsx/a.md',
+    'package.json', 'README.mdx',
+  ].map((path) => ({ path })))('fails closed for non-docs path $path', ({ path }) => {
+    expect(isDocsPath(path)).toBe(false);
+  });
+
+  it.each([
+    ['docs/agent/a.md'],
+    ['AGENTS.md', 'CLAUDE.md', 'docs/agent/a.md'],
+    ['backlog/1-x.md'],
+    ['backlog/1-x.md', 'docs/agent/a.md', 'AGENTS.md'],
+  ].map((files) => ({ files })))('allows a pull request containing only cards or docs: $files', ({ files }) => {
+    expect(classifyLight({ event: 'pull_request', files })).toEqual({ light: true, reason: expect.any(String) });
+  });
+
+  it('explains the docs-only light verdict', () => {
+    expect(classifyLight({ event: 'pull_request', files: ['docs/agent/a.md'] })).toEqual({
+      light: true, reason: expect.stringMatching(/docs/i),
+    });
+  });
+
+  it.each(['scripts/x.mjs', 'docs/a.json', 'src/a.md', 'docs/../a.md'])(
+    'rejects a mixed docs diff and names the offending path %s', (path) => {
+      expect(classifyLight({ event: 'pull_request', files: ['docs/agent/a.md', path] })).toEqual({
+        light: false, reason: expect.stringContaining(path),
+      });
+    });
+
+  it.each(['push', 'merge_group', 'schedule', 'workflow_dispatch', undefined])(
+    'fails closed for event %s even with docs and cards', (event) => {
+      expect(classifyLight({ event, files: ['docs/agent/a.md', 'backlog/1-x.md'] })).toEqual({
+        light: false, reason: expect.any(String),
+      });
+    });
+
+  it.each([[], undefined, null].map((files) => ({ files })))(
+    'fails closed with an empty or missing file list $files', ({ files }) => {
+      expect(classifyLight({ event: 'pull_request', files })).toEqual({ light: false, reason: expect.any(String) });
+    });
+
+  it('keeps docs-only diffs out of classifyCardOnly for local verify and pr-land', () => {
+    expect(classifyCardOnly({ event: 'pull_request', files: ['docs/agent/a.md'] }).light).toBe(false);
+  });
+
+  it('keeps docs-only diffs out of isCardOnlyDiff for local verify and pr-land', () => {
+    expect(isCardOnlyDiff(['docs/agent/a.md'])).toBe(false);
+  });
+
+  it('CLI uses the event base: docs-only prints light=true; adding code prints light=false', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'ci-docs-only-'));
+    const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const commit = (message) => {
+      git('add', '-A');
+      git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', message);
+      return git('rev-parse', 'HEAD');
+    };
+    const cli = resolve(import.meta.dirname, '../ci-card-only.mjs');
+    try {
+      git('init', '-q', '-b', 'main');
+      writeFileSync(join(cwd, 'README.md'), 'base');
+      const base = commit('base');
+      mkdirSync(join(cwd, 'docs/agent'), { recursive: true });
+      writeFileSync(join(cwd, 'docs/agent/a.md'), 'docs');
+      const docsHead = commit('docs only');
+      const out = (head) => execFileSync(process.execPath,
+        [cli, '--event=pull_request', `--base=${base}`, `--head=${head}`],
+        { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      expect.soft(out(docsHead)).toBe('light=true');
+      mkdirSync(join(cwd, 'scripts'), { recursive: true });
+      writeFileSync(join(cwd, 'scripts/x.mjs'), 'export {};');
+      const codeHead = commit('add code');
+      expect(out(codeHead)).toBe('light=false');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });
 

@@ -314,7 +314,7 @@ describe('warm base selection and delta proof',()=>{
     const base=await baseFixture();
     await fs.writeFile(join(repo,'a.test.mjs'),'changed '+seed);await fs.rm(join(repo,'deleted.txt'));await fs.chmod(join(repo,'mode.txt'),0o755);
     await fs.writeFile(join(repo,'added.txt'),'added '+seed);git(['add','.']);commit();
-    await fs.writeFile(join(repo,'untracked.txt'),'untracked '+seed);await fs.writeFile(join(repo,'credentials.txt'),'still private');
+    await fs.writeFile(join(repo,'untracked.txt'),'untracked '+seed);await fs.writeFile(join(repo,'local-credentials.txt'),'still private');
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
     const full=await remote.buildManifest({cwd:repo,exec});
     expect(delta.manifestDigest).toBe(full.manifestDigest);
@@ -322,7 +322,7 @@ describe('warm base selection and delta proof',()=>{
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs','added.txt','mode.txt','untracked.txt']);
     expect(delta.deletions.map(p=>p.toString())).toEqual(['deleted.txt']);
     expect(delta.entries.some(e=>e.path.toString()==='oauth-source.mjs')).toBe(true);
-    expect(delta.excluded.map(p=>p.toString())).toContain('credentials.txt');
+    expect(delta.excluded.map(p=>p.toString())).toContain('local-credentials.txt');
   });
   it('refuses a credential source changed from public evidence and ignored tests in delta mode',async()=>{
     const base=await baseFixture();await fs.writeFile(join(repo,'oauth-source.mjs'),'private bytes');
@@ -336,7 +336,7 @@ describe('warm base selection and delta proof',()=>{
     const delta=await remote.buildDeltaManifest({cwd:repo,exec,base,fs:{...fs,readFile:read}});
     expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs']);
     expect(delta.manifestMode).toBe('git-delta');
-    expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','oauth-source.mjs']);
+    expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','credentials.txt','oauth-source.mjs']);
   });
   it('reads and hashes every final leaf when the fast path is unavailable',async()=>{
     const base=await baseFixture();
@@ -519,8 +519,9 @@ describe('runner base materialization refuses before install',()=>{
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
   // These cases run real Git, file copies and the install supervisor; allow for CI contention.
-  it.each(['delta','tracked symlink','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+  it.each(['delta','tracked symlink','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s, preserves the exact full manifest and reports prepared run IDs on initial execution and full retries',async mode=>{
     const f=await setup(false,undefined,mode==='tracked symlink'),requests=[],copies=[],log=vi.fn();
+    const preparedRuns=[], notifiedRuns=[], transferNotifications=[];
     const sshOptions=['-o','BatchMode=yes','-o','ControlMaster=auto','-o','ControlPersist=60s','-o','ControlPath=private-cm/%C'];
     let baseRetrieved=false,ignoredCalls=0,manifestCalls=0;
     const attempts=[];
@@ -535,6 +536,7 @@ describe('runner base materialization refuses before install',()=>{
       if(call.file==='git'){if(mode==='git failure'&&gitArgs(call)[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&gitArgs(call)[0]==='cat-file'&&gitArgs(call)[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
       if(call.file==='ssh')expect(call.sshOptions).toEqual(sshOptions);
       if(call.file==='rsync'){
+        transferNotifications.push([...notifiedRuns]);
         expect(call.args[call.args.indexOf('-e')+1]).toBe(`ssh ${sshOptions.map(value=>`'${value}'`).join(' ')}`);
         copies.push(call.input);
         // Fail after manifest construction, then allow the full-ship retry.
@@ -552,11 +554,15 @@ describe('runner base materialization refuses before install',()=>{
       if(action==='base-manifest'&&mode==='manifest unavailable')return {code:254,stdout:''};
       if(action==='base-manifest'&&mode==='oversized manifest')return {code:0,stdout:'x'.repeat(4*1024*1024+1)};
       const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='prepare')preparedRuns.push(value.run);
       if(action==='base-manifest')baseRetrieved=true;
       if(action==='run'){requests.push(JSON.parse(call.input));return {code:value.code,stdout:''};}
       return {code:0,stdout:JSON.stringify(value)};
     };
-    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions});
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions,onRun:run=>notifiedRuns.push(run)});
+    expect(preparedRuns).toHaveLength(mode==='late delta failure'?2:1);
+    expect(notifiedRuns).toEqual(preparedRuns);
+    expect(transferNotifications).toEqual(preparedRuns.map((_,i)=>preparedRuns.slice(0,i+1)));
     expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','tracked symlink','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
     if(mode==='retry succeeds')expect(manifestCalls).toBe(2);
@@ -573,8 +579,8 @@ describe('runner base materialization refuses before install',()=>{
     const deltaMode=['delta','tracked symlink','retry succeeds','next base'].includes(mode);
     expect(stage.shipMode).toBe(deltaMode?'delta':'full');
     // Independent fixture bytes: unchanged lock/mode/public source are reused
-    // only in delta mode; the deleted file and private credentials never ship.
-    const payloads=mode==='tracked symlink'?['changed','skill','skill']:deltaMode?['changed']:['changed','lock','mode','public'];
+    // only in delta mode; the deleted file never ships; the tracked, identical, clean credentials.txt ships in full mode (R321).
+    const payloads=mode==='tracked symlink'?['changed','skill','skill']:deltaMode?['changed']:['changed','lock','mode','public','private'];
     const bytes=payloads.reduce((sum,content)=>sum+Buffer.byteLength(content),0);
     expect(stage).toMatchObject({fileCount:payloads.length,bytesSent:bytes,
       deltaFileCount:deltaMode?payloads.length:0,deltaBytes:deltaMode?bytes:0});
@@ -621,11 +627,13 @@ describe('runner base materialization refuses before install',()=>{
     for(const listing of ignoredListings)expect(listing.toString().split('\0')).toContain('late.test.mjs');
     expect(transport.mock.calls.some(([call])=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
   });
-  it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('retries only a proven pre-start delta rejection once: %s',async fault=>{
+  it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('reports prepared run IDs on initial execution and full retries, retrying only a proven pre-start delta rejection once: %s',async fault=>{
     const f=await setup(),requests=[],prepares=[],finishes=[],copies=[];
+    const preparedRuns=[], notifiedRuns=[], transferNotifications=[];
     const transport=async call=>{
       if(call.file==='git')return exec(call);
       if(call.file==='rsync') {
+        transferNotifications.push([...notifiedRuns]);
         copies.push(call.input);
         const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
         for(const name of call.input.toString().split('\0').filter(Boolean)){const rel=name.slice(2);await fs.mkdir(join(destination,rel,'..'),{recursive:true});await fs.copyFile(join(call.cwd,rel),join(destination,rel));}
@@ -648,6 +656,7 @@ describe('runner base materialization refuses before install',()=>{
         return {code:value.code,stdout:''};
       }
       let value=await f.runner[action](request);
+      if(action==='prepare')preparedRuns.push(value.run);
       if(action==='finish') {
         finishes.push(request);
         if(fault==='missing finish')return {code:1,stdout:''};
@@ -657,10 +666,13 @@ describe('runner base materialization refuses before install',()=>{
       }
       return {code:0,stdout:JSON.stringify(value)};
     };
-    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport});
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,onRun:run=>notifiedRuns.push(run)});
     const retry=['corrupt base','missing base','second rejection','lost run response'].includes(fault);
     expect(requests).toHaveLength(retry?2:1);
     expect(prepares).toHaveLength(retry?2:1);
+    expect(notifiedRuns).toEqual(preparedRuns);
+    expect(preparedRuns).toEqual(requests.map(request=>request.run));
+    expect(transferNotifications).toEqual(preparedRuns.map((_,i)=>preparedRuns.slice(0,i+1)));
     expect(finishes).toHaveLength(retry?2:1);
     if(retry) {
       expect(requests[0].baseSha).toBe(f.base.sha);
@@ -963,6 +975,31 @@ describe('warm-base tick',()=>{
     const install=vi.fn(async()=>({code:0}));
     return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs,runs:join(root,'slots'),receipts:join(root,'receipts')}};
   }
+  it('warmTick excludes flagged public files with secret-like content and matches full/delta inventories',async()=>{
+    const refused={
+      'token-patterns.mjs':'const sample = "ghp_abcdefghijklmnopqrstuvwxyz0123";',
+      'credentials.yaml':'password: q8Zr2LmX9vT4pW7kJ1nB5cY3',
+      'token-utf16.txt':Buffer.from('password: q8Zr2LmX9vT4pW7kJ1nB5cY3','utf16le'),
+    };
+    for(const [path,bytes] of Object.entries(refused))await fs.writeFile(join(repo,path),bytes);
+    await fs.writeFile(join(repo,'token-clean.mjs'),'export const ok = 1;');
+    git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    const f=await tickFixture();
+    await expect(f.warm.warmTick(f.options)).resolves.toMatchObject({sha:f.base.sha});
+    const published=join(f.target,f.base.sha),wire=JSON.parse(await fs.readFile(join(published,'manifest.json'),'utf8'));
+    expect(wire).toEqual(f.base.manifest);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base:f.base});
+    expect(manifestWire(delta)).toEqual(wire);
+    const paths=Buffer.from(wire.paths,'base64').toString().split('\0');
+    const excluded=Buffer.from(wire.excluded,'base64').toString().split('\0');
+    for(const path of Object.keys(refused)){
+      expect(excluded).toContain(path);expect(paths).not.toContain(path);
+      await expect(fs.lstat(join(published,'tree',path))).rejects.toMatchObject({code:'ENOENT'});
+    }
+    expect(paths).toEqual(expect.arrayContaining(['mode.txt','token-clean.mjs']));
+    expect(await fs.readFile(join(published,'tree','token-clean.mjs'),'utf8')).toBe('export const ok = 1;');
+    expect(f.install).toHaveBeenCalledOnce();
+  });
   it('publishes only ready verified trees, logs latency and does not pass tokens to anonymous git',async()=>{
     const f=await tickFixture();await f.warm.warmTick(f.options);
     const ready=JSON.parse(await fs.readFile(join(f.target,f.base.sha,'READY'),'utf8'));
