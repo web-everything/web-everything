@@ -6,7 +6,13 @@ status: open
 scaffoldedBy: "post-accept-advisory"
 dateScaffolded: "2026-11-01"
 blockedBy: ["xu34pnv"]
-scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/conveyor/advisory-fix-mark.mjs"]
+scope:
+  - "we:scripts/lib/review-loop-policy.mjs"
+  - "we:scripts/operations/review-loop-cli.mjs"
+  - "we:scripts/conveyor/advisory-fix-mark.mjs"
+  - "we:scripts/lib/__tests__/review-loop-policy.test.mjs"
+  - "we:scripts/operations/__tests__/review-loop-cli.test.mjs"
+  - "we:scripts/conveyor/__tests__/advisory-fix-mark.test.mjs"
 dateOpened: "2026-11-01"
 tags: []
 ---
@@ -18,14 +24,19 @@ Mechanics for xu34pnv, ratified R370 and codified in `we:docs/agent/platform-dec
 
 ## Acceptance
 
-- [A1] **Executable** — add the following named cases to the `post-accept advisory replay fixtures` block in `scripts/lib/__tests__/review-loop-policy.test.mjs`; `npm run test:unit -- scripts/lib/__tests__/review-loop-policy.test.mjs` passes. Cases (g) and (h) also require the caller tests named below.
+- [A1] **Executable** — add the following named cases to the `post-accept advisory replay fixtures` block in `we:scripts/lib/__tests__/review-loop-policy.test.mjs`. Run from the WE repository root; the command must pass. Cases (g) and (h) also require the caller tests named below.
+
+  ```sh
+  npm run test:unit -- scripts/lib/__tests__/review-loop-policy.test.mjs
+  ```
+
   - (a) `accepted cardable findings at any round produce one card without a push`: cosmetic/degraded findings with every guard clear, at rounds below and above K, give no push and one card with one numbered line per finding.
   - (b) `non-cardable impacts and security tags force a push without confirmation`: table-test broken, unrecoverable, unstated and unknown impacts, plus security-tagged findings at each impact including cosmetic/degraded, with and without confirmation. Each forces a push and no card-only merge.
   - (c) `unreadable policy evidence fails closed`: unknown impact, an unreadable ledger or setting, or a rule error forces a push.
   - (d) `off preserves current behaviour`: mode=off gives today's behaviour.
   - (e) `shadow records decisions without changing behaviour`: mode=shadow records the would-be card/push decision while retaining today's behaviour, including the refusal cases in (b) and (f).
   - (f) `mandatory referrals and every shared refusal guard force a push`: table-test `requiresMandatoryReferral`, human-required, pending referral, blocked referral and uncorroborated retirement separately on a genuine accepted verdict. Mix each with otherwise cardable findings and assert no card-only merge. Pin existing changes-only round-budget behaviour after shared-guard extraction.
-  - (g) In both `scripts/operations/__tests__/review-loop-cli.test.mjs` and `scripts/conveyor/__tests__/advisory-fix-mark.test.mjs`, add caller tests `card filed before merge` and `filing failure parks the accepted PR`. Inject a deferred filer and assert no merge or new head before it succeeds, then one persisted card before merge eligibility. Table-test a throw, an explicit filing refusal and an incomplete result with no persisted card: each leaves the PR parked, with no merge or new head. Reach the real caller wiring with injected filing/merge IO; a pure decision fixture alone is insufficient.
+  - (g) In both `we:scripts/operations/__tests__/review-loop-cli.test.mjs` and `we:scripts/conveyor/__tests__/advisory-fix-mark.test.mjs`, add caller tests `card filed before merge` and `filing failure parks the accepted PR`. Inject a deferred filer and assert no merge or new head before it succeeds, then one persisted card before merge eligibility. Table-test a throw, an explicit filing refusal and an incomplete result with no persisted card: each leaves the PR parked, with no merge or new head. Reach the real caller wiring with injected filing/merge IO; a pure decision fixture alone is insufficient.
   - (h) `verdict provenance alone controls cardability`: only the trusted review verdict supplies impact and security/referral metadata. Test a PR author claiming its own finding cardable, author-supplied overrides of broken/security/referral metadata, missing or unreadable verdict provenance, and finding text claiming cosmetic/broken/security status. Reject author overrides and fail closed on absent trusted evidence; varying text alone must never change the verdict-derived decision. Include newline, CR/U+2028, backticks, quotes, leading `--`, `..`, invisible/NFKC characters and concatenated payloads, copied as inert card data. Also add caller test `author input cannot override verdict provenance` in both caller suites from (g), exercising the actual verdict-input path rather than only preconstructed trusted facts.
 - [A2] Shadow mode writes one ledger row per accepted PR: `wouldCard`, `wouldPush`, and the loops that followed. A report prints the counts and the count of shadow-carded findings later confirmed broken.
 - [A3] Each carded finding is counted, with the cards' later fix rate, so card debt is visible (same counter as 5471 A3).
