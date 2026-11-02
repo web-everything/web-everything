@@ -3395,3 +3395,51 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(readReferralRecords(w.state.comments, { head: H1 }).malformed).toBe(false);
   });
 });
+
+
+describe('post-accept advisory rating IO', () => {
+  it('serializes concurrent persisted ratings and keeps replay byte-identical', async () => {
+    const { recordPostAcceptAdvisoryShadow: accept, recordPostAcceptAdvisoryLoops: loops,
+      recordPostAcceptAdvisoryRating: rate } = await import('../review-pr-io.mjs');
+    const { postAcceptAdvisoryShadowReport } = await import('../../lib/review-loop-policy.mjs');
+    const ledgerPath = join(root, 'ratings.jsonl');
+    const finding = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness',
+      summary: 'cosmetic', impactIfUnfixed: 'cosmetic', verdict: 'CONFIRMED' };
+    const facts = { repo: 'o/r', pr: 7, head: 'A', ledgerPath };
+    await accept({ ...facts, decision: { wouldCard: true, wouldPush: false, findings: [finding] } });
+    await loops({ ...facts, head: 'B', runId: 'later' });
+    const rating = { ...facts, head: 'B', runId: 'later', findings: [{ ...finding, summary: 'new prose', impactIfUnfixed: 'broken' }] };
+    await Promise.all([rate(rating), rate(rating), rate(rating)]);
+    const original = readFileSync(ledgerPath, 'utf8');
+    const rows = original.trim().split('\n').map(JSON.parse);
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(1);
+    expect(postAcceptAdvisoryShadowReport(rows)).toMatchObject({ laterBroken: 1, unconfirmedBroken: 0, skipped: 0 });
+    await rate(rating);
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(original);
+    expect(existsSync(ledgerPath + '.lock')).toBe(false);
+  });
+
+  it('refuses partial injected IO, corrupt history, and a busy persisted lock without writing', async () => {
+    const { recordPostAcceptAdvisoryRating: rate } = await import('../review-pr-io.mjs');
+    const ledgerPath = join(root, 'refused-rating.jsonl'), logs = [];
+    const facts = { repo: 'o/r', pr: 7, head: 'B', runId: 'later', findings: [], ledgerPath, out: line => logs.push(line) };
+    await rate({ ...facts, readLedgerRows: () => [] });
+    expect(existsSync(ledgerPath)).toBe(false);
+    const corrupt = JSON.stringify({ kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', loopsAfter: -1 }) + '\n';
+    writeFileSync(ledgerPath, corrupt);
+    await rate(facts);
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(corrupt);
+    expect(existsSync(ledgerPath + '.lock')).toBe(false);
+    writeFileSync(ledgerPath + '.lock', 'other writer');
+    let time = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => time += 3000);
+    try { await rate(facts); } finally { clock.mockRestore(); }
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(corrupt);
+    expect(readFileSync(ledgerPath + '.lock', 'utf8')).toBe('other writer');
+    expect(logs).toHaveLength(3);
+    expect(logs[0]).toContain('supply both reader and writer');
+    expect(logs[1]).toContain('invalid loop history; inspect shadow ledger');
+    expect(logs[2]).toContain('inspect writer before removing an orphaned lock');
+    expect(logs.every(line => line.includes('live review unaffected'))).toBe(true);
+  });
+});

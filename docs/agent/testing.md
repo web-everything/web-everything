@@ -3769,3 +3769,16 @@ a later accept and restart, concurrent duplicate and distinct runs, and duplicat
 persisted rows. The report and recorder share the replay reducer so skipped rows cannot suppress
 a valid replacement or inflate measurements. Keep these probes in the three review-loop-policy,
 review-loop-cli, and review-pr-io test files.
+
+
+## Post-accept advisory production ratings
+
+The CLI records later verdict ratings after the loop recorder has established the run marker.
+`advisory-rating` rows name an earlier would-card accept and reuse its repository/PR/head identity.
+Match cited findings with `roundCardsFindingsFingerprint`; without a valid path, require a stable
+finding ID rather than the fingerprint's prose fallback. Replay and the writer share this identity
+helper and the recorded-order boundary. Deduplicate by accepted head, finding identity, impact,
+and verdict across runs. Both confirmed and plausible broken ratings have production writers;
+only confirmed ratings increase `laterBroken`, while plausible ratings feed `unconfirmedBroken`.
+The CLI regression compares all live effects with mode off and exercises replay and writer/logger
+failures. Policy and persisted-IO probes cover refusal, lock ownership, and concurrent deduplication.

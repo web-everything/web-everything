@@ -1731,3 +1731,80 @@ describe('card 5471 [A3]: the round-cards report (count + later fix rate)', asyn
     expect(roundCardsReport([])).toMatchObject({ cards: 0, findings: 0, fixRate: null });
   });
 });
+
+
+describe('production post-accept advisory ratings', () => {
+  const finding = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness',
+    summary: 'cosmetic at accept', impactIfUnfixed: 'cosmetic', verdict: 'CONFIRMED' };
+  const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: 'A',
+    wouldCard: true, wouldPush: false, findings: [finding], loopsAfter: null };
+  const run = { kind: 'advisory-run', repo: 'o/r', pr: 7, headSha: 'B', runId: 'later' };
+  const rated = { ...finding, summary: 'different prose', impactIfUnfixed: 'broken' };
+  const setup = (rows = [structuredClone(accept), structuredClone(run)]) => ({ rows,
+    facts: { repo: 'o/r', pr: 7, head: 'B', runId: 'later', findings: [rated],
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; } } });
+
+  it('matches shared fingerprints without prose, isolates PRs/heads, and deduplicates identity plus rating across runs', async () => {
+    const { rows, facts } = setup();
+    rows.unshift({ ...accept, pr: 8 }, { ...accept, repo: 'other/repo' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [rated, rated,
+      { ...rated, line: 99 }, { ...rated, file: 'scripts/other.mjs' }] });
+    const snapshot = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating(facts);
+    expect(rows).toEqual(snapshot);
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toEqual([expect.objectContaining({
+      headSha: 'A', repo: 'o/r', pr: 7, impactIfUnfixed: 'broken', verdict: 'CONFIRMED',
+      findingIdentity: `fingerprint:${reviewLoopPolicy.roundCardsFindingsFingerprint([finding])}`,
+    })]);
+    rows.push({ ...run, runId: 'later-again' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, runId: 'later-again' });
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(1);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [{ ...rated, verdict: 'PLAUSIBLE' }] });
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(2);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ laterBroken: 1, unconfirmedBroken: 0 });
+  });
+
+  it.each([
+    ['missing run', [accept]], ['historical unknown head', [accept, { kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', runId: 'later', loopsAfter: 1 }]],
+    ['conflicting run head', [accept, { ...run, headSha: 'C' }]],
+    ['corrupt loops', [accept, run, { kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', loopsAfter: -1 }]],
+    ['corrupt rating', [accept, run, { ...run, kind: 'advisory-rating', findingIdentity: 'unknown', impactIfUnfixed: 'broken', verdict: 'CONFIRMED', headSha: 'A' }]],
+  ])('refuses %s with an inspect-ledger fallback and no writes', async (_name, initial) => {
+    const { rows, facts } = setup(structuredClone(initial)), logs = [];
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, out: line => logs.push(line) });
+    expect(rows).toEqual(before);
+    expect(logs.join('\n')).toContain('inspect shadow ledger');
+  });
+
+  it.each([{ repo: '' }, { pr: '7' }, { head: '' }, { runId: '' }, { findings: null },
+    { findings: [{ ...rated, impactIfUnfixed: 'unknown' }] }, { findings: [{ ...rated, verdict: undefined }] }])(
+    'refuses incomplete evidence %j', async invalid => {
+      const { rows, facts } = setup(), logs = [];
+      await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, ...invalid, out: line => logs.push(line) });
+      expect(rows).toHaveLength(2);
+      expect(logs.join('\n')).toContain('live review unaffected');
+    });
+
+  it('never matches free text, future accepts, same heads, or would-push observations', async () => {
+    const { rows, facts } = setup([{ ...accept, findings: [{ category: finding.category, summary: rated.summary, impactIfUnfixed: 'cosmetic' }] },
+      { ...accept, headSha: 'B' }, { ...accept, headSha: 'push', wouldCard: false, wouldPush: true }, run,
+      { ...accept, headSha: 'future' }]);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating(facts);
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toEqual([]);
+  });
+
+  it('supports stable IDs without paths and refuses unreadable ledgers or failed writes', async () => {
+    const byId = { ...finding, file: undefined, findingId: 'stable' };
+    const { rows, facts } = setup([{ ...accept, findings: [byId] }, run]);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [{ ...byId, summary: 'new prose', impactIfUnfixed: 'broken' }] });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows).laterBroken).toBe(1);
+    for (const override of [{ readLedgerRows: () => null }, { appendLedgerRow: () => ({ ok: false }) }]) {
+      const logs = [];
+      await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [{ ...byId, impactIfUnfixed: 'degraded' }],
+        ...override, out: line => logs.push(line) });
+      expect(logs.join('\n')).toContain('live review unaffected');
+    }
+    expect(rows).toHaveLength(3);
+  });
+});

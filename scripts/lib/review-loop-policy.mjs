@@ -605,7 +605,9 @@ function roundCardsRefusal(verdict) {
   return null;
 }
 
-/** Post-accept advisory policy. This slice always preserves the live push, including mode on. PURE. */
+/** Post-accept advisory policy. This slice always preserves the live push, including mode on. PURE.
+ * @verdicts-partial Accept-only observation; changes is a synthetic input to shared bounce guards. Other verdicts refuse incomplete evidence.
+ */
 export function postAcceptAdvisoryDecision(input = {}) {
   const { verdict, guards = {}, mode = 'shadow', invalid = false } = advisoryObject(input) ? input : {};
   // Presence is authoritative: corrupt admitted evidence must never fall back to raw findings.
@@ -704,6 +706,17 @@ const validAdvisoryRun = row => advisoryIdentity(row) && row.kind === 'advisory-
 const advisoryPrKey = row => JSON.stringify([row.repo, row.pr]);
 const advisoryRunKey = row => JSON.stringify([row.repo, row.pr, row.runId]);
 
+/** Stable across jury prose and ratings; never use the fingerprint's no-file prose fallback. */
+export function postAcceptAdvisoryFindingIdentity(finding) {
+  if (cleanFindingFile(finding)) return `fingerprint:${roundCardsFindingsFingerprint([finding])}`;
+  return nonemptyAdvisoryString(finding?.findingId) ? `id:${finding.findingId}` : null;
+}
+const validAdvisoryRating = row => advisoryIdentity(row) && row.kind === 'advisory-rating'
+  && nonemptyAdvisoryString(row.runId) && nonemptyAdvisoryString(row.findingIdentity)
+  && ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(row.impactIfUnfixed)
+  && ['CONFIRMED', 'PLAUSIBLE'].includes(row.verdict);
+const advisoryRatingKey = row => JSON.stringify([row.findingIdentity, row.impactIfUnfixed, row.verdict]);
+
 // Recorded order is authoritative, including after restart. First valid accept/run wins.
 // Historical loop rows also establish a run's first-seen position when no run marker exists.
 function replayAdvisoryLedger(rows) {
@@ -719,7 +732,7 @@ function replayAdvisoryLedger(rows) {
     if (validAdvisoryRow(row)) {
       const key = advisoryKey(row);
       if (accepts.has(key)) { skipped++; return; }
-      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Map(),
+      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Map(), ratings: new Map(),
         measurements: new Set(validLoopCount(row.loopsAfter) ? [row.loopsAfter] : []) });
     } else if (validAdvisoryRun(row)) {
       const key = advisoryRunKey(row);
@@ -751,7 +764,18 @@ function replayAdvisoryLedger(rows) {
       }
       accept.count = row.loopsAfter;
       accept.measurements.add(row.loopsAfter);
-    } else if (['loops', 'advisory-run'].includes(row?.kind)) reject(row);
+    } else if (validAdvisoryRating(row)) {
+      const accept = accepts.get(advisoryKey(row));
+      const run = runs.get(advisoryRunKey(row));
+      if (!accept?.row.wouldCard || !run?.head || accept.index >= run.index
+        || run.head === advisoryIdentity(row).headSha
+        || !accept.row.findings.some(f => postAcceptAdvisoryFindingIdentity(f) === row.findingIdentity)) {
+        reject(row); return;
+      }
+      const key = advisoryRatingKey(row);
+      if (accept.ratings.has(key)) skipped++;
+      else accept.ratings.set(key, row);
+    } else if (['loops', 'advisory-run', 'advisory-rating'].includes(row?.kind)) reject(row);
     else skipped++;
   });
   // No state from an unresolved identity is committed to the replay result, even
@@ -811,6 +835,46 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
   }
 }
 
+/** Match this later run to earlier would-card accepts, once per accepted head, identity and rating. */
+export async function recordPostAcceptAdvisoryRating({ repo, pr, head, runId, findings,
+  readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
+  try {
+    if (!advisoryIdentity({ repo, pr, head }) || !nonemptyAdvisoryString(runId)
+      || !validAdvisoryFindings(findings)) throw new Error('incomplete rating evidence; inspect shadow ledger');
+    const rows = await readLedgerRows(repo);
+    if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
+    const { accepts, runs, unresolved } = replayAdvisoryLedger(rows);
+    if (unresolved.has(advisoryPrKey({ repo, pr }))) throw new Error('invalid loop history; inspect shadow ledger');
+    const run = runs.get(advisoryRunKey({ repo, pr, runId }));
+    if (!run?.head) throw new Error('unknown historical run head; inspect shadow ledger');
+    if (run.head !== head) throw new Error('conflicting run head; inspect shadow ledger');
+    const boundary = Math.min(run.index, accepts.get(advisoryKey({ repo, pr, head }))?.index ?? rows.length);
+    for (const accept of accepts.values()) {
+      if (accept.row.repo !== repo || accept.row.pr !== pr || !accept.row.wouldCard
+        || accept.index >= boundary || advisoryIdentity(accept.row).headSha === head) continue;
+      const identities = new Set(accept.row.findings.map(postAcceptAdvisoryFindingIdentity).filter(Boolean));
+      for (const finding of findings) {
+        const findingIdentity = postAcceptAdvisoryFindingIdentity(finding);
+        if (!findingIdentity || !identities.has(findingIdentity)) continue;
+        if (!['CONFIRMED', 'PLAUSIBLE'].includes(finding.verdict) || !finding.impactIfUnfixed) {
+          throw new Error('incomplete matched rating; inspect shadow ledger');
+        }
+        const row = { kind: 'advisory-rating', repo, pr, headSha: advisoryIdentity(accept.row).headSha,
+          runId, findingIdentity, impactIfUnfixed: finding.impactIfUnfixed, verdict: finding.verdict, at: now() };
+        const key = advisoryRatingKey(row);
+        if (accept.ratings.has(key)) continue;
+        const result = await appendLedgerRow(row);
+        if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
+        accept.ratings.set(key, row);
+      }
+    }
+    return null;
+  } catch (error) {
+    try { out(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+    return null;
+  }
+}
+
 /** Replay unique accepts and later runs in recorded order; explicit counts remain measurements. PURE. */
 export function postAcceptAdvisoryShadowReport(rows = []) {
   if (!Array.isArray(rows)) throw new TypeError('unreadable shadow ledger; inspect shadow ledger');
@@ -835,10 +899,12 @@ export function postAcceptAdvisoryShadowReport(rows = []) {
     const brokenRatings = (row.laterRatings ?? []).filter(rating => rating.impactIfUnfixed === 'broken');
     const confirmed = new Set(brokenRatings.filter(rating => rating.verdict === 'CONFIRMED').map(rating => rating.findingId));
     const unconfirmed = new Set(brokenRatings.filter(rating => rating.verdict !== 'CONFIRMED').map(rating => rating.findingId));
+    const recorded = [...accepts.get(advisoryKey(row)).ratings.values()].filter(rating => rating.impactIfUnfixed === 'broken');
     for (const finding of findings) {
-      if (!nonemptyAdvisoryString(finding.findingId)) continue;
-      if (confirmed.has(finding.findingId)) report.laterBroken++;
-      else if (unconfirmed.has(finding.findingId)) report.unconfirmedBroken++;
+      const ratings = recorded.filter(rating => rating.findingIdentity === postAcceptAdvisoryFindingIdentity(finding));
+      const hasId = nonemptyAdvisoryString(finding.findingId);
+      if ((hasId && confirmed.has(finding.findingId)) || ratings.some(rating => rating.verdict === 'CONFIRMED')) report.laterBroken++;
+      else if ((hasId && unconfirmed.has(finding.findingId)) || ratings.length) report.unconfirmedBroken++;
     }
   }
   return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nUnconfirmed broken: ${report.unconfirmedBroken}\nSkipped: ${report.skipped}\nUnresolved: ${report.unresolved}` };

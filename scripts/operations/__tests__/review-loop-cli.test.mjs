@@ -34,13 +34,13 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
-import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint } from '../../lib/review-loop-policy.mjs';
+import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint, postAcceptAdvisoryShadowReport } from '../../lib/review-loop-policy.mjs';
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
-import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, createReviewPrSinks } from '../review-pr-io.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating, createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
@@ -50,7 +50,7 @@ import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding
 // explicit miss. A case that needs a hit, a structured result, or the REAL lookup passes its own (the spread below
 // lets it win). The real lookup/idempotency tests run against tiny temporary backlogs further down.
 const LOOKUP_MISS = { findFiledPrevention: () => null, findFiledRoundCards: () => null };
-const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, ...options });
+const driveReviewLoopOnce = options => driveReviewLoopOnceRaw({ ...LOOKUP_MISS, advisorySettings: () => ({ value: { mode: 'off' } }), recordAdvisoryLoops: () => null, recordAdvisoryRating: () => null, ...options });
 
 // Legacy filing tests exercise the explicitly disabled safety policy. New boundary tests below
 // use the production default through driveReviewLoopOnce.
@@ -1582,6 +1582,64 @@ describe('unattended accept reads the live head', () => {
 
 
 describe('post-accept advisory shadow wiring', () => {
+  it.each(['CONFIRMED', 'PLAUSIBLE', 'writer-error', 'logger-error'])(
+    'CLI records later %s broken ratings and preserves off/shadow/on live effects', async scenario => {
+      const execute = async mode => {
+        const rows = [], effects = [], outcomes = [], logs = [];
+        const io = { readLedgerRows: () => structuredClone(rows),
+          appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+        const store = createMemoryRunStore();
+        const review = async (head, id, later) => {
+          const { declaration, registry } = registryFor({ rev: head });
+          const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+            sinks: recordingSinks(effects), mintRunId: () => id,
+            makeJudge: () => async request => judgeOutcome(request.lens === 'correctness' ? {
+              summary: 'review', findings: [{ file: NET_PATHS[0], line: 4,
+                summary: later ? 'a fresh description of the defect' : 'improve diagnostic',
+                disposition: later ? 'bug' : 'nit', category: 'correctness/correctness',
+                verdict: scenario === 'PLAUSIBLE' ? 'PLAUSIBLE' : 'CONFIRMED',
+                introduced: true, worseThanBase: true, parallelizable: true,
+                impactIfUnfixed: later ? 'broken' : 'cosmetic' }],
+            } : CLEAN_ANSWER, {}),
+            advisorySettings: () => ({ value: { mode } }),
+            recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+            recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+            recordAdvisoryRating: facts => {
+              if (later && scenario.endsWith('error')) throw new Error('rating writer unavailable\n');
+              return recordPostAcceptAdvisoryRating({ ...facts, ...io });
+            },
+            advisoryLog: line => { logs.push(line); if (scenario === 'logger-error') throw new Error('logger unavailable'); },
+          });
+          outcomes.push({ code: out.code, stopped: out.stopped, lines: out.lines, verdict: out.run.verdict });
+          return out;
+        };
+        const accepted = await review(HEAD_A, 'cosmetic-accept', false);
+        expect(accepted.run.findings.confirm).toBe('accept');
+        if (mode !== 'off') expect(rows.find(row => row.wouldCard)).toMatchObject({
+          findings: [expect.objectContaining({ impactIfUnfixed: 'cosmetic' })],
+        });
+        await review(HEAD_B, 'broken-review', true);
+        const beforeReplay = structuredClone(rows);
+        await review(HEAD_B, 'broken-review', true);
+        expect(rows).toEqual(beforeReplay);
+        return { effects, outcomes, rows, logs };
+      };
+      const baseline = await execute('off');
+      expect(baseline.rows).toEqual([]);
+      for (const mode of ['shadow', 'on']) {
+        const result = await execute(mode);
+        expect(result.effects).toEqual(baseline.effects);
+        expect(result.outcomes).toEqual(baseline.outcomes);
+        expect(postAcceptAdvisoryShadowReport(result.rows)).toMatchObject({
+          wouldCard: 1, findings: 1, loopsAfter: 1,
+          laterBroken: scenario === 'CONFIRMED' ? 1 : 0,
+          unconfirmedBroken: scenario === 'PLAUSIBLE' ? 1 : 0, skipped: 0, unresolved: 0,
+        });
+        expect(result.rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(scenario.endsWith('error') ? 0 : 1);
+        if (scenario.endsWith('error')) expect(result.logs.join('\n')).toContain('live review unaffected');
+      }
+    });
+
   it.each([null, {}, { value: [] }, { value: { mode: undefined } },
     { value: { mode: 'off' }, invalid: true }, { value: { mode: 'off' }, invalid: 'false' }])(
     'fails closed on malformed resolved settings %j while preserving a completed accept', async settings => {

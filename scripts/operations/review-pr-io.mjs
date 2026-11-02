@@ -1835,6 +1835,10 @@ export async function recordPostAcceptAdvisoryLoops(options = {}) {
   return recordAdvisoryObservation('recordPostAcceptAdvisoryLoops', options);
 }
 
+export async function recordPostAcceptAdvisoryRating(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryRating', options);
+}
+
 // Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
 const advisoryWrites = new Map();
 async function recordAdvisoryObservation(recorder, options) {

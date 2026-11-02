@@ -76,7 +76,7 @@ import {
   roundCardsFindingsMarker, roundCardsHeadMarker, postAcceptAdvisoryDecision,
 } from '../lib/review-loop-policy.mjs';
 import { resolvePostAcceptAdvisorySettings } from '../lib/post-accept-advisory-settings.mjs';
-import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } from './review-pr-io.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } from './review-pr-io.mjs';
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
@@ -562,7 +562,8 @@ export async function runReviewLoopOnce({
   readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
   advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
-  recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, advisoryLog = line => console.error(line),
+  recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
+  advisoryLog = line => console.error(line),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
@@ -605,6 +606,10 @@ export async function runReviewLoopOnce({
             if (settings.value.mode !== 'off') {
               await recordAdvisoryLoops({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
                 head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog });
+              if (out.run.verdict) await recordAdvisoryRating({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog,
+                findings: Object.hasOwn(out.run.verdict, 'admittedFindings')
+                  ? out.run.verdict.admittedFindings : out.run.verdict.findings });
               if (out.stopped === 'complete' && out.run.findings?.confirm === 'accept') await recordAdvisoryShadow({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
                 head: out.run.findings?.read?.netBasis?.rev, loopsAfter: null, now, out: advisoryLog,
                 decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode, invalid: settings.invalid }) });
