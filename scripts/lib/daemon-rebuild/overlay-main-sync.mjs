@@ -104,12 +104,10 @@ function readSyncState(file, io = fs) {
   const legacyFile = file.replace(/\.state$/, '.json');
   const mtime = path => { try { return io.statSync(path).mtimeMs; } catch (error) { if (error.code === 'ENOENT') return -1; throw error; } };
   const source = mtime(legacyFile) > mtime(file) ? legacyFile : file;
-  try {
-    data = JSON.parse(io.readFileSync(source, 'utf8'));
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    data = { lastSyncedMain: {} };
-  }
+  // Both files must parse: a corrupt one fails closed whichever is newer.
+  const parsed = path => { try { return JSON.parse(io.readFileSync(path, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; } };
+  parsed(source === file ? legacyFile : file);
+  data = parsed(source) ?? { lastSyncedMain: {} };
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
   for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
@@ -142,7 +140,15 @@ function readSyncState(file, io = fs) {
 }
 function writeSyncState(file, data, io) {
   const temp = `${file}.${randomUUID()}.tmp`;
-  try { io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file); }
+  try {
+    io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
+    // Rollout: not-yet-reloaded workers still read the pre-rename file, so keep it in step.
+    if (file.endsWith('.state')) {
+      const legacyTemp = `${file}.${randomUUID()}.legacy.tmp`;
+      try { io.writeFileSync(legacyTemp, JSON.stringify(data)); io.renameSync(legacyTemp, file.replace(/\.state$/, '.json')); }
+      finally { io.rmSync(legacyTemp, { force: true }); }
+    }
+  }
   finally { io.rmSync(temp, { force: true }); }
 }
 const transactionWait = new Int32Array(new SharedArrayBuffer(4));

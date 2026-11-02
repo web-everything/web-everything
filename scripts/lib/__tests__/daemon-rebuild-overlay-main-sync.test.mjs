@@ -1620,4 +1620,16 @@ describe('R372 genuine merge conflict stops retrying', () => {
     tick(f, { spawnFn });
     expect(spawnFn).not.toHaveBeenCalled();
   });
+  it('keeps the legacy file in step for old workers, and a corrupt legacy file fails closed even when .state is newer', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    const legacy = `${overlayFilePath(f.root, f.env)}.main-sync.json`;
+    expect(json(legacy).attemptedMain[ref]).toBe(f.mainSha);
+    fs.writeFileSync(legacy, '{not json');
+    const old = new Date(Date.now() - 5000); fs.utimesSync(legacy, old, old);
+    moveRefTip(f);
+    const spawnFn = spawner();
+    tick(f, { spawnFn });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
 });
