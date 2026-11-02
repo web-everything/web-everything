@@ -50,11 +50,26 @@ describe('GET /prs per-repo freshness', () => {
     expect(log.readPrs(null, 10, T + 3_600_000).repos['o/a'].coverage).toBe(true);
   });
 
+  it('a future event time with a valid bootstrap voids coverage', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.bootstrap(seed('o/a'), T);
+    log.append(ev('o/a'), T + 3_600_000);
+    expect(log.readPrs(null, 10, T).repos['o/a']).toEqual({ bootstrapAt: T, lastEventAt: null, coverage: false });
+  });
+
+  it('a delayed complete import at the same cursor cannot close PRs a newer import seeded', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.bootstrap({ ...seed('o/a', 0, 'complete', 'new'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
+    log.bootstrap(seed('o/a', 0, 'complete', 'old'), T);
+    expect(log.readPrs(null, 10, T).prs[0].state).toBe('open');
+  });
+
   it('a complete re-import closes open rows it omits so coverage is never true over a stale open PR', () => {
     const log = createEventLog(createMemoryStorage());
     log.bootstrap({ ...seed('o/a'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
-    log.bootstrap(seed('o/a', 0, 'complete', 'i2'), T);
-    expect(log.readPrs(null, 10, T).prs[0].state).toBe('closed');
+    log.append(ev('o/b', 9), T);
+    log.bootstrap(seed('o/a', 1, 'complete', 'i2'), T);
+    expect(log.readPrs(null, 10, T).prs.find((p) => p.repo === 'o/a').state).toBe('closed');
   });
 
   it('keeps every existing /prs field (additive only)', () => {

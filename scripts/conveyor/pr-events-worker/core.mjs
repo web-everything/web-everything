@@ -284,7 +284,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor });
       // A complete listing is the full open set at baseCursor: an open row it omits (and no later event touched)
       // is closed, so a re-import cannot leave a stale open PR under coverage=true.
-      if (input.status === 'complete') {
+      const prior = storage.getProjection('bootstrap', input.repo);
+      if (input.status === 'complete' && !(prior && prior.baseCursor >= input.baseCursor)) { // never reconcile from an older or same-cursor listing
         const listed = new Set(input.prs.map((p) => p.number));
         for (const row of storage.listProjection('prs')) {
           if (row.repo !== input.repo || listed.has(row.number) || row.state !== 'open' || (row.fields.state || 0) > input.baseCursor) continue;
@@ -339,7 +340,9 @@ function repoFreshness(storage, head, now) {
     const b = boots.get(repo);
     const bootstrapAt = b ? clamp(b.at) : null;
     const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
-    out[repo] = { bootstrapAt, lastEventAt: clamp(lastEvent.get(repo)), coverage: !!b && b.status === 'complete' && bootstrapAt != null && !gap };
+    const lastEventAt = clamp(lastEvent.get(repo));
+    const badEvent = lastEvent.has(repo) && lastEventAt == null; // an unreadable/future event time voids coverage
+    out[repo] = { bootstrapAt, lastEventAt, coverage: !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent };
   }
   return out;
 }
