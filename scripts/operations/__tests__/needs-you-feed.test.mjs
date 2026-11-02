@@ -355,6 +355,19 @@ describe('gateReadyItems: a confirmed red-team break on the live head is owed a 
     const forged = { ...advisory(head, confirmed), user: { login: 'someone-else' } };
     expect((await run([forged])).kept[0]).toMatchObject({ kind: 'needs-you' });
   });
+  it('sees a confirmed break on a verdict carried onto the live head', async () => {
+    const from = 'c'.repeat(40);
+    const carried = { user: { login: 'web-everything' }, created_at: '2026-11-02T13:00:00Z',
+      body: `<!-- review-verdict-carried from=${from} to=${head} patch-id=${'d'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${advisory(head, confirmed).body}` };
+    expect((await run([carried])).kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  it('keeps the alert but marks it unverified when the live PR is unreadable or the pass is past its deadline', async () => {
+    const unreadable = await gateReadyItems(itemsFromReport(report), report, { log: () => {}, gh: async () => { throw new Error('rate limited'); } });
+    expect(unreadable.kept[0]).toMatchObject({ kind: 'needs-you' });
+    expect(unreadable.kept[0].reason).toMatch(/red-team check unverified/);
+    const late = await gateReadyItems(itemsFromReport(report), report, { log: () => {}, deadlineMs: -1, gh: async () => { throw new Error('unused'); } });
+    expect(late.kept[0].reason).toMatch(/red-team check unverified/);
+  });
   it('resolves by absence like the other report kinds', () => {
     const open = diffFeed([], [{ repo, pr: 6239, head, kind: 'confirmed-break-owed-send-back', reason: 'r' }], at);
     const next = diffFeed(open.openKeys, [], at, { clearKinds: REPORT_KINDS });

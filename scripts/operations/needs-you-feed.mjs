@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
-import { redTeamForHead } from '../lib/red-team-gate.mjs';
+import { liveResultGateState } from '../lib/red-team-gate.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -200,19 +200,21 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
   const out = new Array(items.length); const held = [];
+  // An alert is never dropped on missing evidence, but it must not claim the red-team check passed when it did not run.
+  const unverified = (i) => ({ ...i, reason: `${i.reason} (live red-team check unverified)` });
   const judge = async (index) => {
     const item = items[index];
     if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
     // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
-    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = unverified(item); return; }
     try {
       const view = await readLivePr(item, { gh, cwd });
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       if (reasons.length) { held.push({ item, reasons }); return; }
       // The red-team gate only sends back BROKEN, so a clear label can hide a confirmed break of any severity. Read the
-      // parsed result for exactly this head (trusted author only); a break is owed a send-back, not a human review.
-      const breaks = (redTeamForHead(view.comments, item.pr, view.headRefOid)?.findings ?? []).filter(f => f.confirmed);
+      // gate's own live result for exactly this head (trusted author only, carried results included); a break is owed a send-back, not a human review.
+      const breaks = (liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo).result?.findings ?? []).filter(f => f.confirmed);
       if (breaks.length) {
         const named = breaks.map(f => `#${f.index} ${f.impact ?? 'impact?'}${f.file ? ` ${f.file}${f.line != null ? `:${f.line}` : ''}` : ''}`).join('; ');
         out[index] = { ...item, kind: 'confirmed-break-owed-send-back', head: view.headRefOid,
@@ -221,7 +223,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       }
       // Publish the head that was actually checked, not a stale one from the report or a later lookup.
       out[index] = { ...item, head: view.headRefOid };
-    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = unverified(item); }
   };
   let next = 0;
   await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
