@@ -22,12 +22,13 @@ function fixture({ cache = {}, missing = false, unreadable = false, roleTable = 
   if (unreadable) mkdirSync(path);
   else if (!missing) writeFileSync(path, typeof cache === 'string' ? cache : JSON.stringify({ v: 2, token: secret, expiresAt: new Date(Date.now() + 3600e3).toISOString().replace(/\.\d{3}Z$/, 'Z'), ...cache }));
   const clockMarker = join(dir, 'clock');
+  const dateBin = nowEpoch !== undefined ? join(dir, "clock 'date") : undefined;
   if (nowEpoch !== undefined) {
-    writeFileSync(join(dir, 'date'), '#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = +%s ] || exit 92\nprintf "DATE\\n" >> "$CLOCK_MARKER"\nprintf "%s\\n" "$CLOCK_EPOCH"\n');
-    chmodSync(join(dir, 'date'), 0o755);
+    writeFileSync(dateBin, '#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = +%s ] || exit 92\nprintf "DATE\\n" >> "$CLOCK_MARKER"\nprintf "%s\\n" "$CLOCK_EPOCH"\n');
+    chmodSync(dateBin, 0o755);
   }
   const shim = join(dir, 'gh');
-  const src = renderGhShimScript({ realGhPath: real, cachePath, roleTable });
+  const src = renderGhShimScript({ realGhPath: real, cachePath, roleTable, dateBin });
   // Use an inherited descriptor for the cache so its shared offset measures the
   // actual bytes consumed by the shell, including any builtin read-ahead.
   const readFd = measureRead ? openSync(path, 'r') : undefined;
@@ -37,7 +38,7 @@ function fixture({ cache = {}, missing = false, unreadable = false, roleTable = 
   if (measureRead) expect(executable).not.toBe(src);
   writeFileSync(shim, executable); chmodSync(shim, 0o755);
   const env = { PATH: `${dir}:/usr/bin:/bin`, HOME: dir, MARKER: marker, LC_ALL: 'C', CLOCK_MARKER: clockMarker, CLOCK_EPOCH: String(nowEpoch) };
-  return { src, bytesRead: () => bytesRead, clockCalls: () => readFileSync(clockMarker, 'utf8'), run(args = ['-R', 'web-everything/x'], extra = {}) {
+  return { dir, src, bytesRead: () => bytesRead, clockCalls: () => readFileSync(clockMarker, 'utf8'), run(args = ['-R', 'web-everything/x'], extra = {}) {
     let r;
     try {
       r = spawnSync(shim, args, {
@@ -56,6 +57,13 @@ function fixture({ cache = {}, missing = false, unreadable = false, roleTable = 
   } };
 }
 describe('gh shim shell fast path', () => {
+  it('uses the baked /bin/date default instead of a PATH-planted date', () => {
+    const f = fixture();
+    const plantedDate = join(f.dir, 'date');
+    writeFileSync(plantedDate, '#!/bin/sh\nprintf "PATH_DATE\\n" >> "$MARKER"\nexit 93\n');
+    chmodSync(plantedDate, 0o755);
+    expect(f.run()).toBe(`REAL argc=2 tokenlen=${secret.length}\n`);
+  });
   it.each([['ASCII', 'x'], ['NUL', '\0']])('bounds bytes consumed from an oversized single-line %s cache before falling back', (_, char) => {
     const f = fixture({ cache: char.repeat(8 * 1024 * 1024), measureRead: true });
     expect(f.run()).toBe('NODE\n');
