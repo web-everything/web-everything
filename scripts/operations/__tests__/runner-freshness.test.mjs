@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -7,6 +7,9 @@ import { checkMainStaleness, gitRun } from '../../lib/main-staleness.mjs';
 import { assertRunnerFreshness, requiresFreshRunner, FRESHNESS_TTL } from '../runner-freshness.mjs';
 import { OPERATIONS, resolveOperation, cliPreflight, createCodexAuditSink, finishCodexAudit } from '../run.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
+import * as auditIo from '../codex-audit-io.mjs';
 
 function fixture(options = {}) {
   const calls = [], writes = [], diagnostics = [];
@@ -211,7 +214,7 @@ describe('runner freshness policy', () => {
       appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
     const run = async (answer, json) => {
       const written = [];
-      const sink = createCodexAuditSink({ makeDeps: () => deps(answer), write: t => written.push(t) });
+      const sink = createCodexAuditSink({ makeDeps: () => deps(answer, written) });
       const verdict = await sink({ base: 'm', head: HEAD, json });
       return { written, verdict, out: finishCodexAudit({ run: { verdict }, code: 0, lines: [], json }) };
     };
@@ -237,6 +240,35 @@ describe('runner freshness policy', () => {
       const { out } = await run(undefined, true);
       expect(out.code).toBe(3);
       expect(out.lines).toEqual([]);
+    });
+    it.each([
+      ['NOT WEAKENED', [], 0],
+      ['WEAKENED', ['run.mjs:1 loosened'], 1],
+    ])('registered CLI --json emits only the %s envelope', async (verdict, findings, code) => {
+      const written = [];
+      const auditDeps = vi.spyOn(auditIo, 'createAuditDeps').mockImplementation(() =>
+        deps([verdict, ...findings].join('\n'), written));
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(text => {
+        written.push(String(text));
+        return true;
+      });
+      try {
+        const binding = resolveOperation('codex-audit');
+        const outcome = await runOperationCli({
+          ...binding, argv: ['--base=m', `--head=${HEAD}`, '--json'],
+          store: createMemoryRunStore(), newRunId: () => 'audit-json-regression',
+        });
+        expect(auditDeps).toHaveBeenCalledOnce();
+        expect(outcome.run.verdict).toMatchObject({ verdict, findings, code });
+        expect(written).toEqual([]);
+        const output = binding.finish({ ...outcome, json: true });
+        expect(output.code).toBe(code);
+        process.stdout.write(`${output.lines.join('\n')}\n`);
+        expect(JSON.parse(written.join(''))).toMatchObject({ verdict, findings, base: SHA, head: HEAD });
+      } finally {
+        stdout.mockRestore();
+        auditDeps.mockRestore();
+      }
     });
   });
 });
