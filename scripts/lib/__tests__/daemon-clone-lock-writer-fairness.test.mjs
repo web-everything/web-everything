@@ -356,6 +356,16 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(r.waitedMs).toBeGreaterThanOrEqual(28_000);
   });
 
+  it('an infinite override window is capped, and waitMs 0 stays an immediate timeout', async () => {
+    const r = await simulate({ waitPriorityMs: 8000, window: Infinity, rReleaseMs: 1e9 });
+    expect(r.w.reason).toBe('reader-priority'); // yielded at the built-in 5 min cap, not never
+    const lockRoot = mkTmp('dcww-root-');
+    const clone = mkTmp('dcww-clone-');
+    expect(acquireRead(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'R', nowMs: 0 }).ok).toBe(true);
+    const w = await acquireWrite(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'W', waitMs: 0, now: () => 0, sleep: async () => {} });
+    expect(w.reason).toBe('tick-in-progress');
+  });
+
   it('an infinite wait is not honoured: it falls back to the bounded default', async () => {
     const lockRoot = mkTmp('dcww-root-');
     const clone = mkTmp('dcww-clone-');

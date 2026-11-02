@@ -505,12 +505,15 @@ export async function acquireWrite(root, opts = {}) {
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
     writerWaitPriorityMs = resolveWriterWaitPriorityMs(),
-    writerWaitPriorityWindowMs = WRITER_WAIT_PRIORITY_WINDOW_MS,
+    writerWaitPriorityWindowMs: writerWaitPriorityWindowMsOpt = WRITER_WAIT_PRIORITY_WINDOW_MS,
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   // Fail closed on an unbounded/invalid wait: the wait-priority override must always end.
-  const waitMs = Number.isFinite(Number(waitMsOpt)) && Number(waitMsOpt) > 0 ? Number(waitMsOpt) : 600_000;
+  const waitMs = Number.isFinite(Number(waitMsOpt)) && Number(waitMsOpt) >= 0 ? Number(waitMsOpt) : 600_000;
 
+  // The override window can only shrink below the built-in cap; a non-finite or negative value uses the cap.
+  const windowMs = Number.isFinite(Number(writerWaitPriorityWindowMsOpt)) && Number(writerWaitPriorityWindowMsOpt) >= 0
+    ? Math.min(Number(writerWaitPriorityWindowMsOpt), WRITER_WAIT_PRIORITY_WINDOW_MS) : WRITER_WAIT_PRIORITY_WINDOW_MS;
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
   // Writer fairness: our own live, effective claim (we already starved). Older claim wins — we only yield to a
@@ -525,7 +528,7 @@ export async function acquireWrite(root, opts = {}) {
   const priorityFor = (nowMsN) => {
     const waited = nowMsN - startMs;
     const waitedPast = writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
-      && waited < writerWaitPriorityMs + writerWaitPriorityWindowMs;
+      && waited < writerWaitPriorityMs + windowMs;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
       startedBeforeMs: waitedPast ? startMs : null,
