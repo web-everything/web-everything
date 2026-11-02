@@ -23,11 +23,10 @@ export function probeFixReady({ storePath, roots = daemonCloneRoots(workspaceOf(
   const deadline = nowFn() + budgetMs;
   const remainingTimeout = () => Math.min(5000, timeoutMs, deadline - nowFn());
   const store = resolveFixReadyStore(storePath);
-  const records = readFixReadyRecords(store.path).filter((r) => {
-    const ageMs = now - Date.parse(r.at);
-    return Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= lookbackDays * 24 * 60 * 60_000;
-  });
-  if (!records.length) return [];
+  const stored = readFixReadyRecords(store.path);
+  const errors = stored.filter((r) => r.storeUnreadable);
+  const records = stored.filter((r) => !r.storeUnreadable);
+  if (!records.length) return errors;
   // Probe oldest first, rotating each minute so a bounded tick cannot starve later fixes.
   // Keep indices so the returned report retains the store's original record order.
   const order = records.map((_, i) => i).sort((a, b) => Date.parse(records[a].at) - Date.parse(records[b].at));
@@ -68,7 +67,11 @@ export function probeFixReady({ storePath, roots = daemonCloneRoots(workspaceOf(
     const index = order[(start + offset) % order.length];
     results[index] = probeRecord(records[index]);
   }
-  return results;
+  // Only positive resolution permits expiry. Unknown/over-budget records stay visible.
+  return [...results.filter((r) => {
+    const resolved = r.ancestorOf?.length || (typeof r.loadSkipQuote === 'string' && r.loadSkipQuote.trim());
+    return !resolved || !(now - Date.parse(r.at) > lookbackDays * 24 * 60 * 60_000);
+  }), ...errors];
 }
 
 /** Only the rebuild data used by this smell, read as probeSelfSync does. Avoid the health-watch IO graph. */

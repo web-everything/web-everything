@@ -20,20 +20,36 @@ export function resolveFixReadyStore(store, { env = process.env, declared = read
   return { path: resolve(expanded), source };
 }
 
-/** Invalid JSON/records are ignored; timestamp order, rather than append order, selects each ref. */
+/** Preserve readable records and explicitly report incomplete store evidence in the array. */
 export function readFixReadyRecords(storePath) {
+  const unreadable = (error) => ({ storeUnreadable: true, unknown: true, error });
   let contents;
-  try { contents = readFileSync(storePath, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-  const latest = new Map();
+  try { contents = readFileSync(storePath, 'utf8'); }
+  catch (e) { return [unreadable(`store unreadable (${e.code || 'read failed'})`)]; }
+  const byRef = new Map();
+  let malformed = false;
   for (const line of contents.split('\n')) {
+    if (!line.trim()) continue;
     let r;
-    try { r = JSON.parse(line); } catch { continue; }
+    try { r = JSON.parse(line); } catch { malformed = true; continue; }
     if (!r || typeof r.ref !== 'string' || !r.ref.trim() || !validSha(r.sha)
       || r.tests !== 'green' || typeof r.audit !== 'string' || !r.audit.trim()
-      || typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) continue;
-    if (!latest.has(r.ref) || Date.parse(r.at) >= Date.parse(latest.get(r.ref).at)) latest.set(r.ref, r);
+      || typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) {
+      malformed = true;
+      continue;
+    }
+    if (!byRef.has(r.ref)) byRef.set(r.ref, []);
+    byRef.get(r.ref).push(r);
   }
-  return [...latest.values()];
+  const records = [...byRef.values()].map((rows) => {
+    // Sort before folding: first-seen time must not affect which mark's metadata wins.
+    rows.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+    return rows.reduce((previous, r) => ({ ...r,
+      at: previous?.sha.toLowerCase() === r.sha.toLowerCase() ? previous.at : r.at,
+    }), null);
+  });
+  if (malformed) records.push(unreadable('store unreadable (malformed record)'));
+  return records;
 }
 
 export function parseFlags(args) {
@@ -60,6 +76,7 @@ export function main(argv = process.argv.slice(2)) {
   console.error(`fix-ready: store ${store.path} (source: ${store.source})`);
   if (command === 'list') {
     const records = readFixReadyRecords(store.path);
+    if (records.some((r) => r.storeUnreadable)) throw new Error('store unreadable');
     console.log(flags.json ? JSON.stringify(records, null, 2) : records.map((r) => `${r.at} ${r.ref} ${r.sha} ${r.audit}`).join('\n'));
     return;
   }

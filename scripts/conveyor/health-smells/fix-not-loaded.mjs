@@ -39,6 +39,12 @@ export function appliedFixClones(record, selfSync) {
 /** PURE: rows for overdue fixes with no observed load and no operator exception. */
 export function notLoadedFixes(records, selfSync, { now, readyMs }) {
   return (records || []).flatMap((r) => {
+    if (r.storeUnreadable) return [{
+      subject: 'fix-not-loaded:store', breach: true,
+      measure: { unknown: true, storeUnreadable: true },
+      summary: 'Fix-ready store unreadable; fix load status is unknown.',
+      recommendation: 'Restore the configured fix-ready store and repair malformed records, then rerun the probe.',
+    }];
     const ageMs = now - Date.parse(r.at);
     if (!Number.isFinite(ageMs) || ageMs <= readyMs
       || (typeof r.loadSkipQuote === 'string' && r.loadSkipQuote.trim())

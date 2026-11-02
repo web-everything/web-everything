@@ -9,7 +9,7 @@ import smell, { notLoadedFixes, resolveFixNotLoadedSettings } from '../fix-not-l
 import { validateSmellShape } from '../../health-smells-shape.mjs';
 import { probeFixReady } from '../../fix-ready-probe.mjs';
 import { emptyHealthState, episodeKey, runHealthTick } from '../../health-watch-core.mjs';
-import { resolveFixReadyStore, FIX_READY_STORE } from '../../../fix-ready.mjs';
+import { readFixReadyRecords, resolveFixReadyStore, FIX_READY_STORE } from '../../../fix-ready.mjs';
 import { readDeclaredSettings } from '../../../lib/settings-files.mjs';
 import { dirname } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -138,10 +138,10 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 });
 
 describe('fix-ready probe and store', () => {
-  it('skips bad lines and selects the latest timestamp per ref, even out of append order', () => {
+  it('selects the latest timestamp per ref, even out of append order', () => {
     const storePath = join(temp(), 'ready.jsonl');
     const older = record({ sha: '1234567', at: new Date(now - 60 * minute).toISOString() });
-    writeFileSync(storePath, [JSON.stringify(record()), '{broken', JSON.stringify(older), JSON.stringify({}), JSON.stringify(record({ tests: 'red' }))].join('\n'));
+    writeFileSync(storePath, [JSON.stringify(record()), '  ', JSON.stringify(older)].join('\n'));
     const head = 'b'.repeat(40);
     const exec = vi.fn((_cmd, args) => { if (args[1] === '/missing') throw new Error('missing object'); return args[2] === 'rev-parse' ? Buffer.from(`${head}\n`) : ''; });
     expect(probeFixReady({ storePath, roots: ['/loaded', '/missing'], exec, timeoutMs: 123, now })).toEqual([record({ liveHeads: [head], ancestorOf: ['/loaded'] })]);
@@ -232,16 +232,16 @@ describe('fix-ready probe and store', () => {
     expect(result[0]).toMatchObject({ ancestorOf: null, unknown: true });
     expect(smell.evaluate({ fixReady: result, selfSync: [] }, { now })[0]).toMatchObject({ breach: true, measure: { unknown: true } });
   });
-  it('skips unparseable timestamps before issuing any git call', () => {
+  it('surfaces unparseable timestamps as an unreadable store before issuing any git call', () => {
     const storePath = join(temp(), 'ready.jsonl');
     writeFileSync(storePath, JSON.stringify(record({ at: 'invalid' })));
     const exec = vi.fn();
-    expect(probeFixReady({ storePath, roots: ['/daemon'], now, exec })).toEqual([]);
+    expect(smell.evaluate({ fixReady: probeFixReady({ storePath, roots: ['/daemon'], now, exec }) }, { now })[0]).toMatchObject({ subject: 'fix-not-loaded:store', breach: true, summary: expect.stringContaining('store unreadable') });
     expect(exec).not.toHaveBeenCalled();
   });
-  it('returns no records for a missing store without executing git', () => {
+  it('alerts for a missing store without executing git', () => {
     const exec = vi.fn();
-    expect(probeFixReady({ storePath: join(temp(), 'missing'), roots: ['/daemon'], exec })).toEqual([]);
+    expect(smell.evaluate({ fixReady: probeFixReady({ storePath: join(temp(), 'missing'), roots: ['/daemon'], exec }) }, { now })[0]).toMatchObject({ subject: 'fix-not-loaded:store', breach: true, summary: expect.stringContaining('store unreadable') });
     expect(exec).not.toHaveBeenCalled();
   });
   it('treats nonzero injected process status as not loaded', () => {
@@ -249,7 +249,7 @@ describe('fix-ready probe and store', () => {
     writeFileSync(storePath, JSON.stringify(record()));
     expect(probeFixReady({ storePath, roots: ['/daemon'], now, exec: () => ({ status: 1 }) })[0]).toMatchObject({ ancestorOf: [], liveHeads: [] });
   });
-  it('filters to the last seven days before git and probes live heads once with a 5000 ms timeout', () => {
+  it('keeps unresolved records of every age and probes live heads once with a 5000 ms timeout', () => {
     const storePath = join(temp(), 'ready.jsonl');
     const day = 24 * 60 * minute;
     const rows = [record(), record({ ref: 'boundary', at: new Date(now - 7 * day).toISOString() }),
@@ -259,16 +259,69 @@ describe('fix-ready probe and store', () => {
     const head = 'c'.repeat(40);
     const exec = vi.fn((_cmd, args) => args[2] === 'rev-parse' ? { status: 0, stdout: `${head}\n` } : { status: 1 });
     const result = probeFixReady({ storePath, roots: ['/daemon'], now, exec });
-    expect(result.map((r) => r.ref)).toEqual(['lane/fix', 'boundary']);
+    expect(result.map((r) => r.ref)).toEqual(rows.map((r) => r.ref));
     expect(result.every((r) => r.liveHeads.length === 1 && r.liveHeads[0] === head)).toBe(true);
     expect(exec.mock.calls.filter(([, args]) => args[2] === 'rev-parse')).toHaveLength(1);
-    expect(exec.mock.calls).toHaveLength(3);
+    expect(exec.mock.calls).toHaveLength(5);
     expect(exec.mock.calls.every(([, , opts]) => opts.timeoutMs === 5000)).toBe(true);
-    expect(probeFixReady({ storePath, roots: [], now, lookbackDays: 1 }).map((r) => r.ref)).toEqual(['lane/fix']);
+    expect(probeFixReady({ storePath, roots: [], now, lookbackDays: 1 }).map((r) => r.ref)).toEqual(rows.map((r) => r.ref));
     exec.mockClear();
     writeFileSync(storePath, JSON.stringify(rows[2]));
+    expect(probeFixReady({ storePath, roots: ['/daemon'], now, exec })).toHaveLength(1);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+  it('keeps an unresolved alert open beyond lookback, including budget exhaustion, then drops old loaded fixes', () => {
+    const storePath = join(temp(), 'ready.jsonl');
+    const old = record({ at: new Date(now - 8 * 24 * 60 * minute).toISOString() });
+    writeFileSync(storePath, JSON.stringify(old));
+    let state = emptyHealthState();
+    const key = episodeKey(smell.id, 'fix-not-loaded:lane/fix');
+    for (const budgetMs of [15000, 0, 0]) {
+      const fixReady = probeFixReady({ storePath, roots: ['/daemon'], now, budgetMs, exec: () => ({ status: 1 }) });
+      expect(fixReady).toHaveLength(1);
+      const tick = runHealthTick(state, { fixReady, selfSync: [] }, [smell], now);
+      state = tick.state;
+      expect(state.episodes[key]).toMatchObject({ status: 'open', cleanStreak: 0 });
+    }
+    const exec = vi.fn(() => ({ status: 0, stdout: 'bbbbbbb' }));
     expect(probeFixReady({ storePath, roots: ['/daemon'], now, exec })).toEqual([]);
-    expect(exec).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledTimes(2);
+    writeFileSync(storePath, JSON.stringify({ ...old, loadSkipQuote: 'Operator: defer' }));
+    expect(probeFixReady({ storePath, roots: [], now })).toEqual([]);
+  });
+  it.each(['missing', '{broken', '{}', JSON.stringify(record({ tests: 'red' })), 'mixed', 'directory'])('keeps a store breach open across unreadable ticks: %s', (contents) => {
+    const storePath = contents === 'directory' ? temp() : join(temp(), 'ready.jsonl');
+    if (!['missing', 'directory'].includes(contents)) writeFileSync(storePath, contents === 'mixed' ? JSON.stringify(record()) + '\n{broken' : contents);
+    let state = emptyHealthState();
+    for (const at of [now, now + minute, now + 2 * minute]) {
+      const fixReady = probeFixReady({ storePath, roots: [], now: at });
+      expect(smell.evaluate({ fixReady }, { now: at })).toContainEqual(expect.objectContaining({ subject: 'fix-not-loaded:store', breach: true, summary: expect.stringContaining('store unreadable') }));
+      const tick = runHealthTick(state, { fixReady, selfSync: [] }, [smell], at);
+      state = tick.state;
+      expect(state.episodes[episodeKey(smell.id, 'fix-not-loaded:store')]).toMatchObject({ status: 'open', cleanStreak: 0 });
+      expect(tick.transitions.some((t) => t.type === 'closed')).toBe(false);
+    }
+    if (contents === 'mixed') expect(smell.evaluate({ fixReady: probeFixReady({ storePath, roots: [], now }) }, { now })).toContainEqual(expect.objectContaining({ subject: 'fix-not-loaded:lane/fix', breach: true }));
+  });
+  it('accepts a readable empty or whitespace-only store', () => {
+    const storePath = join(temp(), 'ready.jsonl');
+    writeFileSync(storePath, ' \n\t\n');
+    expect(probeFixReady({ storePath, roots: [], now })).toEqual([]);
+  });
+  it('preserves first-seen age when the same SHA is re-marked out of append order, while using latest metadata', () => {
+    const storePath = join(temp(), 'ready.jsonl');
+    const first = record();
+    const latest = record({ at: new Date(now - minute).toISOString(), audit: 're-audited' });
+    const middle = record({ at: new Date(now - 10 * minute).toISOString() });
+    writeFileSync(storePath, [latest, first, middle].map(JSON.stringify).join('\n'));
+    expect(readFixReadyRecords(storePath)).toEqual([{ ...latest, at: first.at }]);
+    expect(smell.evaluate({ fixReady: probeFixReady({ storePath, roots: [], now }) }, { now })[0]).toMatchObject({ breach: true, measure: { ageMs: 31 * minute } });
+    const changed = { ...latest, sha: '1234567' };
+    writeFileSync(storePath, [changed, first, middle].map(JSON.stringify).join('\n'));
+    expect(readFixReadyRecords(storePath)).toEqual([changed]);
+    const reverted = { ...first, at: new Date(now).toISOString() };
+    writeFileSync(storePath, [reverted, changed, first, middle].map(JSON.stringify).join('\n'));
+    expect(readFixReadyRecords(storePath)).toEqual([reverted]);
   });
   it('resolves CLI > env > declared owner > built-in, expanding home', () => {
     const declared = { settings: { fixNotLoaded: { storePath: '~/declared' } }, owners: { 'fixNotLoaded.storePath': 'settings/custom.json' } };
@@ -308,6 +361,16 @@ describe('fix-ready CLI', () => {
     const list = cli(['list', '--json', `--store=${store}`]);
     expect(list.status).toBe(0);
     expect(JSON.parse(list.stdout)).toEqual([rows[1]]);
+  });
+  it('list reports an unreadable store with a failing status', () => {
+    const store = join(temp(), 'ready.jsonl');
+    for (const contents of [null, '{broken']) {
+      if (contents !== null) writeFileSync(store, contents);
+      const result = cli(['list', '--json', `--store=${store}`]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('store unreadable');
+      expect(result.stdout).toBe('');
+    }
   });
   it.each([
     ['--ref=lane/fix', '--sha=abcdef1', '--tests=red', '--audit=approved'],
