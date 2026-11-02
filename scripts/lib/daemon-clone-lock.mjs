@@ -5,6 +5,10 @@
  *   operator CLIs safely share ONE daemon clone while `daemon-rebuild.mjs` (card 4044) moves it under them.
  *   Ruling: docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle (clauses 2-5).
  *
+ * Single-owner heartbeat + rebuild requests coordinate shared clones; bounded hard claims drain readers
+ * without skip-cap/older-reader backoff. Expiry restores ordinary fairness. Request acknowledgement
+ * records the consumed ID separately, so acknowledgement never deletes a concurrent publication.
+ *
  * WHY a reader/writer lock, not just the per-path lock `scripts/readiness/file-locks.mjs` already has: that
  * module guards individual FILES inside the shared central checkout so two lanes never edit the same path.
  * Here the unit under contention is an entire CLONE'S WORKING TREE moving out from under a running tick — a
@@ -36,9 +40,10 @@
  * compose the reader/writer protocol ourselves.
  */
 
+import { randomUUID } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
-import { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
-import { join, resolve as resolvePath } from 'node:path';
+import fs, { readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
+import { basename, join, resolve as resolvePath } from 'node:path';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -87,6 +92,85 @@ export function cloneLockKey(root) {
 export function cloneLockDirs(root, lockRoot = defaultLockRoot()) {
   const base = join(lockRoot, cloneLockKey(root));
   return { base, writerRoot: join(base, 'writer'), readersRoot: join(base, 'readers'), starvedRoot: join(base, 'starved') };
+}
+
+// Clone coordination sidecars share the lock identity and survive working-tree replacement.
+const OWNER_ENTRIES = Object.freeze({ 'wev-review-daemon': 'review-daemon.mjs' });
+const loggedSettings = new Set();
+function settingLog(key, value, source, log = console) {
+  const message = `daemon-clone-lock: ${key}=${value} (source ${source})`;
+  if (!loggedSettings.has(message)) { loggedSettings.add(message); log.error?.(message); }
+}
+function positiveSetting(key, fallback, env = process.env, integer = false) {
+  const n = Number(env?.[key]);
+  const valid = Number.isFinite(n) && n > 0 && (!integer || Number.isInteger(n));
+  const value = valid ? n : fallback;
+  settingLog(key, value, valid ? 'environment' : 'standard');
+  return value;
+}
+function atomicSidecar(file, record) {
+  mkdirSync(join(file, '..'), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  // Look up native operations at publication time so the hermetic fs guard and fault probes stay live.
+  try { fs.writeFileSync(tmp, `${JSON.stringify(record)}\n`, 'utf8'); fs.renameSync(tmp, file); }
+  finally { rmSync(tmp, { force: true }); }
+}
+function sidecar(root, name, lockRoot) { return join(cloneLockDirs(root, lockRoot).base, name); }
+export function touchOwnerHeartbeat(root, { lockRoot, nowMs = Date.now() } = {}) {
+  atomicSidecar(sidecar(root, 'owner-heartbeat.json', lockRoot), { at: nowMs });
+}
+export function resolveCloneOwnership({ root, entries = [], env = process.env, nowMs = Date.now(), lockRoot } = {}) {
+  const override = typeof env?.WE_DAEMON_CLONE_OWNER_ENTRY === 'string' ? env.WE_DAEMON_CLONE_OWNER_ENTRY.trim() : '';
+  const entry = override || OWNER_ENTRIES[basename(canonicalCloneRoot(root))];
+  settingLog('WE_DAEMON_CLONE_OWNER_ENTRY', entry ?? 'unconfigured', override ? 'environment' : 'standard');
+  if (!entry) return { owner: true, reason: 'owner-unconfigured' };
+  if ((Array.isArray(entries) ? entries : []).some((e) => e && basename(String(e)) === basename(entry))) return { owner: true, reason: 'owner-entry' };
+  const staleMs = positiveSetting('WE_DAEMON_CLONE_OWNER_STALE_MS', 15 * 60_000, env);
+  try {
+    const rec = JSON.parse(readFileSync(sidecar(root, 'owner-heartbeat.json', lockRoot), 'utf8'));
+    if (typeof rec?.at === 'number' && Number.isFinite(rec.at) && nowMs - rec.at < staleMs && nowMs >= rec.at) {
+      return { owner: false, reason: 'owner-active' };
+    }
+  } catch { /* Missing, unreadable or corrupt owner evidence restores the legacy rebuild path. */ }
+  return { owner: true, reason: 'owner-stale-fallback' };
+}
+export function writeRebuildRequest(root, { by = null, reason, ref, nowMs = Date.now(), lockRoot } = {}) {
+  const rec = { by, reason, ref, at: nowMs, id: randomUUID() };
+  atomicSidecar(sidecar(root, 'rebuild-request.json', lockRoot), rec);
+  return rec;
+}
+export function readRebuildRequest(root, { nowMs = Date.now(), ttlMs, lockRoot, env = process.env } = {}) {
+  const ttl = ttlMs ?? positiveSetting('WE_DAEMON_REBUILD_REQUEST_TTL_MS', 30 * 60_000, env);
+  try {
+    const rec = JSON.parse(readFileSync(sidecar(root, 'rebuild-request.json', lockRoot), 'utf8'));
+    if (!rec || typeof rec.at !== 'number' || !Number.isFinite(rec.at) || !Number.isFinite(ttl) || !(ttl > 0)
+      || nowMs - rec.at >= ttl || typeof rec.reason !== 'string' || typeof rec.ref !== 'string'
+      || !(rec.by === null || typeof rec.by === 'string') || typeof rec.id !== 'string' || !rec.id) return null;
+    // Unknown acknowledgement evidence never suppresses a valid request: replay is safe, lost work is not.
+    try {
+      const ack = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request-ack.json', lockRoot), 'utf8'));
+      if (ack?.id === rec.id) return null;
+    } catch { /* absent/unreadable/corrupt acknowledgement: leave the request visible */ }
+    return rec;
+  } catch { return null; }
+}
+/** Acknowledge a specific immutable request ID, never unlink the publication path. With no ID, capture
+ * the current ID first (legacy clear API). Publication may race any subsequent operation safely because a
+ * fresh publication always has a fresh ID. Out-of-order acknowledgements can replay work, never lose it.
+ * Keep just one acknowledgement sidecar, so storage stays bounded across repeated publications. */
+export function clearRebuildRequest(root, { lockRoot, id } = {}) {
+  if (id === undefined) {
+    try { id = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request.json', lockRoot), 'utf8'))?.id; }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  }
+  if (typeof id !== 'string' || !id) return; // incomplete evidence cannot acknowledge anything
+  atomicSidecar(sidecar(root, 'rebuild-request-ack.json', lockRoot), { id });
+}
+function hardWindowMs() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', 15 * 60_000); }
+function hardAfter() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', 2, process.env, true); }
+function claimIsHard(rec, nowMs) {
+  const since = Date.parse(rec?.since || '');
+  return rec?.hard === true && Number.isFinite(since) && nowMs >= since && nowMs - since < hardWindowMs();
 }
 
 // ── reader fairness (live 2026-10-05 20:18-20:37 ET) ─────────────────────────────────────────────────────────
@@ -257,21 +341,29 @@ function readWriterClaim(starvedRoot) {
 
 /** Record one more consecutive `tick-in-progress` give-up by `owner`. A claim by a DIFFERENT live owner is kept
  *  (first come keeps its age); our own is bumped. Best-effort. */
-function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe }) {
+function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe, hardClaim = false, gaveUp = true }) {
   const prev = readWriterClaim(starvedRoot);
-  if (prev && prev.owner !== owner && writerClaimIsLive(prev, nowMs, ttlMs, probe)) return prev;
-  const same = prev && prev.owner === owner;
+  const live = writerClaimIsLive(prev, nowMs, ttlMs, probe);
+  if (live && prev.owner !== owner) {
+    if (!hardClaim || claimIsHard(prev, nowMs)) return prev;
+    // A job may promote its spawner's soft claim; changing pids never restarts the bounded window.
+    const promoted = { ...prev, hard: true, lastAt: new Date(nowMs).toISOString() };
+    atomicSidecar(writerClaimFile(starvedRoot), promoted);
+    return promoted;
+  }
+  const same = live && prev.owner === owner;
   const nowIso = new Date(nowMs).toISOString();
   const rec = {
-    owner, pid, count: (same ? prev.count : 0) + 1, heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
+    owner, pid, count: (same ? prev.count : 0) + (gaveUp ? 1 : 0), heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
   };
+  rec.hard = hardClaim || (same && prev.hard === true) || rec.count >= hardAfter();
   try {
     const file = writerClaimFile(starvedRoot);
     mkdirSync(join(file, '..'), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}`;
     writeFileSync(tmp, `${JSON.stringify(rec)}\n`, 'utf8');
     renameSync(tmp, file);
-  } catch { /* best-effort */ }
+  } catch (error) { if (hardClaim) throw error; /* soft claims remain best-effort */ }
   return rec;
 }
 
@@ -286,14 +378,13 @@ function writerClaimIsLive(rec, nowMs, ttlMs, probe) {
   return probe({ owner: rec.owner, pid: rec.pid }) !== 'dead';
 }
 
-/** The live, effective writer claim (count ≥ `after`) other than `owner`'s own, else null. A lapsed one is
+/** The live, effective writer claim (hard window or count ≥ `after`) other than `owner`'s own, else null. A lapsed one is
  *  removed on sight. */
 function findPriorityWriter(starvedRoot, { owner, nowMs, ttlMs, probe, after }) {
-  if (!(after > 0)) return null;
   const rec = readWriterClaim(starvedRoot);
   if (!rec) return null;
   if (!writerClaimIsLive(rec, nowMs, ttlMs, probe)) { clearWriterClaim(starvedRoot); return null; }
-  if (rec.owner === owner || rec.count < after) return null;
+  if (rec.owner === owner || (!claimIsHard(rec, nowMs) && (!(after > 0) || rec.count < after))) return null;
   return rec;
 }
 
@@ -401,8 +492,8 @@ export function acquireRead(root, opts = {}) {
   if (claim) {
     const mine = readStarvedRecords(starvedRoot).find((r) => r.readerKey === readerKey);
     const skips = readWriterSkips(starvedRoot)[readerKey] ?? 0;
-    if (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since)) && skips < writerPriorityMaxSkips) {
-      if (trackStarvation) setWriterSkips(starvedRoot, readerKey, skips + 1);
+    if (claimIsHard(claim, nowMs) || (!(mine && isoMs(mine.firstRefusedAt) < isoMs(claim.since)) && skips < writerPriorityMaxSkips)) {
+      if (trackStarvation && !claimIsHard(claim, nowMs)) setWriterSkips(starvedRoot, readerKey, skips + 1);
       return { ok: false, reason: 'writer-priority', heldBy: claim.owner, writerStarved: claim.count, claimSince: claim.since };
     }
   }
@@ -471,6 +562,7 @@ export async function acquireWrite(root, opts = {}) {
     owner = defaultOwner(opts.pid),
     // Callers must explicitly opt in to excluding readers; inherited env never grants a bypass.
     ignoreOwners = [],
+    hardClaim = false, // publish before reserving; existing readers drain, NEW reads yield for a bounded window
     lockRoot = defaultLockRoot(),
     waitMs = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
     pollMs = 1000,
@@ -488,6 +580,7 @@ export async function acquireWrite(root, opts = {}) {
 
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
+  if (hardClaim) noteWriterGaveUp(starvedRoot, { owner, pid, nowMs: startMs, ttlMs: writerClaimTtlMs, probe, hardClaim: true, gaveUp: false });
   // Writer fairness: our own live, effective claim (we already starved). Older claim wins — we only yield to a
   // starved reader whose starvation began BEFORE our claim (see "writer fairness" above).
   const ownClaim = () => {
@@ -498,6 +591,8 @@ export async function acquireWrite(root, opts = {}) {
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
+    const claim = readWriterClaim(starvedRoot);
+    if (writerClaimIsLive(claim, nowMsN, writerClaimTtlMs, probe) && claimIsHard(claim, nowMsN)) return null;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
     });
@@ -558,7 +653,7 @@ export async function acquireWrite(root, opts = {}) {
     if (nowMsN >= deadline) {
       releaseLockDir(writerRoot, WRITER_KEY);
       // Writer fairness: leave (or bump) a claim so NEW reads yield until a writer gets the clone.
-      const claim = writerPriorityAfter > 0
+      const claim = (writerPriorityAfter > 0 || hardClaim)
         ? noteWriterGaveUp(starvedRoot, {
           owner, pid, nowMs: nowMsN, heldBy: lastBlockers[0] || null, ttlMs: writerClaimTtlMs, probe,
         })

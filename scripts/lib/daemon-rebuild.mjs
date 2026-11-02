@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/lib/daemon-rebuild.mjs
+ * Public rebuild entry opts into a bounded hard writer claim for admission and adoption, including job children.
  * @description Module C (card 4044/xgomze7, "the heart") of the daemon-clone rebuild
  *   (docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clauses 2-5) — REBUILDS a daemon clone
  *   fresh from `origin/main` plus its registered overlay list (`daemon-overlays.mjs`, Module B) every tick,
@@ -108,10 +109,16 @@
 // The code lives in `./daemon-rebuild/` (move-only split, one file per concern; `./daemon-rebuild/index.mjs` is
 // the re-export surface). This file stays the compatibility entry point and the CLI, so no caller changes.
 export * from './daemon-rebuild/index.mjs';
+// Register-only overlay writers signal the rebuilder through this existing public facade; no lock is taken.
+export { writeRebuildRequest } from './daemon-clone-lock.mjs';
 
 import { resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rebuildClone, dryRunRebuild } from './daemon-rebuild/index.mjs';
+import { rebuildClone as rebuildCloneImpl, dryRunRebuild } from './daemon-rebuild/index.mjs';
+
+export function rebuildClone(options = {}) {
+  return rebuildCloneImpl({ ...options, lockOpts: { hardClaim: true, ...options.lockOpts } });
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────
 // `node scripts/lib/daemon-rebuild.mjs --clone=<path> [--dry-run] [--json] [--ready-only] [--entry=<script>]... [--main-only]`

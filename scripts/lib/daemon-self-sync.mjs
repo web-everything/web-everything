@@ -1,5 +1,8 @@
 /**
  * @file scripts/lib/daemon-self-sync.mjs
+ * Shared clones elect a heartbeat-backed rebuild owner; siblings keep read-locked ticks and HEAD restarts.
+ * Overlay rebuild requests survive refusals/failures; concluded rebuilds acknowledge their observed ID
+ * without deleting newer publications.
  * @description xv6fciw (narrow slice of decision #3681) — keep a daemon's DEDICATED clone on `origin/main`
  *   without a human re-syncing it, and restart the daemon onto new code between ticks.
  *
@@ -122,6 +125,7 @@ import { resolveVersionedContext, isInsideVersions, currentVersion } from './dae
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
   acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
+  resolveCloneOwnership, touchOwnerHeartbeat, readRebuildRequest, clearRebuildRequest,
 } from './daemon-clone-lock.mjs';
 import { basename, dirname, join } from 'node:path';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -624,6 +628,9 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
 }
 
 /**
+ * Single-owner clone coordination gates every rebuild path, refreshes the owner heartbeat each tick,
+ * and consumes overlay rebuild requests only after movement or an up-to-date conclusion.
+ *
  * Wrap a daemon's `runDaemonLoop` effects so each tick first self-syncs the clone. When new commits arrive,
  * `onRestart` runs in place of the tick (the caller releases its lease and exits); otherwise the tick runs.
  *
@@ -699,9 +706,21 @@ export function withSelfSync(effects, {
   let readyIdentity = null;
   let adoptWaitTicks = 0;
   const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
-  const rebuild = rebuildOpt ?? ((o = {}) => rebuildClone({
+  const rebuildImpl = rebuildOpt ?? ((o = {}) => rebuildClone({
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
+  let tickOwnership = null;
+  let pendingRebuildRequest = null;
+  let lastOwnershipReason = null;
+  const rebuild = async (...args) => {
+    if (tickOwnership && !tickOwnership.owner) return { moved: false, reason: 'clone-non-owner' };
+    const result = await rebuildImpl(...args);
+    if (pendingRebuildRequest && (result?.moved || result?.reason === 'up-to-date')) {
+      clearRebuildRequest(root, { ...cloneLockOpts(), id: pendingRebuildRequest.id });
+      pendingRebuildRequest = null;
+    }
+    return result;
+  };
   const bg = background === undefined
     ? resolveBackgroundBuild({ entry: entries?.[0], settings: loadBackgroundBuildSettings(), env })
     : (background ? { ...BUILT_IN_BACKGROUND_BUILD_SETTINGS, ...background, enabled: !!background.enabled } : null);
@@ -780,7 +799,7 @@ export function withSelfSync(effects, {
         log.error?.(`daemon-self-sync: switched to a new version ${cur.id} (${rebuildResult.head}) — restarting onto the new code (card 89)`);
         return onRestart(rebuildResult);
       }
-    } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
+    } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date' && rebuildResult.reason !== 'clone-non-owner') {
       log.error?.(`daemon-self-sync: version rebuild did not switch (${rebuildResult.reason}) — ticking on the current version`);
     }
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -895,7 +914,19 @@ export function withSelfSync(effects, {
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
     tickOnce: async (...args) => {
-      if (resolvedPocBranch) {
+      tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: now(), ...cloneLockOpts() });
+      if (tickOwnership.reason !== lastOwnershipReason) {
+        lastOwnershipReason = tickOwnership.reason;
+        log.error?.(`daemon-self-sync: clone ownership=${tickOwnership.reason}; rebuild=${tickOwnership.owner}`);
+      }
+      // A fallback sibling must NOT impersonate the dead owner by refreshing its heartbeat.
+      if (tickOwnership.reason === 'owner-entry') {
+        try { touchOwnerHeartbeat(root, { ...cloneLockOpts(), nowMs: now() }); }
+        catch (error) { log.error?.(`daemon-self-sync: owner heartbeat unavailable; siblings may use owner-stale-fallback (${error.code ?? 'write-failed'})`); }
+      }
+      pendingRebuildRequest = tickOwnership.owner
+        ? readRebuildRequest(root, { ...cloneLockOpts(), env, nowMs: now() }) : null;
+      if (resolvedPocBranch && tickOwnership.owner) {
         const r = syncPoc({ root, base, pocBranch: resolvedPocBranch, ...(timeoutMs != null ? { timeoutMs } : {}) });
         if (r.merged) {
           const partial = r.reason === 'merged-partial';
@@ -926,7 +957,7 @@ export function withSelfSync(effects, {
 
       // Only count candidates already smoke-passed at tick entry, still based on this clone's HEAD.
       // This is a tick-boundary policy: it never interrupts a running tick or changes the clone lock.
-      const ready = readReady(root, env);
+      const ready = tickOwnership.owner ? readReady(root, env) : null;
       const identity = ready && readHead(syncOpts()) === ready.prevHead
         ? JSON.stringify([ready.adopt?.finalSha, ready.passedAt, ready.prevHead]) : null;
       adoptWaitTicks = identity === null ? 0 : identity === readyIdentity ? adoptWaitTicks + 1 : 1;
@@ -971,7 +1002,7 @@ export function withSelfSync(effects, {
           log.error?.(`daemon-self-sync: rebuilt the clone onto ${rebuildResult.head} — restarting onto the new code (#4044)`);
           return onRestart(rebuildResult);
         }
-      } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
+      } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date' && rebuildResult.reason !== 'clone-non-owner') {
         // Said once per reason (and per job), not every tick: a job in flight answers `rebuild-job-running` for the
         // whole smoke.
         const key = `${rebuildResult.reason}:${rebuildResult.job?.id ?? ''}`;
@@ -1001,7 +1032,7 @@ export function withSelfSync(effects, {
 
       // Idle boundary: adoption has finished and this tick does not yet hold a READ slot.
       // Tests with an injected rebuild opt in to maintenance explicitly, avoiding real clone/state IO.
-      if (maintain || realIo) {
+      if (tickOwnership.owner && (maintain || realIo)) {
         try {
           if (!/^rebuild-job-(started|running)$/.test(String(rebuildResult?.reason))
             && await hasMaintenanceRebuildJob() === false) {

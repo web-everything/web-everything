@@ -1,6 +1,7 @@
 /** Phase 1 contract tests: single rebuild owner and durable overlay wakeups. No network. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,14 +11,16 @@ import { withSelfSync } from '../daemon-self-sync.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
 import { retireRegistration } from '../../daemon-overlay.mjs';
 
-// Observe publication through the real filesystem, including the old contents at rename time.
-vi.mock('node:fs', async (original) => {
-  const fs = await original();
-  return { ...fs, writeFileSync: vi.fn(fs.writeFileSync), renameSync: vi.fn(fs.renameSync) };
-});
+// The hermetic guard rebinds native fs exports. Spy on that native object and synchronize its
+// bindings, so production imports and assertions observe the same filesystem calls.
+let writeSpy, renameSpy, realRename;
 let scratch, root, lockRoot, env;
 const T = 1_800_000_000_000;
 beforeEach(() => {
+  realRename = fs.renameSync;
+  writeSpy = vi.spyOn(fs, 'writeFileSync');
+  renameSpy = vi.spyOn(fs, 'renameSync');
+  syncBuiltinESMExports();
   vi.stubEnv('WE_DAEMON_REBUILD_REQUEST_TTL_MS', undefined);
   scratch = mkdtempSync(join(tmpdir(), 'clone-single-owner-'));
   root = join(scratch, 'wev-review-daemon');
@@ -26,7 +29,7 @@ beforeEach(() => {
   env = { WE_DAEMON_CLONE_LOCK_ROOT: lockRoot, WE_DAEMON_OVERLAY_DIR: join(scratch, 'overlays'),
     WE_DAEMON_STATE_DIR: join(scratch, 'state'), WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
 });
-afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(scratch, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); syncBuiltinESMExports(); rmSync(scratch, { recursive: true, force: true }); });
 const ownership = (entries, extra = {}) => lock.resolveCloneOwnership({ root, entries, env, lockRoot, nowMs: T, ...extra });
 const heartbeat = (nowMs = T) => lock.touchOwnerHeartbeat(root, { lockRoot, nowMs });
 const request = (nowMs = T) => lock.writeRebuildRequest(root, { lockRoot, nowMs, by: 'operator', reason: 'removed', ref: 'lane/fix' });
@@ -108,8 +111,7 @@ describe('durable rebuild request', () => {
     request();
     const target = onlyFile();
     const old = readFileSync(target, 'utf8');
-    const realRename = renameSync.getMockImplementation();
-    renameSync.mockImplementationOnce((from, to) => {
+    renameSpy.mockImplementationOnce((from, to) => {
       expect(String(to)).toBe(target);
       expect(String(from)).not.toBe(target);
       expect(dirname(String(from))).toBe(dirname(target));
@@ -117,10 +119,10 @@ describe('durable rebuild request', () => {
       expect(JSON.parse(readFileSync(from, 'utf8'))).toMatchObject({ ref: 'lane/next' });
       return realRename(from, to);
     });
-    writeFileSync.mockClear(); renameSync.mockClear();
+    writeSpy.mockClear(); renameSpy.mockClear();
     lock.writeRebuildRequest(root, { lockRoot, nowMs: T + 1, by: 'tester', reason: 'retired', ref: 'lane/next' });
-    expect(renameSync).toHaveBeenCalledTimes(1);
-    expect(writeFileSync.mock.calls.some(([path]) => String(path) !== target)).toBe(true);
+    expect(renameSpy).toHaveBeenCalledTimes(1);
+    expect(writeSpy.mock.calls.some(([path]) => String(path) !== target)).toBe(true);
     expect(readRequest()).toMatchObject({ ref: 'lane/next' });
     expect(readdirSync(dirname(target), { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => entry.name))
       .toEqual([target.slice(dirname(target).length + 1)]);
@@ -146,12 +148,12 @@ describe('withSelfSync single owner', () => {
   it('non-owner runs every tick under a read lock without rebuild or a write reservation', async () => {
     heartbeat();
     const w = wrapper('other.mjs');
-    writeFileSync.mockClear();
+    writeSpy.mockClear();
     await expect(w.synced.tickOnce()).resolves.toBe('ticked');
     await expect(w.synced.tickOnce()).resolves.toBe('ticked');
     expect(w.rebuild).not.toHaveBeenCalled();
     const writerRoot = lock.cloneLockDirs(root, lockRoot).writerRoot;
-    expect(writeFileSync.mock.calls.some(([file]) => String(file).startsWith(writerRoot))).toBe(false);
+    expect(writeSpy.mock.calls.some(([file]) => String(file).startsWith(writerRoot))).toBe(false);
     expect(lock.inspectCloneLock(root, { lockRoot }).readers).toEqual([]);
   });
   it('non-owner stale-refusal recovery never rebuilds', async () => {

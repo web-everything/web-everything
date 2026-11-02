@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/daemon-overlay.mjs
+ * Pinned remove/retire publishes a durable rebuild request for the clone owner; unpinned withdrawals do not.
  * @description Operator/daemon CLI for the per-clone overlay list (`scripts/lib/daemon-overlays.mjs`, Module
  *   B) — docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clause 5: a daemon clone tracks
  *   `main` plus an explicit overlay list kept in a per-clone state file OUTSIDE the clone. This is the
@@ -116,7 +117,7 @@ import {
 } from './lib/daemon-overlays.mjs';
 import { planRetirements } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
-import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
+import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
@@ -457,6 +458,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       return refuse(after === undefined ? 'tip-unreadable-restored' : 'tip-moved-restored', { tipNow: after ?? null });
     }
     clearPending(root, env, ref);
+    if (entry.pinned === true) writeRebuildRequest(root, { by, reason: proof.reason, ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
     appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence }, { env });
     return { retired: true, refused: null, reason: proof.reason, evidence: proof.evidence, settled, list: readOverlays(root, { env }) };
   });
@@ -936,7 +938,9 @@ async function main() {
     output = { settled: await withAddGuardLock(root, env, () => settlePendingDrops({ root, env, by })), pending: readPendingDrops(root, env), list: readOverlays(root, { env }) };
     if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
-    const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator' });
+    const entry = readOverlays(root, { env }).find((o) => o.ref === flags.ref);
+    const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator', expectedOverlay: entry });
+    if (removed && entry?.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref: flags.ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
     if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
     output = { removed, list };
   } else if (cmd === 'approve-edge') {
