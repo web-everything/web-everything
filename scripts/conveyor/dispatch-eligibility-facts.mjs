@@ -1,7 +1,6 @@
 /** Pure adapters from read evidence to fail-closed dispatch eligibility facts. */
 import { known, unread, POPULATIONS } from './dispatch-eligibility.mjs';
-import { liveResultGateState, parseRedTeamComment } from '../lib/red-team-gate.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { liveResultGateState } from '../lib/red-team-gate.mjs';
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -38,39 +37,21 @@ function readFact(name, value) {
   return value?.readFailed === true || !validFact(name, value) ? unread() : known(value);
 }
 
-/** Derive red-team evidence using the shared live-result and marker trust rules. */
+/**
+ * Red-team evidence from the gate's own store only (liveResultGateState). This module never parses comments or
+ * markers itself: anything the gate does not decide for the current head (no result, an older head, no gate
+ * record, an unknown outcome) is unread.
+ */
 export function redTeamFact(comments, prNumber, head) {
   if (!Array.isArray(comments) || typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) return unread();
   const s = liveResultGateState(comments, prNumber, head);
-  if (s.result === null) {
-    const olderResult = comments.some(comment => {
-      if (!isTrustedMarkerAuthor(comment)) return false;
-      const parsed = parseRedTeamComment(typeof comment === 'string' ? comment : comment?.body);
-      return parsed !== null && parsed.pr === Number(prNumber) && parsed.rev !== head.toLowerCase();
-    });
-    return olderResult ? unread() : known({ state: 'none', resultId: null, sendBackResultId: null });
-  }
-  // A finding-shaped line the shared parser dropped means the result cannot be trusted as read.
-  const live = head.toLowerCase();
-  const malformed = comments.some(comment => {
-    if (!isTrustedMarkerAuthor(comment)) return false;
-    const raw = String(typeof comment === 'string' ? comment : comment?.body ?? '').replace(/\r\n/g, '\n');
-    // A carried verdict embeds the advisory result after wrapper lines, so read from the marker onward.
-    const at = raw.indexOf('<!-- we:red-team-advisory');
-    if (at < 0) return false;
-    const body = raw.slice(at);
-    const parsed = parseRedTeamComment(body);
-    if (!parsed || parsed.pr !== Number(prNumber) || parsed.rev !== live) return false;
-    return body.split('\n').filter(line => /^\d+\. \[/.test(line)).length !== parsed.findings.length;
-  });
-  if (malformed) return unread();
-  if (s.outcomes.has('operator-block')) {
-    return known({ state: 'blocked', resultId: s.resultId, sendBackResultId: null });
-  }
-  const state = !s.result.findings.some(finding => finding.confirmed) ? 'clear'
-    : s.sendBackOutcome === 'round-cap' ? 'held'
-      : s.sendBackOutcome === 'sent-back' ? 'send-back' : 'pending';
-  return known({ state, resultId: s.resultId, sendBackResultId: state === 'send-back' ? s.resultId : null });
+  if (s.result === null || s.resultId === null) return unread();
+  const bound = state => known({ state, resultId: s.resultId, sendBackResultId: state === 'send-back' ? s.resultId : null });
+  if (s.outcomes.has('operator-block')) return bound('blocked');
+  if (s.sendBackOutcome === 'round-cap') return bound('held');
+  if (s.sendBackOutcome === 'sent-back') return bound('send-back');
+  if (s.outcomes.has('no-send-back')) return bound('clear');
+  return unread();
 }
 
 /**
