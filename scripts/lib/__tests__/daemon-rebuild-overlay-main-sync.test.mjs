@@ -1694,18 +1694,58 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(state.attemptedMain[ref]).toBeUndefined();
   });
 
+  it.each([false, true])('checks moved tips with main attributes in an older daemon checkout (resolved=%s)', async resolved => {
+    const f = fixture({ conflict: true, mainUnion: true });
+    ok(f.root, ['checkout', '-q', '--detach', f.baseSha]);
+    expect(fs.existsSync(join(f.root, '.gitattributes'))).toBe(false);
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    ok(f.root, ['checkout', '-q', ref]);
+    if (resolved) write(f.root, 'worker.mjs', ok(f.root, ['show', `${f.mainSha}:worker.mjs`]) + '\n');
+    ok(f.root, ['commit', '-qam', 'moved overlay', '--allow-empty']);
+    const tip = ok(f.root, ['rev-parse', 'HEAD']);
+    ok(f.origin, ['fetch', '-q', f.root, `${tip}:refs/heads/${ref}`]);
+    ok(f.root, ['checkout', '-q', '--detach', f.baseSha]);
+    // The real Git surface demonstrates why the daemon checkout cannot supply attributes.
+    const plain = run(['merge-tree', '--write-tree', '--name-only', f.mainSha, tip], { cwd: f.root });
+    expect(plain.status).toBe(1);
+    expect(plain.stdout).toContain('docs/agent/testing.md');
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn }).started).toEqual(resolved ? [ref] : []);
+    expect(f.deps.git).toHaveBeenCalledWith(
+      ['--attr-source=origin/main', 'merge-tree', '--write-tree', '--name-only', f.mainSha, tip], expect.any(Object));
+    const state = json(sidecar(f));
+    expect(state.conflictMain[ref]).toBe(resolved ? undefined : f.mainSha);
+    expect(state.attemptedMain[ref]).toBe(resolved ? undefined : f.mainSha);
+    expect(spawnFn).toHaveBeenCalledTimes(resolved ? 1 : 0);
+  });
+
+  it.each(['--attr-source', '--attr-source=origin/main'])('preflight retains the worker compatibility fallback for unsupported %s', async option => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    cleanTip(f);
+    const git = vi.fn((args, opts) => args[0] === '--attr-source=origin/main'
+      ? { status: 129, stdout: '', stderr: `unknown option: ${option}\nusage: git\n` }
+      : f.deps.git(args, opts));
+    expect(tick(f, { spawnFn: spawner(), git }).started).toEqual([ref]);
+    expect(git.mock.calls.filter(([args]) => gitCommand(args) === 'merge-tree').map(([args]) => args.slice(0, 2)))
+      .toEqual([['--attr-source=origin/main', 'merge-tree'], ['merge-tree', '--write-tree']]);
+  });
+
   it.each([['exit 128', { status: 128, stdout: '', stderr: 'fatal: unsupported' }], ['thrown', 'throw'], ['exit 0 with empty output', { status: 0, stdout: '', stderr: '' }],
+    ['other unsupported option', { status: 129, stdout: '', stderr: 'unknown option: --other-option\n' }],
+    ['attribute-source IO error', { status: 129, error: new Error('IO failed'), stdout: '', stderr: 'unknown option: --attr-source\n' }],
     ['exit 0 with malformed output', { status: 0, stdout: 'not-a-tree\n', stderr: '' }]])(
     'a merge check that errors (%s) keeps the stop and fails closed', async (_, failure) => {
       const f = fixture({ conflict: true });
       await expect(job(f)).rejects.toThrow(/merge conflicts/);
       cleanTip(f);
       const git = vi.fn((args, opts) => {
-        if (args[0] === 'merge-tree') { if (failure === 'throw') throw new Error('boom'); return failure; }
+        if (gitCommand(args) === 'merge-tree') { if (failure === 'throw') throw new Error('boom'); return failure; }
         return f.deps.git(args, opts);
       });
       const spawnFn = spawner();
       expect(tick(f, { spawnFn, git })).toMatchObject({ started: [] });
+      expect(git.mock.calls.some(([args]) => args[0] === 'merge-tree')).toBe(false);
       expect(spawnFn).not.toHaveBeenCalled();
       const state = json(sidecar(f));
       expect(state.attemptedMain[ref]).toBe(f.mainSha);

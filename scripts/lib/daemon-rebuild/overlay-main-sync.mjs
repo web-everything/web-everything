@@ -29,6 +29,8 @@ const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-reba
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
 const cleanText = text => String(text ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
 const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
+const unsupportedAttributeSource = result => result?.status === 129 && !result.error
+  && /^unknown option: --attr-source(?:=origin\/main)?\r?$/m.test(result.stderr ?? '');
 const output = result => {
   if (result?.status !== 0 || result.error || typeof result.stdout !== 'string') {
     const step = result?.step ?? 'unknown', tail = stderrTail(result);
@@ -316,7 +318,12 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
           // Only the ref tip moved: lift the terminal stop ONLY on evidence that the new tip merges cleanly
           // with the same main (side-effect-free merge-tree). A conflict or an error keeps the stop.
           let check;
-          try { check = run(['merge-tree', '--write-tree', '--name-only', main, tip]); }
+          try {
+            // Match the scratch worker even when this checkout predates main's merge attributes.
+            const args = ['merge-tree', '--write-tree', '--name-only', main, tip];
+            check = run(['--attr-source=origin/main', ...args]);
+            if (unsupportedAttributeSource(check)) check = run(args);
+          }
           catch (error) { check = { error }; }
           // Evidence must be complete: a tree id on the first line, whatever the exit status.
           const treeOk = !check?.error && typeof check?.stdout === 'string' && /^[a-f0-9]{40}$/.test(check.stdout.split(/\r?\n/)[0]);
@@ -453,8 +460,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     try {
       // The overlay may predate main's merge attributes. Keep the retry/diagnostic step as merge.
       merge = git(['merge', '--no-edit', 'origin/main'], scratch, ['--attr-source=origin/main']);
-      if (merge.status === 129 && !merge.error
-        && /^unknown option: --attr-source(?:=origin\/main)?\r?$/m.test(merge.stderr ?? '')) {
+      if (unsupportedAttributeSource(merge)) {
         // Git before 2.40 rejects the global option before starting a merge.
         merge = git(['merge', '--no-edit', 'origin/main'], scratch);
       }
