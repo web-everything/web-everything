@@ -10,8 +10,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops } from '../daemon-overlay.mjs';
+import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, inferPrNumber } from '../daemon-overlay.mjs';
 import { addOverlay } from '../lib/daemon-overlays.mjs';
+import { planRebuild } from '../lib/daemon-rebuild.mjs';
 
 const CLI = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-overlay.mjs');
 const dirs = [];
@@ -368,10 +369,34 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
 });
 
 describe('daemon-overlay.mjs add records the PR when GitHub knows it', () => {
+  const originHead = { headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false };
+
+  it('closing a same-name fork PR cannot remove unmerged origin work in the rebuild planner', async () => {
+    const f = fixture();
+    const tip = f.push('lane/known', 'a.txt', 'unmerged origin work\n');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known',
+      headRepository: { nameWithOwner: 'contributor/web-everything' }, isCrossRepository: true }]);
+    const r = f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' });
+    expect(r.status, r.stderr).toBe(0);
+    const stateQueries = [];
+    const plan = await planRebuild({
+      git: (args, opts = {}) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        cwd: f.author, encoding: 'utf8', env: { ...f.env, ...opts.env }, timeout: 20_000,
+      }),
+      headSha: gitOk(f.author, ['rev-parse', 'origin/main']), mainRef: 'origin/main',
+      overlays: [f.entry('lane/known')],
+      prState: (pr) => { stateQueries.push(pr); return 'CLOSED'; },
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.applied).toMatchObject([{ ref: 'lane/known', sha: tip }]);
+    expect(stateQueries).toEqual([]);
+    expect(f.entry('lane/known').pr).toBe(null);
+  });
+
   it('fills in the PR of the single open PR headed by the ref', () => {
     const f = fixture();
     f.push('lane/known', 'a.txt', 'a\n');
-    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known' }]);
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known', ...originHead }]);
     expect(f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' }).status).toBe(0);
     expect(f.entry('lane/known').pr).toBe(9);
   });
@@ -379,9 +404,83 @@ describe('daemon-overlay.mjs add records the PR when GitHub knows it', () => {
   it('leaves the PR empty when two PRs head the ref', () => {
     const f = fixture();
     f.push('lane/known', 'a.txt', 'a\n');
-    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known' }, { number: 10, state: 'OPEN', headRefName: 'lane/known' }]);
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known', ...originHead }, { number: 10, state: 'OPEN', headRefName: 'lane/known', ...originHead }]);
     expect(f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' }).status).toBe(0);
     expect(f.entry('lane/known').pr).toBe(null);
+  });
+
+  it.each([false, true])('replace records only origin PRs (fork: %s)', (fork) => {
+    const f = fixture();
+    f.push('lane/old-top', 'a.txt', 'a\n');
+    expect(f.run(['add', '--ref=lane/old-top']).status).toBe(0);
+    const tip = f.push('lane/new-top', 'b.txt', 'b\n', 'origin/lane/old-top');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/new-top',
+      ...(fork ? { headRepository: { nameWithOwner: 'contributor/web-everything' }, isCrossRepository: true } : originHead) }]);
+    const r = f.run(['replace', '--ref=lane/new-top', '--replaces=lane/old-top', `--expected-sha=${tip}`], { WE_DAEMON_OVERLAY_INFER_PR: '1' });
+    expect(r.status, r.stderr).toBe(0);
+    expect(f.entry('lane/new-top').pr).toBe(fork ? null : 9);
+  });
+});
+
+describe('inferPrNumber origin identity and incomplete evidence', () => {
+  const originUrl = 'git@github.com:web-everything/web-everything.git';
+  const sameRepo = { number: 9, headRefName: 'lane/known',
+    headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false };
+  function infer(prs, { repo = 'web-everything/web-everything', originStatus = 0, listStatus = 0, repoStatus = 0, raw } = {}) {
+    const calls = [];
+    const value = inferPrNumber({ root: '/unused', ref: 'lane/known', env: {}, run: (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'git') return { status: originStatus, stdout: originUrl };
+      if (args[0] === 'repo') return { status: repoStatus, stdout: repo };
+      return { status: listStatus, stdout: raw ?? JSON.stringify(prs) };
+    } });
+    return { value, calls };
+  }
+
+  it('resolves the origin remote explicitly rather than the gh default repository', () => {
+    const { value, calls } = infer([sameRepo]);
+    expect(value).toBe(9);
+    expect(calls[0]).toEqual(['git', 'remote', 'get-url', 'origin']);
+    expect(calls[1]).toEqual(['gh', 'repo', 'view', originUrl, '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    expect(calls[2][calls[2].indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['headRepository', 'isCrossRepository']));
+  });
+
+  it.each([
+    ['fork', { ...sameRepo, isCrossRepository: true, headRepository: { nameWithOwner: 'contributor/web-everything' } }],
+    ['other owner despite same-repo flag', { ...sameRepo, headRepository: { nameWithOwner: 'contributor/web-everything' } }],
+    ['other repository with same owner', { ...sameRepo, headRepository: { nameWithOwner: 'web-everything/unrelated' } }],
+    ['cross-repository flag contradicts identity', { ...sameRepo, isCrossRepository: true }],
+    ['unknown repository', { ...sameRepo, headRepository: null }],
+    ['missing full identity', { ...sameRepo, headRepository: { name: 'web-everything' } }],
+    ['missing cross-repository flag', { ...sameRepo, isCrossRepository: undefined }],
+    ['wrong ref', { ...sameRepo, headRefName: 'lane/other' }],
+    ['non-integer PR', { ...sameRepo, number: '9' }],
+    ['non-positive PR', { ...sameRepo, number: 0 }],
+  ])('refuses %s evidence', (_name, pr) => {
+    expect(infer([pr]).value).toBe(null);
+  });
+
+  it('ignores a fork when exactly one origin PR matches', () => {
+    expect(infer([{ ...sameRepo, number: 10, isCrossRepository: true,
+      headRepository: { nameWithOwner: 'contributor/web-everything' } }, sameRepo]).value).toBe(9);
+  });
+
+  it('compares GitHub repository identity without case sensitivity', () => {
+    expect(infer([{ ...sameRepo, headRepository: { nameWithOwner: 'Web-Everything/Web-Everything' } }]).value).toBe(9);
+  });
+
+  it.each([
+    ['none', []], ['ambiguous', [sameRepo, { ...sameRepo, number: 10 }]],
+    ['limit reached', [sameRepo, ...Array.from({ length: 4 }, (_, i) => ({ ...sameRepo, number: 10 + i, headRefName: 'lane/other' }))]],
+  ])('refuses %s results', (_name, prs) => {
+    expect(infer(prs).value).toBe(null);
+  });
+
+  it.each([
+    { originStatus: 1 }, { repoStatus: 1 }, { listStatus: 1 }, { repo: 'invalid' },
+    { raw: '{' }, { raw: '{}' }, { raw: 'null' },
+  ])('refuses unreadable or malformed lookup: %j', (opts) => {
+    expect(infer([sameRepo], opts).value).toBe(null);
   });
 });
 

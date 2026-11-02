@@ -326,16 +326,25 @@ export function proveSquashMerged({ root, entry, env = process.env, run = spawnS
     evidence: { refGone: true, prState: 'MERGED', mergeCommit: mergeOid, prVia: 'head-ref' } };
 }
 
-/** The single open PR headed by `ref`, or null (none, several, or GitHub unreadable). Recorded on registrations. */
+/** The single open origin PR headed by `ref`, or null (none, several, or incomplete evidence).
+ * Fork branches with the same name cannot authorize dropping an origin overlay when their PR closes. */
 export function inferPrNumber({ root, ref, env = process.env, run = spawnSync }) {
-  const call = (args) => { const r = run('gh', args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
-  const repo = call(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
-  const slug = repo.code === 0 ? repo.stdout.trim() : '';
-  if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
-  const list = call(['pr', 'list', '--repo', slug, '--head', ref, '--state', 'open', '--json', 'number,headRefName', '--limit', '5']);
-  if (list.code !== 0) return null;
   try {
-    const hits = (JSON.parse(list.stdout || 'null') ?? []).filter((p) => p?.headRefName === ref && Number.isInteger(p?.number));
+    const call = (cmd, args) => { const r = run(cmd, args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
+    const origin = call('git', ['remote', 'get-url', 'origin']);
+    if (origin.code !== 0 || !origin.stdout.trim()) return null;
+    // gh's default repository can be an upstream or GH_REPO; overlays always load refs from origin.
+    const repo = call('gh', ['repo', 'view', origin.stdout.trim(), '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    const slug = repo.code === 0 ? repo.stdout.trim() : '';
+    if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
+    const list = call('gh', ['pr', 'list', '--repo', slug, '--head', ref, '--state', 'open', '--json', 'number,headRefName,headRepository,isCrossRepository', '--limit', '5']);
+    if (list.code !== 0) return null;
+    const prs = JSON.parse(list.stdout || 'null');
+    // A full page cannot prove uniqueness. Leave --pr to the operator rather than infer from a partial list.
+    if (!Array.isArray(prs) || prs.length >= 5) return null;
+    const hits = prs.filter((p) => p?.headRefName === ref && Number.isSafeInteger(p?.number) && p.number > 0
+      && p.isCrossRepository === false && typeof p.headRepository?.nameWithOwner === 'string'
+      && p.headRepository.nameWithOwner.toLowerCase() === slug.toLowerCase());
     return hits.length === 1 ? hits[0].number : null;
   } catch { return null; }
 }
