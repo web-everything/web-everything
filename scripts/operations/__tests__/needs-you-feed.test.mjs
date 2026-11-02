@@ -447,6 +447,12 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head }, gateComments()), log: () => {} });
     expectUndecided(kept);
   });
+  it('an automatic card-queued record does not settle a confirmed degraded break', async () => {
+    const [res, ...rest] = gateComments({ broken: true, impact: 'degraded', outcome: GATE_OUTCOMES.CARD_QUEUED });
+    const card = { ...rest[0], body: rest[0].body + '\n**Red-team gate**\n- 1 finding(s) filed as a follow-up card (#1).' };
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, [res, card]), log: () => {} });
+    expect(kept.find(i => i.pr === 5768).kind).toBe('confirmed-break-owed-send-back');
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });
