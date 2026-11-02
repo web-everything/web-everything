@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf, REPORT_KINDS } from '../needs-you-feed.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -317,6 +317,49 @@ describe('feed', () => {
 it('keeps round-cap operator notes in the feed while the cap still needs a person', () => {
   expect(Array.from(itemsFromReport({ needsPerson: [{ repo: 'o/r', number: 5403, kind: 'round-cap-exhausted', detail: 'round cap exhausted' }] })))
     .toEqual([expect.objectContaining({ pr: 5403, kind: 'at-round-limit', reason: 'round cap exhausted' })]);
+});
+
+describe('gateReadyItems: a confirmed red-team break on the live head is owed a send-back (#6239)', () => {
+  const repo = 'o/r';
+  const head = '28374514' + 'a'.repeat(32);
+  const old = 'deadbeef' + 'b'.repeat(32);
+  const report = { ready: [{ repo, number: 6239, title: 't' }] };
+  const advisory = (rev, findings) => ({ user: { login: 'plateau-worker[bot]' }, created_at: '2026-11-02T12:00:00Z',
+    body: `<!-- we:red-team-advisory pr=6239 rev=${rev} -->\n${findings}` });
+  const confirmed = '1. [**confirmed**] (logic, degraded) `scripts/run.mjs:485` — the loop drops the last row\n';
+  const unconfirmed = '1. [not confirmed] (logic, degraded) `scripts/run.mjs:485` — maybe drops a row\n';
+  const run = (comments) => gateReadyItems(itemsFromReport(report), report, { log: () => {}, fixClaimLive: () => false,
+    gh: async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:clear' }] })) });
+
+  it('emits confirmed-break-owed-send-back, not "all gates pass", for one confirmed degraded break (label clear)', async () => {
+    const { kept } = await run([advisory(head, confirmed)]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({ pr: 6239, kind: 'confirmed-break-owed-send-back', head });
+    expect(kept[0].reason).toContain('scripts/run.mjs:485');
+    expect(kept[0].reason).not.toMatch(/all gates pass/);
+    const line = diffFeed([], kept, at).lines[0];
+    expect(line).toContain('confirmed-break-owed-send-back');
+    expect(line).not.toMatch(/all gates pass/);
+  });
+  it('leaves a PR with zero confirmed breaks as a normal your-review item', async () => {
+    for (const comments of [[], [advisory(head, '')], [advisory(head, unconfirmed)]]) {
+      const { kept } = await run(comments);
+      expect(kept[0]).toMatchObject({ kind: 'needs-you', head });
+    }
+  });
+  it('ignores an advisory written for an older head', async () => {
+    const { kept } = await run([advisory(old, confirmed)]);
+    expect(kept[0]).toMatchObject({ kind: 'needs-you' });
+  });
+  it('ignores an advisory from an untrusted author', async () => {
+    const forged = { ...advisory(head, confirmed), user: { login: 'someone-else' } };
+    expect((await run([forged])).kept[0]).toMatchObject({ kind: 'needs-you' });
+  });
+  it('resolves by absence like the other report kinds', () => {
+    const open = diffFeed([], [{ repo, pr: 6239, head, kind: 'confirmed-break-owed-send-back', reason: 'r' }], at);
+    const next = diffFeed(open.openKeys, [], at, { clearKinds: REPORT_KINDS });
+    expect(next.lines[0]).toMatch(/^NEEDS-YOU-CLEARED/);
+  });
 });
 
 describe('gateReadyItems: "your review" is re-checked against the live PR (#5768)', () => {
