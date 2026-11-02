@@ -15,8 +15,8 @@ describe('GET /prs per-repo freshness', () => {
     log.bootstrap(seed('o/a'), T - 86_400_000);
     log.append(ev('o/a'), T);
     const { repos } = log.readPrs(null, 10, T + 1000);
-    expect(repos['o/a']).toEqual({ bootstrapAt: T - 86_400_000, lastEventAt: T, coverage: true });
-    expect(repos['o/b']).toEqual({ bootstrapAt: T - 86_400_000, lastEventAt: null, coverage: true });
+    expect(repos['o/a']).toEqual({ bootstrapAt: T - 86_400_000, lastEventAt: T, coverage: true, omittedOpen: [] });
+    expect(repos['o/b']).toEqual({ bootstrapAt: T - 86_400_000, lastEventAt: null, coverage: true, omittedOpen: [] });
   });
 
   it('reports coverage false once the cursor is no longer contiguous after bootstrap', () => {
@@ -30,7 +30,7 @@ describe('GET /prs per-repo freshness', () => {
   it('reports null bootstrapAt and coverage false with no bootstrap', () => {
     const log = createEventLog(createMemoryStorage());
     log.append(ev('o/a'), T);
-    expect(log.readPrs(null, 10, T).repos['o/a']).toEqual({ bootstrapAt: null, lastEventAt: T, coverage: false });
+    expect(log.readPrs(null, 10, T).repos['o/a']).toEqual({ bootstrapAt: null, lastEventAt: T, coverage: false, omittedOpen: [] });
   });
 
   it('is false for truncated or failed bootstraps', () => {
@@ -46,7 +46,7 @@ describe('GET /prs per-repo freshness', () => {
     log.bootstrap(seed('o/a'), T + 3_600_000);
     log.append(ev('o/a'), T + 3_600_000);
     const row = log.readPrs(null, 10, T).repos['o/a'];
-    expect(row).toEqual({ bootstrapAt: null, lastEventAt: null, coverage: false });
+    expect(row).toEqual({ bootstrapAt: null, lastEventAt: null, coverage: false, omittedOpen: [] });
     expect(log.readPrs(null, 10, T + 3_600_000).repos['o/a'].coverage).toBe(true);
   });
 
@@ -54,7 +54,7 @@ describe('GET /prs per-repo freshness', () => {
     const log = createEventLog(createMemoryStorage());
     log.bootstrap(seed('o/a'), T);
     log.append(ev('o/a'), T + 3_600_000);
-    expect(log.readPrs(null, 10, T).repos['o/a']).toEqual({ bootstrapAt: T, lastEventAt: null, coverage: false });
+    expect(log.readPrs(null, 10, T).repos['o/a']).toEqual({ bootstrapAt: T, lastEventAt: null, coverage: false, omittedOpen: [] });
   });
 
   it('a delayed complete import at the same cursor cannot close PRs a newer import seeded', () => {
@@ -70,7 +70,7 @@ describe('GET /prs per-repo freshness', () => {
     log.bootstrap(seed('o/a', 0, 'complete', 'c'), T);
     expect(log.readPrs(null, 10, T).repos['o/a'].coverage).toBe(false);
     log.append(ev('o/b', 9), T);
-    log.bootstrap(seed('o/a', 1, 'complete', 'c2'), T);
+    log.bootstrap({ ...seed('o/a', 1, 'complete', 'c2'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
     expect(log.readPrs(null, 10, T).repos['o/a'].coverage).toBe(true);
   });
 

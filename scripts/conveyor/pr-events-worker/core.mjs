@@ -286,7 +286,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // Import history for the NEW per-repo coverage only (fail closed); it changes no seeding behaviour.
       const seen = storage.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
       const priorLatest = storage.getProjection('bootstrap', input.repo);
-      storage.putProjection('repoImports', input.repo, { repo: input.repo,
+      storage.putProjection('repoImports', input.repo, { repo: input.repo, listed: input.prs.map((p) => p.number),
         others: priorLatest ? [...seen.others, priorLatest.baseCursor] : seen.others });
       storage.putProjection('bootstrap', input.repo, result);
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
@@ -328,7 +328,8 @@ function repoFreshness(storage, head, now) {
   const clamp = (v) => (Number.isFinite(v) && v <= now + FUTURE_SKEW_MS ? v : null); // a future time is rejected, never shown as fresh
   const oldest = storage.minSeq();
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
-  const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i.others]));
+  const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i]));
+  const openRows = storage.listProjection('prs').filter((r) => r.state === 'open');
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
   const out = {};
   for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
@@ -337,8 +338,11 @@ function repoFreshness(storage, head, now) {
     const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
     const lastEventAt = clamp(lastEvent.get(repo));
     const badEvent = lastEvent.has(repo) && lastEventAt == null; // an unreadable/future event time voids coverage
-    out[repo] = { bootstrapAt, lastEventAt, coverage: !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
-      (imports.get(repo) || []).every((c) => c < b.baseCursor) };
+    // Open rows the Worker holds that the latest COMPLETE listing left out (rows a later event touched are newer, not omitted).
+    const omittedOpen = b && b.status === 'complete' ? openRows.filter((r) => r.repo === repo && (r.fields?.state || 0) <= b.baseCursor &&
+      !(imports.get(repo)?.listed || []).includes(r.number)).map((r) => r.number).sort((x, y) => x - y) : [];
+    out[repo] = { bootstrapAt, lastEventAt, omittedOpen, coverage: !omittedOpen.length && !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
+      (imports.get(repo)?.others || []).every((c) => c < b.baseCursor) };
   }
   return out;
 }
