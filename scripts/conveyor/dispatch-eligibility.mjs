@@ -85,7 +85,7 @@ function validFact(name, value) {
 export function eligibility(prState, facts) {
   if (prState?.commentsComplete !== true) return { unknown: 'thread' };
   if (!Number.isInteger(prState.number) || prState.number <= 0) return { unknown: 'pr' };
-  if (!/^[0-9a-f]{40}$/i.test(String(prState.headRefOid ?? ''))) return { unknown: 'pr' };
+  if (typeof prState.headRefOid !== 'string' || !/^[0-9a-f]{40}$/i.test(prState.headRefOid)) return { unknown: 'pr' };
   for (const name of REQUIRED_FACTS) {
     const fact = facts?.[name];
     if (!isRecord(fact) || fact.status !== 'known' || !validFact(name, fact.value)) {

@@ -113,6 +113,25 @@ describe('dispatch-eligibility: holds', () => {
   it.each([undefined, '', 'abc', 'a'.repeat(39)])('a missing or invalid head %s -> unknown:pr', headRefOid => {
     expect(eligibility(pr({ headRefOid }), clean())).toEqual({ unknown: 'pr' });
   });
+  it.each([
+    ['SHA array', [HEAD]],
+    ['object with null toString', { toString: null }],
+    ['object with SHA toString', { toString: () => HEAD }],
+    ['object with throwing toString', { toString: () => { throw new Error('must not coerce head'); } }],
+    ['object without a prototype', Object.create(null)],
+    ['boxed string', new String(HEAD)],
+    ['40-digit number', 1e39],
+    ['40-digit bigint', BigInt('1'.repeat(40))],
+    ['boolean', true],
+    ['symbol', Symbol('head')],
+    ['null', null],
+  ])('a non-string head (%s) -> unknown:pr without coercion', (_name, headRefOid) => {
+    expect(eligibility(pr({ headRefOid }), clean())).toEqual({ unknown: 'pr' });
+  });
+  it('preserves a valid mixed-case string head in dispatch evidence', () => {
+    const headRefOid = 'aB12'.repeat(10);
+    expect(eligibility(pr({ headRefOid }), clean())).toMatchObject({ dispatch: true, evidence: { head: headRefOid } });
+  });
   it.each(ALL)('%s: an object-shaped withdrawn label holds too', population => {
     expect(eligibility(pr({ isDraft: true, labels: [{ name: 'review-status:draft-withdrawn' }] }), clean(population))).toEqual({ hold: REASONS.DRAFT });
   });
