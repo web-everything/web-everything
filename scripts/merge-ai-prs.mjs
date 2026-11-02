@@ -2,7 +2,10 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from './lib/drain-queue-safety.mjs';
+import { mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
+import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
+import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -235,7 +238,7 @@ import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-
 import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
-import { readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
+import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -4824,7 +4827,43 @@ async function runCli() {
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
     const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
-      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha });
+      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
+      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
+      enqueueAllowed: () => {
+        const repo = c.repo ?? localSlug;
+        const exec = execFileSyncThrottled;
+        const log = line => process.stderr.write(`  ${line}\n`);
+        try {
+          const comments = readCompletePrComments(c.num, { repo, exec });
+          if (!Array.isArray(comments)) throw Error('complete comments unreadable');
+          const safety = readDrainQueueSafety({ log });
+          if (safety.value.waitForRedTeamBeforeEnqueue) {
+            const evidence = readDrainRedTeamEvidence({ repo, pr: c.num, head: sha });
+            const standingRuling = standingRulingScope({ repo, pr: { number: c.num, headRefOid: sha, comments } });
+            if (redTeamEnqueueHold({ ...evidence, repo, pr: c.num, head: sha, comments, standingRuling })) return false;
+          }
+          // Use the live base, as enqueuePr does: a retarget can expose a workflow edit.
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(c.num), '--repo', repo,
+            '--json', 'headRefOid,baseRefName'], { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'pipe'] }));
+          if (live?.headRefOid !== sha || typeof live.baseRefName !== 'string' || !live.baseRefName) return false;
+          const read = readPinnedChangedFiles({ headSha: sha, base: live.baseRefName, cwd: process.cwd(), exec });
+          if (read.error) return false;
+          const workflow = resolveDrainWorkflowEditHuman();
+          log(`policy · drainWorkflowEditHuman=${workflow.value} (${workflow.source})`);
+          if (decideDrainWorkflowEditHold({ files: read.files, filesComplete: true, headSha: sha,
+            humanClearedSha: parseLatestHumanClearedSha(comments), setting: workflow.value }).hold) return false;
+          const surface = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
+          if (!surface.hold) return true;
+          if (!surface.humanOnly) return false;
+          const setting = resolveApprovalLicensesEnqueue();
+          log(`human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
+          if (!setting.value) return false;
+          const license = proveHumanOnlyLicense({ repo, pr: c.num, headSha: sha, cwd: process.cwd(), exec });
+          return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
+        } catch { return false; }
+      } });
     const guard = mqSameHeadGuard({ refresh, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };

@@ -9,6 +9,7 @@ import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId 
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { enqueuePr } from '../merge-queue-enqueue.mjs';
+import { decideDrainWorkflowEditHold } from '../drain-workflow-edit-hold.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
@@ -50,7 +51,7 @@ describe('merge-queue same-head failure admission', () => {
       const f = { path, store, labels: ['ready-to-merge'], live: {
         headRefOid: head, mergeStateStatus: 'CLEAN',
         statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
-      }, log: vi.fn(), approvedHeadHold: vi.fn(() => false) };
+      }, log: vi.fn(), approvedHeadHold: vi.fn(() => false), enqueueAllowed: vi.fn(() => true) };
       f.exec = vi.fn((_command, args) => {
         if (args.includes('PUT')) {
           if (f.refused) throw new Error('HTTP 422: head moved');
@@ -65,7 +66,8 @@ describe('merge-queue same-head failure admission', () => {
         return response(f.timeline ?? timeline(removed()));
       });
       f.run = (selectedStore = store) => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
-        refresh: createMqSameHeadRefreshOptions({ store: selectedStore, approvedHeadHold: f.approvedHeadHold, repo, pr, head }) });
+        refresh: createMqSameHeadRefreshOptions({ store: selectedStore, approvedHeadHold: f.approvedHeadHold,
+          enqueueAllowed: f.enqueueAllowed, repo, pr, head }) });
       f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
     }
@@ -79,6 +81,45 @@ describe('merge-queue same-head failure admission', () => {
       f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
       expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
+    }));
+    it('head-bound red-team refusal prevents update-branch, live label read and ledger spend', () => fixture(f => {
+      f.enqueueAllowed.mockImplementation(() => redTeamEnqueueHold({
+        repo, pr, head, comments: [], scheduled: true, skipCardOnly: false, env: {},
+      }) === null);
+      f.run();
+      expect(f.requests()).toHaveLength(0);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('labels,headRefOid'))).toBe(false);
+      expect(existsSync(f.path)).toBe(false);
+      f.enqueueAllowed.mockReturnValue(true);
+      f.run();
+      expect(f.requests()).toHaveLength(1);
+    }));
+    it('workflow-edit refusal prevents update-branch, live label read and ledger spend', () => fixture(f => {
+      f.enqueueAllowed.mockImplementation(() => decideDrainWorkflowEditHold({
+        files: ['.github/workflows/ci.yml'], filesComplete: true, headSha: head, setting: 'on',
+      }).hold === false);
+      f.run();
+      expect(f.requests()).toHaveLength(0);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('labels,headRefOid'))).toBe(false);
+      expect(existsSync(f.path)).toBe(false);
+    }));
+    it('incomplete workflow evidence prevents update-branch and ledger spend', () => fixture(f => {
+      f.enqueueAllowed.mockImplementation(() => decideDrainWorkflowEditHold({
+        files: ['scripts/safe.mjs'], filesComplete: false, headSha: head, setting: 'on',
+      }).hold === false);
+      f.run();
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+      expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/authorization refused or unreadable; inspect.*approval before retrying/));
+    }));
+    it.each(['unreadable', 'incomplete', 'missing'])('enqueue evidence %s fails closed before labels or ledger spend', kind => fixture(f => {
+      if (kind === 'missing') f.enqueueAllowed = undefined;
+      else f.enqueueAllowed.mockImplementation(() => { if (kind === 'unreadable') throw Error('offline'); });
+      f.run();
+      expect(f.requests()).toHaveLength(0);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('labels,headRefOid'))).toBe(false);
+      expect(existsSync(f.path)).toBe(false);
+      expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/authorization refused or unreadable; inspect.*approval before retrying/));
     }));
     it.each([
       ['unbound removal', { ...removed(), beforeCommit: null }],

@@ -101,8 +101,9 @@ export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath
   };
 }
 
-export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, repo, pr, head }) {
-  return { store, allow: () => approvedHeadHold({ repo, num: pr }, head, { strict: true }) === false };
+export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, enqueueAllowed, repo, pr, head }) {
+  return { store, allow: () => enqueueAllowed?.() === true
+    && approvedHeadHold({ repo, num: pr }, head, { strict: true }) === false };
 }
 
 function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
@@ -122,8 +123,13 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
     if (!Array.isArray(checks) || !checks.length || !checks.every(check => check
       && (check.status == null || check.status === 'COMPLETED')
       && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state))) return;
-    // Unreadable approval evidence is never permission to refresh.
-    if (allow?.() !== true) return;
+    // Unreadable enqueue or approval evidence is never permission to refresh.
+    let allowed = false;
+    try { allowed = allow?.() === true; } catch { /* Fail closed before labels or claim. */ }
+    if (!allowed) {
+      log(`${prefix}authorization refused or unreadable; inspect red-team evidence and workflow/human approval before retrying`);
+      return;
+    }
     // Read labels LIVE after approval and before spending the claim. Recheck the head too.
     const labeled = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
       '--json', 'labels,headRefOid'], opts));
