@@ -436,7 +436,7 @@ describe('one shared run store across daemon clones (D6 of 128, #xyloz19)', () =
   it('moves records written before the move into the shared folder, once, without overwriting', () => {
     const legacy = join(dir, 'clone', '.operations', 'runs');
     const shared = join(dir, 'shared');
-    writeRun(newRunRecord({ id: 'old-one', op: 'review-pr', input: {} }), legacy);
+    writeRun(newRunRecord({ id: 'old-one', op: 'old', input: {} }), legacy);
     writeRun(newRunRecord({ id: 'both', op: 'old', input: {} }), legacy);
     writeRun(newRunRecord({ id: 'both', op: 'new', input: {} }), shared);
     const r = migrateLegacyRuns(legacy, shared);

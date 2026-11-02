@@ -70,6 +70,20 @@ describe('rebuildClone coordination events', () => {
     expectEvent('rebuild-adopted', { sha });
   });
 
+  it('reports closure-scope provenance in rebuild-adopted', async () => {
+    const result = { moved: true, adopted: true, head: sha,
+      plan: { applied: [{ ref: 'lane/a', resolvedVia: 'closure-scope', excluded: ['unused.mjs'] }] } };
+    smokeAndAdopt.mockResolvedValue(result);
+    await rebuildClone(options);
+    expectEvent('rebuild-adopted', { sha, resolvedVia: 'closure-scope' });
+  });
+
+  it('passes the caller entries through to preparation', async () => {
+    terminal({ moved: false, reason: 'up-to-date' });
+    await rebuildClone({ ...options, entries: ['scripts/caller.mjs'] });
+    expect(prepareRebuild).toHaveBeenCalledWith(expect.objectContaining({ entries: ['scripts/caller.mjs'] }));
+  });
+
   it('also emits once for a ready candidate adopted during prepare', async () => {
     const result = { moved: true, adopted: true, reason: 'ready-adopted', head: sha };
     terminal(result);
@@ -78,7 +92,21 @@ describe('rebuildClone coordination events', () => {
     expectEvent('rebuild-adopted', { sha });
   });
 
+  it('emits overlay-adopted from the rebuild path when a pending overlay sha is in the clone HEAD', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const { recordPendingAdoption } = await import('../overlay-adoption.mjs');
+    const git = (...a) => execFileSync('git', ['-C', options.root, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { encoding: 'utf8' }).trim();
+    git('init', '-q'); git('commit', '-q', '--allow-empty', '-m', 'one');
+    const head = git('rev-parse', 'HEAD');
+    recordPendingAdoption(options.root, { ref: 'lane/x', sha: head }, { env: options.env });
+    terminal({ moved: false, reason: 'up-to-date' });
+    await rebuildClone(options);
+    expect(options.emitEvent).toHaveBeenCalledTimes(1);
+    expect(options.emitEvent.mock.calls[0][0]).toMatchObject({ kind: 'overlay-adopted', detail: { ref: 'lane/x', sha: head } });
+  });
+
   it.each(['quarantined', 'established-overlay-conflict', 'still-rejected',
+    'overlay-source-unavailable', 'overlay-source-unverifiable',
     'error: build unavailable', 'established-overlay-conflict: lane/example'])(
     'emits rebuild-failed once for a prepare refusal: %s', async (reason) => {
       terminal({ moved: false, reason });
@@ -107,7 +135,7 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
-  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted'])(
+  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted', 'closure-opaque'])(
     'emits nothing for a no-op result: %s', async (reason) => {
       terminal({ moved: false, reason });
       expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
@@ -242,7 +270,7 @@ describe('rebuildClone coordination events', () => {
       'index-locked', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
-      'other-base', 'overlay-no-longer-wanted', 'overlay-set-aside', 'pinned-conflict-skipped',
+      'other-base', 'overlay-no-longer-wanted', 'overlay-registration-changed', 'overlay-set-aside', 'pinned-conflict-skipped',
       'pinned-contained-in-applied', 'pinned-overlay-conflict-skipped', 'pr-closed', 'pr-merged',
       'ready-adopted', 'ready-pending', 'ready-recorded', 'rebuild-in-progress', 'rebuild-job-running',
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',
@@ -250,7 +278,8 @@ describe('rebuildClone coordination events', () => {
       'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'stack-base-moved',
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
-      'unverified-build', 'up-to-date',
+      'unverified-build', 'up-to-date', 'scoped-noop', 'fixpoint-exhausted',
+      'entries-unreadable', 'closure-incomplete', 'closure-too-large', 'closure-opaque', 'scope-unreadable',
     ]);
     const reasons = new Set();
     function collect(expression) {

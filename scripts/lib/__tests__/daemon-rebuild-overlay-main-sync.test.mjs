@@ -374,7 +374,6 @@ describe('overlay main sync', () => {
     expect(f.deps.git.mock.calls.filter(([args]) => args[0] !== 'checkout')
       .every(([, opts]) => opts.timeout === undefined)).toBe(true);
     expect(f.deps.git.mock.calls.some(([args]) => gitCommand(args) === 'merge')).toBe(true);
-    expect(f.deps.git.mock.calls.some(([args]) => args.includes('merge'))).toBe(true);
     expect(synced(f)).toHaveLength(1);
     expect(alerts(f)).toEqual([]);
     expect(fs.readFileSync(join(outside, 'keep.md'), 'utf8')).toBe('preserve outside scratch\n');

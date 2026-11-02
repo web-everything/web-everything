@@ -5,12 +5,14 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { readOverlayState, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
-import { resolveOverlayConflict } from './overlay-strategies.mjs';
+import { finalClosureScope, isExcludable } from './closure-scope.mjs';
+import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -100,14 +102,33 @@ export function matchReadyCandidate({
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null,
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
+  const applied = Array.isArray(adopt?.applied) ? adopt.applied : [];
+  const scoped = applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined);
+  // Persisted scoped builds still need runtime evidence after the strategy is disabled.
+  if (scoped || (closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
+    try {
+      entries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(entries) || !entries.length) return false;
+    } catch { return false; }
+  }
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
   // Never a rollback: the record's main must be at or past the main the current head was built on.
   const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
-  const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
+  let finalScope;
+  if (scoped) {
+    const final = finalClosureScope({ git, sha: adopt.finalSha, entries, env });
+    if (!final.ok) return false;
+    finalScope = final.scope;
+    for (const a of applied) {
+      if (a?.resolvedVia !== 'closure-scope' && a?.excluded !== undefined) return false;
+      if (a?.resolvedVia === 'closure-scope' && (!Array.isArray(a.excluded) || !a.excluded.length
+        || new Set(a.excluded).size !== a.excluded.length || !a.excluded.every(p => isExcludable(p, finalScope)))) return false;
+    }
+  }
   let cur = adopt.finalSha;
   for (let i = applied.length - 1; i >= 0; i -= 1) {
     const a = applied[i];
@@ -126,7 +147,11 @@ export function readyBuildVerified({
     if (tip ? !isAncestor(a.sha, tip) : !isAncestor(a.sha, mainTip)) return false;
     // The merge's tree is exactly what planRebuild mints for (prev, overlay) — never an arbitrary tree.
     let minted;
-    if (a.resolvedVia) {
+    if (a.resolvedVia === 'closure-scope') {
+      const resolved = resolveClosureScopedConflict({ git, cur: prev, ovSha: a.sha, scope: finalScope });
+      if (!resolved?.ok || JSON.stringify(resolved.excluded) !== JSON.stringify(a.excluded)) return false;
+      minted = resolved.tree;
+    } else if (a.resolvedVia) {
       // An edge-resolved build is only as trusted as the operator's CURRENT recorded approval: the record's own
       // `edgeSha` must still equal it, and the tree is re-derived through that same approved edge.
       const approvedEdgeSha = approvedEdgeShaFor(a.ref);
@@ -150,7 +175,19 @@ export function dropSuspectOverlays({
   root, env, suspects, failed, alert,
 }) {
   for (const s of suspects) {
-    removeOverlay(root, s.ref, { env, why: 'smoke-failed' });
+    // Legacy fallback records can name a ref without binding their smoke evidence to a registration.
+    // An absent CAS token would make removeOverlay unconditional, so keep the entry for operator review.
+    if (typeof s.registrationId !== 'string' || !s.registrationId) {
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
+    try {
+      removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: s.registrationId });
+    } catch (error) {
+      if (!/registration changed/.test(String(error?.message))) throw error;
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
     appendOverlayEvent(root, {
       kind: 'dropped-smoke-failed', ref: s.ref, pr: s.pr, reason: failed,
     }, { env });
@@ -212,6 +249,16 @@ export async function finalizeRebuild({
       appendFileSync(file, `${JSON.stringify({ at: nowIso(), kind, detail })}\n`, 'utf8');
     } catch { /* best-effort audit trail only */ }
   };
+  const adoptionRows = () => {
+    const registry = readOverlayState(root, { env });
+    return plan.applied.map((row) => {
+      if (!row.registrationId || (!registry.corrupt && registry.overlays.some((entry) =>
+        entry?.ref === row.ref && entry.registrationId === row.registrationId))) return row;
+      alert('overlay-registration-changed', { ref: row.ref });
+      const { registrationId, ...unbound } = row;
+      return unbound;
+    });
+  };
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
@@ -236,7 +283,7 @@ export async function finalizeRebuild({
   if (headNow === plan.finalSha) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
       };
       state.rejected = null;
       state.held = null;
@@ -292,7 +339,7 @@ export async function finalizeRebuild({
       });
     }
     state.adopted = {
-      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
     };
     state.rejected = null;
     state.held = null;

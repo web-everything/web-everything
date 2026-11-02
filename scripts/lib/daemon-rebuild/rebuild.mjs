@@ -3,6 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { basename } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -32,7 +33,8 @@ export const FAILURE_REASONS = new Set([
   'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'overlay-source-unavailable', 'overlay-source-unverifiable', 'overlay-state-corrupt',
+  'pinned-overlay-conflict', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
@@ -69,7 +71,9 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     if (result.moved === true) {
       if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
         await emitEvent({
-          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head,
+            ...(result.plan?.applied?.some(a => a.resolvedVia === 'closure-scope') ? { resolvedVia: 'closure-scope' } : {}),
+          },
         }, eventOptions);
       }
     } else if (typeof result.reason === 'string' && FAILURE_REASONS.has(result.reason.split(':', 1)[0])) {
@@ -77,6 +81,11 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
     }
+    // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
+    await checkPendingAdoptions({
+      root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
+      emit: (event) => emitEvent(event, eventOptions),
+    });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   return result;
 }
@@ -148,7 +157,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, entries,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {

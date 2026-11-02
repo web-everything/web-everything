@@ -409,6 +409,21 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
   }
 }
 
+/** Pending swaps own both registrations until verified adoption cleanup. Unreadable evidence must preserve them. */
+export function pendingSwapRefs({ root, env = process.env }) {
+  const { dir } = paths(root, env, '');
+  let names;
+  try { names = fs.readdirSync(dir); } catch (error) { if (error.code === 'ENOENT') return new Set(); throw error; }
+  const refs = new Set();
+  for (const name of names.filter(n => n.endsWith('.json'))) {
+    const swap = readPending(fs, join(dir, name));
+    if (!isSafeBranchName(swap?.old) || !isSafeBranchName(swap?.new)) throw new Error('invalid pending swap; retirement deferred');
+    refs.add(swap.old);
+    refs.add(swap.new);
+  }
+  return refs;
+}
+
 export function finishPendingSwaps({ root, env = process.env, run, removeOverlay = overlays.removeOverlay, appendOverlayEvent = overlays.appendOverlayEvent }) {
   const { dir } = paths(root, env, '');
   let names;
