@@ -158,9 +158,9 @@ function ownerGone(root, index, file, liveness, selfPid) {
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
  * a result keeps the marker. A marker whose run id was never recorded (the client died before prepare returned) is kept
- * while any run started inside its own possible window ([at - skew, first-seen-dead]) is still unfinished.
+ * while any run started inside its own possible window ([at - skew, first-seen-dead + skew]) is still unfinished.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run to ask Forge about: it is
- * reaped past the grace window once no live local process holds its slot lock.
+ * retained until an operator confirms remote termination and clears it manually.
  */
 export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
@@ -211,9 +211,8 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (marker.unreadable) continue;
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
-          // No host, run or Forge question applies: reap on proof that no live local process owns the slot.
-          if (now - mtimeMs < graceMs || !ownerGone(root, index, file, liveness, selfPid)) continue;
-          if (claimAndRemove({file, name, ino, mtimeMs, index})) reaped.push(name);
+          // Local owner disappearance cannot prove remote termination. Without a host/run binding,
+          // telemetry cannot authorize cleanup; retain the marker for operator-confirmed cleanup.
           continue;
         }
         // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.
@@ -246,10 +245,10 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   };
 }
 
-// A run-less marker's run could only have started between the marker's dispatch and the owner's death.
+// Remote timestamps may differ from local dispatch and death timestamps by CLOCK_SKEW_MS in either direction.
 function maybeOwnsInflight(telemetry, atMs, diedByMs) {
   return telemetry.recent.some(item => {
     const started = Date.parse(item?.startedAtET);
-    return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs));
+    return !Number.isInteger(item?.code) && (!Number.isFinite(started) || (started >= atMs - CLOCK_SKEW_MS && started <= diedByMs + CLOCK_SKEW_MS));
   });
 }

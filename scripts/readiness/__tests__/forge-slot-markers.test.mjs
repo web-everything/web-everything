@@ -105,10 +105,28 @@ describe('stale remote slot markers (perf10)', () => {
     const r2 = createMarkerReaper({root: again, host: 'forge', clock: () => NOW, liveness: liveness([111])});
     expect(await r2.step(tel(1, undefined, [mine]))).toEqual([]);
   });
-  it('reaps a bare legacy marker once no live local process holds its slot lock', async () => {
+  it.each([null, {sampledAtET: iso(NOW + 120_000), activeRuns: 0, recent: []},
+    {sampledAtET: iso(NOW + 120_000), activeRuns: 1, recent: [going(RUN_A)]}])(
+    'retains orphaned legacy markers when remote termination is unknown', async telemetry => {
     const root = setup({0: {}, 1: {}});
-    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW});
-    expect(await reaper.step(async () => null)).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    const lock = lockDirFor(root, 'slot-1');
+    mkdirSync(lock, {recursive: true});
+    writeFileSync(join(lock, 'lock.json'), JSON.stringify({owner: 'dead', pid: 4242,
+      heartbeatAt: new Date(NOW).toISOString(), acquiredAt: new Date(NOW).toISOString(), path: 'slot-1'}));
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => 'dead'});
+    expect(await reaper.step(async () => telemetry)).toEqual([]);
+    expect(names(root)).toEqual(['0', '1']);
+    expect([...blockedSlots(root, 2)].sort()).toEqual([0, 1]);
+  });
+  it.each([
+    [-660_001, true], [-660_000, false], [-659_999, false],
+    [1, false], [59_999, false], [60_000, false], [60_001, true],
+  ])('applies clock skew to both run-less ownership-window boundaries (start offset %i)', async (offset, reap) => {
+    const root = setup({0: {pid: 111}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(tel(1, undefined, [going(RUN_A, NOW + offset)])))
+      .toEqual(reap ? ['slot-0.unconfirmed'] : []);
+    expect(names(root)).toEqual(reap ? [] : ['0']);
   });
   it('keeps a bare legacy marker inside the grace window or while its slot lock owner is alive', async () => {
     const root = setup({0: {ageMs: 30_000}, 1: {}});

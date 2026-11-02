@@ -666,7 +666,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     const remoteRoot = join(f.lockRoot, '..', 'remote');
     mkdirSync(remoteRoot, { recursive: true });
     const marker = join(remoteRoot, 'slot-0.unconfirmed');
-    // A live owner (this process): a bare text marker with no lock holder would now be reaped as having no live owner.
+    // A structured marker with a live owner (this process) keeps this slot blocked.
     writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: Date.now() }) + '\n');
     const base = Date.now();
     let t = base;
