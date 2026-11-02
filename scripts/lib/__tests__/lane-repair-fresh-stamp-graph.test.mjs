@@ -56,4 +56,19 @@ describe('repairCloneRefs with a fresh deep-check stamp', () => {
     expect(r.ok).toBe(false);
     expect(r.problems.join(' ')).toContain('commit-graph still unreadable');
   });
+
+  it('a persistently unhealable graph is retried at most once per window, not on every sync', () => {
+    repairCloneRefs(clone);
+    corruptGraph();
+    mkdirSync(join(clone, '.git', '.commit-graph-heal.lock'));
+    writeFileSync(join(clone, '.git', '.commit-graph-heal.lock', 'owner'), JSON.stringify({ pid: process.pid, at: Date.now() }));
+    const logs = [];
+    const first = repairCloneRefs(clone, { log: (m) => logs.push(m) });
+    const n = logs.length;
+    const second = repairCloneRefs(clone, { log: (m) => logs.push(m) });
+    expect(first.ok).toBe(false);
+    expect(second.ok).toBe(false);
+    expect(second.problems.join(' ')).toContain('commit-graph still unreadable');
+    expect(logs.length).toBe(n);
+  });
 });
