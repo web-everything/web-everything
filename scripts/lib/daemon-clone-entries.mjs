@@ -30,7 +30,13 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
   const realRoot = realpathSync(root);
   const inside = path => {
     const rel = relative(realRoot, canonicalArgument(path));
-    return rel && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel) ? rel : null;
+    if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) return null;
+    // The closure scanner cannot follow require(). Refuse both the supplied path
+    // and its canonical target until CommonJS closure coverage is available.
+    if ([path, rel].some(entry => extname(entry) === '.cjs')) {
+      throw new Error(`CommonJS runtime entry unsupported: ${rel}`);
+    }
+    return rel;
   };
   const out = new Set(DAEMON_ENTRY_MODULES);
   for (const entry of entries) {
@@ -59,16 +65,17 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     if (interpreter !== 'node' && interpreter !== 'nodejs') refuse(`interpreter ${interpreter}`);
     // Eval flags are node's own only before the script; after it they are script arguments.
     let scriptSeen = false;
-    // Only a script not preceded by a flag counts (a flag may take it as a value, e.g. --title /x.js).
+    // A known boolean flag consumes no value; unknown flags may consume a script-shaped value.
     for (const [index, arg] of args.entries()) {
-      if (isAbsolute(arg) && ['.mjs', '.js', '.cjs'].includes(extname(arg)) && !args[index - 1]?.startsWith('-')) scriptSeen = true;
+      if (isAbsolute(arg) && ['.mjs', '.js'].includes(extname(arg))
+        && (!args[index - 1]?.startsWith('-') || NODE_SAFE_FLAGS.has(args[index - 1]))) scriptSeen = true;
       if (!arg.startsWith('-')) {
         const path = resolve(realRoot, arg);
         // Canonicalize even missing paths: only ENOENT may mean absent evidence.
         const rel = inside(path);
         const file = statSync(path, { throwIfNoEntry: false });
         if (rel && file?.isFile()
-          && [path, rel].some(entry => !['.mjs', '.js', '.cjs'].includes(extname(entry)))) {
+          && [path, rel].some(entry => !['.mjs', '.js'].includes(extname(entry)))) {
           throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
         }
       }

@@ -229,7 +229,61 @@ it('refuses an unknown pass for this clone', () => {
   }) })).toThrow();
 });
 
-it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner', '.', '..',
+it.each([{ passes: [] }, { passes: ['--pass=branch-drift', '--pass=branch-drift'] },
+  { passes: ['--pass=branch-drift', '--pass=review'] }])(
+  'refuses pass-daemon with missing or duplicate pass flags: %j', ({ passes }) => {
+    const f = fixture();
+    writeFileSync(join(f.launchAgentsDir, 'com.we.pass.plist'), 'plist');
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+      stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, 'skills-src/conveyor/pass-daemon.mjs'), ...passes] }),
+    }) })).toThrow('LaunchAgents pass unknown');
+  });
+
+it('permits Program equal to ProgramArguments[0]', () => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.program.plist'), 'plist');
+  expect(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ Program: '/usr/bin/node', ProgramArguments: ['/usr/bin/node', join(f.root, 'worker.mjs')] }),
+  }) })).toContain('worker.mjs');
+});
+
+it.each(['--no-warnings', '--enable-source-maps', '--trace-warnings'])(
+  'permits script arguments after an entry preceded by safe boolean Node flag %s', flag => {
+    const f = fixture();
+    writeFileSync(join(f.launchAgentsDir, 'com.we.flags.plist'), 'plist');
+    for (const prefix of [['node'], ['/usr/bin/env', 'node']]) {
+      for (const argument of ['-e', '-pe', '--eval=1']) {
+        expect(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+          stdout: JSON.stringify({ ProgramArguments: [...prefix, flag, join(f.root, 'worker.mjs'), argument] }),
+        }) })).toContain('worker.mjs');
+      }
+    }
+  });
+
+it.each(['caller', 'LaunchAgent', 'relative LaunchAgent', 'aliased caller', 'aliased LaunchAgent', 'cjs alias to ESM'])(
+  'refuses a CommonJS runtime root from %s until require graphs are supported', source => {
+    const f = fixture();
+    writeFileSync(join(f.root, 'worker.cjs'), "require('./dep.js');\n");
+    writeFileSync(join(f.root, 'dep.js'), 'module.exports = 1;\n');
+    let entry = join(f.root, 'worker.cjs');
+    if (source === 'aliased LaunchAgent' || source === 'aliased caller') {
+      entry = join(f.root, 'worker.mjs');
+      symlinkSync('worker.cjs', entry);
+    }
+    if (source === 'cjs alias to ESM') {
+      writeFileSync(join(f.root, 'esm.mjs'), 'export {};\n');
+      rmSync(entry);
+      symlinkSync('esm.mjs', entry);
+    }
+    if (source === 'relative LaunchAgent') entry = 'worker.cjs';
+    const caller = source === 'caller' || source === 'aliased caller';
+    if (!caller) writeFileSync(join(f.launchAgentsDir, 'com.we.cjs.plist'), 'plist');
+    expect(() => cloneRuntimeEntries({ ...f, entries: caller ? [entry] : [],
+      run: () => ({ status: 0, stdout: JSON.stringify({ ProgramArguments: ['node', entry] }) }),
+    })).toThrow('CommonJS runtime entry unsupported');
+  });
+
+it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.ts', 'relative/runner', '.', '..',
   'daemon.mts', 'daemon.py', 'daemon.cts', 'daemon.tsx', '--import=./x', '--import=package',
   '--require=./x', '--loader=./x', '--experimental-loader=./x',
   '--import', '--require', '--loader', '--experimental-loader', '-r./relative-module.cjs', '-rpackage', '-r',
@@ -328,12 +382,12 @@ it('permits --repo=owner/repo on a LaunchAgent with an absolute entrypoint', () 
 
 it('permits node paths, absolute scripts, plain flags, pass names and numeric argument tokens', () => {
   const f = fixture();
-  for (const entry of ['worker.mjs', 'worker.js', 'worker.cjs']) writeFileSync(join(f.root, entry), 'export {};');
+  for (const entry of ['worker.mjs', 'worker.js']) writeFileSync(join(f.root, entry), 'export {};');
   writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
   expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
     stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '/usr/bin/node',
-      join(f.root, 'worker.mjs'), join(f.root, 'worker.js'), join(f.root, 'worker.cjs'), '-e', '--no-warnings', '--pass=NAME', '42'] }),
-  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs', 'worker.js', 'worker.cjs']));
+      join(f.root, 'worker.mjs'), join(f.root, 'worker.js'), '-e', '--no-warnings', '--pass=NAME', '42'] }),
+  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs', 'worker.js']));
 });
 
 it('refuses an extensionless in-clone LaunchAgent script entry instead of silently omitting it', () => {
