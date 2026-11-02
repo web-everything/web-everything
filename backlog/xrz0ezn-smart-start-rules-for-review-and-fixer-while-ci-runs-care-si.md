@@ -59,7 +59,7 @@ It is three weeks later and the change was a mistake. Most likely stories:
 ## Acceptance
 
 - [A1] **Executable** - vitest over we:scripts/lib/__tests__/review-timing.test.mjs and we:scripts/lib/__tests__/review-timing-settings.test.mjs fails before and passes after the build slice (new eligibility, shadow and startOnConfirmed cases). Decision turn only rules; build is a child slice.
-- [A2] **Must** - every new setting defaults off and resolves through the policy cascade; shadow logs the decision without acting.
+- [A2] **Must** - every new setting defaults off and resolves through the policy cascade; shadow logs the decision without acting. Planned test in we:scripts/lib/__tests__/review-timing-settings.test.mjs: "absent or disabled smart-start settings preserve existing behaviour", covering both absent settings and explicitly disabled settings.
 - [A3] **Must** - on error, missing or unreadable evidence, the gate refuses (waits for CI); docs, config and data diffs wait for CI.
 - [A4] **Must** - merge never happens before CI is green; a test proves it with CI pending.
 
@@ -73,7 +73,7 @@ It is three weeks later and the change was a mistake. Most likely stories:
 1. **Untrusted text** - n/a: inputs are typed settings, check states and diff counts, no free text parsed.
 2. **Truncated reads** - an unreadable or partial check list counts as "CI state unknown" and the review waits.
 3. **Shared state files** - verify ledger is read-only here; a torn record counts as absent. Shadow log is append-only and bounded.
-4. **Fail closed** - any missing input (care, size, kind, verify record, CI state) means wait for CI; the fixer push hold ends at the bound and pushes, so a fix is never stranded.
+4. **Fail closed** - any missing input (care, size, kind, verify record, CI state) means wait for CI; at the bound the fixer pushes only if the previous head's CI is complete; otherwise it keeps holding and escalates. It never pushes into a running CI.
 5. **Identity scoping** - the verify record and the confirmed findings must both name the exact head sha.
 6. **State over time** - a head move voids early-started review and early-started fixer; the push-hold timer is measured from first held time and is not reset by polls.
 7. **Who wrote it** - findings count as confirmed only when written by the review or red-team seats of this head; a gate-less or skipped ledger record is not trusted.
