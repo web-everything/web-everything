@@ -438,8 +438,8 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     deps.afterDrop?.(); // test seam: a process killed here leaves the intent for settlePendingDrops
     let after;
     try { after = tip(ref); } catch { after = undefined; } // an exception is an unreadable tip: restore
-    // A squash-merged branch is deleted on origin: its tip reads null, and the PR's recorded head is the proof.
-    const tipHeld = after === expectedTip || (proof.evidence?.refGone === true && after === null);
+    // A squash-merged branch is deleted on origin: its tip reads null, and the PR's recorded head is the proof, and a branch back on origin (even at that tip) restores the registration.
+    const tipHeld = proof.evidence?.refGone === true ? after === null : after === expectedTip;
     if (!tipHeld) {
       const restored = restoreRegistration(root, entry, env);
       clearPending(root, env, ref);
