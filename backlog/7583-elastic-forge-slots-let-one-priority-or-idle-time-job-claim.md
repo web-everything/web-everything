@@ -3,7 +3,8 @@ bornAs: xjba691
 kind: decision
 size: 8
 status: open
-scope: ["we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/forge-gate-options.mjs"]
+scope: ["we:docs/agent/platform-decisions.md"]
+scopeRationale: "The named executable checks are delivered by xzzsdv9 after policy completion; this card delivers only the statute amendment and its card update."
 dateOpened: "2026-11-01"
 tags: []
 ---
@@ -32,8 +33,11 @@ Mechanics (grant function, polling, starvation bound, timeout, grant contract, r
 
 ## Acceptance
 
-- [A1] **Executable** - the ratified policy is recorded and the amended statute text lands in we:docs/agent/platform-decisions.md; the build story xzzsdv9 is unblocked.
-- [A2] **Must refuse** - this card changes no code; elastic stays disabled until the build story's live proof.
+- [A1] **Executable** - completion requires only the recorded ratification and statute amendments 0–5 landed by this card in we:docs/agent/platform-decisions.md. That completion unblocks xzzsdv9; no build implementation or live proof is a prerequisite for this policy card. Planned check `policyCompletionHasStatuteAndUnblockedBuild` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` asserts that ratification plus the landed statute permits policy completion and makes xzzsdv9 eligible, even with the build and its live proof unfinished; missing ratification or statute text refuses completion. The dependency is one-way: xzzsdv9 is blocked by 7583, and 7583 is never blocked by xzzsdv9.
+- [A2] **Must refuse** - planned check `policyChangeTouchesNoRuntimeCode` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` asserts that the policy delivery changes only this card and we:docs/agent/platform-decisions.md, rejecting any runtime or runner change.
+- [A3] **Must refuse** - planned check `elasticDefaultStaysDisabledUntilProof` in `we:scripts/readiness/__tests__/elastic-forge-policy.test.mjs` resolves settings with the elastic configuration absent and separately with `enabled: false`; both must keep elastic disabled and grant exactly 1 slot. A proposed platform-preferences flip to true without the build story's attached live proof must be rejected. This future enablement gate does not block policy completion.
+
+These are planned executable checks, not tests implemented by this card-only split. The build story implements the test suite; running it is not a prerequisite for this policy card's ratification and statute delivery.
 
 ## Where this card amends the statute (for ratification)
 
@@ -66,15 +70,15 @@ Unchanged: clause 3 (waiting-for-capacity tick). Consistent with, not amended: "
 
 Operator chalbert, 2026-11-01 17:34 ET: "\"Ratify as is\" for xjba691."
 
-Statute amendments 0–5 to `#heavy-command-admission-queue` are ratified as written. The statute text change itself lands with the build (xzzsdv9).
+Statute amendments 0–5 to `#heavy-command-admission-queue` are ratified as written. This policy card (7583) owns and lands the we:docs/agent/platform-decisions.md amendment, including the text-location clarifications below, before xzzsdv9 is unblocked. The build story implements the landed rule and does not own its initial statute amendment.
 
-## Known gaps (close in build xzzsdv9)
+## Ratification clarifications (close here before statute delivery)
 
-Six second-screen flags, recorded at ratification and carried into the build story as acceptance items:
+Six second-screen flags were recorded at ratification. This card resolves the statute wording and anchors before landing it; xzzsdv9 tests that its implementation matches that landed wording:
 
 1. Values: `maxSlots` 3; idle = at least 4 of 8 slots free.
 2. Anchor amendment 0.
 3. Anchor amendment 3's second insertion.
 4. Amendment 3's unverifiable "as they already are".
 5. Amend the re-entrance "one slot, not two" note.
-6. Waiting-marker token semantics, to be decided in the build.
+6. Waiting-marker token semantics: the statute records one owner holding N tokens and reaping all N; the build implements and tests that rule.
