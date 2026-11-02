@@ -1,11 +1,12 @@
 import * as nodeFs from 'node:fs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { tmpdir as nodeTmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readRemoteReport, shouldConfirmRemoteRed, phaseRunLocation } from './verify-remote-routing.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
-import { killProcessTree } from './bounded-child.mjs';
+import { startTreeWatchdog } from './tree-watchdog.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
 const positive = n => Number.isSafeInteger(n) && n > 0;
@@ -39,11 +40,18 @@ export function splitVitestArgs(argv, count) {
   return { shards, flags };
 }
 
-export function inventoryVerdict(text, files, cwd = process.cwd()) {
+export function inventoryVerdict(text, files, cwd = process.cwd(), { receiptId } = {}) {
   try {
     const report = JSON.parse(text);
     if (!Array.isArray(report.testResults)) return 'INVENTORY-INCOMPLETE';
-    const results = new Map(report.testResults.map(r => [resolve(cwd, r.name), r]));
+    const results = new Map(report.testResults.map(r => {
+      // Forge runs the same repo at a different absolute root. Only rebase names
+      // belonging to the completed run, never arbitrary matching path suffixes.
+      const remote = /^\/srv\/forge-exec\/(?:slot-[1-9]\d*\/)?(r-[a-f0-9]{32})\/work\/(.+)$/.exec(r.name);
+      if (remote && remote[2].split('/').some(part => part === '.' || part === '..')) throw Error('invalid remote inventory path');
+      const name = remote && remote[1] === receiptId ? remote[2] : r.name;
+      return [resolve(cwd, name), r];
+    }));
     const assigned = files.map(f => results.get(resolve(cwd, f)));
     // A suite reported but skipped/pending is not execution evidence.
     if (assigned.some(r => !r || !['passed', 'failed'].includes(r.status)
@@ -53,16 +61,50 @@ export function inventoryVerdict(text, files, cwd = process.cwd()) {
   } catch { return 'INVENTORY-INCOMPLETE'; }
 }
 
+export const SHARD_REPORT_MAX_BYTES = 8 * 1024 * 1024;
+// Vitest's JSON reporter prints one JSON line. npm/install chatter may precede
+// it; missing, oversized or ambiguous inventory remains incomplete evidence.
+export function streamedInventory(stdout) {
+  if (Buffer.byteLength(stdout) > SHARD_REPORT_MAX_BYTES) return null;
+  const reports = [];
+  for (const line of stdout.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    try { if (Array.isArray(JSON.parse(line).testResults)) reports.push(line); } catch { return null; }
+  }
+  return reports.length === 1 ? reports[0] : null;
+}
+
 // Streams output without retaining an unbounded child buffer. A partial line is
 // bounded too, so even a child printing without newlines remains observable.
-export function executeShard({ command, args, env, cwd, timeoutMs, prefix, log }, {
-  spawn = nodeSpawn, killTree = killProcessTree, setTimer = setTimeout, clearTimer = clearTimeout,
+export function executeShard({ command, args, env, cwd, timeoutMs, prefix, log, report }, {
+  spawn = nodeSpawn, startWatchdog = startTreeWatchdog,
 } = {}) {
   return new Promise(resolveResult => {
-    let child, timer, settled = false;
-    const finish = result => { if (!settled) { settled = true; clearTimer(timer); resolveResult(result); } };
+    let child, watchdog, settled = false, bytes = 0, overflow = false;
+    const chunks = [];
+    const finish = async result => {
+      if (settled) return;
+      settled = true;
+      const timedOut = result.timedOut || watchdog?.fired();
+      if (timedOut) await watchdog?.settled();
+      await watchdog?.stop();
+      resolveResult({ ...(timedOut ? { exitCode: 124, timedOut: true } : result),
+        ...(report ? { reportText: overflow ? null : streamedInventory(Buffer.concat(chunks).toString('utf8')) } : {}) });
+    };
     try {
-      child = spawn(command, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      const marker = `WE_VERIFY_SHARD_RUN=${randomUUID()}`;
+      child = spawn(command, args, { cwd, env: { ...(env ?? process.env), WE_VERIFY_SHARD_RUN: marker.split('=')[1] },
+        detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stdout?.on('data', chunk => {
+        if (!report || overflow) return;
+        const buffer = Buffer.from(chunk);
+        bytes += buffer.length;
+        if (bytes > SHARD_REPORT_MAX_BYTES) {
+          overflow = true; chunks.length = 0;
+          log(`${prefix}inventory capture exceeded ${SHARD_REPORT_MAX_BYTES} bytes; rerun the affected selection\n`);
+        }
+        else chunks.push(buffer);
+      });
       for (const stream of [child.stdout, child.stderr]) {
         let pending = '';
         stream?.on('data', chunk => {
@@ -76,10 +118,12 @@ export function executeShard({ command, args, env, cwd, timeoutMs, prefix, log }
       }
       child.once('error', () => finish({ exitCode: 1 }));
       child.once('close', (exitCode, signal) => finish({ exitCode, signal }));
-      timer = setTimer(() => {
-        try { killTree(child.pid, 'SIGKILL', { orphansOfGroup: child.pid }); }
-        finally { finish({ exitCode: 124, timedOut: true }); }
-      }, timeoutMs);
+      // The child inherits the supervisor's group (including SIGKILL). The
+      // separate watchdog thread can kill only this shard even if output blocks
+      // the wrapper's event loop. Its unique marker also catches escaped workers.
+      if (Number.isInteger(child.pid)) watchdog = startWatchdog({ pid: child.pid, timeoutMs,
+        kill: { marker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter(Number.isInteger) },
+        onFire: () => finish({ exitCode: 124, timedOut: true }) });
     } catch { finish({ exitCode: 1 }); }
   });
 }
@@ -141,15 +185,21 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         async function attempt(local) {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${local ? 'local' : 'initial'}.json`);
-          const args = ['vitest', 'run', ...files, ...flags, '--reporter=default', '--reporter=json', `--outputFile=${report}`];
+          // Preserve the npx command class through admission. JSON travels on
+          // stdout through the existing SSH stream; no remote file is left behind
+          // for finish() to delete before the inventory can be retrieved.
+          const args = ['npx', 'vitest', 'run', ...files, ...flags, '--reporter=json'];
           const result = await execute({ command: local ? 'npx' : 'node',
-            args: local ? args : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
+            args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
             files, report, remoteReport, cwd, env: local ? { ...childEnv, [ADMISSION_HELD_ENV]: '1' } : childEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
           let inventory;
-          try { inventory = inventoryVerdict(fs.readFileSync(report, 'utf8'), files, cwd); }
+          try {
+            const location = local ? {} : phaseRunLocation(readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
+            inventory = inventoryVerdict(Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8'), files, cwd, location);
+          }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') return inventory;
           return result.exitCode === 0 && !result.signal && inventory === 'PASS' ? 'PASS' : 'FAIL';

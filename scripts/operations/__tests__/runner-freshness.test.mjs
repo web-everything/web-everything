@@ -67,6 +67,7 @@ describe('runner freshness policy', () => {
         "clear-claim",
         "clear-stuck-session",
         "close-items",
+        "codex-audit",
         "daemon-status",
         "dispatch-eligibility",
         "dispatch-lane",

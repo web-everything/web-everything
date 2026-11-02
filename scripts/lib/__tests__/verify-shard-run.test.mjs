@@ -1,7 +1,15 @@
+// @vitest-environment node
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli } from '../verify-shard-run.mjs';
+import { allowedCommand } from '../../readiness/forge-exec-run.mjs';
+import { runRemote } from '../../readiness/remote-exec.mjs';
+import { splitVitestArgs, runShards, executeShard, inventoryVerdict, parseShardCli, streamedInventory, SHARD_REPORT_MAX_BYTES } from '../verify-shard-run.mjs';
 
 describe('shard split', () => {
   it('balances deterministically, covers files once, and preserves flags including values', () => {
@@ -70,14 +78,17 @@ describe('process boundary and bounds', () => {
   it('kills the whole child tree at the deadline and prefixes both output streams', async () => {
     const child = new EventEmitter(); child.pid = 123;
     child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
-    let fire, killed, cleared = false; const lines = [];
+    let fire, watched, cleared = false; const lines = [];
     const pending = executeShard({ command: 'node', args: [], timeoutMs: 19, prefix: '[shard] ', log: l => lines.push(l) }, {
-      spawn: () => child, killTree: (...args) => { killed = args; },
-      setTimer: (fn, ms) => { expect(ms).toBe(19); fire = fn; return 7; }, clearTimer: () => { cleared = true; },
+      spawn: (_command, _args, options) => { expect(options.detached).toBe(false); return child; },
+      startWatchdog: options => { watched = options; fire = options.onFire; return {
+        fired: () => false, settled: async () => {}, stop: async () => { cleared = true; },
+      }; },
     });
     child.stdout.emit('data', 'failure details\n'); child.stderr.emit('data', 'stderr details\n'); fire();
     expect(await pending).toEqual({ exitCode: 124, timedOut: true });
-    expect(killed).toEqual([123, 'SIGKILL', { orphansOfGroup: 123 }]); expect(cleared).toBe(true);
+    expect(watched).toMatchObject({ pid: 123, timeoutMs: 19, kill: { marker: expect.stringMatching(/^WE_VERIFY_SHARD_RUN=/) } });
+    expect(watched.kill.orphansOfOwnGroup).toBeUndefined(); expect(cleared).toBe(true);
     expect(lines.join('')).toContain('[shard] failure details'); expect(lines.join('')).toContain('[shard] stderr details');
   });
   it('spawn errors are red, and malformed CLI input is refused', async () => {
@@ -151,4 +162,124 @@ describe('signal-killed shard (128+signal from heavy-admission)', () => {
     expect(await f.run()).toBe(137);
     expect(f.calls.length).toBe(1);
   });
+});
+
+describe('review regressions: Forge and supervisor wiring', () => {
+  it('sends the generated command through the real Forge allowlist and client', async () => {
+    const f = fixture();
+    await f.run();
+    const requested = f.calls[0].args.slice(3);
+    // Mirror admission's existing bare-vitest -> npm reconstruction.
+    const remoteArgv = requested[0] === 'vitest'
+      ? ['npm', 'run', 'test:unit', '--', ...requested.slice(2)] : requested;
+    expect(allowedCommand(remoteArgv)).toBe(true);
+    let transportCalls = 0;
+    const result = await runRemote({ argv: remoteArgv, exec: async () => {
+      transportCalls++; throw Error('offline probe: no transport');
+    } });
+    expect(result.reason).not.toBe('command-not-allowed');
+    expect(transportCalls).toBeGreaterThan(0);
+    expect(remoteArgv).toContain('--reporter=json');
+    expect(remoteArgv.some(a => a.startsWith('--outputFile'))).toBe(false);
+  });
+
+  it('retrieves a JSON inventory streamed alongside install logs, across chunk boundaries', async () => {
+    const reportText = JSON.stringify({ testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] });
+    const result = await executeShard({ command: process.execPath,
+      args: ['-e', `process.stdout.write('install log\\n'); const report=${JSON.stringify(reportText)}; process.stdout.write(report.slice(0, 20)); setTimeout(() => process.stdout.write(report.slice(20)+'\\n'), 5);`],
+      report: '/unused', timeoutMs: 5000, prefix: '', log: () => {} });
+    expect(result.exitCode).toBe(0);
+    expect(result.reportText).toBe(reportText);
+  });
+
+  it.each(['SIGTERM', 'SIGKILL'])('a real supervisor group %s reaches silent shards and descendants', async signal => {
+    const directory = mkdtempSync(resolve(tmpdir(), 'shard-cancel-'));
+    const pidFile = resolve(directory, 'pids');
+    const moduleUrl = pathToFileURL(resolve('scripts/lib/verify-shard-run.mjs')).href;
+    const childCode = `const {spawn}=require('node:child_process'); const grandchild=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid,grandchild.pid])); setInterval(()=>{},1000);`;
+    const wrapper = spawn(process.execPath, ['--input-type=module', '-e',
+      `import {executeShard} from ${JSON.stringify(moduleUrl)}; await executeShard({command:process.execPath,args:['-e',${JSON.stringify(childCode)}],timeoutMs:10000,prefix:'',log:()=>{}});`],
+    { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let errors = ''; wrapper.stderr.on('data', chunk => { errors += chunk; });
+    let pids = [];
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const waitFor = async predicate => { const end = Date.now() + 5000; while (Date.now() < end) { if (predicate()) return true; await new Promise(r => setTimeout(r, 20)); } return false; };
+    try {
+      expect(await waitFor(() => { try { pids = JSON.parse(readFileSync(pidFile, 'utf8')); return true; } catch { return false; } }), errors).toBe(true);
+      process.kill(-wrapper.pid, signal);
+      expect(await waitFor(() => pids.every(pid => !alive(pid)))).toBe(true);
+    } finally {
+      for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+      try { process.kill(-wrapper.pid, 'SIGKILL'); } catch {}
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  it('fails closed for ambiguous, absent, malformed and oversized stdout inventories', () => {
+    const report = JSON.stringify({ testResults: [] });
+    for (const text of ['', '{broken', `${report}\n${report}`, 'x'.repeat(SHARD_REPORT_MAX_BYTES + 1)])
+      expect(streamedInventory(text)).toBeNull();
+  });
+
+  it.each(['', 'slot-2/'])('rebases only the completed Forge run inventory (%s)', slot => {
+    const receiptId = `r-${'a'.repeat(32)}`;
+    const report = JSON.stringify({ testResults: [{ name: `/srv/forge-exec/${slot}${receiptId}/work/a.test.mjs`,
+      status: 'passed', assertionResults: [{ status: 'passed' }] }] });
+    expect(inventoryVerdict(report, ['a.test.mjs'], '/repo', { receiptId })).toBe('PASS');
+    expect(inventoryVerdict(report, ['a.test.mjs'], '/repo')).toBe('INVENTORY-INCOMPLETE');
+    expect(inventoryVerdict(report, ['a.test.mjs'], '/repo', { receiptId: `r-${'b'.repeat(32)}` })).toBe('INVENTORY-INCOMPLETE');
+  });
+
+  it.each(['remote', 'local-fallback'])('retrieves the streamed inventory end to end for %s', location => {
+    const receiptId = `r-${'c'.repeat(32)}`;
+    return runShards({ argv: ['npx', 'vitest', 'run', 'a.test.mjs'], shards: 1, parallel: 1, budgetMs: 10000 }, {
+      fs, discover: () => null, log: () => {},
+      execute: async options => {
+        const name = location === 'remote' ? `/srv/forge-exec/slot-2/${receiptId}/work/a.test.mjs` : resolve('a.test.mjs');
+        const text = JSON.stringify({ testResults: [{ name, status: 'passed', assertionResults: [{ status: 'passed' }] }] });
+        fs.writeFileSync(options.remoteReport, JSON.stringify({ location, receiptId, exitCode: 0 }) + '\n');
+        return executeShard({ ...options, command: process.execPath,
+          args: ['-e', `console.log('install output'); console.log(${JSON.stringify(text)});`] });
+      },
+    }).then(code => expect(code).toBe(0));
+  });
+
+  it('keeps the timeout active when the wrapper event loop is blocked', async () => {
+    const directory = mkdtempSync(resolve(tmpdir(), 'shard-watchdog-'));
+    const pidFile = resolve(directory, 'pid');
+    const heartbeatFile = resolve(directory, 'heartbeat');
+    const moduleUrl = pathToFileURL(resolve('scripts/lib/verify-shard-run.mjs')).href;
+    const childCode = `const fs=require('node:fs');let tick=0;setInterval(()=>fs.writeFileSync(${JSON.stringify(heartbeatFile)},String(++tick)),20);`;
+    const wrapper = spawn(process.execPath, ['--input-type=module', '-e',
+      `import {executeShard} from ${JSON.stringify(moduleUrl)};
+       import {writeFileSync} from 'node:fs';
+       executeShard({command:process.execPath,args:['-e',${JSON.stringify(childCode)}],timeoutMs:1500,prefix:'',log:()=>{}}, {
+         spawn:(...args)=>{const child=spawn(...args);writeFileSync(${JSON.stringify(pidFile)},String(child.pid));return child;}
+       });
+       import {spawn} from 'node:child_process';
+       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);`],
+    { detached: true, stdio: 'ignore' });
+    let pid;
+    try {
+      const end = Date.now() + 5000;
+      while (Date.now() < end) {
+        try { pid = Number(readFileSync(pidFile, 'utf8')); } catch {}
+        if (fs.existsSync(heartbeatFile)) break;
+        await new Promise(r => setTimeout(r, 20));
+      }
+      expect(pid).toBeGreaterThan(0);
+      expect(fs.existsSync(heartbeatFile)).toBe(true);
+      await new Promise(r => setTimeout(r, 2000));
+      const stoppedAt = readFileSync(heartbeatFile, 'utf8');
+      await new Promise(r => setTimeout(r, 300));
+      expect(readFileSync(heartbeatFile, 'utf8')).toBe(stoppedAt);
+      // The blocked wrapper cannot reap its killed child yet (kill(pid, 0)
+      // would also succeed for a zombie). Its independent heartbeat has stopped.
+      expect(() => process.kill(wrapper.pid, 0)).not.toThrow();
+    } finally {
+      if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+      try { process.kill(-wrapper.pid, 'SIGKILL'); } catch {}
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 10000);
 });
