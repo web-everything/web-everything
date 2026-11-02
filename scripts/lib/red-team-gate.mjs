@@ -87,7 +87,10 @@ export function parseRedTeamComment(body) {
     const s = SUB_RE.exec(line);
     if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
   }
-  return { pr: Number(m[1]), rev: m[2].toLowerCase(), findings, shapedLines };
+  const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
+  // Non-enumerable: it only keys the digest and must not change the parsed shape callers compare or serialise.
+  Object.defineProperty(parsed, 'shapedLines', { value: shapedLines, enumerable: false });
+  return parsed;
 }
 
 /**
