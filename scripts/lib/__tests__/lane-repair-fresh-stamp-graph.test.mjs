@@ -1,7 +1,7 @@
 // Live 2026-11-02: the fix daemon's clone had a corrupt commit-graph, the tick's repairCloneRefs returned early on a fresh
 // deep-check stamp (never healing), and the read-only rebuild job deferred the heal to that tick forever.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -45,5 +45,15 @@ describe('repairCloneRefs with a fresh deep-check stamp', () => {
     const r = repairCloneRefs(clone);
     expect(r.commitGraphHealed).toBeUndefined();
     expect(r.ok).toBe(true);
+  });
+
+  it('fails closed (ok:false, not stamped healthy) when the heal cannot run', () => {
+    repairCloneRefs(clone);
+    corruptGraph();
+    mkdirSync(join(clone, '.git', '.commit-graph-heal.lock')); // live foreign lock: the heal is denied
+    writeFileSync(join(clone, '.git', '.commit-graph-heal.lock', 'owner'), JSON.stringify({ pid: process.pid, at: Date.now() }));
+    const r = repairCloneRefs(clone, { log: () => {} });
+    expect(r.ok).toBe(false);
+    expect(r.problems.join(' ')).toContain('commit-graph still unreadable');
   });
 });

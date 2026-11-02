@@ -569,6 +569,9 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
   }
 
   const problems = diagnoseLane(dir).problems.filter((p) => !/ref\(s\) point at missing objects/.test(p));
+  // Fail closed: a graph that is still unreadable after the heal attempt (swallowed error, denied lock) is a problem,
+  // never a healthy clone to stamp.
+  if (standalone && graphBroken && !verifyCommitGraph(dir).ok) problems.push('commit-graph still unreadable after heal attempt');
   const pruneFailed = out.reported.some((r) => r.includes('prune failed'));
   if (!problems.length && !pruneFailed) {
     if (probeFailed) return out; // never stamp a clone whose ref probe failed
