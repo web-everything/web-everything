@@ -26,7 +26,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createFakeGithub } from '../helpers/fake-gh.mjs';
 import { createFakeClaude } from '../../../operations/__tests__/helpers/fake-claude.mjs';
@@ -267,6 +267,10 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
 
   // (h) sim clock
   const clock = createSimClock({ file: join(root, 'clock.json'), startOffsetMs: clockStartOffsetMs });
+  // Keep the guard injection outside the copied production tree. Scope it to
+  // this world's lane-pool entry; other children retain native Node loading.
+  const freshnessLoader = pathToFileURL(join(INVOKING_ROOT, 'scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs'));
+  freshnessLoader.searchParams.set('tool', pathToFileURL(join(simClone, 'scripts/lane-pool.mjs')).href);
 
   // (i) one merged env
   const ghBinDir = rawGh.env.PATH.split(':')[0];
@@ -299,7 +303,7 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // sharing module state or skipping any real tick.
     ...nodeRuntimeEnv(root),
     PATH: [ghBinDir, claudeBinDir, toolsDir].join(':'),
-    NODE_OPTIONS: clock.env.NODE_OPTIONS,
+    NODE_OPTIONS: `${clock.env.NODE_OPTIONS} --import=${freshnessLoader.href}`,
     HOME: home,
     SIM_CLOCK_FILE: clock.env.SIM_CLOCK_FILE,
     FAKE_GH_STORE: rawGh.env.FAKE_GH_STORE,

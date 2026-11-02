@@ -20,6 +20,12 @@ describe('simulator git and budget regressions', () => {
       lanes: 1,
       play: [(w) => {
         expect(readFileSync(join(w.simCloneRoot, checklistPath), 'utf8').trim()).toBe(checklist);
+        // A simulator owns its preload set: retain its clock and explicitly
+        // select its copied tool instead of inheriting the host's injection.
+        const preloads = w.env.NODE_OPTIONS.split(/\s+/).filter(option => option.startsWith('--import='));
+        expect(preloads.some(option => option.includes('fake-clock-preload.mjs'))).toBe(true);
+        const freshness = new URL(preloads.find(option => option.includes('lane-pool-freshness-loader.mjs')).slice('--import='.length));
+        expect(freshness.searchParams.get('tool')).toBe(pathToFileURL(join(w.simCloneRoot, 'scripts/lane-pool.mjs')).href);
         const policyModule = pathToFileURL(join(w.simCloneRoot, 'scripts/lib/build-policy.mjs')).href;
         const operationsModule = pathToFileURL(join(w.simCloneRoot, 'scripts/operations/run.mjs')).href;
         const brief = execFileSync(process.execPath, ['--input-type=module', '-e', `

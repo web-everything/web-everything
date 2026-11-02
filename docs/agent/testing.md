@@ -230,6 +230,12 @@ too: the transcript checker needs `skills-src/inspect-codex-transcript/` at the 
 `scripts/` for locus guards, move that dependency alongside it and retain access to `node_modules`.
 Remove the fixture during teardown.
 
+Native lane-pool fixtures inject the freshness check through the test-only
+`scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs` preload. Register its hook only
+when the child entry is the selected tool: hooks in unrelated children hide ESM reads from
+the runtime tracer. Simulator worlds must explicitly select their private tool through the
+preload URL's `tool` parameter while retaining the clock preload; production has no test-marker exemption.
+
 Post-run transcript diagnostics resolve their policy independently of the optional inspector dependency.
 Keep the named checker-import failure regression in `scripts/__tests__/codex-direct-task.test.mjs`:
 a completed run must still return its report, preserve the shipped warn default, and enforce fail in
