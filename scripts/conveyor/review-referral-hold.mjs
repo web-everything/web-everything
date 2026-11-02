@@ -15,7 +15,7 @@ import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { latestCheckNamed, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
-import { prCancelledRerunMarker } from './pr-cancelled-rerun.mjs';
+import { prCancelledRerunMarker, readLiveRequiredChecks, safeRequiredBase } from './pr-cancelled-rerun.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
@@ -354,7 +354,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
 }
 
 export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env),
-  requiredChecks, readRequiredChecks, defaultBranch = 'main' } = {}) {
+  readRequiredChecks, readBranchProtected, defaultBranch = 'main' } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
@@ -372,16 +372,14 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
     if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) {
       // Unknown, stale or partial requirements cannot prove recovery. Keep the normal hold and its
       // operator re-arm path when protection or current-head check evidence is unavailable.
-      let required;
-      try { required = requiredChecks ?? readRequiredChecks?.({ repo, branch: defaultBranch }); }
-      catch { /* Fail closed: a protection read failure must never release the hold. */ }
-      const checks = required?.checks;
-      const recovered = ['live', 'cache'].includes(required?.source) && Array.isArray(checks) && checks.length > 0 &&
-        checks.every(name => typeof name === 'string' && name.trim().length > 0 &&
-          !requiredCheckReadNeeded(pr, name) && (() => {
-            const row = latestCheckNamed(pr.statusCheckRollup, name);
-            return row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion);
-          })());
+      const checks = safeRequiredBase(pr.baseRefName) ? readLiveRequiredChecks({
+        repo, branch: pr.baseRefName, defaultBranch, readRequiredChecks, readBranchProtected,
+      }) : null;
+      const recovered = Array.isArray(checks) && checks.length > 0 &&
+        checks.every(name => !requiredCheckReadNeeded(pr, name) && (() => {
+          const row = latestCheckNamed(pr.statusCheckRollup, name);
+          return row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion);
+        })());
       if (recovered) return null;
     }
   }
@@ -617,18 +615,19 @@ function defaultReadComments({ repo, number }) {
 }
 
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
-  readComments = defaultReadComments, requiredChecks, readRequiredChecks = getRequiredStatusChecks,
+  readComments = defaultReadComments, readRequiredChecks = getRequiredStatusChecks, readBranchProtected,
   defaultBranch = 'main' } = {}) {
   const runs = readRuns();
-  // One fresh policy snapshot per enrichment, fetched only when a rerun could release a hold.
-  let requiredRead = false, requiredResult;
+  // One fresh snapshot per base, fetched only when a rerun could release a hold.
+  const requiredByBase = new Map();
   const readRequired = args => {
-    if (!requiredRead) {
-      requiredRead = true;
-      try { requiredResult = readRequiredChecks(args); }
-      catch { /* Unknown requirements keep every candidate held. */ }
+    if (!requiredByBase.has(args.branch)) {
+      let result;
+      try { result = readRequiredChecks(args); }
+      catch { /* Unknown requirements keep candidates on this base held. */ }
+      requiredByBase.set(args.branch, result);
     }
-    return requiredResult;
+    return requiredByBase.get(args.branch);
   };
   return prs.map(pr => {
     // List reads cap comments at 100; later operator events must reach both hold decisions.
@@ -644,7 +643,7 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now, env });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
     return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env, requiredChecks, readRequiredChecks: readRequired, defaultBranch })) };
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env, readRequiredChecks: readRequired, readBranchProtected, defaultBranch })) };
   });
 }
 

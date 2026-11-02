@@ -74,7 +74,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
-import { sweepPrCancelledRerun, formatPrCancelledReport, safeRequiredBase, HUNG_CI_COMMENT_MARKER } from './pr-cancelled-rerun.mjs';
+import { sweepPrCancelledRerun, formatPrCancelledReport, readLiveRequiredChecks, HUNG_CI_COMMENT_MARKER } from './pr-cancelled-rerun.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -1018,39 +1018,8 @@ export function defaultReadAttributedRequiredChecks({
   }
 }
 
-/** Unknown protection never proves that a stacked base is unprotected. */
-export function defaultReadBranchProtected({ repo, branch, exec = execFileSyncThrottled } = {}) {
-  try {
-    const out = exec('gh', ['api', `repos/${repo}/branches/${encodeURIComponent(branch)}`], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
-      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-    });
-    const result = JSON.parse(String(out));
-    return typeof result?.protected === 'boolean' ? result.protected : null;
-  } catch { return null; }
-}
-
-/** Required checks for cancelled-PR recovery: only a fresh live read can authorize a rerun. */
-export function readLiveRequiredChecks({
-  repo = null, branch = 'main', defaultBranch = 'main', readRequiredChecks = getRequiredStatusChecks,
-  readBranchProtected = defaultReadBranchProtected,
-} = {}) {
-  if (!repo || !safeRequiredBase(branch) || !safeRequiredBase(defaultBranch)) return null;
-  for (const base of branch === defaultBranch ? [branch] : [branch, defaultBranch]) {
-    try {
-      const result = readRequiredChecks({ repo, branch: base, ttlMs: 0 });
-      if (result?.source === 'live' && Array.isArray(result.checks) && result.checks.length &&
-        result.checks.every(check => typeof check === 'string' && check)) return result.checks;
-
-      // Empty fallback also covers denied protection reads: require independent proof.
-      if (base === defaultBranch || result?.source !== 'fallback' || !Array.isArray(result.checks) ||
-        result.checks.length !== 0 || readBranchProtected({ repo, branch: base }) !== false) return null;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
+// Compatibility exports: the hold and rerun pass share the same live reader.
+export { readLiveRequiredChecks, defaultReadBranchProtected } from './pr-cancelled-rerun.mjs';
 
 // ── MISSING-CI-RUN RECOVERY (we:backlog/xi4od2p-*.md, parent #4075/#3383) ──────────────────────────────────────
 // See `we:scripts/conveyor/main-red-recovery.mjs`'s own "MISSING-CI-RUN RECOVERY" section header for the full

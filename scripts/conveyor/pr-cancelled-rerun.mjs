@@ -4,6 +4,7 @@ import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
 import { isTrustedMarkerAuthor, countTrustedLeadingMarker } from '../lib/marker-authorship.mjs';
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 
 // Shared with the hung-recovery writer; keep readers and writer on one marker identity.
@@ -20,6 +21,40 @@ function hungRecoveryStopped(comments, headSha) {
 export const safeRequiredBase = name => typeof name === 'string' && name.length <= 255 &&
   /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(name) && !name.includes('..') &&
   name.split('/').every(part => part && !part.startsWith('.') && !part.endsWith('.') && !part.endsWith('.lock'));
+/** Unknown protection never proves that a stacked base is unprotected. */
+export function defaultReadBranchProtected({ repo, branch, exec = execFileSyncThrottled } = {}) {
+  try {
+    const out = exec('gh', ['api', `repos/${repo}/branches/${encodeURIComponent(branch)}`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    const result = JSON.parse(String(out));
+    return typeof result?.protected === 'boolean' ? result.protected : null;
+  } catch { return null; }
+}
+
+/** Required checks for cancelled-PR recovery and hold re-arm: only fresh live evidence authorizes recovery. */
+export function readLiveRequiredChecks({
+  repo = null, branch = 'main', defaultBranch = 'main', readRequiredChecks = getRequiredStatusChecks,
+  readBranchProtected = defaultReadBranchProtected,
+} = {}) {
+  if (!repo || !safeRequiredBase(branch) || !safeRequiredBase(defaultBranch)) return null;
+  for (const base of branch === defaultBranch ? [branch] : [branch, defaultBranch]) {
+    try {
+      const result = readRequiredChecks({ repo, branch: base, ttlMs: 0 });
+      if (result?.source === 'live' && Array.isArray(result.checks) && result.checks.length &&
+        result.checks.every(check => typeof check === 'string' && check.trim().length > 0)) return result.checks;
+
+      // Empty fallback also covers denied protection reads: require independent proof.
+      if (base === defaultBranch || result?.source !== 'fallback' || !Array.isArray(result.checks) ||
+        result.checks.length !== 0 || readBranchProtected({ repo, branch: base }) !== false) return null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export const prCancelledRerunMarker = (repo, pr, head) => `<!-- pr-ci-cancelled-rerun: ${repo}#${pr}@${head} -->`;
 
 const ioOptions = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
