@@ -197,7 +197,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
-import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate, readMergeQueueState } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
@@ -4820,9 +4820,16 @@ async function runCli() {
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options) {
-    const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
-      log: line => process.stderr.write(`${line}\n`) });
-    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
+    const repo = c.repo ?? localSlug;
+    const queue = readMergeQueueState({ repo, pr: c.num,
+      readJson: args => JSON.parse(execFileSync('gh', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
+    // A human retry already in the queue must reach the strategy's normal already-queued
+    // result and bookkeeping. Unreadable membership or a different head grants no bypass.
+    if (queue.inQueue !== true || queue.head !== sha) {
+      const guard = mqSameHeadGuard({ repo, pr: c.num, head: sha,
+        log: line => process.stderr.write(`${line}\n`) });
+      if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
+    }
     return mergeStrategy.enqueue(c, sha, options);
   }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.

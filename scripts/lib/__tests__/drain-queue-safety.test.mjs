@@ -27,6 +27,8 @@ describe('merge-queue same-head failure admission', () => {
     expect(decision.line).toMatch(detail);
   };
   const response = evidence => JSON.stringify({ data: { repository: { pullRequest: {
+    headRefOid: evidence.headCommit?.oid,
+    commits: { nodes: evidence.headCommit ? [{ commit: evidence.headCommit }] : [] },
     timelineItems: { nodes: evidence.nodes, pageInfo: { hasPreviousPage: evidence.hasPreviousPage } },
   } } } });
 
@@ -63,6 +65,72 @@ describe('merge-queue same-head failure admission', () => {
   it('compares reasons case-insensitively and trims whitespace', () => {
     expect(decide(timeline(removed(' FaIlEd_ChEcKs ')))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
   });
+  it.each([[head.toUpperCase(), head], [head, head.toUpperCase()]])('holds the same OID regardless of case (%s, %s)', (current, tested) => {
+    expect(decideMqSameHead({ pr, head: current, timeline: timeline(removed('failed_checks', tested)) }).hold).toBe(true);
+  });
+  it('new heads release all strictly older unbound removals (reason, binding and time variants)', () => {
+    for (const reason of ['merge_conflict', 'branch_protection_failure', 'invalid_merge_commit', 'failed_checks', 'future_failure']) {
+      for (const beforeCommit of [null, { parents: { nodes: [] } }, { parents: { nodes: [{ oid: prior }] } }]) {
+        for (const seconds of [1, 60, 3600, 86400]) {
+          const pushedDate = new Date(Date.parse(removed().createdAt) + seconds * 1000).toISOString();
+          const oldRemovals = [0, 1, 60].map(age => ({ ...removed(reason), beforeCommit,
+            createdAt: new Date(Date.parse(removed().createdAt) - age * 1000).toISOString() }));
+          const evidence = { ...timeline(...oldRemovals), headCommit: { oid: head, pushedDate } };
+          expect(decide(evidence), JSON.stringify({ reason, beforeCommit, seconds })).toEqual(released);
+        }
+      }
+    }
+  });
+  it('a rebase to a different head releases old unbound removals even without a commit push date', () => {
+    const rebase = { __typename: 'HeadRefForcePushedEvent', createdAt: '2026-11-02T12:00:00Z',
+      beforeCommit: { oid: prior }, afterCommit: { oid: head.toUpperCase() } };
+    const old = { ...removed('merge_conflict'), beforeCommit: null };
+    expect(decide(timeline(old, rebase))).toEqual(released);
+    expect(decide(timeline(rebase, old))).toEqual(released);
+    expectHold(decide(timeline(old, { ...rebase, beforeCommit: { oid: head } })), /no commit binding/);
+    expectHold(decide(timeline(old, { ...rebase, afterCommit: { oid: prior } })), /no commit binding/);
+    expectHold(decide(timeline(old, { ...rebase, createdAt: old.createdAt })), /no commit binding/);
+    expectHold(decide(timeline(old, { ...rebase, createdAt: null })), /no commit binding/);
+    expectHold(decide(timeline(removed(), rebase)), /failed_checks/);
+  });
+  it.each([
+    { oid: prior, pushedDate: '2026-11-02T12:00:00Z' },
+    { oid: head, pushedDate: null },
+    { oid: head, pushedDate: 'invalid' },
+    { oid: head, pushedDate: '2026-11-01T11:59:59Z' },
+    { oid: head, pushedDate: '2026-11-01T12:00:00Z' },
+  ])('unbound removal holds without proof the current head was first pushed later (%j)', headCommit => {
+    expectHold(decide({ ...timeline({ ...removed(), beforeCommit: null }), headCommit }), /no commit binding/);
+  });
+  it('a missing removal date cannot release an unbound removal', () => {
+    expectHold(decide({ ...timeline({ ...removed(), beforeCommit: null, createdAt: null }),
+      headCommit: { oid: head, pushedDate: '2026-11-02T12:00:00Z' } }), /no commit binding/);
+  });
+  it('a new unbound failure still holds after older unbound failures are released', () => {
+    const old = { ...removed('merge_conflict'), beforeCommit: null };
+    const current = { ...removed('branch_protection_failure'), beforeCommit: null, createdAt: '2026-11-02T13:00:00Z' };
+    for (const nodes of [[old, current], [current, old]]) {
+      expectHold(decide({ ...timeline(...nodes), headCommit: { oid: head, pushedDate: '2026-11-02T12:00:00Z' } }), /no commit binding/);
+    }
+  });
+  it('a current-head binding still holds even with a newer push timestamp', () => {
+    expectHold(decide({ ...timeline(removed()), headCommit: { oid: head, pushedDate: '2026-11-02T12:00:00Z' } }), /failed_checks/);
+  });
+  it('returning to an older head cannot erase its earlier unbound failure', () => {
+    const old = { ...removed('merge_conflict'), beforeCommit: null };
+    const away = {__typename:'HeadRefForcePushedEvent',createdAt:'2026-11-01T13:00:00Z',
+      beforeCommit:{oid:head},afterCommit:{oid:prior}};
+    const back = {__typename:'HeadRefForcePushedEvent',createdAt:'2026-11-02T12:00:00Z',
+      beforeCommit:{oid:prior},afterCommit:{oid:head}};
+    expectHold(decide({ ...timeline(old, away, back),
+      headCommit:{oid:head,pushedDate:'2026-11-02T12:00:00Z'} }), /no commit binding/);
+    // Even without a recorded departure, an earlier push date prevents treating this as a new OID.
+    expectHold(decide({ ...timeline(old, back),
+      headCommit:{oid:head,pushedDate:'2026-11-01T11:00:00Z'} }), /no commit binding/);
+  });
+  it.each(['not-a-hash', 'a'.repeat(39), 'a'.repeat(41), ` ${head} `])('an invalid head %s holds even with no removals', head => {
+    expect(decideMqSameHead({ pr, head, timeline: timeline() }).hold).toBe(true);
+  });
   it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
     expectHold(decide(evidence), /unreadable/i);
   });
@@ -90,18 +158,36 @@ describe('merge-queue same-head failure admission', () => {
     const query = args.find(arg => arg.startsWith('query='));
     expect(query).toBeDefined();
     const compact = query.replace(/\s+/g, '');
-    expect(compact).toMatch(/timelineItems\(last:100,itemTypes:\[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT\]\)/);
+    expect(compact).toMatch(/timelineItems\(last:100,itemTypes:\[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,HEAD_REF_FORCE_PUSHED_EVENT\]\)/);
+    expect(compact).toContain('...onHeadRefForcePushedEvent{createdAtbeforeCommit{oid}afterCommit{oid}}');
     expect(compact).toContain('pageInfo{hasPreviousPage}');
     expect(compact).toMatch(/\.\.\.onRemovedFromMergeQueueEvent\{/);
     expect(compact).toContain('beforeCommit{oidparents(first:2){nodes{oid}}}');
     expect(compact).toContain('reason');
     expect(compact).toContain('createdAt');
+    expect(compact).toContain('headRefOid');
+    expect(compact).toContain('commits(last:1){nodes{commit{oidpushedDate}}}');
     // Arguments may use GraphQL variables or literals, but must identify this repo and PR.
     expect(args.join(' ')).toContain('fixture');
     expect(args.join(' ')).toContain('drain');
     expect(args.join(' ')).toContain('6215');
     expect(opts.encoding).toBe('utf8');
     expect(opts.timeout).toBeGreaterThan(0);
+  });
+  it('mqSameHeadGuard releases an old unbound removal using the pinned current-head push date from the same read', () => {
+    const evidence = { ...timeline({ ...removed('merge_conflict'), beforeCommit: null }),
+      headCommit: { oid: head.toUpperCase(), pushedDate: '2026-11-02T12:00:00Z' } };
+    const exec = vi.fn(() => response(evidence)), log = vi.fn();
+    expect(readMqTimeline({ repo, pr, exec })).toEqual(evidence);
+    expect(mqSameHeadGuard({ repo, pr, head, exec, log })).toEqual(released);
+    expect(log).not.toHaveBeenCalled();
+  });
+  it('readMqTimeline does not use a commit date when the live head differs', () => {
+    const payload = JSON.parse(response({ ...timeline({ ...removed(), beforeCommit: null }),
+      headCommit: { oid: prior, pushedDate: '2026-11-02T12:00:00Z' } }));
+    payload.data.repository.pullRequest.headRefOid = head;
+    const exec = vi.fn(() => JSON.stringify(payload));
+    expectHold(mqSameHeadGuard({ repo, pr, head, exec }), /no commit binding/);
   });
   it.each([
     ['exec throws', () => { throw new Error('offline'); }],

@@ -6,24 +6,48 @@ import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
+const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null;
+const mqTime = value => typeof value === 'string' ? Date.parse(value) : NaN;
+
 /** Only the merge-group commit's second parent identifies the tested PR head. */
 export function decideMqSameHead({ pr, head, timeline } = {}) {
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
   const hold = reason => ({ hold: true, line: `mq-same-head-failed: #${safe(pr)} head ${safe(head)} — ${reason}` });
   if (typeof head !== 'string' || !head.trim()) return hold('missing head');
+  const currentHead = mqOid(head);
+  if (!currentHead) return hold('invalid head');
   if (timeline?.error || !Array.isArray(timeline?.nodes) || typeof timeline.hasPreviousPage !== 'boolean')
     return hold('unreadable merge-queue timeline; inspect timeline before retrying');
   if (timeline.hasPreviousPage)
     return hold('incomplete timeline at 100-event cap; operator must inspect full history before retrying');
+  // A removal with no merge-group commit cannot bind a head. A later, head-bound push
+  // can date it to an older head; missing dates retain the operator-inspection hold.
+  // Force-push events cover rebases even when GitHub supplies no commit pushedDate.
+  let headSince = mqOid(timeline.headCommit?.oid) === currentHead ? mqTime(timeline.headCommit.pushedDate) : NaN;
+  let returnedHead = false;
   for (const event of timeline.nodes) {
-    if (event?.__typename === 'AddedToMergeQueueEvent') continue;
+    if (event?.__typename !== 'HeadRefForcePushedEvent') continue;
+    const before = mqOid(event.beforeCommit?.oid), after = mqOid(event.afterCommit?.oid);
+    const at = mqTime(event.createdAt);
+    if (before === currentHead && after && after !== currentHead) returnedHead = true;
+    if (before && before !== currentHead && after === currentHead && Number.isFinite(at))
+      headSince = Number.isFinite(headSince) ? Math.min(headSince, at) : at;
+  }
+  // Returning to an old OID is not evidence that its earlier unbound failures were on
+  // another head. Use the earliest known introduction, and retain ambiguity on returns.
+  if (returnedHead) headSince = NaN;
+  for (const event of timeline.nodes) {
+    if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
     const reason = typeof event.reason === 'string' ? event.reason.trim().toLowerCase() : '';
     if (reason === 'manual' || reason === 'merged') continue;
-    const testedHead = event.beforeCommit?.parents?.nodes?.[1]?.oid;
-    if (typeof testedHead !== 'string' || !/^[a-f0-9]{40}$/i.test(testedHead))
+    const testedHead = mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid);
+    if (!testedHead) {
+      const removedAt = mqTime(event.createdAt);
+      if (Number.isFinite(removedAt) && Number.isFinite(headSince) && removedAt < headSince) continue;
       return hold('no commit binding for merge-queue removal; inspect timeline before retrying');
-    if (testedHead === head) return hold(safe(reason) || 'unknown removal reason');
+    }
+    if (testedHead === currentHead) return hold(safe(reason) || 'unknown removal reason');
   }
   return { hold: false, line: null };
 }
@@ -36,11 +60,13 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
       return { error: 'invalid repository or PR' };
     const query = `query($owner:String!,$name:String!,$number:Int!){
       repository(owner:$owner,name:$name){pullRequest(number:$number){
-        timelineItems(last:100,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT]){
+        headRefOid commits(last:1){nodes{commit{oid pushedDate}}}
+        timelineItems(last:100,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,HEAD_REF_FORCE_PUSHED_EVENT]){
           pageInfo{hasPreviousPage}
           nodes{__typename
             ... on RemovedFromMergeQueueEvent{reason createdAt beforeCommit{oid parents(first:2){nodes{oid}}}}
             ... on AddedToMergeQueueEvent{createdAt}
+            ... on HeadRefForcePushedEvent{createdAt beforeCommit{oid} afterCommit{oid}}
           }
         }
       }}
@@ -48,10 +74,13 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
     const result = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`,
       '-f', `owner=${parts[0]}`, '-f', `name=${parts[1]}`, '-F', `number=${pr}`],
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
-    const items = result?.data?.repository?.pullRequest?.timelineItems;
+    const pullRequest = result?.data?.repository?.pullRequest;
+    const items = pullRequest?.timelineItems;
     if (result?.errors?.length || !Array.isArray(items?.nodes) || typeof items?.pageInfo?.hasPreviousPage !== 'boolean')
       return { error: 'unreadable merge-queue timeline' };
-    return { nodes: items.nodes, hasPreviousPage: items.pageInfo.hasPreviousPage };
+    const commit = pullRequest?.commits?.nodes?.[0]?.commit;
+    const headCommit = mqOid(pullRequest?.headRefOid) && mqOid(pullRequest.headRefOid) === mqOid(commit?.oid) ? commit : null;
+    return { nodes: items.nodes, hasPreviousPage: items.pageInfo.hasPreviousPage, ...(headCommit ? { headCommit } : {}) };
   } catch {
     return { error: 'unreadable merge-queue timeline' };
   }
