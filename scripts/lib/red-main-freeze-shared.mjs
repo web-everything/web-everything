@@ -346,13 +346,13 @@ export function dequeueUnpublishedFreeze({ repo, branch, dryRun = false, exec = 
 const TIMEOUT_RE = /ETIMEDOUT|timed out/i;
 const LKG_RETRIES = 2;
 const LKG_BACKOFF_MS = 1000;
-const LKG_DEFAULT_MINUTES = 5;
-const LKG_MAX_MINUTES = 15; // upper bound: a setting can never turn the cache into a long freeze bypass
+const LKG_DEFAULT_MINUTES = 2;
+const LKG_MAX_MINUTES = 2; // upper bound: a setting can never turn the cache into a long freeze bypass
 const lkgMemory = new Map(); // per drain process; the disk copy below survives a restart
 
 /**
  * Drain-side shared-freeze read: a git TIMEOUT is retried (at most {@link LKG_RETRIES}, backoff) and, if it persists, a FRESH
- * last-known-good "not frozen" read (younger than WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES, default 5; 0 = off) stands in.
+ * last-known-good "not frozen" read (younger than WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES, default 2, capped at 2; 0 = off) stands in.
  * Any successful read wins and replaces the cache; a cached "frozen", a stale/missing cache, or a non-timeout error stay fail-closed.
  */
 function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {

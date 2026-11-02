@@ -875,7 +875,7 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     const m = mk();
     expect((await run(() => T, m)).s.frozen).toBe(true);
     await run(() => CLEAR, m);
-    expect((await run(() => T, { ...m, t: m.t + 6 * 60_000 })).s.frozen).toBe(true);
+    expect((await run(() => T, { ...m, t: m.t + 3 * 60_000 })).s.frozen).toBe(true);
   });
   it('a successful read always overrides the cache; non-timeout errors never use it', async () => {
     const m = mk(); await run(() => CLEAR, m);
@@ -889,5 +889,9 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     await run(() => CLEAR, m, { key: 'k' });
     writeFileSync(m.file, JSON.stringify({ key: 'k', at: m.t + 500, result: FROZEN }));
     expect((await run(() => T, { ...m, t: m.t + 1000 }, { key: 'k' })).s.frozen).toBe(true);
+  });
+  it('a configured window above the 2-minute cap is clamped', async () => {
+    const m = mk(); await run(() => CLEAR, m);
+    expect((await run(() => T, { ...m, t: m.t + 3 * 60_000 }, { minutes: 30 })).s.frozen).toBe(true);
   });
 });
