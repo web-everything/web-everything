@@ -3707,6 +3707,15 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason(`git -C ${CLONE} remote -v`, { cwd: LANE, roots })).toBeNull();
   });
 
+  it('DENIES attached -c, --repo= fetch, and GIT_DIR exported in an earlier segment', () => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -cremote.origin.fetch=+main:refs/heads/other fetch origin`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --repo=origin main:refs/heads/other`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    expect(decide(`export GIT_DIR=${CLONE}/.git GIT_WORK_TREE=${CLONE} && git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`GIT_DIR=${CLONE}/.git; git clean -fd`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide('export FOO=1 && git reset --hard', ctx)).toBeNull();
+  });
+
   it('reaches reason()/decide() — the real enforcement points, not just the pure predicate', () => {
     const ctx = { cwd: CLONE, daemonCloneRoots: roots };
     expect(reason('git reset --hard origin/main', ctx)).toMatch(/DAEMON CLONE/);

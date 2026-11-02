@@ -2015,8 +2015,13 @@ const GIT_FETCH_VALUE_FLAGS = new Set([
  *  `--update-head-ok` / `-u` (the flag exists only to let fetch overwrite the checked-out branch) and for any
  *  refspec whose destination is a local branch: under `refs/heads/`, or unqualified (git resolves a bare
  *  destination to a branch). Destinations under `refs/remotes/`, `refs/tags/` and other `refs/` namespaces,
- *  and refspecs with no destination (`fetch origin main`), are fine. The first positional is the remote and
- *  is skipped (an scp-style `git@host:org/repo` there is not a refspec). */
+ *  and refspecs with no destination (`fetch origin main`), are fine. Every positional is checked
+ *  (so `fetch --repo=origin main:refs/heads/x` is caught) except remote URLs, which are not refspecs. */
+/** A remote URL (`https://…`, `ssh://…`, scp-style `git@host:org/repo`), never a refspec. */
+function isRemoteUrl(t) {
+  return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(t) || /^[^\s:@\/]+@[^:\s]+:/.test(t);
+}
+
 function fetchWritesLocalBranch(segment) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const dstIsBranch = (spec) => {
@@ -2029,11 +2034,11 @@ function fetchWritesLocalBranch(segment) {
   let i = 1;
   while (i < toks.length && toks[i] !== 'fetch') {
     // `git -c remote.<n>.fetch=<refspec> fetch <n>` injects a configured refspec
-    const cfg = toks[i] === '-c' ? /^remote\.[^=]*\.fetch=(.*)$/s.exec(toks[i + 1] || '') : null;
+    const kv = toks[i] === '-c' ? toks[i + 1] || '' : toks[i].startsWith('-c') ? toks[i].slice(2) : '';
+    const cfg = /^remote\.[^=]*\.fetch=(.*)$/s.exec(kv);
     if (cfg && dstIsBranch(cfg[1])) return true;
     i += GIT_VALUE_FLAGS.has(toks[i]) ? 2 : 1;
   }
-  let remoteSeen = false;
   for (i += 1; i < toks.length; i++) {
     const t = toks[i];
     if (t === '--update-head-ok' || t === '-u' || /^-[a-z]*u[a-z]*$/.test(t)) return true;
@@ -2041,7 +2046,7 @@ function fetchWritesLocalBranch(segment) {
     if (t.startsWith('--refmap=')) { if (dstIsBranch(t.slice(9))) return true; continue; }
     if (GIT_FETCH_VALUE_FLAGS.has(t)) { i += 1; continue; }
     if (t.startsWith('-')) continue;
-    if (!remoteSeen) { remoteSeen = true; continue; }
+    if (isRemoteUrl(t)) continue;
     if (dstIsBranch(t)) return true;
   }
   return false;
@@ -2096,13 +2101,16 @@ function daemonCloneWriteMessage(dir) {
  * cwd naming one explicitly (`cp x /…/wev-review-daemon/y` run from a lane) are caught. Falls back to the
  * ambient-cwd test alone when no operand is found at all (e.g. a bare `rm` with nothing to resolve).
  */
-export function daemonCloneWriteReason(segment, { cwd = null, roots = [] } = {}) {
+export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [] } = {}) {
   if (!roots.length) return null;
   const s = String(segment || '');
   const sub = gitSubcommand(s);
   if (sub) {
     if (!GIT_STATE_SUBCOMMANDS.has(sub)) return null; // a read op (log/status/diff/show/…) — never denied
-    const hit = gitTargetDirs(s, cwd).find((d) => isDaemonCloneRealpath(d, roots));
+    // `envDirs`: GIT_DIR / GIT_WORK_TREE values assigned/exported by ANY segment of the same command (decide()
+    // collects them), since `export GIT_DIR=<clone>/.git && git reset --hard` splits across segments.
+    const targets = gitTargetDirs(s, cwd).concat(envDirs.map((p) => resolve(cwd || '.', p)));
+    const hit = targets.find((d) => isDaemonCloneRealpath(d, roots));
     if (!hit) return null;
     // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
     // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
@@ -3867,7 +3875,7 @@ function globMatch(tokens, s) {
   return t === tokens.length;
 }
 
-export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
+export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], gitEnvDirs = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
 
@@ -3879,7 +3887,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // #xpt9fvd — a write targeting a DAEMON CLONE. Checked early and unconditionally (independent of
   // `primaryCwd`/lease context — a daemon clone is neither a primary checkout nor an ordinary leased lane):
   // see `daemonCloneWriteReason`'s own doc for the two shapes it catches and the one it deliberately does not.
-  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots });
+  const daemonWrite = daemonCloneWriteReason(s, { cwd, roots: daemonCloneRoots, envDirs: gitEnvDirs });
   if (daemonWrite) return daemonWrite;
 
   // xpnhz4o — a bare full-suite run. Before the raw-heavy arm so a bare `vitest run` gets THIS message (which
@@ -4781,8 +4789,17 @@ export function decide(command, ctx = {}) {
   // quote-CORRECT (r1–r4) lost the coverage the quote-BLIND split had by accident, because a nested
   // command stopped being torn open at its separators. Recursing into those positions restores it
   // structurally — and covers the `bash -c "npm run build"` shape base never caught at all.
-  for (const seg of withNestedCommands(segments, command)) {
-    const r = reason(seg, ctx);
+  const nested = withNestedCommands(segments, command);
+  const gitEnvDirs = [];
+  for (const seg of nested) {
+    for (const t of shellTokens(String(seg || '')).filter((x) => !x.op)) {
+      const m = /^(?:GIT_DIR|GIT_WORK_TREE)=(.+)$/s.exec(t.text);
+      if (m) gitEnvDirs.push(m[1]);
+    }
+  }
+  const rctx = gitEnvDirs.length ? { ...ctx, gitEnvDirs } : ctx;
+  for (const seg of nested) {
+    const r = reason(seg, rctx);
     if (r) return r;
   }
   return null;
