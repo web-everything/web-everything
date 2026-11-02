@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
-  liveResultGateState,
+  liveResultGateState, redTeamResultId,
 } from '../red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -328,5 +328,36 @@ describe('readRedTeamDisposition: only a human operator releases a break held at
       expect(heldBy(clear({ author: { login: 'chalbert[bot]' } }))).toBe(1);
     });
     it('posted by a human operator releases it', () => expect(heldBy(clear(human))).toBe(0));
+  });
+});
+
+describe('redTeamResultId digest covers every finding-shaped line (card 43)', () => {
+  const ID = redTeamResultId(parseRedTeamComment(BODY_4722));
+  const added = (line) => `${BODY_4722}\n${line}`;
+  const FORGED = [
+    '   3. [**confirmed**] (edge-case, broken) `a.mjs:1` — an indented extra finding the strict parser skips.',
+    '3. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case.',
+    '3. [**confirmed**] edge-case broken — malformed, no parenthesised class.',
+  ];
+  it('unchanged findings keep the same digest', () => {
+    expect(redTeamResultId(parseRedTeamComment(BODY_4722))).toBe(ID);
+    expect(redTeamResultId(parseRedTeamComment(`${BODY_4722}\nunrelated prose line`))).toBe(ID);
+  });
+  for (const line of FORGED) {
+    it(`an appended finding-shaped line changes the digest: ${line.slice(0, 40)}`, () => {
+      expect(redTeamResultId(parseRedTeamComment(added(line)))).not.toBe(ID);
+    });
+  }
+  it('a removed or changed finding changes the digest', () => {
+    expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace('Restarting with', 'Restarted with')))).not.toBe(ID);
+    expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace(/\n2\. \[\*\*confirmed.*?\n/s, '\n')))).not.toBe(ID);
+  });
+  it('a sent-back record keyed on the old digest does not apply to the edited result (fails closed)', () => {
+    const record = bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.SENT_BACK, ID));
+    const before = liveResultGateState([bot(BODY_4722), record], 4722, HEAD);
+    expect(before.outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(true);
+    const after = liveResultGateState([bot(added(FORGED[0])), record], 4722, HEAD);
+    expect(after.resultId).not.toBe(ID);
+    expect(after.outcomes.has(GATE_OUTCOMES.SENT_BACK)).toBe(false);
   });
 });
