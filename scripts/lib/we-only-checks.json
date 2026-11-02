@@ -22,5 +22,9 @@
   {
     "file": "scripts/operations/land-advance-io.mjs",
     "reason": "The three flagged `gh`/reconcile-pass reads (a fix plan's PR-diff fallback scope, its itemless-PR diff-path resolution, and the cached reconcile-pass read) are all reached only for a `we` PR: `planFixesFromReconcile` is called only after `p.repo !== 'we'` is refused upstream as `unsupported-repo`, and `readReconcile`'s own docblock (`reconcile-pass owns what a PR is owed`) already states it is read once for `we`, the only repo it plans today."
+  },
+  {
+    "file": "scripts/lib/lane-alternates.mjs",
+    "reason": "Names the one GitHub redirect pair (chalbert/web-everything to web-everything/web-everything) so a lane remote and the org URL read as the same repository; deliberately WE-specific and never widened to other repos."
   }
 ]
