@@ -532,7 +532,9 @@ it('flags a ledger row that names the PR head but is malformed as unreadable evi
 });
 
 // Evidence must never depend on how stale the caller's checkout is (R372).
-const freshFacts = { generatedAt: at, prs: [{ number: 7, evidenceErrors: [] }] };
+
+const goodPr = { number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
+const freshFacts = { generatedAt: at, prs: [goodPr] };
 const staleOptions = extra => options({ gh: vi.fn(() => { throw new Error('stale checkout must not read locally'); }), ...extra });
 
 it('reads facts from a fresh origin/main when the checkout is behind', () => {
@@ -575,7 +577,6 @@ it('does not trust an inherited env flag: freshness is still checked and fails c
   expect(gh).not.toHaveBeenCalled();
 });
 
-const goodPr = { number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
 it.each([
   ['an empty prs list shape is allowed', [], true],
   ['a PR with no fields', [{}], false],
