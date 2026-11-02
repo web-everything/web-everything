@@ -69,3 +69,32 @@ it.each(['broken', '[]', '["o/r","one"]'])('rejects an invalid composite cursor 
   expect(response.status).toBe(400);
   expect(await response.json()).toEqual({ error: 'invalid PR row cursor' });
 });
+
+it('treats a tied numeric 0 and string "0" sequence as one tie so no open PR is omitted', async () => {
+  const { storage, read } = fixture(0);
+  for (const [n, seq] of [[1, 0], [2, '0'], [3, 0], [4, '0']]) storage.putProjection('prs', JSON.stringify(['o/r', n]), {
+    repo: 'o/r', number: n, seq, state: 'open', fields: { state: 1 }, updatedAt: T });
+  const seen = [];
+  let page = await read('?prsLimit=1'); seen.push(...page.prs.map((r) => r.number));
+  while (page.prsMore) {
+    page = await read(`?prsLimit=1&prsCursor=${page.prsCursor}&prsAfter=${encodeURIComponent(page.prsAfter)}`);
+    seen.push(...page.prs.map((r) => r.number));
+  }
+  expect(seen.sort()).toEqual([1, 2, 3, 4]);
+});
+
+it.each([1.5, 'x', '-1', '1.5', true])('rejects a stored non-integer sequence %j with a 400', async (seq) => {
+  const { storage, log } = fixture(0);
+  storage.putProjection('prs', JSON.stringify(['o/r', 1]), { repo: 'o/r', number: 1, seq, state: 'open', fields: { state: 1 }, updatedAt: T });
+  const response = await handleRequest(new Request('https://test/prs', { headers: { authorization: 'Bearer read' } }),
+    { PR_EVENTS_READ_TOKEN: 'read' }, { getLog: () => log, now: () => T });
+  expect(response.status).toBe(400);
+});
+
+it.each(['{broken', '[]', '"s"', '7'])('fails closed on invalid coverage metadata %s', (raw) => {
+  const { log, storage } = fixture(2);
+  storage.setMeta('coverage', raw);
+  const body = log.readPrs(null, 10, T);
+  expect(body.repos['o/r'].coverage).toBe(false);
+  expect(body.truncated.malformed).toBeGreaterThan(0);
+});

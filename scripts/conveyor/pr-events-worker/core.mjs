@@ -377,7 +377,9 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     readPrs(cursor, limit, now = Date.now(), { prsCursor = null, prsLimit = DEFAULT_PAGE_LIMIT, prsAfter = null } = {}) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
       const truncated = { rows: 0, repos: {}, malformed: 0, unattributed: 0 }, incomplete = new Set();
-      const after = Number.isSafeInteger(prsCursor) && prsCursor >= 0 ? prsCursor : null;
+      // One canonical integer form: a safe integer or its canonical digit string; anything else is rejected, never coerced to a tie-breaker.
+      const toSeq = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : typeof v === 'string' && /^\d+$/.test(v) && Number.isSafeInteger(Number(v)) ? Number(v) : null);
+      const after = toSeq(prsCursor);
       let key = null;
       if (prsAfter != null) {
         try { key = JSON.parse(prsAfter); } catch { /* Rejected below, never restart an unreadable cursor. */ }
@@ -389,13 +391,22 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         truncated.malformed += 1;
         if (isRepo(row?.repo)) incomplete.add(row.repo.toLowerCase());
         else truncated.unattributed += 1;
+      }).map((r) => {
+        const seq = toSeq(r.seq);
+        if (seq == null) throw new RangeError('invalid PR row cursor');
+        return seq === r.seq ? r : { ...r, seq };
       }).sort((a, b) => a.seq - b.seq || comparePrKey(a, b));
       // Stable identity within a sequence survives earlier rows advancing during concurrent deliveries.
       const eligible = projected.filter((r) => after == null || r.seq > after ||
         (r.seq === after && key && comparePrKey(r, { repo: key[0], number: key[1] }) > 0));
       const rows = eligible.slice(0, pageSize);
-      let coverage;
-      try { coverage = JSON.parse(storage.getMeta('coverage')); } catch { /* Legacy metadata is not evidence. */ }
+      // Absent metadata is legacy; present-but-unreadable metadata is not evidence and fails every repo closed.
+      let coverage, badCoverage = false;
+      const rawCoverage = storage.getMeta('coverage');
+      if (rawCoverage != null) {
+        try { coverage = JSON.parse(rawCoverage); } catch { /* Counted below. */ }
+        if (!isObject(coverage)) { badCoverage = true; truncated.malformed += 1; }
+      }
       const response = { ...envelope, prs: [], stateCursor: envelope.head, repos: repoFreshness(storage, envelope.head, now),
         coverage: { ...(isObject(coverage) ? coverage : {}), bootstrap: storage.listProjection('bootstrap') }, truncated,
         prsCursor: rows.at(-1)?.seq ?? after ?? 0, prsMore: eligible.length > rows.length, prsAfter: null };
@@ -411,7 +422,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         response.repos[repo].coverage = false;
       };
       incomplete.forEach(failClosed);
-      if (truncated.unattributed) Object.keys(response.repos).forEach(failClosed);
+      if (truncated.unattributed || badCoverage) Object.keys(response.repos).forEach(failClosed);
       const drop = (row) => {
         truncated.rows += 1;
         truncated.repos[row.repo] = (truncated.repos[row.repo] || 0) + 1;
