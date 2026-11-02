@@ -3648,6 +3648,53 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason('cp fix.md notes.md', { cwd: CLONE, roots: [] })).toBeNull();
   });
 
+  it('DENIES repeated -C that lands in a daemon clone (effective dir applied in order, like git)', () => {
+    expect(daemonCloneWriteReason('git -C /ws -C wev-review-daemon reset --hard', { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C "/ws" -C 'wev-review-daemon' commit -am x`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    // a later absolute -C wins; a later ../ walks back out
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -C ${LANE} reset --hard`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -C .. status`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('DENIES --git-dir / --work-tree pointing into a daemon clone (both spellings)', () => {
+    expect(daemonCloneWriteReason(`git --git-dir=${CLONE}/.git reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --git-dir ${CLONE}/.git commit -am x`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --work-tree=${CLONE} checkout .`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --work-tree ${CLONE} checkout .`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --git-dir=${CLONE}/.git log`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('does not mistake a subcommand option -C for a global -C', () => {
+    expect(daemonCloneWriteReason('git commit -C HEAD', { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} commit -C HEAD`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS legitimate repeated -C and read-only git on a daemon clone', () => {
+    expect(daemonCloneWriteReason(`git -C ${LANE} -C sub status`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git -C /ws/wev-review-daemon log', { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git -C /ws -C wev-review-daemon rev-parse HEAD', { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('DENIES fetch that writes a local branch or uses --update-head-ok in a daemon clone', () => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --update-head-ok origin main:main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch origin +main:refs/heads/main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch origin 'refs/heads/*:refs/heads/*'`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git fetch -u origin main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git fetch --update-head-ok origin main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git fetch --depth 1 origin main:main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C /ws -C wev-review-daemon fetch origin main:main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS fetch in a daemon clone that writes no branch, and any fetch elsewhere', () => {
+    expect(daemonCloneWriteReason('git fetch origin main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch origin', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch --depth 1 origin main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch origin main:refs/remotes/origin/main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch origin +refs/heads/*:refs/remotes/origin/*', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch git@github.com:org/repo.git main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch --update-head-ok origin main:main', { cwd: LANE, roots })).toBeNull();
+  });
+
   it('reaches reason()/decide() — the real enforcement points, not just the pure predicate', () => {
     const ctx = { cwd: CLONE, daemonCloneRoots: roots };
     expect(reason('git reset --hard origin/main', ctx)).toMatch(/DAEMON CLONE/);
