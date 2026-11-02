@@ -1015,17 +1015,18 @@ export function defaultTipCarriesChange(tipBlob, baseBlob, prBlob, { exec = exec
  *   - `D`: the path must be absent from `mainRef`'s tip — a SUCCESSFUL read that finds nothing, never a failed
  *     one — and the deleting commit must sit in the window.
  *   - anything else (`T`ype change, unmerged, unknown): unsupported → `null`, never a guess.
- * Any failed git read makes the whole answer `null`. Bounded below by the PR's own merge-base: see
+ * Any failed git read makes the whole answer `null`, or throws with `strictRead` so callers can
+ * distinguish unreadable containment from a successful non-match. Bounded below by the PR's own merge-base: see
  * `we:scripts/lib/already-landed-content.mjs`'s header for why a match that predates it (a deliberate
  * restoration) is never delivery.
  * @param {{status:string, path:string, dstMode:string, dstBlob:string}} change
  * @param {{base:string, mainRef:string, exec?:Function, windowLimit?:number, readEntryAt?:Function,
- *   tipCarriesChange?:Function}} o
+ *   tipCarriesChange?:Function, strictRead?:boolean}} o
  * @returns {string|null}
  */
 export function defaultFindMatchingMainCommit(change, {
   base, mainRef, exec = execFileSync, windowLimit = ALREADY_LANDED_LOG_WINDOW, readEntryAt = defaultReadEntryAt,
-  tipCarriesChange = defaultTipCarriesChange,
+  tipCarriesChange = defaultTipCarriesChange, strictRead = false,
 } = {}) {
   const path = change?.path;
   if (!path || !isSha(base) || !mainRef) return null;
@@ -1056,7 +1057,8 @@ export function defaultFindMatchingMainCommit(change, {
       if (e && e.blob === change.dstBlob && e.mode === change.dstMode) return c;
     }
     return null;
-  } catch {
+  } catch (error) {
+    if (strictRead) throw error;
     return null;
   }
 }
@@ -1090,6 +1092,8 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * Pays the extra reads for PRs carrying `merge-status:conflicting`, plus default-base PRs whose
  * mergeable is CONFLICTING or mergeStateStatus is DIRTY. The latter population can dispatch a
  * conflicting-rebase without the label, and needs the same containment guard before repair.
+ * Unreadable evidence marks only that unlabelled population `containmentUnreadable`, so the
+ * planner holds repair until a later pass can read it. Label-based repair retains its existing behavior.
  * Other PRs cost no extra IO; `defaultReadPrs` already fetched all eligibility fields.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
@@ -1106,20 +1110,30 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
   return list.map((pr) => {
     const defaultBaseConflict = pr?.baseRefName === defaultBranch
       && (pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY');
-    if (!hasLabel(pr?.labels, CONFLICT_LABEL) && !defaultBaseConflict) return pr;
+    const labelled = hasLabel(pr?.labels, CONFLICT_LABEL);
+    if (!labelled && !defaultBaseConflict) return pr;
+    const unreadable = () => labelled ? pr : { ...pr, containmentUnreadable: true };
     const prNumber = Number(pr?.number);
     const headSha = pr?.headRefOid;
-    if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return pr;
+    if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return unreadable();
 
-    fetchRef(prNumber, {});
-    const base = readMergeBase(headSha, mainRef, {});
-    if (!base) return pr; // no common history to bound the search by — never guess
-    const changes = readChanges(base, headSha, {});
-    if (!changes.length) return pr; // could not even read the diff — never guess containment from nothing
+    let fileMatches;
+    try {
+      fetchRef(prNumber, {});
+      const base = readMergeBase(headSha, mainRef, {});
+      if (!base) return unreadable(); // no common history to bound the search
+      const changes = readChanges(base, headSha, {});
+      if (!changes.length) return unreadable(); // no readable diff to establish containment
 
-    const fileMatches = changes.map((change) => ({
-      file: change.path, matchedCommit: findMatchingCommit(change, { base, mainRef }),
-    }));
+      fileMatches = changes.map((change) => ({
+        file: change.path, matchedCommit: findMatchingCommit(change, {
+          base, mainRef, ...(!labelled ? { strictRead: true } : {}),
+        }),
+      }));
+    } catch (error) {
+      if (labelled) throw error;
+      return unreadable();
+    }
 
     const verdict = computeAlreadyLandedVerdict(fileMatches);
     if (!verdict.landed) return pr;
