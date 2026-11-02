@@ -49,6 +49,9 @@ export function redTeamMarker(pr, rev) {
 
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
+// Any line that LOOKS like a finding (leading whitespace, any case, loose punctuation). Used only to key the result
+// digest, never to decide what blocks: a line the strict FINDING_RE skips still changes the digest.
+const FINDING_SHAPED_RE = /^\s*\d+\s*[.)]\s*\[\s*(?:\*\*)?\s*(?:confirmed|not confirmed|unverifiable)\b/i;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.
@@ -66,7 +69,9 @@ export function parseRedTeamComment(body) {
   const m = MARKER_RE.exec(text);
   if (!m) return null;
   const findings = [];
+  const shapedLines = [];
   for (const line of text.split('\n')) {
+    if (FINDING_SHAPED_RE.test(line)) shapedLines.push(line.trim());
     const f = FINDING_RE.exec(line);
     if (f) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
@@ -82,7 +87,7 @@ export function parseRedTeamComment(body) {
     const s = SUB_RE.exec(line);
     if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
   }
-  return { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
+  return { pr: Number(m[1]), rev: m[2].toLowerCase(), findings, shapedLines };
 }
 
 /**
@@ -94,7 +99,10 @@ const RESULT_ID_FIELDS = ['index', 'confirmed', 'recheckOutcome', 'category', 'i
 export function redTeamResultId(parsed) {
   if (!parsed) return null;
   const findings = (parsed.findings ?? []).map(f => RESULT_ID_FIELDS.map(k => f?.[k] ?? null));
-  return createHash('sha256').update(JSON.stringify(['v1', findings])).digest('hex').slice(0, 16);
+  // v2: also covers every finding-shaped line (even ones the strict parser skips), so an appended, indented or malformed
+  // finding re-keys the result. Records keyed on a v1 id no longer match: they are ignored (fail closed).
+  const shaped = Array.isArray(parsed.shapedLines) ? parsed.shapedLines : [];
+  return createHash('sha256').update(JSON.stringify(['v2', findings, shaped])).digest('hex').slice(0, 16);
 }
 
 /**
