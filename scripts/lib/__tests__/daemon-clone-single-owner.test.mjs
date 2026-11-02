@@ -105,8 +105,13 @@ describe('durable rebuild request', () => {
     request();
     expect(readRequest({ nowMs: T + 101 })).toBeNull();
   });
-  it.each(['{broken', '{}', 'null'])('corrupt or incomplete request %s is null', (contents) => {
-    request(); writeFileSync(onlyFile(), contents);
+  it.each(['{broken', '{}', 'null', '{"at":0}'])('corrupt or incomplete request %s remains synthetically pending', (contents) => {
+    request();
+    const file = onlyFile();
+    writeFileSync(file, contents);
+    const pending = readRequest();
+    expect(pending).toEqual({ corrupt: true, id: `corrupt:${fs.statSync(file).mtimeMs}` });
+    lock.clearRebuildRequest(root, { lockRoot, id: pending.id });
     expect(readRequest()).toBeNull();
   });
   it('publishes via tmp + rename in the lock base, keeping the old complete request until publication', () => {
@@ -154,6 +159,57 @@ describe('withSelfSync single owner', () => {
     const w = wrapper('review-daemon.mjs');
     await expect(w.synced.tickOnce()).resolves.toBe('ticked');
     expect(w.rebuild.mock.calls).toEqual([[]]);
+  });
+  it('corrupt requests get hard priority, one alert, and acknowledgement by synthetic ID', async () => {
+    request(); writeFileSync(onlyFile(), '{broken');
+    const pending = readRequest();
+    const alert = vi.fn();
+    const log = { error: vi.fn() };
+    const w = wrapper('review-daemon.mjs', { log, tickProgress: { alert, markTickDone: vi.fn() } });
+    await w.synced.tickOnce();
+    expect(w.rebuild).toHaveBeenCalledWith({ lockOpts: { hardClaim: true } });
+    expect(readRequest()).toBeNull();
+    const ack = JSON.parse(readFileSync(join(lock.cloneLockDirs(root, lockRoot).base, 'rebuild-request-ack.json'), 'utf8'));
+    expect(ack.id).toBe(pending.id);
+    await w.synced.tickOnce();
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledWith('rebuild-request-corrupt', expect.objectContaining({ id: pending.id }), T);
+    expect(log.error.mock.calls.filter(([line]) => line.includes('ALERT rebuild-request-corrupt'))).toHaveLength(1);
+    expect(w.rebuild.mock.calls[1]).toEqual([]);
+  });
+  it('unreadable existing request remains pending and can be acknowledged by its synthetic ID', async () => {
+    request();
+    const file = onlyFile();
+    fs.rmSync(file); fs.mkdirSync(file); // EISDIR is reliable even under root.
+    const pending = readRequest();
+    expect(pending).toEqual({ corrupt: true, id: `corrupt:${fs.statSync(file).mtimeMs}` });
+    const w = wrapper('review-daemon.mjs');
+    await w.synced.tickOnce();
+    expect(w.rebuild).toHaveBeenCalledWith({ lockOpts: { hardClaim: true } });
+    expect(readRequest()).toBeNull();
+  });
+  it('refused rebuild retains a corrupt request and deduplicates its alert across retries', async () => {
+    request(); writeFileSync(onlyFile(), '{}');
+    const pending = readRequest();
+    const alert = vi.fn();
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'tick-in-progress' }));
+    const w = wrapper('review-daemon.mjs', { rebuild, tickProgress: { alert, markTickDone: vi.fn() } });
+    await w.synced.tickOnce(); await w.synced.tickOnce();
+    expect(readRequest()).toEqual(pending);
+    expect(rebuild.mock.calls).toEqual([[{ lockOpts: { hardClaim: true } }], [{ lockOpts: { hardClaim: true } }]]);
+    expect(alert).toHaveBeenCalledTimes(1);
+  });
+  it('expired request is dropped without hard priority and alerts once across ticks', async () => {
+    request(T - 30 * 60_000 - 1);
+    const alert = vi.fn();
+    const log = { error: vi.fn() };
+    const w = wrapper('review-daemon.mjs', { log, tickProgress: { alert, markTickDone: vi.fn() } });
+    await w.synced.tickOnce(); await w.synced.tickOnce();
+    expect(readRequest()).toBeNull();
+    expect(w.rebuild.mock.calls).toEqual([[], []]);
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledWith('rebuild-request-expired', expect.any(Object), T);
+    expect(log.error.mock.calls.filter(([line]) => line.includes('ALERT rebuild-request-expired'))).toHaveLength(1);
   });
   it('owner requests a hard claim for a live request only until it is consumed', async () => {
     request();

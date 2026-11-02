@@ -8,7 +8,8 @@
  * Single-owner heartbeat + rebuild requests coordinate shared clones; bounded hard claims drain readers
  * without skip-cap/older-reader backoff. Expiry restores ordinary fairness. Request acknowledgement
  * records the consumed ID separately, so acknowledgement never deletes a concurrent publication.
- * Soft-to-hard promotion is disabled unless an explicit positive environment threshold enables it.
+ * Soft-to-hard promotion is opt-in; persistent per-writer cooldowns preserve a reader gap.
+ * Unreadable reader state blocks moves; corrupt request evidence stays pending until acknowledged.
  *
  * WHY a reader/writer lock, not just the per-path lock `scripts/readiness/file-locks.mjs` already has: that
  * module guards individual FILES inside the shared central checkout so two lanes never edit the same path.
@@ -140,20 +141,29 @@ export function writeRebuildRequest(root, { by = null, reason, ref, nowMs = Date
   atomicSidecar(sidecar(root, 'rebuild-request.json', lockRoot), rec);
   return rec;
 }
-export function readRebuildRequest(root, { nowMs = Date.now(), ttlMs, lockRoot, env = process.env } = {}) {
+export function readRebuildRequest(root, { nowMs = Date.now(), ttlMs, lockRoot, env = process.env, onExpired, onCorrupt } = {}) {
   const ttl = ttlMs ?? positiveSetting('WE_DAEMON_REBUILD_REQUEST_TTL_MS', 30 * 60_000, env);
-  try {
-    const rec = JSON.parse(readFileSync(sidecar(root, 'rebuild-request.json', lockRoot), 'utf8'));
-    if (!rec || typeof rec.at !== 'number' || !Number.isFinite(rec.at) || !Number.isFinite(ttl) || !(ttl > 0)
-      || nowMs - rec.at >= ttl || typeof rec.reason !== 'string' || typeof rec.ref !== 'string'
-      || !(rec.by === null || typeof rec.by === 'string') || typeof rec.id !== 'string' || !rec.id) return null;
-    // Unknown acknowledgement evidence never suppresses a valid request: replay is safe, lost work is not.
+  const file = sidecar(root, 'rebuild-request.json', lockRoot);
+  let stamp;
+  try { stamp = fs.statSync(file).mtimeMs; }
+  catch (error) { if (error.code === 'ENOENT') return null; }
+  let rec;
+  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; }
+  const valid = rec && typeof rec.at === 'number' && Number.isFinite(rec.at) && Number.isFinite(ttl) && ttl > 0
+    && typeof rec.reason === 'string' && typeof rec.ref === 'string' && (rec.by === null || typeof rec.by === 'string')
+    && typeof rec.id === 'string' && !!rec.id;
+  if (!valid) rec = { corrupt: true, id: `corrupt:${Number.isFinite(stamp) ? stamp : 'unknown'}` };
+  // An unknown generation cannot be safely suppressed by a previous acknowledgement.
+  if (valid || Number.isFinite(stamp)) {
     try {
       const ack = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request-ack.json', lockRoot), 'utf8'));
       if (ack?.id === rec.id) return null;
-    } catch { /* absent/unreadable/corrupt acknowledgement: leave the request visible */ }
-    return rec;
-  } catch { return null; }
+    } catch { /* unknown acknowledgement evidence leaves work visible */ }
+  }
+  if (rec.corrupt) { onCorrupt?.(rec); return rec; }
+  if (nowMs - rec.at >= ttl) { onExpired?.(rec); return null; }
+  return rec;
 }
 /** Acknowledge a specific immutable request ID, never unlink the publication path. With no ID, capture
  * the current ID first (legacy clear API). Publication may race any subsequent operation safely because a
@@ -161,13 +171,44 @@ export function readRebuildRequest(root, { nowMs = Date.now(), ttlMs, lockRoot, 
  * Keep just one acknowledgement sidecar, so storage stays bounded across repeated publications. */
 export function clearRebuildRequest(root, { lockRoot, id } = {}) {
   if (id === undefined) {
-    try { id = JSON.parse(fs.readFileSync(sidecar(root, 'rebuild-request.json', lockRoot), 'utf8'))?.id; }
-    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    id = readRebuildRequest(root, { lockRoot })?.id;
   }
   if (typeof id !== 'string' || !id) return; // incomplete evidence cannot acknowledge anything
   atomicSidecar(sidecar(root, 'rebuild-request-ack.json', lockRoot), { id });
 }
 function hardWindowMs() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', 15 * 60_000); }
+function hardCooldownMs() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', 2 * 60_000); }
+function hardHistoryFile(starvedRoot, owner) { return join(starvedRoot, '..', 'hard-writers', `${lockIdFor(owner)}.json`); }
+function readHardHistory(starvedRoot, owner, claim) {
+  try {
+    const h = JSON.parse(fs.readFileSync(hardHistoryFile(starvedRoot, owner), 'utf8'));
+    return h && Number.isFinite(h.since) && Number.isFinite(h.until) && Number.isFinite(h.coolUntil)
+      && h.since < h.until && h.until < h.coolUntil ? h : { unknown: true };
+  } catch (error) { if (error.code !== 'ENOENT') return { unknown: true }; }
+  const since = claim?.hard === true ? Date.parse(claim.since || '') : NaN;
+  return Number.isFinite(since) ? { since, until: since + hardWindowMs(), coolUntil: since + hardWindowMs() + hardCooldownMs() } : null;
+}
+function hardCooldownActive(starvedRoot, owner, nowMs, claim) {
+  const h = readHardHistory(starvedRoot, owner, claim);
+  return !!h && (h.unknown || (nowMs >= h.until && nowMs < h.coolUntil));
+}
+function armHardClaim(starvedRoot, owner, nowMs, claim) {
+  let h = readHardHistory(starvedRoot, owner, claim);
+  if (h?.unknown) return null;
+  if (h && nowMs >= h.until && nowMs < h.coolUntil) {
+    // Migrate older claims before softening them, or the next attempt could forget their hard window.
+    atomicSidecar(hardHistoryFile(starvedRoot, owner), h);
+    return null;
+  }
+  if (!h || nowMs >= h.coolUntil) {
+    // An existing soft claim keeps its original age on first promotion; a completed cooldown starts a new window.
+    const priorSince = !h && claim ? Date.parse(claim.since || '') : NaN;
+    const since = Number.isFinite(priorSince) && nowMs - priorSince < hardWindowMs() ? priorSince : nowMs;
+    h = { since, until: since + hardWindowMs(), coolUntil: since + hardWindowMs() + hardCooldownMs() };
+  }
+  atomicSidecar(hardHistoryFile(starvedRoot, owner), h);
+  return h.since;
+}
 function hardAfter() {
   const key = 'WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER';
   const raw = process.env[key];
@@ -356,7 +397,9 @@ function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe
   if (live && prev.owner !== owner) {
     if (!hardClaim || claimIsHard(prev, nowMs)) return prev;
     // A job may promote its spawner's soft claim; changing pids never restarts the bounded window.
-    const promoted = { ...prev, hard: true, lastAt: new Date(nowMs).toISOString() };
+    const since = armHardClaim(starvedRoot, prev.owner, nowMs, prev);
+    if (since === null) return prev;
+    const promoted = { ...prev, hard: true, since: new Date(since).toISOString(), lastAt: new Date(nowMs).toISOString() };
     atomicSidecar(writerClaimFile(starvedRoot), promoted);
     return promoted;
   }
@@ -366,7 +409,10 @@ function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe
     owner, pid, count: (same ? prev.count : 0) + (gaveUp ? 1 : 0), heldBy: heldBy ?? null, since: same ? prev.since : nowIso, lastAt: nowIso,
   };
   const promoteAfter = hardAfter();
-  rec.hard = hardClaim || (same && prev.hard === true) || (promoteAfter > 0 && rec.count >= promoteAfter);
+  const wantsHard = hardClaim || (same && prev.hard === true) || (promoteAfter > 0 && rec.count >= promoteAfter);
+  const hardSince = wantsHard ? armHardClaim(starvedRoot, owner, nowMs, same ? prev : null) : null;
+  rec.hard = hardSince !== null;
+  if (rec.hard) rec.since = new Date(hardSince).toISOString();
   try {
     const file = writerClaimFile(starvedRoot);
     mkdirSync(join(file, '..'), { recursive: true });
@@ -393,7 +439,18 @@ function writerClaimIsLive(rec, nowMs, ttlMs, probe) {
 function findPriorityWriter(starvedRoot, { owner, nowMs, ttlMs, probe, after }) {
   const rec = readWriterClaim(starvedRoot);
   if (!rec) return null;
-  if (!writerClaimIsLive(rec, nowMs, ttlMs, probe)) { clearWriterClaim(starvedRoot); return null; }
+  if (!writerClaimIsLive(rec, nowMs, ttlMs, probe)) {
+    if (rec.hard === true) {
+      const h = readHardHistory(starvedRoot, rec.owner, rec);
+      if (h && !h.unknown && nowMs < h.coolUntil) {
+        try { atomicSidecar(hardHistoryFile(starvedRoot, rec.owner), h); }
+        catch { return null; } // leave the old claim as evidence if its history could not be persisted
+      }
+    }
+    clearWriterClaim(starvedRoot);
+    return null;
+  }
+  if (hardCooldownActive(starvedRoot, rec.owner, nowMs, rec)) return null;
   if (rec.owner === owner || (!claimIsHard(rec, nowMs) && (!(after > 0) || rec.count < after))) return null;
   return rec;
 }
@@ -431,32 +488,29 @@ export function defaultProbePidLiveness(entry) {
  *  provably `dead` — the two-tier floor the file header describes. `null`/missing entries are never live. */
 function entryIsLive(entry, nowMs, leaseMinutes, probe) {
   if (!entry) return false;
+  if (entry.unreadable) return true; // no trustworthy identity or lease evidence to reclaim
   if (isLeaseExpired(entry, nowMs, leaseMinutes)) return false;
   if (probe(entry) === 'dead') return false;
   return true;
 }
 
-/** List every reader entry currently on disk under `readersRoot`. NOT a new lock primitive — `readLockEntry`
- *  only knows how to read ONE already-known path's entry, and readers need to be enumerated (their key is the
- *  owner string, unknown to us up front), so this walks the directory and reuses {@link parseLockEntry} to
- *  interpret each `lock.json` it finds. A missing/unreadable/corrupt entry is skipped, never thrown. */
+/** Unknown reader evidence is a blocker, including the mkdir/write gap. Only a provably absent
+ * readers root or disappeared reader directory means no reader; valid leases retain normal reclamation. */
 function listReaderEntries(readersRoot) {
   let names;
-  try {
-    names = readdirSync(readersRoot);
-  } catch {
-    return [];
+  try { names = fs.readdirSync(readersRoot); }
+  catch (error) {
+    return error.code === 'ENOENT' ? [] : [{ owner: '<unreadable-readers>', unreadable: true, error: error.code ?? 'read-failed' }];
   }
   const out = [];
   for (const name of names) {
-    let text;
-    try {
-      text = readFileSync(join(readersRoot, name, 'lock.json'), 'utf8');
-    } catch {
-      continue;
-    }
-    const entry = parseLockEntry(text);
-    if (entry) out.push(entry);
+    const dir = join(readersRoot, name);
+    let entry;
+    try { entry = parseLockEntry(fs.readFileSync(join(dir, 'lock.json'), 'utf8')); } catch { /* inspect existence below */ }
+    if (entry && Number.isFinite(Date.parse(entry.heartbeatAt))) { out.push(entry); continue; }
+    try { fs.statSync(dir); }
+    catch (error) { if (error.code === 'ENOENT') continue; }
+    out.push({ owner: `<unreadable-reader:${name}>`, unreadable: true });
   }
   return out;
 }
@@ -596,7 +650,7 @@ export async function acquireWrite(root, opts = {}) {
   const ownClaim = () => {
     if (!(writerPriorityAfter > 0)) return null;
     const c = readWriterClaim(starvedRoot);
-    return c && c.owner === owner && c.count >= writerPriorityAfter
+    return c && !hardCooldownActive(starvedRoot, c.owner, now(), c) && c.owner === owner && c.count >= writerPriorityAfter
       && writerClaimIsLive(c, now(), writerClaimTtlMs, probe) ? c : null;
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
@@ -632,6 +686,7 @@ export async function acquireWrite(root, opts = {}) {
     }
     const blockers = [];
     for (const entry of listReaderEntries(readersRoot)) {
+      if (entry.unreadable) { blockers.push(entry.owner); continue; }
       if (entry.owner === owner) continue;
       if (ignoreOwners.includes(entry.owner)) {
         // An ignored reader still owns its entry, even after lease expiry; only proven death reclaims it.

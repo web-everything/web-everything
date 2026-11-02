@@ -2,6 +2,7 @@
 /**
  * @file scripts/daemon-overlay.mjs
  * Pinned remove/retire publishes a durable rebuild request for the clone owner; unpinned withdrawals do not.
+ * An absent remove snapshot is a no-op; every mutation carries a concrete registration compare guard.
  * @description Operator/daemon CLI for the per-clone overlay list (`scripts/lib/daemon-overlays.mjs`, Module
  *   B) — docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clause 5: a daemon clone tracks
  *   `main` plus an explicit overlay list kept in a per-clone state file OUTSIDE the clone. This is the
@@ -414,6 +415,19 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
     settled.push({ ref: record.ref, outcome: 'restored' });
   }
   return settled;
+}
+
+/** Register-only removal requires a concrete pre-read snapshot. An absent ref never reaches the
+ * mutation helper, so a registration arriving after that snapshot cannot be removed unguarded. */
+export function removeRegistration({ root, ref, by = null, reason = null, env = process.env, deps = {} }) {
+  const state = (deps.readState ?? readOverlayState)(root, { env });
+  if (state.corrupt) throw new Error('overlay state is corrupt — refusing removal');
+  const entry = state.overlays.find((o) => o.ref === ref);
+  if (!entry) return { removed: false, list: state.overlays };
+  const result = (deps.remove ?? removeOverlay)(root, ref, { env, why: reason || 'operator', expectedOverlay: entry });
+  if (result.removed && entry.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
+  if (result.removed) appendOverlayEvent(root, { kind: 'removed', ref, by, reason }, { env });
+  return result;
 }
 
 /**
@@ -938,11 +952,7 @@ async function main() {
     output = { settled: await withAddGuardLock(root, env, () => settlePendingDrops({ root, env, by })), pending: readPendingDrops(root, env), list: readOverlays(root, { env }) };
     if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
-    const entry = readOverlays(root, { env }).find((o) => o.ref === flags.ref);
-    const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator', expectedOverlay: entry });
-    if (removed && entry?.pinned === true) writeRebuildRequest(root, { by, reason: reason || 'operator', ref: flags.ref, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
-    if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
-    output = { removed, list };
+    output = removeRegistration({ root, ref: flags.ref, by, reason, env });
   } else if (cmd === 'approve-edge') {
     // The ONLY way an `origin/edge/<ref>` branch becomes adoptable by a rebuild: record actor + exact tip sha on
     // the registered overlay. A malformed sha, a missing actor or an unregistered ref is a usage error (exit 2).

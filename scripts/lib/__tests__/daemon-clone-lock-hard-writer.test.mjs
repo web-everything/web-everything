@@ -1,6 +1,6 @@
 /** Phase 1 regressions for bounded hard writer priority. All lock state is task-local. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import fs, { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -12,6 +12,7 @@ const alive = () => 'alive';
 beforeEach(() => {
   vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', undefined);
   vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', undefined);
+  vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', undefined);
   scratch = mkdtempSync(join(tmpdir(), 'clone-hard-writer-'));
   root = join(scratch, 'clone'); mkdirSync(root);
   lockRoot = join(scratch, 'locks'); t = T;
@@ -148,6 +149,79 @@ describe('hard claims, deterministic priority boundaries', () => {
     expect(snapshot().readers).toEqual([]);
     expect(snapshot().writerClaim).toBeNull();
     releaseWrite(root, { lockRoot, owner: 'writer' });
+  });
+  it('same writer cannot re-arm during the configured cooldown, then may start a new hard window', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    expect(read('existing').ok).toBe(true);
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'tick-in-progress' });
+    t = T + 100;
+    seedOlderReader();
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    expect(read('older')).toEqual({ ok: true }); release('older');
+    t = T + 149;
+    seedOlderReader();
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    t = T + 150;
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'tick-in-progress' });
+    expect(snapshot().writerClaim).toMatchObject({ hard: true, since: new Date(T + 150).toISOString() });
+    release('existing');
+  });
+  it('persisted pre-cooldown hard claims cannot re-arm on the second attempt in the gap', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    seedClaim({ owner: 'writer' }); // Old persisted format: there is no hard-window history sidecar.
+    t = T + 100;
+    seedOlderReader();
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    t = T + 149;
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    t = T + 150;
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    releaseWrite(root, { lockRoot, owner: 'writer' });
+  });
+  it('TTL cleanup of an old persisted hard claim preserves its reader cooldown', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    seedClaim({ owner: 'writer' });
+    t = T + 101;
+    expect(read('retrying', { writerClaimTtlMs: 10 })).toEqual({ ok: true }); release('retrying');
+    expect(snapshot().writerClaim).toBeNull();
+    seedOlderReader();
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+  });
+  it('default two-minute cooldown survives claim cleanup after a successful write', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    releaseWrite(root, { lockRoot, owner: 'writer' });
+    expect(snapshot().writerClaim).toBeNull();
+    t = T + 101;
+    expect(read('existing').ok).toBe(true);
+    seedOlderReader();
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    t = T + 100 + 120_000 - 1;
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    t += 1;
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'tick-in-progress' });
+    expect(snapshot().writerClaim?.hard).toBe(true);
+    release('existing');
+  });
+  it('a reader repeatedly refused by hard priority gets a gap immediately when the window ends', () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    seedClaim();
+    for (let i = 0; i < 5; i += 1) expect(read('retrying')).toMatchObject({ reason: 'writer-priority' });
+    expect(snapshot().starved).toEqual([]);
+    t = T + 100;
+    expect(read('retrying')).toEqual({ ok: true }); release('retrying');
+  });
+  it('unreadable hard-window history refuses re-arming rather than bypassing the reader gap', async () => {
+    expect(read('existing').ok).toBe(true);
+    await write({ hardClaim: true });
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writers');
+    fs.writeFileSync(join(history, fs.readdirSync(history)[0]), '{broken');
+    seedOlderReader();
+    expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
+    expect(read('older')).toEqual({ ok: true }); release('older'); release('existing');
   });
   it('hard claim remains hard with its original since across timeout refreshes', async () => {
     expect(read('existing').ok).toBe(true);
