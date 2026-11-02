@@ -3,7 +3,13 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+
+export const safeRequiredBase = name => typeof name === 'string' && name.length <= 255 &&
+  /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(name) && !name.includes('..') &&
+  name.split('/').every(part => part && !part.startsWith('.') && !part.endsWith('.') && !part.endsWith('.lock'));
+export const prCancelledRerunMarker = (repo, pr, head) => `<!-- pr-ci-cancelled-rerun: ${repo}#${pr}@${head} -->`;
 
 const ioOptions = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
   maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
@@ -75,6 +81,7 @@ export function sweepPrCancelledRerun(options = {}) {
 }
 
 function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readRequiredChecks,
+  readComments, postComment, defaultBranch = 'main',
   readRuns = defaultReadRuns, readJobs = defaultReadJobs, rerunFailed = rerunPrCancelledRun,
   recordPath, readRecord, writeRecord, lock: _lock, assertHeld = () => {}, now = Date.now(), maxPerTick = 3,
   emitEvent = event => appendDaemonEvent({ ...event, daemon: 'ci-red-recovery-watch' }),
@@ -118,11 +125,25 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
       !Array.isArray(pr.statusCheckRollup) || pr.requiredCheckReadError) { refuse('pr-evidence-incomplete', detail); continue; }
     let checks;
     try {
-      if (typeof pr.baseRefName !== 'string' || !/^[A-Za-z0-9._\/-]+$/.test(pr.baseRefName)) throw Error('unsafe or missing PR base');
+      if (!safeRequiredBase(pr.baseRefName)) throw Error('unsafe or missing PR base');
       checks = requiredChecks ?? readRequiredChecks({ repo, branch: pr.baseRefName });
       if (!Array.isArray(checks) || !checks.length || checks.some(c => typeof c !== 'string' || !c)) throw Error('incomplete required set');
     } catch {
-      refuse('required-set-unreadable', { ...detail, error: 'inspect PR base and live required-check settings; retry next tick' });
+      const error = (!safeRequiredBase(pr.baseRefName)
+        ? 'unsafe or missing PR base; protection was not read'
+        : `base ${pr.baseRefName} required set unreadable; ${pr.baseRefName === defaultBranch ? 'default branch read failed' : `default branch ${defaultBranch} fallback did not establish a live non-empty set`}`) + '; inspect protection and retry next tick';
+      refuse('required-set-unreadable', { ...detail, error });
+      if (apply && readComments && postComment) {
+        const marker = `<!-- pr-ci-required-unreadable: ${repo}#${pr.number}@${sha} -->`;
+        try {
+          const comments = readComments(pr.number, { repo });
+          if (!Array.isArray(comments)) throw Error('comment evidence unreadable');
+          if (!comments.some(c => isTrustedMarkerAuthor(c) && c.body?.includes(marker))) {
+            assertHeld();
+            postComment(pr.number, { repo, body: `NEEDS-YOU: PR #${pr.number} head ${sha}, base ${String(pr.baseRefName).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')}: ${error}. Inspect branch protection before retrying.\n\n${marker}` });
+          }
+        } catch { result.refusals.at(-1).error += '; could not read or publish the durable needs-you marker; inspect PR comments'; }
+      }
       continue;
     }
     const rows = checks.map(name => latestCheckNamed(pr.statusCheckRollup, name));
@@ -287,6 +308,10 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
         result.applied.push({ ...dispatch, ok: false, error: 'confirmation write failed; reservation retained; inspect PR CI' });
         return result;
       }
+      try {
+        assertHeld();
+        postComment?.(pr.number, { repo, body: `Cancelled required CI rerun submitted for head ${sha}, run ${runId}.\n\n${prCancelledRerunMarker(repo, pr.number, sha)}` });
+      } catch { refuse('rerun-marker-unpublished', { ...detail, error: 'rerun submitted; inspect PR CI and re-arm review manually if needed' }); }
       try { Promise.resolve(emitEvent({ kind: 'pr-ci-cancelled-rerun', detail: { ...detail, runId, cancelReason } })).catch(() => {}); }
       catch { /* Best-effort; the attempt record is authoritative. */ }
       result.applied.push({ ...dispatch, ok: true });

@@ -13,6 +13,7 @@ import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { prCancelledRerunMarker } from './pr-cancelled-rerun.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
@@ -70,6 +71,7 @@ export function reviewRunEvidence(run) {
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
+    verdict: verdict?.verdict,
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
@@ -357,6 +359,15 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
   if (!last || last.persistenceFailed) return null;
+  // A successful cancelled-required-CI rerun proves the mechanical gap. Only a completed accepted
+  // review covering this exact head may use it, and the marker releases at most one later attempt.
+  if (last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
+    Array.isArray(last.pending) && last.pending.length === 0) {
+    const marker = prCancelledRerunMarker(repo, pr.number, pr.headRefOid);
+    const rerunAt = Math.max(0, ...(pr.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && c.body?.includes(marker))
+      .map(c => Date.parse(c.createdAt)).filter(Number.isFinite));
+    if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) return null;
+  }
   const wake = wakeTime(pr, last);
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold

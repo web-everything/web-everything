@@ -74,7 +74,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
-import { sweepPrCancelledRerun, formatPrCancelledReport } from './pr-cancelled-rerun.mjs';
+import { sweepPrCancelledRerun, formatPrCancelledReport, safeRequiredBase } from './pr-cancelled-rerun.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -1020,17 +1020,20 @@ export function defaultReadAttributedRequiredChecks({
 
 /** Required checks for cancelled-PR recovery: only a fresh live read can authorize a rerun. */
 export function readLiveRequiredChecks({
-  repo = null, branch = 'main', readRequiredChecks = getRequiredStatusChecks,
+  repo = null, branch = 'main', defaultBranch = 'main', readRequiredChecks = getRequiredStatusChecks,
 } = {}) {
-  if (!repo) return null;
-  try {
-    const result = readRequiredChecks({ repo, branch, ttlMs: 0 });
-    if (result?.source !== 'live' || !Array.isArray(result.checks) || !result.checks.length ||
-      result.checks.some(check => typeof check !== 'string' || !check)) return null;
-    return result.checks;
-  } catch {
-    return null;
+  if (!repo || !safeRequiredBase(branch) || !safeRequiredBase(defaultBranch)) return null;
+  for (const base of branch === defaultBranch ? [branch] : [branch, defaultBranch]) {
+    try {
+      const result = readRequiredChecks({ repo, branch: base, ttlMs: 0 });
+      if (result?.source === 'live' && Array.isArray(result.checks) && result.checks.length &&
+        result.checks.every(check => typeof check === 'string' && check)) return result.checks;
+
+    } catch {
+      // The default branch may still supply live evidence for a stacked base.
+    }
   }
+  return null;
 }
 
 // ── MISSING-CI-RUN RECOVERY (we:backlog/xi4od2p-*.md, parent #4075/#3383) ──────────────────────────────────────
@@ -1735,6 +1738,8 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
     readOpenPrs: options.readOpenPrs ?? (() => result.prs ?? null),
     requiredChecks: undefined,
     readRequiredChecks: readLiveRequiredChecks,
+    readComments: options.readComments ?? defaultReadPrComments,
+    postComment: options.postComment ?? defaultPostExhaustedRetryComment,
     recordPath: prCancelledRecordPath(options.repo), lock: withMainRetriggerLock,
     readRecord: readPrCancelledRecord, writeRecord: writeMainRetriggerRecord,
   });
