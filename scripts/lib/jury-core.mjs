@@ -3297,6 +3297,18 @@ export function isSecurityClassFinding(f) {
 export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr, sameGapDecisions } = {}) {
   if (!referral?.key || !referral.finding || !head || !repo || !pr
     || !Array.isArray(records) || !Array.isArray(operatorRulings)) return null;
+  // A legacy-owner block stays under its written spelling. It must still veto a sibling carry, including one
+  // already persisted, or an adopted clearance on another run could erase the hold. Unlike visible blocks,
+  // these cannot participate in exact thread-order overrides: only an explicit ruling on the target can clear it.
+  for (const o of operatorRulings) {
+    if (!o || o.result !== 'block' || o.head !== head || o.pr !== pr || o.repo === repo
+      || canonicalRepoSlug(o.repo) !== canonicalRepoSlug(repo)) continue;
+    const record = records.find(r => r?.runId === o.runId && r.head === head && r.repo === repo && r.pr === pr);
+    const ruled = record?.referrals?.find(f => f.key === o.key);
+    if (!ruled?.finding || o.key === referral.key || sameGapSameHead(
+      { ...ruled.finding, original: ruled.original ?? ruled.finding },
+      { ...referral.finding, original: referral.original ?? referral.finding }, { decisions: sameGapDecisions })) return null;
+  }
   const seen = new Set();
   for (const o of [...operatorRulings].reverse()) {
     if (!o || o.head !== head || o.repo !== repo || o.pr !== pr || !o.runId || !o.key) continue;

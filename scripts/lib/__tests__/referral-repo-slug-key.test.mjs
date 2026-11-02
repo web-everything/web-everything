@@ -1,8 +1,13 @@
 /** #6170: a ruling recorded under a repo's old owner must rule the finding a record names under the new one, and nothing else. */
 import { describe, it, expect } from 'vitest';
 import { readOperatorRulings, readReferralRecords, buildOperatorRulingComment, renderReferralRecord, mandatoryReferralState, mandatoryReferralReviewer,
-  validateReferralRecord, referralFindingKey, normalizeFinding } from '../jury-core.mjs';
+  validateReferralRecord, referralFindingKey, normalizeFinding, findSameHeadSiblingRuling, judgeSameGapPairs, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
 import { canonicalRepoSlug } from '../repo-slug.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createReviewPrSinks } from '../../operations/review-pr-io.mjs';
+import { REVIEW_EFFECTS } from '../../operations/review-pr.mjs';
 
 const HEAD = '21da276841fe341adf3431649b4f7d41830aad09';
 const NEW_REPO = 'web-everything/web-everything', OLD_REPO = 'chalbert/web-everything';
@@ -23,6 +28,29 @@ const world = ({ rulingRepo = OLD_REPO, rulingKey, runId = 'review-pr-ddbf3105-8
 };
 const state = (comments, repo) => mandatoryReferralState(comments, { head: HEAD, repo, pr: 6170, body: '<!-- authored-by-actor: author -->', cardReadable: () => true });
 
+const siblings = (result = 'card') => {
+  const { comments } = world({ runId: 'review-pr-A' });
+  const source = readReferralRecords(comments).records[0];
+  const makeRecord = (seat, runId) => ({ ...source, runId, reviewer: mandatoryReferralReviewer(runId),
+    referrals: [{ ...source.referrals[0], seat, key: referralFindingKey(seat, original) }] });
+  const target = makeRecord('redTeam', 'review-pr-B');
+  const third = makeRecord('judgeCorrectness', 'review-pr-C');
+  const ruling = (record, value, over = {}) => post(buildOperatorRulingComment({ version: 1, repo: OLD_REPO,
+    pr: record.pr, head: record.head, actor: 'chalbert', channel: 'test', reason: 'checked',
+    at: '2026-11-01T20:00:00Z', clearerId: 'x', ...over,
+    rulings: [{ runId: record.runId, key: record.referrals[0].key, result: value,
+      ...(value === 'card' ? { card: CARD } : {}) }] }), 'chalbert');
+  const records = [source, target, third];
+  const recordComments = records.map(r => post(renderReferralRecord(r), 'web-everything'));
+  const clearance = ruling(source, result);
+  const carry = { key: target.referrals[0].key, reason: REFERRAL_CARRY_REASON,
+    from: { head: HEAD, runId: source.runId, key: source.referrals[0].key }, result,
+    ...(result === 'card' ? { card: CARD } : {}) };
+  const context = comments => ({ head: HEAD, repo: NEW_REPO, pr: source.pr, records,
+    operatorRulings: readOperatorRulings(comments).rulings });
+  return { source, target, third, ruling, recordComments, clearance, carry, context };
+};
+
 describe('canonicalRepoSlug', () => {
   it('follows the listed rename, lower-cases, and leaves every other slug as itself', () => {
     expect(canonicalRepoSlug(OLD_REPO)).toBe(NEW_REPO);
@@ -33,6 +61,89 @@ describe('canonicalRepoSlug', () => {
 });
 
 describe('operator ruling repo spelling (#6170)', () => {
+  it('the production sink retains the hold instead of persisting a carry over the later old-owner block', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-slug-sibling-'));
+    try {
+      const w = siblings();
+      const live = { headRefOid: HEAD, body: w.source.authorBody, labels: [],
+        comments: [...w.recordComments, w.clearance, w.ruling(w.target, 'block')] };
+      const provider = {
+        readPrState: () => { live.comments.forEach((c, i) => { c.id ??= String(i); }); return structuredClone(live); },
+        editComment: (id, body) => { live.comments.find(c => c.id === id).body = body; },
+        postComment: (_repo, _pr, body) => live.comments.push(post(body, 'web-everything')),
+        setLabels: () => {},
+      };
+      const sinks = createReviewPrSinks({ root, env: {}, labelProvider: provider, cardReadable: () => true,
+        readChangedLines: () => { throw new Error('no cross-head comparison expected'); },
+        referralJudge: () => { throw new Error('no new reviewer decision'); },
+        sameGapJudge: () => { throw new Error('identical findings need no judge'); },
+        mirrorReferral: () => {}, appendLedgerRow: () => ({ ok: true }), out: () => {} });
+      const result = await sinks[REVIEW_EFFECTS.MANDATORY_REFERRALS]({ referrals: [], read: {
+        repo: NEW_REPO, pr: w.source.pr, netBasis: { rev: HEAD }, body: live.body } }, { runId: 'sink-run' });
+      const saved = readReferralRecords(live.comments).records.find(r => r.runId === w.target.runId);
+      expect.soft(saved.carried ?? []).toEqual([]);
+      expect.soft(result.pending).toContain(w.target.referrals[0].key);
+      expect.soft(state(live.comments, NEW_REPO).pending).toContain(w.target.referrals[0].key);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['card', 'not-real'])('a hidden block prevents a sibling %s carry and withdraws a persisted carry', result => {
+    const w = siblings(result);
+    for (const blocked of [w.target, w.third]) {
+      for (const repo of [OLD_REPO, 'Chalbert/Web-Everything']) {
+        const block = w.ruling(blocked, 'block', { repo });
+        for (const rulings of [[w.clearance, block], [block, w.clearance]]) {
+          const comments = [...w.recordComments, ...rulings];
+          expect.soft(findSameHeadSiblingRuling(w.target.referrals[0], w.context(comments))).toBeNull();
+          const saved = post(renderReferralRecord({ ...w.target, carried: [w.carry] }), 'web-everything');
+          expect.soft(state([...comments, saved], NEW_REPO).pending).toContain(w.target.referrals[0].key);
+        }
+      }
+    }
+  });
+  it('a hidden block on an unrelated readable finding does not veto the sibling carry', () => {
+    const w = siblings();
+    const unrelated = { ...original, summary: 'An unrelated defect in the writer.' };
+    w.third.referrals = [{ seat: 'judgeCorrectness', original: unrelated, finding: normalizeFinding(unrelated),
+      key: referralFindingKey('judgeCorrectness', unrelated) }];
+    const records = [w.source, w.target, w.third].map(r => post(renderReferralRecord(r), 'web-everything'));
+    const comments = [...records, w.clearance, w.ruling(w.third, 'block')];
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], w.context(comments))).toMatchObject({ result: 'card' });
+  });
+  it('an unreadable hidden block subject cannot expose an older sibling clearance', () => {
+    const w = siblings();
+    const missing = { ...w.third, runId: 'missing-run' };
+    const comments = [...w.recordComments, w.clearance, w.ruling(missing, 'block')];
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], w.context(comments))).toBeNull();
+  });
+  it('a hidden block on a judged paraphrase also vetoes the sibling carry', async () => {
+    const w = siblings();
+    const paraphrase = { ...original, summary: 'No named regression proves the unreadable-file guarantee.' };
+    w.third.referrals = [{ seat: 'judgeCorrectness', original: paraphrase, finding: normalizeFinding(paraphrase),
+      key: referralFindingKey('judgeCorrectness', paraphrase) }];
+    const comments = [...w.recordComments, w.clearance, w.ruling(w.third, 'block')];
+    const context = w.context(comments);
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], context)).toMatchObject({ result: 'card' });
+    const judged = await judgeSameGapPairs([w.third.referrals[0].finding, w.target.referrals[0].finding], {
+      judge: async () => ({ pairs: [{ id: 0, sameGap: true, confidence: 0.95, reason: 'same missing regression' }] }),
+    });
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], { ...context, sameGapDecisions: judged.decisions })).toBeNull();
+  });
+  it.each(['card', 'not-real'])('a current-owner policy block still allows a later adopted sibling %s clearance', result => {
+    const w = siblings(result);
+    const block = w.ruling(w.third, 'block', { repo: NEW_REPO, actor: 'auto-policy' });
+    const comments = [...w.recordComments, block, w.clearance];
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], w.context(comments))).toMatchObject({ result });
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], w.context([...w.recordComments, w.clearance, block]))).toBeNull();
+  });
+  it.each([
+    ['another repo', { repo: 'someone/else' }],
+    ['another head', { head: 'a'.repeat(40) }],
+    ['another PR', { pr: 6171 }],
+  ])('a hidden block for %s cannot veto a sibling carry', (_name, over) => {
+    const w = siblings();
+    const comments = [...w.recordComments, w.clearance, w.ruling(w.target, 'block', over)];
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], w.context(comments))).toMatchObject({ result: 'card' });
+  });
   it('a card ruling under the old owner clears the finding (live repo spelled as the record)', () => {
     const { comments } = world();
     for (const repo of [NEW_REPO]) {
