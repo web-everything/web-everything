@@ -166,7 +166,8 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
       continue;
     }
     if (rec.owner === owner) continue;
-    // A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
+    // Bounded: the override lives only inside one writer wait (capped by waitMs); the starved reader's claim is
+    // kept, so the writer's NEXT attempt (and its start check) yields to it again. A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
     if (startedBeforeMs !== null && !(isoMs(rec.firstRefusedAt) < startedBeforeMs)) continue;
     if (rec.count >= after) return rec;
   }
@@ -205,7 +206,7 @@ export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 30_000;
 /** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default; 0 = off). */
 export function resolveWriterWaitPriorityMs(env = process.env) {
   const raw = env?.[WRITER_WAIT_PRIORITY_ENV];
-  if (raw === undefined || raw === '') return DEFAULT_WRITER_WAIT_PRIORITY_MS;
+  if (raw === undefined || String(raw).trim() === '') return DEFAULT_WRITER_WAIT_PRIORITY_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WRITER_WAIT_PRIORITY_MS;
 }

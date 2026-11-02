@@ -345,5 +345,25 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '0' })).toBe(0);
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '45000' })).toBe(45000);
     expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: 'x' })).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
+    expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '   ' })).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
+  });
+
+  it('the override is bounded to one wait: if the writer gives up, the starved reader still has priority next attempt', async () => {
+    const lockRoot = mkTmp('dcww-root-');
+    const clone = mkTmp('dcww-clone-');
+    const common = { lockRoot, probe: alive, leaseMinutes: LEASE, writerClaimTtlMs: TTL, readerPriorityAfter: 3 };
+    let t = 0;
+    expect(acquireRead(clone, { ...common, owner: 'R', readerKey: 'R', nowMs: t }).ok).toBe(true);
+    const w = await acquireWrite(clone, {
+      ...common, owner: 'W', waitMs: 30_000, pollMs: 1000, now: () => t, writerWaitPriorityMs: 1000,
+      sleep: async (ms) => {
+        t += ms;
+        if (t % 5000 === 0) acquireRead(clone, { ...common, owner: 'S', readerKey: 'S', nowMs: t });
+      },
+    });
+    expect(w.reason).toBe('tick-in-progress'); // R never drained; override did not turn into a forever-wait
+    const next = await acquireWrite(clone, { ...common, owner: 'W', waitMs: 1000, now: () => t, sleep: async (ms) => { t += ms; } });
+    expect(next.reason).toBe('reader-priority');
+    expect(next.heldBy).toBe('S');
   });
 });
