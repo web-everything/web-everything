@@ -309,6 +309,21 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.list()).toEqual(['lane/sq']);
   });
 
+  it('an interrupted squash retire is restored on recovery when the branch reappeared at the proved tip', async () => {
+    const { f, tip, mergeOid } = setup();
+    await expect(retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
+      prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
+      tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
+    expect(f.list()).toEqual([]);
+    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => tip } })).toEqual([{ ref: 'lane/sq', outcome: 'restored' }]);
+    expect(f.list()).toEqual(['lane/sq']);
+    // and with the branch still deleted, the drop is confirmed
+    await expect(retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
+      prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
+      tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
+    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'drop-confirmed' }]);
+  });
+
   it('refuses when the merge commit is not an ancestor of main', () => {
     const { f, tip } = setup();
     f.ghPrs([merged('lane/sq', tip, tip)]); // the (deleted) branch tip is not on main
