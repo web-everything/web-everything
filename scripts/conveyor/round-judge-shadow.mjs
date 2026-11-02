@@ -13,6 +13,7 @@
  *   Log: `~/workspace/.operations/round-judge-shadow/YYYY-MM.jsonl` (override dir: `WE_ROUND_JUDGE_SHADOW_DIR`).
  *   One record per (PR, head, cap trigger, cap episode); a re-seen cap is skipped. Never throws into the caller.
  */
+import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -68,6 +69,14 @@ export function resolveBreakClassStopSetting({ env = process.env, path = ROUND_J
 }
 
 /** Later prompt wiring must record the enumeration in a trusted review comment before round 1. */
+/** Hash of the thread and file evidence the verdict was computed from, so corrected evidence is never suppressed. */
+function evidenceHash(subject) {
+  const h = createHash('sha256');
+  for (const c of subject?.comments ?? []) h.update(`${c?.createdAt ?? ''}\0${c?.body ?? ''}\0`);
+  for (const f of subject?.files ?? []) h.update(`${typeof f === 'string' ? f : f?.path}\0`);
+  return h.digest('hex');
+}
+
 export function enumerateFirstPrompt() {
   return 'Before round 1 on daemon/Forge PRs, enumerate the full list of edge cases and break candidates; record it in a review comment with <!-- we:enumerate-first -->.';
 }
@@ -84,7 +93,7 @@ export function observeBreakClassStop({ pr, repo = null, subject = {}, env = pro
     if (result.reason) return { skipped: 'incomplete-evidence', reason: result.reason };
     if (!result.applies) return { skipped: 'not-applicable' };
     const outDir = dir ?? roundJudgeDir(env);
-    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head.toLowerCase(), result.rounds.length]);
+    const key = JSON.stringify(['break-class-stop', repo, Number(pr), head.toLowerCase(), evidenceHash(subject)]);
     if (seenKeys(outDir, now).has(key)) return { skipped: 'already-logged', key };
     const record = { ts: new Date(now).toISOString(), kind: 'break-class-stop', key, pr: Number(pr), repo,
       head: head.toLowerCase(), mode: cfg.mode, modeSource: cfg.source, setting: cfg, ...result,
