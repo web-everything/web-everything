@@ -88,13 +88,15 @@ export function sameHeadFailedDecision({ pr, head, runs = [], readError = null }
   if (readError) return { hold: true, kind: 'mq-same-head-unreadable', reason: `merge_group failure read errored: ${readError.message ?? readError}`,
     line: `mq-same-head-unreadable: #${pr} head ${short} — merge_group failure read errored (${String(readError.message ?? readError).split('\n')[0].slice(0, 120)}); holding the enqueue` };
   const own = runs.filter(r => r.prHead === head);
+  const inFlight = own.some(r => r.conclusion == null || ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(r.conclusion));
   const open = own.filter(r => (r.conclusion === 'failure' || r.conclusion === 'timed_out')
     && !own.some(g => g.conclusion === 'success' && g.workflow === r.workflow && (g.completedAt ?? 0) > (r.completedAt ?? 0)));
-  if (!open.length) return { hold: false };
-  const line = `mq-same-head-failed: #${pr} head ${short} — waiting for a new head or green rerun`;
+  if (!open.length && !inFlight) return { hold: false };
+  const line = `mq-same-head-failed: #${pr} head ${short} — waiting for a new head or green rerun${inFlight ? ' (rerun not finished)' : ''}`;
   return { hold: true, kind: 'mq-same-head-failed', reason: line, line };
 }
 
+const SHA = /^[0-9a-f]{40}$/;
 const MAX_PAGES = 12, MAX_PR_RUNS = 20;
 /** Reads this PR's recent merge_group runs and  through gh, decides, and logs the one named line. */
 export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = () => {}, now = Date.now } = {}) {
@@ -104,6 +106,7 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
   const stamp = r => Date.parse(r.updated_at ?? r.run_started_at) || 0;
   let decision;
   try {
+    if (!SHA.test(String(head))) throw new Error('PR head sha missing or malformed');
     // Page newest-first until the horizon is covered; hitting the page cap first means the history is incomplete: fail closed.
     // No merge_group run of this PR can predate the PR itself; created_at is set by GitHub, never by the author.
     // (A run cannot be queried by PR head: its head_sha is the group commit, and the branch suffix is the base sha.)
@@ -117,12 +120,12 @@ export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = 
       covered = rows.length < 100 || rows.some(r => (Date.parse(r.created_at) || Infinity) < committed);
     }
     if (!covered) throw new Error(`merge_group run history not covered within ${MAX_PAGES} pages`);
-    const mine = all.filter(r => done(r) && new RegExp(`/pr-${pr}-`).test(r.head_branch ?? '') && r.conclusion !== 'cancelled' && r.conclusion !== 'skipped');
+    const mine = all.filter(r => new RegExp(`/pr-${pr}-`).test(r.head_branch ?? '') && r.conclusion !== 'cancelled' && r.conclusion !== 'skipped');
     if (mine.length > MAX_PR_RUNS) throw new Error(`more than ${MAX_PR_RUNS} merge_group runs for the PR in the window`);
-    const toRun = r => ({ workflow: r.workflow_id ?? r.name, conclusion: r.conclusion, completedAt: stamp(r) });
+    const toRun = r => ({ workflow: r.workflow_id ?? r.name, conclusion: done(r) ? r.conclusion : (r.status || 'in_progress'), completedAt: stamp(r) });
     const runs = mine.map(r => {
       const parents = readJson(['api', `repos/${repo}/commits/${r.head_sha}`]).parents;
-      if (!Array.isArray(parents) || !parents.length) throw new Error(`merge_group commit ${String(r.head_sha).slice(0, 12)} has no readable parents`);
+      if (!Array.isArray(parents) || !parents.length || !parents.every(q => SHA.test(q?.sha))) throw new Error(`merge_group commit ${String(r.head_sha).slice(0, 12)} has missing or malformed parent shas`);
       return { ...toRun(r), prHead: parents.some(p => p.sha === head) ? head : parents.at(-1).sha };
     });
     decision = sameHeadFailedDecision({ pr, head, runs });

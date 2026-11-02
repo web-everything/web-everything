@@ -464,7 +464,7 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
         { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6215-abc', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' },
         { name: 'CI', head_branch: 'gh-readonly-queue/main/pr-6216-abc', head_sha: 'g2', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' }] });
       if (args[1].endsWith(`pulls/6215`)) return JSON.stringify({ created_at: '2026-11-02T08:00:00Z' });
-      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
+      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'a'.repeat(40) }, { sha: H }] });
       throw new Error(`unexpected ${args}`); };
     const r = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec, log: l => lines.push(l) });
     expect(r.hold).toBe(true);
@@ -488,8 +488,32 @@ describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run
       if (args[1].endsWith('pulls/6215')) return JSON.stringify({ created_at: '2026-11-02T08:00:00Z' });
       if (args[1].endsWith(`commits/${H}`)) return JSON.stringify({ commit: { committer: { date: '2999-01-01T00:00:00Z' } } });
       if (args[1].includes('event=merge_group')) return JSON.stringify({ workflow_runs: [{ name: 'CI', workflow_id: 1, head_branch: 'gh-readonly-queue/main/pr-6215-a', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z' }] });
-      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
+      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'a'.repeat(40) }, { sha: H }] });
       return JSON.stringify({ workflow_runs: [{ name: 'CI', workflow_id: 1, event: 'pull_request', status: 'completed', conclusion: 'success', updated_at: '2026-11-02T11:00:00Z' }] }); };
     expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec }).hold).toBe(true);
+  });
+  describe('fail-closed on a rerun in flight and on malformed shas', () => {
+    const mk = (over, parents) => (_c, args) => {
+      if (args[1].endsWith('pulls/6215')) return JSON.stringify({ created_at: '2026-11-02T08:00:00Z' });
+      if (args[1].includes('event=merge_group')) return JSON.stringify({ workflow_runs: [{ name: 'CI', workflow_id: 1, head_branch: 'gh-readonly-queue/main/pr-6215-a', head_sha: 'g1', conclusion: 'failure', status: 'completed', created_at: '2026-11-02T09:30:00Z', updated_at: '2026-11-02T10:00:00Z', ...over }] });
+      if (args[1].includes('commits/g1')) return JSON.stringify({ parents });
+      return '{}'; };
+    const good = [{ sha: 'a'.repeat(40) }, { sha: 'b'.repeat(40) }];
+    it('a queued or in_progress rerun at H stays held', () => {
+      for (const st of ['queued', 'in_progress']) {
+        const r = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: 'b'.repeat(40), exec: mk({ status: st, conclusion: null }, good) });
+        expect(r.hold).toBe(true);
+        expect(r.kind).toBe('mq-same-head-failed');
+      }
+    });
+    it('missing or malformed parent or head shas hold visibly', () => {
+      const lines = [];
+      for (const parents of [[{}], [{ sha: 'zz' }], [{ sha: 'a'.repeat(40) }, {}]]) {
+        const r = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: 'b'.repeat(40), exec: mk({}, parents), log: l => lines.push(l) });
+        expect(r.kind).toBe('mq-same-head-unreadable');
+      }
+      expect(sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: 'nothex', exec: mk({}, good), log: l => lines.push(l) }).kind).toBe('mq-same-head-unreadable');
+      expect(lines.length).toBe(4);
+    });
   });
 });
