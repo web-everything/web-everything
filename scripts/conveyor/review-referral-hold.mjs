@@ -13,6 +13,7 @@ import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
 import { prCancelledRerunMarker } from './pr-cancelled-rerun.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -367,7 +368,8 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
     const rerunAt = Math.max(0, ...(pr.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && c.body?.includes(marker))
       .map(c => Date.parse(c.createdAt)).filter(Number.isFinite));
     const rollup = pr.statusCheckRollup;
-    const recovered = Array.isArray(rollup) && rollup.length > 0 && rollup.every(row =>
+    const recovered = Array.isArray(rollup) && rollup.length > 0 &&
+      !requiredCheckReadNeeded(pr, rollup[0]?.name || rollup[0]?.context) && rollup.every(row =>
       row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion));
     if (recovered && rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) return null;
   }

@@ -3,8 +3,25 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor, countTrustedLeadingMarker } from '../lib/marker-authorship.mjs';
+import { DEFAULT_MAX_HUNG_RETRIES_PER_SHA } from './main-red-recovery.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+
+/** Preserve the hung pass's durable stop decision when another pass sees its cancellation. */
+function hungRecoveryStopped(comments, headSha) {
+  if (!Array.isArray(comments)) return true;
+  const countForHead = rows => countTrustedLeadingMarker(rows.filter(c =>
+    typeof c?.body === 'string' && c.body.split('\n').includes(`sha: ${headSha}`)),
+    '⏱️ conveyor CI-hung-recovery');
+  if (countForHead(comments) >= DEFAULT_MAX_HUNG_RETRIES_PER_SHA) return true;
+  return comments.some(comment => {
+    if (!countForHead([comment])) return false;
+    const body = typeof comment === 'string' ? comment : comment.body;
+    // Builders predating structured kind fields recorded the decision in the outcome prose.
+    return /\b(?:hung-cap-escalate|hung-cap-exhausted|repeat-hang|cancelled-no-rerun)\b/.test(body) ||
+      body.includes('and did NOT re-run it');
+  });
+}
 
 export const safeRequiredBase = name => typeof name === 'string' && name.length <= 255 &&
   /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(name) && !name.includes('..') &&
@@ -162,6 +179,14 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     if (rows.some(row => !row || typeof row !== 'object' || Array.isArray(row) ||
       !(row.status === 'COMPLETED' && ['CANCELLED', 'SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion)))) {
       refuse('required-evidence-unreadable', { ...detail, error: 'inspect required-check evidence; retry next tick' });
+      continue;
+    }
+    try {
+      const comments = readComments(pr.number, { repo });
+      if (hungRecoveryStopped(comments, sha)) throw Error('hung recovery stopped or comments unreadable');
+    } catch {
+      refuse('hung-recovery-stopped', { ...detail,
+        error: 'inspect this head’s hung-recovery comments and CI manually before retrying' });
       continue;
     }
     const key = `${repo}#${pr.number}@${sha}`;

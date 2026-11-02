@@ -11,7 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { homedir } from 'node:os';
 import { REPO_ROOT } from '../../operations/dispatch-lane-io.mjs';
 import {
-  buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
+  readLiveRequiredChecks, defaultReadBranchProtected, buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
   cancelAndRerunHungRun, cancelHungRun, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
@@ -2015,4 +2015,38 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 7, kind: 'missing-run-cap-exhausted', attempts: 1 })]);
   });
 
+});
+
+describe('cancelled rerun branch protection proof', () => {
+  const repo = 'owner/repo';
+  it.each([true, null, undefined, 'throws'])('refuses ambiguous fallback base protection (%j)', protectedValue => {
+    const readRequiredChecks = vi.fn(({ branch }) => branch === 'main'
+      ? { source: 'live', checks: ['test'] } : { source: 'fallback', checks: [] });
+    const readBranchProtected = vi.fn(() => {
+      if (protectedValue === 'throws') throw Error('denied');
+      return protectedValue;
+    });
+    expect(readLiveRequiredChecks({ repo, branch: 'lane/topic', readRequiredChecks, readBranchProtected })).toBeNull();
+    expect(readRequiredChecks).toHaveBeenCalledOnce();
+    expect(readBranchProtected).toHaveBeenCalledWith({ repo, branch: 'lane/topic' });
+  });
+  it('borrows the live default set only for a proven unprotected base', () => {
+    const readRequiredChecks = vi.fn(({ branch }) => branch === 'main'
+      ? { source: 'live', checks: ['test'] } : { source: 'fallback', checks: [] });
+    expect(readLiveRequiredChecks({ repo, branch: 'lane/topic', readRequiredChecks,
+      readBranchProtected: () => false })).toEqual(['test']);
+    expect(readRequiredChecks).toHaveBeenCalledTimes(2);
+  });
+  it.each([true, false])('reads boolean branch protection (%s) through injected IO', protectedValue => {
+    const exec = vi.fn(() => JSON.stringify({ protected: protectedValue }));
+    expect(defaultReadBranchProtected({ repo, branch: 'lane/topic', exec })).toBe(protectedValue);
+    expect(exec).toHaveBeenCalledWith('gh', ['api', 'repos/owner/repo/branches/lane%2Ftopic'], expect.any(Object));
+  });
+  it.each(['{}', '{"protected":null}', '{"protected":"false"}', 'bad json', 'throws'])(
+    'returns unknown for unreadable branch protection (%s)', payload => {
+      expect(defaultReadBranchProtected({ repo, branch: 'main', exec: () => {
+        if (payload === 'throws') throw Error('denied');
+        return payload;
+      } })).toBeNull();
+    });
 });

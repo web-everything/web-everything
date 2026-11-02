@@ -22,7 +22,7 @@ function fixture({ initial = {}, prs = [pr()], runs = [run()], checks = ['CI'] }
   const options = {
     repo, apply: true, now: Date.parse(date), requiredChecks: checks, recordPath: 'fixture/pr-cancelled.json',
     readOpenPrs: vi.fn(() => prs), readRuns: vi.fn(() => runs), readJobs: vi.fn(() => []),
-    readRecord: vi.fn(() => structuredClone(record)),
+    readComments: vi.fn(() => []), readRecord: vi.fn(() => structuredClone(record)),
     writeRecord: vi.fn((_path, value) => { record = structuredClone(value); }),
     lock: (_path, fn) => ({ locked: true, value: fn() }), rerunFailed: vi.fn(() => ({ ok: true })), emitEvent: vi.fn(),
   };

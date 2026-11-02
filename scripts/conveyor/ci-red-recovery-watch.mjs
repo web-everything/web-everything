@@ -1018,9 +1018,22 @@ export function defaultReadAttributedRequiredChecks({
   }
 }
 
+/** Unknown protection never proves that a stacked base is unprotected. */
+export function defaultReadBranchProtected({ repo, branch, exec = execFileSyncThrottled } = {}) {
+  try {
+    const out = exec('gh', ['api', `repos/${repo}/branches/${encodeURIComponent(branch)}`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    const result = JSON.parse(String(out));
+    return typeof result?.protected === 'boolean' ? result.protected : null;
+  } catch { return null; }
+}
+
 /** Required checks for cancelled-PR recovery: only a fresh live read can authorize a rerun. */
 export function readLiveRequiredChecks({
   repo = null, branch = 'main', defaultBranch = 'main', readRequiredChecks = getRequiredStatusChecks,
+  readBranchProtected = defaultReadBranchProtected,
 } = {}) {
   if (!repo || !safeRequiredBase(branch) || !safeRequiredBase(defaultBranch)) return null;
   for (const base of branch === defaultBranch ? [branch] : [branch, defaultBranch]) {
@@ -1029,8 +1042,9 @@ export function readLiveRequiredChecks({
       if (result?.source === 'live' && Array.isArray(result.checks) && result.checks.length &&
         result.checks.every(check => typeof check === 'string' && check)) return result.checks;
 
-      // Only an explicit unprotected-base result permits borrowing the default branch's set.
-      if (result?.source !== 'fallback' || !Array.isArray(result.checks) || result.checks.length !== 0) return null;
+      // Empty fallback also covers denied protection reads: require independent proof.
+      if (base === defaultBranch || result?.source !== 'fallback' || !Array.isArray(result.checks) ||
+        result.checks.length !== 0 || readBranchProtected({ repo, branch: base }) !== false) return null;
     } catch {
       return null;
     }

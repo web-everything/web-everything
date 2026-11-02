@@ -1104,6 +1104,18 @@ describe('R372 accepted same-head CI rerun release', () => {
     else p.statusCheckRollup = rollup;
     expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
   });
+  it.each([100, 101])('keeps the hold for a potentially truncated green rollup (%s rows)', length => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup = Array.from({ length }, (_, i) => ({
+      name: 'check-' + i, status: 'COMPLETED', conclusion: 'SUCCESS',
+    }));
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+  });
+  it('keeps the hold when the required-check read failed despite a green rollup', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.requiredCheckReadError = 'denied';
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+  });
   it('releases a stacked accept without a reviewed-sha stamp', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     p.comments.shift();
