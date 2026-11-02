@@ -7224,8 +7224,8 @@ async function runCli() {
           }
           if (landLock.result?.enqueued === true) {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
-            try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: c.headSha }); } catch { /* Best-effort timing only. */ }
             await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
+            try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: c.headSha }); } catch { /* timing only */ }
           }
           if (landLock.result?.enqueued === false) {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
