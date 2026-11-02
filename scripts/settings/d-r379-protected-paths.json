@@ -19,7 +19,6 @@
     "docs/topics/**/*.md",
     "README*.md",
     "**/*.png",
-    "**/*.svg",
     "**/*.jpg",
     "**/*.webp"
   ],

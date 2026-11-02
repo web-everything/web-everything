@@ -128,9 +128,11 @@ async function reviewed(pr, head, base, deps) {
   let labels, audit;
   try { labels = labelNames(await deps.readLabels(pr, head)); }
   catch { return unknown(2, name, 'labels unavailable'); }
+  // Unknown review:* and advisory:* labels fail closed: only these review labels may coexist with delegated approval.
+  const ALLOWED_REVIEW = [REVIEW_LABELS.accepted, 'review:pending', REVIEW_LABELS.human];
   const blocked = labels.filter(l => (l.startsWith('red-team:') && l !== 'red-team:clear')
-    || [REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical, 'review:blocked',
-      'advisory:ruling-needed', 'advisory:needs-human', 'advisory:changes'].includes(l));
+    || (l.startsWith('review:') && !ALLOWED_REVIEW.includes(l)) || l.startsWith('advisory:')
+    || [REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical].includes(l));
   const missing = ['red-team:clear'].filter(l => !labels.includes(l));
   if (![REVIEW_LABELS.accepted, 'review:pending', REVIEW_LABELS.human].some(l => labels.includes(l))) {
     missing.push(REVIEW_LABELS.accepted);

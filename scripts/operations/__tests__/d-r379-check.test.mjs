@@ -1165,7 +1165,7 @@ describe('round 8 runtime source enforcement across trees', () => {
       evidence: [`unclassified path: ${path}; operator review`]});
     expect(r.eligible).toBe(false);
   });
-  it.each(['docs/examples/x.md', 'blocks/foo/image.png', 'plateau/docs/image.svg'])
+  it.each(['docs/examples/x.md', 'blocks/foo/image.png', 'plateau/docs/image.png'])
   ('keeps allowlisted content %s PASS', async path => {
     expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
   });
@@ -1185,7 +1185,7 @@ describe('round 10 harmless-path allowlist', () => {
   });
   it.each(['docs/examples/example.md', 'docs/topic.md', 'docs/topics/detail.md',
     'backlog/123-story.md', 'README.fr.md', 'image.jpg', 'assets/image.webp',
-    'assets/image.png', 'assets/image.svg'])('allowlisted %s passes', async path => {
+    'assets/image.png'])('allowlisted %s passes', async path => {
     expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
   });
   it.each(['docs/agent/future.md', 'docs/examples/runtime.js', 'docs/prompts/example.md',
@@ -1320,5 +1320,17 @@ describe('round 14 clear-human acceptance', () => {
     const r = await checkPr(1, deps(f, { readReviewLedger: async pr => [verdict(pr, f.headRefOid, { verdict: 'clear-human', approval: 'clear-human' })] }));
     expect(condition(r, 2).status).not.toBe('PASS');
     expect(r.eligible).toBe(false);
+  });
+});
+
+describe('round 16 svg and unknown review labels', () => {
+  it('an svg is not harmless (it can carry script)', async () => {
+    const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['src/assets/active.svg'] }));
+    expect(condition(r, 4).status).not.toBe('PASS');
+  });
+  it.each(['review:awaiting-advisory', 'advisory:needs-panel', 'review:something-new'])('label %s blocks', async label => {
+    const f = fixture(6223);
+    const r = await checkPr(1, deps({ ...f, labels: [...f.labels, label] }, { readLabels: async () => [...f.labels, label] }));
+    expect(condition(r, 2).status).toBe('FAIL');
   });
 });
