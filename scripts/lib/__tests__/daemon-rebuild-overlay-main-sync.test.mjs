@@ -1694,14 +1694,39 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(state.attemptedMain[ref]).toBeUndefined();
   });
 
-  it.each([['exit 128', { status: 128, stdout: '', stderr: 'fatal: unsupported' }], ['thrown', 'throw'], ['exit 0 with empty output', { status: 0, stdout: '', stderr: '' }],
+  it.each([false, true])('uses main attributes in a stale daemon checkout when the moved tip still conflicts: %s', async stillConflicts => {
+    const f = fixture({ conflict: true, mainUnion: true });
+    ok(f.root, ['checkout', '-q', '--detach', f.baseSha]);
+    expect(fs.existsSync(join(f.root, '.gitattributes'))).toBe(false);
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    expect(json(sidecar(f)).conflictTip[ref]).toBe(f.oldSha);
+    expect(daemonEvents(f).filter(e => e.kind === 'overlay-main-sync-conflict').at(-1).detail.files).toEqual(['worker.mjs']);
+    if (stillConflicts) moveRefTip(f); else cleanTip(f);
+    ok(f.root, ['checkout', '-q', '--detach', f.baseSha]);
+    const events = [], spawnFn = spawner();
+    expect(tick(f, { spawnFn, deps: { appendDaemonEvent: event => events.push(event) } }).started).toEqual(stillConflicts ? [] : [ref]);
+    const state = json(sidecar(f));
+    if (stillConflicts) {
+      expect(spawnFn).not.toHaveBeenCalled();
+      expect(state.conflictTip[ref]).toBe(ok(f.root, ['rev-parse', `refs/heads/${ref}`]));
+      expect(events.filter(e => e.kind === 'overlay-main-sync-conflict').map(e => e.detail.files)).toEqual([['worker.mjs']]);
+    } else {
+      expect(spawnFn).toHaveBeenCalledOnce();
+      expect(state.conflictMain[ref]).toBeUndefined();
+      expect(state.attemptedMain[ref]).toBeUndefined();
+    }
+  });
+
+  it.each([['exit 128', { status: 128, stdout: '', stderr: 'fatal: unsupported' }],
+    ['unsupported attribute source', { status: 129, stdout: '', stderr: 'unknown option: --attr-source=origin/main\n' }],
+    ['thrown', 'throw'], ['exit 0 with empty output', { status: 0, stdout: '', stderr: '' }],
     ['exit 0 with malformed output', { status: 0, stdout: 'not-a-tree\n', stderr: '' }]])(
     'a merge check that errors (%s) keeps the stop and fails closed', async (_, failure) => {
       const f = fixture({ conflict: true });
       await expect(job(f)).rejects.toThrow(/merge conflicts/);
       cleanTip(f);
       const git = vi.fn((args, opts) => {
-        if (args[0] === 'merge-tree') { if (failure === 'throw') throw new Error('boom'); return failure; }
+        if (gitCommand(args) === 'merge-tree') { if (failure === 'throw') throw new Error('boom'); return failure; }
         return f.deps.git(args, opts);
       });
       const spawnFn = spawner();

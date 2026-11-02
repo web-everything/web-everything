@@ -316,7 +316,8 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
           // Only the ref tip moved: lift the terminal stop ONLY on evidence that the new tip merges cleanly
           // with the same main (side-effect-free merge-tree). A conflict or an error keeps the stop.
           let check;
-          try { check = run(['merge-tree', '--write-tree', '--name-only', main, tip]); }
+          // Match the worker merge even when this checkout predates main's merge attributes.
+          try { check = run(['--attr-source=origin/main', 'merge-tree', '--write-tree', '--name-only', main, tip]); }
           catch (error) { check = { error }; }
           // Evidence must be complete: a tree id on the first line, whatever the exit status.
           const treeOk = !check?.error && typeof check?.stdout === 'string' && /^[a-f0-9]{40}$/.test(check.stdout.split(/\r?\n/)[0]);
