@@ -630,6 +630,12 @@ describe('isReviewCodePath (#4387)', () => {
     }
     expect(missing).toEqual([]);
   });
+  it('puts the review child heap-cap helper and its runtime settings on the path', () => {
+    const closure = { files: new Set(), complete: true, bareDeps: false, jsonNames: new Set() };
+    for (const path of ['scripts/lib/node-heap-cap.mjs', 'scripts/settings/node-heap-cap.json']) {
+      expect(isReviewCodePath(path, { closure })).toBe(true);
+    }
+  });
   // PR #2916 review, round 2: the credential sandbox sits one import deeper than the entry files (dispatch-lane-io
   // → gh-app-shim; review-core → mandate-fence; judge-spawn → session-role), so direct imports alone missed it.
   it('puts the sandbox modules\' deeper imports on the path (PR #2916 review, round 2)', () => {

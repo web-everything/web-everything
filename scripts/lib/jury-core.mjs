@@ -39,6 +39,7 @@
  */
 import { FALSE_FINDING_CAUSES } from './false-finding-causes.mjs';
 import { createHash } from 'node:crypto';
+import { canonicalRepoSlug } from './repo-slug.mjs';
 import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
@@ -3117,7 +3118,7 @@ export const CARRY_SEVERITY_FIELDS = Object.freeze(['verdict', 'impactIfUnfixed'
  * ignored-ruling ledger (`ruling-ledger.mjs#ignoredRulings`), so they cannot disagree on whether a carry stands.
  */
 export function carriedBackingHolds(carried, { repo, pr, operatorRulings = [] }) {
-  const backing = operatorRulings.filter(o => o.repo === repo && o.pr === pr
+  const backing = operatorRulings.filter(o => sameOwnerRuling(o, repo) && o.pr === pr
     && o.head === carried.from.head && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
   return backing && backing.result === carried.result && backing.card === carried.card ? backing : null;
 }
@@ -3154,19 +3155,45 @@ function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings
     return latest && latest.from.runId === carried.from.runId && latest.from.key === carried.from.key
       && latest.result === carried.result && latest.card === carried.card ? backing : null;
   }
+  // A legacy-owner block on this finding written AFTER the backing ruling withdraws the carry, as it ends
+  // `findCarriedOperatorRuling`'s search: the persisted carry must not outlive the hold that search honours.
+  const after = operatorRulings.slice(operatorRulings.lastIndexOf(backing) + 1);
+  for (const o of after) {
+    if (!isLegacyOwnerBlock(o, repo) || o.pr !== pr || o.head === head) continue;
+    const ruled = (Array.isArray(records) ? records : []).find(r => r.runId === o.runId && r.head === o.head && r.pr === pr
+      && canonicalRepoSlug(r.repo) === canonicalRepoSlug(repo))?.referrals.find(f => f.key === o.key)?.finding;
+    if (!ruled || sameFindingForClearing(ruled, target.finding)) return null;
+  }
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
     && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
   return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
 }
 
+/** A `block` spelled with the repo's other (legacy/alias) owner: never adopted onto the record's spelling. */
+const isLegacyOwnerBlock = (o, repo) => Boolean(o) && o.result === 'block' && o.repo !== repo
+  && canonicalRepoSlug(o.repo) === canonicalRepoSlug(repo);
+/**
+ * Whether an operator ruling belongs to `repo`'s thread-order decision on a subject: a clearance only under the exact
+ * spelling (it was adopted onto the record's spelling when it rules one), a block ALSO under the legacy spelling it was
+ * written with. A hold must never be hidden by a spelling mismatch, so every "latest ruling on this subject" read
+ * uses this one definition.
+ */
+const sameOwnerRuling = (o, repo) => o.repo === repo || isLegacyOwnerBlock(o, repo);
+
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
   for (const o of [...operatorRulings].reverse()) {
-    if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
-    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
+    // A block written under the repo's legacy owner stays under that spelling (see `readOperatorRulings`), so it is
+    // matched by canonical repo: it must end this search exactly like a block spelled as the records are.
+    const legacyBlock = isLegacyOwnerBlock(o, repo);
+    if (o.head === head || (o.repo !== repo && !legacyBlock) || o.pr !== pr) continue;
+    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.pr === pr
+      && (r.repo === repo || (legacyBlock && canonicalRepoSlug(r.repo) === canonicalRepoSlug(repo))));
     const finding = record?.referrals.find(f => f.key === o.key)?.finding;
+    // A legacy-owner block whose record or finding cannot be read fails closed: nothing carries past it.
+    if (legacyBlock && !finding) return null;
     // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
     // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
     if (!finding || !sameFindingForClearing(finding, target)) continue;
@@ -3296,6 +3323,18 @@ export function isSecurityClassFinding(f) {
 export function findSameHeadSiblingRuling(referral, { records = [], operatorRulings = [], head, repo, pr, sameGapDecisions } = {}) {
   if (!referral?.key || !referral.finding || !head || !repo || !pr
     || !Array.isArray(records) || !Array.isArray(operatorRulings)) return null;
+  // A legacy-owner block stays under its written spelling. It must still veto a sibling carry, including one
+  // already persisted, or an adopted clearance on another run could erase the hold. Unlike visible blocks,
+  // these cannot participate in exact thread-order overrides: only an explicit ruling on the target can clear it.
+  for (const o of operatorRulings) {
+    if (!o || o.result !== 'block' || o.head !== head || o.pr !== pr || o.repo === repo
+      || canonicalRepoSlug(o.repo) !== canonicalRepoSlug(repo)) continue;
+    const record = records.find(r => r?.runId === o.runId && r.head === head && r.repo === repo && r.pr === pr);
+    const ruled = record?.referrals?.find(f => f.key === o.key);
+    if (!ruled?.finding || o.key === referral.key || sameGapSameHead(
+      { ...ruled.finding, original: ruled.original ?? ruled.finding },
+      { ...referral.finding, original: referral.original ?? referral.finding }, { decisions: sameGapDecisions })) return null;
+  }
   const seen = new Set();
   for (const o of [...operatorRulings].reverse()) {
     if (!o || o.head !== head || o.repo !== repo || o.pr !== pr || !o.runId || !o.key) continue;
@@ -3396,7 +3435,7 @@ export function reviewerCarryBacking(carried, { records = [], operatorRulings = 
   }
   // An operator ruling is decided by the LATEST one on its (head, run, finding): a block the operator later re-ruled
   // is no longer standing (the same rule `carriedBackingHolds` applies to an operator carry).
-  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === repo && o.pr === pr);
+  const ops = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameOwnerRuling(o, repo) && o.pr === pr);
   if (ops.some(o => o.result === 'block' && sameId(o.head, o.runId, o.key)
     && ops.filter(p => p.head === o.head && p.runId === o.runId && p.key === o.key).at(-1) === o)) return null;
   return ruling;
@@ -3543,8 +3582,16 @@ export function referralRecordState(record, options = {}) {
     // #4979 — the operator's ruling on THIS exact (repo, PR, head, run, finding) is the explicit, authorized
     // supersession: the latest one decides, over the reviewer's. It is pinned to the record's head, so a new
     // head (or an unreadable card) leaves the finding pending exactly like a reviewer ruling would.
-    const operator = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.repo === record.repo
-      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key).at(-1);
+    const onSubject = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => sameOwnerRuling(o, record.repo)
+      && o.pr === record.pr && o.head === record.head && o.runId === record.runId && o.key === f.key);
+    // A legacy-owner block stays invisible as a ruling (it holds the finding PENDING, never cleared), so one written
+    // after a clearance spelled as the record withdraws that clearance instead of being skipped by the spelling filter.
+    const operator = onSubject.filter(o => !isLegacyOwnerBlock(o, record.repo)).at(-1);
+    if (operator && operator.result !== 'block'
+      && onSubject.slice(onSubject.lastIndexOf(operator) + 1).some(o => isLegacyOwnerBlock(o, record.repo))) {
+      pending.push(f.key);
+      continue;
+    }
     if (operator) {
       if (head !== record.head || (operator.result === 'card' && !cardReadable(operator.card))) pending.push(f.key);
       else { rulings.push(operator); if (operator.result === 'block') blocked.push(f.key); }
@@ -3868,6 +3915,40 @@ export function readOperatorRulings(comments, { head } = {}) {
   const rulings = [];
   let malformed = false;
   const current = /^[a-f0-9]{40}$/.test(head ?? '') ? head : null;
+  // #6170 — a repo that changed owner is spelled two ways in one thread (a ruling written from a clone with the old
+  // origin, records written under the new name). A ruling takes the spelling of the ONE record it rules on, found by
+  // (pr, head, run) and alias-equal repo, so every later exact comparison against that record still holds and nothing
+  // else about the match loosens. No such record: the ruling keeps the spelling it was written with.
+  let recordRepos, blockRepos;
+  const blockSubject = (repo, pr, head, runId, key) => JSON.stringify([canonicalRepoSlug(repo), pr, head, runId, key]);
+  const spellingOf = (repo, pr, head, runId, key, result) => {
+    // A `block` never adopts: only a clearing ruling is made MORE visible, so a spelling mismatch can never hide a hold.
+    if (result === 'block' || canonicalRepoSlug(repo) === repo) return repo;
+    recordRepos ??= readReferralRecords(comments).records;
+    // Only a record that names THIS finding counts, and only when every such record agrees on one spelling: an
+    // ambiguous match keeps the ruling's own spelling, so it can never attach to a record it does not rule.
+    const spellings = new Set(recordRepos.filter(x => x.pr === pr && x.head === head && x.runId === runId
+      && canonicalRepoSlug(x.repo) === canonicalRepoSlug(repo) && x.referrals.some(f => f.key === key)).map(x => x.repo));
+    if (spellings.size !== 1) return repo;
+    const [recordRepo] = spellings;
+    // Only a block on this exact subject that would stay invisible under the record's spelling vetoes adoption.
+    // Blocks already spelled like the record retain ordinary thread ordering, including later operator overrides.
+    if (!blockRepos) {
+      blockRepos = new Map();
+      for (const c of Array.isArray(comments) ? comments : []) {
+        const r = parseOperatorRulingComment(c)?.record;
+        if (!r) continue;
+        for (const y of r.rulings) {
+          if (y.result !== 'block') continue;
+          const subject = blockSubject(r.repo, r.pr, r.head, y.runId, y.key);
+          if (!blockRepos.has(subject)) blockRepos.set(subject, new Set());
+          blockRepos.get(subject).add(r.repo);
+        }
+      }
+    }
+    const blocks = blockRepos.get(blockSubject(repo, pr, head, runId, key));
+    return blocks && [...blocks].some(spelling => spelling !== recordRepo) ? repo : recordRepo;
+  };
   for (const comment of Array.isArray(comments) ? comments : []) {
     const parsed = parseOperatorRulingComment(comment);
     if (!parsed) continue;
@@ -3875,7 +3956,7 @@ export function readOperatorRulings(comments, { head } = {}) {
     if (parsed.malformed) { malformed ||= !(current && parsed.head && parsed.head !== current); continue; }
     const r = parsed.record;
     for (const x of r.rulings) {
-      rulings.push(Object.freeze({ operator: true, repo: r.repo, pr: r.pr, head: r.head, runId: x.runId, key: x.key,
+      rulings.push(Object.freeze({ operator: true, repo: spellingOf(r.repo, r.pr, r.head, x.runId, x.key, x.result), pr: r.pr, head: r.head, runId: x.runId, key: x.key,
         result: x.result, ...(x.cause ? { cause: x.cause } : {}), ...(x.lens ? { lens: x.lens } : {}), ...(x.card ? { card: x.card } : {}), ...(x.supersedes ? { supersedes: [...x.supersedes] } : {}), actor: r.actor, channel: r.channel, reason: r.reason,
         at: r.at, clearerId: r.clearerId }));
     }
