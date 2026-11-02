@@ -145,3 +145,17 @@ it('refreshes last-event time on a closed row and never expires a reopened PR', 
   write(log, T + 2 * INTERVAL);
   expect(storage.listProjection('prs').map((r) => r.number)).toEqual([2]);
 });
+
+it('reports coverage false for a repo whose pruned check evidence belongs to a reopened PR on the same SHA', () => {
+  const storage = core.createMemoryStorage(), log = core.createEventLog(storage, { prRetentionMs: 0, tombstoneRetentionMs: 0 });
+  log.bootstrap({ repo: 'o/r', importId: 'i', baseCursor: 0, status: 'complete', prs: [] }, T);
+  log.append(event(1, 'opened', 'S'), T);
+  log.append({ repo: 'o/r', prs: [1], sha: 'S', type: 'check_run', name: 'security', conclusion: 'failure' }, T);
+  log.append(event(1, 'closed', 'S'), T);
+  write(log, T + INTERVAL); // prunes the closed PR and its exclusive failing check
+  expect(storage.listProjection('checks').filter((c) => c.repo === 'o/r')).toEqual([]);
+  log.append(event(1, 'reopened', 'S'), T + INTERVAL + 1);
+  const body = log.readPrs(null, 10, T + INTERVAL + 2);
+  expect(body.prs.find((r) => r.number === 1)?.checks ?? []).toEqual([]);
+  expect(body.repos['o/r'].coverage).toBe(false);
+});

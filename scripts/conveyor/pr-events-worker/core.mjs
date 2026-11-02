@@ -157,6 +157,7 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
     // A check run is identified by name AND app: two apps may report the same name for the same SHA.
     const checkKey = checkProjectionKey(event);
     const previous = get('checks', checkKey);
+    if (get('prunedEvidence', checkKey)) storage.deleteProjection('prunedEvidence', checkKey); // re-delivered: evidence is whole again
     put('checks', checkKey, { ...event, prs: [...new Set([...(previous?.prs || []), ...(event.prs || [])])] });
   }
   const associated = sha ? get('shas', key(repo, sha)) || [] : [];
@@ -246,7 +247,11 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
     const shaKey = JSON.stringify([c.repo, c.sha]);
     if (kept.length === prs.length && !deadShas.has(shaKey)) continue;
     const associated = c.sha && storage.getProjection('shas', shaKey);
-    if (!kept.length && !(Array.isArray(associated) && associated.length)) storage.deleteProjection('checks', key);
+    if (!kept.length && !(Array.isArray(associated) && associated.length)) {
+      // Deleting evidence must stay visible: a PR reopened on this SHA is not covered until the check is re-delivered.
+      if (c.sha) storage.putProjection('prunedEvidence', key, { repo: c.repo, sha: c.sha, prunedAt: now });
+      storage.deleteProjection('checks', key);
+    }
     else storage.putProjection('checks', key, { ...c, prs: kept });
   }
 }
@@ -485,6 +490,7 @@ function repoFreshness(storage, head, now) {
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
   const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i]));
   const openRows = storage.listProjection('prs').filter((r) => isPrRow(r) && r.state === 'open');
+  const pruned = new Set(storage.listProjection('prunedEvidence').filter(isObject).map((e) => JSON.stringify([e.repo, e.sha])));
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
   const out = {};
   for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
@@ -496,7 +502,9 @@ function repoFreshness(storage, head, now) {
     // Open rows the Worker holds that the latest COMPLETE listing left out (rows a later event touched are newer, not omitted).
     const omittedOpen = b && b.status === 'complete' ? openRows.filter((r) => r.repo === repo && (r.fields?.state || 0) <= b.baseCursor &&
       !(imports.get(repo)?.listed || []).includes(r.number)).map((r) => r.number).sort((x, y) => x - y) : [];
-    out[repo] = { bootstrapAt, lastEventAt, omittedOpen, coverage: !omittedOpen.length && !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
+    // An open row on a SHA whose check evidence was pruned cannot prove its checks: this repo is not covered.
+    const lostEvidence = openRows.some((r) => r.repo === repo && r.sha && pruned.has(JSON.stringify([r.repo, r.sha])));
+    out[repo] = { bootstrapAt, lastEventAt, omittedOpen, coverage: !lostEvidence && !omittedOpen.length && !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
       (imports.get(repo)?.others || []).every((c) => c < b.baseCursor) };
   }
   return out;

@@ -177,6 +177,26 @@ describe('full mirror pagination', () => {
     expect(mirror.cursor).toBe(1);
   });
 
+  it('stops a full pull that exceeds the page cap and fails closed to GitHub', async () => {
+    let calls = 0;
+    const result = await refreshMirror(null, { ...options, maxFullPages: 3, fetchImpl: async () => new Response(JSON.stringify({
+      ...first, prs: [row(++calls)], prsCursor: calls, prsAfter: JSON.stringify(['o/r', calls]), prsMore: true })) });
+    expect(result.mode).toBe('failed');
+    expect(result.error).toMatch(/page cap/);
+    expect(calls).toBe(3);
+  });
+
+  it('stops a full pull that exceeds the overall deadline even when every request is fast', async () => {
+    let calls = 0, t = 0;
+    const result = await refreshMirror(null, { ...options, fullDeadlineMs: 100, clock: () => t, fetchImpl: async () => {
+      t += 60; calls += 1;
+      return new Response(JSON.stringify({ ...first, prs: [row(calls)], prsCursor: calls, prsAfter: JSON.stringify(['o/r', calls]), prsMore: true }));
+    } });
+    expect(result.mode).toBe('failed');
+    expect(result.error).toMatch(/deadline/);
+    expect(calls).toBeLessThanOrEqual(3);
+  });
+
   it('reads all 501 tied bootstrap rows through the real Worker and retains complete coverage', async () => {
     const w = worker();
     w.bootstrap(Array.from({ length: 501 }, (_, n) => ({ number: n + 1, sha: `sha-${n}`, draft: false, state: 'open', labels: [] })));

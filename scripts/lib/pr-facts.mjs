@@ -63,6 +63,8 @@ export const PR_FACTS_DEFAULTS = Object.freeze({
   staleAfterMs: PR_EVENTS_DEFAULTS.staleAfterMs, // no webhook delivery for this long → feed 'stale' → null
   maxDeltaPages: 5,        // a backlog deeper than this many /events pages → one full /prs pull instead
   pageLimit: 500,
+  maxFullPages: 100,       // a full /prs pull (restarts included) never walks more pages than this; beyond it → GitHub
+  fullDeadlineMs: 120_000, // ...nor runs longer than this overall (the per-request timeout alone resets every page)
   timeoutMs: PR_EVENTS_DEFAULTS.timeoutMs,
   lockWaitMs: 10_000,
   lockStaleMs: 60_000,
@@ -293,9 +295,12 @@ async function withAsyncLock(lockPath, fn, { waitMs, staleMs }) {
  * judges `feed-unreachable` and every read falls back to GitHub.
  */
 export async function refreshMirror(prev, { repo, url, token, fetchImpl = globalThis.fetch, nowMs = Date.now(),
-  timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
+  timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit,
+  maxFullPages = PR_FACTS_DEFAULTS.maxFullPages, fullDeadlineMs = PR_FACTS_DEFAULTS.fullDeadlineMs, clock = Date.now } = {}) {
   const io = { fetchImpl, timeoutMs };
   const full = async () => {
+    const startedAt = clock();
+    let pagesFetched = 0;
     retry: for (let restarts = 0; restarts <= 2; restarts += 1) {
       const prs = [];
       let first, snapshot, cursor = null, after = null, key = null;
@@ -303,7 +308,12 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
         const q = new URLSearchParams({ prsLimit: String(pageLimit) });
         if (cursor != null) q.set('prsCursor', String(cursor));
         if (after != null) q.set('prsAfter', after);
-        const body = await getJson(`${url}/prs?${q}`, token, io);
+        if (pagesFetched >= maxFullPages) throw new Error(`full /prs pull exceeded the page cap (${maxFullPages})`);
+        const remaining = fullDeadlineMs - (clock() - startedAt);
+        if (remaining <= 0) throw new Error(`full /prs pull exceeded the overall deadline (${fullDeadlineMs}ms)`);
+        pagesFetched += 1;
+        const body = await getJson(`${url}/prs?${q}`, token, { ...io, timeoutMs: Math.min(timeoutMs, remaining) });
+        if (clock() - startedAt > fullDeadlineMs) throw new Error(`full /prs pull exceeded the overall deadline (${fullDeadlineMs}ms)`);
         if (!body || !Array.isArray(body.prs) || typeof body.prsMore !== 'boolean') throw new Error('malformed /prs page');
         validateServedRows(body.prs, repo);
         if (!Number.isSafeInteger(body.stateCursor) || body.stateCursor < 0 || !Array.isArray(body.coverage?.bootstrap) ||
