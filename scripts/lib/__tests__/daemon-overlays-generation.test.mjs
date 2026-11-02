@@ -540,12 +540,12 @@ describe('overlay registration generations', () => {
     expect(f.list()).toEqual([replacement]);
   });
 
-  it("smoke suspect without its own registrationId is removed using the plan's bound id", () => {
+  it("smoke suspect with its registrationId is removed without a plan", () => {
     const f = fixture();
     const bound = f.add();
     const alert = vi.fn();
-    dropSuspectOverlays({ root: f.root, env: f.env, suspects: [{ ref: REF, pr: bound.pr }],
-      plan: { applied: [bound] }, failed: 'smoke', alert });
+    dropSuspectOverlays({ root: f.root, env: f.env, suspects: [{ ref: REF, pr: bound.pr, registrationId: bound.registrationId }],
+      failed: 'smoke', alert });
     expect(f.list()).toEqual([]);
     expect(alert.mock.calls.map(([kind]) => kind)).toEqual(['overlay-dropped-smoke-failed']);
     const events = readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);

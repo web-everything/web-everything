@@ -225,6 +225,24 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     expectAbsent(sinksOf(f, r), ['requires approval', 'deploy', 'papaword9x', 'quebecword10x']);
   });
 
+  it('dispatch-failure removal does not delete a replacement registration', async () => {
+    const f = makeFixture();
+    addDispatchOverlay(f);
+    const original = readOverlayState(f.cloneDir, { env: f.env }).overlays[0];
+    let replacement;
+    const r = await rebuild(f, async () => {
+      addOverlay(f.cloneDir, { ref: original.ref, pr: original.pr, addedBy: 'replacement' }, { env: f.env });
+      replacement = readOverlayState(f.cloneDir, { env: f.env }).overlays[0];
+      return { ok: false, reason: 'commands-denied' };
+    });
+    expect(replacement.registrationId).not.toBe(original.registrationId);
+    expect(r.adopted).toBeFalsy();
+    expect(readOverlayState(f.cloneDir, { env: f.env }).overlays).toEqual([replacement]);
+    expect(r.alerts).toContainEqual({ kind: 'overlay-registration-changed', detail: { ref: original.ref } });
+    expect(r.alerts.map((a) => a.kind)).not.toContain('overlay-dropped-dispatch-smoke-failed');
+    expect(sinksOf(f, r).join('\n')).not.toContain('dropped-dispatch-smoke-failed');
+  });
+
   it('an injected result cannot push free text through the alert diagnostics', async () => {
     const f = makeFixture();
     addDispatchOverlay(f);
@@ -362,8 +380,50 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     const runSmoke = vi.fn().mockResolvedValueOnce(FAIL).mockResolvedValue(PASS);
     const r = await rebuild(f, run, { runSmoke });
     expect(r.reason).toBe('fallback-plain-main');
+    expect(refs(f)).toEqual([]);
+    expect(r.alerts.map((a) => a.kind)).toContain('overlay-dropped-smoke-failed');
     expect(run).not.toHaveBeenCalled();
   });
+
+  it.each(['unchanged', 'suspect replaced', 'retained replaced'])(
+    'fallback suspects carry registration ids and removal is CAS-bound (%s)', async (change) => {
+      const f = makeFixture();
+      addDispatchOverlay(f, 'lane/bad', 'bad.mjs');
+      addDispatchOverlay(f, 'lane/kept');
+      const original = readOverlayState(f.cloneDir, { env: f.env }).overlays;
+      let replacement;
+      const runSmoke = vi.fn(async () => {
+        if (runSmoke.mock.calls.length === 1) return {
+          ...FAIL, smoke: { results: [{ ok: false, name: 'x', detail: 'boom', entries: [{ files: ['bad.mjs'] }] }] },
+        };
+        if (change !== 'unchanged') {
+          const ref = change === 'suspect replaced' ? 'lane/bad' : 'lane/kept';
+          addOverlay(f.cloneDir, { ref, pr: 77, addedBy: 'replacement' }, { env: f.env });
+          replacement = readOverlayState(f.cloneDir, { env: f.env }).overlays.find((o) => o.ref === ref);
+        }
+        return PASS;
+      });
+      const r = await rebuild(f, async () => ({ ok: true, reason: 'passed' }), { runSmoke });
+      expect(r.reason).toBe('overlay-set-aside');
+      expect(runSmoke).toHaveBeenCalledTimes(2);
+      expect(r.setAside.dropped[0].registrationId).toBe(original[0].registrationId);
+      if (change === 'retained replaced') {
+        expect(r.adopted).toBeFalsy();
+        expect(refs(f)).toEqual(['lane/bad', 'lane/kept']);
+      } else {
+        expect(r.adopted).toBe(true);
+        expect(readRebuildState(f.cloneDir, f.env).adopted.applied).toEqual([
+          expect.objectContaining({ ref: 'lane/kept', registrationId: original[1].registrationId }),
+        ]);
+        expect(refs(f)).toEqual(change === 'unchanged' ? ['lane/kept'] : ['lane/bad', 'lane/kept']);
+      }
+      if (replacement) {
+        expect(readOverlayState(f.cloneDir, { env: f.env }).overlays).toContainEqual(replacement);
+        expect(r.alerts).toContainEqual({ kind: 'overlay-registration-changed', detail: { ref: replacement.ref } });
+        expect(r.alerts.map((a) => a.kind)).not.toContain('overlay-dropped-smoke-failed');
+      } else expect(r.alerts.map((a) => a.kind)).toContain('overlay-dropped-smoke-failed');
+    },
+  );
 
   it('adopting a candidate "as no worse" (harness broken) still requires the dispatch smoke', async () => {
     const f = makeFixture();

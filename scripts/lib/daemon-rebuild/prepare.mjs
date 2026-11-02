@@ -700,7 +700,7 @@ export async function prepareRebuild({
           lease: { token: ready.token ?? null },
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
-              root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
+              root, env, suspects: m.dropRefs.map(({ ref, pr, registrationId }) => ({ ref, pr, registrationId })), failed: m.failed, alert: finAlert,
             })
             : undefined,
         });
