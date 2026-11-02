@@ -7,12 +7,53 @@ import { dirname, join } from 'node:path';
 import { withFrozenBacklogDir } from './frozen-backlog';
 import { normalizeBriefScope } from '../../../scripts/operations/dispatch-lane.mjs';
 import { dispatchPlan } from '../../../scripts/readiness/dispatch-plan.mjs';
+import { LOCI } from '../../../scripts/check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
 const { normalizeScope } = require('../backlog.js');
 const matter = require('gray-matter');
 
 describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
+  it.each([
+    { name: 'FrontierUI tag with bare paths', tags: ['frontierui'], scope: ['src/a.mjs b.mjs,src/c.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs', 'fui:b.mjs', 'fui:src/c.mjs'] },
+    { name: 'FrontierUI tag alias', tags: ['frontier-ui'], scope: ['src/a.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs'] },
+    { name: 'Plateau tag', tags: ['plateau-app'], scope: ['src/a.mjs'], locus: 'plateau-app', expected: ['plateau:src/a.mjs'] },
+    { name: 'explicit locus overrides tags', tags: ['frontierui'], authored: 'plateau-app', scope: ['src/a.mjs'], locus: 'plateau-app', expected: ['plateau:src/a.mjs'] },
+    { name: 'bare entry before explicit scope overrides tags', tags: ['frontierui'], scope: ['src/a.mjs', 'WE:src/b.mjs'], locus: 'webeverything', expected: ['we:src/a.mjs', 'we:src/b.mjs'] },
+    { name: 'bare entry inherits inferred scope locus', tags: [], scope: ['src/a.mjs', 'FrontierUI:src/b.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs', 'fui:src/b.mjs'] },
+    { name: 'no signals defaults to WE', tags: [], scope: ['src/a.mjs'], locus: 'webeverything', expected: ['we:src/a.mjs'] },
+  ])('infers locus before qualifying scope: $name', ({ tags, scope, authored, locus, expected }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'scope-locus-'));
+    const modulePath = require.resolve('../backlog.js');
+    const cached = require.cache[modulePath];
+    try {
+      writeFileSync(join(dir, '99999-scope.md'), matter.stringify('Scope fixture.', {
+        title: 'Scope', status: 'open', tags, scope, ...(authored ? { locus: authored } : {}),
+      }));
+      delete require.cache[modulePath];
+      const load = withFrozenBacklogDir(dir, () => require('../backlog.js'));
+      // Both public entry points must derive the same gate and canonical scheduling scope.
+      for (let read = 0; read < 2; read++) {
+        const cards = read === 0 ? load() : load.loadBacklogScoped(['99999-scope.md']);
+        const item = cards.find((card: { num: string }) => card.num === '99999');
+        expect.soft(item.locus).toBe(locus);
+        expect.soft(item.locusAuthored).toBe(Boolean(authored));
+        expect.soft(item.scope).toEqual(expected);
+        expect.soft(item.scopeDisplay).toEqual(scope);
+        expect.soft(LOCI[item.locus]).toEqual(LOCI[locus]);
+        if (locus === 'frontierui') {
+          expect.soft(LOCI[item.locus].repoPath).toBe('../frontierui');
+          expect.soft(LOCI[item.locus].gateCommand).toBe('npm run check:standards');
+        }
+        expect.soft(normalizeBriefScope(item.scope)).toEqual(expected);
+      }
+    } finally {
+      if (cached) require.cache[modulePath] = cached;
+      else delete require.cache[modulePath];
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('accepts every open backlog card scope through the dispatcher', () => {
     const dir = join(dirname(require.resolve('../backlog.js')), '../../backlog');
     const open = readdirSync(dir).filter((file) => file.endsWith('.md')).map((file) => ({
