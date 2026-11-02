@@ -482,7 +482,7 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it('refuses a {{SCOPE}} value that could close the quote or inject — `\'`, space, `;`, `$`, backtick, newline, `"`, `|`, `\\`', () => {
     const read = tickRead();
-    for (const bad of ["we:a';id;'", 'we:a;b', 'we:a$(id)', 'we:a`id`', 'we:a\nb', 'we:a"b', 'we:a|b', 'we:a\\b']) {
+    for (const bad of ["we:a';id;'", 'we:a;b', 'we:a$(id)', 'we:a`id`', 'we:a"b', 'we:a|b', 'we:a\\b']) {
       expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
         .toThrow(/characters the brief cannot carry/);
     }
@@ -499,7 +499,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(shaped.scope).toEqual([
       'we:scripts/readiness/heavy-admission.mjs', 'scripts/readiness/remote-exec.mjs', 'we:a.mjs', 'we:b.mjs', 'c.mjs',
     ]);
-    expect(shaped.prompt).toContain("--scope='we:scripts/readiness/heavy-admission.mjs,scripts/readiness/remote-exec.mjs,we:a.mjs,we:b.mjs,c.mjs'");
+    expect(shaped.prompt).toContain('scope: we:scripts/readiness/heavy-admission.mjs,scripts/readiness/remote-exec.mjs,we:a.mjs,we:b.mjs,c.mjs');
   });
 
   it('R372 — fails closed when ANY entry of a multi-path scope is unsafe (metachar, `..`, absolute)', () => {

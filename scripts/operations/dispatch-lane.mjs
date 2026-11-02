@@ -410,6 +410,33 @@ export const BRIEF_VALUE_RE = /^[A-Za-z0-9_.,:/@#-]+$/;
 export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
 
 /**
+ * R372 — a card's `scope:` entry may name several paths in one string (`a.mjs b.mjs`): split every entry on
+ * whitespace or commas, so the lane-lease consumer still gets the comma-joined list it expects. Each piece is
+ * checked against {@link BRIEF_SCOPE_VALUE_RE}, then refused if it carries a `..` segment or is absolute (with or
+ * without a `repo:` prefix). FAIL CLOSED: one bad piece throws for the whole scope.
+ */
+export function normalizeBriefScope(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const entry of raw) {
+    for (const piece of String(entry ?? '').split(/[\s,]+/).filter(Boolean)) {
+      if (!BRIEF_SCOPE_VALUE_RE.test(piece)) {
+        throw new Error(
+          `dispatch-lane: the value for {{SCOPE}} (${JSON.stringify(piece)}) has characters the brief cannot carry `
+          + 'safely — it is pasted into a shell command the agent is told to run. Refusing.',
+        );
+      }
+      const path = piece.replace(/^[A-Za-z][\w-]*:/, '');
+      if (path.startsWith('/') || path.split('/').includes('..')) {
+        throw new Error(`dispatch-lane: unsafe scope entry ${JSON.stringify(piece)} — absolute paths and \`..\` are refused for {{SCOPE}}.`);
+      }
+      out.push(piece);
+    }
+  }
+  return out;
+}
+
+/**
  * What `{{GATE_COMMAND}}`/`{{ATTRIBUTION}}` (#3960) may contain — WIDER than {@link BRIEF_VALUE_RE} on
  * purpose, and for a different reason than that regex's own id/path/lane-number shape.
  *
@@ -1069,7 +1096,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
   }
   const item = raw.item && typeof raw.item === 'object' ? raw.item : null;
   const specPath = String(item?.specPath || '').trim();
-  const itemScope = Array.isArray(item?.scope) ? item.scope.map(String).filter(Boolean) : [];
+  const itemScope = normalizeBriefScope(item?.scope);
   if (blocked('item-spec', !specPath, specPath)) {
     throw new Error(`dispatch-lane.read: no backlog file resolved for #${resolvedNum} — the brief needs the item's spec path`);
   }
