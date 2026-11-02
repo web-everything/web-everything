@@ -4,8 +4,10 @@
  */
 import { register } from 'node:module';
 import { isMainThread } from 'node:worker_threads';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const tool = new URL('../../lane-pool.mjs', import.meta.url).href;
+const tool = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)), '../../lane-pool.mjs')).href;
 if (isMainThread) register(import.meta.url);
 
 export async function load(url, context, nextLoad) {

@@ -2,7 +2,7 @@ import { beforeEach, afterEach, afterAll, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
 import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
@@ -146,7 +146,9 @@ if (hermetic) {
 process.env.WE_UNDER_TEST = '1';
 // Native fixture children inject the freshness check through its parameter. The
 // production entry has no VITEST exemption; guard tests use independent copies.
-const lanePoolFixtureLoader = new URL('./scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs', import.meta.url).href;
+// Build a filesystem URL explicitly: Vite rewrites new URL(relative, import.meta.url)
+// into an HTTP asset URL in the DOM test tier, which native Node cannot preload.
+const lanePoolFixtureLoader = pathToFileURL(join(REPO_ROOT, 'scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs')).href;
 if (!process.env.NODE_OPTIONS?.includes(`--import=${lanePoolFixtureLoader}`)) {
   process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS || ''} --import=${lanePoolFixtureLoader}`.trim();
 }
