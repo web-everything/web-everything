@@ -598,7 +598,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // R365 fix 5 — `review.finalHeadSeats` (see `../lib/review-final-head-seats.mjs`) and the PR's live head.
     finalHeadSeatsSetting: () => resolveFinalHeadSeats({ env }),
     liveHead: ({ pr, repo }) => {
-      try { return JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })).headRefOid ?? null; } catch { return null; }
+      try { return JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })).headRefOid ?? null; } catch { return null; }
     },
     // Read the existing quota and queue signals; never invent a second outage detector.
     reviewInfraBlock: () => {
@@ -1035,9 +1035,14 @@ function finalHeadSeatsGate(input, io) {
   let setting;
   try { setting = io.finalHeadSeatsSetting?.(); } catch { setting = null; }
   if (!setting) return { run: true, skip: false, reason: 'no final-head setting' };
-  let liveHead = null;
-  try { liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo }) ?? null; } catch { liveHead = null; }
-  const d = decideFinalHeadSeats({ loopPayload: input.loopPayload, liveHead, setting });
+  let d = decideFinalHeadSeats({ loopPayload: input.loopPayload, setting });
+  // Only a potential final head needs supersession evidence. Off, definitive changes
+  // (including shadow), and missing verdicts already have a decision without a lookup.
+  if (d.reason === 'final head') {
+    let liveHead = null;
+    try { liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo }) ?? null; } catch { liveHead = null; }
+    d = decideFinalHeadSeats({ loopPayload: input.loopPayload, liveHead, setting });
+  }
   if (d.reason !== 'final head' && d.reason !== 'final-head seats off') {
     io.log(`review-job: final-head seats (${setting.mode}): ${d.skip ? 'SKIP' : 'would skip (shadow, running)'} — ${d.reason}`);
   }
