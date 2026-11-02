@@ -1,10 +1,12 @@
 import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { cpus, loadavg } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { shellQuote } from './verify-lane-gate.mjs';
 
 function simpleShellWords(command) {
   if (/[\r\n]/.test(command)) return null;
@@ -82,7 +84,12 @@ function wrappedChain(command) {
   return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
 }
 
+// Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
+export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
+  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
+    return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
+  }
   if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
     const wrapped = decision?.remote === true ? wrappedChain(command) : null;
     if (wrapped || command.split(' && ').some(isVitestSegment)) {
@@ -102,7 +109,7 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
   // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
   // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
-  return plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
+  return !plan?.shardWrapper && plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
     && ranOn.failureLocation === 'remote'
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
     && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
