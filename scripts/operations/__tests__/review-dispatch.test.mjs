@@ -613,8 +613,9 @@ describe('isReviewCodePath (#4387)', () => {
       'scripts/lib/__tests__/review-core.test.mjs', 'docs/review/x.mjs', '', null, undefined,
     ].some(path => isReviewCodePath(path, { closure }))).toBe(false);
   });
-  it('keeps unrelated code relevant when the real sandbox graph has unwalked CommonJS dependencies', () => {
-    expect(isReviewCodePath('scripts/lane-pool.mjs')).toBe(true);
+  it('keeps unrelated code outside the real sandbox graph', () => {
+    expect(reviewSandboxClosure().complete).toBe(true);
+    expect(isReviewCodePath('scripts/lane-pool.mjs')).toBe(false);
     expect(isReviewCodePath('backlog/4387-review.md')).toBe(false);
   });
   // PR #2916 review: the dispatcher's own direct imports (provider routing, session isolation, the gh shim in
@@ -720,13 +721,13 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });
 
-  it('refuses unrelated code lag before spawning when the default sandbox graph has unwalked CommonJS', () => {
+  it('dispatches despite unrelated code lag with the default sandbox graph', () => {
     const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
     managed();
-    expect(reviewSandboxClosure().complete).toBe(false);
-    const spawnAgent = vi.fn();
-    expect(() => run(root, { spawnAgent })).toThrow(/3 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
-    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(reviewSandboxClosure().complete).toBe(true);
+    const spawnAgent = vi.fn(() => '');
+    expect(() => run(root, { spawnAgent })).not.toThrow();
+    expect(spawnAgent).toHaveBeenCalledOnce();
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3');
   });
 

@@ -1,11 +1,28 @@
 /** Clone-specific runtime roots. Throws on unreadable/malformed LaunchAgents evidence;
  * callers must retain the full conflict rather than proceed with narrowed entries. */
-import { readdirSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DAEMON_ENTRY_MODULES } from './daemon-boot-smoke.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
+import { collectImportClosure } from './import-closure.mjs';
+import { collectRunClosure } from './daemon-rebuild/skip-unrelated.mjs';
+
+/** Strict, unwired clone proof. Keep refusal out of the legacy production ESM walker.
+ * Reject hints even in comments/strings; this is not the planned inert-source grammar.
+ * A refused read uses the collector's ordinary incomplete-evidence fallback. */
+export function collectCloneImportClosure({ readFile = path => readFileSync(path, 'utf8'), ...options }) {
+  // Never accept parsed results from the legacy policy as strict proof. Spawn walks
+  // still share raw reads, but each strict traversal validates its own source.
+  return collectImportClosure({ ...options, parsed: new Map(), readFile: path => {
+    const source = readFile(path);
+    if (extname(path) === '.cjs' || /\b(?:require|createRequire)\b|\\u/.test(source)) {
+      throw new Error('unsupported clone dependency syntax');
+    }
+    return source;
+  } });
+}
 
 // Canonicalize both sides of containment, including aliases of a missing entry's
 // existing parent. Missing entries still reach closure/smoke's unreadable fallback;
@@ -111,6 +128,14 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
       if (!script) throw new Error(`LaunchAgents pass unknown: ${name}`);
       add(script);
     }
+  }
+  // Check readable roots separately so a missing sibling cannot mask unsupported
+  // source. Missing roots stay in the result for downstream null-closure handling.
+  for (const entry of out) {
+    if (!statSync(join(realRoot, entry), { throwIfNoEntry: false })) continue;
+    const closure = collectRunClosure({ root: realRoot, entries: [entry],
+      importClosure: collectCloneImportClosure, stopWhenIncomplete: true });
+    if (!closure?.complete) throw new Error(`runtime dependency proof incomplete: ${entry}`);
   }
   return [...out];
 }

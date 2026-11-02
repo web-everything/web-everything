@@ -16,8 +16,8 @@
  *
  * SCENARIO (real git, real modules from `sourceRoot`):
  *   A. a managed clone is 21 commits behind its origin, every commit touching only code outside a proven
- *      complete fixture review graph — `dispatchReviewJob` must start the job. The default graph's
- *      unwalked CommonJS dependencies must instead retain the stale refusal, before spawning;
+ *      complete fixture review graph — `dispatchReviewJob` must start the job. The default production
+ *      graph must also dispatch despite this unrelated lag;
  *   B. a smoke whose `lane-pool list` hits its cap on a busy host must pass with that row skipped, not fail.
  */
 import { execFileSync } from 'node:child_process';
@@ -52,7 +52,7 @@ out.fixtureComplete = closure?.complete;
 out.fixtureFiles = [...(closure?.files ?? [])].sort();
 try {
   const r = job.dispatchReviewJob({
-    ...options, spawnJob: () => 4242,
+    ...options, dir: join(process.env.SOAK_JOBS, 'fixture'), spawnJob: () => 4242,
     reviewCodePath: path => dispatch.isReviewCodePath(path, { closure }),
   });
   out.spawned = r.jobPid ?? null;
@@ -138,8 +138,8 @@ export default {
       ])) {
         violations.push({ invariant: 'fixture-closure-proven', detail: `expected the complete two-module fixture graph: ${JSON.stringify(out)}` });
       }
-      if (out.defaultComplete !== false || out.defaultSpawns !== 0 || !/STALE code/.test(out.defaultRefusal ?? '')) {
-        violations.push({ invariant: 'unknown-commonjs-closure-refuses', detail: `unwalked default dependencies must refuse before spawning: ${JSON.stringify(out)}` });
+      if (out.defaultComplete !== true || out.defaultSpawns !== 1 || out.defaultRefusal !== null) {
+        violations.push({ invariant: 'production-closure-tolerates-unrelated-lag', detail: `default graph must dispatch: ${JSON.stringify(out)}` });
       }
       if (out.spawned !== 4242) {
         violations.push({

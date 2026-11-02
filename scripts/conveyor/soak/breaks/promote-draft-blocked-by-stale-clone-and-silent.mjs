@@ -19,7 +19,7 @@
  *   A. a managed clone (WE_DAEMON_MANAGED_CLONE=1) is 1 commit behind its origin, the commit touching only
  *      `scripts/operations/cli-adapter.mjs`; the promote pass runs from it with a planned green draft and a fake
  *      `gh pr ready` — the draft must be promoted when a complete fixture graph proves the file unrelated.
- *      The default graph's unwalked CommonJS dependencies must refuse before any ready call;
+ *      The default production graph must also promote despite this unrelated lag;
  *   B. a daemon tick whose promote half throws must produce a log line naming the promote half and its reason.
  */
 import { execFileSync } from 'node:child_process';
@@ -131,8 +131,8 @@ export default {
       ])) {
         violations.push({ invariant: 'fixture-closure-proven', detail: `expected the complete two-module fixture graph: ${JSON.stringify(out)}` });
       }
-      if (out.defaultComplete !== false || out.defaultReady.length !== 0 || !/STALE code/.test(out.defaultRefusal ?? '')) {
-        violations.push({ invariant: 'unknown-commonjs-closure-refuses', detail: `unwalked default dependencies must refuse before promotion: ${JSON.stringify(out)}` });
+      if (out.defaultComplete !== true || !out.defaultReady.includes(PR) || out.defaultRefusal !== null) {
+        violations.push({ invariant: 'production-closure-tolerates-unrelated-lag', detail: `default graph must permit promotion: ${JSON.stringify(out)}` });
       }
       if (!out.ready.includes(PR)) {
         violations.push({

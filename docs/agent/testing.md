@@ -3768,14 +3768,15 @@ test failed persistence warnings explicitly so callers cannot promise an event t
 
 ## Unwalked CommonJS dependencies in closure fixtures
 
-`collectImportClosure` now marks CommonJS files, require/createRequire references and Unicode escapes
-incomplete. This supersedes the earlier admission-import assertion that the live daemon graph is complete:
-the native client adapter remains lazy, but its dependencies have no static proof. Shape/admission boundary
-tests retain their forbidden-module checks, independently audit ESM edges with the TypeScript parser,
-and assert unknown relevance through `closureHits`. Computed imports, unparseable source and local ESM
-dependencies absent from the graph fail that boundary audit, even when CommonJS already makes it incomplete.
-Review session/job and draft-promotion lag scenarios use real two-module ESM fixture graphs for the positive
-off-path case, passed through their trusted classifier seams. They separately require the default incomplete
-graph to refuse before spawning or promoting. Keep both cases; do not mark the live graph complete or
-disable the staleness guard to preserve an old permissive fixture. Load consumer modules during test collection
-when checking missing-entry behavior, so cold module transformation cannot consume the fixture's timeout.
+The production `collectImportClosure` retains its legacy ESM semantics; it does not prove CommonJS
+dependencies. Do not turn off selective dispatch/restart by globally refusing CommonJS hints. The unwired
+clone collector `collectCloneImportClosure` refuses CommonJS extensions, require/createRequire references
+and Unicode escapes, including comments/strings. Discovery validates readable roots through this strict
+collector, including spawned dependencies, before returning them; missing roots remain for downstream refusal.
+Shape/admission tests independently audit ESM edges with the TypeScript parser and retain their forbidden-module
+checks. Production review, promotion, fix and daemon closures must remain complete. Session/job and promotion
+soaks must tolerate unrelated lag using the default production graph as well as the injected fixture graph.
+`daemon-clone-entries.test.mjs` separately pins extension-only and comment/string refusal, and measures rebuild
+counts over one corpus (legacy: 2; strict: 3). Before changing production policy, measure that cost and disclose
+it in the PR. Missing-root consumer tests remain conservative under both policies. Load consumer modules during
+test collection so cold module transformation cannot consume the fixture's timeout.

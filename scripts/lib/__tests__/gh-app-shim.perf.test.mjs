@@ -51,11 +51,11 @@ for (let i = 0; i < ${CALLS}; i++) { const r = spawnSync(${JSON.stringify(shimPa
 }
 
 describe('gh shim process fan-out (R320 #1)', () => {
-  it('keeps the generator closure conservative with its CommonJS dependencies', () => {
+  it('keeps the generator closure complete with its throttle dependency', () => {
     // Resolve as a Node path so Vite cannot rewrite this as a browser asset URL.
     const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
     const closure = collectImportClosure({ root, entries: ['scripts/lib/gh-app-shim.mjs'] });
-    expect(closure?.complete).toBe(false);
+    expect(closure?.complete).toBe(true);
     expect(closure.files.has('scripts/lib/gh-throttle.mjs')).toBe(true);
     expect(closure.files.has('scripts/lib/__tests__/gh-app-shim.perf.test.mjs')).toBe(false);
   });

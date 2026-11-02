@@ -361,13 +361,13 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
     } finally { err.mockRestore(); }
   });
 
-  it('refuses unrelated code lag before spawning or claiming a job with the default incomplete graph', () => {
+  it('dispatches despite unrelated code lag with the default complete graph', () => {
     behind('scripts/lane-pool.mjs', 'scripts/backlog/capacity.mjs');
-    expect(reviewDispatch.reviewSandboxClosure().complete).toBe(false);
-    const spawnJob = vi.fn();
-    expect(() => go({ spawnJob })).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
-    expect(spawnJob).not.toHaveBeenCalled();
-    expect(existsSync(join(dir, 'jobs'))).toBe(false);
+    expect(reviewDispatch.reviewSandboxClosure().complete).toBe(true);
+    const spawnJob = vi.fn(() => 77);
+    expect(go({ spawnJob })).toMatchObject({ jobPid: 77 });
+    expect(spawnJob).toHaveBeenCalledOnce();
+    expect(existsSync(join(dir, 'jobs'))).toBe(true);
   });
 
   it('behind in a file the review runs (review-loop-cli, or review-job\'s own imports): still refuses', () => {

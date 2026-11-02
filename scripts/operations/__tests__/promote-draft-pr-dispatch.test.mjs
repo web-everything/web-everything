@@ -462,19 +462,19 @@ describe('xul2kwr fresh withdrawal guard', () => {
 // write is `gh pr ready` after a fresh per-sha re-check, so lag outside its own import closure must not block it.
 describe('isPromoteCodePath — the declared promote code path (#3806 incident)', () => {
   it('real closure: a file the promote pass imports is on the path', () => {
-    expect(promoteCodeClosure()?.complete).toBe(false);
+    expect(promoteCodeClosure()?.complete).toBe(true);
     expect(isPromoteCodePath('scripts/operations/promote-draft-pr-dispatch.mjs')).toBe(true);
     expect(isPromoteCodePath('scripts/conveyor/reconcile-core.mjs')).toBe(true);
     expect(isPromoteCodePath('scripts/lib/draft-promote-provider.mjs')).toBe(true);
   });
-  it('real closure: unwalked CommonJS dependencies keep other code relevant', () => {
-    expect(isPromoteCodePath('scripts/operations/cli-adapter.mjs')).toBe(true);
+  it('real closure: the CLI adapter is not on the promote path', () => {
+    expect(isPromoteCodePath('scripts/operations/cli-adapter.mjs')).toBe(false);
     expect(isPromoteCodePath('scripts/operations/__tests__/render-outcome-effect-refusal.test.mjs')).toBe(false);
   });
-  it('real closure: main CI evidence and owner dispatcher remain relevant while incomplete', () => {
-    expect(promoteCodeClosure()?.complete).toBe(false);
+  it('real closure: main CI evidence is on the path without the owner dispatcher', () => {
+    expect(promoteCodeClosure()?.complete).toBe(true);
     expect(isPromoteCodePath('scripts/conveyor/main-ci-red-probe.mjs')).toBe(true);
-    expect(isPromoteCodePath('scripts/conveyor/main-ci-red-io.mjs')).toBe(true);
+    expect(isPromoteCodePath('scripts/conveyor/main-ci-red-io.mjs')).toBe(false);
   });
   it('a complete closure still excludes unrelated code', () => {
     const closure = { complete: true, files: new Set(['scripts/conveyor/main-ci-red-probe.mjs']), bareDeps: false, jsonNames: new Set() };

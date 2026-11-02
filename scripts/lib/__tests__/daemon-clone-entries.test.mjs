@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { cloneRuntimeEntries, collectCloneImportClosure } from '../daemon-clone-entries.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
 import { collectRunClosure, decideSkipRebuild, makeSkipCheck } from '../daemon-rebuild/skip-unrelated.mjs';
@@ -11,9 +11,21 @@ import { decideRestart } from '../daemon-self-sync.mjs';
 import { checkCodeUnchanged } from '../daemon-live-smoke.mjs';
 import { loadReadOnlyOps } from '../read-only-ops.mjs';
 import * as importClosureModule from '../import-closure.mjs';
-import { isReviewCodePath } from '../../operations/review-dispatch.mjs';
-import { isPromoteCodePath } from '../../operations/promote-draft-pr-dispatch.mjs';
-import { isFixCodePath } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { isReviewCodePath, reviewSandboxClosure } from '../../operations/review-dispatch.mjs';
+import { isPromoteCodePath, promoteCodeClosure } from '../../operations/promote-draft-pr-dispatch.mjs';
+import { isFixCodePath, fixCodeClosure } from '../../conveyor/reconcile-fix-dispatch.mjs';
+
+it('keeps real production closures complete and unrelated code off the dispatch path', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
+  for (const closure of [reviewSandboxClosure(), promoteCodeClosure(), fixCodeClosure(),
+    ...DAEMON_ENTRY_MODULES.map(entry => collectImportClosure({ root, entries: [entry] }))]) {
+    expect(closure?.complete).toBe(true);
+    expect(closureHits({ closure, changedFiles: ['scripts/lane-pool.mjs'] })).toEqual([]);
+  }
+  for (const classify of [isReviewCodePath, isPromoteCodePath, isFixCodePath]) {
+    expect(classify('scripts/lane-pool.mjs')).toBe(false);
+  }
+});
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -147,22 +159,74 @@ it.each(['js', 'mjs', 'cjs'])('a changed required dependency remains relevant: %
     for (const mode of ['entry', 'imported', 'spawned', ...(extension === 'cjs' ? [] : ['discovered', 'LaunchAgent'])]) {
       writeFileSync(join(root, 'entry.mjs'), mode === 'imported'
         ? `import './worker.${extension}';` : `spawn(process.execPath, ['./worker.${extension}']);`);
-      let entries = mode === 'discovered' ? cloneRuntimeEntries({ ...f, entries: [`worker.${extension}`] })
-        : [mode === 'entry' ? `worker.${extension}` : 'entry.mjs'];
+      if (mode === 'discovered') {
+        expect(() => cloneRuntimeEntries({ ...f, entries: [`worker.${extension}`] }))
+          .toThrow('runtime dependency proof incomplete');
+        continue;
+      }
+      const entries = [mode === 'entry' ? `worker.${extension}` : 'entry.mjs'];
       if (mode === 'LaunchAgent') {
         const plist = join(f.launchAgentsDir, 'org.example.worker.plist');
         writeFileSync(plist, 'plist');
-        entries = cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
+        expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
           ProgramArguments: ['node', join(root, `worker.${extension}`)],
-        }) }) });
+        }) }) })).toThrow('runtime dependency proof incomplete');
         rmSync(plist);
+        continue;
       }
-      const closure = mode === 'spawned' ? collectRunClosure({ root, entries, byName: () => [] })
-        : collectImportClosure({ root, entries });
+      const closure = mode === 'spawned' ? collectRunClosure({ root, entries, byName: () => [], importClosure: collectCloneImportClosure })
+        : collectCloneImportClosure({ root, entries });
       const hits = closureHits({ closure, changedFiles: ['dep.js'] });
       expect(hits === null || hits.includes('dep.js')).toBe(true);
     }
   }
+});
+
+it('marks a CommonJS file incomplete without require references', () => {
+  const { root } = fixture();
+  writeFileSync(join(root, 'worker.cjs'), 'module.exports = 1;');
+  const closure = collectCloneImportClosure({ root, entries: ['worker.cjs'] });
+  expect(closure.complete).toBe(false);
+  expect(closureHits({ closure, changedFiles: ['dep.js'] })).toBeNull();
+});
+
+it('does not reuse legacy parsed completeness as strict clone proof', () => {
+  const { root } = fixture();
+  writeFileSync(join(root, 'worker.mjs'), "require('./dep.js');");
+  const options = { root, entries: ['worker.mjs'], parsed: new Map() };
+  expect(collectImportClosure(options).complete).toBe(true);
+  const closure = collectCloneImportClosure(options);
+  expect(closure.complete).toBe(false);
+  expect(closureHits({ closure, changedFiles: ['dep.js'] })).toBeNull();
+});
+
+it.each(['imported', 'spawned'])('refuses a discovered %s CommonJS dependency even beside missing roots', mode => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'entry.mjs'), mode === 'imported'
+    ? "import './worker.js';" : "spawn(process.execPath, ['./worker.js']);");
+  writeFileSync(join(f.root, 'worker.js'), "require('./dependency.js');");
+  // Boot roots are absent: validating the union at once would return null before reading entry.mjs.
+  expect(() => cloneRuntimeEntries({ ...f, entries: ['missing.mjs', 'entry.mjs'] }))
+    .toThrow('runtime dependency proof incomplete');
+});
+
+it.each(['// require', '/* createRequire */', 'export const hint = "require";', String.raw`// \u0061`])(
+  'keeps CommonJS hints in comments and strings incomplete: %s', source => {
+    const { root } = fixture();
+    writeFileSync(join(root, 'worker.mjs'), source);
+    const closure = collectCloneImportClosure({ root, entries: ['worker.mjs'] });
+    expect(closure.complete).toBe(false);
+    expect(closureHits({ closure, changedFiles: ['dep.js'] })).toBeNull();
+  });
+
+it('measures rebuild decisions before and after conservative refusal', () => {
+  const { root } = fixture();
+  writeFileSync(join(root, 'worker.mjs'), '// require\nexport {};');
+  const options = { root, entries: ['worker.mjs'] };
+  const corpus = ['worker.mjs', 'scripts/unrelated.mjs', 'package-lock.json', 'docs/readme.md'];
+  const rebuilds = closure => corpus.filter(path => !decideSkipRebuild({ closure, changedFiles: [path] }).skip).length;
+  expect(rebuilds(collectImportClosure(options))).toBe(2);
+  expect(rebuilds(collectCloneImportClosure(options))).toBe(3);
 });
 
 it.each(['boot entry', 'mapped pass'])('refuses CommonJS targets for default boot and manifest-mapped roots: %s', source => {

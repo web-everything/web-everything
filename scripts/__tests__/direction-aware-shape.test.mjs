@@ -57,11 +57,10 @@ describe('R131 direction-aware shape wiring', () => {
     expect(isBlastRadiusPath('scripts/lib/review-shape.mjs')).toBe(true);
     const closure = importClosure.collectImportClosure({ root: resolve('.'), entries: ['scripts/operations/review-pr.mjs'] });
     expect(esmBoundaryViolations({ root: resolve('.'), files: closure.files })).toEqual([]);
-    // Sharing pure shape code does not prove the operation's CommonJS dependencies.
-    // Preserve the CLI boundary below and require conservative relevance for unknown edges.
-    expect(closure?.complete).toBe(false);
+    // Preserve production ESM completeness and independently audit the CLI boundary.
+    expect(closure?.complete).toBe(true);
     expect(closure.files.has('scripts/lib/backlog-status.cjs')).toBe(true);
-    expect(importClosure.closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toBeNull();
+    expect(importClosure.closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toEqual([]);
     expect(closure.files.has('scripts/lib/review-shape.mjs')).toBe(true);
     for (const file of ['scripts/review-core-cli.mjs', 'scripts/lib/read-only-ops.mjs',
       'scripts/operations/run.mjs', 'scripts/operations/cli-adapter.mjs']) {

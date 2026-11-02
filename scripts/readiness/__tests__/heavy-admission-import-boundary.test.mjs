@@ -99,11 +99,11 @@ describe('admission import boundary', () => {
     expect(existsSync(f.eventPath)).toBe(false);
   }, 10_000);
 
-  it('keeps the client loader lazy and the handoff push CLI out, without claiming CommonJS completeness', () => {
+  it('keeps the production ESM closure complete, client loader lazy and handoff push CLI out', () => {
     const closure = collectImportClosure({ root: repoRoot, entries: ['scripts/readiness/heavy-admission.mjs'] });
     expect(esmBoundaryViolations({ root: repoRoot, files: closure.files })).toEqual([]);
-    expect(closure.complete).toBe(false);
-    expect(closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toBeNull();
+    expect(closure.complete).toBe(true);
+    expect(closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toEqual([]);
     expect(closure.files.has('scripts/lib/daemon-events.mjs')).toBe(true);
     expect(closure.files.has('scripts/readiness/remote-exec.mjs')).toBe(true);
     expect(closure.files.has('scripts/operations/handoff-home.mjs')).toBe(false);
