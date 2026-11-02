@@ -519,8 +519,9 @@ describe('runner base materialization refuses before install',()=>{
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
   // These cases run real Git, file copies and the install supervisor; allow for CI contention.
-  it.each(['delta','tracked symlink','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+  it.each(['delta','tracked symlink','retry succeeds','next base','fallback reason','old runner','manifest unavailable','oversized manifest','git failure','base blob failure','late delta failure','ignored listing failure','ignored listing rejection'])('remote transport uses %s, preserves the exact full manifest and reports prepared run IDs on initial execution and full retries',async mode=>{
     const f=await setup(false,undefined,mode==='tracked symlink'),requests=[],copies=[],log=vi.fn();
+    const preparedRuns=[], notifiedRuns=[], transferNotifications=[];
     const sshOptions=['-o','BatchMode=yes','-o','ControlMaster=auto','-o','ControlPersist=60s','-o','ControlPath=private-cm/%C'];
     let baseRetrieved=false,ignoredCalls=0,manifestCalls=0;
     const attempts=[];
@@ -535,6 +536,7 @@ describe('runner base materialization refuses before install',()=>{
       if(call.file==='git'){if(mode==='git failure'&&gitArgs(call)[0]==='status')return {code:1,stdout:Buffer.alloc(0)};if(mode==='base blob failure'&&gitArgs(call)[0]==='cat-file'&&gitArgs(call)[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
       if(call.file==='ssh')expect(call.sshOptions).toEqual(sshOptions);
       if(call.file==='rsync'){
+        transferNotifications.push([...notifiedRuns]);
         expect(call.args[call.args.indexOf('-e')+1]).toBe(`ssh ${sshOptions.map(value=>`'${value}'`).join(' ')}`);
         copies.push(call.input);
         // Fail after manifest construction, then allow the full-ship retry.
@@ -552,11 +554,15 @@ describe('runner base materialization refuses before install',()=>{
       if(action==='base-manifest'&&mode==='manifest unavailable')return {code:254,stdout:''};
       if(action==='base-manifest'&&mode==='oversized manifest')return {code:0,stdout:'x'.repeat(4*1024*1024+1)};
       const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='prepare')preparedRuns.push(value.run);
       if(action==='base-manifest')baseRetrieved=true;
       if(action==='run'){requests.push(JSON.parse(call.input));return {code:value.code,stdout:''};}
       return {code:0,stdout:JSON.stringify(value)};
     };
-    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions});
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log,sshOptions,onRun:run=>notifiedRuns.push(run)});
+    expect(preparedRuns).toHaveLength(mode==='late delta failure'?2:1);
+    expect(notifiedRuns).toEqual(preparedRuns);
+    expect(transferNotifications).toEqual(preparedRuns.map((_,i)=>preparedRuns.slice(0,i+1)));
     expect(log).toHaveBeenCalledWith(expect.stringMatching(['delta','tracked symlink','retry succeeds','next base','late delta failure'].includes(mode)?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
     if(mode==='retry succeeds')expect(manifestCalls).toBe(2);
@@ -621,11 +627,13 @@ describe('runner base materialization refuses before install',()=>{
     for(const listing of ignoredListings)expect(listing.toString().split('\0')).toContain('late.test.mjs');
     expect(transport.mock.calls.some(([call])=>call.file==='rsync'||call.file==='ssh'&&/ (prepare|run)$/.test(call.args.at(-1)))).toBe(false);
   });
-  it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('retries only a proven pre-start delta rejection once: %s',async fault=>{
+  it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('reports prepared run IDs on initial execution and full retries, retrying only a proven pre-start delta rejection once: %s',async fault=>{
     const f=await setup(),requests=[],prepares=[],finishes=[],copies=[];
+    const preparedRuns=[], notifiedRuns=[], transferNotifications=[];
     const transport=async call=>{
       if(call.file==='git')return exec(call);
       if(call.file==='rsync') {
+        transferNotifications.push([...notifiedRuns]);
         copies.push(call.input);
         const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
         for(const name of call.input.toString().split('\0').filter(Boolean)){const rel=name.slice(2);await fs.mkdir(join(destination,rel,'..'),{recursive:true});await fs.copyFile(join(call.cwd,rel),join(destination,rel));}
@@ -648,6 +656,7 @@ describe('runner base materialization refuses before install',()=>{
         return {code:value.code,stdout:''};
       }
       let value=await f.runner[action](request);
+      if(action==='prepare')preparedRuns.push(value.run);
       if(action==='finish') {
         finishes.push(request);
         if(fault==='missing finish')return {code:1,stdout:''};
@@ -657,10 +666,13 @@ describe('runner base materialization refuses before install',()=>{
       }
       return {code:0,stdout:JSON.stringify(value)};
     };
-    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport});
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,onRun:run=>notifiedRuns.push(run)});
     const retry=['corrupt base','missing base','second rejection','lost run response'].includes(fault);
     expect(requests).toHaveLength(retry?2:1);
     expect(prepares).toHaveLength(retry?2:1);
+    expect(notifiedRuns).toEqual(preparedRuns);
+    expect(preparedRuns).toEqual(requests.map(request=>request.run));
+    expect(transferNotifications).toEqual(preparedRuns.map((_,i)=>preparedRuns.slice(0,i+1)));
     expect(finishes).toHaveLength(retry?2:1);
     if(retry) {
       expect(requests[0].baseSha).toBe(f.base.sha);
