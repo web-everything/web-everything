@@ -39,7 +39,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -94,7 +94,7 @@ function eventsFilePath(root, env = process.env) {
  * with an empty list — a caller decides whether/how to alert, this function only fails closed.
  * @param {string} root
  * @param {{env?:NodeJS.ProcessEnv}} [o]
- * @returns {{clone:string|null, overlays:Array<object>, corrupt:boolean}}
+ * @returns {{clone:string|null, overlays:Array<object>, generation:number, corrupt:boolean}}
  */
 export function readOverlayState(root, { env = process.env } = {}) {
   const file = overlayFilePath(root, env);
@@ -102,19 +102,19 @@ export function readOverlayState(root, { env = process.env } = {}) {
   try {
     raw = readFileSync(file, 'utf8');
   } catch (e) {
-    if (e && e.code === 'ENOENT') return { clone: null, overlays: [], corrupt: false };
-    return { clone: null, overlays: [], corrupt: true };
+    if (e && e.code === 'ENOENT') return { clone: null, overlays: [], generation: 0, corrupt: false };
+    return { clone: null, overlays: [], generation: 0, corrupt: true };
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { clone: null, overlays: [], corrupt: true };
+    return { clone: null, overlays: [], generation: 0, corrupt: true };
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.overlays)) {
-    return { clone: null, overlays: [], corrupt: true };
+    return { clone: null, overlays: [], generation: 0, corrupt: true };
   }
-  return { clone: typeof parsed.clone === 'string' ? parsed.clone : null, overlays: parsed.overlays, corrupt: false };
+  return { clone: typeof parsed.clone === 'string' ? parsed.clone : null, overlays: parsed.overlays, generation: typeof parsed.generation === 'number' ? parsed.generation : 0, corrupt: false };
 }
 
 /**
@@ -168,13 +168,17 @@ function withListLock(root, env, fn) {
   }
 }
 
-/** The list to MUTATE — like {@link readOverlays}, but throws on a corrupt file so a write never replaces it. */
-function readOverlaysForWrite(root, env) {
+/** State to mutate: capture list and generation together, refusing a corrupt file. */
+function readOverlayStateForWrite(root, env) {
   const state = readOverlayState(root, { env });
   if (state.corrupt) {
     throw new Error(`daemon-overlays: overlay state file ${overlayFilePath(root, env)} is corrupt — refusing to overwrite it; fix or remove it by hand`);
   }
-  return state.overlays;
+  return state;
+}
+
+function readOverlaysForWrite(root, env) {
+  return readOverlayStateForWrite(root, env).overlays;
 }
 
 /**
@@ -184,16 +188,59 @@ function readOverlaysForWrite(root, env) {
  * @param {string} root
  * @param {Array<object>} list
  * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @param {number} [o.generation] registration generation; cache writes preserve the current value
  * @returns {Array<object>} the same `list`, for chaining
  */
-export function writeOverlays(root, list, { env = process.env } = {}) {
+export function writeOverlays(root, list, { env = process.env, generation = readOverlayState(root, { env }).generation } = {}) {
   const file = overlayFilePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
-  const payload = JSON.stringify({ clone: resolveCloneRoot(root), overlays: list }, null, 2);
+  const payload = JSON.stringify({ clone: resolveCloneRoot(root), generation, overlays: list }, null, 2);
   const tmp = `${file}.tmp-${process.pid}`;
   writeFileSync(tmp, payload, 'utf8');
   renameSync(tmp, file);
   return list;
+}
+
+/** Adopted evidence belongs only to an explicit matching registration. */
+export function appliedRowFor(adopted, ref, registrationId) {
+  if (typeof ref !== 'string' || !ref || typeof registrationId !== 'string' || !registrationId
+    || !Array.isArray(adopted?.applied)) return null;
+  return adopted.applied.find((row) => row?.ref === ref && row.registrationId === registrationId) ?? null;
+}
+
+/** Stamp legacy entries once; bind adopted rows only to uniquely provable legacy inputs. */
+export function migrateRegistrationIds(root, { env = process.env, adopted } = {}) {
+  return withListLock(root, env, () => {
+    const { overlays: current, generation: capturedGeneration } = readOverlayStateForWrite(root, env);
+    if (current.some((o) => !o || typeof o !== 'object' || Array.isArray(o) || typeof o.ref !== 'string' || !o.ref)) {
+      return { list: current, generation: capturedGeneration, stamped: [], unprovable: [], adopted };
+    }
+    const stamped = [];
+    const list = current.map((entry) => {
+      if (entry.registrationId) return entry;
+      const registrationId = randomUUID();
+      stamped.push({ ref: entry.ref, registrationId });
+      return { ...entry, registrationId };
+    });
+    const unprovable = [];
+    let changed = false;
+    const applied = adopted?.applied?.map((row) => {
+      if (!row || row.registrationId) return row;
+      const matches = list.filter((entry) => entry.ref === row.ref);
+      if (!matches.length) return row;
+      const entry = matches[0];
+      if (matches.length === 1 && stamped.some((s) => s.registrationId === entry.registrationId)
+        && (row.pr === undefined || row.pr === (entry.pr ?? null))) {
+        changed = true;
+        return { ...row, registrationId: entry.registrationId };
+      }
+      unprovable.push({ ref: row.ref });
+      return row;
+    });
+    const generation = capturedGeneration + (stamped.length ? 1 : 0);
+    if (stamped.length) writeOverlays(root, list, { env, generation });
+    return { list, generation, stamped, unprovable, adopted: changed ? { ...adopted, applied } : adopted };
+  });
 }
 
 /**
@@ -246,11 +293,11 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
-/** Registration intent excludes the rebuild's mutable base-chain cache. */
+/** Registration intent excludes the rebuild's mutable caches. */
 export function registrationIdentity(entry) {
   if (entry == null) return entry;
-  const { stackBases, ...identity } = entry;
-  void stackBases;
+  const { stackBases, tipSha, ...identity } = entry;
+  void stackBases; void tipSha;
   return identity;
 }
 
@@ -269,22 +316,25 @@ export function addOverlay(root, {
       throw new Error('source registration unavailable or changed; refusing replacement');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
+    const registrationId = randomUUID();
     if (idx === -1) {
       list.push({
-        ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
+        ref, registrationId, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
-      const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
+      const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
+      for (const field of ['tipSha', 'sha', 'headSha']) delete next[field];
+      delete next.edgeResolution;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
       if (conflictOverride) next.conflictOverride = conflictOverride;
       list[idx] = next;
     }
-    return writeOverlays(root, list, { env });
+    return writeOverlays(root, list, { env, generation: readOverlayState(root, { env }).generation + 1 });
   });
 }
 
@@ -294,7 +344,7 @@ export function addOverlay(root, {
  * equals this sha (`daemon-rebuild.mjs#recordedEdgeSha`), so a branch anyone pushed under `edge/` is never run.
  * `sha` must be a full lowercase 40-hex sha and `by` a non-empty actor; the overlay must already be registered
  * (an approval for an unregistered ref would sit unused and misleading). Re-recording replaces the previous
- * approval; removing the overlay drops it with the entry. Leaves an audit event.
+ * approval; removing or re-registering the overlay drops it with the entry. Leaves an audit event.
  * @param {string} root
  * @param {string} ref
  * @param {{sha:string, by:string, reason?:string|null, now?:string}} approval
@@ -336,10 +386,14 @@ export function recordEdgeResolution(root, ref, {
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
  * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
+ * Passing `expectRegistrationId` requires a nonempty matching id; an unusable token refuses removal.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectRegistrationId?:string}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
+export function removeOverlay(root, ref, options = {}) {
+  const { env = process.env, why, requireRef, expectedOverlay, expectRegistrationId } = options;
+  // Presence of the key requests CAS even when its token is unusable.
+  const casRequested = Object.hasOwn(options, 'expectRegistrationId');
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
@@ -351,10 +405,33 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
+    if (casRequested && idx !== -1 && (typeof expectRegistrationId !== 'string' || !expectRegistrationId
+      || list[idx].registrationId !== expectRegistrationId)) {
+      throw new Error('registration changed; refusing removal');
+    }
     if (idx === -1) return { removed: false, list };
     const next = list.slice(0, idx).concat(list.slice(idx + 1));
-    writeOverlays(root, next, { env });
+    writeOverlays(root, next, { env, generation: readOverlayState(root, { env }).generation + 1 });
     return { removed: true, list: next };
+  });
+}
+
+/** Record refreshed tips only while both the captured registration id and identity still match. */
+export function persistTipShas(root, tips, { env = process.env } = {}) {
+  if (!(tips instanceof Map) || tips.size === 0) return { written: 0 };
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env).slice();
+    let written = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const { sha, reg, registrationId } = (list[i] && tips.get(list[i].ref)) ?? {};
+      if (typeof registrationId !== 'string' || !registrationId || list[i]?.registrationId !== registrationId) continue;
+      if (!reg || !isDeepStrictEqual(registrationIdentity(list[i]), reg)
+        || !/^[0-9a-f]{40,64}$/.test(sha ?? '') || list[i].tipSha === sha) continue;
+      list[i] = { ...list[i], tipSha: sha };
+      written += 1;
+    }
+    if (written) writeOverlays(root, list, { env });
+    return { written };
   });
 }
 

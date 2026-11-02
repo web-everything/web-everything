@@ -5,7 +5,7 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { readOverlayState, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
@@ -204,7 +204,19 @@ export function dropSuspectOverlays({
   root, env, suspects, failed, alert,
 }) {
   for (const s of suspects) {
-    removeOverlay(root, s.ref, { env, why: 'smoke-failed' });
+    // Legacy fallback records can name a ref without binding their smoke evidence to a registration.
+    // An absent CAS token would make removeOverlay unconditional, so keep the entry for operator review.
+    if (typeof s.registrationId !== 'string' || !s.registrationId) {
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
+    try {
+      removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: s.registrationId });
+    } catch (error) {
+      if (!/registration changed/.test(String(error?.message))) throw error;
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
     appendOverlayEvent(root, {
       kind: 'dropped-smoke-failed', ref: s.ref, pr: s.pr, reason: failed,
     }, { env });
@@ -266,6 +278,16 @@ export async function finalizeRebuild({
       appendFileSync(file, `${JSON.stringify({ at: nowIso(), kind, detail })}\n`, 'utf8');
     } catch { /* best-effort audit trail only */ }
   };
+  const adoptionRows = () => {
+    const registry = readOverlayState(root, { env });
+    return plan.applied.map((row) => {
+      if (!row.registrationId || (!registry.corrupt && registry.overlays.some((entry) =>
+        entry?.ref === row.ref && entry.registrationId === row.registrationId))) return row;
+      alert('overlay-registration-changed', { ref: row.ref });
+      const { registrationId, ...unbound } = row;
+      return unbound;
+    });
+  };
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
@@ -290,7 +312,7 @@ export async function finalizeRebuild({
   if (headNow === plan.finalSha) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
       };
       state.rejected = null;
       state.held = null;
@@ -346,7 +368,7 @@ export async function finalizeRebuild({
       });
     }
     state.adopted = {
-      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: adoptionRows(), at: nowIso(),
     };
     state.rejected = null;
     state.held = null;
