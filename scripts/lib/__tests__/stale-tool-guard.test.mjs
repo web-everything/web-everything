@@ -109,7 +109,7 @@ describe('importClosure', () => {
 /** exec is injectable spawnSync(command, argv, options), returning { status, stdout, stderr, error? }. */
 function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', fail, throws = false, childStatus = 0 } = {}) {
   const root = scratch();
-  mkdirSync(join(root, '.git'));
+  // The injected exec and explicit root need no on-disk Git metadata.
   mkdirSync(join(root, 'node_modules'));
   put(root, 'scripts/tool.mjs', "import './lib/dep.mjs';");
   put(root, 'scripts/lib/dep.mjs', 'export const version = 1;');
@@ -184,7 +184,7 @@ describe('review regressions', () => {
     expect(env.GIT_DIR).toBe('/untrusted/repository');
   });
 
-  it('refuses an ext origin with GIT_DIR set without executing its transport command', async () => {
+  it.each(['checkout', 'elsewhere'])('refuses an ext origin with GIT_DIR pointing %s without executing its transport command', async (location) => {
     const { guardToolCheckout } = await load();
     const root = scratch();
     const marker = join(root, 'transport-executed');
@@ -193,9 +193,14 @@ describe('review regressions', () => {
     mkdirSync(join(root, 'refs'));
     put(root, 'HEAD', 'ref: refs/heads/main\n');
     put(root, 'config', `[core]\n bare = true\n[remote "origin"]\n url = ext::sh -c >${marker}\n[protocol "ext"]\n allow = always\n`);
+    // A missing inherited repository must not redirect Git away from the trusted checkout.
+    // The transport-specific stderr below proves that Git actually reached that checkout's origin.
+    const inheritedGitDir = location === 'checkout' ? root : join(scratch(), 'missing-repository');
     const exec = vi.fn(spawnSync);
     await expect(guardToolCheckout({ entry: join(root, 'scripts/tool.mjs'), root,
-      exec, env: { ...process.env, GIT_DIR: root }, log: () => {},
+      exec, env: { ...process.env, GIT_DIR: inheritedGitDir,
+        GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always',
+        GIT_ALLOW_PROTOCOL: 'ext' }, log: () => {},
     })).rejects.toThrow('Git fetch');
     expect(existsSync(marker)).toBe(false);
     expect(exec).toHaveBeenCalledTimes(1);
