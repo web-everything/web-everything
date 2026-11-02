@@ -53,6 +53,41 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 const CTX = { key: 'run-1#4#0', runId: 'run-1', type: 'x', stepIndex: 4, step: 'record', index: 0 };
 
 describe('post-accept advisory persisted ledger', () => {
+  it.each([{}, { readLedgerRows: () => [] }, { appendLedgerRow: () => ({ ok: true }) },
+    { readLedgerRows: [], appendLedgerRow: null }])('refuses incomplete injected IO %j without touching persisted state', async injected => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');
+    const ledgerPath = join(root, 'incomplete-io.jsonl'), logs = [];
+    const facts = { repo: 'o/r', pr: 7, head: 'head', ledgerPath, readLedgerRows: undefined,
+      ...injected, decision: { wouldCard: false, wouldPush: true, findings: [] }, loopsAfter: 1,
+      out: line => logs.push(line) };
+    expect(await recordPostAcceptAdvisoryShadow(facts)).toBeNull();
+    expect(await recordPostAcceptAdvisoryLoops(facts)).toBeNull();
+    expect(existsSync(ledgerPath)).toBe(false);
+    expect(existsSync(ledgerPath + '.lock')).toBe(false);
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('supply both reader and writer; live review unaffected'))).toBe(true);
+  });
+
+  it.each([null, [], 42])('refuses malformed recorder options %j', async options => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');
+    expect(await recordPostAcceptAdvisoryShadow(options)).toBeNull();
+    expect(await recordPostAcceptAdvisoryLoops(options)).toBeNull();
+  });
+
+  it('does not append numeric repo identities and replays historical head rows without duplication', async () => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');
+    const ledgerPath = join(root, 'identity.jsonl');
+    const decision = { wouldCard: false, wouldPush: true, findings: [] };
+    const original = JSON.stringify({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      head: 'legacy-head', ...decision, loopsAfter: null }) + '\n';
+    writeFileSync(ledgerPath, original);
+    const facts = { repo: 'o/r', pr: 7, head: 'legacy-head', decision, ledgerPath };
+    expect(await recordPostAcceptAdvisoryShadow(facts)).toBeNull();
+    expect(await recordPostAcceptAdvisoryShadow({ ...facts, repo: 42 })).toBeNull();
+    expect(await recordPostAcceptAdvisoryLoops({ ...facts, repo: 42, loopsAfter: 1 })).toBeNull();
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(original);
+  });
+
   it('persists later-run counts under the ledger lock and dedupes replayed run IDs', async () => {
     const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');
     const ledgerPath = join(root, 'loops.jsonl');
@@ -66,8 +101,8 @@ describe('post-accept advisory persisted ledger', () => {
     const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(rows).toHaveLength(3);
     expect(rows.slice(1)).toMatchObject([
-      { head: facts.head, loopsAfter: 1, runId: 'later-1' },
-      { head: facts.head, loopsAfter: 2, runId: 'later-2' },
+      { headSha: facts.head, loopsAfter: 1, runId: 'later-1' },
+      { headSha: facts.head, loopsAfter: 2, runId: 'later-2' },
     ]);
   });
 

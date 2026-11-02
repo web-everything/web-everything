@@ -1582,6 +1582,25 @@ describe('unattended accept reads the live head', () => {
 
 
 describe('post-accept advisory shadow wiring', () => {
+  it.each([null, {}, { value: [] }, { value: { mode: undefined } },
+    { value: { mode: 'off' }, invalid: true }, { value: { mode: 'off' }, invalid: 'false' }])(
+    'fails closed on malformed resolved settings %j while preserving a completed accept', async settings => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const decisions = [], logs = [];
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+        store: createMemoryRunStore(), sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER),
+        mintRunId: () => 'malformed-settings', advisorySettings: () => settings,
+        recordAdvisoryLoops: async () => null,
+        recordAdvisoryShadow: facts => { decisions.push(facts.decision); }, advisoryLog: line => logs.push(line),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
+      expect(logs.join('\n')).toContain('invalid resolved settings; using shadow');
+    });
+
   it.each(['shadow', 'on', 'recorder-error', 'logging-error'])(
     '%s measures later review runs once per run ID and preserves mode-off live effects', async scenario => {
       const execute = async mode => {
@@ -1612,7 +1631,7 @@ describe('post-accept advisory shadow wiring', () => {
         }
         await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
         if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops'))
-          .toMatchObject([{ head: HEAD_A, loopsAfter: 1, runId: 'later-1' }]);
+          .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }]);
         await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
         if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops')).toHaveLength(1);
         await review(HEAD_B, 'later-2', BLOCKING_ANSWER);
@@ -1623,7 +1642,7 @@ describe('post-accept advisory shadow wiring', () => {
       expect(result.effects).toEqual(baseline.effects);
       expect(result.outcomes).toEqual(baseline.outcomes);
       if (['shadow', 'on'].includes(scenario)) expect(result.rows.filter(row => row.kind === 'loops'))
-        .toMatchObject([{ head: HEAD_A, loopsAfter: 1, runId: 'later-1' }, { head: HEAD_A, loopsAfter: 2, runId: 'later-2' }]);
+        .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }, { headSha: HEAD_A, loopsAfter: 2, runId: 'later-2' }]);
       else expect(result.logs.join('\n')).toContain('live review unaffected');
     });
 

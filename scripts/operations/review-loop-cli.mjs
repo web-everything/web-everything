@@ -595,7 +595,13 @@ export async function runReviewLoopOnce({
       .then(async (out) => {
         if (out?.run) {
           try {
-            const settings = advisorySettings({ log: advisoryLog });
+            const resolved = advisorySettings({ log: advisoryLog });
+            const mode = resolved?.value?.mode;
+            const invalid = !resolved || Array.isArray(resolved) || !resolved.value || Array.isArray(resolved.value)
+              || !['off', 'shadow', 'on'].includes(mode)
+              || (resolved.invalid !== undefined && typeof resolved.invalid !== 'boolean') || resolved.invalid === true;
+            const settings = { value: { mode: invalid ? 'shadow' : mode }, invalid };
+            if (invalid) advisoryLog('post-accept-advisory warning: invalid resolved settings; using shadow');
             if (settings.value.mode !== 'off') {
               await recordAdvisoryLoops({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
                 head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog });

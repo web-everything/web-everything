@@ -1838,13 +1838,18 @@ export async function recordPostAcceptAdvisoryLoops(options = {}) {
 // Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
 const advisoryWrites = new Map();
 async function recordAdvisoryObservation(recorder, options) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
+  const injected = Object.hasOwn(options, 'readLedgerRows') || Object.hasOwn(options, 'appendLedgerRow');
   const path = options.ledgerPath ?? join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
   const previous = advisoryWrites.get(path) ?? Promise.resolve();
   const pending = previous.then(async () => {
     let lock;
     const lockPath = `${path}.lock`;
     try {
-      if (!options.readLedgerRows && !options.appendLedgerRow) {
+      if (injected && (typeof options.readLedgerRows !== 'function' || typeof options.appendLedgerRow !== 'function')) {
+        throw new Error('incomplete shadow ledger IO; supply both reader and writer');
+      }
+      if (!injected) {
         mkdirSync(dirname(path), { recursive: true });
         const deadline = Date.now() + 2000;
         for (;;) {

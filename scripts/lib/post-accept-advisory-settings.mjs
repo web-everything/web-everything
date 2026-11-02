@@ -17,8 +17,13 @@ export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
   const blockMode = (value, layer) => {
     if (value === undefined) return undefined;
     if (!object(value)) { warn(`invalid ${layer} settings shape`); return 'shadow'; }
+    if (Object.hasOwn(value, 'mode') && value.mode === undefined) { warn(`invalid ${layer} mode`); return 'shadow'; }
     return value.mode;
   };
+  if (!object(env)) { warn('invalid environment settings shape'); env = {}; }
+  else if (Object.hasOwn(env, 'WE_REVIEW_POST_ACCEPT_ADVISORY_MODE') && env.WE_REVIEW_POST_ACCEPT_ADVISORY_MODE === undefined) {
+    warn('invalid env mode');
+  }
   let tool;
   try {
     const data = JSON.parse(readFile(file));

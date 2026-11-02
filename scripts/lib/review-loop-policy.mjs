@@ -606,25 +606,31 @@ function roundCardsRefusal(verdict) {
 }
 
 /** Post-accept advisory policy. This slice always preserves the live push, including mode on. PURE. */
-export function postAcceptAdvisoryDecision({ verdict, guards = {}, mode = 'shadow', invalid = false } = {}) {
-  if (mode === 'off' && !invalid) return { action: 'push' };
-  const findings = Array.isArray(verdict?.admittedFindings) ? verdict.admittedFindings : verdict?.findings;
+export function postAcceptAdvisoryDecision(input = {}) {
+  const { verdict, guards = {}, mode = 'shadow', invalid = false } = advisoryObject(input) ? input : {};
+  // Presence is authoritative: corrupt admitted evidence must never fall back to raw findings.
+  const findings = advisoryObject(verdict) && Object.hasOwn(verdict, 'admittedFindings')
+    ? verdict.admittedFindings : verdict?.findings;
   const out = (wouldCard, reason) => ({ action: 'push', wouldCard, wouldPush: !wouldCard,
-    findings: Array.isArray(findings) ? findings : [], reason });
-  if (invalid || !['shadow', 'on'].includes(mode)) return out(false, 'invalid-mode');
-  if (verdict?.verdict !== VERDICTS.ACCEPT || !Array.isArray(findings) || !guards || typeof guards !== 'object') {
+    findings: validAdvisoryFindings(findings) ? findings : [], reason });
+  if (invalid !== false || !['off', 'shadow', 'on'].includes(mode)
+    || (advisoryObject(input) && Object.hasOwn(input, 'mode') && input.mode === undefined)) return out(false, 'invalid-mode');
+  if (!advisoryObject(input) || !advisoryObject(verdict) || !advisoryObject(guards)
+    || (Object.hasOwn(input, 'guards') && input.guards === undefined)
+    || verdict.verdict !== VERDICTS.ACCEPT || !validAdvisoryFindings(findings)
+    || (Object.hasOwn(verdict, 'findings') && !validAdvisoryFindings(verdict.findings))) {
     return out(false, 'incomplete-evidence');
   }
   // Apply the shared bounce guards to both evidence sources without letting either overwrite the other.
   for (const facts of [verdict, guards]) {
-    if (facts.humanRequired !== undefined && typeof facts.humanRequired !== 'boolean') return out(false, 'unknown-guard');
+    if (Object.hasOwn(facts, 'humanRequired') && typeof facts.humanRequired !== 'boolean') return out(false, 'unknown-guard');
     for (const key of ['pendingReferrals', 'blockedReferrals', 'uncorroboratedRetirements']) {
-      if (facts[key] !== undefined && !Array.isArray(facts[key])) return out(false, 'unknown-guard');
+      if (Object.hasOwn(facts, key) && !Array.isArray(facts[key])) return out(false, 'unknown-guard');
     }
     const refusal = roundCardsRefusal({ ...facts, verdict: VERDICTS.CHANGES, admittedFindings: findings });
     if (refusal) return out(false, refusal);
   }
-  if (!findings.length) return out(false, 'no-findings');
+  if (!findings.length) return mode === 'off' ? { action: 'push' } : out(false, 'no-findings');
   for (const finding of findings) {
     if (!finding || requiresMandatoryReferral(finding)
       || !CARDABLE_IMPACTS.includes(finding.impactIfUnfixed)) return out(false, 'blocking-impact');
@@ -632,22 +638,22 @@ export function postAcceptAdvisoryDecision({ verdict, guards = {}, mode = 'shado
       || !PANEL_LENSES.includes(finding.category.split('/')[0])
       || finding.category.split('/')[0] === 'security') return out(false, 'security-or-unknown-category');
   }
-  return out(true, 'advisory-only');
+  return mode === 'off' ? { action: 'push' } : out(true, 'advisory-only');
 }
 
 /** Persist one shadow observation per repository, PR and reviewed head. IO is supplied by the caller. */
 export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision, loopsAfter = null,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
-    if (!repo || !Number.isInteger(pr) || pr < 1 || !/^[a-f0-9]{40}$/i.test(head ?? '')
-      || typeof decision?.wouldCard !== 'boolean' || decision.wouldPush !== !decision.wouldCard
+    if (!advisoryIdentity({ repo, pr, head })
+      || !advisoryObject(decision) || typeof decision.wouldCard !== 'boolean' || decision.wouldPush !== !decision.wouldCard
       || !validAdvisoryFindings(decision.findings) || (loopsAfter !== null && !validLoopCount(loopsAfter))) {
       throw new Error('incomplete shadow evidence');
     }
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
     const kind = 'we.post-accept-advisory-shadow';
-    if (rows.some(row => validAdvisoryRow(row) && row.kind === kind && row.repo === repo && row.pr === pr && row.headSha === head)) return null;
+    if (rows.some(row => validAdvisoryRow(row) && row.kind === kind && row.repo === repo && row.pr === pr && advisoryKey(row) === advisoryKey({ repo, pr, head }))) return null;
     const row = { v: 1, kind, at: now(), repo, pr, headSha: head,
       wouldCard: decision.wouldCard, wouldPush: decision.wouldPush, findings: decision.findings, loopsAfter };
     const result = await appendLedgerRow(row);
@@ -660,29 +666,41 @@ export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision,
 }
 
 const validLoopCount = value => Number.isSafeInteger(value) && value >= 0;
-const advisoryIdentity = row => row && typeof row === 'object' && !Array.isArray(row)
-  && typeof row.repo === 'string' && row.repo.length > 0 && Number.isInteger(row.pr) && row.pr > 0
-  && /^[a-f0-9]{40}$/i.test(row.headSha ?? row.head ?? '');
 const advisoryObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonemptyAdvisoryString = value => typeof value === 'string' && value.trim().length > 0;
-const validAdvisoryFindings = findings => Array.isArray(findings) && findings.every(finding => advisoryObject(finding)
+// Read both historical spellings, reject conflicting aliases, write only headSha.
+const advisoryIdentity = row => {
+  if (!advisoryObject(row) || !nonemptyAdvisoryString(row.repo)
+    || !Number.isSafeInteger(row.pr) || row.pr < 1) return null;
+  const heads = ['headSha', 'head'].filter(key => Object.hasOwn(row, key)).map(key => row[key]);
+  if (!heads.length || !heads.every(nonemptyAdvisoryString) || heads.some(head => head !== heads[0])) return null;
+  return { repo: row.repo, pr: row.pr, headSha: heads[0] };
+};
+const validAdvisoryFindings = findings => Array.isArray(findings) && Array.from(findings).every(finding => advisoryObject(finding)
   && nonemptyAdvisoryString(finding.category)
   // Absent impact is the existing UNDECLARED marker; unknown declared values are corrupt evidence.
   && (finding.impactIfUnfixed === undefined || ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(finding.impactIfUnfixed))
+  && (!Object.hasOwn(finding, 'findingId') || nonemptyAdvisoryString(finding.findingId))
+  && (!Object.hasOwn(finding, 'verdict') || ['CONFIRMED', 'PLAUSIBLE'].includes(finding.verdict))
+  && (!Object.hasOwn(finding, 'summary') || nonemptyAdvisoryString(finding.summary))
+  && (!Object.hasOwn(finding, 'finding') || nonemptyAdvisoryString(finding.finding))
   && nonemptyAdvisoryString(finding.summary ?? finding.finding));
 const validLaterRatings = ratings => ratings === undefined || (Array.isArray(ratings)
-  && ratings.every(rating => advisoryObject(rating) && typeof rating.findingId === 'string'
-    && rating.findingId.length > 0 && ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(rating.impactIfUnfixed)));
-const validAdvisoryRow = row => advisoryIdentity(row) && typeof row.wouldCard === 'boolean'
+  && Array.from(ratings).every(rating => advisoryObject(rating) && typeof rating.findingId === 'string'
+    && rating.findingId.trim().length > 0 && ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(rating.impactIfUnfixed)));
+const validAdvisoryRow = row => advisoryIdentity(row) && row.kind === 'we.post-accept-advisory-shadow' && typeof row.wouldCard === 'boolean'
   && row.wouldPush === !row.wouldCard && validAdvisoryFindings(row.findings) && validLaterRatings(row.laterRatings)
   && (row.loopsAfter === null || validLoopCount(row.loopsAfter));
-const advisoryKey = row => JSON.stringify([row.repo, row.pr, row.headSha ?? row.head]);
+const advisoryKey = row => JSON.stringify(advisoryIdentity(row));
+const validAdvisoryLoops = row => advisoryIdentity(row) && row.kind === 'loops' && validLoopCount(row.loopsAfter)
+  && (!Object.hasOwn(row, 'runId') || nonemptyAdvisoryString(row.runId));
 
 /** Append explicit counts, or measure one later run per earlier accepted head, idempotently by run ID. */
 export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter, runId,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
     if (!advisoryIdentity({ repo, pr, head })
+      || (runId !== undefined && !nonemptyAdvisoryString(runId))
       || (loopsAfter === undefined ? !nonemptyAdvisoryString(runId) : !validLoopCount(loopsAfter))) throw new Error('incomplete loops evidence');
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
@@ -691,19 +709,18 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
         && row.kind === 'we.post-accept-advisory-shadow' && row.repo === repo && row.pr === pr
         && (row.headSha ?? row.head) !== head).map(row => [advisoryKey(row), row]));
       for (const [key, accept] of accepts) {
-        const measurements = rows.filter(row => advisoryIdentity(row) && row.kind === 'loops'
-          && advisoryKey(row) === key && validLoopCount(row.loopsAfter));
+        const measurements = rows.filter(row => validAdvisoryLoops(row) && advisoryKey(row) === key);
         if (measurements.some(row => row.runId === runId)) continue;
         const count = measurements.reduce((count, row) => Math.max(count, row.loopsAfter), accept.loopsAfter ?? 0) + 1;
         if (!validLoopCount(count)) throw new Error('loop count exhausted; inspect shadow ledger');
-        const row = { kind: 'loops', repo, pr, head: accept.headSha ?? accept.head, loopsAfter: count, runId, at: now() };
+        const row = { kind: 'loops', repo, pr, headSha: advisoryIdentity(accept).headSha, loopsAfter: count, runId, at: now() };
         const result = await appendLedgerRow(row);
         if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
       }
       return null;
     }
-    const row = { kind: 'loops', repo, pr, head, loopsAfter, at: now() };
-    if (rows.some(old => advisoryIdentity(old) && old.kind === 'loops'
+    const row = { kind: 'loops', repo, pr, headSha: head, loopsAfter, at: now() };
+    if (rows.some(old => validAdvisoryLoops(old)
       && advisoryKey(old) === advisoryKey(row) && old.loopsAfter === loopsAfter)) return null;
     const result = await appendLedgerRow(row);
     if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
@@ -716,11 +733,12 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
 
 /** Latest appended loop observation wins; unknown measurements remain separate from zero. PURE. */
 export function postAcceptAdvisoryShadowReport(rows = []) {
-  const observations = rows.filter(row => validAdvisoryRow(row) && row.kind !== 'loops');
+  if (!Array.isArray(rows)) throw new TypeError('unreadable shadow ledger; inspect shadow ledger');
+  const observations = rows.filter(validAdvisoryRow);
   const loops = new Map();
   let skipped = rows.length - observations.length;
   for (const row of rows) {
-    if (advisoryIdentity(row) && row.kind === 'loops' && validLoopCount(row.loopsAfter)) {
+    if (validAdvisoryLoops(row)) {
       loops.set(advisoryKey(row), row.loopsAfter);
       skipped--;
     }
