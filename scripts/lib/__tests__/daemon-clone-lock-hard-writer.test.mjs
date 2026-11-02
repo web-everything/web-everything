@@ -19,7 +19,7 @@ beforeEach(() => {
   common = { lockRoot, probe: alive, leaseMinutes: 1e9, writerClaimTtlMs: 1e12,
     writerPriorityAfter: 1, readerPriorityAfter: 3, writerPriorityMaxSkips: 2 };
 });
-afterEach(() => { vi.unstubAllEnvs(); rmSync(scratch, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(scratch, { recursive: true, force: true }); });
 const snapshot = () => inspectCloneLock(root, { ...common, nowMs: t });
 const read = (owner, extra = {}) => acquireRead(root, { ...common, owner, readerKey: `reader:${owner}`, nowMs: t, ...extra });
 const release = (owner) => releaseRead(root, { lockRoot, owner });
@@ -217,8 +217,9 @@ describe('hard claims, deterministic priority boundaries', () => {
   it('unreadable hard-window history refuses re-arming rather than bypassing the reader gap', async () => {
     expect(read('existing').ok).toBe(true);
     await write({ hardClaim: true });
-    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writers');
-    fs.writeFileSync(join(history, fs.readdirSync(history)[0]), '{broken');
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    fs.writeFileSync(history, '{broken');
+    seedClaim({ owner: 'writer', hard: false }); // only a NEW hard claim must be refused
     seedOlderReader();
     expect(await write({ hardClaim: true })).toMatchObject({ reason: 'reader-priority' });
     expect(read('older')).toEqual({ ok: true }); release('older'); release('existing');
@@ -258,6 +259,175 @@ describe('hard claims, deterministic priority boundaries', () => {
     await write();
     expect(snapshot().writerClaim).toMatchObject({ count: 3, hard: true });
     release('existing');
+  });
+  it('a new owner and PID cannot restart an expired clone hard window until cooldown elapses', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    expect(read('existing').ok).toBe(true);
+    await write({ hardClaim: true, owner: 'daemon:101', pid: 101 });
+    t = T + 100;
+    seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'daemon:202', pid: 202 })).toMatchObject({ reason: 'reader-priority' });
+    expect(snapshot().writerClaim.since).toBe(new Date(T).toISOString()); // first claimant keeps its age
+    expect(read('older').ok).toBe(true); release('older');
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    expect(JSON.parse(fs.readFileSync(history, 'utf8'))).toMatchObject({ endedAt: T + 100, coolUntil: T + 150 });
+    t = T + 149;
+    seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'daemon:303', pid: 303 })).toMatchObject({ reason: 'reader-priority' });
+    expect(snapshot().writerClaim.since).toBe(new Date(T).toISOString());
+    t = T + 150;
+    expect(await write({ hardClaim: true, owner: 'daemon:404', pid: 404 })).toMatchObject({ reason: 'tick-in-progress' });
+    expect(snapshot().writerClaim).toMatchObject({ hard: true, since: new Date(T + 150).toISOString() });
+    release('existing');
+  });
+  it('successful hard acquisition closes the clone window for fresh writers before its maximum expires', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    expect(await write({ hardClaim: true, owner: 'daemon:101', pid: 101 })).toEqual({ ok: true });
+    expect(snapshot().writerClaim).toBeNull();
+    t = T + 1;
+    expect(await write({ hardClaim: true, owner: 'daemon:202', pid: 202 })).toMatchObject({ reason: 'concurrent-mover' });
+    expect(snapshot().writerClaim).toMatchObject({ owner: 'daemon:202', hard: false });
+    releaseWrite(root, { lockRoot, owner: 'daemon:101', nowMs: t });
+    expect(read('existing').ok).toBe(true);
+    seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'daemon:303', pid: 303 })).toMatchObject({ reason: 'reader-priority' });
+    expect(read('older').ok).toBe(true); release('older');
+    t = T + 149;
+    seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'daemon:404', pid: 404 })).toMatchObject({ reason: 'reader-priority' });
+    t = T + 150;
+    expect(await write({ hardClaim: true, owner: 'daemon:505', pid: 505 })).toMatchObject({ reason: 'tick-in-progress' });
+    expect(snapshot().writerClaim.hard).toBe(true);
+    release('existing');
+  });
+  it('a long hard move cannot pre-arm its successor and gives readers a full clone cooldown after release', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    t = T + 200;
+    expect(await write({ hardClaim: true, owner: 'new:199', pid: 199 })).toMatchObject({ reason: 'concurrent-mover' });
+    expect(snapshot().writerClaim).toMatchObject({ hard: false });
+    expect(releaseWrite(root, { lockRoot, owner: 'writer', nowMs: t })).toEqual({ ok: true });
+    expect(read('existing').ok).toBe(true);
+    for (const offset of [200, 249]) {
+      t = T + offset; seedOlderReader();
+      expect(await write({ hardClaim: true, owner: `new:${offset}`, pid: offset })).toMatchObject({ reason: 'reader-priority' });
+      expect(read('older').ok).toBe(true); release('older');
+    }
+    t = T + 250;
+    expect(await write({ hardClaim: true, owner: 'new:250', pid: 250 })).toMatchObject({ reason: 'tick-in-progress' });
+    expect(snapshot().writerClaim.hard).toBe(true);
+    release('existing');
+  });
+  it.each(['corrupt', 'unreadable'])('%s clone history refuses NEW hard claims without changing existing reader rules', async (failure) => {
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    mkdirSync(cloneLockDirs(root, lockRoot).base, { recursive: true });
+    writeFileSync(history, '{broken');
+    if (failure === 'unreadable') {
+      const original = fs.readFileSync;
+      vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...args) => {
+        if (path === history) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        return original(path, ...args);
+      });
+    }
+    seedClaim({ hard: true });
+    expect(read('retrying')).toMatchObject({ reason: 'writer-priority' });
+    expect(snapshot().starved).toEqual([]);
+    seedClaim({ hard: false }); seedOlderReader();
+    expect(read('older').ok).toBe(true); release('older');
+    expect(await write({ hardClaim: true, owner: 'new:202', pid: 202 })).toMatchObject({ reason: 'reader-priority' });
+    expect(snapshot().writerClaim.hard).toBe(false);
+  });
+  it('clone history is published with atomic rename before the successful hard claim is cleared', async () => {
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    const original = fs.renameSync;
+    const publications = [];
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === history) {
+        expect(from).toContain(`${history}.tmp-`);
+        const next = JSON.parse(fs.readFileSync(from, 'utf8'));
+        publications.push(next);
+        if (next.endedAt !== undefined) expect(snapshot().writerClaim.hard).toBe(true);
+      }
+      return original(from, to);
+    });
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    expect(publications).toHaveLength(2);
+    expect(publications[1]).toMatchObject({ endedAt: T, activeOwner: 'writer' });
+    expect(snapshot().writerClaim).toBeNull();
+    vi.restoreAllMocks();
+    releaseWrite(root, { lockRoot, owner: 'writer', nowMs: t });
+  });
+  it('failure to persist a hard acquisition end refuses the move and retains its claim', async () => {
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    const original = fs.renameSync;
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === history && JSON.parse(fs.readFileSync(from, 'utf8')).endedAt !== undefined) {
+        throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      }
+      return original(from, to);
+    });
+    expect(await write({ hardClaim: true })).toMatchObject({ ok: false, reason: 'hard-cooldown-unavailable' });
+    expect(snapshot().writerLive).toBe(false);
+    expect(snapshot().writerClaim).toMatchObject({ hard: true });
+    vi.restoreAllMocks();
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    releaseWrite(root, { lockRoot, owner: 'writer', nowMs: t });
+  });
+  it('a concurrent publisher cannot replace the cooldown while acquisition closes the window', async () => {
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    const original = fs.renameSync;
+    let competing;
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === history && JSON.parse(fs.readFileSync(from, 'utf8')).endedAt !== undefined) {
+        // Pause just before the closing record is published; a different writer tries to arm here.
+        competing = write({ hardClaim: true, owner: 'new:202', pid: 202 });
+      }
+      return original(from, to);
+    });
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    expect(await competing).toMatchObject({ reason: 'concurrent-mover' });
+    vi.restoreAllMocks();
+    releaseWrite(root, { lockRoot, owner: 'writer', nowMs: t });
+    expect(read('existing').ok).toBe(true); seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'new:303', pid: 303 })).toMatchObject({ reason: 'reader-priority' });
+    expect(snapshot().writerClaim.hard).toBe(false);
+    expect(read('older').ok).toBe(true); release('older'); release('existing');
+  });
+  it('a hard writer lost without release starts a clone reader gap before another owner can arm', async () => {
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', '100');
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', '50');
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    // Model a crashed writer whose dead reservation has been reclaimed without its release callback.
+    fs.rmSync(cloneLockDirs(root, lockRoot).writerRoot, { recursive: true, force: true });
+    t = T + 200;
+    expect(read('existing').ok).toBe(true); seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'new:202', pid: 202 })).toMatchObject({ reason: 'reader-priority' });
+    expect(snapshot().writerClaim.hard).toBe(false);
+    expect(read('older').ok).toBe(true); release('older');
+    t = T + 249; seedOlderReader();
+    expect(await write({ hardClaim: true, owner: 'new:249', pid: 249 })).toMatchObject({ reason: 'reader-priority' });
+    t = T + 250;
+    expect(await write({ hardClaim: true, owner: 'new:250', pid: 250 })).toMatchObject({ reason: 'tick-in-progress' });
+    expect(snapshot().writerClaim.hard).toBe(true);
+    release('existing');
+  });
+  it('failure to persist the release cooldown retains the write slot until a safe retry', async () => {
+    expect(await write({ hardClaim: true })).toEqual({ ok: true });
+    const history = join(cloneLockDirs(root, lockRoot).base, 'hard-writer-history.json');
+    const original = fs.renameSync;
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === history) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return original(from, to);
+    });
+    expect(releaseWrite(root, { lockRoot, owner: 'writer', nowMs: t })).toMatchObject({ ok: false, reason: 'hard-cooldown-unavailable' });
+    expect(snapshot().writerLive).toBe(true);
+    expect(read('newcomer').ok).toBe(false);
+    vi.restoreAllMocks();
+    expect(releaseWrite(root, { lockRoot, owner: 'writer', nowMs: t })).toEqual({ ok: true });
+    expect(read('newcomer').ok).toBe(true); release('newcomer');
   });
   it('dead hard claimant does not block readers forever', () => {
     seedClaim();

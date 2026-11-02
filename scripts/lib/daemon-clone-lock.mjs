@@ -8,7 +8,7 @@
  * Single-owner heartbeat + rebuild requests coordinate shared clones; bounded hard claims drain readers
  * without skip-cap/older-reader backoff. Expiry restores ordinary fairness. Request acknowledgement
  * records the consumed ID separately, so acknowledgement never deletes a concurrent publication.
- * Soft-to-hard promotion is opt-in; persistent per-writer cooldowns preserve a reader gap.
+ * Soft-to-hard promotion is opt-in; atomic per-clone cooldown history survives PID changes and preserves a reader gap.
  * Unreadable reader state blocks moves; corrupt request evidence stays pending until acknowledged.
  *
  * WHY a reader/writer lock, not just the per-path lock `scripts/readiness/file-locks.mjs` already has: that
@@ -178,37 +178,87 @@ export function clearRebuildRequest(root, { lockRoot, id } = {}) {
 }
 function hardWindowMs() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_MAX_MS', 15 * 60_000); }
 function hardCooldownMs() { return positiveSetting('WE_DAEMON_CLONE_LOCK_WRITER_HARD_COOLDOWN_MS', 2 * 60_000); }
-function hardHistoryFile(starvedRoot, owner) { return join(starvedRoot, '..', 'hard-writers', `${lockIdFor(owner)}.json`); }
-function readHardHistory(starvedRoot, owner, claim) {
+function hardHistoryFile(starvedRoot) { return join(starvedRoot, '..', 'hard-writer-history.json'); }
+// These synchronous critical sections serialize history and claim publication across processes.
+// A busy guard refuses this attempt without waiting; its PID/lease permits crash recovery.
+function updateHardHistory(starvedRoot, fn) {
+  const guardRoot = join(starvedRoot, '..', 'coordination');
+  const key = '<clone:hard-history-update>';
+  const owner = `${defaultOwner()}-${randomUUID()}`;
+  const nowMs = Date.now(); // a short filesystem lease uses wall time, independently of test/window clocks
+  let held;
+  try { held = reserve(guardRoot, key, owner, nowMs, new Date(nowMs).toISOString(), process.pid, defaultProbePidLiveness, 1); }
+  catch { return { updated: false }; }
+  if (!held.ok) return { updated: false };
+  try { return { updated: true, value: fn() }; }
+  finally { releaseLockDir(guardRoot, key); }
+}
+
+function readHardHistory(starvedRoot, claim) {
   try {
-    const h = JSON.parse(fs.readFileSync(hardHistoryFile(starvedRoot, owner), 'utf8'));
+    const h = JSON.parse(fs.readFileSync(hardHistoryFile(starvedRoot), 'utf8'));
     return h && Number.isFinite(h.since) && Number.isFinite(h.until) && Number.isFinite(h.coolUntil)
-      && h.since < h.until && h.until < h.coolUntil ? h : { unknown: true };
+      && h.since < h.until && h.until < h.coolUntil
+      && (h.endedAt === undefined || Number.isFinite(h.endedAt))
+      && (h.activeOwner === undefined || typeof h.activeOwner === 'string') ? h : { unknown: true };
   } catch (error) { if (error.code !== 'ENOENT') return { unknown: true }; }
+  // Preserve the window of a claim written before clone-wide history was introduced.
   const since = claim?.hard === true ? Date.parse(claim.since || '') : NaN;
   return Number.isFinite(since) ? { since, until: since + hardWindowMs(), coolUntil: since + hardWindowMs() + hardCooldownMs() } : null;
 }
-function hardCooldownActive(starvedRoot, owner, nowMs, claim) {
-  const h = readHardHistory(starvedRoot, owner, claim);
-  return !!h && (h.unknown || (nowMs >= h.until && nowMs < h.coolUntil));
+function hardCooldownActive(starvedRoot, nowMs, claim) {
+  const h = readHardHistory(starvedRoot, claim);
+  // Unknown history only refuses NEW hard claims; it cannot change existing reader-priority rules.
+  return !!h && !h.unknown && (h.endedAt !== undefined || nowMs >= h.until) && nowMs < h.coolUntil;
 }
-function armHardClaim(starvedRoot, owner, nowMs, claim) {
-  let h = readHardHistory(starvedRoot, owner, claim);
-  if (h?.unknown) return null;
-  if (h && nowMs >= h.until && nowMs < h.coolUntil) {
-    // Migrate older claims before softening them, or the next attempt could forget their hard window.
-    atomicSidecar(hardHistoryFile(starvedRoot, owner), h);
+// Called under updateHardHistory, including the subsequent claim publication.
+function armHardClaim(starvedRoot, nowMs, claim) {
+  let h = readHardHistory(starvedRoot, claim);
+  if (h?.unknown) {
+    // Refreshing an already-live hard claim does not create a new window.
+    return claimIsHard(claim, nowMs) ? Date.parse(claim.since) : null;
+  }
+  if (h?.activeOwner) {
+    // A move may outlast the scheduled cooldown. Never pre-arm its successor while it still holds the slot.
+    const writer = readLockEntry(join(starvedRoot, '..', 'writer'), WRITER_KEY);
+    if (writer?.owner === h.activeOwner) return null;
+    // Its slot has gone or changed hands without a matching release (e.g. a crashed process).
+    atomicSidecar(hardHistoryFile(starvedRoot), {
+      ...h, activeOwner: undefined, endedAt: nowMs, coolUntil: Math.max(h.coolUntil, nowMs + hardCooldownMs()),
+    });
+    return null;
+  }
+  if (h && (h.endedAt !== undefined || nowMs >= h.until) && nowMs < h.coolUntil) {
+    atomicSidecar(hardHistoryFile(starvedRoot), { ...h, endedAt: h.endedAt ?? h.until });
     return null;
   }
   if (!h || nowMs >= h.coolUntil) {
-    // An existing soft claim keeps its original age on first promotion; a completed cooldown starts a new window.
     const priorSince = !h && claim ? Date.parse(claim.since || '') : NaN;
     const since = Number.isFinite(priorSince) && nowMs - priorSince < hardWindowMs() ? priorSince : nowMs;
     h = { since, until: since + hardWindowMs(), coolUntil: since + hardWindowMs() + hardCooldownMs() };
   }
-  atomicSidecar(hardHistoryFile(starvedRoot, owner), h);
+  atomicSidecar(hardHistoryFile(starvedRoot), h);
   return h.since;
 }
+// A completed hard acquire closes the window immediately, even if its maximum has not elapsed.
+// Keep the originally promised cooldown too, and extend it after a long-running move finishes.
+function endHardWindow(starvedRoot, owner, nowMs, { acquiring = false } = {}) {
+  return updateHardHistory(starvedRoot, () => {
+    const claim = readWriterClaim(starvedRoot);
+    const h = readHardHistory(starvedRoot, claim);
+    const acquiringHard = acquiring && claim?.hard === true;
+    if (acquiringHard && h?.unknown) return false; // cannot safely erase the only evidence
+    if (h && !h.unknown && (acquiringHard || (acquiring && h.activeOwner) || h.activeOwner === owner)) {
+      atomicSidecar(hardHistoryFile(starvedRoot), {
+        ...h, endedAt: nowMs, coolUntil: Math.max(h.coolUntil, nowMs + hardCooldownMs()),
+        ...(acquiring ? { activeOwner: owner } : { activeOwner: undefined }),
+      });
+    }
+    if (acquiring) clearWriterClaim(starvedRoot);
+    return true;
+  });
+}
+
 function hardAfter() {
   const key = 'WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER';
   const raw = process.env[key];
@@ -391,13 +441,18 @@ function readWriterClaim(starvedRoot) {
 
 /** Record one more consecutive `tick-in-progress` give-up by `owner`. A claim by a DIFFERENT live owner is kept
  *  (first come keeps its age); our own is bumped. Best-effort. */
-function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe, hardClaim = false, gaveUp = true }) {
+function noteWriterGaveUp(starvedRoot, options) {
+  const result = updateHardHistory(starvedRoot, () => publishWriterClaim(starvedRoot, options));
+  return result.updated ? result.value : readWriterClaim(starvedRoot);
+}
+
+function publishWriterClaim(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe, hardClaim = false, gaveUp = true }) {
   const prev = readWriterClaim(starvedRoot);
   const live = writerClaimIsLive(prev, nowMs, ttlMs, probe);
   if (live && prev.owner !== owner) {
     if (!hardClaim || claimIsHard(prev, nowMs)) return prev;
     // A job may promote its spawner's soft claim; changing pids never restarts the bounded window.
-    const since = armHardClaim(starvedRoot, prev.owner, nowMs, prev);
+    const since = armHardClaim(starvedRoot, nowMs, prev);
     if (since === null) return prev;
     const promoted = { ...prev, hard: true, since: new Date(since).toISOString(), lastAt: new Date(nowMs).toISOString() };
     atomicSidecar(writerClaimFile(starvedRoot), promoted);
@@ -410,7 +465,7 @@ function noteWriterGaveUp(starvedRoot, { owner, pid, nowMs, heldBy, ttlMs, probe
   };
   const promoteAfter = hardAfter();
   const wantsHard = hardClaim || (same && prev.hard === true) || (promoteAfter > 0 && rec.count >= promoteAfter);
-  const hardSince = wantsHard ? armHardClaim(starvedRoot, owner, nowMs, same ? prev : null) : null;
+  const hardSince = wantsHard ? armHardClaim(starvedRoot, nowMs, same ? prev : null) : null;
   rec.hard = hardSince !== null;
   if (rec.hard) rec.since = new Date(hardSince).toISOString();
   try {
@@ -440,17 +495,30 @@ function findPriorityWriter(starvedRoot, { owner, nowMs, ttlMs, probe, after }) 
   const rec = readWriterClaim(starvedRoot);
   if (!rec) return null;
   if (!writerClaimIsLive(rec, nowMs, ttlMs, probe)) {
-    if (rec.hard === true) {
-      const h = readHardHistory(starvedRoot, rec.owner, rec);
-      if (h && !h.unknown && nowMs < h.coolUntil) {
-        try { atomicSidecar(hardHistoryFile(starvedRoot, rec.owner), h); }
-        catch { return null; } // leave the old claim as evidence if its history could not be persisted
+    try { updateHardHistory(starvedRoot, () => {
+      // A new claimant may have published while we were reading the old one.
+      const current = readWriterClaim(starvedRoot);
+      if (!current || writerClaimIsLive(current, nowMs, ttlMs, probe)) return;
+      if (current.hard === true) {
+        const h = readHardHistory(starvedRoot, current);
+        if (h?.unknown) return; // retain the claim as evidence when history is unavailable
+        if (h) atomicSidecar(hardHistoryFile(starvedRoot), {
+          ...h, endedAt: Math.min(nowMs, h.until),
+        });
       }
-    }
-    clearWriterClaim(starvedRoot);
+      clearWriterClaim(starvedRoot);
+    }); } catch { /* leave the old claim as evidence if its history cannot be persisted */ }
     return null;
   }
-  if (hardCooldownActive(starvedRoot, rec.owner, nowMs, rec)) return null;
+  if (rec.hard === true && !claimIsHard(rec, nowMs)) {
+    try { updateHardHistory(starvedRoot, () => {
+      const h = readHardHistory(starvedRoot, rec);
+      if (h && !h.unknown && h.endedAt === undefined && nowMs >= h.until) {
+        atomicSidecar(hardHistoryFile(starvedRoot), { ...h, endedAt: h.until });
+      }
+    }); } catch { /* the claim still records the expired window; new hard claims fail closed */ }
+  }
+  if (hardCooldownActive(starvedRoot, nowMs, rec)) return null;
   if (rec.owner === owner || (!claimIsHard(rec, nowMs) && (!(after > 0) || rec.count < after))) return null;
   return rec;
 }
@@ -619,7 +687,7 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Reader fairness: before reserving, and on every drain poll, a live starved reader (refused
  * `readerPriorityAfter` times in a row) makes this writer back off — `reader-priority`, writer key released. Only
  * ever during the drain wait, before anything moved; a writer that returned ok is never interrupted.
- * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority', heldBy:string|null, starved?:number}>}
+ * @returns {Promise<{ok:true}|{ok:false, reason:'concurrent-mover'|'tick-in-progress'|'reader-priority'|'hard-cooldown-unavailable', heldBy:string|null, starved?:number}>}
  */
 export async function acquireWrite(root, opts = {}) {
   const {
@@ -650,7 +718,7 @@ export async function acquireWrite(root, opts = {}) {
   const ownClaim = () => {
     if (!(writerPriorityAfter > 0)) return null;
     const c = readWriterClaim(starvedRoot);
-    return c && !hardCooldownActive(starvedRoot, c.owner, now(), c) && c.owner === owner && c.count >= writerPriorityAfter
+    return c && !hardCooldownActive(starvedRoot, now(), c) && c.owner === owner && c.count >= writerPriorityAfter
       && writerClaimIsLive(c, now(), writerClaimTtlMs, probe) ? c : null;
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
@@ -707,7 +775,13 @@ export async function acquireWrite(root, opts = {}) {
       return { ok: false, reason: 'reader-priority', heldBy: starvedReader.owner, starved: starvedReader.count };
     }
     if (blockers.length === 0) {
-      clearWriterClaim(starvedRoot); // the clone is ours to move — any writer claim has done its job
+      let ended;
+      try { ended = endHardWindow(starvedRoot, owner, nowMsN, { acquiring: true }); }
+      catch { ended = { updated: false }; }
+      if (!ended.updated || !ended.value) {
+        releaseLockDir(writerRoot, WRITER_KEY);
+        return { ok: false, reason: 'hard-cooldown-unavailable', heldBy: null };
+      }
       return { ok: true };
     }
     // #4044: a wait that blocks this process's own ticks is never silent — report it once, with who and how long.
@@ -737,9 +811,13 @@ export async function acquireWrite(root, opts = {}) {
  *  never a seize of whatever is there now. */
 export function releaseWrite(root, opts = {}) {
   const { owner = defaultOwner(opts.pid), lockRoot = defaultLockRoot() } = opts;
-  const { writerRoot } = cloneLockDirs(root, lockRoot);
+  const { writerRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
   const current = readLockEntry(writerRoot, WRITER_KEY);
   if (current && current.owner === owner) {
+    let ended;
+    try { ended = endHardWindow(starvedRoot, owner, opts.nowMs ?? opts.now?.() ?? Date.now()); }
+    catch { ended = { updated: false }; }
+    if (!ended.updated || !ended.value) return { ok: false, reason: 'hard-cooldown-unavailable' };
     releaseLockDir(writerRoot, WRITER_KEY);
   }
   return { ok: true };
