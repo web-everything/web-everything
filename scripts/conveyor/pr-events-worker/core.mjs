@@ -282,6 +282,16 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       // webhook). Their field clock is the cursor the listing was taken at, so any later delivery wins.
       for (const pr of input.prs) foldObservation(storage, { ...pr, number: undefined, prs: [pr.number], repo: input.repo,
         type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor });
+      // A complete listing is the full open set at baseCursor: an open row it omits (and no later event touched)
+      // is closed, so a re-import cannot leave a stale open PR under coverage=true.
+      if (input.status === 'complete') {
+        const listed = new Set(input.prs.map((p) => p.number));
+        for (const row of storage.listProjection('prs')) {
+          if (row.repo !== input.repo || listed.has(row.number) || row.state !== 'open' || (row.fields.state || 0) > input.baseCursor) continue;
+          storage.putProjection('prs', JSON.stringify([row.repo, row.number]),
+            { ...row, state: 'closed', merged: null, fields: { ...row.fields, state: input.baseCursor } });
+        }
+      }
       const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
       storage.putProjection('bootstrap', input.repo, result);
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
@@ -317,10 +327,10 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
 
 const FUTURE_SKEW_MS = 60_000;
 /** Per-repo `{ bootstrapAt, lastEventAt, coverage }`, each from that repo's OWN bootstrap/event rows. Times are the
- *  Worker's clock at write, beyond the reader's now + 60 s clamped to now (never trust a future time). Coverage = bootstrap
+ *  Worker's clock at write, beyond the reader's now + 60 s rejected as null with coverage false (never trust a future time). Coverage = bootstrap
  *  complete with a recorded time AND no events pruned since its base cursor (conservative: the ring is global). */
 function repoFreshness(storage, head, now) {
-  const clamp = (v) => (Number.isFinite(v) ? (v > now + FUTURE_SKEW_MS ? now : v) : null);
+  const clamp = (v) => (Number.isFinite(v) && v <= now + FUTURE_SKEW_MS ? v : null); // a future time is rejected, never shown as fresh
   const oldest = storage.minSeq();
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));

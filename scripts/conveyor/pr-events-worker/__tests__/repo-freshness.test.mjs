@@ -41,13 +41,20 @@ describe('GET /prs per-repo freshness', () => {
     expect([repos['o/a'].coverage, repos['o/b'].coverage]).toEqual([false, false]);
   });
 
-  it('clamps times later than now + 60 s', () => {
+  it('rejects times later than now + 60 s (null, coverage false), not shown as fresh', () => {
     const log = createEventLog(createMemoryStorage());
     log.bootstrap(seed('o/a'), T + 3_600_000);
     log.append(ev('o/a'), T + 3_600_000);
     const row = log.readPrs(null, 10, T).repos['o/a'];
-    expect(row.bootstrapAt).toBe(T);
-    expect(row.lastEventAt).toBe(T);
+    expect(row).toEqual({ bootstrapAt: null, lastEventAt: null, coverage: false });
+    expect(log.readPrs(null, 10, T + 3_600_000).repos['o/a'].coverage).toBe(true);
+  });
+
+  it('a complete re-import closes open rows it omits so coverage is never true over a stale open PR', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.bootstrap({ ...seed('o/a'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
+    log.bootstrap(seed('o/a', 0, 'complete', 'i2'), T);
+    expect(log.readPrs(null, 10, T).prs[0].state).toBe('closed');
   });
 
   it('keeps every existing /prs field (additive only)', () => {
