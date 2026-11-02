@@ -56,8 +56,9 @@ describe('breakClassStop', () => {
   it('enumerate-first requires enabled setting and trusts marker authors only', () => {
     const setting = { mode: 'shadow', enumerateFirst: true };
     const marker = bot('<!-- we:enumerate-first -->\n1. Empty input\n2. Concurrent writes');
-    expect(breakClassStop(input([...replay6033, marker], { setting })).enumerateFirst).toEqual({ required: true, recorded: true });
-    expect(breakClassStop(input([{ ...marker, author: { login: 'stranger' } }], { setting })).enumerateFirst).toEqual({ required: true, recorded: false });
+    const early = { ...marker, createdAt: new Date(Date.UTC(2026, 9, 19)).toISOString() };
+    expect(breakClassStop(input([...replay6033, early], { setting })).enumerateFirst).toEqual({ required: true, recorded: true });
+    expect(breakClassStop(input([{ ...early, author: { login: 'stranger' } }], { setting })).enumerateFirst).toEqual({ required: true, recorded: false });
     expect(breakClassStop(input()).enumerateFirst.required).toBe(false);
     expect(enumerateFirstPrompt()).toMatch(/<!-- we:enumerate-first -->/);
     expect(enumerateFirstPrompt()).toMatch(/edge cases.*break candidates/i);
@@ -100,5 +101,28 @@ describe('break-class policy and shadow observer', () => {
     expect(observeBreakClassStop({ env: { VITEST: 'true' } })).toMatchObject({ skipped: 'under-test' });
     expect(() => observeBreakClassStop({ ...args, dir: join(dir, '2026-10.jsonl') })).not.toThrow();
     expect(() => observeBreakClassStop({ ...args, subject: new Proxy({}, { get() { throw Error('subject'); } }) })).not.toThrow();
+  });
+
+  it('class identity keys on the full path: same basename in different directories stays distinct', () => {
+    const mk = (cat, file, i) => bot(`<!-- we:red-team-advisory pr=${PR} rev=${String(i + 1).repeat(40)} -->\n1. [**confirmed**] (${cat}, broken) \`${file}:5\` — Break ${i}\n   - Scenario: s\n   - Re-check: r\n`, i);
+    const r = breakClassStop(input([mk('edge-case', 'scripts/conveyor/a/worker.mjs', 0), mk('edge-case', 'scripts/conveyor/b/worker.mjs', 1), mk('edge-case', 'scripts/conveyor/c/worker.mjs', 2)]));
+    expect(r).toMatchObject({ wouldStop: true, consecutive: 3 });
+  });
+  it('enumerate marker must precede round 1, lead the comment (not quoted) and not be a later/quoted mention', () => {
+    const setting = { mode: 'shadow', enumerateFirst: true };
+    const at = (h, body) => ({ ...bot(body), createdAt: new Date(Date.UTC(2026, 9, h)).toISOString() });
+    const mark = '<!-- we:enumerate-first -->\n1. Empty input';
+    expect(breakClassStop(input([...replay6033, at(25, mark)], { setting })).enumerateFirst.recorded).toBe(false);
+    expect(breakClassStop(input([...replay6033, at(19, `> quoted\n> <!-- we:enumerate-first -->\nmore`)], { setting })).enumerateFirst.recorded).toBe(false);
+    expect(breakClassStop(input([...replay6033, at(19, `see <!-- we:enumerate-first --> later`)], { setting })).enumerateFirst.recorded).toBe(false);
+    expect(breakClassStop(input([...replay6033, at(19, mark)], { setting })).enumerateFirst.recorded).toBe(true);
+  });
+  it('dedup keys on the evidence hash: corrected evidence with the same round count is logged again', () => {
+    const dir = tmp();
+    const args = { pr: PR, repo: 'org/repo', subject: subject(), env, dir, now: Date.UTC(2026, 9, 21), log: () => {} };
+    expect(observeBreakClassStop(args)).toMatchObject({ wouldStop: true });
+    const changed = replay6033.map((c, i) => i === 2 ? { ...c, body: c.body.replace('Candidate 3 breaks', 'Candidate 3 differs') } : c);
+    expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: changed } })).toMatchObject({ kind: 'break-class-stop' });
+    expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: changed } })).toMatchObject({ skipped: 'already-logged' });
   });
 });
