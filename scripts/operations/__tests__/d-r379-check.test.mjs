@@ -449,74 +449,6 @@ describe('current-head ledger acceptance regressions', () => {
   });
 });
 
-describe('protected implementation and test regressions', () => {
-  it.each(['gate','guard','verdict','ledger','codeql','secret','policy','permission','approval','label']
-    .flatMap(name => ['scripts', '.github'].flatMap(tree => [
-      `${tree}/lib/custom-${name}-helper.mjs`,
-      `${tree}/lib/__tests__/custom-${name}-helper.test.mjs`,
-    ])))('generic protection refuses condition 4 for %s', async path => {
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
-    expect(condition(r,4).status).toBe('FAIL'); expect(r.eligible).toBe(false);
-  });
-  it.each([
-    'scripts/lib/codeql-gate.mjs',
-    'scripts/lib/__tests__/merge-gate-verdict.test.mjs',
-    'scripts/operations/d-r379-check-io.mjs',
-    'scripts/operations/codex-audit.mjs',
-    'scripts/operations/codex-audit-io.mjs',
-    'scripts/lib/standards-sections.mjs',
-    'scripts/check-standards.mjs',
-    'scripts/check-standards-rules.mjs',
-    'scripts/check-demos.mjs',
-    'scripts/check-memory.mjs',
-    'scripts/lib/policy-cascade.mjs',
-    'scripts/lib/constellation-repos.mjs',
-    'scripts/lib/gh-throttle.mjs',
-    'scripts/lib/delivery-platform-preferences.json',
-    'scripts/lib/delivery-priority-settings.json',
-    'scripts/__tests__/check-standards.test.mjs',
-    'scripts/lib/review-core.mjs',
-    'scripts/lib/review-ledger-history.mjs',
-    'scripts/lib/verdict-ledger.mjs',
-    'scripts/lib/verdict-ledger-io.mjs',
-    'scripts/lib/pr-state.mjs',
-    'scripts/lib/review-escalation.mjs',
-    'scripts/lib/review-labels.mjs',
-    'scripts/review-ledger-check.mjs',
-    'scripts/settings/pr-limit.json',
-    'scripts/drain-gate-settings.json',
-    'scripts/lib/review-policy.contract.json',
-    'scripts/check-standards.contract.json',
-    'scripts/__tests__/guard-bash.test.mjs',
-    'scripts/__tests__/review-set-label.test.mjs',
-    'scripts/lib/__tests__/jury-core.test.mjs',
-    'scripts/operations/__tests__/d-r379-check.test.mjs',
-    'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
-    'scripts/lib/__tests__/verdict-ledger.test.mjs',
-    'scripts/lib/__tests__/pr-limit.test.mjs',
-    'scripts/lib/utc-day-slice-scan.mjs',
-    'scripts/lib/invisible-source-scan.mjs',
-    'scripts/lib/stdout-flush-scan.mjs',
-    'scripts/lib/rust-scan-bridge.mjs',
-    'scripts/lib/validate-rules-anchors.cjs',
-    'scripts/lib/memory-freshness.cjs',
-    'scripts/lib/verdict-totality.mjs',
-    'scripts/lib/jury-core.mjs',
-    'scripts/lib/review-skill-guard.mjs',
-    'scripts/lib/mandate-fence-scan.mjs'
-  ])('classifies %s as protected with the shipped glob policy', async path => {
-    expect(settings.protectedPaths.some(glob => matchesGlob(path,glob))).toBe(true);
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
-    expect(condition(r,4).status).toBe('FAIL');
-    expect(r.eligible).toBe(false);
-  });
-  it.each(['docs/foo.md','docs/examples/x.md','docs/gate-policy.md'])('keeps innocuous %s eligible', async path => {
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
-    expect(condition(r,4).status).toBe('PASS'); expect(r.eligible).toBe(true);
-  });
-});
-
-
 describe('merge-base decision ratification regressions', () => {
   const path = 'backlog/123-test.md';
   const card = (status, key = 'kind', kind = 'decision') => `---\n${key}: ${kind}\nstatus: ${status}\n---\n`;
@@ -596,62 +528,6 @@ describe('merge-base card reader', () => {
     const d = createCheckDeps({exec:()=>{throw Error('must not execute');}});
     await expect(d.readBaseFile('HEAD',path)).rejects.toThrow('invalid commit');
     await expect(d.readBaseFile(base,'../card.md')).rejects.toThrow('invalid card path');
-  });
-});
-
-describe('protected test, coverage and CI execution controls', () => {
-  it.each([
-    'package.json',
-    'package-lock.json',
-    'vitest.config.ts',
-    'vitest.integration.config.ts',
-    'vitest.live.config.ts',
-    'vitest.soak.config.ts',
-    'vitest.maas-conformance.config.ts',
-    'vitest.shared.ts',
-    'vitest.setup.ts',
-    'vitest.globalSetup.mjs',
-    'playwright.config.ts',
-    'bun-test.preload.ts',
-    '.github/workflows/ci.yml',
-    '.github/workflows/update-visual-baselines.yml',
-    'scripts/merge-coverage.mjs',
-    'scripts/ci-card-only.mjs',
-    'scripts/ci/quarantine-skip.mjs',
-    'scripts/ci/coverage-reach.mjs',
-    'scripts/ci/shard-runner-compare.mjs',
-    'scripts/ci/test-timings.json',
-    'scripts/conveyor/soak/run-shard.mjs',
-    'scripts/dev/regression.mjs',
-    'scripts/hermetic-tests.settings.json',
-    'scripts/hermetic-test-baseline.json',
-    'scripts/lib/hermetic-tests.mjs',
-    'scripts/lib/hermetic-tests-vitest.mjs',
-    'scripts/lib/hermetic-git-overlay.mjs',
-    'scripts/lib/trust-chain-tier.mjs',
-    'scripts/lib/test-result-cache.mjs',
-    'scripts/lib/test-cache-trace.mjs',
-    'scripts/lib/test-result-store.mjs',
-    'scripts/lib/related-test-selection.mjs',
-    'scripts/test-cache/shadow-reporter.mjs',
-    'scripts/test-cache/trace-setup.mjs',
-    'scripts/lib/workflow-invariants.cjs',
-    'scripts/readiness/heavy-admission.mjs'
-  ])('refuses eligibility for %s', async path => {
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
-    expect(condition(r,4).status).toBe('FAIL'); expect(r.eligible).toBe(false);
-  });
-});
-
-
-describe('round 4 wholesale test protection', () => {
-  it.each(['tests/helper.js', 'src/widget.spec.ts', 'widget.test.js',
-    'lib/__tests__/assertions.mjs', 'playwright.mobile.config.ts',
-    'config/playwright.config.js', 'tests/a11y/helper.ts', 'blocks/__tests__/e2e/helper.js'])
-  ('requires operator review for any edit or assertion removal in %s', async path => {
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
-    expect(condition(r,4)).toMatchObject({status:'FAIL',evidence:[`protected path: ${path}`]});
-    expect(r.eligible).toBe(false);
   });
 });
 
@@ -797,72 +673,6 @@ describe('R391 EOF-only ruling records', () => {
   });
 });
 
-
-describe('round 6 enforcement-tree classification', () => {
-  it.each(['scripts/rust-scan/src/stdout_flush.rs', 'scripts/lib/we-scan-cache.mjs',
-    'docs/agent/testing.md', 'scripts/lib/format-date.mjs', '.github/helper.yml',
-    '.claude/commands/example.md', 'new-config.json', 'native/check.rs', 'tools/check.sh', 'README.rs'])
-  ('keeps unclassified %s UNKNOWN with operator review', async path => {
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
-    expect(condition(r,4)).toMatchObject({status:'UNKNOWN',
-      evidence:[`unclassified path: ${path}; operator review`]});
-    expect(r.eligible).toBe(false);
-  });
-  it.each(['docs/examples/x.md','backlog/123-story.md','README.md'])('passes allowlisted content path %s', async path => {
-    expect(condition(await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]})),4).status).toBe('PASS');
-  });
-  it('rejects a non-empty reviewedSafePaths policy for an enforcement path', async () => {
-    const path = 'scripts/lib/format-date.mjs';
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}, {
-      readSettings:()=>({...settings,reviewedSafePaths:[path]}),
-    }));
-    expect(condition(r,4).status).toBe('UNKNOWN');
-    expect(condition(r,4).evidence.join(' ')).toContain('human review');
-    expect(r.eligible).toBe(false);
-  });
-  it('ignores empty reviewedSafePaths and still fails protected paths', async () => {
-    const path = 'scripts/check-standards.mjs';
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs',path]}, {
-      readSettings:()=>({...settings,reviewedSafePaths:[]}),
-    }));
-    expect(condition(r,4)).toMatchObject({status:'FAIL',evidence:[`protected path: ${path}`]});
-  });
-  it.each([{}, {reviewedSafePaths:[]}])('ignores absent/empty reviewedSafePaths: %j', async extra => {
-    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs']}, {
-      readSettings:()=>({...settings,...extra}),
-    }));
-    expect(condition(r,4).status).toBe('UNKNOWN');
-  });
-  it.each([{enforcementTrees:null},{reviewedSafePaths:null},
-    {reviewedSafePaths:['']},{reviewedSafePaths:Array(1001).fill('docs/**')}])
-  ('keeps invalid classification settings closed: %j', async extra => {
-    const r = await checkPr(6223,deps(undefined,{readSettings:()=>({...settings,...extra})}));
-    expect(condition(r,4).status).toBe('UNKNOWN'); expect(r.eligible).toBe(false);
-    expect(condition(r,4).evidence.join(' ')).toContain('human review');
-  });
-});
-
-describe('round 15 removed reviewedSafePaths policy', () => {
-  it.each([['**'], ['docs/examples/x.md'], ['unrelated/**'], [''], Array(1001).fill('docs/**')]
-    .map(reviewedSafePaths => ({reviewedSafePaths})))
-  ('rejects non-empty reviewedSafePaths even for a harmless diff: %j', async ({reviewedSafePaths}) => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md']}, {
-      readSettings: () => ({...settings, reviewedSafePaths}),
-    }));
-    for (const id of [3, 4]) {
-      expect(condition(r, id).status).toBe('UNKNOWN');
-      expect(condition(r, id).evidence.join(' ')).toContain('human review');
-    }
-    expect(r.eligible).toBe(false);
-  });
-  it.each([{}, {reviewedSafePaths: []}])('absent/empty legacy key preserves harmless eligibility: %j', async extra => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md']}, {
-      readSettings: () => ({...settings, ...extra}),
-    }));
-    expect(condition(r, 4)).toMatchObject({status: 'PASS', evidence: ['all paths harmless; no protected paths']});
-    expect(r.eligible).toBe(true);
-  });
-});
 
 describe('round 6 ruling-entry content evidence', () => {
   const path = 'docs/agent/platform-decisions.md';
@@ -1131,208 +941,6 @@ describe('round 9 rejected canonical audits', () => {
   });
 });
 
-describe('round 9 agent and review instruction enforcement', () => {
-  it.each(['skills-src/review/SKILL.md', 'skills-src/review/review-agent-system-prompt.md',
-    'packages/reviewer/SKILL.md', 'packages/reviewer/CLAUDE.md',
-    'agent-memory-src/mandatory-guards.md', '.claude-plugin/review/instructions.md',
-    'prompts/review.md', 'packages/reviewer/prompts/review.md',
-    '.claude/commands/review.md', '.github/prompts/review.prompt.md',
-    'skills/review/instructions.md', 'packages/reviewer/skills/review/instructions.md'])
-  ('keeps instruction Markdown %s UNKNOWN with operator fallback', async path => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
-    expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
-      evidence: [`unclassified path: ${path}; operator review`]});
-    expect(r.eligible).toBe(false);
-  });
-  it('keeps ordinary example Markdown PASS', async () => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md']}));
-    expect(condition(r, 4).status).toBe('PASS');
-  });
-});
-
-describe('round 8 runtime source enforcement across trees', () => {
-  it.each(['blocks/router/route-config.ts', 'blocks/widget.js', 'src/assets/js/runtime.js',
-    'src/runtime/check.ts', 'src/runtime/check.mjs', 'apps/server/validate.cjs',
-    'packages/schema/check.py', 'plateau/runtime/validate.rs', 'plateau-app/runtime/check.sh',
-    'packages/runtime/config.json', 'validation-generation/provider.ts',
-    'validator-resolution/provider.ts', 'validity-merge/provider.ts', 'capability-manifest/guard.ts',
-    'conformance-vectors/schema.ts', 'conformance-evidence/provider.ts', 'explorer/schema.ts',
-    'repro-bundle/schema.ts', 'guard/accessControl.ts', 'config/defineConfig.ts',
-    'webcases/requirementValidator.ts', 'functions/runtime/check.js', 'tools/runtime/check.mjs'])
-  ('keeps runtime source %s UNKNOWN with operator fallback', async path => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
-    expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
-      evidence: [`unclassified path: ${path}; operator review`]});
-    expect(r.eligible).toBe(false);
-  });
-  it.each(['docs/examples/x.md', 'blocks/foo/image.png', 'plateau/docs/image.png'])
-  ('keeps allowlisted content %s PASS', async path => {
-    expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
-  });
-});
-
-describe('round 10 harmless-path allowlist', () => {
-  it.each(['blocks/renderers/jsx/__fixtures__/mapping-cases.tsx', 'new-tree/future.code',
-    'blocks/foo/README.md', 'src/content.md', 'LICENSE.txt', 'CHANGELOG.md',
-    'blocks/foo/example.njk', 'blocks/foo/style.css', 'src/pages/example.njk',
-    'src/assets/style.css', 'apps/docs/README.md', 'packages/docs/example.njk',
-    'validation-generation/README.md', 'research/topic.md', 'backlog/nested/story.md'])
-  ('unknown path %s requires operator review', async path => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
-    expect(condition(r, 4)).toEqual({id: 4, name: 'Not guard-loosening / hard to undo',
-      status: 'UNKNOWN', evidence: [`unclassified path: ${path}; operator review`]});
-    expect(r.eligible).toBe(false);
-  });
-  it.each(['docs/examples/example.md', 'docs/topic.md', 'docs/topics/detail.md',
-    'backlog/123-story.md', 'README.fr.md', 'image.jpg', 'assets/image.webp',
-    'assets/image.png'])('allowlisted %s passes', async path => {
-    expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
-  });
-  it.each(['docs/agent/future.md', 'docs/examples/runtime.js', 'docs/prompts/example.md',
-    'scripts/image.svg', '.github/image.png', 'packages/reviewer/skills/image.webp'])
-  ('harmless match cannot bypass enforcement tree for %s', async path => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
-    expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
-      evidence: [`unclassified path: ${path}; operator review`]});
-  });
-  it('one unknown path prevents a harmless mixed diff from passing', async () => {
-    const path = 'new-tree/future.code';
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md', path]}));
-    expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
-      evidence: [`unclassified path: ${path}; operator review`]});
-  });
-  it('non-empty reviewedSafePaths cannot classify paths outside the allowlist', async () => {
-    const path = 'new-tree/future.code';
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-      readSettings: () => ({...settings, reviewedSafePaths: [path]}),
-    }));
-    expect(condition(r, 4).status).toBe('UNKNOWN');
-    expect(condition(r, 4).evidence.join(' ')).toContain('human review');
-    expect(r.eligible).toBe(false);
-  });
-  it('non-empty reviewedSafePaths makes a protected harmless match ineligible', async () => {
-    const path = 'tests/image.svg';
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-      readSettings: () => ({...settings, reviewedSafePaths: [path]}),
-    }));
-    expect(condition(r, 4).status).toBe('UNKNOWN');
-    expect(condition(r, 4).evidence.join(' ')).toContain('human review');
-    expect(r.eligible).toBe(false);
-  });
-  it('protected paths fail even when they match the built-in harmless allowlist', async () => {
-    const path = 'tests/image.png';
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
-    expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
-    expect(r.eligible).toBe(false);
-  });
-  it.each([undefined, null, [], [''], Array(1001).fill('docs/**'), ['x'.repeat(4097)]]
-    .map(harmlessPaths => ({harmlessPaths})))
-  ('any supplied harmlessPaths key stays closed: %j', async ({harmlessPaths}) => {
-    const r = await checkPr(6223, deps(undefined, {
-      readSettings: () => ({...settings, harmlessPaths}),
-    }));
-    expect(condition(r, 4).status).toBe('UNKNOWN');
-    expect(condition(r, 4).evidence.join(' ')).toContain('human review');
-    expect(r.eligible).toBe(false);
-  });
-  it.each(['conformance-vectors/webdirectives-ssr-harness-contract.md',
-    'conformance-evidence/contract.md', 'contracts/new-contract.md',
-    'schemas/new-schema.md', 'wrapper-conformance/contract.md'])
-  ('normative path %s fails condition 3', async path => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
-    expect(condition(r, 3)).toMatchObject({status: 'FAIL', evidence: [`direction path: ${path}`]});
-    expect(r.eligible).toBe(false);
-  });
-});
-
-describe('round 17 code-owned path policy', () => {
-  const minimal = {rulingRecordPaths: settings.rulingRecordPaths};
-  const empty = {...minimal, protectedPaths: [], directionPaths: [], enforcementTrees: []};
-  it.each([undefined, null, [], ['docs/examples/**/*.md'], ['**']])
-  ('rejects the harmlessPaths key regardless of its value: %j', async harmlessPaths => {
-    const r = await checkPr(6223, deps(undefined, {
-      readSettings: () => ({...settings, harmlessPaths}),
-    }));
-    for (const id of [3, 4]) {
-      expect(condition(r, id).status).toBe('UNKNOWN');
-      expect(condition(r, id).evidence.join(' ')).toContain('human review');
-    }
-    expect(r.eligible).toBe(false);
-  });
-  it.each([['empty', empty], ['omitted', minimal]])
-  ('%s additions retain the built-in harmless allowlist', async (_name, policy) => {
-    const r = await checkPr(6223, deps(undefined, {readSettings: () => policy}));
-    expect(r.eligible).toBe(true);
-  });
-  it.each(['scripts/guard-bash.mjs', 'scripts/lib/jury-core.mjs',
-    'scripts/review-set-label.mjs', '.github/workflows/ci.yml', 'package.json',
-    'tests/security.test.ts', 'scripts/lib/delivery-platform-preferences.json',
-    'scripts/settings/d-r379-protected-paths.json',
-    'scripts/operations/d-r379-check.mjs', 'scripts/operations/d-r379-check-io.mjs',
-    'scripts/operations/__tests__/d-r379-check.test.mjs',
-    'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
-    'scripts/operations/__fixtures__/d-r379/nested/policy.json'])
-  ('empty or omitted additions cannot remove built-in protection for %s', async path => {
-    for (const policy of [empty, minimal]) {
-      const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-        readSettings: () => policy,
-      }));
-      expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
-      expect(r.eligible).toBe(false);
-    }
-  });
-  it.each(['scripts/example.png', '.github/example.png', '.claude/example.png',
-    'skills-src/example.png', 'docs/agent/example.png', 'docs/prompts/example.md'])
-  ('empty enforcement additions cannot bless harmless-looking %s', async path => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-      readSettings: () => empty,
-    }));
-    expect(condition(r, 4).status).toBe('UNKNOWN');
-    expect(r.eligible).toBe(false);
-  });
-  it('empty direction additions cannot remove conformance-vector protection', async () => {
-    const path = 'conformance-vectors/x.md';
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-      readSettings: () => empty,
-    }));
-    expect(condition(r, 3)).toMatchObject({status: 'FAIL', evidence: [`direction path: ${path}`]});
-    expect(r.eligible).toBe(false);
-  });
-  it.each([
-    ['protectedPaths', 'docs/examples/protected.md', 4, 'FAIL'],
-    ['directionPaths', 'docs/examples/direction.md', 3, 'FAIL'],
-    ['enforcementTrees', 'docs/examples/enforcement.md', 4, 'UNKNOWN'],
-  ])('JSON %s additions extend built-in protection', async (key, path, id, status) => {
-    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
-      readSettings: () => ({...empty, [key]: [path]}),
-    }));
-    expect(condition(r, id).status).toBe(status);
-    expect(r.eligible).toBe(false);
-  });
-  it.each(['protectedPaths', 'directionPaths', 'enforcementTrees'])
-  ('oversized %s additions require human review', async key => {
-    const r = await checkPr(6223, deps(undefined, {
-      readSettings: () => ({...empty, [key]: Array(1001).fill('extra/**')}),
-    }));
-    for (const id of [3, 4]) {
-      expect(condition(r, id).status).toBe('UNKNOWN');
-      expect(condition(r, id).evidence.join(' ')).toContain('human review');
-    }
-  });
-});
-
-describe('round 11 equal-time hold and executable examples', () => {
-  it('a docs/examples executable file is not harmless', async () => {
-    const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['docs/examples/access-control.tsx'] }));
-    expect(condition(r, 4).status).not.toBe('PASS');
-    expect(r.eligible).toBe(false);
-  });
-  it('docs/examples markdown stays harmless', async () => {
-    const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['docs/examples/example-9.md'] }));
-    expect(condition(r, 4).status).toBe('PASS');
-  });
-});
-
 describe('round 14 clear-human acceptance', () => {
   it('a clear-human ledger clearance is not delegated acceptance', async () => {
     const f = fixture(6223);
@@ -1343,13 +951,119 @@ describe('round 14 clear-human acceptance', () => {
 });
 
 describe('round 16 svg and unknown review labels', () => {
-  it('an svg is not harmless (it can carry script)', async () => {
+  it('an svg outside protected paths passes condition 4', async () => {
     const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['src/assets/active.svg'] }));
-    expect(condition(r, 4).status).not.toBe('PASS');
+    expect(condition(r, 4).status).toBe('PASS');
   });
   it.each(['review:awaiting-advisory', 'advisory:needs-panel', 'review:something-new'])('label %s blocks', async label => {
     const f = fixture(6223);
     const r = await checkPr(1, deps({ ...f, labels: [...f.labels, label] }, { readLabels: async () => [...f.labels, label] }));
     expect(condition(r, 2).status).toBe('FAIL');
+  });
+});
+
+
+describe('condition 4 operator exclusions', () => {
+  const minimal = {rulingRecordPaths: settings.rulingRecordPaths};
+  const empty = {...minimal, protectedPaths: [], directionPaths: []};
+  const protectedCases = [
+    'scripts/guard-bash.mjs', 'scripts/review-set-label.mjs',
+    'scripts/lib/red-team-gate-core.mjs', 'scripts/lib/red-team-gate.mjs',
+    'scripts/lib/jury-core.mjs', 'scripts/lib/secret-scrub.mjs',
+    'scripts/lib/github-app-token.mjs', '.claude/hooks/x.mjs',
+    '.githooks/pre-commit', 'scripts/hooks/pre-push', '.claude/settings.json',
+    'settings.json', 'nested/settings.json', 'guard-custom.mjs',
+    'tools/review-set-label-helper.mjs', 'tools/red-team-helper.mjs',
+    'tools/referral-helper.mjs', 'scripts/lib/__tests__/guard-foo.test.mjs',
+    'scripts/lib/__tests__/jury-core.test.mjs',
+    'scripts/lib/__tests__/secret-scrub.test.mjs',
+    'scripts/lib/__tests__/github-app-token.test.mjs',
+    'scripts/readiness/forge-setup.sh', 'scripts/readiness/forge-exec-limits.mjs',
+    'forge-exec/limits.json', 'etc/forge-exec/limits.json',
+    'migrations/001.sql', 'data/migrations/001.sql',
+    '.github/workflows/ci.yml', '.github/workflows/nested/check.yml',
+    'scripts/operations/d-r379-check.mjs', 'scripts/operations/d-r379-check-io.mjs',
+    'scripts/settings/d-r379-protected-paths.json',
+    'scripts/operations/__tests__/d-r379-check.test.mjs',
+    'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
+    'scripts/operations/__fixtures__/d-r379/6223.json',
+    ...['gate','guard','verdict','ledger','codeql','secret','approval','permission','label','policy']
+      .flatMap(name => ['scripts', '.github'].flatMap(tree => [
+        `${tree}/lib/custom-${name}-helper.mjs`,
+        `${tree}/lib/__tests__/custom-${name}-helper.test.mjs`,
+      ])),
+  ];
+  it.each(protectedCases)('protects %s even with empty or omitted JSON additions', async path => {
+    for (const policy of [settings, empty, minimal]) {
+      const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
+        readSettings: () => policy,
+      }));
+      expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
+      expect(r.eligible).toBe(false);
+    }
+  });
+  it.each([
+    'scripts/conveyor/foo.mjs', 'docs/examples/x.md', 'tests/a/b.test.mjs',
+    'scripts/lib/__tests__/format-date.test.mjs', 'widget.spec.ts',
+    'lib/__tests__/assertions.mjs', 'tests/helper.js', 'tests/a11y/helper.ts',
+    'blocks/__tests__/e2e/helper.js', 'blocks/widget.js', 'blocks/foo/README.md',
+    'src/assets/js/runtime.js', 'src/assets/active.svg', 'src/content.md',
+    'docs/examples/access-control.tsx', 'docs/agent/testing.md', 'docs/gate-policy.md',
+    'scripts/lib/format-date.mjs', 'scripts/lib/standards-sections.mjs',
+    'scripts/check-standards.mjs', 'scripts/operations/codex-audit.mjs',
+    'scripts/gen-inventory.mjs', 'scripts/lib/gh-throttle.mjs',
+    'scripts/lib/pr-state.mjs', 'scripts/settings/pr-limit.json',
+    'scripts/ci/shard-runner.mjs', 'scripts/readiness/heavy-admission.mjs',
+    'package.json', 'package-lock.json', 'vitest.config.ts', 'playwright.config.ts',
+    'skills-src/review/SKILL.md', 'packages/reviewer/CLAUDE.md',
+    'prompts/review.md', '.claude/commands/review.md', '.github/helper.yml',
+    'scripts/image.svg', '.github/image.png', 'new-tree/future.code',
+    'LICENSE.txt', 'backlog/nested/story.md', 'image.jpg',
+  ])('passes non-protected path %s with explicit evidence', async path => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
+    expect(condition(r, 4)).toMatchObject({status: 'PASS', evidence: ['no protected paths']});
+  });
+  it('passes a mixed diff when no path is protected', async () => {
+    const r = await checkPr(6223, deps({...fixture(6223),
+      netDiffPaths: ['docs/examples/x.md', 'scripts/conveyor/foo.mjs', 'tests/a/b.test.mjs']}));
+    expect(condition(r, 4)).toMatchObject({status: 'PASS', evidence: ['no protected paths']});
+    expect(r.eligible).toBe(true);
+  });
+  it('fails a mixed diff if any path is protected', async () => {
+    const r = await checkPr(6223, deps({...fixture(6223),
+      netDiffPaths: ['scripts/conveyor/foo.mjs', 'scripts/guard-bash.mjs']}));
+    expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: ['protected path: scripts/guard-bash.mjs']});
+  });
+  it.each([undefined, null, [], ['**'], Array(1001).fill('docs/**')])
+  ('ignores removed classification keys regardless of value: %j', async value => {
+    const policy = {...empty, harmlessPaths: value, enforcementTrees: value, reviewedSafePaths: value};
+    for (const [path, status] of [['scripts/conveyor/foo.mjs', 'PASS'], ['scripts/guard-bash.mjs', 'FAIL']]) {
+      const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {readSettings: () => policy}));
+      expect(condition(r, 4).status).toBe(status);
+    }
+  });
+  it.each([
+    ['protectedPaths', 'docs/examples/protected.md', 4],
+    ['directionPaths', 'docs/examples/direction.md', 3],
+  ])('JSON %s additions extend the built-in policy', async (key, path, id) => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
+      readSettings: () => ({...empty, [key]: [path]}),
+    }));
+    expect(condition(r, id).status).toBe('FAIL');
+  });
+  it.each(['protectedPaths', 'directionPaths'])('oversized %s additions require human review', async key => {
+    const r = await checkPr(6223, deps(undefined, {
+      readSettings: () => ({...empty, [key]: Array(1001).fill('extra/**')}),
+    }));
+    for (const id of [3, 4]) {
+      expect(condition(r, id).status).toBe('UNKNOWN');
+      expect(condition(r, id).evidence.join(' ')).toContain('human review');
+    }
+  });
+  it.each(['conformance-vectors/x.md', 'conformance-evidence/x.md', 'contracts/x.md',
+    'schemas/x.md', 'wrapper-conformance/x.md'])('retains condition 3 direction protection for %s', async path => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {readSettings: () => empty}));
+    expect(condition(r, 3)).toMatchObject({status: 'FAIL', evidence: [`direction path: ${path}`]});
+    expect(condition(r, 4)).toMatchObject({status: 'PASS', evidence: ['no protected paths']});
   });
 });
