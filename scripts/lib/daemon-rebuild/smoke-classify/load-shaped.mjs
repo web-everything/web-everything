@@ -33,8 +33,9 @@ export const LOAD_CONTENTION_SIGNATURES = Object.freeze([
 ]);
 /** Our own shared gh semaphore refusing: another caller's slot, never the tree under test. Anchored on the exact
  *  refusal text, and applied per failure segment (see {@link isGhThrottleOnlyDetail}). */
-const GH_THROTTLE_SEGMENT = /^(?:dispatch dry-run failed \(\d+\/\d+\): )?(?:[\w-]+(?: PR #\d+)?: )?gh-throttle: throttled — no gh slot within [\d.]+s(?: \(class=[\w-]+\))?$/;
-const GH_THROTTLE_TAIL = /^retry next tick(?: — [^\n]*)?$/;
+const GH_THROTTLE_SEGMENT = /^(?:dispatch dry-run failed \(\d+\/\d+\): )?(?:[\w-]+(?: PR #\d+)?: )?gh-throttle: throttled — no gh slot within [\d.]+s(?: \(class=[\w-]+\))?(?: — (?:[\w-]+ (?:\d+ms|[\d.]+s|unknown)(?:, )?)+)?$/;
+const TIMINGS = '(?: — (?:[\\w-]+ (?:\\d+ms|[\\d.]+s|unknown)(?:, )?)+)?';
+const GH_THROTTLE_TAIL = new RegExp(`^retry next tick${TIMINGS}$`);
 
 /** PURE: the WHOLE detail is gh-throttle refusals (each `; `-joined segment fully anchored, optional "retry next
  *  tick" tail). Any other text — a code failure, a newline — makes it NOT throttle-only. */
