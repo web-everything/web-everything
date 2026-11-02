@@ -144,6 +144,12 @@ if (hermetic) {
 }
 
 process.env.WE_UNDER_TEST = '1';
+// Native fixture children inject the freshness check through its parameter. The
+// production entry has no VITEST exemption; guard tests use independent copies.
+const lanePoolFixtureLoader = new URL('./scripts/__tests__/fixtures/lane-pool-freshness-loader.mjs', import.meta.url).href;
+if (!process.env.NODE_OPTIONS?.includes(`--import=${lanePoolFixtureLoader}`)) {
+  process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS || ''} --import=${lanePoolFixtureLoader}`.trim();
+}
 // Set after the ambient WE_* strip, including for tiers that opt out of hermetic HOME.
 // Callers may still inject a private sink; the default and child processes use this file's sink.
 process.env.WE_DAEMON_EVENTS = lazyRoot('daemon-events.jsonl');

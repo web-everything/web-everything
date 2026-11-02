@@ -330,7 +330,8 @@ describe('automatic reclaim backup-to-reset guard', () => {
     const mutant = source.replace(guard, 'if (false) {').replace(/(from\s+|import\s*\(\s*|import\s+)(['"])(\.[^'"]+)\2/g,
       (_, prefix, quote, specifier) => `${prefix}${quote}${pathToFileURL(resolve(dirname(script), specifier)).href}${quote}`);
     const lanePoolPath = join(base, 'lane-pool-mutant.mjs');
-    writeFileSync(lanePoolPath, mutant);
+    writeFileSync(lanePoolPath, mutant.replace('await guardToolEntry();',
+      'await guardToolEntry({ check: async () => undefined });'));
     const observed = await recoverWithRace({ lanePoolPath });
     expect(observed.result.reclaimed).toEqual([1]);
     expect(existsSync(observed.card)).toBe(false);

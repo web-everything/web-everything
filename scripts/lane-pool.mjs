@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import './lib/stale-tool-guard-entry.mjs';
+import { guardToolEntry } from './lib/stale-tool-guard-entry.mjs';
+await guardToolEntry();
 // Awaited imports run only after the guard permits this module body to execute.
 const { classifyLaneNames, nextLaneNumbers, capState, recoverPool, realRecoverIo, verifyRecoveryBackup, collectVerdicts, diagnosePool, emitFullPoolNeedsYou } = await import('./lib/lane-pool-recover.mjs');
 const { scheduledLaneGc } = await import('./lib/host-load.mjs');

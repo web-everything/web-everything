@@ -108,9 +108,9 @@ describe('lane-pool acquire reclaim log', () => {
     // One fail() write far larger than a pipe buffer, then process.exit(1): with an async pipe the tail is lost.
     // Many short unknown flags (one huge argv string hits E2BIG): fail() lists them all in ONE ~200KB line.
     const flags = Array.from({ length: 2000 }, (_, i) => `--unknown-${String(i).padStart(4, '0')}-${'x'.repeat(90)}`);
-    // Preserve the fixture-only stale-tool guard exemption even with the minimal environment.
+    // Preserve the test-only parameter injector even with the minimal environment.
     const child = spawn(process.execPath, [SCRIPT, 'status', ...flags], { stdio: ['ignore', 'ignore', 'pipe'],
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, VITEST: 'true', LANE_POOL_ROOT: pool } }); // small env: argv+env stay under ARG_MAX
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, NODE_OPTIONS: process.env.NODE_OPTIONS, VITEST: 'true', LANE_POOL_ROOT: pool } }); // small env: argv+env stay under ARG_MAX
     const exited = new Promise((done) => child.on('exit', done));
     child.stderr.pause();
     await new Promise((done) => setTimeout(done, 1_500)); // a stalled reader: the pipe fills meanwhile

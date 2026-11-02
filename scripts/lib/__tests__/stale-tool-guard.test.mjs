@@ -127,8 +127,10 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', upstream =
       return { status: childStatus, stdout: '', stderr: '' };
     }
     expect(command).toBe('git');
-    expect(options.cwd).toBe(args.includes('--show-toplevel') ? process.cwd() : root);
+    expect(options.cwd).toBe(args.includes('--show-toplevel') ? process.cwd()
+      : args.includes('config') || args.includes('reset') ? worktree : root);
     if (args.includes('--show-toplevel')) return failure(); // Model a non-Git invocation cwd.
+    if (args.includes('config') || args.includes('reset')) return success();
     const operation = ['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff', 'worktree'].find((name) => args.includes(name));
     const stage = operation === 'worktree' ? `worktree-${args[args.indexOf('worktree') + 1]}` : operation;
     if (stage === fail) {
@@ -402,11 +404,13 @@ describe('guardToolCheckout', () => {
       .rejects.toThrow('stale tool checkout (6 behind)');
   });
 
-  it('only the exact re-exec marker 1 bypasses all Git IO', async () => {
+  it('re-exec marker still validates and refuses a second re-exec', async () => {
     const { guardToolCheckout } = await load();
     const h = harness();
-    await guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: '1' } });
-    expect(h.exec).not.toHaveBeenCalled();
+    await expect(guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: '1' }, settings: { mode: 'reexec' } }))
+      .rejects.toThrow('refusing a second re-exec');
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(true);
+    expect(nodeCalls(h)).toHaveLength(0);
     for (const marker of ['0', 'true', '']) {
       await expect(async () => guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: marker } }))
         .rejects.toThrow('stale tool checkout (6 behind)');
@@ -617,16 +621,136 @@ describe('lane-pool entry wiring', () => {
     expect(source).toContain('? process.env.WE_TOOL_ORIGINAL_CHECKOUT : resolve(dirname(fileURLToPath(import.meta.url))');
   });
 
-  it('imports the separate guard side-effect entry before every other import', () => {
+  it('awaits the guard entry before loading tool dependencies', () => {
     const source = readFileSync(join(ROOT, 'scripts/lane-pool.mjs'), 'utf8');
     const imports = source.split(/\r?\n/).filter((line) => /^\s*import\b/.test(line));
-    expect(imports[0]).toMatch(/^import\s+['"]\.\/lib\/stale-tool-guard-entry\.mjs['"];?\s*$/);
+    expect(imports[0]).toBe("import { guardToolEntry } from './lib/stale-tool-guard-entry.mjs';");
     expect(imports).not.toContain("import './lib/stale-tool-guard.mjs';");
-    expect(imports).toEqual(["import './lib/stale-tool-guard-entry.mjs';"]);
+    expect(imports).toEqual(["import { guardToolEntry } from './lib/stale-tool-guard-entry.mjs';"]);
+    expect(source.indexOf('await guardToolEntry();')).toBeLessThan(source.indexOf('= await import('));
   });
 });
 
 describe('guard bounds and settings', () => {
+  it('lets unit fixtures inject a check without an environment exemption', async () => {
+    const { guardToolEntry } = await import('../stale-tool-guard-entry.mjs');
+    const check = vi.fn(async () => undefined);
+    await guardToolEntry({ check });
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledWith({ entry: process.argv[1] });
+  });
+
+  it.each(['missing directory', 'missing legacy', 'malformed', 'non-object', 'dangling feature'])(
+    'refuses %s declared settings with a named error', async kind => {
+      const { readDeclaredSettings } = await import('../settings-files.mjs');
+      const { resolveStaleToolSettings } = await load();
+      const root = scratch();
+      let dir = root, legacyPath = null;
+      if (kind === 'missing directory') dir = join(root, 'missing');
+      else if (kind === 'missing legacy') legacyPath = join(root, 'missing.json');
+      else if (kind === 'dangling feature') {
+        const { symlinkSync } = await import('node:fs');
+        symlinkSync(join(root, 'missing'), join(root, 'strict.json'));
+      } else put(root, 'strict.json', kind === 'malformed' ? '{broken' : '[]');
+      const readDeclared = options => readDeclaredSettings({ ...options, dir, legacyPath });
+      expect(() => resolveStaleToolSettings({ platform: {}, env: {}, readDeclared, log: () => {} }))
+        .toThrow(/staleToolGuard declared settings/);
+    },
+  );
+
+  it.each(['current', 'fetch failure', 'invalid settings'])('re-exec child repeats validation: %s', async kind => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ behind: '0\n', fail: kind === 'fetch failure' ? 'fetch' : undefined });
+    const run = guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: '1' },
+      settings: kind === 'invalid settings' ? { threshold: -1 } : {} });
+    if (kind === 'current') {
+      await expect(run).resolves.toBeUndefined();
+      expect(h.exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(true);
+    } else await expect(run).rejects.toThrow(kind === 'fetch failure' ? 'Git fetch' : 'Invalid staleToolGuard');
+    expect(nodeCalls(h)).toHaveLength(0);
+  });
+
+  it('refuses unreadable declared settings directories instead of using defaults', async () => {
+    const { readDeclaredSettings } = await import('../settings-files.mjs');
+    const { resolveStaleToolSettings } = await load();
+    const dir = join(scratch(), 'not-a-directory');
+    writeFileSync(dir, 'unreadable settings inventory');
+    const readDeclared = options => readDeclaredSettings({ ...options, dir, legacyPath: null });
+    expect(() => resolveStaleToolSettings({ platform: {}, env: {}, readDeclared, log: () => {} }))
+      .toThrow(/staleToolGuard.*settings/);
+  });
+
+  it('disables configured checkout filters before populating the re-exec worktree', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    const runner = h.exec.getMockImplementation();
+    h.exec.mockImplementation((command, args, options) => {
+      if (args.includes('config')) return success('filter.fixture.smudge\0filter.fixture.process\0filter.fixture.required\0');
+      if (args.includes('reset')) {
+        expect(configPins(options.env)).toMatchObject({ 'filter.fixture.smudge': '',
+          'filter.fixture.process': '', 'filter.fixture.clean': '', 'filter.fixture.required': 'false',
+          'core.hooksPath': '/dev/null' });
+        return success();
+      }
+      return runner(command, args, options);
+    });
+    await guardToolCheckout({ ...h, settings: { mode: 'reexec' } });
+    const add = h.exec.mock.calls.find(([, args]) => args.includes('add'));
+    expect(add[1]).toContain('--no-checkout');
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('reset'))).toBe(true);
+  });
+
+  it.each(['smudge', 'process'])('real Git cannot run a configured %s filter with checkout hardening', async driver => {
+    const { laneGitCheckoutEnv, laneGitHardeningEnv } = await import('../lane-git-hardening.mjs');
+    const root = scratch();
+    const marker = join(root, 'filter-ran');
+    const payload = 'fixture payload\n';
+    const bytes = Buffer.from(`blob ${Buffer.byteLength(payload)}\0${payload}`);
+    const oid = createHash('sha1').update(bytes).digest('hex');
+    put(root, `objects/${oid.slice(0, 2)}/${oid.slice(2)}`, deflateSync(bytes));
+    mkdirSync(join(root, 'refs'));
+    put(root, 'HEAD', 'ref: refs/heads/main\n');
+    put(root, 'config', `[core]\n bare = true\n[filter "fixture.with.dots"]\n ${driver} = touch '${marker}'\n required = true\n`);
+    put(root, 'info/attributes', '*.txt filter=fixture.with.dots\n');
+    const env = laneGitHardeningEnv({ ...process.env });
+    const options = { env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 };
+    const config = spawnSync('git', ['-C', root, 'config', '--name-only', '--list', '--includes', '-z'], options);
+    expect(config.status, config.stderr).toBe(0);
+    const result = spawnSync('git', ['-C', root, 'cat-file', '--filters', '--path=payload.txt', oid],
+      { ...options, env: laneGitCheckoutEnv(env, config.stdout) });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe(payload);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('refuses truncated, control-bearing and oversized filter inventories with a recovery path', async () => {
+    const { laneGitCheckoutEnv } = await import('../lane-git-hardening.mjs');
+    for (const config of ['filter.fixture.smudge', 'filter.fi\nxture.smudge\0', 'filter.fi\rxture.process\0',
+      'filter.fi\u2028xture.smudge\0',
+      Array.from({ length: 257 }, (_, i) => `filter.driver${i}.smudge\0`).join('')]) {
+      expect(() => laneGitCheckoutEnv({}, config)).toThrow(/checkout filter/i);
+    }
+  });
+
+  it.each(['--driver', 'with.dots', 'two words', "quote'back`tick", '$(inert)', 'ｆilter', 'invisible\u200bname'])(
+    'pins the exact filter name %s without normalization or shell interpolation', async driver => {
+      const { laneGitCheckoutEnv } = await import('../lane-git-hardening.mjs');
+      const env = laneGitCheckoutEnv({}, `filter.${driver}.process\0`);
+      expect(configPins(env)).toMatchObject({ [`filter.${driver}.process`]: '',
+        [`filter.${driver}.smudge`]: '', [`filter.${driver}.required`]: 'false' });
+    },
+  );
+
+  it.each(['config', 'reset'])('fails closed when re-exec %s fails and cleans the worktree', async operation => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    const runner = h.exec.getMockImplementation();
+    h.exec.mockImplementation((command, args, options) => args.includes(operation) ? failure() : runner(command, args, options));
+    await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow(`Git ${operation}`);
+    expect(nodeCalls(h)).toHaveLength(0);
+    expect(removals(h)).toHaveLength(1);
+  });
+
   it('resolves each setting through standard, platform, tool and environment with provenance', async () => {
     const { resolveStaleToolSettings } = await load();
     const log = vi.fn();
@@ -704,7 +828,7 @@ describe('guard bounds and settings', () => {
 });
 
 describe('side-effect entry exit behavior', () => {
-  it('refusal prevents sibling dependency side effects', () => {
+  it.each([undefined, 'true'])('refusal prevents sibling dependency side effects with VITEST=%s', (vitest) => {
     const root = scratch();
     const marker = join(root, 'sibling-ran');
     // Exercise the actual lane-pool bootstrap, including its dependency loading strategy.
@@ -722,7 +846,7 @@ describe('side-effect entry exit behavior', () => {
       writeFileSync(${JSON.stringify(marker)}, 'stale side effect');
       ${firstDependency[1].split(',').map(name => `export const ${name.trim()} = undefined;`).join('\n')}`);
     const result = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs')], {
-      env: (({ VITEST, ...e }) => e)(process.env), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, VITEST: vitest }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(1);
@@ -757,7 +881,7 @@ describe('side-effect entry exit behavior', () => {
       if (entry !== process.argv[1]) throw new Error('wrong tool entry');
       ${action === 'continue' ? 'return;' : action === 'reexec' ? 'return 23;' : "throw new Error('fixture refusal');"}
     }`);
-    put(root, 'tool.mjs', "import './entry.mjs'; console.log('tool continued');");
+    put(root, 'tool.mjs', "import { guardToolEntry } from './entry.mjs'; await guardToolEntry(); console.log('tool continued');");
     const result = spawnSync(process.execPath, [join(root, 'tool.mjs')], {
       env: (({ VITEST, ...e }) => e)(process.env), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     });

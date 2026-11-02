@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneGitCheckoutEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { checkoutRootFor, guardedPoolRoot } from './lane-pool-paths.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -19,15 +19,17 @@ const recovery = 'Update the tool checkout from origin/main and retry; check Git
  * Feature files under scripts/settings are discovered by readDeclaredSettings, without a registry.
  * Invalid/unreadable layers refuse instead of silently weakening the guard.
  */
-export function resolveStaleToolSettings({ env = process.env, settings, platform, log = console.error } = {}) {
+export function resolveStaleToolSettings({ env = process.env, settings, platform, readDeclared = readDeclaredSettings, log = console.error } = {}) {
   if (platform === undefined) {
     const { prefs, errors } = readPlatformPreferences({ env });
     if (errors.length) throw new Error(`Unreadable staleToolGuard platform settings: ${errors.join('; ')}`);
     platform = prefs.staleToolGuard;
   }
   if (settings === undefined) {
-    const declared = readDeclaredSettings();
-    if (declared.errors.length || declared.duplicates.length) throw new Error('Unreadable or duplicate declared settings');
+    const declared = readDeclared({ strict: true });
+    if (declared.errors.length || declared.duplicates.length) {
+      throw new Error(`Unreadable or duplicate staleToolGuard declared settings: ${JSON.stringify({ errors: declared.errors, duplicates: declared.duplicates })}`);
+    }
     settings = declared.settings.staleToolGuard;
   }
   const rawThreshold = env.WE_TOOL_STALE_THRESHOLD;
@@ -112,7 +114,6 @@ function checkoutRoot(entry) {
 
 /** Returns undefined to continue, or the fresh child's exit status. All unknown evidence throws. */
 export async function guardToolCheckout({ entry, root, exec = spawnSync, env = process.env, settings, log = console.error } = {}) {
-  if (env.WE_TOOL_FRESH_REEXEC === '1') return;
   try {
     if (typeof entry !== 'string' || !entry) throw new Error('Missing tool entry');
     entry = resolve(entry);
@@ -122,8 +123,8 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     // No inherited Git repository, executable, config or transport context may redirect this guard.
     const cleanEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
     const gitEnv = laneGitHardeningEnv(scrubGitRepoEnv(cleanEnv), { remoteFetch: true });
-    const git = (args, cwd = root) => {
-      const result = exec('git', ['-C', cwd, ...args], { cwd, env: gitEnv,
+    const git = (args, cwd = root, commandEnv = gitEnv) => {
+      const result = exec('git', ['-C', cwd, ...args], { cwd, env: commandEnv,
         encoding: 'utf8', timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, shell: false });
       if (result?.error || result?.status !== 0 || typeof result.stdout !== 'string') {
         throw new Error(`Git ${args[0]} failed or exceeded its ${GIT_TIMEOUT_MS}ms / ${MAX_BUFFER}-byte bound`);
@@ -152,6 +153,9 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     }
     if (evaluateStaleness({ behind, threshold: policy.threshold, changedPaths, depPaths }).action === 'ok') return;
     if (policy.mode === 'refuse') throw new Error(`stale tool checkout (${behind} behind)`);
+    if (env.WE_TOOL_FRESH_REEXEC === '1') {
+      throw new Error(`stale tool checkout (${behind} behind): refusing a second re-exec`);
+    }
     // Resolve both roots while the script still lives in the original checkout. A non-Git cwd
     // falls back to that checkout, just as lane-pool's normal bootstrap does.
     let cwdTopLevel;
@@ -163,8 +167,12 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     const worktree = join(scratch, 'checkout');
     let added = false;
     try {
-      git(['worktree', 'add', '--detach', worktree, upstream]);
+      // Creation must not populate files: conditional includes can select different
+      // filter drivers in the new worktree, so enumerate its effective config first.
+      git(['worktree', 'add', '--no-checkout', '--detach', worktree, upstream]);
       added = true;
+      const checkoutEnv = laneGitCheckoutEnv(gitEnv, git(['config', '--name-only', '--list', '--includes', '-z'], worktree));
+      git(['reset', '--hard', upstream], worktree, checkoutEnv);
       symlinkSync(join(root, 'node_modules'), join(worktree, 'node_modules'), 'junction');
       const child = exec(process.execPath, [join(worktree, name), ...process.argv.slice(2)], {
         cwd: process.cwd(), env: { ...cleanEnv,

@@ -158,6 +158,35 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, re
   return out;
 }
 
+/** Disable every effective filter before populating a new worktree. Git does not
+ * support wildcard -c filter.* pins: each driver must be pinned by its exact name.
+ * Read config in the destination worktree so conditional includes are included.
+ */
+export function laneGitCheckoutEnv(env, configOutput) {
+  if (typeof configOutput !== 'string' || (configOutput && !configOutput.endsWith('\0'))) {
+    throw new Error('Invalid checkout filter configuration');
+  }
+  const drivers = new Set();
+  for (const key of configOutput.split('\0').slice(0, -1)) {
+    if (/^filter\./i.test(key) && /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(key)) {
+      throw new Error('Invalid checkout filter name; inspect Git configuration and retry');
+    }
+    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/i.exec(key);
+    if (match) drivers.add(match[1]);
+  }
+  if (drivers.size > 256) throw new Error('Too many checkout filters; inspect Git configuration and retry');
+  const out = laneGitHardeningEnv(env);
+  let count = Number(out.GIT_CONFIG_COUNT);
+  for (const driver of drivers) {
+    for (const [key, value] of [['clean', ''], ['smudge', ''], ['process', ''], ['required', 'false']]) {
+      out[`GIT_CONFIG_KEY_${count}`] = `filter.${driver}.${key}`;
+      out[`GIT_CONFIG_VALUE_${count++}`] = value;
+    }
+  }
+  out.GIT_CONFIG_COUNT = String(count);
+  return out;
+}
+
 /** The argv that lists a lane's effective config with each entry's scope, NUL-separated (`scope\0key\nvalue\0…`). Reading
  *  config executes nothing. */
 export const LANE_CONFIG_LIST_ARGS = Object.freeze(['config', '--show-scope', '--list', '--includes', '-z']);
