@@ -252,6 +252,34 @@ const mutationCases = [
 ];
 
 describe('ready-only preparation defers clone mutations to the normal tick', () => {
+  it.each([false, true])('readyOnly allows a reported dangling non-remote ref (diagnosis message: %s)', async withDiagnosis => {
+    const f = prepareFixture();
+    const path = join(f.root, '.git/refs/heads/dangling');
+    fs.writeFileSync(path, 'a'.repeat(40) + '\n');
+    vi.spyOn(repair, 'diagnoseLane').mockReturnValue(withDiagnosis
+      ? { ok: false, problems: ['1 ref(s) point at missing objects'] }
+      : { ok: true, problems: [] });
+    const plan = plannedFixture(f);
+    const before = cloneBytes(f.root);
+    const r = await prepareRebuild({ ...f.args, readyOnly: true });
+    expect(r.result?.reason).not.toBe('readonly-job-mutation-due');
+    expect(r.result?.mutation).not.toBe('clone-reclone');
+    expect(r).toMatchObject({ terminal: false, plan, lease: { token: expect.any(String) } });
+    expect(cloneBytes(f.root)).toEqual(before);
+  });
+
+  it('readyOnly still defers pruning a dangling remote ref that is not the HEAD symref', async () => {
+    const f = prepareFixture();
+    expect(f.git(['symbolic-ref', 'HEAD'])).toBe('refs/heads/main');
+    const path = join(f.root, '.git/refs/remotes/origin/dangling');
+    fs.writeFileSync(path, 'a'.repeat(40) + '\n');
+    const before = cloneBytes(f.root);
+    expect(await prepareRebuild({ ...f.args, readyOnly: true })).toMatchObject({
+      terminal: true, result: { reason: 'readonly-job-mutation-due', mutation: 'clone-ref-repair' },
+    });
+    expect(cloneBytes(f.root)).toEqual(before);
+  });
+
   it('readyOnly prepare queues the job with untracked backlog/xabc123-unlanded.md without bornAs on origin/main or a collision', async () => {
     const f = prepareFixture();
     const plan = plannedFixture(f);
@@ -372,6 +400,7 @@ describe('ready-only preparation defers clone mutations to the normal tick', () 
     const { ignoreOwners: _ignored, ...lockOpts } = f.opts;
     const before = cloneBytes(f.root);
     const r = await rebuildClone({ ...f.args, env, readyOnly, asJob: false, versions: null,
+      spawnerOwners: () => ['Mac:60796'],
       lockOpts: { ...lockOpts, owner: 'Mac:12154', ...(ignoreOwners === undefined ? {} : { ignoreOwners }) },
     });
     expect(r).toMatchObject(admitted
@@ -379,6 +408,23 @@ describe('ready-only preparation defers clone mutations to the normal tick', () 
       : { moved: false, reason: 'tick-in-progress', heldBy: 'Mac:60796' });
     expect(cloneBytes(f.root)).toEqual(before);
     if (!admitted) expect(f.run).not.toHaveBeenCalled();
+    expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, 'Mac:60796')).not.toBeNull();
+  });
+
+  it('drops an env ignore-owner that is not the spawner or an ancestor, warns, and still waits for that reader', async () => {
+    const f = prepareFixture(); mutationCases[0][1](f);
+    f.read('Mac:60796', 60796);
+    const errors = [];
+    const env = { ...f.env, WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS: 'Mac:60796' };
+    const { ignoreOwners: _ignored, ...lockOpts } = f.opts;
+    const before = cloneBytes(f.root);
+    const r = await rebuildClone({ ...f.args, env, readyOnly: true, asJob: false, versions: null,
+      spawnerOwners: () => ['Mac:555'], log: { ...console, error: (m) => errors.push(String(m)) },
+      lockOpts: { ...lockOpts, owner: 'Mac:12154' },
+    });
+    expect(r).toMatchObject({ moved: false, reason: 'tick-in-progress', heldBy: 'Mac:60796' });
+    expect(errors.join('\n')).toMatch(/ignored.*Mac:60796|Mac:60796.*not (the|a) spawner/i);
+    expect(cloneBytes(f.root)).toEqual(before);
     expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, 'Mac:60796')).not.toBeNull();
   });
 });

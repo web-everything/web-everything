@@ -293,7 +293,8 @@ export function runRebuildChild({
 /** The ready-only child excludes just its spawner; the next daemon tick still honours its writer slot. */
 export function rebuildChildEnv(env = process.env, { ppid = process.ppid, host = hostname() } = {}) {
   const childEnv = { ...env, [REBUILD_AS_JOB_ENV]: '0' };
-  for (const k of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'DAEMON_JOB_HEARTBEAT_MS', 'OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS']) delete childEnv[k];
+  for (const k of Object.keys(childEnv)) if (k.startsWith('DAEMON_JOB_')) delete childEnv[k];
+  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS']) delete childEnv[k];
   if (ppid > 1) childEnv.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS = `${host}:${ppid}`;
   return childEnv;
 }
@@ -348,20 +349,23 @@ export function reportReaderWaitTimeout({
   return outcome;
 }
 
-async function jobMain() {
+export async function jobMain({
+  runChild = runRebuildChild, reportTimeout = reportReaderWaitTimeout, env = process.env,
+  ppid = process.ppid, host = hostname(),
+} = {}) {
   let child = null;
   for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, () => { try { child?.kill('SIGTERM'); } catch { /* gone */ } process.exit(143); });
   }
-  const dir = process.env.OPERATION_RUNS_DIR;
+  const dir = env.OPERATION_RUNS_DIR;
   const out = await runJob({
     steps: [{
       name: 'rebuild',
       run: async ({ jobId, input }) => {
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} building ${input.target ?? 'main + overlays'} for ${input.root}\n`);
-        const childEnv = rebuildChildEnv();
-        const r = await runRebuildChild({ input, env: childEnv, onChild: (c) => { child = c; } });
-        const timeout = reportReaderWaitTimeout({ root: input.root, r });
+        const childEnv = rebuildChildEnv(env, { ppid, host });
+        const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
+        const timeout = reportTimeout({ root: input.root, env, r });
         const result = {
           finishedAt: Date.now(), reason: r.reason ?? null, readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
           alerts: (r.alerts || []).map((a) => a.kind),

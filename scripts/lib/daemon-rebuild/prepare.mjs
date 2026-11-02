@@ -256,9 +256,15 @@ export async function prepareRebuild({
     // read probes here; even an incomplete diagnosis defers to the normal tick, never to repair.
     try {
       const refs = probeBrokenRefs(root);
-      if (refs.probeFailed !== false || !Array.isArray(refs.broken) || refs.broken.length) return mutationDue('clone-ref-repair');
+      if (refs.probeFailed !== false || !Array.isArray(refs.broken)) return mutationDue('clone-ref-repair');
+      // repairCloneRefs prunes only dangling remote-tracking refs other than HEAD's; any other dangling ref is
+      // merely reported, so it must not defer every ready-only job.
+      const head = refs.broken.length ? String(git(['symbolic-ref', '-q', 'HEAD']).stdout ?? '').trim() : '';
+      if (refs.broken.some((b) => String(b?.ref).startsWith('refs/remotes/') && b.ref !== head)) return mutationDue('clone-ref-repair');
       const diagnosis = diagnoseLane(root);
-      if (diagnosis.ok !== true || !Array.isArray(diagnosis.problems) || diagnosis.problems.length) return mutationDue('clone-reclone');
+      // repairCloneRefs ignores the "ref(s) point at missing objects" problem too (handled above).
+      const problems = Array.isArray(diagnosis.problems) ? diagnosis.problems.filter((p) => !/ref\(s\) point at missing objects/.test(p)) : null;
+      if (!problems || problems.length || (diagnosis.ok !== true && !refs.broken.length)) return mutationDue('clone-reclone');
       if (git(['commit-graph', 'verify']).status !== 0) return mutationDue('clone-commit-graph-repair');
     } catch { return mutationDue('clone-repair-unverified'); }
   }
