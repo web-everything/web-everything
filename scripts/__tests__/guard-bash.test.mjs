@@ -3653,7 +3653,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason(`git -C "/ws" -C 'wev-review-daemon' commit -am x`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
     // a later absolute -C wins; a later ../ walks back out
     expect(daemonCloneWriteReason(`git -C ${CLONE} -C ${LANE} reset --hard`, { cwd: LANE, roots })).toBeNull();
-    expect(daemonCloneWriteReason(`git -C ${CLONE} -C .. status`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -C .. reset --hard`, { cwd: LANE, roots })).toBeNull();
   });
 
   it('DENIES --git-dir / --work-tree pointing into a daemon clone (both spellings)', () => {
@@ -3673,6 +3673,70 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason(`git -C ${LANE} -C sub status`, { cwd: LANE, roots })).toBeNull();
     expect(daemonCloneWriteReason('git -C /ws/wev-review-daemon log', { cwd: LANE, roots })).toBeNull();
     expect(daemonCloneWriteReason('git -C /ws -C wev-review-daemon rev-parse HEAD', { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('ALLOWS symbolic-ref reads in a daemon clone', () => {
+    expect(daemonCloneWriteReason('git symbolic-ref HEAD', { cwd: CLONE, roots })).toBeNull();
+    expect(decide('git symbolic-ref HEAD', { cwd: CLONE, daemonCloneRoots: roots })).toBeNull();
+  });
+
+  it.each([
+    `GIT_DIR=${CLONE}/.git git log && git commit -m x`,
+    `env GIT_WORK_TREE=${CLONE} git log; git reset --hard`,
+    `echo GIT_DIR=${CLONE}/.git; git add .`,
+    `git reset --hard; printf '%s\\n' GIT_DIR=${CLONE}/.git`,
+    `git reset --hard; export GIT_WORK_TREE=${CLONE}`,
+    `git reset --hard; GIT_DIR=${CLONE}/.git`,
+    `bash -c 'export GIT_DIR=${CLONE}/.git; git log'; git reset --hard`,
+    `bash -c 'git reset --hard'; export GIT_DIR=${CLONE}/.git`,
+    `export GIT_DIR=${CLONE}/.git; GIT_DIR=${LANE}/.git git reset --hard`,
+    `GIT_DIR=${CLONE}/.git echo "$(git reset --hard)"`,
+  ])('ignores literal, later and command-local Git targets for lane mutations: %s', (command) => {
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+  });
+
+  it.each([
+    `export GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `GIT_WORK_TREE=${CLONE}; git clean -fd`,
+    `command env GIT_DIR=${CLONE}/.git git reset --hard`,
+    `export GIT_DIR=${CLONE}/.git; bash -c 'git reset --hard'`,
+    `bash -c 'export GIT_DIR=${CLONE}/.git; git reset --hard'`,
+    `command env GIT_DIR=${CLONE}/.git bash -c 'git reset --hard'`,
+    `command env GIT_WORK_TREE=${CLONE} bash -c 'git clean -fd'`,
+    `command export GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `GIT_DIR=${CLONE}/.git export GIT_DIR; git reset --hard`,
+    `declare -x GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `eval 'export GIT_DIR=${CLONE}/.git'; git reset --hard`,
+    `eval "eval 'export GIT_DIR=${CLONE}/.git'"; git reset --hard`,
+    `{ export GIT_DIR=${CLONE}/.git; }; git reset --hard`,
+  ])('DENIES active exported, bare and wrapped Git targets: %s', (command) => {
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    `git -c core.worktree=${CLONE} reset --hard`,
+    `git -ccore.worktree=${CLONE} clean -fd`,
+    `git -c 'core.worktree=${CLONE}' reset --hard`,
+    `git -c CORE.WorkTree=${CLONE} reset --hard`,
+    `git -c core.worktree=../wev-review-daemon reset --hard`,
+    `git -c core.bare=false -c core.worktree=${CLONE} reset --hard`,
+    `TARGET=${CLONE} git --config-env=core.worktree=TARGET reset --hard`,
+    `env TARGET=${CLONE} git --config-env core.worktree=TARGET clean -fd`,
+    `export TARGET=${CLONE}; git --config-env=core.worktree=TARGET reset --hard`,
+    'git --config-env=core.worktree=MISSING_GUARD_TEST_TARGET reset --hard',
+  ])('DENIES configured worktree targets including unavailable env evidence: %s', (command) => {
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS configured worktrees outside daemon clones and configured worktree reads', () => {
+    expect(decide(`git -c core.worktree=${LANE} reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+    expect(decide(`git -c core.worktree=${CLONE} log`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+    expect(decide('git --config-env=core.worktree=TARGET reset --hard', {
+      cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { TARGET: LANE },
+    })).toBeNull();
+    expect(decide('git --config-env=core.worktree=TARGET reset --hard', {
+      cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { TARGET: CLONE },
+    })).toMatch(/DAEMON CLONE/);
   });
 
   it('DENIES fetch that writes a local branch or uses --update-head-ok in a daemon clone', () => {
@@ -3937,6 +4001,25 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
       `GIT_DIR=${configRepos.branch} git fetch origin main`,
       `export GIT_DIR=${configRepos.branch}; git fetch origin main`,
     ]) expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision, command).toBe('deny');
+  });
+
+  it.each([
+    `git -c core.worktree=${fakeClone} reset --hard`,
+    `TARGET=${fakeClone} git --config-env=core.worktree=TARGET reset --hard`,
+    `export TARGET=${fakeClone}; git --config-env=core.worktree=TARGET reset --hard`,
+  ])('DENIES configured worktree targets at the real CLI boundary: %s', (command) => {
+    const out = runHook(command, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    `GIT_DIR=${fakeClone}/.git git log; git reset --hard`,
+    `echo GIT_WORK_TREE=${fakeClone}; git reset --hard`,
+    `git reset --hard; export GIT_DIR=${fakeClone}/.git`,
+    `bash -c 'export GIT_DIR=${fakeClone}/.git; git log'; git reset --hard`,
+  ])('ALLOWS unrelated lane writes at the real CLI boundary: %s', (command) => {
+    expect(runHook(command, lane)).toBeNull();
   });
 
   it('does not let GIT_CONFIG hide persisted branch mappings from the CLI', () => {

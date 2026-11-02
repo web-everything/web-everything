@@ -1982,20 +1982,15 @@ function absoluteGitTarget(base, p) {
  *  subcommand's own `-C` (`git commit -C HEAD`) is NOT a global option and is never read here. Reads the
  *  SAME wrapper-peeled, basename-resolved `canonicalCommand` view `gitSubcommand` does. A leading `~` is
  *  expanded from HOME (the shell would have, before git saw it). */
-function gitTargetDirs(segment, cwd) {
+function gitTargetDirs(segment, cwd, configEnv = {}) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   if (!toks.length || toks[0] !== 'git') return [];
   let dir = cwd || '.';
-  let gitDir = null;
-  let workTree = null;
-  // `GIT_DIR=… GIT_WORK_TREE=… git …` / `env GIT_DIR=… git …`: leading assignments, read from the RAW tokens
-  // (the canonical view peels them). Same targets as the flags; an `export` in an EARLIER segment is not visible.
-  for (const t of shellTokens(String(segment || '')).filter((x) => !x.op).map((x) => x.text)) {
-    const m = /^(GIT_DIR|GIT_WORK_TREE)=(.*)$/.exec(t);
-    if (m) { if (m[1] === 'GIT_DIR') gitDir = m[2]; else workTree = m[2]; continue; }
-    if (t === 'env' || t.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue;
-    break;
-  }
+  const env = { ...configEnv };
+  for (const assignment of gitLeadingAssignments(segment)) env[assignment[1]] = assignment[2];
+  let gitDir = env.GIT_DIR ?? null;
+  let workTree = env.GIT_WORK_TREE ?? null;
+  const configuredTrees = [];
   for (let i = 1; i < toks.length; i++) {
     const t = toks[i];
     if (t === '-C' && i + 1 < toks.length) {
@@ -2012,6 +2007,17 @@ function gitTargetDirs(segment, cwd) {
     if (t === '--work-tree' && i + 1 < toks.length) { workTree = toks[++i]; continue; }
     if (t.startsWith('--git-dir=')) { gitDir = t.slice('--git-dir='.length); continue; }
     if (t.startsWith('--work-tree=')) { workTree = t.slice('--work-tree='.length); continue; }
+    let config = null;
+    let fromEnv = false;
+    if (t === '-c') config = toks[++i] || '';
+    else if (t.startsWith('-c')) config = t.slice(2);
+    else if (t === '--config-env') { config = toks[++i] || ''; fromEnv = true; }
+    else if (t.startsWith('--config-env=')) { config = t.slice('--config-env='.length); fromEnv = true; }
+    if (config !== null) {
+      const match = /^core\.worktree=(.*)$/is.exec(config);
+      if (match) configuredTrees.push(fromEnv ? env[match[1]] ?? null : match[1]);
+      continue;
+    }
     if (GIT_VALUE_FLAGS.has(t)) { i += 1; continue; }
     if (t.startsWith('-')) continue;
     break; // the subcommand — everything after it is the subcommand's own options
@@ -2019,6 +2025,12 @@ function gitTargetDirs(segment, cwd) {
   const out = [dir];
   if (gitDir !== null) out.push(absoluteGitTarget(dir, gitDir));
   if (workTree !== null) out.push(absoluteGitTarget(dir, workTree));
+  for (const tree of configuredTrees) {
+    // Git resolves relative core.worktree against its git dir (possibly discovered through a gitfile).
+    // Without filesystem evidence that base is unknown; do not guess the cwd and allow a clone write.
+    out.push(tree === null || (!isAbsolute(tree) && !tree.startsWith('~/') && tree !== '~')
+      ? null : absoluteGitTarget(dir, tree));
+  }
   return out;
 }
 
@@ -2154,13 +2166,12 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const globals = toks.slice(1, gitSubcommandIndex(toks));
   const env = { ...process.env, ...configEnv, GIT_OPTIONAL_LOCKS: '0' };
-  for (const assignment of gitLeadingAssignments(segment)) {
-    let value = assignment[2];
-    if (['GIT_DIR', 'GIT_WORK_TREE'].includes(assignment[1]) && value.startsWith('~/')) {
-      value = absoluteGitTarget(cwd, value);
-      if (value === null) return null;
+  for (const assignment of gitLeadingAssignments(segment)) env[assignment[1]] = assignment[2];
+  for (const key of ['GIT_DIR', 'GIT_WORK_TREE']) {
+    if (env[key] === '~' || env[key]?.startsWith('~/')) {
+      env[key] = absoluteGitTarget(cwd, env[key]);
+      if (env[key] === null) return null;
     }
-    env[assignment[1]] = value;
   }
   // GIT_CONFIG selects a file for `git config` ONLY; `git fetch` ignores it. Leaving it in this read would
   // let a safe decoy hide the repository's actual branch-writing fetch config.
@@ -2240,9 +2251,8 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
   if (sub) {
     const configWrite = (sub === 'config' || sub === 'remote') && gitConfigOrRemoteWrites(s, sub);
     if (!GIT_STATE_SUBCOMMANDS.has(sub) && !configWrite) return null;
-    // `envDirs`: GIT_DIR / GIT_WORK_TREE values assigned/exported by ANY segment of the same command (decide()
-    // collects them), since `export GIT_DIR=<clone>/.git && git reset --hard` splits across segments.
-    const targets = gitTargetDirs(s, cwd).concat(envDirs.map((p) => absoluteGitTarget(cwd, p)));
+    // Named environment follows shell scope/order; envDirs remains a conservative explicit caller input.
+    const targets = gitTargetDirs(s, cwd, configEnv).concat(envDirs.map((p) => absoluteGitTarget(cwd, p)));
     if (configWrite && sub === 'config') targets.push(...gitConfigFileTargets(s, targets[0], configEnv));
     const hit = targets.find((d) => d === null || isDaemonCloneRealpath(d, roots));
     if (hit === undefined) return null;
@@ -2255,7 +2265,7 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
       }
       if (!fetchWritesLocalBranch(s, config)) return null;
     }
-    return daemonCloneWriteMessage(hit ?? 'unresolved git target: HOME is unavailable or relative');
+    return daemonCloneWriteMessage(hit ?? 'unresolved git target: unavailable environment or relative configured worktree');
   }
   const prog = programWord(s);
   const isWrite = isFileWriteRedirect(s);
@@ -4933,28 +4943,57 @@ export function decide(command, ctx = {}) {
   // quote-CORRECT (r1–r4) lost the coverage the quote-BLIND split had by accident, because a nested
   // command stopped being torn open at its separators. Recursing into those positions restores it
   // structurally — and covers the `bash -c "npm run build"` shape base never caught at all.
-  const nested = withNestedCommands(segments, command);
-  const gitEnvDirs = [];
-  for (const seg of nested) {
-    for (const t of shellTokens(String(seg || '')).filter((x) => !x.op)) {
-      const m = /^(?:GIT_DIR|GIT_WORK_TREE)=(.+)$/s.exec(t.text);
-      if (m) gitEnvDirs.push(m[1]);
-    }
-  }
-  const rctx = gitEnvDirs.length ? { ...ctx, gitEnvDirs } : ctx;
-  const gitConfigEnv = { ...ctx.gitConfigEnv };
-  for (const seg of nested) {
-    const r = reason(seg, { ...rctx, gitConfigEnv });
-    if (r) return r;
-    const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
-    if (words[0] === 'export' || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
-      for (const word of words) {
-        const m = /^(GIT_CONFIG(?:_GLOBAL|_SYSTEM)?)=(.*)$/s.exec(word);
-        if (m) gitConfigEnv[m[1]] = m[2];
+  // Visit nested shells at their invocation, with a copy of the environment at that point. Flattening
+  // first applies future exports to earlier commands and lets assignments in child shells leak out.
+  let nestedBudget = NESTED_NODE_CAP;
+  const checkScope = (list, whole, inherited, depth, persist = null) => {
+    const gitConfigEnv = { ...inherited };
+    const setAssignment = (key, value) => {
+      gitConfigEnv[key] = value;
+      if (persist) persist(key, value);
+    };
+    const checkNested = (text, env, persistChanges = null) => {
+      if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
+      nestedBudget -= 1;
+      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges);
+    };
+    for (const seg of list) {
+      const r = reason(seg, { ...ctx, gitConfigEnv });
+      if (r) return r;
+      const localEnv = { ...gitConfigEnv };
+      for (const assignment of gitLeadingAssignments(seg)) localEnv[assignment[1]] = assignment[2];
+      // Substitutions run before the command's local assignments take effect; explicit child shells
+      // and runners receive those assignments even behind wrappers such as `command env`.
+      const substitutionCount = substitutionBodies(seg).length;
+      for (const [index, text] of nestedCommandStrings(seg).entries()) {
+        const substitution = index < substitutionCount;
+        // eval executes in this shell; explicit assignments in its script survive the invocation.
+        const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
+          !substitution && programWord(seg) === 'eval' ? setAssignment : null);
+        if (nestedReason) return nestedReason;
+      }
+      const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
+      const canonicalWords = shellTokens(canonicalCommand(seg)).filter((t) => !t.op).map((t) => t.text);
+      const directive = !seg.trim().startsWith('(')
+        && ['export', 'declare', 'typeset', 'readonly'].includes(canonicalWords[0]);
+      if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
+        const assignments = directive ? [...gitLeadingAssignments(seg).map((m) => m[0]), ...canonicalWords] : words;
+        for (const word of assignments) {
+          const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
+          if (m) setAssignment(m[1], m[2]);
+        }
       }
     }
-  }
-  return null;
+    // Preserve the whole-command recovery used by withNestedCommands: a substitution/group containing
+    // separators may not be reconstructible from an individual segment. Never use future assignments.
+    const group = leadingGroupBody(whole);
+    for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
+      const r = checkNested(text, inherited);
+      if (r) return r;
+    }
+    return null;
+  };
+  return checkScope(segments, command, ctx.gitConfigEnv, 0);
 }
 
 // #2323 — how many commits is `cwd`'s HEAD behind its upstream (`@{u}`)? Impure (a git call), so it lives in
@@ -5126,8 +5165,8 @@ if (IS_CLI) {
   if (/\bgit\b/.test(cmd) && /\bpush\b/.test(cmd)) {
     ({ fixPushes } = await computeFixClaimCtx(cmd, { caller: { sessionId: hookSessionId, who: process.env.WE_FIX_WHO || null, token: process.env.WE_FIX_TOKEN || null }, cwd: effectiveCwd || process.cwd() }));
   }
-  const gitConfigEnv = Object.fromEntries(['GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']
-    .filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]));
+  // --config-env can name any inherited variable, not just one of Git's own GIT_* variables.
+  const gitConfigEnv = { ...process.env };
   const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, gitConfigEnv, daemonFetchConfigReader: readDaemonFetchConfig, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
