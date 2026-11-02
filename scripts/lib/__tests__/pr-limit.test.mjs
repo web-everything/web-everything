@@ -1116,3 +1116,61 @@ describe('non-implementing retry branch grants', () => {
     expect(isBranchAllowedNow(build, 'lane/5754b-example', 1000)).toBe(false);
   });
 });
+
+describe('excludeFocus — operator R384: focus PRs are exempt from the cap (explicit ref list or `focus` label, never the title)', () => {
+  const row = (n, extra = {}) => ({ number: n, labels: [], isCrossRepository: false, headRefName: `lane/p${n}`, files: [{ path: 'scripts/x.mjs' }], ...extra });
+  const commitsPage = (commits) => JSON.stringify({ data: { repository: { pullRequest: { commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: commits.map((commit) => ({ commit })) } } } } });
+  const aiCommit = { message: 'x\n\nCo-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } };
+  const execFor = (rows) => (args) => {
+    if (args[1] === 'list') return JSON.stringify(rows);
+    if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
+    throw new Error(`unexpected call: ${JSON.stringify(args)}`);
+  };
+  const scope = (o = {}) => ({ excludeCardOnly: true, excludeStackedAwaitingBase: true, excludeFocus: true, focusRefs: [], ...o });
+
+  it('defaults to on, resolves through the cascade (env wins), and the shipped file states it', () => {
+    expect(PR_LIMIT_SCOPE_DEFAULTS.excludeFocus).toBe(true);
+    expect(resolvePrLimitScope({})).toMatchObject({ excludeFocus: true, focusRefs: [], source: { excludeFocus: 'default' } });
+    expect(resolvePrLimitScope({ tool: { excludeFocus: false } })).toMatchObject({ excludeFocus: false, source: { excludeFocus: 'tool' } });
+    expect(resolvePrLimitScope({ tool: { excludeFocus: false }, env: { WE_PR_LIMIT_EXCLUDE_FOCUS: '1' } })).toMatchObject({ excludeFocus: true, source: { excludeFocus: 'env' } });
+    expect(resolvePrLimitScope({ tool: { focusRefs: ['lane/a', 7, '', 'lane/b'] } }).focusRefs).toEqual(['lane/a', 'lane/b']);
+    expect(resolvePrLimitScope({ tool: { focusRefs: 'lane/a' } }).focusRefs).toEqual([]);
+    const shipped = readPrLimitScope({ env: {} });
+    expect(shipped).toMatchObject({ excludeFocus: true, source: { excludeFocus: 'tool' } });
+    expect(Array.isArray(shipped.focusRefs)).toBe(true);
+  });
+
+  it('a PR whose head ref is listed, or that carries the `focus` label, is not counted; the rest still are', () => {
+    const rows = [row(1), row(2), row(3, { labels: [{ name: 'focus' }] }), row(4, { labels: [{ name: 'not-focus' }] })];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p2'] }) });
+    expect(r).toMatchObject({ count: 2, prNumbers: [1, 4], focus: 2, focusPrNumbers: [2, 3] });
+  });
+
+  it('never infers focus from the title or a ref that merely contains a listed one', () => {
+    const rows = [row(1, { title: 'focus: fix the thing' }), row(2, { headRefName: 'lane/p1-extra' })];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p1'] }) });
+    expect(r).toMatchObject({ count: 2, focus: 0, focusPrNumbers: [] });
+  });
+
+  it('excludeFocus off counts them all again (the 15 cap holds for everything else)', () => {
+    const rows = [row(1), row(3, { labels: [{ name: 'focus' }] })];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ excludeFocus: false, focusRefs: ['lane/p1'] }) });
+    expect(r).toMatchObject({ count: 2, focus: 0 });
+  });
+
+  it('a fork PR carrying a listed head ref name or label from outside is still counted only if upstream-listed: fork refs never match the list', () => {
+    const rows = [row(1, { isCrossRepository: true, headRefName: 'lane/p9' })];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p9'] }) });
+    expect(r).toMatchObject({ count: 1, focus: 0 });
+  });
+
+  it('decideOpenPr: opening a listed focus branch passes at the cap; an unlisted branch is still refused; off restores the cap', () => {
+    const base = { repoKey: 'we', limit: 15, openCount: 15 };
+    const d = decideOpenPr({ ...base, branch: 'lane/f', focusRefs: ['lane/f'] });
+    expect(d).toMatchObject({ allowed: true, exempt: true, overridden: false });
+    expect(d.reason).toMatch(/focus/);
+    expect(decideOpenPr({ ...base, branch: 'lane/g', focusRefs: ['lane/f'] }).allowed).toBe(false);
+    expect(decideOpenPr({ ...base, branch: 'lane/f', focusRefs: ['lane/f'], excludeFocus: false }).allowed).toBe(false);
+    expect(decideOpenPr({ ...base, branch: null, focusRefs: ['lane/f'] }).allowed).toBe(false);
+  });
+});
