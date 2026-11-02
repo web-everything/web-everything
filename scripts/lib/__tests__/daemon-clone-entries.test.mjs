@@ -1,9 +1,10 @@
 import { afterEach, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
+import { closureHits, collectImportClosure } from '../import-closure.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -15,6 +16,62 @@ function fixture() {
   mkdirSync(root); mkdirSync(launchAgentsDir);
   return { dir, root, launchAgentsDir };
 }
+
+it.each(['caller', 'LaunchAgent', 'mapped pass', 'boot entry', 'dangling caller symlink'])(
+  'keeps the closure consumer conservative for a missing %s alongside readable entries', source => {
+    const f = fixture();
+    for (const entry of DAEMON_ENTRY_MODULES) {
+      mkdirSync(dirname(join(f.root, entry)), { recursive: true });
+      writeFileSync(join(f.root, entry), 'export {};');
+    }
+    const alias = join(f.dir, 'alias');
+    symlinkSync(f.root, alias);
+    let missing = 'absent/worker.mjs';
+    let entries = [];
+    let args;
+    if (source === 'caller') entries = [join(alias, missing)];
+    if (source === 'dangling caller symlink') {
+      missing = 'dangling.mjs';
+      symlinkSync('absent-target.mjs', join(f.root, missing));
+      entries = [missing];
+    }
+    if (source === 'LaunchAgent') args = ['node', join(alias, missing)];
+    if (source === 'mapped pass') {
+      missing = 'scripts/conveyor/branch-drift.mjs';
+      args = ['node', join(alias, 'skills-src/conveyor/pass-daemon.mjs'), '--pass=branch-drift'];
+    }
+    if (source === 'boot entry') {
+      missing = DAEMON_ENTRY_MODULES[0];
+      rmSync(join(f.root, missing));
+    }
+    if (args) writeFileSync(join(f.launchAgentsDir, 'com.we.missing.plist'), 'plist');
+    const runtimeEntries = cloneRuntimeEntries({ ...f, entries,
+      run: () => ({ status: 0, stdout: JSON.stringify({ ProgramArguments: args }) }),
+    });
+    expect(runtimeEntries).toContain(missing);
+    const closure = collectImportClosure({ root: f.root, entries: runtimeEntries });
+    // A readable sibling must never turn absent runtime evidence into "unrelated".
+    expect(closureHits({ closure, changedFiles: ['scripts/changed-dependency.mjs'] })).toBeNull();
+    expect(closure).toBeNull();
+  });
+
+it('collects a complete clone closure only when every retained runtime entry is readable', () => {
+  const f = fixture();
+  for (const entry of [...DAEMON_ENTRY_MODULES, 'scripts/caller.mjs']) {
+    mkdirSync(dirname(join(f.root, entry)), { recursive: true });
+    writeFileSync(join(f.root, entry), 'export {};');
+  }
+  const entries = cloneRuntimeEntries({ ...f, entries: ['scripts/caller.mjs'] });
+  const closure = collectImportClosure({ root: f.root, entries });
+  expect(closure.complete).toBe(true);
+  expect(closure.files).toEqual(new Set(entries));
+  expect(closureHits({ closure, changedFiles: ['scripts/unrelated.mjs'] })).toEqual([]);
+  const unreadable = collectImportClosure({ root: f.root, entries,
+    readFile() { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); },
+  });
+  expect(unreadable.complete).toBe(false);
+  expect(closureHits({ closure: unreadable, changedFiles: ['scripts/unrelated.mjs'] })).toBeNull();
+});
 
 it('unions clone-realpath LaunchAgents, mapped passes, caller entries and boot entries', () => {
   const f = fixture();

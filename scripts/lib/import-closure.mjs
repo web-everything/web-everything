@@ -28,7 +28,8 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * NON-literal dynamic `import(expr)` in code (its target can't be known statically) — the caller then falls back
  * to "any code file changed". `bareDeps` = some file imports a package (a `package*.json` change is relevant).
  * `jsonNames` = basenames of `.json` string literals in closure files (a config read at runtime by name).
- * Never throws: an unreadable entry returns `null` (the caller's conservative fallback).
+ * A missing entry returns `null`; a read failure marks the closure incomplete. Both use the caller's
+ * conservative fallback, even when other entries are readable.
  * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
  * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
  * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map}} o
@@ -48,8 +49,9 @@ export function collectImportClosure({
     return presence.get(path);
   };
   const starts = (entries || []).filter(Boolean).map((e) => (isAbsolute(e) ? e : resolvePath(absRoot, e)))
-    .filter((e) => !relative(absRoot, e).startsWith('..') && existsOnce(e));
-  if (!starts.length) return null;
+    .filter((e) => !relative(absRoot, e).startsWith('..'));
+  // Missing runtime roots are unknown evidence, not permission to narrow the closure to readable siblings.
+  if (!starts.length || starts.some((e) => !existsOnce(e))) return null;
   const seen = new Set();
   const jsonNames = new Set();
   let complete = true;
