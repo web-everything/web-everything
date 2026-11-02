@@ -77,8 +77,9 @@ export async function readLedgerPrs({
     for (const row of body.prs) {
       if (row && sameRepo(row.repo, repo)) for (const c of [...(row.checks || []), ...(row.suites || [])]) seen.push(stamp(c?.at));
     }
-    const repoSeenAt = Math.max(-Infinity, ...seen.filter(t => t !== null));
-    if (!(feedNow - repoSeenAt <= repoMaxAgeMs)) return unavailable('stale-repo');
+    // Timestamps later than the Worker's own clock (+60s skew) are invalid evidence and are ignored.
+    const valid = seen.filter(t => t !== null && t <= feedNow + 60_000);
+    if (!valid.length || !(feedNow - Math.max(...valid) <= repoMaxAgeMs)) return unavailable('stale-repo');
     const prs = [];
     for (const row of body.prs) {
       // A row without a repository cannot safely be excluded from this listing.

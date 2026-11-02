@@ -158,6 +158,18 @@ describe('readLedgerPrs — real HTTP fixture', () => {
     unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'stale-repo', fixture.url);
   });
 
+  it('ignores timestamps dated after the Worker clock: a year-ahead check or bootstrap is stale-repo', async () => {
+    const future = NOW + 365 * 24 * 3600_000;
+    const boot = [{ repo: REPO, status: 'complete', baseCursor: 0, cursor: 7, importId: 'b', importedAt: future }];
+    for (const payload of [
+      body({ coverage: { partial: true, bootstrap: boot }, prs: [row({ checks: [{ at: new Date(future).toISOString() }] })] }),
+      body({ coverage: { partial: true, bootstrap: boot }, prs: [row({ checks: [{ at: 'garbage' }] })] }),
+    ]) {
+      const fixture = await serve(payload);
+      unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'stale-repo', fixture.url);
+    }
+  });
+
   it('compare reports duplicate rows instead of collapsing them', () => {
     const c = compareLedgerToGithub([githubPr(1), githubPr(1)], usable([githubPr(1)]));
     expect(c.agree).toBe(false);
