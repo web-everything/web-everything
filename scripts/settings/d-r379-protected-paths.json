@@ -13,7 +13,7 @@
   ],
   "rulingRecordPaths": ["docs/agent/platform-decisions.md"],
   "harmlessPaths": [
-    "docs/examples/**",
+    "docs/examples/**/*.md",
     "backlog/*.md",
     "docs/*.md",
     "docs/**/*.md",

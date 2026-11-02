@@ -153,7 +153,7 @@ async function reviewed(pr, head, base, deps) {
         throw new Error('missing hold application or acceptance time');
       }
     } catch { return unknown(2, name, 'hold label timeline unavailable, incomplete or oversized'); }
-    const later = liveHolds.filter(label => applications.get(label) > Date.parse(current.at));
+    const later = liveHolds.filter(label => applications.get(label) >= Date.parse(current.at));
     if (later.length) return result(2, name, 'FAIL', later.map(label => `hold applied after acceptance: ${label}`));
   }
   return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',

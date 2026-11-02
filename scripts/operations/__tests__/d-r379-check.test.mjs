@@ -966,8 +966,11 @@ describe('round 7 live hold chronology', () => {
     ]);
     expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:[`hold applied after acceptance: ${label}`]});
   });
-  it.each(['2026-11-02T09:00:00Z','2026-11-02T10:00:00Z'])('permits a hold applied at %s before or at acceptance', async at => {
+  it.each(['2026-11-02T09:00:00Z'])('permits a hold applied at %s strictly before acceptance', async at => {
     expect(condition(await check('review:human',()=>[event('review:human',at)]),2).status).toBe('PASS');
+  });
+  it('a hold applied at the same instant as acceptance fails', async () => {
+    expect(condition(await check('review:human',()=>[event('review:human','2026-11-02T10:00:00Z')]),2).status).toBe('FAIL');
   });
   it.each(['throw','missing','malformed','invalid time','oversized'])('keeps %s timeline UNKNOWN with human fallback', async kind => {
     const r = await check('review:human',()=>{
@@ -1157,7 +1160,7 @@ describe('round 10 harmless-path allowlist', () => {
       status: 'UNKNOWN', evidence: [`unclassified path: ${path}; operator review`]});
     expect(r.eligible).toBe(false);
   });
-  it.each(['docs/examples/example.txt', 'docs/topic.md', 'docs/topics/detail.md',
+  it.each(['docs/examples/example.md', 'docs/topic.md', 'docs/topics/detail.md',
     'backlog/123-story.md', 'README.fr.md', 'image.jpg', 'assets/image.webp',
     'assets/image.png', 'assets/image.svg'])('allowlisted %s passes', async path => {
     expect(condition(await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]})), 4).status).toBe('PASS');
@@ -1206,5 +1209,17 @@ describe('round 10 harmless-path allowlist', () => {
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
     expect(condition(r, 3)).toMatchObject({status: 'FAIL', evidence: [`direction path: ${path}`]});
     expect(r.eligible).toBe(false);
+  });
+});
+
+describe('round 11 equal-time hold and executable examples', () => {
+  it('a docs/examples executable file is not harmless', async () => {
+    const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['docs/examples/access-control.tsx'] }));
+    expect(condition(r, 4).status).not.toBe('PASS');
+    expect(r.eligible).toBe(false);
+  });
+  it('docs/examples markdown stays harmless', async () => {
+    const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['docs/examples/example-9.md'] }));
+    expect(condition(r, 4).status).toBe('PASS');
   });
 });
