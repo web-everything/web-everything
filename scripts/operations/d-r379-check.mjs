@@ -124,6 +124,11 @@ function latestAudit(records, head, base) {
   return latest;
 }
 
+function isHold(l) {
+  return (l.startsWith('red-team:') && l !== 'red-team:clear') || (l.startsWith('review:') && l !== REVIEW_LABELS.accepted)
+    || l.startsWith('advisory:');
+}
+
 async function reviewed(pr, head, base, deps) {
   const name = 'Reviewed';
   let labels, audit;
@@ -167,29 +172,33 @@ async function reviewed(pr, head, base, deps) {
     ['ledger acceptance is a clear-human ceremony; it needs a companion approval, not delegated approval']);
   if (!state.clears || state.reviewExempt || !state.verdict) return result(2, name, 'FAIL',
     ['verdict ledger does not accept the current head', ...state.holds.map(h => `${h.code}: ${h.reason}`)]);
-  const liveHolds = labels.filter(label => ['review:pending', REVIEW_LABELS.human].includes(label));
-  if (liveHolds.length) {
-    let applications;
-    try {
-      const events = await deps.readLabelEvents(pr);
-      if (!Array.isArray(events) || events.length > 1000) throw new Error('invalid or oversized label timeline');
-      applications = new Map();
-      for (const event of events) {
-        if (!['labeled', 'unlabeled'].includes(event?.event) || typeof event.label?.name !== 'string'
-          || typeof event.created_at !== 'string' || !Number.isFinite(Date.parse(event.created_at))) {
-          throw new Error('invalid label event');
-        }
-        if (event.event !== 'labeled' || !liveHolds.includes(event.label.name)) continue;
-        const at = Date.parse(event.created_at);
-        applications.set(event.label.name, Math.max(applications.get(event.label.name) ?? -Infinity, at));
+  const liveHolds = labels.filter(isHold);
+  let applications = new Map(), sincePush = new Map();
+  try {
+    const pushed = Date.parse(await deps.readHeadPushedAt(pr, head));
+    if (!Number.isFinite(pushed)) throw new Error('invalid head push time');
+    const events = await deps.readLabelEvents(pr);
+    if (!Array.isArray(events) || events.length > 1000) throw new Error('invalid or oversized label timeline');
+    for (const event of events) {
+      if (!['labeled', 'unlabeled'].includes(event?.event) || typeof event.label?.name !== 'string'
+        || typeof event.created_at !== 'string' || !Number.isFinite(Date.parse(event.created_at))) {
+        throw new Error('invalid label event');
       }
-      if (!Number.isFinite(Date.parse(current.at)) || liveHolds.some(label => !applications.has(label))) {
-        throw new Error('missing hold application or acceptance time');
-      }
-    } catch { return unknown(2, name, 'hold label timeline unavailable, incomplete or oversized'); }
-    const later = liveHolds.filter(label => applications.get(label) >= Date.parse(current.at));
-    if (later.length) return result(2, name, 'FAIL', later.map(label => `hold applied after acceptance: ${label}`));
-  }
+      const label = event.label.name;
+      if (event.event !== 'labeled' || !isHold(label)) continue;
+      const at = Date.parse(event.created_at);
+      applications.set(label, Math.max(applications.get(label) ?? -Infinity, at));
+      if (at >= pushed) sincePush.set(label, (sincePush.get(label) ?? 0) + 1);
+    }
+    if (liveHolds.length && (!Number.isFinite(Date.parse(current.at)) || liveHolds.some(label => !applications.has(label)))) {
+      throw new Error('missing hold application or acceptance time');
+    }
+  } catch { return unknown(2, name, 'hold label timeline or head push time unavailable, incomplete or oversized'); }
+  // A live hold accounts for its latest application; any other application since the push was removed again.
+  const removed = [...sincePush].filter(([label, count]) => count > (liveHolds.includes(label) ? 1 : 0)).map(([label]) => label);
+  if (removed.length) return result(2, name, 'FAIL', removed.map(label => `hold applied since head push: ${label}`));
+  const later = liveHolds.filter(label => applications.get(label) >= Date.parse(current.at));
+  if (later.length) return result(2, name, 'FAIL', later.map(label => `hold applied after acceptance: ${label}`));
   return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',
     `canonical audit NOT WEAKENED for head ${head}, base ${audit.base}, at ${audit.at}`,
     'verdict ledger accepts the current head with no holds']);

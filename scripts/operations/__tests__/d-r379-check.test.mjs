@@ -976,6 +976,13 @@ describe('round 7 live hold chronology', () => {
     expect(condition(r,2).status).toBe('UNKNOWN');
     expect(condition(r,2).evidence.join(' ')).toContain('human review');
   });
+  it('reads the head commit date through the pinned API path and rejects a bad sha', async () => {
+    const calls = [];
+    const adapter = createCheckDeps({exec:(...a)=>{ calls.push(a); return '2026-11-02T09:30:00Z\n'; }});
+    expect(await adapter.readHeadPushedAt(6223,'b'.repeat(40))).toBe('2026-11-02T09:30:00Z');
+    expect(JSON.stringify(calls)).toContain(`commits/${'b'.repeat(40)}`);
+    await expect(adapter.readHeadPushedAt(6223,'main; rm')).rejects.toThrow();
+  });
   it('paginates explicit-repo issue events and filters hold label events', async () => {
     const calls = [];
     const rows = Array.from({length:100},()=>({event:'commented'}));

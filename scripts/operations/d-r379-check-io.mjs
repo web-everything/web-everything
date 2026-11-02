@@ -109,11 +109,16 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
           if (!row || typeof row.event !== 'string') throw new Error('invalid issue event; human review required');
           if (!['labeled', 'unlabeled'].includes(row.event)) continue;
           if (typeof row.label?.name !== 'string') throw new Error('invalid label event; human review required');
-          if (['review:human', 'review:pending'].includes(row.label.name)) events.push(row);
+          if (/^(review|red-team|advisory):/.test(row.label.name)) events.push(row);
         }
         if (rows.length < 100) return events;
       }
       throw new Error('label timeline page bound exceeded; human review required');
+    },
+    async readHeadPushedAt(pr, head) {
+      checkPrNumber(pr); checkSha(head);
+      // The head commit's committer date is never later than its push, so the window since it is a safe superset.
+      return (await run('gh', ['api', `repos/${CONSTELLATION_REPOS.we.slug}/commits/${head}`, '--jq', '.commit.committer.date'])).trim();
     },
     async readReviewLedger(pr) {
       checkPrNumber(pr);
