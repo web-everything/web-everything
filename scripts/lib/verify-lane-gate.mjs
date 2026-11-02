@@ -200,6 +200,19 @@ export function stampedTimeoutFactor(gate) {
   return match ? Number(match[1]) / VITEST_BASE_TIMEOUTS.testTimeout : 1;
 }
 
+/** Compare default gates across checkouts, ignoring only the absolute shard-wrapper root.
+ * Keep every argument and remaining shell step exact; the matched plan executes our own wrapper.
+ * The quoted path accepts shellQuote's escaped apostrophes as well as ordinary checkout names.
+ */
+export function gateCommandsEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  if (left === right) return true;
+  const wrapper = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
+  const leftPrefix = wrapper.exec(left), rightPrefix = wrapper.exec(right);
+  return !!leftPrefix && !!rightPrefix
+    && left.slice(leftPrefix[0].length) === right.slice(rightPrefix[0].length);
+}
+
 /**
  * #66 — recognize a dispatched child's `--gate` as the requester's DEFAULT gate even when the requester resolved it
  * under different settings than this child (an older lane base without the settings file, or a session whose env
@@ -228,7 +241,7 @@ export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, v
   let other;
   try { other = resolveUnder(otherEnv); } catch { return null; }
   if (!other || other.decision?.selectionMode?.mode === ours) return null;
-  if (other.command === gate) return other;
+  if (gateCommandsEqual(other.command, gate)) return other;
   return matchUnderSelection({ gate, env: otherEnv, resolved: other, resolveUnder, variants });
 }
 
@@ -249,7 +262,7 @@ function matchUnderSelection({ gate, env, resolved, resolveUnder, variants }) {
         for (const policy of VERIFY_STANDARDS_POLICIES) {
           let variant;
           try { variant = resolveUnder({ ...env, ...selection, WE_VERIFY_STANDARDS: policy }); } catch { continue; }
-          if (variant?.command !== gate || !sameDiff(variant)) continue;
+          if (!gateCommandsEqual(variant?.command, gate) || !sameDiff(variant)) continue;
           if (relatedMode === ours.relatedMode && factor === ours.factor && limit === null) return resolved;
           const plan = resolveUnder({ ...env, ...selection });
           return sameDiff(plan) ? plan : null;

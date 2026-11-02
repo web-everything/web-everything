@@ -78,7 +78,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
@@ -436,7 +436,7 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   try {
     const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
-    if (resolved.command === GATE) resolvedGate = resolved;
+    if (gateCommandsEqual(resolved.command, GATE)) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
     // which can differ from this dispatched child's (the daemon's env + checkout file): the standards policy,
     // and (#66) the related-test mode or timeout factor. If the stamped command is exactly what some declared
@@ -453,7 +453,7 @@ if (!resolvedGate && typeof flags.gate === 'string') {
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
         const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
         const base = finalGate === ours ? resolved : resolveUnder(env);
-        resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        resolvedGate = (gateCommandsEqual(base.command, GATE) ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
         if (resolvedGate) break;
         // #5831 — the requester may have stamped under build.finalGateStandards=selected (no standards half) or with the
         // card-only skip on. `always` pins WE_VERIFY_STANDARDS and the skip, so the matcher's probes cannot reproduce
