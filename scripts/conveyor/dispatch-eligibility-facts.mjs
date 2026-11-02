@@ -40,7 +40,8 @@ function readFact(name, value) {
 /**
  * Red-team evidence from the gate's own store only (liveResultGateState). This module never parses comments or
  * markers itself: anything the gate does not decide for the current head (no result, an older head, no gate
- * record, an unknown outcome) is unread.
+ * record, an unknown outcome, a no-send-back record) is unread. There is no `clear` yet: it needs a gate-side
+ * digest-bound clearance, which the gate does not write.
  */
 export function redTeamFact(comments, prNumber, head) {
   if (!Array.isArray(comments) || typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) return unread();
@@ -50,7 +51,6 @@ export function redTeamFact(comments, prNumber, head) {
   if (s.outcomes.has('operator-block')) return bound('blocked');
   if (s.sendBackOutcome === 'round-cap') return bound('held');
   if (s.sendBackOutcome === 'sent-back') return bound('send-back');
-  if (s.outcomes.has('no-send-back')) return bound('clear');
   return unread();
 }
 
