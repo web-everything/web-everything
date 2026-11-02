@@ -362,6 +362,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(r.w.ok).toBe(false);
     expect(r.w.reason).toBe('reader-priority');
     expect(r.waitedMs).toBeGreaterThanOrEqual(28_000);
+    expect(r.waitedMs).toBeLessThanOrEqual(28_000 + 11_000); // yields at the 20s window, not the 5 min cap
   });
 
   it('an infinite override window is capped, and waitMs 0 stays an immediate timeout', async () => {
