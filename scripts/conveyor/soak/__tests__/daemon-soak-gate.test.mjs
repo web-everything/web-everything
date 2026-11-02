@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import yaml from 'js-yaml';
 import { REPO_ROOT } from '../shard-files.mjs';
 
 const CI_YML = join(REPO_ROOT, '.github', 'workflows', 'ci.yml');
@@ -98,8 +99,10 @@ describe('daemon-soak runs on main pushes, not only on PRs', () => {
     }
   });
 
-  it('on a non-PR event the scope step always says run (no path filter on main)', () => {
-    const yml = readFileSync(CI_YML, 'utf8');
-    expect(yml).toContain(`if [ "\${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi`);
+  it('on a non-PR event without a queue-tested push receipt the scope says run via the env event', () => {
+    const scope = yaml.load(readFileSync(CI_YML, 'utf8')).jobs['daemon-soak-scope'].steps.find((step) => step.id === 'scope');
+    expect(scope.env.EVENT_NAME).toBe('${{ github.event_name }}');
+    expect(scope.run).not.toContain('${{');
+    expect(scope.run).toContain('if [ "$EVENT_NAME" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi');
   });
 });

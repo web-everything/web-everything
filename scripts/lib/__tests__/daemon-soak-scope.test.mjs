@@ -71,11 +71,12 @@ const scopeStep = scopeJob.steps.find((step) => step.id === 'scope');
 const baseSha = 'a'.repeat(40);
 const headSha = 'b'.repeat(40);
 
-function runScope({ event = 'pull_request', files = 'backlog/new-card.md', endpointFiles = 'scripts/conveyor/main-only.mjs', renamed = false, gitFails = false } = {}) {
+function runScope({ event = 'pull_request', light = 'false', files = 'backlog/new-card.md', endpointFiles = 'scripts/conveyor/main-only.mjs', renamed = false, gitFails = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'we-daemon-scope-'));
   const output = join(root, 'output');
   const values = {
     'github.event_name': event,
+    'needs.changes.outputs.light': light,
     'github.event.pull_request.base.sha': baseSha,
     'github.event.pull_request.head.sha': headSha,
   };
@@ -142,9 +143,39 @@ describe('daemon-soak scope workflow uses the PR contribution', () => {
     expect(result.output).toBe('');
   });
 
-  it.each(['push', 'merge_group', 'workflow_dispatch'])('always runs on %s without resolving a PR diff', (event) => {
+  it.each(['push', 'merge_group', 'workflow_dispatch', 'schedule'])('runs on %s without a queue-tested receipt or resolving a PR diff', (event) => {
     const result = runScope({ event, gitFails: true });
     expect(result.status, result.stderr).toBe(0);
     expect(result.output).toBe('run=true');
+  });
+
+  it('skips a queue-tested push without resolving a PR diff', () => {
+    const result = runScope({ event: 'push', light: 'true', gitFails: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=false');
+  });
+
+  it.each(['', 'false', 'TRUE', 'unknown'])('runs a push when the light output is %j', (light) => {
+    const result = runScope({ event: 'push', light, gitFails: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=true');
+  });
+
+  it.each(['merge_group', 'workflow_dispatch', 'schedule'])('never skips %s even with a light output', (event) => {
+    const result = runScope({ event, light: 'true', gitFails: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=true');
+  });
+
+  it('still scopes daemon edits on a light PR', () => {
+    const result = runScope({ light: 'true', files: 'scripts/conveyor/pr-edit.mjs' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe('run=true');
+  });
+
+  it('fails closed when a light PR diff cannot be resolved', () => {
+    const result = runScope({ light: 'true', gitFails: true });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toBe('');
   });
 });
