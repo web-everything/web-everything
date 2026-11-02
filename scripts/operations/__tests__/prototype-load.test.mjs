@@ -13,13 +13,20 @@ import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import * as prototypeLoad from '../prototype-load.mjs';
+import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
+import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
-import { parseOperationArgv } from '../cli-adapter.mjs';
+import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
 import { checkPendingAdoptions, readPendingAdoptions, recordPendingAdoption } from '../../lib/overlay-adoption.mjs';
+// Exercise the real runner binding without spawning an auditor or writing audit records.
+vi.mock('../codex-audit.mjs', async (importOriginal) => ({
+  ...await importOriginal(), main: vi.fn(async () => 0),
+}));
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
 const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control', waitAdoptionMs: 30 };
 const settings = {
@@ -47,6 +54,10 @@ function fixture(options = {}) {
       reads.push(p);
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
+      if (p === '/home/test/canonical-audits.jsonl') {
+        if (options.auditReadError) throw Object.assign(new Error('audit file unreadable'), { code: options.auditReadError });
+        return options.audits ?? '';
+      }
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
       if (p.endsWith('.events.jsonl')) return options.events || '';
@@ -235,6 +246,163 @@ function fixture(options = {}) {
   return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+const auditRecord = (overrides = {}) => ({
+  at: '2026-10-20T12:00:00Z', base: TREE, head: SHA, baseRef: 'origin/main',
+  questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], ...overrides,
+});
+const auditLines = (records) => records.map(record => JSON.stringify(record)).join('\n') + '\n';
+function auditedFixture(mode, options = {}) {
+  return fixture({ ...options, settings: {
+    auditRecordPath: '~/canonical-audits.jsonl',
+    ...(mode === undefined ? {} : { canonicalAuditMode: mode }), ...options.settings,
+  } });
+}
+
+describe('codex-audit runner registration', () => {
+  it('declares base and head inputs and binds execution to codex-audit main', async () => {
+    vi.mocked(auditMain).mockClear();
+    const { declaration, registry, sinks } = resolveOperation('codex-audit');
+    expect(declaration.name).toBe('codex-audit');
+    expect(declaration.input).toMatchObject({ base: { type: 'string' }, head: { type: 'string' } });
+    const parsed = parseOperationArgv(declaration, ['--base=origin/main', `--head=${SHA}`]);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.input).toMatchObject({ base: 'origin/main', head: SHA });
+    await runOperationCli({ declaration, registry, sinks,
+      argv: ['--base=origin/main', `--head=${SHA}`],
+      store: createMemoryRunStore(), newRunId: () => 'canonical-audit-registration',
+    });
+    expect(auditMain).toHaveBeenCalledTimes(1);
+    const [argv] = vi.mocked(auditMain).mock.calls[0];
+    expect(argv).toEqual(expect.arrayContaining(['--base=origin/main', `--head=${SHA}`]));
+  });
+});
+
+describe('canonicalAuditEvidence', () => {
+  it('exports a pure selector returning the matching NOT WEAKENED record', () => {
+    const record = Object.freeze(auditRecord());
+    const records = Object.freeze([record]);
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: true, record });
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA).record).toBe(record);
+  });
+  it.each([
+    ['empty records', []],
+    ['foreign question hash', [auditRecord({ questionHash: 'foreign-question' })]],
+    ['other head', [auditRecord({ head: MERGE })]],
+    ['invalid date', [auditRecord({ at: 'not-a-date' })]],
+    ['missing date', [auditRecord({ at: undefined })]],
+  ])('returns no-record for %s', (_, records) => {
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('returns weakened for a matching WEAKENED record', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it.each([false, true])('latest timestamp defeats an older pass regardless of file order (reverse=%s)', reverse => {
+    const records = [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })];
+    expect(prototypeLoad.canonicalAuditEvidence(reverse ? records.reverse() : records, SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('a later canonical pass supersedes an older weakened record even across bases', () => {
+    const latest = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
+    expect(prototypeLoad.canonicalAuditEvidence([latest, auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: true, record: latest });
+  });
+  it('ignores newer foreign hashes, other heads and invalid dates when selecting a canonical record', () => {
+    const record = auditRecord();
+    const newer = { at: '2026-10-22T12:00:00Z', verdict: 'WEAKENED' };
+    expect(prototypeLoad.canonicalAuditEvidence([record,
+      auditRecord({ ...newer, questionHash: 'foreign-question' }),
+      auditRecord({ ...newer, head: MERGE }),
+      auditRecord({ ...newer, at: 'not-a-date' }),
+    ], SHA)).toEqual({ ok: true, record });
+  });
+});
+
+describe('prototype-load canonical audit admission', () => {
+  it('ships canonicalAuditMode warn in the default settings', () => {
+    const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
+    expect(shipped.canonicalAuditMode).toBe('warn');
+  });
+  it.each([
+    ['explicit warn', 'warn', [], 'no-record'],
+    ['absent mode', undefined, [], 'no-record'],
+    ['weakened in warn', 'warn', [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
+    ['weakened with absent mode', undefined, [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
+    ['unreadable in warn', 'warn', [], 'no-record', 'EACCES'],
+    ['missing file with absent mode', undefined, [], 'no-record', 'ENOENT'],
+  ])('%s proceeds with failed canonical evidence and a loud warning line', async (_, mode, records, reason, auditReadError) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const f = auditedFixture(mode, { audits: auditLines(records), auditReadError });
+      const out = await f.run();
+      expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode: 'warn', ok: false, reason } });
+      expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+      const lines = [...warning.mock.calls, ...error.mock.calls, ...stderr.mock.calls]
+        .map(args => args.map(String).join(' ')).join('\n');
+      expect(lines).toMatch(/WARNING[^\n]*canonical[ -]audit/i);
+      expect(mutations(f, 'add')).toHaveLength(1);
+    } finally { warning.mockRestore(); error.mockRestore(); stderr.mockRestore(); }
+  });
+  it.each([
+    ['no records', [], 'no-record'],
+    ['foreign question hash', [auditRecord({ questionHash: 'foreign-question' })], 'no-record'],
+    ['other head', [auditRecord({ head: MERGE })], 'no-record'],
+    ['invalid date', [auditRecord({ at: 'not-a-date' })], 'no-record'],
+    ['latest record weakened', [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })], 'weakened'],
+  ])('refuse stops before git or registration on %s and names the worker fallback', async (_, records, reason) => {
+    const f = auditedFixture('refuse', { audits: auditLines(records) });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+    expect(f.records[0]).toMatchObject({ stopReason: 'no-canonical-audit' });
+  });
+  it.each(['ENOENT', 'EACCES', 'EIO'])('refuse fails closed on unreadable audit records (%s)', async auditReadError => {
+    const f = auditedFixture('refuse', { auditReadError });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['warn', 'refuse'])('%s accepts a canonical NOT WEAKENED audit read from the configured JSONL path', async mode => {
+    const record = auditRecord();
+    const f = auditedFixture(mode, { audits: `malformed json\n${auditLines([record])}` });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode, ok: true } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('checks ready evidence before reading canonical audits, including when explicit ready arguments pass', async () => {
+    const f = auditedFixture('refuse', { ready: '', auditReadError: 'EACCES' });
+    expect((await f.run()).stopReason).toBe('no-ready');
+    expect(f.reads).not.toContain('/home/test/canonical-audits.jsonl');
+    const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
+    expect(out).toMatchObject({ stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(f.calls).toEqual([]);
+  });
+  it('uses input.sha rather than a fixed or unrelated audit head', async () => {
+    const f = auditedFixture('refuse', { sha: MERGE, audits: auditLines([auditRecord()]) });
+    const out = await f.run();
+    expect(out).toMatchObject({ stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`--head=${MERGE}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['invalid', '', null, false, 0])('unknown mode %j is treated as refuse', async mode => {
+    const f = auditedFixture(mode);
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+  });
+});
 describe('default combined-tree test proof', () => {
   const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
   const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
