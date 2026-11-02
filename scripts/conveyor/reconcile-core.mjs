@@ -1,4 +1,5 @@
 import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from './dispatch-eligibility-shadow.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
  * every open PR, and return what to dispatch plus every refusal and the fact each turned on.
@@ -2157,6 +2158,7 @@ export function planReconcile({
   // every queue that consumes this plan in order), is promoted from draft at once, and is never told to wait for main
   // (`owed-ci-rerun`) — it is the one PR main is waiting for. `null` (default) = before this card, byte-identical.
   mainRedPriority = null,
+  shadowDeps,
 } = {}) {
   // Fast checks are per repo: a repo whose CI does not publish them (null) waits on its required checks instead.
   const repoReviewTiming = { ...reviewTiming, fastChecks: fastChecksFor(reviewTiming?.fastChecks, repo) };
@@ -3944,6 +3946,12 @@ export function planReconcile({
     notes.push({ kind: 'review-churn', prNumber: d.prNumber, loops: d.churnCap.loops, cap: d.churnCap.cap,
       text: `PR #${d.prNumber}: ${d.churnCap.loops} reviews of distinct heads (review.reviewChurn.maxLoopsPerPr=${d.churnCap.cap}) — the fix/review loop is not converging; the new head is still reviewed, and a person should look at the PR` });
   }
+  try {
+    const { mode, appendLine, readLocals, ...deps } = eligibilityShadowDeps({
+      ...(shadowDeps ? { hermetic: true } : {}), ...shadowDeps,
+    });
+    runEligibilityShadow({ ...deps, dispatch: timedDispatch, prs, mode, appendLine, pathId: 'reconcile-core', readLocals });
+  } catch (error) { reportShadowError(error); }
   return { dispatch: timedDispatch, refusals, notes };
 }
 

@@ -1,4 +1,5 @@
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
+import { unread } from './dispatch-eligibility.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { pidIdentity } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -1131,13 +1132,13 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * `defaultReadPrs` already fetched every field for.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
- *   readPulls?:Function, repo?:string|null, defaultBranch?:string}} [o]
+ *   readPulls?:Function, repo?:string|null, defaultBranch?:string, onShadowFact?:Function|null}} [o]
  * @returns {Array<object>}
  */
 export function enrichPrsWithAlreadyLandedFacts(prs, {
   fetchRef = defaultFetchRef, readMergeBase = defaultReadMergeBase, readChanges = defaultReadChanges,
   findMatchingCommit = defaultFindMatchingMainCommit, readPulls = defaultReadPullsForCommit,
-  repo = null, defaultBranch = 'main',
+  repo = null, defaultBranch = 'main', onShadowFact = null,
 } = {}) {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
@@ -1149,9 +1150,15 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
 
     fetchRef(prNumber, {});
     const base = readMergeBase(headSha, mainRef, {});
-    if (!base) return pr; // no common history to bound the search by — never guess
+    if (!base) {
+      try { onShadowFact?.(prNumber, { alreadyLanded: unread() }); } catch { /* Shadow reporting cannot affect reconciliation. */ }
+      return pr; // no common history to bound the search by — never guess
+    }
     const changes = readChanges(base, headSha, {});
-    if (!changes.length) return pr; // could not even read the diff — never guess containment from nothing
+    if (!changes.length) {
+      try { onShadowFact?.(prNumber, { alreadyLanded: unread() }); } catch { /* Shadow reporting cannot affect reconciliation. */ }
+      return pr; // could not even read the diff — never guess containment from nothing
+    }
 
     const fileMatches = changes.map((change) => ({
       file: change.path, matchedCommit: findMatchingCommit(change, { base, mainRef }),
