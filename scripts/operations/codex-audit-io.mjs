@@ -19,8 +19,8 @@ function readReport(stdout) {
 /** All filesystem and subprocess effects are injectable; no shell interprets refs or prompts. */
 export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
   scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync } = {}) {
-  const run = (command, args, timeout) => {
-    const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout });
+  const run = (command, args, timeout, env) => {
+    const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout, ...(env ? { env } : {}) });
     if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
     return result.stdout;
   };
@@ -29,10 +29,18 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     runCodex(prompt) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));
       try {
+        const indexPath = resolve(cwd, run('git', ['rev-parse', '--git-path', 'index'], 30_000).trim());
+        const scratchIndex = join(scratch, 'index');
+        try { fs.copyFileSync(indexPath, scratchIndex); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          // Git initializes a missing index; a zero-byte file is not a valid index.
+        }
         const taskFile = join(scratch, 'task.md');
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, ['scripts/codex-direct-task.mjs', '--review', '--json',
-          '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000));
+          '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
+          { ...process.env, GIT_INDEX_FILE: scratchIndex }));
         if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
           throw new Error('Codex failed or returned incomplete evidence');
         }

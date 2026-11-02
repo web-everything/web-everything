@@ -1,5 +1,8 @@
 /** @file Hermetic standalone audit contract and real-adapter boundary tests. */
 import { createHash } from 'node:crypto';
+import * as realFs from 'node:fs';
+import { spawnSync as realSpawnSync } from 'node:child_process';
+import { join, dirname } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
@@ -114,27 +117,44 @@ describe('canonical audit', () => {
   });
 
   it('findAudit selects the later appended record when timestamps are equal', () => {
-    const first = { head: HEAD, questionHash: QUESTION_HASH, at: AT, verdict: 'NOT WEAKENED' };
+    const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, at: AT, verdict: 'NOT WEAKENED' };
     const later = { ...first, verdict: 'WEAKENED' };
-    expect(findAudit([first, later], { head: HEAD, questionHash: QUESTION_HASH })).toBe(later);
+    expect(findAudit([first, later], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(later);
   });
 
-  it('findAudit selects latest exact head and canonical hash, rejecting other hashes and heads', () => {
-    const first = { head: HEAD, questionHash: QUESTION_HASH, at: '2026-01-01T00:00:00.000Z' };
+  it('findAudit selects latest exact base, head and canonical hash, rejecting other hashes and heads', () => {
+    const first = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, at: '2026-01-01T00:00:00.000Z' };
     const latest = { ...first, at: AT };
     const records = [latest, { ...latest, head: BASE }, { ...latest, questionHash: 'other' }, first];
-    expect(findAudit(records, { head: HEAD, questionHash: QUESTION_HASH })).toBe(latest);
-    expect(findAudit(records, { head: BASE, questionHash: 'other' })).toBeNull();
-    expect(findAudit([first], { head: BASE, questionHash: QUESTION_HASH })).toBeNull();
-    expect(findAudit([{ ...first, questionHash: 'other' }], { head: HEAD, questionHash: 'other' })).toBeNull();
-    expect(findAudit([], { head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+    expect(findAudit(records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(latest);
+    expect(findAudit(records, { base: BASE, head: BASE, questionHash: 'other' })).toBeNull();
+    expect(findAudit([first], { base: BASE, head: BASE, questionHash: QUESTION_HASH })).toBeNull();
+    expect(findAudit([{ ...first, questionHash: 'other' }], { base: BASE, head: HEAD, questionHash: 'other' })).toBeNull();
+    expect(findAudit([], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+  });
+
+  it('findAudit rejects a different base for the same head and canonical hash', () => {
+    const record = { base: HEAD, head: HEAD, questionHash: QUESTION_HASH, at: AT };
+    expect(findAudit([record], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+  });
+
+  it.each([undefined, null, '', 'origin/main', 'a'.repeat(39), 'g'.repeat(40), BASE + '\n'])('findAudit rejects missing or non-full base %j', base => {
+    const record = { base, head: HEAD, questionHash: QUESTION_HASH, at: AT };
+    expect(findAudit([record], { base, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+  });
+
+  it('findAudit rejects a missing query base and legacy records without a base', () => {
+    const record = { base: BASE, head: HEAD, questionHash: QUESTION_HASH, at: AT };
+    expect(findAudit([record], { head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+    const legacy = { head: HEAD, questionHash: QUESTION_HASH, at: AT };
+    expect(findAudit([legacy], { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
   });
 });
 
 function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' }) {
   const fs = { readFileSync: vi.fn(() => '{}'), mkdtempSync: vi.fn(() => '/scratch/audit-1'),
-    writeFileSync: vi.fn(), rmSync: vi.fn(), mkdirSync: vi.fn(), appendFileSync: vi.fn() };
-  const spawnSync = vi.fn(() => ({ status: 0, stdout: JSON.stringify(report) }));
+    copyFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), mkdirSync: vi.fn(), appendFileSync: vi.fn() };
+  const spawnSync = vi.fn(command => ({ status: 0, stdout: command === 'git' ? '.git/index\n' : JSON.stringify(report) }));
   const deps = createAuditDeps({ cwd: '/repo', home: '/home/test', scratchRoot: '/scratch', fs, spawnSync });
   return { deps, fs, spawnSync };
 }
@@ -151,13 +171,69 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     const f = adapter();
     expect(f.deps.runCodex('fixed prompt')).toBe('NOT WEAKENED');
     expect(f.fs.writeFileSync).toHaveBeenCalledWith('/scratch/audit-1/task.md', 'fixed prompt', expect.any(Object));
-    expect(f.spawnSync.mock.calls[0][1]).toEqual(['scripts/codex-direct-task.mjs', '--review', '--json', '--gate=none', '--task-file=/scratch/audit-1/task.md', '--dir=/repo']);
+    expect(f.spawnSync.mock.calls[1][1]).toEqual(['scripts/codex-direct-task.mjs', '--review', '--json', '--gate=none', '--task-file=/scratch/audit-1/task.md', '--dir=/repo']);
+    expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
+  });
+
+  it.each(['.git/index', '/shared/worktrees/lane/index'])('isolates the Codex index from %s in scratch and removes it', indexPath => {
+    const f = adapter();
+    f.spawnSync.mockReturnValueOnce({ status: 0, stdout: indexPath + '\n' });
+    expect(f.deps.runCodex('prompt')).toBe('NOT WEAKENED');
+    expect(f.spawnSync.mock.calls[0]).toEqual(['git', ['rev-parse', '--git-path', 'index'],
+      expect.objectContaining({ cwd: '/repo' })]);
+    expect(f.spawnSync.mock.calls[0][2].env).toBeUndefined();
+    expect(f.fs.copyFileSync).toHaveBeenCalledWith(indexPath.startsWith('/') ? indexPath : '/repo/' + indexPath,
+      '/scratch/audit-1/index');
+    expect(f.spawnSync.mock.calls[1][2].env).toEqual({ ...process.env, GIT_INDEX_FILE: '/scratch/audit-1/index' });
+    expect(f.fs.copyFileSync.mock.invocationCallOrder[0]).toBeLessThan(f.spawnSync.mock.invocationCallOrder[1]);
+    expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
+  });
+
+  it('runs real Git with an absent repository index, isolates intent-to-add and removes scratch', () => {
+    const root = realFs.mkdtempSync(join(process.env.TMPDIR, 'codex-audit-test-'));
+    const cwd = join(root, 'repo');
+    let scratchIndex;
+    const spawnSync = vi.fn((command, args, options) => {
+      if (command === 'git') return realSpawnSync(command, args, options);
+      expect(command).toBe(process.execPath);
+      scratchIndex = options.env.GIT_INDEX_FILE;
+      expect(dirname(dirname(scratchIndex))).toBe(root);
+      const added = realSpawnSync('git', ['add', '--intent-to-add', '--', 'sample.txt'], options);
+      expect(added.stderr).toBe('');
+      expect(added.status).toBe(0);
+      expect(realFs.existsSync(scratchIndex)).toBe(true);
+      const diff = realSpawnSync('git', ['diff', '--', 'sample.txt'], options);
+      expect(diff.status).toBe(0);
+      expect(diff.stdout).toContain('+audit fixture');
+      return { status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' }) };
+    });
+    try {
+      const init = realSpawnSync('git', ['init', '--quiet', cwd], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
+      expect(init.status).toBe(0);
+      realFs.writeFileSync(join(cwd, 'sample.txt'), 'audit fixture\n');
+      expect(realFs.existsSync(join(cwd, '.git', 'index'))).toBe(false);
+      const deps = createAuditDeps({ cwd, scratchRoot: root, spawnSync });
+      expect(deps.runCodex('prompt')).toBe('NOT WEAKENED');
+      expect(realFs.existsSync(join(cwd, '.git', 'index'))).toBe(false);
+      expect(realFs.existsSync(dirname(scratchIndex))).toBe(false);
+    } finally {
+      realFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an unreadable index without launching Codex and removes scratch', () => {
+    const f = adapter();
+    f.fs.copyFileSync.mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); });
+    expect(() => f.deps.runCodex('prompt')).toThrow('denied');
+    expect(f.spawnSync).toHaveBeenCalledTimes(1);
+    expect(f.spawnSync.mock.calls[0][0]).toBe('git');
     expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
   });
 
   it('reads the final JSON report after streamed JSONL events', () => {
     const f = adapter();
     f.spawnSync.mockReturnValue({ status: 0, stdout: '{"type":"event"}\n' + JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'WEAKENED' }, null, 2) });
+    f.spawnSync.mockReturnValueOnce({ status: 0, stdout: '.git/index\n' });
     expect(f.deps.runCodex('prompt')).toBe('WEAKENED');
   });
 
@@ -171,7 +247,9 @@ describe('audit IO with injected filesystem and subprocesses', () => {
   it.each([{ status: 1 }, { status: null, error: new Error('maxBuffer exceeded') }, { status: 0, stdout: 'bad json' }])('rejects failed, oversized or malformed subprocess output %j', result => {
     const f = adapter();
     f.spawnSync.mockReturnValue(result);
+    f.spawnSync.mockReturnValueOnce({ status: 0, stdout: '.git/index\n' });
     expect(() => f.deps.runCodex('prompt')).toThrow();
+    expect(f.spawnSync).toHaveBeenCalledTimes(2);
     expect(f.fs.rmSync).toHaveBeenCalled();
   });
 
