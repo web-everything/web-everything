@@ -11,6 +11,8 @@ import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { QUICK_SOAK_MAX_MS } from './quick.mjs';
+import { launchQuickSoak } from './quick-soak-job.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -205,6 +207,7 @@ export function staleAlertDetail(result, state) {
  */
 export async function finalizeRebuild({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+  quick = false, launchSoak = launchQuickSoak,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -243,13 +246,33 @@ export async function finalizeRebuild({
   // something else moved `root` entirely (abandon this attempt cleanly; the next tick recomputes a fresh plan).
   const headNow = verifyRev(git, 'HEAD');
   if (headNow === plan.finalSha) {
-    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
+    const lastGood = state.unverified?.quick && state.unverified.sha === plan.finalSha
+      ? state.unverified.lastGood : state.adopted ? { ...state.adopted } : null;
+    if (!state.adopted || state.adopted.head !== plan.finalSha || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
         head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        ...(state.unverified?.quick && state.unverified.sha === plan.finalSha ? { unverified: true } : {}),
       };
       state.rejected = null;
       state.held = null;
       writeState();
+    }
+    // A fallback can already be HEAD while its fresh quick smoke still owes both dry runs.
+    // Persist the debt before launching, just as on the reset path; HEAD equality proves no soak.
+    if (quick) {
+      state.adopted.unverified = true;
+      state.unverified = {
+        quick: true, unverified: true, head: plan.finalSha, sha: plan.finalSha, prevHead, lastGood,
+        token: lease.token, adoptedAt: nowIso(),
+      };
+      state.unverified.deadline = Date.parse(state.unverified.adoptedAt) + QUICK_SOAK_MAX_MS;
+      writeState();
+      await launchSoak({ root, env: stEnv, marker: state.unverified, run, log });
+      Object.assign(state, readRebuildState(root, stEnv));
+      if (state.adopted?.head !== plan.finalSha || state.quarantine) {
+        clearReadyCandidate(root, stEnv);
+        return terminal({ moved: false, reason: state.quarantine ? 'rollback-failed' : 'smoke-rejected', plan, rolledBack: !state.quarantine });
+      }
     }
     return terminal({
       moved: false, adopted: true, reason: 'already-adopted', head: plan.finalSha, plan,
@@ -278,11 +301,12 @@ export async function finalizeRebuild({
   }
 
   // ── The ONE `reset --hard` this module performs — always AFTER a passing smoke, never before. ──────────
-  // `verified: true` is what lets crash recovery promote this record unsmoked — a record without it came from
-  // the pre-fix code, which reset BEFORE smoking (PR #2731 review; see prepareRebuild's Step 0).
+  // Only full smoke earns `verified: true` for crash promotion. A quick adoption interrupted before its soak
+  // starts rolls back on recovery, like the pre-fix never-smoked records (PR #2731).
   state.inProgress = {
     pid: process.pid, host: hostname(), prevHead, target: plan.finalSha, startedAt: nowIso(),
-    inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, verified: true,
+    inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, verified: !quick,
+    ...(quick ? { quick: true } : {}),
   };
   writeState();
   try {
@@ -300,13 +324,28 @@ export async function finalizeRebuild({
         moved: false, reason: 'reset-failed', rolledBack, ...(rolledBack ? {} : { quarantine: true }), plan,
       });
     }
+    const lastGood = state.adopted;
     state.adopted = {
       head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      ...(quick ? { unverified: true } : {}),
+    };
+    if (quick) state.unverified = {
+      quick: true, unverified: true, head: plan.finalSha, sha: plan.finalSha, prevHead, lastGood,
+      token: lease.token, adoptedAt: state.adopted.at, deadline: Date.parse(state.adopted.at) + QUICK_SOAK_MAX_MS,
     };
     state.rejected = null;
     state.held = null;
     state.inProgress = null;
     writeState();
+    if (quick) {
+      await launchSoak({ root, env: stEnv, marker: state.unverified, run, log });
+      // The launch may have failed and rolled back. Never write the stale pending state over its outcome.
+      Object.assign(state, readRebuildState(root, stEnv));
+      if (state.adopted?.head !== plan.finalSha || state.quarantine) {
+        clearReadyCandidate(root, stEnv);
+        return terminal({ moved: false, reason: state.quarantine ? 'rollback-failed' : 'smoke-rejected', plan, rolledBack: !state.quarantine });
+      }
+    }
     return terminal({
       moved: true, adopted: true, head: plan.finalSha, prevHead, plan,
     });

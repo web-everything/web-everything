@@ -4275,6 +4275,7 @@ describe('F4 — review-set-label honours a clearing ledger write miss', () => {
     const { exitCode, payload } = run(p, ['77', '--repo=o/n', '--to=accepted', '--actor=op']);
     expect(exitCode).toBe(1);
     expect(payload.error).toMatch(/write refused for a clearing verdict/);
+    expect(payload.error).toContain('no git board configured');
     expect(p.calls).toEqual([]);
   });
 
@@ -4855,7 +4856,7 @@ describe('#5649 — approval rows at the label home', () => {
     const p = stubProvider(['review:human']);
     const { exitCode, payload } = run(p, CLEAR, { appendApproval: () => ({ ok: false, errors: ['boom'] }) });
     expect(exitCode).toBe(1);
-    expect(payload.error).toMatch(/F4/);
+    expect(payload.error).toMatch(/F4.*boom/);
     expect(p.calls).toEqual([]);
   });
 
@@ -4863,6 +4864,18 @@ describe('#5649 — approval rows at the label home', () => {
     const p = stubProvider(['review:human']);
     const { exitCode } = run(p, CLEAR, { appendApproval: () => { throw new Error('disk gone'); } });
     expect(exitCode).toBe(1);
+    expect(p.calls).toEqual([]);
+  });
+
+  it('F4 JSON failure carries the first 200 characters of the git cause without later lines', () => {
+    const p = stubProvider(['review:human']);
+    const cause = `fatal: permission denied ${'word '.repeat(50)}\nprivate second line`;
+    const { exitCode, payload } = run(p, CLEAR, {
+      appendApproval: () => ({ ok: false, git: { error: cause }, errors: ['generic refusal'] }),
+    });
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain(`${cause.slice(0, 200)}; the label is NOT swapped`);
+    expect(payload.error).not.toContain('private second line');
     expect(p.calls).toEqual([]);
   });
 

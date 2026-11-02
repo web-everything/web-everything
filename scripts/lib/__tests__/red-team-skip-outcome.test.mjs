@@ -217,15 +217,26 @@ describe('settleRedTeamSkip', () => {
 });
 
 
-describe('PR 5890 not-owed settlement', () => {
+describe('PR 5890 not-owed settlement (R100: not-owed on an accepted head is policy-clear)', () => {
   it.each([
     { status: 'not-owed' },
     { status: 'not-owed', policy: 'card-only' },
     { status: 'not-owed', reason: 'review verdict is needs-human, not accept' },
-  ])('contradictory not-owed never clears and notifies once: %j', redTeam => {
+  ])('not-owed on an ACCEPTED head clears with a reasoned marker and no alert: %j', redTeam => {
     const f = fixture();
-    expect(f.settle(redTeam).outcome).toBe('non-policy');
-    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.settle(redTeam, { accepted: true }).outcome).toBe('policy-clear');
+    expect(f.io.postComment).toHaveBeenCalledOnce();
+    expect(f.io.postComment.mock.calls[0][0].body).toContain('not-owed on an accepted head');
+    expect(redTeamForHead(f.comments, pr, head)).not.toBeNull();
+    expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).toBe('red-team:clear');
+    expect(f.io.publishNeedsYou).not.toHaveBeenCalled();
+    expect(f.settle(redTeam, { accepted: true }).outcome).toBe('already');
+  });
+  it.each([undefined, false, 'yes', 1])('not-owed on a NON-accepted head (accepted=%j) never clears and alerts once', accepted => {
+    const f = fixture();
+    const redTeam = { status: 'not-owed' };
+    expect(f.settle(redTeam, { accepted }).outcome).toBe('non-policy');
+    expect(f.settle(redTeam, { accepted }).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
     expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).not.toBe('red-team:clear');
@@ -239,13 +250,13 @@ describe('PR 5890 not-owed settlement', () => {
     { deferredByGuard: 'yes' }, { deferredByCap: {} },
   ])('deferred not-owed never clears: %j', flags => {
     const f = fixture();
-    expect(f.settle({ status: 'not-owed', ...flags }).outcome).toBe('non-policy');
+    expect(f.settle({ status: 'not-owed', ...flags }, { accepted: true }).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
   });
   it.each([undefined, null, '', 'unknown', 'b'.repeat(40), {}])('not-owed with unbound read %j never clears', readHead => {
     const f = fixture();
-    expect(f.settle({ status: 'not-owed' }, { readHead }).outcome).toBe('non-policy');
+    expect(f.settle({ status: 'not-owed' }, { readHead, accepted: true }).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
   });
@@ -275,5 +286,16 @@ describe('stored-review not-owed settlement context', () => {
       accepted: true, storedReviewPolicyClear: true,
     }).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
+  });
+});
+
+// The overlay acceptance form and graduated stored-review form coexist. Explicit
+// recovery authority must never fall back to the legacy form when malformed.
+describe('not-owed settlement authority forms', () => {
+  it.each([false, undefined, null, 0, 1, 'true'])('explicit malformed recovery authority %j refuses legacy fallback', storedReviewPolicyClear => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed' }, { accepted: true, storedReviewPolicyClear }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
   });
 });

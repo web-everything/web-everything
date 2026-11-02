@@ -112,6 +112,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
+import { decideReviewChurn } from './review-churn.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
@@ -1694,6 +1695,16 @@ function dispatchReviewRow({
       return;
     }
   }
+  // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
+  // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
+  // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
+  // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
+  const churnRaw = decideReviewChurn(pr);
+  const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
+  if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
+  // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
+  // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
+  if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
@@ -2872,9 +2883,34 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
-      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
-    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+    // Review holds own review-gate failures; cancelled/skipped jobs are not real CI red.
+    // Inspect all visible checks so a non-required failure still keeps its repair owner.
+    const visibleRealRed = collapseRollupToLatestPerName(pr?.statusCheckRollup)
+      .filter(row => FAILED_CHECK_CONCLUSIONS.filter(c => c !== 'CANCELLED')
+        .includes(String(row?.conclusion || row?.state || '').toUpperCase()))
+      .filter(row => row?.name !== 'merge-gate' || !reviewHoldGatesOnlyRed([row], ['merge-gate']))
+      .map(row => row?.name || row?.context);
+    const reviewHoldHasRealRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      // A non-required merge-gate is reported only; required failures still route via check.state below.
+      && visibleRealRed.includes('review-gate') && visibleRealRed.some(name => name !== 'review-gate' && name !== 'merge-gate');
+    const reviewGateOnlyRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      && !requiredChecks?.includes('review-gate')
+      && visibleRealRed.length > 0 && visibleRealRed.every(name => name === 'review-gate');
+    const ciRepairOwed = !reviewGateOnlyRed && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
+    const cancelledReviewWork = reviewGateOnlyRed && collapseRollupToLatestPerName(pr?.statusCheckRollup)
+      .some(row => String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled');
+    if (reviewGateOnlyRed && (phase === 'ci-red' || (phase === 'needs-human'
+        && (cancelledReviewWork || check.state !== 'green') && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)))) {
+      // Ignore completed cancellations only for this review decision; preserve missing/pending evidence.
+      const reviewPr = { ...pr, statusCheckRollup: collapseRollupToLatestPerName(pr?.statusCheckRollup).map(row =>
+        String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
+          ? { ...row, conclusion: 'neutral' } : row) };
+      dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
+      continue;
+    }
+    if (!reviewHoldHasRealRed && !(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -2987,7 +3023,7 @@ export function planReconcile({
     }
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed
+    const reviewHoldRed = ciRepairOwed && !reviewHoldHasRealRed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
@@ -3919,6 +3955,11 @@ export function planReconcile({
         attempts: entry.reviewFixAttempts ?? entry.attempts,
         joinedInputs: { head: pr.headRefOid, ciFailures: facts.ciFailures, reviewFindings: facts.findings.map(c => c.body) } });
     } else timedDispatch.push(entry);
+  }
+  for (const d of timedDispatch) {
+    if (d.kind !== 'review' || !d.churnCap || notes.some(n => n.kind === 'review-churn' && n.prNumber === d.prNumber)) continue;
+    notes.push({ kind: 'review-churn', prNumber: d.prNumber, loops: d.churnCap.loops, cap: d.churnCap.cap,
+      text: `PR #${d.prNumber}: ${d.churnCap.loops} reviews of distinct heads (review.reviewChurn.maxLoopsPerPr=${d.churnCap.cap}) — the fix/review loop is not converging; the new head is still reviewed, and a person should look at the PR` });
   }
   return { dispatch: timedDispatch, refusals, notes };
 }

@@ -73,8 +73,10 @@ import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
-  roundCardsFindingsMarker, roundCardsHeadMarker,
+  roundCardsFindingsMarker, roundCardsHeadMarker, postAcceptAdvisoryDecision,
 } from '../lib/review-loop-policy.mjs';
+import { resolvePostAcceptAdvisorySettings } from '../lib/post-accept-advisory-settings.mjs';
+import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } from './review-pr-io.mjs';
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
@@ -559,6 +561,9 @@ export async function runReviewLoopOnce({
   parallelJudges = false, seatLanes = null,
   readAcceptancePr = defaultReadResumePr, cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
+  advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
+  recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
+  advisoryLog = line => console.error(line),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
@@ -588,7 +593,33 @@ export async function runReviewLoopOnce({
     const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run, { filed: true }) : null;
     const resume = acceptHeld ? null : o.resume;
     return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes })
-      .then((out) => (acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out));
+      .then(async (out) => {
+        if (out?.run) {
+          try {
+            const resolved = advisorySettings({ log: advisoryLog });
+            const mode = resolved?.value?.mode;
+            const invalid = !resolved || Array.isArray(resolved) || !resolved.value || Array.isArray(resolved.value)
+              || !['off', 'shadow', 'on'].includes(mode)
+              || (resolved.invalid !== undefined && typeof resolved.invalid !== 'boolean') || resolved.invalid === true;
+            const settings = { value: { mode: invalid ? 'shadow' : mode }, invalid };
+            if (invalid) advisoryLog('post-accept-advisory warning: invalid resolved settings; using shadow');
+            if (settings.value.mode !== 'off') {
+              await recordAdvisoryLoops({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog });
+              if (out.run.verdict) await recordAdvisoryRating({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, runId: out.run.id, now, out: advisoryLog,
+                findings: Object.hasOwn(out.run.verdict, 'admittedFindings')
+                  ? out.run.verdict.admittedFindings : out.run.verdict.findings });
+              if (out.stopped === 'complete' && out.run.findings?.confirm === 'accept') await recordAdvisoryShadow({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
+                head: out.run.findings?.read?.netBasis?.rev, loopsAfter: null, now, out: advisoryLog,
+                decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode, invalid: settings.invalid }) });
+            }
+          } catch (error) {
+            try { advisoryLog(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+          }
+        }
+        return acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out;
+      });
   };
   const heldLine = (held) => `Unattended accept parked after filing: ${held}.`;
   if (parsed.control.help) {

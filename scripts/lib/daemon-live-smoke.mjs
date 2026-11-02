@@ -870,6 +870,7 @@ export async function runLiveSmoke({
   clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
+  deferredChecks = [], onlyChecks = null,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -923,6 +924,12 @@ export async function runLiveSmoke({
     const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy, dryRun };
     const results = [];
     for (const check of SMOKE_CHECKS) {
+      if (onlyChecks && !onlyChecks.includes(check.name)) continue;
+      if (deferredChecks.includes(check.name)) {
+        results.push({ name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
+          detail: 'deferred to post-adopt soak (quick mode)' });
+        continue;
+      }
       const startedAt = clock();
       let result;
       if (check.kind === 'code' && (reuseCode || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
@@ -1098,6 +1105,7 @@ export async function runLiveSmokeWithRetry({
   clock = Date.now,
   loadAvg = () => loadavg(),
   log = console,
+  singleAttempt = false, deferredChecks = [],
 } = {}) {
   if (isSmokeGateDisabled(env)) return { verdict: 'pass', disabled: true };
   let smoke;
@@ -1117,8 +1125,9 @@ export async function runLiveSmokeWithRetry({
     // Fresh token for EVERY attempt, the same way the daemon's own tick gets one (see refreshSmokeGithubEnv).
     const { env: runEnv, refresh } = await refreshAuth({ env: attemptEnv, force: forceRefresh });
     forceRefresh = false;
-    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock });
+    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock, deferredChecks });
     verdict = classifySmokeFailure(smoke.results);
+    if (singleAttempt) break;
     // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
     // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
     // Still reject any independent code row, and never promote skips without prior probe confirmation.
@@ -1501,18 +1510,57 @@ export function clearRejectedSha(root, env = process.env) {
   }
 }
 
+// Bound both Git output and parsing work. Missing/truncated/oversized evidence refuses rollback.
+const ROLLBACK_PATH_LIST_MAX_BYTES = 1024 * 1024;
+function rollbackPathList(run, args, root) {
+  try {
+    const result = run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: ROLLBACK_PATH_LIST_MAX_BYTES });
+    if (result.status !== 0 || typeof result.stdout !== 'string'
+      || Buffer.byteLength(result.stdout) > ROLLBACK_PATH_LIST_MAX_BYTES
+      || (result.stdout && !result.stdout.endsWith('\0'))) return null;
+    const paths = result.stdout ? result.stdout.slice(0, -1).split('\0') : [];
+    return paths.every(path => path && !path.startsWith('/')
+      && !path.split('/').some(part => !part || part === '.' || part === '..')) ? paths : null;
+  } catch { return null; }
+}
+function rollbackHasUntrackedCollision(untracked, target) {
+  const files = new Set(target);
+  const directories = new Set();
+  for (const path of target) {
+    for (let slash = path.indexOf('/'); slash !== -1; slash = path.indexOf('/', slash + 1)) {
+      directories.add(path.slice(0, slash));
+    }
+  }
+  return untracked.some(path => {
+    if (files.has(path) || directories.has(path)) return true;
+    for (let slash = path.indexOf('/'); slash !== -1; slash = path.indexOf('/', slash + 1)) {
+      if (files.has(path.slice(0, slash))) return true;
+    }
+    return false;
+  });
+}
+
 /**
  * Roll a clone back to `sha` — ALLOWED ONLY because the tree is verified clean first (a `git status --porcelain`
  * that fails, times out, or reports dirt fails CLOSED: never reset a tree we could not confirm was safe to
- * discard). Mirrors `daemon-self-sync.mjs#decideSelfSync`'s own fail-closed posture on an unreadable tree state.
- * @param {{root:string, sha:string|null, run?:typeof gitRun}} o
+ * discard). `ignoreUntracked` opts runtime sidecars out of the dirty check; tracked dirt still refuses.
+ * Untracked paths (including ignored files) must not obstruct a file or directory in the target tree.
+ * Mirrors `daemon-self-sync.mjs#decideSelfSync`'s own fail-closed posture on an unreadable tree state.
+ * @param {{root:string, sha:string|null, run?:typeof gitRun, ignoreUntracked?:boolean}} o
  * @returns {{ok:boolean, reason?:string}}
  */
-export function rollbackToSha({ root, sha, run = gitRun }) {
+export function rollbackToSha({ root, sha, run = gitRun, ignoreUntracked = false }) {
   if (!sha) return { ok: false, reason: 'no-sha' };
-  const status = run(['status', '--porcelain'], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+  const status = run(['status', '--porcelain', ...(ignoreUntracked ? ['--untracked-files=no'] : [])], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
   const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
   if (dirty !== false) return { ok: false, reason: dirty === null ? 'status-failed' : 'dirty' };
+  if (ignoreUntracked) {
+    // Include ignored sidecars too: reset --hard can delete either kind of untracked obstruction.
+    const untracked = rollbackPathList(run, ['ls-files', '--others', '-z'], root);
+    const target = rollbackPathList(run, ['ls-tree', '-r', '--full-tree', '--name-only', '-z', sha], root);
+    if (untracked === null || target === null) return { ok: false, reason: 'status-failed' };
+    if (rollbackHasUntrackedCollision(untracked, target)) return { ok: false, reason: 'untracked-collision' };
+  }
   const reset = run(['reset', '--hard', sha], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
   if (reset.status !== 0) return { ok: false, reason: 'reset-failed' };
   return { ok: true };
