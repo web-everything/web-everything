@@ -33,14 +33,16 @@ export const LOAD_CONTENTION_SIGNATURES = Object.freeze([
 ]);
 /** Our own shared gh semaphore refusing: another caller's slot, never the tree under test. Anchored on the exact
  *  refusal text, and applied per failure segment (see {@link isGhThrottleOnlyDetail}). */
-const GH_THROTTLE_REFUSAL = /gh-throttle: throttled — no gh slot within [\d.]+s/;
-const GH_THROTTLE_TAIL = /^retry next tick/;
+const GH_THROTTLE_SEGMENT = /^(?:dispatch dry-run failed \(\d+\/\d+\): )?(?:[\w-]+(?: PR #\d+)?: )?gh-throttle: throttled — no gh slot within [\d.]+s(?: \(class=[\w-]+\))?$/;
+const GH_THROTTLE_TAIL = /^retry next tick(?: — [^\n]*)?$/;
 
-/** PURE: every `; `-joined failure segment of the detail is the gh-throttle refusal (or its "retry next tick" tail).
- *  An aggregated dispatch row that also carries a code failure is NOT throttle-only. */
+/** PURE: the WHOLE detail is gh-throttle refusals (each `; `-joined segment fully anchored, optional "retry next
+ *  tick" tail). Any other text — a code failure, a newline — makes it NOT throttle-only. */
 function isGhThrottleOnlyDetail(detail) {
-  if (!GH_THROTTLE_REFUSAL.test(detail)) return false;
-  return detail.split('; ').every((seg) => GH_THROTTLE_REFUSAL.test(seg) || GH_THROTTLE_TAIL.test(seg));
+  if (/[\r\n]/.test(detail)) return false;
+  const segs = detail.split('; ');
+  return segs.some((seg) => GH_THROTTLE_SEGMENT.test(seg))
+    && segs.every((seg) => GH_THROTTLE_SEGMENT.test(seg) || GH_THROTTLE_TAIL.test(seg));
 }
 
 export function loadDifferentialEnabled(env) {

@@ -27,6 +27,11 @@ describe('isLoadShapedRow: gh-throttle refusal', () => {
     expect(isLoadShapedRow({ ok: false, mayBeTransient: false, detail: 'x: gh-throttle: throttled — no gh slot within 8s' })).toBe(false);
   });
 
+  it('throttle text followed by a code failure on a new line is not load-shaped', () => {
+    const detail = 'gh-throttle: throttled — no gh slot within 8s (class=read); retry next tick\nTypeError: x is not a function';
+    expect(isLoadShapedRow({ ok: false, detail })).toBe(false);
+  });
+
   it('a passing row is never load-shaped', () => {
     expect(isLoadShapedRow({ ok: true, detail: 'gh-throttle: throttled — no gh slot within 8s' })).toBe(false);
   });
