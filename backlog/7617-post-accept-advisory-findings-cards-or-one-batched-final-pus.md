@@ -1,4 +1,5 @@
 ---
+bornAs: xu34pnv
 kind: decision
 size: 3
 parent: "5467"
@@ -9,13 +10,13 @@ dateOpened: "2026-11-01"
 dateResolved: "2026-11-01"
 codifiedIn: "docs/agent/platform-decisions.md#post-accept-advisory-cards"
 tags: [review]
-relatedTo: ["5471", "5472", "x5vjl3o"]
+relatedTo: ["5471", "5472", "7618"]
 ---
 
 
 # Post-accept advisory findings: cards or one batched final push, instead of re-arming review
 
-Operator ruling R368 (2026-11-01). Finding from R365 fix #4 (PR #6201): review churn comes from fixer and advisory-fix pushes made AFTER an accept. On PRs #6158, #6033 and #6141 every loop ran on a new git tree, because each post-accept push re-arms a full review. Those 3 PRs used 29% of all review loops, at 5 to 13 loops each. Policy only here; the mechanics are in the build child x5vjl3o.
+Operator ruling R368 (2026-11-01). Finding from R365 fix #4 (PR #6201): review churn comes from fixer and advisory-fix pushes made AFTER an accept. On PRs #6158, #6033 and #6141 every loop ran on a new git tree, because each post-accept push re-arms a full review. Those 3 PRs used 29% of all review loops, at 5 to 13 loops each. Policy only here; the mechanics are in the build child 7618.
 
 Grounding: the round budget (5471) already turns `cosmetic`/`degraded` findings into cards past round K (`CARDABLE_IMPACTS`, we:scripts/lib/review-loop-policy.mjs:586; the decision at :604-611). It stops at the accept. Nothing governs a finding raised with or after the accept; the advisory fixer (we:scripts/conveyor/advisory-fix-mark.mjs) still pushes for it. Heal commits are handled by 5472 `healDeltaReview` (ratified, off by default), which keys on heal-role commits only.
 
@@ -56,7 +57,7 @@ Fork-existence: the flawed branches are "ship on with no evidence" and "shadow f
 - (b) Ship `on` directly with only the replay of the three PRs as evidence.
 - (c) Shadow only, report only.
 
-**Default: (a).** Staging and the cascade wiring live in the build child x5vjl3o; only the bar and the end rule are decided here. Same pattern as 5469 and the 5471 `roundBudget`.
+**Default: (a).** Staging and the cascade wiring live in the build child 7618; only the bar and the end rule are decided here. Same pattern as 5469 and the 5471 `roundBudget`.
 
 Skeptic: SURVIVES-WITH-AMENDMENT. Folded in: the promotion bar now counts only PRs that had would-have-carded findings, names a detector (fixer diff journal or re-rate), and adds a revert detector and a card-debt trigger to the end rule.
 Screen: flagged(prio), edit applied on ratification (R370): cut to one evidence bar.
@@ -74,7 +75,7 @@ Skeptic ruled this a non-fork: the other branches (folding into the budget, or e
 Assume it shipped and failed. The likely stories:
 
 1. Cards pile up and are never fixed (card debt). Mitigation: the count and the cards' fix rate are reported (build A3); one card per PR, not one per finding.
-2. A real bug was classed `degraded` and merged. Mitigation: only confirmed broken, security or unknown block; shadow mode measures this before `on`; the end rule drops back to shadow on a traced defect.
+2. A real bug was classed `degraded` and merged. Mitigation: Fork 2 forces a push for any non-cardable impact, mandatory referral, security finding at any impact or fired refusal guard, regardless of confirmation status; shadow mode measures misclassification before `on`; the end rule drops back to shadow on a traced defect.
 3. A fixer or reviewer learns to label findings `degraded` to avoid a push. Mitigation: impact comes from the review verdict, not the PR author; finding text is data.
 4. The shadow window is too small to show anything. Mitigation: the 20-PR bar (each with a would-have-carded finding) and the replay of the three live PRs.
 5. The card filing fails. Mitigation: the card is filed BEFORE the merge; if filing fails the accept is not merged and the PR stays parked, never merges silently.
@@ -82,7 +83,7 @@ Assume it shipped and failed. The likely stories:
 
 ## Test and proof plan
 
-- Test: replay fixtures on `review-loop-policy` (cases in build child x5vjl3o A1), including unknown impact, off, and shadow.
+- Test: replay fixtures on `review-loop-policy` (build child 7618 A1(a)-(f), (h)), including all Fork 2 push gates without a confirmation requirement, unknown impact, off, shadow and verdict-only provenance. Caller tests in A1(g) prove filing precedes merge and filing failure parks the PR; caller tests in A1(h) prove author input cannot override trusted verdict metadata or turn finding text into severity.
 - Proof before/after, with the before figures: PRs #6158, #6033 and #6141 took 5 to 13 loops each and used 29% of all review loops. Replay their ledgers under the rule and print the loops removed. Target (proposal): each of the three at no more than the loops up to its first accept, plus at most one forced-push loop; the three PRs' share of all loops below 10%.
 - Held-out check: after the replay, measure the next 20 accepted PRs in shadow (not the three used to design the rule) and report loops per PR against the 5 to 13 before figures.
 - Forced-push loops in the target are counted as loops that start on a head pushed after an accept for a Fork 2 reason.
@@ -94,13 +95,13 @@ The rule trusts review verdicts and ledger rows, never the PR author's text. Fin
 
 ## Acceptance
 
-- [A1] The three defaults above (Forks 1 to 3) and the composition note are ratified or overridden by the operator; the build child x5vjl3o is then updated to match.
+- [A1] The three defaults above (Forks 1 to 3) and the composition note are ratified or overridden by the operator; the build child 7618 is then updated to match.
 - [A2] The build child's A4 proof (replay of the three PRs plus one live PR) is attached before the mode moves from shadow to on.
 
 ## Non-goals
 
 - [N1] No change to the round cap of 5, to K, or to 5472.
-- [N2] No mechanics in this card; they live in x5vjl3o.
+- [N2] No mechanics in this card; they live in 7618.
 
 ## Edge cases this change must handle
 
@@ -114,11 +115,11 @@ The rule trusts review verdicts and ledger rows, never the PR author's text. Fin
 
 ## Ratified — 2026-11-01 (R370)
 
-Operator, 2026-11-01 19:21 ET, verbatim: "Ratify xu34pnv with edits". The two screen edits are applied above (Fork 2 minor options folded into (a); Fork 3 cut to one evidence bar). Ratified defaults:
+Operator, 2026-11-01 19:21 ET, verbatim: "Ratify 7617 with edits". The two screen edits are applied above (Fork 2 minor options folded into (a); Fork 3 cut to one evidence bar). Ratified defaults:
 
 - Fork 1: (a) cards, no push.
 - Fork 2: (a) a push is forced by impact broken/unrecoverable/unstated, a mandatory referral, a security finding, or a fired guard.
 - Fork 3: (a) shadow, then on, with off as the kill switch.
 - Round budget K=3 and card 5472 (`healDeltaReview`) untouched.
 
-Codified in `we:docs/agent/platform-decisions.md#post-accept-advisory-cards`. Build child: x5vjl3o.
+Codified in `we:docs/agent/platform-decisions.md#post-accept-advisory-cards`. Build child: 7618.
