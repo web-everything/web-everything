@@ -121,11 +121,12 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     const policy = resolveStaleToolSettings({ env, settings, log });
     // No inherited Git repository, executable, config or transport context may redirect this guard.
     const cleanEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
-    const gitEnv = { ...cleanEnv, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: 'https' };
+    // Support HTTPS and SSH origins while keeping executable helpers and local transports denied.
+    const gitEnv = { ...cleanEnv, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: 'https:ssh' };
     const git = (args, cwd = root) => {
       const result = exec('git', ['-C', cwd, ...laneGitConfigArgs(),
         '-c', 'protocol.ext.allow=never', '-c', 'protocol.allow=never',
-        '-c', 'protocol.https.allow=always', '-c', 'protocol.file.allow=never',
+        '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.file.allow=never',
         ...args], { cwd, env: gitEnv,
         encoding: 'utf8', timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, shell: false });
       if (result?.error || result?.status !== 0 || typeof result.stdout !== 'string') {

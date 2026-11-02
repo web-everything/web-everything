@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -155,6 +155,41 @@ const nodeCalls = (h) => h.exec.mock.calls.filter(([cmd]) => cmd === process.exe
 const removals = (h) => h.exec.mock.calls.filter(([, args]) => args.includes('worktree') && args.includes('remove'));
 
 describe('review regressions', () => {
+  it.each([
+    'git@github.com:web-everything/web-everything.git',
+    'ssh://git@github.com:2222/web-everything/web-everything.git',
+  ])('checks freshness for a current SSH origin %s', async (origin) => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ behind: '0\n', changed: '' });
+    // Bare metadata avoids .git writes. The SSH stand-in advertises an empty remote
+    // locally, exercising real Git transport admission without network or credentials.
+    mkdirSync(join(h.root, 'objects'));
+    mkdirSync(join(h.root, 'refs'));
+    put(h.root, 'HEAD', 'ref: refs/heads/main\n');
+    put(h.root, 'config', `[core]\n bare = true\n sshCommand = untrusted-command\n[remote "origin"]\n url = ${origin}\n[protocol "ssh"]\n allow = never\n`);
+    put(h.root, 'bin/ssh', '#!/bin/sh\nprintf "0000"\n');
+    chmodSync(join(h.root, 'bin/ssh'), 0o755);
+    const runner = h.exec.getMockImplementation();
+    let probe;
+    h.exec.mockImplementation((command, args, options) => {
+      if (!args.includes('fetch')) return runner(command, args, options);
+      // Reuse the guard's exact config/env for a read-only transport probe; the
+      // subsequent count/diff use the current-checkout fixture above.
+      probe = spawnSync(command, [...args.slice(0, args.indexOf('fetch')), 'ls-remote', 'origin'], options);
+      return probe;
+    });
+    const outcome = await guardToolCheckout({ ...h, env: { ...process.env,
+      PATH: `${join(h.root, 'bin')}:${process.env.PATH}`,
+      GIT_ALLOW_PROTOCOL: 'ext', GIT_SSH_COMMAND: 'untrusted-command',
+    }, log: () => {} }).then(() => 'continued', error => error.message);
+    expect(probe.stderr).toBe('');
+    expect(probe.status).toBe(0);
+    expect(outcome).toBe('continued');
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('rev-list'))).toBe(true);
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(true);
+    expect(nodeCalls(h)).toHaveLength(0);
+  });
+
   it('scrubs inherited Git context and pins every Git call to the tool checkout', async () => {
     const { guardToolCheckout } = await load();
     const h = harness();
@@ -173,11 +208,13 @@ describe('review regressions', () => {
     for (const [, args, options] of h.exec.mock.calls.filter(([cmd]) => cmd === 'git')) {
       expect(args.slice(0, 2)).toEqual(['-C', options.cwd]);
       for (const key of Object.keys(env).filter(key => key.startsWith('GIT_'))) {
-        expect(options.env[key], key).toBe(key === 'GIT_ALLOW_PROTOCOL' ? 'https' : undefined);
+        expect(options.env[key], key).toBe(key === 'GIT_ALLOW_PROTOCOL' ? 'https:ssh' : undefined);
       }
       expect(options.env.FIXTURE_TOKEN).toBe('keep');
       for (const setting of ['protocol.ext.allow=never', 'protocol.allow=never',
-        'protocol.https.allow=always', 'protocol.file.allow=never']) expect(args).toContain(setting);
+        'protocol.https.allow=always', 'protocol.ssh.allow=always', 'protocol.file.allow=never',
+        'core.sshCommand=ssh']) expect(args).toContain(setting);
+      if (args.includes('fetch')) expect(args).toContain('--upload-pack=git-upload-pack');
     }
     const childEnv = nodeCalls(h)[0][2].env;
     for (const key of Object.keys(env).filter(key => key.startsWith('GIT_'))) expect(childEnv[key], key).toBeUndefined();
