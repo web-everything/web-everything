@@ -3,6 +3,8 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { execFileSync } from 'node:child_process';
+import { hostname } from 'node:os';
 import { basename } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -46,6 +48,32 @@ export const FAILURE_REASONS = new Set([
 // Array view for event-contract consumers, sharing the explicit failure classification.
 export const REBUILD_FAILURE_REASONS = Object.freeze([...FAILURE_REASONS]);
 
+/** Owners (`host:pid`) of this process's parent and ancestors, nearest first. Unreadable evidence yields fewer owners. */
+export function defaultSpawnerOwners({ pid = process.ppid, host = hostname(), exec = execFileSync, depth = 6 } = {}) {
+  const owners = [];
+  let cur = pid;
+  for (let i = 0; i < depth && Number.isSafeInteger(cur) && cur > 1; i++) {
+    owners.push(`${host}:${cur}`);
+    try {
+      cur = Number(String(exec('ps', ['-o', 'ppid=', '-p', String(cur)], {
+        encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] })).trim());
+    } catch { break; }
+  }
+  return owners;
+}
+
+function trustedIgnoreOwners(raw, spawnerOwners, log) {
+  const wanted = String(raw || '').split(',').map((owner) => owner.trim()).filter(Boolean);
+  if (!wanted.length) return [];
+  let allowed = [];
+  try { allowed = spawnerOwners() ?? []; } catch { /* unverifiable spawner: honour nothing */ }
+  const kept = wanted.filter((owner) => allowed.includes(owner));
+  const dropped = wanted.filter((owner) => !kept.includes(owner));
+  if (dropped.length) log?.error?.(`daemon-rebuild: ignored WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS entries that are not this process's spawner or an ancestor: ${dropped.join(', ')}`);
+  return kept;
+}
+
+
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
  * full three-step design — {@link prepareRebuild} (locked, fast) → build + smoke a disposable candidate
@@ -85,7 +113,7 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs,
+  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -124,8 +152,8 @@ async function rebuildCloneInternal({
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
     // Only the ready-only job has prepare guards that make excluding its spawner safe.
-    ...(readyOnly ? { ignoreOwners: (env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS || '')
-      .split(',').map((owner) => owner.trim()).filter(Boolean) } : {}),
+    // The env value is honoured only for this process's actual spawner or an ancestor; anything else is dropped.
+    ...(readyOnly ? { ignoreOwners: trustedIgnoreOwners(env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS, spawnerOwners, log) } : {}),
     now,
     waitMs,
     onBlocked: ({ blockers, waitMs: w }) => log.error?.(
