@@ -58,6 +58,14 @@
         "preparation still writes refs/objects before the ref guard; read-only does not cover all clone bytes (feature-scope)",
         "lock exclusion weakens the previous reader-exclusion guarantee (inherent to the feature)"
       ]
+    },
+    {
+      "ref": "lane/dispatch-scope-multi",
+      "sha": "2fe6208f8409668f0a74a637c5b53ac46f5031cf",
+      "ruling": "R396",
+      "findings": [
+        "scripts/operations/dispatch-lane.mjs:429 \u2014 Glob refusal applies only within multi-path entries; separate glob entries remain accepted despite the pre-existing overlap-check limitation. Probe: `we:src/a*b.mjs` and `we:src/ab*.mjs` both cover `we:src/abb.mjs`, but `scopesOverlap` returns false, allowing conflicting work through lease/rival exclusion."
+      ]
     }
   ]
 }
