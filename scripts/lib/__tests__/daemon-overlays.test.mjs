@@ -111,7 +111,7 @@ describe('cloneKey / overlayFilePath', () => {
 describe('readOverlays / readOverlayState', () => {
   it('missing file ⇒ [] and corrupt:false, never throws', () => {
     expect(readOverlays(cloneRoot, { env: env() })).toEqual([]);
-    expect(readOverlayState(cloneRoot, { env: env() })).toEqual({ clone: null, overlays: [], corrupt: false });
+    expect(readOverlayState(cloneRoot, { env: env() })).toEqual({ clone: null, overlays: [], generation: 0, corrupt: false });
   });
 
   it('corrupt (unparsable) file ⇒ [] and corrupt:true, never throws', () => {
@@ -155,7 +155,7 @@ describe('writeOverlays', () => {
 describe('addOverlay', () => {
   it('adds a new entry', () => {
     const list = addOverlay(cloneRoot, { ref: 'lane/foo', pr: 12, addedBy: 'nic', reason: 'fix' }, { env: env() });
-    expect(list).toEqual([{ ref: 'lane/foo', pr: 12, addedAt: expect.any(String), addedBy: 'nic', reason: 'fix' }]);
+    expect(list).toEqual([{ ref: 'lane/foo', registrationId: expect.any(String), pr: 12, addedAt: expect.any(String), addedBy: 'nic', reason: 'fix' }]);
   });
 
   it('duplicate ref updates pr/reason in place and keeps position + original addedAt/addedBy', () => {
@@ -191,11 +191,10 @@ describe('removeOverlay', () => {
 describe('recordEdgeResolution', () => {
   const SHA = 'a'.repeat(40);
 
-  it('records actor + sha on a registered overlay, keeps it across a re-add, and leaves an audit event', () => {
+  it('records actor + sha on a registered overlay and leaves an audit event', () => {
     addOverlay(cloneRoot, { ref: 'lane/a' }, { env: env() });
     const list = recordEdgeResolution(cloneRoot, 'lane/a', { sha: SHA, by: ' operator ', reason: 'reviewed', now: '2026-10-05T00:00:00Z' }, { env: env() });
     expect(list[0].edgeResolution).toEqual({ sha: SHA, by: 'operator', at: '2026-10-05T00:00:00Z', reason: 'reviewed' });
-    addOverlay(cloneRoot, { ref: 'lane/a', pr: 9 }, { env: env() });
     expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution.sha).toBe(SHA);
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneRoot)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events.at(-1)).toMatchObject({ kind: 'edge-resolution-recorded', ref: 'lane/a', sha: SHA, by: 'operator' });
@@ -208,6 +207,16 @@ describe('recordEdgeResolution', () => {
     }
     expect(() => recordEdgeResolution(cloneRoot, 'lane/nope', { sha: SHA, by: 'op' }, { env: env() })).toThrow(/not registered/);
     expect(readOverlays(cloneRoot, { env: env() })[0].edgeResolution).toBeUndefined();
+  });
+
+  it.each([null, 9])('is dropped by a re-add (a new registration, pr %s) so the old approval never vouches for it', (pr) => {
+    addOverlay(cloneRoot, { ref: 'lane/a', pr: 9 }, { env: env() });
+    recordEdgeResolution(cloneRoot, 'lane/a', { sha: SHA, by: 'op' }, { env: env() });
+    const before = readOverlays(cloneRoot, { env: env() })[0];
+    addOverlay(cloneRoot, { ref: 'lane/a', pr }, { env: env() });
+    const after = readOverlays(cloneRoot, { env: env() })[0];
+    expect(after.registrationId).not.toBe(before.registrationId);
+    expect(after).not.toHaveProperty('edgeResolution');
   });
 
   it('is dropped together with the overlay entry', () => {
@@ -248,7 +257,7 @@ describe('CLI (spawnSync, --no-lock — never imports daemon-clone-lock.mjs)', (
     const r = run(['add', `--clone=${cloneDir}`, '--ref=lane/cli-test', '--pr=7', '--by=tester', '--no-lock', '--json']);
     expect(r.status, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout);
-    expect(out.list).toEqual([{ ref: 'lane/cli-test', pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
+    expect(out.list).toEqual([{ ref: 'lane/cli-test', registrationId: expect.any(String), pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneDir)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ kind: 'added', ref: 'lane/cli-test', pr: 7 });
