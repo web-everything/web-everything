@@ -1647,6 +1647,29 @@ describe('post-accept advisory shadow wiring', () => {
       else expect(result.logs.join('\n')).toContain('live review unaffected');
     });
 
+  it('corrupt persisted loops refuse telemetry on both heads while the live review still completes', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A,
+      wouldCard: false, wouldPush: true, findings: [], loopsAfter: null },
+    { kind: 'loops', repo: 'web-everything/web-everything', pr: 1234, headSha: HEAD_A, runId: 'R', loopsAfter: 99 }];
+    const before = structuredClone(rows), logs = [];
+    for (const rev of [HEAD_A, HEAD_B]) {
+      const { declaration, registry } = registryFor({ rev });
+      const io = { readLedgerRows: () => structuredClone(rows),
+        appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(),
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'R',
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: line => logs.push(line),
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+      expect(rows).toEqual(before);
+    }
+    expect(logs.filter(line => line.includes('invalid loop history; inspect shadow ledger'))).toHaveLength(4);
+  });
+
   it('replaying accepted run A after accepted run B never counts A against B', async () => {
     const rows = [], store = createMemoryRunStore();
     const io = { readLedgerRows: () => structuredClone(rows),

@@ -651,6 +651,8 @@ export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision,
     }
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
+    const { unresolved } = replayAdvisoryLedger(rows);
+    if (unresolved.has(advisoryPrKey({ repo, pr }))) throw new Error('invalid loop history; inspect shadow ledger');
     const kind = 'we.post-accept-advisory-shadow';
     if (rows.some(row => validAdvisoryRow(row) && row.kind === kind && row.repo === repo && row.pr === pr && advisoryKey(row) === advisoryKey({ repo, pr, head }))) return null;
     const row = { v: 1, kind, at: now(), repo, pr, headSha: head,
@@ -699,18 +701,25 @@ const validAdvisoryLoops = row => advisoryIdentity(row) && row.kind === 'loops' 
   && (!Object.hasOwn(row, 'runId') || nonemptyAdvisoryString(row.runId));
 
 const validAdvisoryRun = row => advisoryIdentity(row) && row.kind === 'advisory-run' && nonemptyAdvisoryString(row.runId);
+const advisoryPrKey = row => JSON.stringify([row.repo, row.pr]);
 const advisoryRunKey = row => JSON.stringify([row.repo, row.pr, row.runId]);
 
 // Recorded order is authoritative, including after restart. First valid accept/run wins.
 // Historical loop rows also establish a run's first-seen position when no run marker exists.
 function replayAdvisoryLedger(rows) {
-  const accepts = new Map(), runs = new Map();
+  const accepts = new Map(), runs = new Map(), unresolved = new Set();
   let skipped = 0;
+  const reject = row => {
+    skipped++;
+    if (nonemptyAdvisoryString(row?.repo) && Number.isSafeInteger(row.pr) && row.pr > 0) {
+      unresolved.add(advisoryPrKey(row));
+    }
+  };
   Array.from(rows).forEach((row, index) => {
     if (validAdvisoryRow(row)) {
       const key = advisoryKey(row);
       if (accepts.has(key)) { skipped++; return; }
-      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Set(),
+      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Map(),
         measurements: new Set(validLoopCount(row.loopsAfter) ? [row.loopsAfter] : []) });
     } else if (validAdvisoryRun(row)) {
       const key = advisoryRunKey(row);
@@ -718,25 +727,41 @@ function replayAdvisoryLedger(rows) {
         index: Math.min(index, accepts.get(advisoryKey(row))?.index ?? index),
         head: advisoryIdentity(row).headSha,
       });
+      else if (runs.get(key).head !== advisoryIdentity(row).headSha) reject(row);
       else skipped++;
     } else if (validAdvisoryLoops(row)) {
       const accept = accepts.get(advisoryKey(row));
+      if (!accept) { reject(row); return; }
       if (row.runId !== undefined) {
         const key = advisoryRunKey(row);
-        if (!runs.has(key)) runs.set(key, { index, head: null });
-        const run = runs.get(key);
-        if (!accept || accept.index >= run.index || run.head === advisoryIdentity(accept.row).headSha
-          || accept.seen.has(row.runId) || !validLoopCount((accept.count ?? 0) + 1)
-          || row.loopsAfter !== (accept.count ?? 0) + 1) { skipped++; return; }
-        accept.seen.add(row.runId);
-      } else if (!accept || (validLoopCount(accept.count) && row.loopsAfter <= accept.count)) {
-        skipped++; return;
+        const run = runs.get(key) ?? { index, head: null };
+        if (accept.index >= run.index || run.head === advisoryIdentity(accept.row).headSha) { reject(row); return; }
+        if (accept.seen.has(row.runId)) {
+          if (accept.seen.get(row.runId) !== row.loopsAfter) reject(row);
+          else skipped++;
+          return;
+        }
+        if (!validLoopCount((accept.count ?? 0) + 1)
+          || row.loopsAfter !== (accept.count ?? 0) + 1) { reject(row); return; }
+        // Validate the complete measurement before reserving a run or changing any count.
+        runs.set(key, run);
+        accept.seen.set(row.runId, row.loopsAfter);
+      } else if (validLoopCount(accept.count) && row.loopsAfter <= accept.count) {
+        skipped++; return; // A well-formed redundant explicit measurement is harmless.
       }
       accept.count = row.loopsAfter;
       accept.measurements.add(row.loopsAfter);
-    } else skipped++;
+    } else if (['loops', 'advisory-run'].includes(row?.kind)) reject(row);
+    else skipped++;
   });
-  return { accepts, runs, skipped };
+  // No state from an unresolved identity is committed to the replay result, even
+  // when its bad row follows otherwise valid measurements or run markers.
+  for (const [key, accept] of accepts) if (unresolved.has(advisoryPrKey(accept.row))) accepts.delete(key);
+  for (const [key] of runs) {
+    const [repo, pr] = JSON.parse(key);
+    if (unresolved.has(advisoryPrKey({ repo, pr }))) runs.delete(key);
+  }
+  return { accepts, runs, skipped, unresolved };
 }
 
 /** Append explicit counts, or measure one later run per earlier accepted head, idempotently by run ID. */
@@ -749,13 +774,15 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
     if (runId !== undefined && loopsAfter !== undefined) throw new Error('ambiguous loops evidence; supply a run ID or an explicit count; inspect shadow ledger');
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
-    const { accepts, runs } = replayAdvisoryLedger(rows);
+    const { accepts, runs, unresolved } = replayAdvisoryLedger(rows);
+    if (unresolved.has(advisoryPrKey({ repo, pr }))) throw new Error('invalid loop history; inspect shadow ledger');
     const append = async row => {
       const result = await appendLedgerRow(row);
       if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
     };
     if (loopsAfter === undefined) {
       const run = runs.get(advisoryRunKey({ repo, pr, runId }));
+      if (run && run.head === null) throw new Error('unknown historical run head; inspect shadow ledger');
       if (run?.head && run.head !== head) throw new Error('conflicting run head; inspect shadow ledger');
       // For historical ledgers, the original head's accept also fences an old run's replay.
       const boundary = Math.min(run?.index ?? rows.length,
@@ -787,10 +814,10 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
 /** Replay unique accepts and later runs in recorded order; explicit counts remain measurements. PURE. */
 export function postAcceptAdvisoryShadowReport(rows = []) {
   if (!Array.isArray(rows)) throw new TypeError('unreadable shadow ledger; inspect shadow ledger');
-  const { accepts, skipped } = replayAdvisoryLedger(rows);
+  const { accepts, skipped, unresolved } = replayAdvisoryLedger(rows);
   const observations = [...accepts.values()].map(accept => accept.row);
   const report = { prs: new Set(observations.map(row => `${row.repo}#${row.pr}`)).size,
-    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0, skipped };
+    wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0, skipped, unresolved: unresolved.size };
   for (const row of observations) {
     if (row.wouldPush === true) report.wouldPush++;
     const count = accepts.get(advisoryKey(row)).count;
@@ -807,7 +834,7 @@ export function postAcceptAdvisoryShadowReport(rows = []) {
       .map(rating => rating.findingId).filter(Boolean));
     report.laterBroken += new Set(findings.map(finding => finding.findingId).filter(id => id && broken.has(id))).size;
   }
-  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nSkipped: ${report.skipped}` };
+  return { ...report, text: `PRs: ${report.prs}\nWould-card: ${report.wouldCard}\nWould-push: ${report.wouldPush}\nFindings: ${report.findings}\nLoops after: ${report.loopsAfter}\nUnmeasured: ${report.unmeasured}\nLater broken: ${report.laterBroken}\nSkipped: ${report.skipped}\nUnresolved: ${report.unresolved}` };
 }
 
 /**

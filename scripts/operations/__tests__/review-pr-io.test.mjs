@@ -109,6 +109,31 @@ describe('post-accept advisory persisted ledger', () => {
     ]);
   });
 
+  it.each([false, true])('persisted corrupt count (orphan=%s) refuses R on A then B without changing ledger bytes', async orphan => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../review-pr-io.mjs');
+    const { postAcceptAdvisoryShadowReport } = await import('../../lib/review-loop-policy.mjs');
+    const ledgerPath = join(root, 'corrupt-loops.jsonl'), logs = [];
+    const facts = { repo: 'o/r', pr: 7, head: 'A', ledgerPath, out: line => logs.push(line) };
+    await recordPostAcceptAdvisoryShadow({ ...facts, decision: { wouldCard: false, wouldPush: true, findings: [] } });
+    const accept = readFileSync(ledgerPath, 'utf8');
+    const bad = JSON.stringify({ kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', runId: 'R', loopsAfter: orphan ? 1 : 99 }) + '\n';
+    const original = orphan ? bad + accept : accept + bad;
+    writeFileSync(ledgerPath, original);
+    for (const head of ['A', 'B']) {
+      expect(await recordPostAcceptAdvisoryLoops({ ...facts, head, runId: 'R' })).toBeNull();
+      expect(readFileSync(ledgerPath, 'utf8')).toBe(original);
+      expect(existsSync(ledgerPath + '.lock')).toBe(false);
+    }
+    expect(await recordPostAcceptAdvisoryShadow({ ...facts, head: 'B',
+      decision: { wouldCard: false, wouldPush: true, findings: [] } })).toBeNull();
+    expect(readFileSync(ledgerPath, 'utf8')).toBe(original);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    expect(postAcceptAdvisoryShadowReport(original.trim().split('\n').map(JSON.parse))).toMatchObject({
+      prs: 0, wouldPush: 0, loopsAfter: 0, unresolved: 1,
+    });
+  });
+
   it('separates a truncated JSON tail from new rows and skips unparseable lines on replay', async () => {
     const { recordPostAcceptAdvisoryShadow } = await import('../review-pr-io.mjs');
     const ledgerPath = join(root, 'shadow.jsonl');

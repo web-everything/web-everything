@@ -270,14 +270,19 @@ describe('post-accept advisory shadow ledger', () => {
       .toMatchObject({ headSha: 'next' });
   });
 
-  it('rejects conflicting head aliases, unknown row kinds, and corrupt run IDs without poisoning loop replay', async () => {
+  it('refuses corrupt run IDs without letting ignored aliases or unknown row kinds poison replay', async () => {
     const base = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: null };
     const rows = [base, { ...base, head: 'conflict' }, { ...base, kind: 'unknown' },
       { kind: 'loops', repo: 'o/r', pr: 7, head, loopsAfter: 99, runId: 42 }];
-    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 1, skipped: 3, unmeasured: 1 });
-    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'next', runId: 'later',
-      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
-    expect(rows.at(-1)).toMatchObject({ headSha: head, loopsAfter: 1, runId: 'later' });
+    const before = structuredClone(rows), logs = [];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, wouldCard: 0, skipped: 3, unmeasured: 0, unresolved: 1,
+    });
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'next', runId: 'later',
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs.join(' ')).toContain('invalid loop history; inspect shadow ledger');
     for (const input of [null, {}, 'rows']) expect(() => reviewLoopPolicy.postAcceptAdvisoryShadowReport(input))
       .toThrow('unreadable shadow ledger; inspect shadow ledger');
   });
@@ -533,20 +538,86 @@ describe('post-accept advisory shadow ledger', () => {
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 9, skipped: 0 });
   });
 
-  it('orphan explicit measurement cannot suppress a valid replacement', async () => {
-    const orphan = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter: 1 };
+  it.each([undefined, 'R'])('orphan measurement with run ID %s refuses all later recording for its PR', async runId => {
+    const orphan = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter: 1,
+      ...(runId === undefined ? {} : { runId }) };
     const rows = [orphan, { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
       headSha: head, ...decision, loopsAfter: null }];
-    const io = { repo: 'o/r', pr: 7, head, loopsAfter: 1, readLedgerRows: () => structuredClone(rows),
-      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
-    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 0, unmeasured: 1, skipped: 1 });
-    const replacement = await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io);
-    expect(replacement).toMatchObject(orphan);
-    expect(rows).toHaveLength(3);
-    expect(rows[2]).toEqual(replacement);
-    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 1, unmeasured: 0, skipped: 1 });
-    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io)).toBeNull();
-    expect(rows).toHaveLength(3);
+    const before = structuredClone(rows), logs = [];
+    const io = { repo: 'o/r', pr: 7, head, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; }, out: line => logs.push(line) };
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 1 })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'R' })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', decision })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 0, wouldCard: 0, loopsAfter: 0, unmeasured: 0, skipped: 1, unresolved: 1 });
+    expect(report.text).toContain('Unresolved: 1');
+  });
+
+  it('accept A; corrupt run R count 99; record R on A then B refuses without binding or counting R', async () => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; }, out: line => logs.push(line) };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'A', decision });
+    rows.push({ kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', runId: 'R', loopsAfter: 99 });
+    const before = structuredClone(rows);
+    for (const head of ['A', 'B']) {
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head, runId: 'R' })).toBeNull();
+      expect(rows).toEqual(before);
+    }
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, loopsAfter: 0, wouldCard: 0, unresolved: 1, skipped: 1,
+    });
+  });
+
+  it.each([
+    ['bad count', { kind: 'loops', headSha: 'A', runId: 'R', loopsAfter: -1 }],
+    ['missing head', { kind: 'loops', runId: 'R', loopsAfter: 1 }],
+    ['conflicting aliases', { kind: 'loops', headSha: 'A', head: 'B', runId: 'R', loopsAfter: 1 }],
+    ['bad run marker', { kind: 'advisory-run', headSha: 'B', runId: '' }],
+    ['conflicting run marker', { kind: 'advisory-run', headSha: 'C', runId: 'R' }],
+    ['different duplicate count', { kind: 'loops', headSha: 'A', runId: 'R', loopsAfter: 2 }],
+    ['missing accepted head', { kind: 'loops', headSha: 'missing', loopsAfter: 1 }],
+    ['same-head measurement', { kind: 'loops', headSha: 'B', runId: 'R', loopsAfter: 1 }],
+  ])('sweep: %s invalidates earlier measurements, but only for its repository and PR', async (_name, corrupt) => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; }, out: line => logs.push(line) };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'A', decision });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'R' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', decision });
+    rows.push({ repo: 'o/r', pr: 7, ...corrupt });
+    const before = structuredClone(rows);
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'next' })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'A', loopsAfter: 9 })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'C', decision })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    for (const identity of [{ repo: 'o/r', pr: 8 }, { repo: 'other/r', pr: 7 }]) {
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, ...identity, head: 'A', decision })).not.toBeNull();
+      await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, ...identity, head: 'C', runId: 'next' });
+    }
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 2, wouldCard: 2, loopsAfter: 2, unresolved: 1,
+    });
+  });
+
+  it('sweep: historical measurements with no known run head cannot bind that run to a new head', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, head: 'A', ...decision, loopsAfter: null },
+      { kind: 'loops', repo: 'o/r', pr: 7, head: 'A', runId: 'R', loopsAfter: 1 }];
+    const before = structuredClone(rows), logs = [];
+    for (const head of ['A', 'B']) expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head, runId: 'R',
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('unknown historical run head; inspect shadow ledger'))).toBe(true);
   });
 
   it('prints counts and counts only shadow-carded findings later re-rated broken, matched by identity', () => {
@@ -606,7 +677,7 @@ describe('post-accept advisory shadow ledger', () => {
     expect(rows.filter(row => row.kind === 'loops')).toEqual([]);
     // Even a structurally valid injected measurement cannot turn the migrated run into a later run.
     rows.push({ kind: 'loops', repo: 'o/r', pr: 7, head: 'B', runId: 'A', loopsAfter: 1 });
-    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 0, unmeasured: 2, skipped: 1 });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ prs: 0, loopsAfter: 0, unmeasured: 0, unresolved: 1, skipped: 1 });
   });
 
   it('adversarial partial fanout recovers after restart without counting a later accept', async () => {
@@ -632,13 +703,13 @@ describe('post-accept advisory shadow ledger', () => {
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 3, loopsAfter: 2, unmeasured: 1, skipped: 0 });
   });
 
-  it('adversarial report skips duplicates, orphan and preaccept measurements, and corrupt counts', () => {
+  it('adversarial report excludes identities with orphan, preaccept measurements, and corrupt counts', () => {
     const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: null };
     const loop = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, runId: 'later', loopsAfter: 1 };
     const rows = [{ ...loop, runId: 'early' }, accept, structuredClone(accept), loop, structuredClone(loop),
       { ...loop, runId: 'corrupt', loopsAfter: 99 }, null, {}, { kind: 'advisory-run', repo: 'o/r' }];
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
-      prs: 1, wouldCard: 1, findings: 1, loopsAfter: 1, unmeasured: 0, skipped: 7,
+      prs: 0, wouldCard: 0, findings: 0, loopsAfter: 0, unmeasured: 0, skipped: 7, unresolved: 1,
     });
   });
 
