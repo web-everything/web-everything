@@ -1,6 +1,6 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from '../drain-queue-safety.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -8,6 +8,132 @@ import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escal
 
 const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
+
+describe('merge-queue same-head failure admission', () => {
+  const pr = 6215, repo = 'fixture/drain';
+  const removed = (reason = 'failed_checks', testedHead = head) => ({
+    __typename: 'RemovedFromMergeQueueEvent', reason, createdAt: '2026-11-01T12:00:00Z',
+    // beforeCommit is the merge-group commit: only its SECOND parent binds the tested PR head.
+    beforeCommit: { oid: 'b'.repeat(40), parents: { nodes: [{ oid: prior }, { oid: testedHead }] } },
+  });
+  const added = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:00:00Z' };
+  const timeline = (...nodes) => ({ nodes, hasPreviousPage: false });
+  const decide = evidence => decideMqSameHead({ pr, head, timeline: evidence });
+  const released = { hold: false, line: null };
+  const expectHold = (decision, detail) => {
+    expect(decision.hold).toBe(true);
+    expect(decision.line).toEqual(expect.stringContaining(`mq-same-head-failed: #${pr} head ${head} — `));
+    expect(decision.line.split(' — ')[1]?.trim().length).toBeGreaterThan(0);
+    expect(decision.line).toMatch(detail);
+  };
+  const response = evidence => JSON.stringify({ data: { repository: { pullRequest: {
+    timelineItems: { nodes: evidence.nodes, pageInfo: { hasPreviousPage: evidence.hasPreviousPage } },
+  } } } });
+
+  it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
+    expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
+  });
+  it.each(['branch_protection_failure', 'invalid_merge_commit', 'merge_conflict'])('removal for %s holds the tested head', reason => {
+    expect(decide(timeline(removed(reason)))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — ${reason}` });
+  });
+  it.each(['manual', 'merged', ' MANUAL ', ' MERGED '])('removed with release reason %s permits re-enqueue regardless of binding', reason => {
+    for (const beforeCommit of [removed(reason).beforeCommit, null, { parents: { nodes: [] } }]) {
+      expect(decide(timeline({ ...removed(reason), beforeCommit }))).toEqual(released);
+    }
+  });
+  it('removed with merge-group parent pointing at an OLDER head releases the new head', () => {
+    const event = removed('failed_checks', prior);
+    event.beforeCommit.oid = head;
+    event.beforeCommit.parents.nodes[0].oid = head;
+    expect(decide(timeline(event))).toEqual(released);
+  });
+  it('an earlier failed removal at an old head releases a current head with no removal', () => {
+    expect(decide(timeline(removed('failed_checks', prior), added))).toEqual(released);
+  });
+  it('a PR with no removals releases', () => {
+    expect(decide(timeline())).toEqual(released);
+    expect(decide(timeline(added))).toEqual(released);
+  });
+  it('a later addition or manual removal cannot erase any failure at the same head', () => {
+    expectHold(decide(timeline(removed(), added, removed('manual'))), /failed_checks/);
+  });
+  it.each(['future_failure', undefined, null, ''])('unknown or missing reason %s holds the same head', reason => {
+    expectHold(decide(timeline({ ...removed(), reason })), /.+/);
+  });
+  it('compares reasons case-insensitively and trims whitespace', () => {
+    expect(decide(timeline(removed(' FaIlEd_ChEcKs ')))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
+  });
+  it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
+    expectHold(decide(evidence), /unreadable/i);
+  });
+  it('hasPreviousPage holds at the 100-event cap and exposes the incomplete timeline', () => {
+    expectHold(decide({ nodes: Array.from({ length: 100 }, () => added), hasPreviousPage: true }), /cap|truncat|incomplete|previous/i);
+  });
+  it.each([null, { parents: { nodes: [] } }, { parents: { nodes: [{ oid: head }] } }])('an unbound failure removal holds with no commit binding (%j)', beforeCommit => {
+    expectHold(decide(timeline({ ...removed(), beforeCommit })), /no commit binding/i);
+  });
+  it.each(['', undefined, null])('an empty or missing head %s holds', missingHead => {
+    const result = decideMqSameHead({ pr, head: missingHead, timeline: timeline() });
+    expect(result.hold).toBe(true);
+    expect(result.line).toMatch(/head/i);
+  });
+
+  it('readMqTimeline issues exactly one gh graphql call with last:100 and reads the second-parent binding and cap', () => {
+    const evidence = { nodes: [removed(), added], hasPreviousPage: true };
+    const exec = vi.fn(() => response(evidence));
+    expect(readMqTimeline({ repo, pr, exec })).toEqual(evidence);
+    expect(exec).toHaveBeenCalledTimes(1);
+    const [command, args, opts] = exec.mock.calls[0];
+    expect(command).toBe('gh');
+    expect(args.slice(0, 2)).toEqual(['api', 'graphql']);
+    expect(args).not.toContain('--paginate');
+    const query = args.find(arg => arg.startsWith('query='));
+    expect(query).toBeDefined();
+    const compact = query.replace(/\s+/g, '');
+    expect(compact).toMatch(/timelineItems\(last:100,itemTypes:\[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT\]\)/);
+    expect(compact).toContain('pageInfo{hasPreviousPage}');
+    expect(compact).toMatch(/\.\.\.onRemovedFromMergeQueueEvent\{/);
+    expect(compact).toContain('beforeCommit{oidparents(first:2){nodes{oid}}}');
+    expect(compact).toContain('reason');
+    expect(compact).toContain('createdAt');
+    // Arguments may use GraphQL variables or literals, but must identify this repo and PR.
+    expect(args.join(' ')).toContain('fixture');
+    expect(args.join(' ')).toContain('drain');
+    expect(args.join(' ')).toContain('6215');
+    expect(opts.encoding).toBe('utf8');
+    expect(opts.timeout).toBeGreaterThan(0);
+  });
+  it.each([
+    ['exec throws', () => { throw new Error('offline'); }],
+    ['bad JSON', () => '{'],
+    ['GraphQL errors with partial data', () => JSON.stringify({ ...JSON.parse(response(timeline())), errors: [{ message: 'denied' }] })],
+    ['missing pull request', () => JSON.stringify({ data: { repository: { pullRequest: null } } })],
+    ['malformed timeline nodes', () => response({ nodes: null, hasPreviousPage: false })],
+  ])('unreadable timeline (%s) returns an error and the guard holds and logs it', (_label, read) => {
+    const exec = vi.fn(read);
+    expect(readMqTimeline({ repo, pr, exec })).toEqual({ error: expect.any(String) });
+    expect(exec).toHaveBeenCalledTimes(1);
+    exec.mockClear();
+    const log = vi.fn();
+    const result = mqSameHeadGuard({ repo, pr, head, exec, log });
+    expectHold(result, /unreadable/i);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls).toEqual([[result.line]]);
+  });
+  it('mqSameHeadGuard composes the read and decision and logs the exact hold line', () => {
+    const exec = vi.fn(() => response(timeline(removed()))), log = vi.fn();
+    const result = mqSameHeadGuard({ repo, pr, head, exec, log });
+    expect(result).toEqual(decide(timeline(removed())));
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls).toEqual([[result.line]]);
+  });
+  it('mqSameHeadGuard releases manual removal without logging a hold', () => {
+    const exec = vi.fn(() => response(timeline(removed('manual')))), log = vi.fn();
+    expect(mqSameHeadGuard({ repo, pr, head, exec, log })).toEqual(released);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(log).not.toHaveBeenCalled();
+  });
+});
 const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
 const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });

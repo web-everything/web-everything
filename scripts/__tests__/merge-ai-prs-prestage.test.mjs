@@ -38,6 +38,9 @@ if (a[0] === 'api') {
   if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
+    if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
+      nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
+    } } } } });
     if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
     if (q.includes('isInMergeQueue')) out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
@@ -97,6 +100,50 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it('both enqueue sites use one local helper that guards before the only mergeStrategy.enqueue call', () => {
+    // The local helper is not exported; pin its wiring here and exercise each caller below.
+    const source = readFileSync(script, 'utf8');
+    expect(source).toMatch(/import\s*\{[^}]*\bmqSameHeadGuard\b[^}]*\}\s*from\s*['"]\.\/lib\/drain-queue-safety\.mjs['"]/);
+    const hook = source.match(/enqueue:\s*\(c,\s*sha,\s*entry\)\s*=>\s*(\w+)\(c,\s*sha,/);
+    expect(hook, 'prestage enqueue hook must call a shared local helper').not.toBeNull();
+    const helperName = hook[1];
+    expect(source).toMatch(new RegExp(`return\\s+${helperName}\\(c,\\s*traceHeadSha,`));
+    // Accept a function declaration or a local arrow function, without fixing its name.
+    const definition = source.match(new RegExp(`^([ \\t]*)(?:function\\s+${helperName}\\([^\\n]*|const\\s+${helperName}\\s*=\\s*[^\\n]*)\\{[ \\t]*$`, 'm'));
+    expect(definition, 'shared enqueue helper must be local to the drain').not.toBeNull();
+    const start = definition.index + definition[0].length;
+    const end = source.indexOf(`\n${definition[1]}}`, start);
+    expect(end).toBeGreaterThan(start);
+    const body = source.slice(start, end);
+    expect(body).toMatch(/\bmqSameHeadGuard\s*\(/);
+    expect(body).toMatch(/if\s*\([^)]*\.hold\s*\)\s*(?:\{\s*)?return\s*\{/);
+    expect(body).toMatch(/enqueued:\s*false/);
+    expect(body).toMatch(/kind:\s*['"]mq-same-head-failed['"]/);
+    expect(body).toMatch(/reason:\s*\w+\.line/);
+    expect(body.indexOf('mqSameHeadGuard(')).toBeLessThan(body.indexOf('mergeStrategy.enqueue('));
+    expect(body.match(/mergeStrategy\.enqueue\s*\(/g)).toHaveLength(1);
+    expect((source.slice(0, definition.index) + source.slice(end)).match(/mergeStrategy\.enqueue\s*\(/g) || []).toHaveLength(0);
+  });
+  it.each([false, true])('same-head failed_checks holds without enqueueing through the cascade/prestage path (green event: %s)', green => world(({pr,run}) => {
+    if (green) expect(run().stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-01T12:00:00Z',
+      beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}} }];
+    const next = run(green);
+    const line = `mq-same-head-failed: #42 head ${sha} — failed_checks`;
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+    expect(next.stderr).toContain(line);
+    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(1);
+  }));
+  it.each([false, true])('manual removal permits re-enqueue through the cascade/prestage path (green event: %s)', green => world(({pr,run}) => {
+    if (green) expect(run().stderr).toContain('eligible=true');
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'manual', createdAt:'2026-11-01T12:00:00Z',
+      beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}} }];
+    const next = run(green);
+    expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
+    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(1);
+  }));
   it.each(['--repos=frontier-ui/frontierui', '--repos=frontierui'])('a green event cannot enqueue WE#42 outside %s', scope => world(({pr,run,coord}) => {
     expect(run().stderr).toContain('eligible=true');
     const cacheDir = join(coord, 'drain-prestage');

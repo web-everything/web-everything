@@ -2,6 +2,7 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
+import { mqSameHeadGuard } from './lib/drain-queue-safety.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -4818,6 +4819,12 @@ async function runCli() {
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
+  function enqueueWithSameHeadGuard(c, sha, options) {
+    const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      log: line => process.stderr.write(`${line}\n`) });
+    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
+    return mergeStrategy.enqueue(c, sha, options);
+  }
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
     queueOwnsFreshness: () => mergeStrategy.queueOwnsFreshness(null),
@@ -5317,7 +5324,7 @@ async function runCli() {
       fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
       // The cached base was verified unchanged, and preparation required it to be the default branch.
       beforeEnqueue: (c, sha, entry) => announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName }),
-      enqueue: (c, sha, entry) => mergeStrategy.enqueue(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
+      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }),
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -7166,7 +7173,7 @@ async function runCli() {
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
             if (groupHeld) return { skipped: 'card-group-hold', reason: groupHeld.reason };
-            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
+            if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
