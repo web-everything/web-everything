@@ -50,6 +50,19 @@ export function redTeamFact(comments, prNumber, head) {
     });
     return olderResult ? unread() : known({ state: 'none', resultId: null, sendBackResultId: null });
   }
+  // A finding-shaped line the shared parser dropped means the result cannot be trusted as read.
+  const live = head.toLowerCase();
+  const malformed = comments.some(comment => {
+    if (!isTrustedMarkerAuthor(comment)) return false;
+    const body = String(typeof comment === 'string' ? comment : comment?.body ?? '').replace(/\r\n/g, '\n').trimStart();
+    const parsed = parseRedTeamComment(body);
+    if (!parsed || parsed.pr !== Number(prNumber) || parsed.rev !== live) return false;
+    return body.split('\n').filter(line => /^\d+\. \[/.test(line)).length !== parsed.findings.length;
+  });
+  if (malformed) return unread();
+  if (s.outcomes.has('operator-block')) {
+    return known({ state: 'blocked', resultId: s.resultId, sendBackResultId: null });
+  }
   const state = !s.result.findings.some(finding => finding.confirmed) ? 'clear'
     : s.sendBackOutcome === 'round-cap' ? 'held'
       : s.sendBackOutcome === 'sent-back' ? 'send-back' : 'pending';

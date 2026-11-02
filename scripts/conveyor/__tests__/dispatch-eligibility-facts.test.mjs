@@ -127,3 +127,17 @@ describe('reconcile-pass shadow fact', () => {
     expect(enrichPrsWithAlreadyLandedFacts([labelled], { fetchRef: noop, readMergeBase: () => null })).toEqual([labelled]);
   });
 });
+
+describe('redTeamFact audit closures', () => {
+  it('an operator-block record on the live result is blocked even with no confirmed finding', () => {
+    const comments = [result(head, false)];
+    const id = liveResultGateState(comments, pr, head).resultId;
+    comments.push({ author: { login: 'chalbert', type: 'User' }, body: `${redTeamGateMarker(pr, head, 'operator-block', id)}\nblock` });
+    expect(redTeamFact(comments, pr, head).value?.state ?? 'unread').not.toBe('clear');
+  });
+  it('a malformed finding line makes the result unread, not clear', () => {
+    const good = result(head, false);
+    const bad = bot(`${good.body}\n1. [**confirmed**] malformed finding line without a category`);
+    expect(redTeamFact([bad], pr, head)).toEqual({ status: 'unread' });
+  });
+});
