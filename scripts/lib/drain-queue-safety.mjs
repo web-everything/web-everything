@@ -75,3 +75,51 @@ export function dequeueSentBack({ repo, pr, reason, exec = execFileSync, log = (
   }
   return { dequeued: true };
 }
+
+/**
+ * PURE: should the drain refuse to enqueue `head` because its OWN merge_group run already failed there?
+ * `runs`: this PR's completed merge_group runs, each `{ conclusion, completedAt (ms), prHead }` (prHead = the PR head the
+ * group was built from). A cancelled run (an entry ahead failed) never counts; a later success on the same head, or a
+ * `freshGreenAt` check newer than the failure, releases it. A failed read (`readError`) holds, visibly. No flake
+ * classifier exists for merge_group failures, so there is no retry: a new head or a green rerun is the only way out.
+ */
+export function sameHeadFailedDecision({ pr, head, runs = [], freshGreenAt = null, readError = null } = {}) {
+  const short = String(head).slice(0, 12);
+  if (readError) return { hold: true, kind: 'mq-same-head-unreadable', reason: `merge_group failure read errored: ${readError.message ?? readError}`,
+    line: `mq-same-head-unreadable: #${pr} head ${short} — merge_group failure read errored (${String(readError.message ?? readError).split('\n')[0].slice(0, 120)}); holding the enqueue` };
+  const own = runs.filter(r => r.prHead === head);
+  const failed = own.filter(r => r.conclusion === 'failure' || r.conclusion === 'timed_out');
+  if (!failed.length) return { hold: false };
+  const lastFail = Math.max(...failed.map(r => r.completedAt ?? 0));
+  if (own.some(r => r.conclusion === 'success' && (r.completedAt ?? 0) > lastFail)) return { hold: false };
+  if (freshGreenAt != null && freshGreenAt > lastFail) return { hold: false };
+  const line = `mq-same-head-failed: #${pr} head ${short} — waiting for a new head or green rerun`;
+  return { hold: true, kind: 'mq-same-head-failed', reason: line, line };
+}
+
+/** Reads this PR's recent merge_group runs and newer green checks through gh, decides, and logs the one named line. */
+export function sameHeadFailedHold({ repo, pr, head, exec = execFileSync, log = () => {}, maxRuns = 6 } = {}) {
+  const readJson = args => JSON.parse(exec('gh', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+  let decision;
+  try {
+    const listed = readJson(['api', `repos/${repo}/actions/runs?event=merge_group&per_page=100`]);
+    const mine = (listed.workflow_runs ?? []).filter(r => r.status === 'completed' && new RegExp(`/pr-${pr}-`).test(r.head_branch ?? '')
+      && r.conclusion !== 'cancelled' && r.conclusion !== 'skipped').slice(0, maxRuns);
+    const runs = mine.map(r => {
+      const parents = readJson(['api', `repos/${repo}/commits/${r.head_sha}`]).parents ?? [];
+      return { conclusion: r.conclusion, completedAt: Date.parse(r.updated_at ?? r.run_started_at) || 0, prHead: parents.map(p => p.sha).find(s => s === head) ?? parents.at(-1)?.sha };
+    });
+    let freshGreenAt = null;
+    if (runs.some(r => r.prHead === head && (r.conclusion === 'failure' || r.conclusion === 'timed_out'))) {
+      const checks = readJson(['api', `repos/${repo}/commits/${head}/check-runs?per_page=100`]).check_runs ?? [];
+      const times = c => Date.parse(c.completed_at) || 0;
+      const lastFail = Math.max(...runs.filter(r => r.prHead === head).map(r => r.completedAt));
+      const newer = checks.filter(c => times(c) > lastFail);
+      // Green only when something finished after the failure and nothing newer is red.
+      if (newer.length && newer.every(c => ['success', 'skipped', 'neutral'].includes(c.conclusion))) freshGreenAt = Math.max(...newer.map(times));
+    }
+    decision = sameHeadFailedDecision({ pr, head, runs, freshGreenAt });
+  } catch (error) { decision = sameHeadFailedDecision({ pr, head, readError: error }); }
+  if (decision.hold) log(decision.line);
+  return decision;
+}
