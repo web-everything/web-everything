@@ -311,8 +311,26 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
         result.skipped.push(ref); continue;
       }
       if (Object.hasOwn(synced.conflictMain, ref)) {
-        // Either sha moved: forget the pair now, so the normal retry cap governs any later failure.
         const old = synced.conflictMain[ref];
+        if (old === main) {
+          // Only the ref tip moved: lift the terminal stop ONLY on evidence that the new tip merges cleanly
+          // with the same main (side-effect-free merge-tree). A conflict or an error keeps the stop.
+          let check;
+          try { check = run(['merge-tree', '--write-tree', '--name-only', main, tip]); }
+          catch (error) { check = { error }; }
+          if (check?.status === 1 && !check.error && typeof check.stdout === 'string') {
+            const files = check.stdout.split(/\r?\n/).slice(1).map(cleanText);
+            const conflicted = files.slice(0, files.indexOf('') < 0 ? files.length : files.indexOf('')).filter(Boolean);
+            if (conflicted.length) {
+              updateSyncState(sidecar(root, env), state => { state.conflictTip[ref] = tip; });
+              outcome(root, env, ref, 'conflict', { step: 'merge', main, tip, files: conflicted,
+                stderrTail: '', reason: `merge conflicts remain after the ref tip moved: ${conflicted.join(', ')}` }, deps);
+            } else skip('conflict-check-error');
+            result.skipped.push(ref); continue;
+          }
+          if (check?.status !== 0 || check.error) { skip('conflict-check-error'); continue; }
+        }
+        // Clean after the move (or main moved): forget the pair so the normal retry cap governs later failures.
         updateSyncState(sidecar(root, env), state => {
           delete state.conflictMain[ref]; delete state.conflictTip[ref];
           if (state.attemptedMain[ref] === old) delete state.attemptedMain[ref];

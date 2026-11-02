@@ -1485,6 +1485,13 @@ describe('health-watch overlay main sync wiring', () => {
 describe('R372 genuine merge conflict stops retrying', () => {
   const daemonEvents = f => !fs.existsSync(f.env.WE_DAEMON_EVENTS) ? []
     : fs.readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  // The owner dropped the conflicting change: the new tip merges cleanly with the same main but is not main.
+  const cleanTip = f => {
+    ok(f.root, ['checkout', '-q', ref]); ok(f.root, ['checkout', f.baseSha, '--', 'worker.mjs']);
+    fs.appendFileSync(join(f.root, 'worker.mjs'), 'export const ownerOnly = 1;\n'); ok(f.root, ['add', 'worker.mjs']);
+    ok(f.root, ['commit', '-qm', 'owner dropped the conflicting change']);
+    ok(f.root, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]); ok(f.root, ['checkout', '-q', 'main']);
+  };
   const moveRefTip = f => {
     ok(f.root, ['checkout', '-q', ref]); write(f.root, 'rebased.txt', 'owner rebased\n');
     ok(f.root, ['add', 'rebased.txt']); ok(f.root, ['commit', '-qm', 'owner moved tip']);
@@ -1518,7 +1525,7 @@ describe('R372 genuine merge conflict stops retrying', () => {
     const before = daemonEvents(f).length;
     for (let i = 0; i < 2; i++) expect(tick(f, { spawnFn: spawner() })).toMatchObject({ started: [], skipped: [ref] });
     expect(daemonEvents(f).slice(before).filter(e => /failed|conflict/.test(e.kind))).toEqual([]);
-    moveRefTip(f);
+    cleanTip(f);
     const spawnFn = spawner();
     expect(tick(f, { spawnFn })).toMatchObject({ started: [ref] });
     expect(spawnFn).toHaveBeenCalledOnce();
@@ -1568,7 +1575,7 @@ describe('R372 genuine merge conflict stops retrying', () => {
   it('clears the remembered conflict pair as soon as the ref tip moves, so the retry cap applies to later failures', async () => {
     const f = fixture({ conflict: true });
     await expect(job(f)).rejects.toThrow(/merge conflicts/);
-    moveRefTip(f);
+    cleanTip(f);
     tick(f, { spawnFn: spawner() });
     const state = json(sidecar(f));
     expect(state.conflictMain[ref]).toBeUndefined();
@@ -1612,7 +1619,7 @@ describe('R372 genuine merge conflict stops retrying', () => {
   it('a legacy file written after the new state (mixed-version worker) still holds its cooldown', async () => {
     const f = fixture({ conflict: true });
     await expect(job(f)).rejects.toThrow(/merge conflicts/);
-    moveRefTip(f);
+    cleanTip(f);
     const legacy = `${overlayFilePath(f.root, f.env)}.main-sync.json`;
     fs.writeFileSync(legacy, JSON.stringify({ lastSyncedMain: {}, pushRetryMain: { [ref]: f.mainSha }, pushRetryAfter: { [ref]: Date.now() + 600_000 } }));
     const later = new Date(Date.now() + 5000); fs.utimesSync(legacy, later, later);
@@ -1627,7 +1634,7 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(json(legacy).attemptedMain[ref]).toBe(f.mainSha);
     fs.writeFileSync(legacy, '{not json');
     const old = new Date(Date.now() - 5000); fs.utimesSync(legacy, old, old);
-    moveRefTip(f);
+    cleanTip(f);
     const spawnFn = spawner();
     tick(f, { spawnFn });
     expect(spawnFn).not.toHaveBeenCalled();
@@ -1639,7 +1646,7 @@ describe('R372 genuine merge conflict stops retrying', () => {
       const legacy = `${overlayFilePath(f.root, f.env)}.main-sync.json`;
       fs.writeFileSync(legacy, body);
       const old = new Date(Date.now() - 5000); fs.utimesSync(legacy, old, old);
-      moveRefTip(f);
+      cleanTip(f);
       const spawnFn = spawner();
       tick(f, { spawnFn });
       expect(spawnFn).not.toHaveBeenCalled();
@@ -1651,9 +1658,56 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(fs.existsSync(`${sidecar(f)}.lock`)).toBe(false);
     fs.writeFileSync(legacy, JSON.stringify({ lastSyncedMain: {}, pushRetryMain: { [ref]: f.mainSha }, pushRetryAfter: { [ref]: Date.now() + 600_000 } }));
     const t = new Date(); fs.utimesSync(legacy, t, t); fs.utimesSync(sidecar(f), t, t);
-    moveRefTip(f);
+    cleanTip(f);
     const spawnFn = spawner();
     tick(f, { spawnFn });
     expect(spawnFn).not.toHaveBeenCalled();
   });
+  it('a tip that still conflicts keeps the stop: one conflict event naming the files, pair updated, no repeat', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    moveRefTip(f);
+    const newTip = ok(f.root, ['rev-parse', `refs/heads/${ref}`]);
+    const before = daemonEvents(f).length;
+    for (let i = 0; i < 2; i++) {
+      const spawnFn = spawner();
+      expect(tick(f, { spawnFn })).toMatchObject({ started: [] });
+      expect(spawnFn).not.toHaveBeenCalled();
+    }
+    await new Promise(r => setTimeout(r, 300));
+    const fresh = daemonEvents(f).slice(before).filter(e => /failed|conflict/.test(e.kind));
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]).toMatchObject({ kind: 'overlay-main-sync-conflict', detail: { ref, main: f.mainSha, tip: newTip, files: ['worker.mjs'] } });
+    const state = json(sidecar(f));
+    expect(state.conflictTip[ref]).toBe(newTip);
+    expect(state.attemptedMain[ref]).toBe(f.mainSha);
+  });
+
+  it('a clean rebased tip lifts the stop and attemptedMain, and the job is started', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    cleanTip(f);
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [ref] });
+    const state = json(sidecar(f));
+    expect(state.conflictMain[ref]).toBeUndefined();
+    expect(state.attemptedMain[ref]).toBeUndefined();
+  });
+
+  it.each([['exit 128', { status: 128, stdout: '', stderr: 'fatal: unsupported' }], ['thrown', 'throw']])(
+    'a merge check that errors (%s) keeps the stop and fails closed', async (_, failure) => {
+      const f = fixture({ conflict: true });
+      await expect(job(f)).rejects.toThrow(/merge conflicts/);
+      cleanTip(f);
+      const git = vi.fn((args, opts) => {
+        if (args[0] === 'merge-tree') { if (failure === 'throw') throw new Error('boom'); return failure; }
+        return f.deps.git(args, opts);
+      });
+      const spawnFn = spawner();
+      expect(tick(f, { spawnFn, git })).toMatchObject({ started: [] });
+      expect(spawnFn).not.toHaveBeenCalled();
+      const state = json(sidecar(f));
+      expect(state.attemptedMain[ref]).toBe(f.mainSha);
+      expect(state.conflictMain[ref]).toBe(f.mainSha);
+    });
 });
