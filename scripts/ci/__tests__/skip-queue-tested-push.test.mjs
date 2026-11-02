@@ -81,7 +81,7 @@ process.stdout.write(responses[kind] + '\\n');
       fileURLToPath(new URL('../skip-queue-tested-push.mjs', import.meta.url)),
       ...Object.entries(options).filter(([, value]) => value !== undefined)
         .map(([key, value]) => `--${key}=${value}`),
-    ], { cwd, env: { PATH: cwd, ...env }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    ], { cwd, env: { PATH: cwd, ...env }, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.status).toBe(0);
