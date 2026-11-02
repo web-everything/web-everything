@@ -312,6 +312,17 @@ describe('post-accept advisory shadow ledger', () => {
     });
 
   it.each([
+    ['both decisions true', { wouldPush: true }],
+    ['both decisions false', { wouldCard: false }],
+    ['missing push decision', { wouldPush: undefined }],
+    ['broken card', { findings: [{ ...finding, impactIfUnfixed: 'broken' }] }],
+    ['unrecoverable card', { findings: [{ ...finding, impactIfUnfixed: 'unrecoverable' }] }],
+    ['unstated-impact card', { findings: [{ ...finding, impactIfUnfixed: undefined }] }],
+    ['security card', { findings: [{ ...finding, category: 'security/security' }] }],
+    ['unknown-category card', { findings: [{ ...finding, category: 'unknown/unknown' }] }],
+    ['empty card', { findings: [] }],
+    ['mixed blocking card', { findings: [finding, { ...finding, impactIfUnfixed: 'broken' }] }],
+    ['mixed security card', { findings: [finding, { ...finding, category: 'security/security' }] }],
     ['null finding', { findings: [null] }],
     ['sparse findings', { findings: new Array(1) }],
     ['malformed finding verdict', { findings: [{ ...finding, verdict: 42 }] }],
@@ -342,6 +353,13 @@ describe('post-accept advisory shadow ledger', () => {
     expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
       prs: 0, wouldCard: 0, findings: 0, skipped: 1,
     });
+    if (Object.keys(malformed).some(key => ['wouldCard', 'wouldPush', 'findings'].includes(key))) {
+      const writes = [];
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head,
+        decision: { ...decision, ...malformed }, readLedgerRows: () => [],
+        appendLedgerRow: row => { writes.push(row); return { ok: true }; } })).toBeNull();
+      expect(writes).toEqual([]);
+    }
     const replacement = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision,
       readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
     expect(replacement).toMatchObject({ wouldCard: true, findings: [finding] });
@@ -349,6 +367,18 @@ describe('post-accept advisory shadow ledger', () => {
     const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
     expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 1, skipped: 1 });
     expect(report.text).toContain('Skipped: 1');
+  });
+
+  it.each([
+    { impactIfUnfixed: 'broken' }, { impactIfUnfixed: 'unrecoverable' },
+    { impactIfUnfixed: undefined }, { category: 'security/security' },
+  ])('persists a required push for blocking finding %j', async blocking => {
+    const rows = [];
+    const push = { wouldCard: false, wouldPush: true, findings: [finding, { ...finding, ...blocking }] };
+    const row = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision: push,
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(row).toMatchObject(push);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldPush: 1, wouldCard: 0, skipped: 0 });
   });
 
   it('keeps the existing undeclared-impact marker and finding-text alias readable', async () => {
@@ -452,6 +482,22 @@ describe('post-accept advisory shadow ledger', () => {
     expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
   });
 
+  it('orphan explicit measurement cannot suppress a valid replacement', async () => {
+    const orphan = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter: 1 };
+    const rows = [orphan, { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      headSha: head, ...decision, loopsAfter: null }];
+    const io = { repo: 'o/r', pr: 7, head, loopsAfter: 1, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 0, unmeasured: 1, skipped: 1 });
+    const replacement = await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io);
+    expect(replacement).toMatchObject(orphan);
+    expect(rows).toHaveLength(3);
+    expect(rows[2]).toEqual(replacement);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 1, unmeasured: 0, skipped: 1 });
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io)).toBeNull();
+    expect(rows).toHaveLength(3);
+  });
+
   it('prints counts and counts only shadow-carded findings later re-rated broken, matched by identity', () => {
     const rows = [
       { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: 3,
@@ -468,6 +514,124 @@ describe('post-accept advisory shadow ledger', () => {
     expect(report.text).toMatch(/would.?card[^\n]*2/i);
     expect(report.text).toMatch(/would.?push[^\n]*1/i);
     expect(report.text).toMatch(/broken[^\n]*1/i);
+  });
+
+  it('adversarial replay: accept A, accept B, replay A, and replay an earlier nonaccept after restart', async () => {
+    const { recordPostAcceptAdvisoryShadow: accept, recordPostAcceptAdvisoryLoops: run } = await import('../../operations/review-pr-io.mjs');
+    let rows = [];
+    const io = { repo: 'o/r', pr: 7, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await run({ ...io, head: 'pre', runId: 'pre' });
+    await run({ ...io, head: 'A', runId: 'A' });
+    await accept({ ...io, head: 'A' });
+    await run({ ...io, head: 'B', runId: 'B' });
+    await accept({ ...io, head: 'B' });
+    rows = JSON.parse(JSON.stringify(rows)); // No remembered in-process replay state.
+    const before = structuredClone(rows);
+    await run({ ...io, head: 'A', runId: 'A' });
+    await run({ ...io, head: 'pre', runId: 'pre' });
+    await run({ ...io, head: 'B', runId: 'B' });
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([{ headSha: 'A', runId: 'B', loopsAfter: 1 }]);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 2, loopsAfter: 1, unmeasured: 1, skipped: 0 });
+    await Promise.all(['C', 'C', 'D'].map(runId => run({ ...io, head: runId, runId })));
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: 'A', runId: 'B', loopsAfter: 1 },
+      { headSha: 'A', runId: 'C', loopsAfter: 2 }, { headSha: 'B', runId: 'C', loopsAfter: 1 },
+      { headSha: 'A', runId: 'D', loopsAfter: 3 }, { headSha: 'B', runId: 'D', loopsAfter: 2 },
+    ]);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 5, skipped: 0 });
+  });
+
+  it('adversarial historical accept A, accept B, replay A twice remains fenced after marker migration', async () => {
+    const rows = ['A', 'B'].map(head => ({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      head, ...decision, loopsAfter: null }));
+    const io = { repo: 'o/r', pr: 7, head: 'A', runId: 'A', readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io);
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io);
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toEqual([]);
+    // Even a structurally valid injected measurement cannot turn the migrated run into a later run.
+    rows.push({ kind: 'loops', repo: 'o/r', pr: 7, head: 'B', runId: 'A', loopsAfter: 1 });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 0, unmeasured: 2, skipped: 1 });
+  });
+
+  it('adversarial partial fanout recovers after restart without counting a later accept', async () => {
+    let rows = [];
+    const io = { repo: 'o/r', pr: 7, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    for (const head of ['A', 'B']) await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head });
+    let attempts = 0;
+    const logs = [];
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C', out: line => logs.push(line),
+      appendLedgerRow: row => ++attempts === 3 ? { ok: false } : io.appendLedgerRow(row) });
+    expect(logs.join(' ')).toContain('shadow ledger write failed');
+    expect(rows.filter(row => row.kind === 'loops')).toHaveLength(1);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'D' });
+    rows = JSON.parse(JSON.stringify(rows));
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: 'A', runId: 'C', loopsAfter: 1 }, { headSha: 'B', runId: 'C', loopsAfter: 1 },
+    ]);
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows).toEqual(before);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 3, loopsAfter: 2, unmeasured: 1, skipped: 0 });
+  });
+
+  it('adversarial report skips duplicates, orphan and preaccept measurements, and corrupt counts', () => {
+    const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: null };
+    const loop = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, runId: 'later', loopsAfter: 1 };
+    const rows = [{ ...loop, runId: 'early' }, accept, structuredClone(accept), loop, structuredClone(loop),
+      { ...loop, runId: 'corrupt', loopsAfter: 99 }, null, {}, { kind: 'advisory-run', repo: 'o/r' }];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 1, wouldCard: 1, findings: 1, loopsAfter: 1, unmeasured: 0, skipped: 7,
+    });
+  });
+
+  it('adversarial changed run head fails closed with an inspection fallback', async () => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'A', runId: 'one' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', decision });
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'one', out: line => logs.push(line) });
+    expect(rows).toEqual(before);
+    expect(logs.join(' ')).toContain('conflicting run head; inspect shadow ledger');
+  });
+
+  it('adversarial sparse ledger rows are counted skipped, not silently lost', () => {
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(new Array(2))).toMatchObject({ prs: 0, skipped: 2 });
+  });
+
+  it('adversarial oversized report totals refuse imprecise output with an inspection fallback', () => {
+    const rows = [7, 8].map(pr => ({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr, headSha: head,
+      ...decision, loopsAfter: Number.MAX_SAFE_INTEGER }));
+    expect(() => reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toThrow('loop total exhausted; inspect shadow ledger');
+  });
+
+  it('adversarial explicit measurement without an earlier accept refuses to write with an inspection fallback', async () => {
+    const rows = [], logs = [];
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head, loopsAfter: 2,
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) });
+    expect(rows).toEqual([]);
+    expect(logs.join(' ')).toContain('missing accept; inspect shadow ledger');
+  });
+
+  it('adversarial mixed run ID and explicit counts cannot bypass run replay deduplication', async () => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, head, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow(io);
+    const before = structuredClone(rows);
+    for (const loopsAfter of [1, 2]) await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, runId: 'same-run', loopsAfter });
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('supply a run ID or an explicit count; inspect shadow ledger'))).toBe(true);
   });
 
   it('reports zero counts for an empty shadow ledger', () => {

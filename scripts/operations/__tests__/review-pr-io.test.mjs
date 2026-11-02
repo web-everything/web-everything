@@ -99,8 +99,11 @@ describe('post-accept advisory persisted ledger', () => {
     await recordPostAcceptAdvisoryLoops({ ...later, runId: 'later-2' });
     await recordPostAcceptAdvisoryLoops(later);
     const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(rows).toHaveLength(3);
-    expect(rows.slice(1)).toMatchObject([
+    expect(rows).toHaveLength(6);
+    expect(rows.filter(row => row.kind === 'advisory-run')).toMatchObject([
+      { runId: 'same-head' }, { runId: 'later-1' }, { runId: 'later-2' },
+    ]);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
       { headSha: facts.head, loopsAfter: 1, runId: 'later-1' },
       { headSha: facts.head, loopsAfter: 2, runId: 'later-2' },
     ]);

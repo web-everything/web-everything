@@ -646,8 +646,7 @@ export async function recordPostAcceptAdvisoryShadow({ repo, pr, head, decision,
   readLedgerRows, appendLedgerRow, now = () => new Date().toISOString(), out = () => {} } = {}) {
   try {
     if (!advisoryIdentity({ repo, pr, head })
-      || !advisoryObject(decision) || typeof decision.wouldCard !== 'boolean' || decision.wouldPush !== !decision.wouldCard
-      || !validAdvisoryFindings(decision.findings) || (loopsAfter !== null && !validLoopCount(loopsAfter))) {
+      || !validAdvisoryDecision(decision) || (loopsAfter !== null && !validLoopCount(loopsAfter))) {
       throw new Error('incomplete shadow evidence');
     }
     const rows = await readLedgerRows(repo);
@@ -688,12 +687,54 @@ const validAdvisoryFindings = findings => Array.isArray(findings) && Array.from(
 const validLaterRatings = ratings => ratings === undefined || (Array.isArray(ratings)
   && Array.from(ratings).every(rating => advisoryObject(rating) && typeof rating.findingId === 'string'
     && rating.findingId.trim().length > 0 && ['cosmetic', 'degraded', 'broken', 'unrecoverable'].includes(rating.impactIfUnfixed)));
-const validAdvisoryRow = row => advisoryIdentity(row) && row.kind === 'we.post-accept-advisory-shadow' && typeof row.wouldCard === 'boolean'
-  && row.wouldPush === !row.wouldCard && validAdvisoryFindings(row.findings) && validLaterRatings(row.laterRatings)
+const validAdvisoryDecision = row => advisoryObject(row) && typeof row.wouldCard === 'boolean'
+  && row.wouldPush === !row.wouldCard && validAdvisoryFindings(row.findings)
+  && (!row.wouldCard || (row.findings.length > 0 && row.findings.every(finding =>
+    CARDABLE_IMPACTS.includes(finding.impactIfUnfixed) && PANEL_LENSES.includes(finding.category.split('/')[0])
+    && finding.category.split('/')[0] !== 'security' && !requiresMandatoryReferral(finding))));
+const validAdvisoryRow = row => advisoryIdentity(row) && row.kind === 'we.post-accept-advisory-shadow' && validAdvisoryDecision(row) && validLaterRatings(row.laterRatings)
   && (row.loopsAfter === null || validLoopCount(row.loopsAfter));
 const advisoryKey = row => JSON.stringify(advisoryIdentity(row));
 const validAdvisoryLoops = row => advisoryIdentity(row) && row.kind === 'loops' && validLoopCount(row.loopsAfter)
   && (!Object.hasOwn(row, 'runId') || nonemptyAdvisoryString(row.runId));
+
+const validAdvisoryRun = row => advisoryIdentity(row) && row.kind === 'advisory-run' && nonemptyAdvisoryString(row.runId);
+const advisoryRunKey = row => JSON.stringify([row.repo, row.pr, row.runId]);
+
+// Recorded order is authoritative, including after restart. First valid accept/run wins.
+// Historical loop rows also establish a run's first-seen position when no run marker exists.
+function replayAdvisoryLedger(rows) {
+  const accepts = new Map(), runs = new Map();
+  let skipped = 0;
+  Array.from(rows).forEach((row, index) => {
+    if (validAdvisoryRow(row)) {
+      const key = advisoryKey(row);
+      if (accepts.has(key)) { skipped++; return; }
+      accepts.set(key, { row, index, count: row.loopsAfter, seen: new Set(), measurements: new Set() });
+    } else if (validAdvisoryRun(row)) {
+      const key = advisoryRunKey(row);
+      if (!runs.has(key)) runs.set(key, {
+        index: Math.min(index, accepts.get(advisoryKey(row))?.index ?? index),
+        head: advisoryIdentity(row).headSha,
+      });
+      else skipped++;
+    } else if (validAdvisoryLoops(row)) {
+      const accept = accepts.get(advisoryKey(row));
+      if (row.runId !== undefined) {
+        const key = advisoryRunKey(row);
+        if (!runs.has(key)) runs.set(key, { index, head: null });
+        const run = runs.get(key);
+        if (!accept || accept.index >= run.index || run.head === advisoryIdentity(accept.row).headSha
+          || accept.seen.has(row.runId) || !validLoopCount((accept.count ?? 0) + 1)
+          || row.loopsAfter !== (accept.count ?? 0) + 1) { skipped++; return; }
+        accept.seen.add(row.runId);
+      } else if (!accept) { skipped++; return; }
+      accept.count = row.loopsAfter;
+      accept.measurements.add(row.loopsAfter);
+    } else skipped++;
+  });
+  return { accepts, runs, skipped };
+}
 
 /** Append explicit counts, or measure one later run per earlier accepted head, idempotently by run ID. */
 export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter, runId,
@@ -702,28 +743,36 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
     if (!advisoryIdentity({ repo, pr, head })
       || (runId !== undefined && !nonemptyAdvisoryString(runId))
       || (loopsAfter === undefined ? !nonemptyAdvisoryString(runId) : !validLoopCount(loopsAfter))) throw new Error('incomplete loops evidence');
+    if (runId !== undefined && loopsAfter !== undefined) throw new Error('ambiguous loops evidence; supply a run ID or an explicit count; inspect shadow ledger');
     const rows = await readLedgerRows(repo);
     if (!Array.isArray(rows)) throw new Error('unreadable shadow ledger');
+    const { accepts, runs } = replayAdvisoryLedger(rows);
+    const append = async row => {
+      const result = await appendLedgerRow(row);
+      if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
+    };
     if (loopsAfter === undefined) {
-      const accepts = new Map(rows.filter(row => validAdvisoryRow(row)
-        && row.kind === 'we.post-accept-advisory-shadow' && row.repo === repo && row.pr === pr
-        && (row.headSha ?? row.head) !== head).map(row => [advisoryKey(row), row]));
-      for (const [key, accept] of accepts) {
-        const measurements = rows.filter(row => validAdvisoryLoops(row) && advisoryKey(row) === key);
-        if (measurements.some(row => row.runId === runId)) continue;
-        const count = measurements.reduce((count, row) => Math.max(count, row.loopsAfter), accept.loopsAfter ?? 0) + 1;
+      const run = runs.get(advisoryRunKey({ repo, pr, runId }));
+      if (run?.head && run.head !== head) throw new Error('conflicting run head; inspect shadow ledger');
+      // For historical ledgers, the original head's accept also fences an old run's replay.
+      const boundary = Math.min(run?.index ?? rows.length,
+        accepts.get(advisoryKey({ repo, pr, head }))?.index ?? rows.length);
+      const pending = [];
+      for (const accept of accepts.values()) {
+        if (accept.row.repo !== repo || accept.row.pr !== pr || accept.index >= boundary
+          || advisoryIdentity(accept.row).headSha === head || accept.seen.has(runId)) continue;
+        const count = (accept.count ?? 0) + 1;
         if (!validLoopCount(count)) throw new Error('loop count exhausted; inspect shadow ledger');
-        const row = { kind: 'loops', repo, pr, headSha: advisoryIdentity(accept).headSha, loopsAfter: count, runId, at: now() };
-        const result = await appendLedgerRow(row);
-        if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
+        pending.push({ kind: 'loops', repo, pr, headSha: advisoryIdentity(accept.row).headSha, loopsAfter: count, runId, at: now() });
       }
+      if (!run) await append({ kind: 'advisory-run', repo, pr, headSha: head, runId, at: now() });
+      for (const row of pending) await append(row);
       return null;
     }
     const row = { kind: 'loops', repo, pr, headSha: head, loopsAfter, at: now() };
-    if (rows.some(old => validAdvisoryLoops(old)
-      && advisoryKey(old) === advisoryKey(row) && old.loopsAfter === loopsAfter)) return null;
-    const result = await appendLedgerRow(row);
-    if (!result?.ok || result.ledgerWriteMiss) throw new Error('shadow ledger write failed');
+    if (!accepts.has(advisoryKey(row))) throw new Error('missing accept; inspect shadow ledger');
+    if (accepts.get(advisoryKey(row)).measurements.has(loopsAfter)) return null;
+    await append(row);
     return row;
   } catch (error) {
     try { out(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
@@ -731,24 +780,20 @@ export async function recordPostAcceptAdvisoryLoops({ repo, pr, head, loopsAfter
   }
 }
 
-/** Latest appended loop observation wins; unknown measurements remain separate from zero. PURE. */
+/** Replay unique accepts and later runs in recorded order; explicit counts remain measurements. PURE. */
 export function postAcceptAdvisoryShadowReport(rows = []) {
   if (!Array.isArray(rows)) throw new TypeError('unreadable shadow ledger; inspect shadow ledger');
-  const observations = rows.filter(validAdvisoryRow);
-  const loops = new Map();
-  let skipped = rows.length - observations.length;
-  for (const row of rows) {
-    if (validAdvisoryLoops(row)) {
-      loops.set(advisoryKey(row), row.loopsAfter);
-      skipped--;
-    }
-  }
+  const { accepts, skipped } = replayAdvisoryLedger(rows);
+  const observations = [...accepts.values()].map(accept => accept.row);
   const report = { prs: new Set(observations.map(row => `${row.repo}#${row.pr}`)).size,
     wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, unmeasured: 0, laterBroken: 0, skipped };
   for (const row of observations) {
     if (row.wouldPush === true) report.wouldPush++;
-    const count = loops.has(advisoryKey(row)) ? loops.get(advisoryKey(row)) : row.loopsAfter;
-    if (validLoopCount(count)) report.loopsAfter += count;
+    const count = accepts.get(advisoryKey(row)).count;
+    if (validLoopCount(count)) {
+      if (!validLoopCount(report.loopsAfter + count)) throw new RangeError('loop total exhausted; inspect shadow ledger');
+      report.loopsAfter += count;
+    }
     else report.unmeasured++;
     if (row.wouldCard !== true) continue;
     report.wouldCard++;

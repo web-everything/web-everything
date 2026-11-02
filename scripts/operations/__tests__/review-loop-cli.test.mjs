@@ -1626,8 +1626,9 @@ describe('post-accept advisory shadow wiring', () => {
         // An actual accepted earlier head, followed by later reviews that need not accept.
         await review(HEAD_A, 'accepted');
         if (mode !== 'off') {
-          expect(rows).toHaveLength(1);
-          expect(rows[0]).toMatchObject({ headSha: HEAD_A, loopsAfter: null });
+          expect(rows).toHaveLength(2);
+          expect(rows[0]).toMatchObject({ kind: 'advisory-run', headSha: HEAD_A, runId: 'accepted' });
+          expect(rows[1]).toMatchObject({ headSha: HEAD_A, loopsAfter: null });
         }
         await review(HEAD_B, 'later-1', BLOCKING_ANSWER);
         if (['shadow', 'on'].includes(mode)) expect(rows.filter(row => row.kind === 'loops'))
@@ -1645,6 +1646,32 @@ describe('post-accept advisory shadow wiring', () => {
         .toMatchObject([{ headSha: HEAD_A, loopsAfter: 1, runId: 'later-1' }, { headSha: HEAD_A, loopsAfter: 2, runId: 'later-2' }]);
       else expect(result.logs.join('\n')).toContain('live review unaffected');
     });
+
+  it('replaying accepted run A after accepted run B never counts A against B', async () => {
+    const rows = [], store = createMemoryRunStore();
+    const io = { readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    const review = async (rev, id) => {
+      const { declaration, registry } = registryFor({ rev });
+      const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => id,
+        advisorySettings: () => ({ value: { mode: 'shadow' } }), advisoryLog: () => {},
+        recordAdvisoryShadow: facts => recordPostAcceptAdvisoryShadow({ ...facts, ...io }),
+        recordAdvisoryLoops: facts => recordPostAcceptAdvisoryLoops({ ...facts, ...io }),
+      });
+      expect(out.code).toBe(0);
+      expect(out.stopped).toBe('complete');
+      expect(out.run.findings.confirm).toBe('accept');
+    };
+    await review(HEAD_A, 'accept-A');
+    await review(HEAD_B, 'accept-B');
+    const before = structuredClone(rows);
+    await review(HEAD_A, 'accept-A');
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: HEAD_A, runId: 'accept-B', loopsAfter: 1 },
+    ]);
+  });
 
   it.each(['shadow', 'on', 'invalid-settings', 'settings-error', 'recorder-error'])(
     '%s preserves all live effects for an advisory-bearing would-card accept', async scenario => {
@@ -1685,7 +1712,7 @@ describe('post-accept advisory shadow wiring', () => {
       if (scenario !== 'settings-error') expect(result.decisions[0]).toMatchObject({
         wouldCard: scenario !== 'invalid-settings', wouldPush: scenario === 'invalid-settings',
       });
-      if (result.rows.length) expect(result.rows[0].loopsAfter).toBeNull();
+      if (result.rows.length) expect(result.rows.find(row => row.kind === 'we.post-accept-advisory-shadow').loopsAfter).toBeNull();
     });
 
   it.each(['off', 'shadow', 'on'])('%s preserves acceptance and effects, recording only when enabled', async mode => {
@@ -1714,7 +1741,7 @@ describe('post-accept advisory shadow wiring', () => {
     expect(result.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL))
       .toEqual(baseline.effects.filter(effect => effect.type === REVIEW_EFFECTS.LABEL));
     expect(result.rows).toHaveLength(mode === 'off' ? 0 : 1);
-    if (mode !== 'off') expect(result.rows[0]).toMatchObject({ pr: 1234, headSha: HEAD_A, wouldPush: true });
+    if (mode !== 'off') expect(result.rows.find(row => row.kind === 'we.post-accept-advisory-shadow')).toMatchObject({ pr: 1234, headSha: HEAD_A, wouldPush: true });
   });
 
   it.each(['settings', 'ledger', 'logging'])('%s failure never changes a completed accept', async failure => {
