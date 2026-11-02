@@ -3155,19 +3155,38 @@ function operatorCarryBacking(carried, target, { head, repo, pr, operatorRulings
     return latest && latest.from.runId === carried.from.runId && latest.from.key === carried.from.key
       && latest.result === carried.result && latest.card === carried.card ? backing : null;
   }
+  // A legacy-owner block on this finding written AFTER the backing ruling withdraws the carry, as it ends
+  // `findCarriedOperatorRuling`'s search: the persisted carry must not outlive the hold that search honours.
+  const after = operatorRulings.slice(operatorRulings.lastIndexOf(backing) + 1);
+  for (const o of after) {
+    if (!isLegacyOwnerBlock(o, repo) || o.pr !== pr || o.head === head) continue;
+    const ruled = (Array.isArray(records) ? records : []).find(r => r.runId === o.runId && r.head === o.head && r.pr === pr
+      && canonicalRepoSlug(r.repo) === canonicalRepoSlug(repo))?.referrals.find(f => f.key === o.key)?.finding;
+    if (!ruled || sameFindingForClearing(ruled, target.finding)) return null;
+  }
   const source = (Array.isArray(records) ? records : []).find(r => r.head === carried.from.head
     && r.runId === carried.from.runId && r.repo === repo && r.pr === pr);
   const from = source?.referrals.find(x => x.key === carried.from.key);
   return source && (!from || !sameFindingForClearing(from.finding, target.finding)) ? null : backing;
 }
 
+/** A `block` spelled with the repo's other (legacy/alias) owner: never adopted onto the record's spelling. */
+const isLegacyOwnerBlock = (o, repo) => Boolean(o) && o.result === 'block' && o.repo !== repo
+  && canonicalRepoSlug(o.repo) === canonicalRepoSlug(repo);
+
 /** Latest matching operator decision on an earlier head; the IO caller must prove unchanged cited lines. */
 export function findCarriedOperatorRuling(referral, { records = [], operatorRulings = [], head, repo, pr }) {
   const target = referral.finding;
   for (const o of [...operatorRulings].reverse()) {
-    if (o.head === head || o.repo !== repo || o.pr !== pr) continue;
-    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.repo === repo && r.pr === pr);
+    // A block written under the repo's legacy owner stays under that spelling (see `readOperatorRulings`), so it is
+    // matched by canonical repo: it must end this search exactly like a block spelled as the records are.
+    const legacyBlock = isLegacyOwnerBlock(o, repo);
+    if (o.head === head || (o.repo !== repo && !legacyBlock) || o.pr !== pr) continue;
+    const record = records.find(r => r.runId === o.runId && r.head === o.head && r.pr === pr
+      && (r.repo === repo || (legacyBlock && canonicalRepoSlug(r.repo) === canonicalRepoSlug(repo))));
     const finding = record?.referrals.find(f => f.key === o.key)?.finding;
+    // A legacy-owner block whose record or finding cannot be read fails closed: nothing carries past it.
+    if (legacyBlock && !finding) return null;
     // Clearing a mandatory referral is stricter than merging duplicates (exact path, line window, symmetric word
     // overlap, same severity): see `sameFindingForClearing`, the one definition the ledger's overrule shares.
     if (!finding || !sameFindingForClearing(finding, target)) continue;

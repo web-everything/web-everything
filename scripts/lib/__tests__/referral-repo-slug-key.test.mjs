@@ -1,7 +1,7 @@
 /** #6170: a ruling recorded under a repo's old owner must rule the finding a record names under the new one, and nothing else. */
 import { describe, it, expect } from 'vitest';
 import { readOperatorRulings, readReferralRecords, buildOperatorRulingComment, renderReferralRecord, mandatoryReferralState, mandatoryReferralReviewer,
-  validateReferralRecord, referralFindingKey, normalizeFinding, findSameHeadSiblingRuling, judgeSameGapPairs, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
+  validateReferralRecord, referralFindingKey, normalizeFinding, findSameHeadSiblingRuling, findCarriedOperatorRuling, judgeSameGapPairs, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
 import { canonicalRepoSlug } from '../repo-slug.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -284,5 +284,44 @@ describe('operator ruling repo spelling (#6170)', () => {
     const block = post(buildOperatorRulingComment({ version: 1, repo, pr, head, actor: 'chalbert', channel: 'c',
       reason: 'r', at: '2026-11-01T19:39:00.583Z', clearerId: 'x', rulings: [{ runId, key, result: 'block' }] }), 'chalbert');
     expect(state([comments[0], block, comments[1]], NEW_REPO)).toMatchObject({ pending: [], blocked: [] });
+  });
+  describe('a later old-owner block holds the same finding raised again on a new head', () => {
+    const NEXT = '2'.repeat(40);
+    const crossHead = result => {
+      const w = siblings(result);
+      const target = { ...w.target, head: NEXT, runId: 'review-pr-C', reviewer: mandatoryReferralReviewer('review-pr-C'),
+        carried: [] };
+      const stateAt = comments => mandatoryReferralState(comments, { head: NEXT, repo: NEW_REPO, pr: w.source.pr,
+        body: '<!-- authored-by-actor: author -->', cardReadable: () => true });
+      const find = comments => findCarriedOperatorRuling(target.referrals[0], { records: [w.source, w.third],
+        operatorRulings: readOperatorRulings(comments).rulings, head: NEXT, repo: NEW_REPO, pr: w.source.pr });
+      return { w, target, stateAt, find };
+    };
+    it.each(['card', 'not-real'])('%s: the block ends the cross-head search and withdraws a persisted carry', result => {
+      const { w, target, stateAt, find } = crossHead(result);
+      for (const repo of [OLD_REPO, 'Chalbert/Web-Everything']) {
+        const comments = [...w.recordComments, w.clearance, w.ruling(w.third, 'block', { repo })];
+        expect.soft(find(comments)).toBeNull();
+        const saved = post(renderReferralRecord({ ...target, carried: [{ ...w.carry, key: target.referrals[0].key }] }), 'web-everything');
+        expect.soft(stateAt([...comments, saved]).pending).toContain(target.referrals[0].key);
+      }
+    });
+    it.each(['card', 'not-real'])('%s: a block written BEFORE the clearance does not hold it', result => {
+      const { w, target, stateAt, find } = crossHead(result);
+      const comments = [...w.recordComments, w.ruling(w.third, 'block'), w.clearance];
+      expect(find(comments)).toMatchObject({ result, from: { head: HEAD, runId: w.source.runId } });
+      const saved = post(renderReferralRecord({ ...target, carried: [{ ...w.carry, key: target.referrals[0].key }] }), 'web-everything');
+      expect(stateAt([...comments, saved]).pending).not.toContain(target.referrals[0].key);
+    });
+    it('an old-owner block for another PR or on an unrelated finding does not hold the carry', () => {
+      const { w, find } = crossHead('card');
+      const other = w.ruling(w.third, 'block', { pr: 6171 });
+      expect(find([...w.recordComments, w.clearance, other])).toMatchObject({ result: 'card' });
+      const unrelated = { ...original, summary: 'An unrelated defect in the writer.' };
+      w.third.referrals = [{ seat: 'judgeCorrectness', original: unrelated, finding: normalizeFinding(unrelated),
+        key: referralFindingKey('judgeCorrectness', unrelated) }];
+      const records = [w.source, w.target, w.third].map(r => post(renderReferralRecord(r), 'web-everything'));
+      expect(find([...records, w.clearance, w.ruling(w.third, 'block')])).toMatchObject({ result: 'card' });
+    });
   });
 });
