@@ -99,13 +99,16 @@ const retryKeys = ['retryMain', 'retryTries', 'retryAfter'];
 function clearRetry(state, ref) { for (const key of retryKeys) delete state[key][ref]; }
 function readSyncState(file, io = fs) {
   let data;
+  // Migration and mixed-version rollout: a legacy file written after the new one (by a not-yet-reloaded worker)
+  // is authoritative, so its cooldowns and retry stops are never bypassed. The next write lands in the new file.
+  const legacyFile = file.replace(/\.state$/, '.json');
+  const mtime = path => { try { return io.statSync(path).mtimeMs; } catch (error) { if (error.code === 'ENOENT') return -1; throw error; } };
+  const source = mtime(legacyFile) > mtime(file) ? legacyFile : file;
   try {
-    data = JSON.parse(io.readFileSync(file, 'utf8'));
+    data = JSON.parse(io.readFileSync(source, 'utf8'));
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    // One-time migration: the pre-rename state file (retry caps, cooldowns) is read when no new file exists yet.
-    try { data = JSON.parse(io.readFileSync(file.replace(/\.state$/, '.json'), 'utf8')); }
-    catch (legacy) { if (legacy.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw legacy; }
+    data = { lastSyncedMain: {} };
   }
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
   for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {

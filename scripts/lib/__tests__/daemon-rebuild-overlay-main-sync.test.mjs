@@ -1609,4 +1609,15 @@ describe('R372 genuine merge conflict stops retrying', () => {
     tick(f, { spawnFn });
     expect(spawnFn).not.toHaveBeenCalled();
   });
+  it('a legacy file written after the new state (mixed-version worker) still holds its cooldown', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    moveRefTip(f);
+    const legacy = `${overlayFilePath(f.root, f.env)}.main-sync.json`;
+    fs.writeFileSync(legacy, JSON.stringify({ lastSyncedMain: {}, pushRetryMain: { [ref]: f.mainSha }, pushRetryAfter: { [ref]: Date.now() + 600_000 } }));
+    const later = new Date(Date.now() + 5000); fs.utimesSync(legacy, later, later);
+    const spawnFn = spawner();
+    tick(f, { spawnFn });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
 });
