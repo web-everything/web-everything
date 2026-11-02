@@ -42,10 +42,19 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
       encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
     });
     if (result.error || result.status !== 0) throw new Error(`LaunchAgents plist unreadable: ${name}`);
-    const args = JSON.parse(result.stdout).ProgramArguments;
+    const plist = JSON.parse(result.stdout);
+    const args = plist.ProgramArguments;
     if (!Array.isArray(args) || !args.length || args.some(arg => typeof arg !== 'string')) {
       throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
     }
+    // Fail closed on launchd inputs that can run code this scan cannot see.
+    const refuse = why => { throw new Error(`LaunchAgents unsupported dynamic execution refused: ${name}: ${why}`); };
+    if (plist.Program !== undefined && plist.Program !== args[0]) refuse('Program differs from ProgramArguments[0]');
+    if (plist.EnvironmentVariables && Object.keys(plist.EnvironmentVariables).some(key => /^NODE_/.test(key))) {
+      refuse('NODE_* environment variable');
+    }
+    const interpreter = basename(args[0] === '/usr/bin/env' ? args[1] ?? '' : args[0]);
+    if (interpreter !== 'node' && interpreter !== 'nodejs') refuse(`interpreter ${interpreter}`);
     // Eval flags are node's own only before the script; after it they are script arguments.
     let scriptSeen = false;
     // Only a script not preceded by a flag counts (a flag may take it as a value, e.g. --title /x.js).

@@ -185,6 +185,18 @@ it('refuses node eval after a flag that merely takes a script-shaped value', () 
   }) })).toThrow('LaunchAgents unsupported entrypoint/module argument refused: com.we.title.plist: -e');
 });
 
+it.each([
+  [{ ProgramArguments: ['node', '/tmp/x.mjs'], Program: '/bin/sh' }, 'Program differs'],
+  [{ ProgramArguments: ['node', '/tmp/x.mjs'], EnvironmentVariables: { NODE_OPTIONS: '--import=./x.mjs' } }, 'NODE_*'],
+  [{ ProgramArguments: ['/bin/sh', '-c', 'node -e "$CODE"'] }, 'interpreter sh'],
+  [{ ProgramArguments: ['/usr/bin/env', 'python3', 'x.py'] }, 'interpreter python3'],
+])('refuses launchd inputs that hide executable code: %j', (plist, why) => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.hidden.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: JSON.stringify(plist) }) }))
+    .toThrow(`LaunchAgents unsupported dynamic execution refused: com.we.hidden.plist: ${why}`);
+});
+
 it('refuses --import=./x even when its target exists in the clone', () => {
   const f = fixture();
   writeFileSync(join(f.root, 'x'), 'export {};');
