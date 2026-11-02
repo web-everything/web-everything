@@ -42,7 +42,7 @@ import { lockClosureScopeMode } from './closure-scope-settings.mjs';
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
-  liveApplied, carries = () => false, leftForMain = () => false,
+  liveApplied, carries = () => false, leftForMain = () => false, contentInBuild = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -83,13 +83,23 @@ export function matchReadyCandidate({
   if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
-  // Content-on-main is proven against the record's own build, never merely against CURRENT main.
-  const omitted = liveApplied.filter((a) => a?.ref
-    && !(a.sha && carries(a.sha, ready.adopt.finalSha)) && !leftForMain(a, ready.adopt.finalSha));
+  // No exemption for "landed on main": the CURRENT main having it says nothing about the record's (possibly older)
+  // main — the record itself must contain it (Codex round 2). A squash-landed overlay just refuses superseded (fail closed).
+  // The ONE exemption (live 2026-10-31 ET, perf5/perf-fetch overlays): an omitted overlay that this tick's plan itself
+  // auto-removed as `pr-merged`/`in-main` (`leftForMain`) AND whose applied sha is provably contained in THE RECORD'S
+  // OWN BUILD by content (`contentInBuild`: merging it onto that build changes nothing) is not lost — the candidate
+  // already has it. Its registration is already removed by the plan. Any other omission refuses.
+  const retired = [];
+  const omitted = liveApplied.filter((a) => {
+    if (!a?.ref) return false;
+    if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
+    if (a.sha && leftForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    return true;
+  });
   if (omitted.length > 0) {
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
-  return { adopt: ready.adopt, dropRefs: [], match: 'superseded' };
+  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
 /** Prove a removed overlay graduated into this build, including squash-merged content. Unknown evidence refuses. */

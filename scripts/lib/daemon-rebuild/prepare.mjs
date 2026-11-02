@@ -40,6 +40,14 @@ function validTipSha(raw) {
   return typeof raw?.tipSha === 'string' && FULL_SHA_RE.test(raw.tipSha) ? raw.tipSha : null;
 }
 
+/** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
+ * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
+export function contentContainedInBuild(git, sha, build) {
+  const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+  const t = String(m.stdout ?? '').split('\n')[0].trim();
+  return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
+}
+
 /**
  * Phase 1 (LOCKED, fast — no smoke): recovery, safety, fetch, `planRebuild`, overlay-list
  * edits, and the up-to-date/still-rejected/untracked-collision short-circuits — everything the old single-phase
@@ -770,9 +778,8 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
-        leftForMain: (a, build) => overlayGraduated({
-          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
-        }),
+        contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
+        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       // A saved candidate predates this tick's archives (auto-retirement may have run since it passed).
       // Hold it to the same rule as a fresh plan: every registered carrier's archived sources must be in
@@ -802,6 +809,7 @@ export async function prepareRebuild({
         alert('ready-candidate-adopted', {
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({
