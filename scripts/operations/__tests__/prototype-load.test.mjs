@@ -302,10 +302,14 @@ describe('canonicalAuditEvidence', () => {
     expect(prototypeLoad.canonicalAuditEvidence(reverse ? records.reverse() : records, SHA))
       .toEqual({ ok: false, reason: 'weakened' });
   });
-  it('a later canonical pass supersedes an older weakened record even across bases', () => {
-    const latest = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
-    expect(prototypeLoad.canonicalAuditEvidence([latest, auditRecord({ verdict: 'WEAKENED' })], SHA))
-      .toEqual({ ok: true, record: latest });
+  it('a pass over another base never masks a WEAKENED audit of a different base (fail closed)', () => {
+    const later = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
+    expect(prototypeLoad.canonicalAuditEvidence([later, auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('equal timestamps resolve by append order, so a later WEAKENED beats an earlier pass', () => {
+    const records = [auditRecord(), auditRecord({ verdict: 'WEAKENED' })];
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: false, reason: 'weakened' });
   });
   it('ignores newer foreign hashes, other heads and invalid dates when selecting a canonical record', () => {
     const record = auditRecord();

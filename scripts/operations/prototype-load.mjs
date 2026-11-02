@@ -20,17 +20,18 @@ export function readyEvidence(records, input) {
   const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   return record ? { source: 'ready-record', record } : null;
 }
-/** Latest canonical audit for this head, across bases. Empty-diff audits (base===head) never count, and each
- * base is validated by findAudit (contradictory findings rejected); later appended records break ties. */
+/** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
+ * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
+ * WEAKENED blocks, so a pass over a narrower base can never mask a WEAKENED audit of the fuller change. */
 export function canonicalAuditEvidence(records, sha) {
-  let latest = null;
   const bases = new Set(records.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base));
+  let pass = null;
   for (const base of bases) {
     const record = findAudit(records, { head: sha, base, questionHash: QUESTION_HASH });
-    if (record && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
+    if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+    if (record && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
   }
-  if (latest?.verdict === 'NOT WEAKENED') return { ok: true, record: latest };
-  return { ok: false, reason: latest?.verdict === 'WEAKENED' ? 'weakened' : 'no-record' };
+  return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 export function changedPaths(text) {
