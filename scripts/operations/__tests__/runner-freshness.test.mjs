@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { checkMainStaleness, gitRun } from '../../lib/main-staleness.mjs';
 import { assertRunnerFreshness, requiresFreshRunner, FRESHNESS_TTL } from '../runner-freshness.mjs';
-import { OPERATIONS, resolveOperation, cliPreflight } from '../run.mjs';
+import { OPERATIONS, resolveOperation, cliPreflight, createCodexAuditSink, finishCodexAudit } from '../run.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 
 function fixture(options = {}) {
@@ -203,5 +203,40 @@ describe('runner freshness policy', () => {
   });
   it('independent dispatch refusal remains authoritative', () => {
     expect(() => cliPreflight('dispatch-lane', { arm: () => {}, assertFresh: () => { throw new Error('dispatch refusal'); } })).toThrow('dispatch refusal');
+  });
+
+  describe('codex-audit --json', () => {
+    const SHA = 'a'.repeat(40), HEAD = 'b'.repeat(40);
+    const deps = (answer, out = []) => ({ resolveSha: ref => (ref === 'h' ? HEAD : SHA), runCodex: () => answer,
+      appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
+    const run = async (answer, json) => {
+      const written = [];
+      const sink = createCodexAuditSink({ makeDeps: () => deps(answer), write: t => written.push(t) });
+      const verdict = await sink({ base: 'm', head: 'h', json });
+      return { written, verdict, out: finishCodexAudit({ run: { verdict }, code: 0, lines: [], json }) };
+    };
+    it('json mode: nothing is written by the sink and stdout is only the parseable envelope', async () => {
+      const { written, verdict, out } = await run('NOT WEAKENED\n', true);
+      expect(written).toEqual([]);
+      expect(out.code).toBe(0);
+      expect(out.lines).toHaveLength(1);
+      const env = JSON.parse(out.lines[0]);
+      expect(env).toMatchObject({ verdict: 'NOT WEAKENED', base: SHA, head: HEAD, findings: [] });
+      expect(verdict.code).toBe(0);
+    });
+    it('json mode carries WEAKENED findings and a nonzero code', async () => {
+      const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', true);
+      expect(out.code).toBe(1);
+      expect(JSON.parse(out.lines[0])).toMatchObject({ verdict: 'WEAKENED', findings: ['run.mjs:1 loosened'] });
+    });
+    it('plain mode is unchanged: verdict then findings lines, no JSON', async () => {
+      const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', false);
+      expect(out.lines).toEqual(['WEAKENED', 'run.mjs:1 loosened']);
+    });
+    it('an incomplete audit keeps its code and prints no envelope', async () => {
+      const { out } = await run(undefined, true);
+      expect(out.code).toBe(3);
+      expect(out.lines).toEqual([]);
+    });
   });
 });
