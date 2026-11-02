@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { planRetirements, declaresSupersedes, mergeRefBase, carriedBeyondMain } from '../prototype-retire.mjs';
+import { planRetirements, planFetchFailed, declaresSupersedes, mergeRefBase, carriedBeyondMain } from '../prototype-retire.mjs';
 
 const dirs = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop(), { recursive: true, force: true }); });
@@ -320,5 +320,52 @@ describe('planRetirements', () => {
     const carried = carriedBeyondMain({ git: r.git, ref: 'lane/evil' });
     expect(carried).toMatchObject({ ok: true, unique: [], cleanMerges: false, contentInMain: false });
     expect(plan(r, [{ ref: 'lane/evil', pr: null }], ghStub().gh)[0]).toMatchObject({ action: 'keep', reason: 'unique-commits-not-on-main' });
+  });
+});
+
+describe('planFetchFailed (registration whose branch could not be fetched)', () => {
+  const REPO = 'web-everything/web-everything';
+  const OFF = 'f'.repeat(40);
+  const listGh = (prs, { fail = false } = {}) => (args) => {
+    if (fail || args[0] !== 'pr' || args[1] !== 'list') return { code: 1, stdout: '' };
+    return { code: 0, stdout: JSON.stringify(prs) };
+  };
+  const merged = (head, extra = {}) => ({ number: 7, state: 'MERGED', headRefName: 'lane/gone', headRefOid: head, mergeCommit: { oid: head }, ...extra });
+  const run = (r, gh, row = { ref: 'lane/gone' }) => planFetchFailed({ row, git: r.git, gh, repo: REPO });
+  const withMain = () => { const r = repo(); r.setRemote('main', r.ok('rev-parse', 'HEAD')); return r; };
+
+  it('retires a MERGED PR whose merge commit is on origin/main', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, listGh([merged(sha)]))).toMatchObject({ ref: 'lane/gone', action: 'retire', reason: 'pr-squash-merged', tip: sha, pr: 7 });
+  });
+  it('keeps when the PR is not MERGED', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, listGh([merged(sha, { state: 'OPEN' })]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+  });
+  it('keeps when the lookup fails or is unparseable', () => {
+    const r = withMain();
+    expect(run(r, listGh([], { fail: true }))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    expect(run(r, () => ({ code: 0, stdout: 'not json' }))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+  });
+  it('keeps when the merge commit is not an ancestor of origin/main', () => {
+    const r = withMain();
+    r.ok('checkout', '-q', '-b', 'side');
+    const off = r.commit('side.txt', 'x\n');
+    expect(run(r, listGh([merged(off)]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    expect(run(r, listGh([merged(OFF)]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+  });
+  it('keeps when several PRs or a different recorded PR number match, or an edge resolution is recorded', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, listGh([merged(sha), merged(sha, { number: 8 })]))).toMatchObject({ action: 'keep' });
+    expect(run(r, listGh([merged(sha)]), { ref: 'lane/gone', pr: 99 })).toMatchObject({ action: 'keep' });
+    expect(run(r, listGh([merged(sha)]), { ref: 'lane/gone', edgeResolution: { x: 1 } })).toMatchObject({ action: 'keep' });
+  });
+  it('keeps for an unknown repository', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(planFetchFailed({ row: { ref: 'lane/gone' }, git: r.git, gh: listGh([merged(sha)]), repo: '' })).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
   });
 });
