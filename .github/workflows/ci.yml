@@ -117,6 +117,8 @@ jobs:
         id: fui-app-token
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WE_APP_ID != '' }}
         continue-on-error: true
+        # A hung mint must not use up the changes job's timeout (that would fail changes and turn main red).
+        timeout-minutes: 1
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.WE_APP_ID }}

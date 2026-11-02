@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { decideQueueTestedSkip, MAX_RUNS_CHECKED, INPUT_SETTLE_MS, SIBLING_REPO } from '../skip-queue-tested-push.mjs';
+import { decideQueueTestedSkip, MAX_RUNS_CHECKED, INPUT_SETTLE_MS, SIBLING_REPO, SIBLING_DEFAULT_BRANCH } from '../skip-queue-tested-push.mjs';
 
 const sha = 'a'.repeat(40);
 const pushTree = 'b'.repeat(40);
@@ -134,6 +134,7 @@ describe('queue-tested CLI adapter', () => {
 
   it('pins the sibling repository the workflow checks out', () => {
     expect(SIBLING_REPO).toBe('frontier-ui/frontierui');
+    expect(SIBLING_DEFAULT_BRANCH).toBe('main');
   });
 
   it('uses the supplied repository for every WE endpoint', () => {
@@ -196,6 +197,9 @@ describe('queue-tested CLI adapter', () => {
     ['future quarantine push time', { qActivity: activity(quarantineTip, { timestamp: '2999-01-01T00:00:00Z' }) }],
     ['FUI default-branch API error', { fail: 'fui-branch' }],
     ['unsafe FUI default branch', { fuiBranch: '../main' }],
+    // Self-review round 2: a switch of the default branch to an old branch is invisible to the activity log.
+    ['FUI default branch switched away from main', { fuiBranch: 'next' }],
+    ['FUI default branch with different case', { fuiBranch: 'Main' }],
     ['empty FUI default branch', { fuiBranch: '' }],
     ['FUI tip API error', { fail: 'fui-tip' }],
     ['invalid FUI tip', { fuiTipOut: 'not-a-sha' }],

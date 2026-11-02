@@ -12,6 +12,7 @@ export const MAX_RUNS_CHECKED = 20;
 export const INPUT_SETTLE_MS = 10 * 60 * 1000;
 /** The sibling repo every full-suite job checks out at its default-branch tip (no `ref:`). */
 export const SIBLING_REPO = 'frontier-ui/frontierui';
+export const SIBLING_DEFAULT_BRANCH = 'main';
 /** Each git/gh call is bounded; the workflow step adds its own overall timeout-minutes. */
 const CALL_TIMEOUT_MS = 30_000;
 const isSha = (value) => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/i.test(value);
@@ -141,7 +142,9 @@ function readSiblingAt(exec, token) {
   if (typeof token !== 'string' || token.trim() === '') return { ok: false, error: 'no FUI token' };
   const env = { GH_TOKEN: token };
   const branch = exec('gh', ['api', `repos/${SIBLING_REPO}`, '--jq', '.default_branch'], env);
-  if (!/^[\w-]+$/.test(branch)) return { ok: false, error: 'unsafe default branch' };
+  // The activity log does not record a default-branch switch, so a switch to an old branch would look
+  // unchanged. Accept only the expected default; anything else keeps the full suite.
+  if (branch !== SIBLING_DEFAULT_BRANCH) return { ok: false, error: 'unexpected default branch' };
   const tip = exec('gh', ['api', `repos/${SIBLING_REPO}/branches/${branch}`, '--jq', '.commit.sha'], env);
   return { ok: true, tip, lastPush: lastPushOf(exec, SIBLING_REPO, branch, env) };
 }

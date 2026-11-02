@@ -72,6 +72,10 @@ describe('ci.yml queue-tested push relief and nightly full-run backstop', () => 
     expect(mint.uses).toBe('actions/create-github-app-token@v2');
     expect(mint.if).toBe("${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.WE_APP_ID != '' }}");
     expect(mint['continue-on-error']).toBe(true);
+    // Both fail-soft steps together stay inside the changes job's timeout.
+    const queue = steps.find((step) => step.id === 'queue');
+    expect(mint['timeout-minutes']).toBe(1);
+    expect(mint['timeout-minutes'] + queue['timeout-minutes']).toBeLessThan(jobs.changes['timeout-minutes']);
     expect(mint.with).toMatchObject({ owner: 'frontier-ui', repositories: 'frontierui', 'permission-contents': 'read' });
     expect(steps.indexOf(mint)).toBeLessThan(steps.indexOf(steps.find((step) => step.id === 'queue')));
   });
