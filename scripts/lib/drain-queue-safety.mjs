@@ -91,6 +91,13 @@ export function createMqSameHeadRefreshStore({ read, write }) {
   };
 }
 
+/** Bind the sweep's approval resolver lazily; only an explicit release permits refresh.
+ * Resolver errors propagate to mqSameHeadRefresh's fail-closed allow boundary.
+ */
+export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, repo, pr, head }) {
+  return { store, allow: () => approvedHeadHold({ repo, num: pr }, head) === false };
+}
+
 /** Owns recovery of a confirmed removal; the admission hold remains until the head changes. */
 export function mqSameHeadRefresh({ repo, pr, head, decision, exec = execFileSyncThrottled,
   log = () => {}, store, allow } = {}) {

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, mqSameHeadRefresh, createMqSameHeadRefreshStore } from '../drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, mqSameHeadRefresh, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -44,9 +44,13 @@ describe('merge-queue same-head failure admission', () => {
         if (putError) throw putError;
         return '{}';
       });
-      const pass = allow => mqSameHeadGuard({ repo, pr, head, exec, log, refresh: { store, allow } });
+      const run = refresh => mqSameHeadGuard({ repo, pr, head, exec, log, refresh });
+      const pass = allow => run({ store, allow });
+      const passWithHold = approvedHeadHold => run(createMqSameHeadRefreshOptions({
+        store, approvedHeadHold, repo, pr, head,
+      }));
       const puts = () => exec.mock.calls.filter(([, args]) => args.includes('PUT'));
-      return { store, log, exec, pass, puts };
+      return { store, log, exec, pass, passWithHold, puts };
     }
     it('held + green requests exactly one PUT pinned to the head, including across passes', () => {
       const f = fixture();
@@ -61,6 +65,45 @@ describe('merge-queue same-head failure admission', () => {
       f.pass();
       expect(f.puts()).toHaveLength(1);
       expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'pr')).toHaveLength(1);
+    });
+    it('wired not-held resolver and green PR issue exactly one PUT across passes', () => {
+      const f = fixture();
+      const approvedHeadHold = vi.fn(() => {
+        expect(f.exec.mock.calls.at(-1)[1][0]).toBe('pr');
+        expect(f.store.size).toBe(0);
+        return false;
+      });
+      expect(f.passWithHold(approvedHeadHold).hold).toBe(true);
+      f.passWithHold(approvedHeadHold);
+      expect(approvedHeadHold).toHaveBeenCalledTimes(1);
+      expect(approvedHeadHold).toHaveBeenCalledWith({ repo, num: pr }, head);
+      expect(f.puts()).toHaveLength(1);
+      expect(f.puts()[0][1]).toEqual(['api', '-X', 'PUT',
+        `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]);
+    });
+    it('wired held resolver preserves the approved head without spending its key', () => {
+      const f = fixture(), approvedHeadHold = vi.fn(() => true);
+      f.passWithHold(approvedHeadHold);
+      expect(approvedHeadHold).toHaveBeenCalledTimes(1);
+      expect(approvedHeadHold).toHaveBeenCalledWith({ repo, num: pr }, head);
+      expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+    });
+    it('wired resolver exception fails closed without spending its key', () => {
+      const f = fixture();
+      const approvedHeadHold = vi.fn(() => { throw new ReferenceError('proof unavailable'); });
+      expect(() => f.passWithHold(approvedHeadHold)).not.toThrow();
+      expect(approvedHeadHold).toHaveBeenCalledTimes(1);
+      expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+    });
+    it.each([undefined, null])('wired incomplete hold evidence %s fails closed', evidence => {
+      const f = fixture();
+      f.passWithHold(() => evidence);
+      expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+    });
+    it('wired missing resolver fails closed', () => {
+      const f = fixture();
+      expect(() => f.passWithHold(undefined)).not.toThrow();
+      expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
     });
     it('allow false retains the approved head without spending its key', () => {
       const f = fixture();
