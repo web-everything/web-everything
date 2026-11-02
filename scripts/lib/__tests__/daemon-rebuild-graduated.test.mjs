@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
+import { readOverlayEventLog } from '../daemon-rebuild/prepare.mjs';
+import { overlayFilePath } from '../daemon-overlays.mjs';
 
 const liveApplied = [
   { ref: 'lane/stack-base-refs-m1', sha: 'a'.repeat(40) },
@@ -67,6 +72,37 @@ function matchWith(evidence, overrides = {}) {
   }));
   return { args, leftForMain, match: adoption.matchReadyCandidate({ ...args, leftForMain }) };
 }
+
+describe('readOverlayEventLog', () => {
+  it('reads auto-dropped in-main events from the overlay directory and skips blank lines', () => {
+    const root = mkdtempSync(join(tmpdir(), 'daemon-rebuild-graduated-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: root };
+    try {
+      const events = autoDropped().events;
+      const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+      writeFileSync(file, `\n${events.map((event) => JSON.stringify(event)).join('\n \t\n')}\n\n`, 'utf8');
+      expect(readOverlayEventLog(root, env)).toEqual(events);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns no evidence when the overlay event log is missing', () => {
+    const root = mkdtempSync(join(tmpdir(), 'daemon-rebuild-graduated-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: root };
+    try {
+      expect(readOverlayEventLog(root, env)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('returns no partial evidence when an overlay event cannot be parsed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'daemon-rebuild-graduated-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: root };
+    try {
+      const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+      writeFileSync(file, `${JSON.stringify(autoDropped().events[1])}\ninvalid json\n`, 'utf8');
+      expect(readOverlayEventLog(root, env)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe('squash-graduated overlays in superseded ready candidates', () => {
   it('adopts a candidate that omits a squash-graduated, unregistered overlay', () => {

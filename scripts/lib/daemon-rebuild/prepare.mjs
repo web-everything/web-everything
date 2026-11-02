@@ -6,7 +6,7 @@ import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } fr
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
-import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
@@ -31,6 +31,14 @@ import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
+
+/** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
+export function readOverlayEventLog(root, env) {
+  try {
+    const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
+  } catch { return []; }
+}
 
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
  * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
@@ -458,10 +466,7 @@ export async function prepareRebuild({
       let overlayEvents;
       const readOverlayEvents = () => {
         if (overlayEvents === undefined) {
-          try {
-            const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
-            overlayEvents = readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
-          } catch { overlayEvents = []; }
+          overlayEvents = readOverlayEventLog(root, env);
         }
         return overlayEvents;
       };
