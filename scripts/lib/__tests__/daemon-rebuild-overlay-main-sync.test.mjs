@@ -1580,4 +1580,33 @@ describe('R372 genuine merge conflict stops retrying', () => {
     expect(tick(f, { spawnFn })).toMatchObject({ started: [] });
     expect(spawnFn).not.toHaveBeenCalled();
   });
+  it('an incomplete conflict pair (tip missing) fails closed and does not clear the retry stop', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    const state = json(sidecar(f)); delete state.conflictTip[ref];
+    fs.writeFileSync(sidecar(f), JSON.stringify(state));
+    const spawnFn = spawner();
+    tick(f, { spawnFn });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(json(sidecar(f)).attemptedMain[ref]).toBe(f.mainSha);
+  });
+
+  it('a known conflict pair still lets a pending failure alert be recovered', async () => {
+    const f = fixture({ conflict: true });
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    const state = json(sidecar(f)); delete state.failureAlertedAt[ref]; state.firstFailureAt[ref] = Date.now() - 3 * 3600_000;
+    fs.writeFileSync(sidecar(f), JSON.stringify(state));
+    const before = alerts(f).length;
+    tick(f, { spawnFn: spawner() });
+    expect(alerts(f).length).toBe(before + 1);
+  });
+
+  it('the clone fence keeps its pre-rename file name', async () => {
+    const f = fixture({ conflict: true });
+    const fence = `${overlayFilePath(f.root, f.env)}.main-sync.json.clone.lock`;
+    fs.mkdirSync(dirname(fence), { recursive: true }); fs.writeFileSync(fence, 'held');
+    const spawnFn = spawner();
+    tick(f, { spawnFn });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
 });

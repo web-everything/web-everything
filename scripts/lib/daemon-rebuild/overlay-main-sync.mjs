@@ -21,7 +21,8 @@ import { buildHeavyTestInvocation, runHeavyTests } from './auto-rebase.mjs';
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
 const sidecar = (root, env) => `${overlayFilePath(root, env)}.main-sync.state`;
-const cloneLock = (root, env) => `${sidecar(root, env)}.clone.lock`;
+// The clone-wide fence keeps its original name so old and new workers still exclude each other.
+const cloneLock = (root, env) => `${overlayFilePath(root, env)}.main-sync.json.clone.lock`;
 const failureMarker = (root, env, ref) => join(`${alertsFilePath(root, env)}.main-sync`,
   `${createHash('sha256').update(ref).digest('hex')}.json`);
 const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-rebase`, `${encodeURIComponent(ref)}.lock`);
@@ -125,6 +126,10 @@ function readSyncState(file, io = fs) {
   const staleRefs = new Set([...Object.keys(data.staleRef), ...Object.keys(data.staleRegistration)]);
   if ([...staleRefs].some(ref => !Object.hasOwn(data.staleRef, ref) || !Object.hasOwn(data.staleRegistration, ref))) {
     throw new Error('incomplete stale registration state; operator repair required');
+  }
+  const pairRefs = new Set([...Object.keys(data.conflictMain), ...Object.keys(data.conflictTip)]);
+  if ([...pairRefs].some(ref => !Object.hasOwn(data.conflictMain, ref) || !Object.hasOwn(data.conflictTip, ref))) {
+    throw new Error('incomplete conflict pair state; operator repair required');
   }
   const retryRefs = new Set(retryKeys.flatMap(key => Object.keys(data[key])));
   if ([...retryRefs].some(ref => retryKeys.some(key => !Object.hasOwn(data[key], ref)))) {
@@ -286,7 +291,10 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const tip = sha(run(['rev-parse', `origin/${ref}`]));
       const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
       // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
-      if (pairKnown) { result.skipped.push(ref); continue; }
+      if (pairKnown) {
+        if (Object.hasOwn(synced.firstFailureAt, ref) && !Object.hasOwn(synced.failureAlertedAt, ref)) failureAlert(root, env, ref);
+        result.skipped.push(ref); continue;
+      }
       if (Object.hasOwn(synced.conflictMain, ref)) {
         // Either sha moved: forget the pair now, so the normal retry cap governs any later failure.
         const old = synced.conflictMain[ref];
