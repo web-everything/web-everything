@@ -140,6 +140,45 @@ describe('PR cancelled required-check rerun acceptance', () => {
     expectNoMutation(f);
   });
 
+  it.each([
+    ['FAILURE', { workflowName: 'Other CI', app: { id: 99 } }],
+    ['ERROR', { __typename: 'StatusContext', name: undefined, context: 'smoke', state: 'ERROR', conclusion: undefined }],
+    ['FAILURE', { app: { id: 99 } }],
+    ['FAILURE', { workflowName: 'Other CI' }],
+    ['MYSTERY', { workflowName: 'Other CI' }],
+    [null, { workflowName: 'Other CI' }],
+  ])('refuses an older required namesake with %s behind a newer cancellation', (conclusion, overrides) => {
+    const f = fixture({ prs: [pr({ statusCheckRollup: [
+      check('smoke', conclusion, {
+        startedAt: '2026-10-26T10:00:00Z', completedAt: '2026-10-26T10:10:00Z', ...overrides,
+      }),
+      check('smoke', 'CANCELLED'), check('test'), check('lint'),
+    ] })] });
+    const result = f.tick();
+    expect(result).toMatchObject({ dispatch: [], applied: [], refusals: [
+      expect.objectContaining({ reason: 'required-namesake-failure', error: expect.stringContaining('inspect') }),
+    ] });
+    expect(f.options.readRuns).not.toHaveBeenCalled();
+    expect(f.record()).toEqual({});
+    expectNoMutation(f);
+  });
+
+  it.each([false, true])('reruns a cancelled latest attempt after an older same-source failure (reversed: %s)', reversed => {
+    const attempts = [
+      check('smoke', 'FAILURE', {
+        app: { id: 99 }, startedAt: '2026-10-26T10:00:00Z', completedAt: '2026-10-26T10:10:00Z',
+      }),
+      check('smoke', 'CANCELLED', { app: { id: 99 } }),
+    ];
+    const f = fixture({ prs: [pr({ statusCheckRollup: [
+      ...(reversed ? attempts.reverse() : attempts), check('test'), check('lint'),
+    ] })] });
+    expect(f.tick()).toMatchObject({
+      dispatch: [expect.objectContaining(action())], refusals: [], applied: [expect.objectContaining({ ok: true })],
+    });
+    expect(f.options.rerunFailed).toHaveBeenCalledOnce();
+  });
+
   it('ignores cancellation of an optional check', () => {
     const f = fixture({ prs: [pr({ statusCheckRollup: [check('smoke'), check('test'), check('lint'), check('optional', 'CANCELLED')] })] });
     expect(f.tick().dispatch).toEqual([]);

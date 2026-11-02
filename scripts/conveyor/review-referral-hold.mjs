@@ -13,9 +13,6 @@ import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
-import { latestCheckNamed, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
-import { parsePrCancelledRerunComment, readLiveRequiredChecks, rowRunId, safeRequiredBase } from './pr-cancelled-rerun.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
@@ -73,7 +70,6 @@ export function reviewRunEvidence(run) {
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
-    verdict: verdict?.verdict,
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
@@ -353,8 +349,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
   return !(head && parseReviewedSha(pr?.comments) === head);
 }
 
-export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env),
-  readRequiredChecks, readBranchProtected, defaultBranch = 'main' } = {}) {
+export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
@@ -363,48 +358,11 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const last = latestReviewAttempt(history);
   if (!last || last.persistenceFailed) return null;
   const wake = wakeTime(pr, last);
-  const noVerdict = verdictNeverLanded(pr, last, now);
-  // A CI marker only bypasses the same-head review count, never a spent persist budget.
-  const persistWake = operatorWakeTime(pr, last);
-  const persistAttempts = history.filter(r => r.startedAt >= persistWake && r.persistenceFailed);
-  const persistSpent = persistAttempts.some(persistRetryBudgetSpent) || persistAttempts.reduce((n, r) =>
-    n + 1 + (Number(r.persistRetries) || 0), 0) > REFERRAL_RETRY_MS.length;
-  // The marker proves submission only; this head's current rollup must also prove CI recovered.
-  // Only a completed accepted review covering this exact head may use it, at most once.
-  if (!persistSpent && !noVerdict && last.verdict === 'accept' && Number.isFinite(last.completedAt) && !last.parked &&
-    Array.isArray(last.pending) && last.pending.length === 0) {
-    // The first valid marker owns this head's one CI release. Later markers cannot renew it
-    // after any review attempt (including an unfinished one) has started at or after that marker.
-    const marker = (pr.comments ?? []).map(c => ({
-      ...parsePrCancelledRerunComment(c, repo, pr.number, pr.headRefOid), at: Date.parse(c.createdAt),
-    })).filter(c => c.runId && Number.isFinite(c.at)).sort((a, b) => a.at - b.at || a.runId - b.runId)[0];
-    const rerunAt = marker?.at;
-    if (rerunAt > last.completedAt && rerunAt <= now && !history.some(r => r.startedAt >= rerunAt)) {
-      // Unknown, stale or partial requirements cannot prove recovery. Keep the normal hold and its
-      // operator re-arm path when protection or current-head check evidence is unavailable.
-      const checks = safeRequiredBase(pr.baseRefName) ? readLiveRequiredChecks({
-        repo, branch: pr.baseRefName, defaultBranch, readRequiredChecks, readBranchProtected,
-      }) : null;
-      const recovered = Array.isArray(checks) && checks.length > 0 &&
-        checks.every(name => !requiredCheckReadNeeded(pr, name) && (() => {
-          const matches = pr.statusCheckRollup.filter(row => (row?.name || row?.context) === name);
-          const green = row => row?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion);
-          const ids = matches.map(row => rowRunId(row, repo));
-          if (ids.some(id => !/^[1-9]\d*$/.test(id ?? '') || !Number.isSafeInteger(Number(id)))) return false;
-          const sources = new Set(matches.map((row, i) => JSON.stringify([ids[i], row.app ?? null])));
-          if (sources.size > 1 && !matches.every(green)) return false;
-          const row = latestCheckNamed(pr.statusCheckRollup, name);
-          const finishedAt = Date.parse(row?.completedAt ?? row?.completed_at);
-          return green(row) && Number(rowRunId(row, repo)) >= marker.runId &&
-            Number.isFinite(finishedAt) && finishedAt > rerunAt;
-        })());
-      if (recovered) return null;
-    }
-  }
   // A completed run whose verdict NEVER LANDED on the PR (GitHub refused the comment/label write; live 2026-10-07,
   // #4288: GraphQL error as the review finished, so the PR stayed `review:pending` with no verdict and this hold
   // then silenced it forever, unlogged) did not review the head in any way the PR can see. Re-arm it ourselves,
   // bounded to VERDICT_RETRY_EXTRA extra runs, then bounded cool-down releases with exponential backoff.
+  const noVerdict = verdictNeverLanded(pr, last, now);
   // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
   // budget as soon as read identifies the head, even if the process dies before advise can finish.
   const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));
@@ -631,20 +589,8 @@ function defaultReadComments({ repo, number }) {
 }
 
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,
-  readComments = defaultReadComments, readRequiredChecks = getRequiredStatusChecks, readBranchProtected,
-  defaultBranch = 'main' } = {}) {
+  readComments = defaultReadComments } = {}) {
   const runs = readRuns();
-  // One fresh snapshot per base, fetched only when a rerun could release a hold.
-  const requiredByBase = new Map();
-  const readRequired = args => {
-    if (!requiredByBase.has(args.branch)) {
-      let result;
-      try { result = readRequiredChecks(args); }
-      catch { /* Unknown requirements keep candidates on this base held. */ }
-      requiredByBase.set(args.branch, result);
-    }
-    return requiredByBase.get(args.branch);
-  };
   return prs.map(pr => {
     // List reads cap comments at 100; later operator events must reach both hold decisions.
     if (Array.isArray(pr.comments) && pr.comments.length >= GH_LIST_COMMENT_CAP
@@ -659,7 +605,7 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     const { hold, released } = evaluateReferralHold(pr, runs, { repo, now, env });
     const blockRuledReferrals = blockRuledReferralsFor(pr, { repo });
     return { ...pr, blockRuledReferrals,
-      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env, readRequiredChecks: readRequired, readBranchProtected, defaultBranch })) };
+      referralHold: hold ?? (released ? null : decideSameHeadHold(pr, runs, { repo, now, env })) };
   });
 }
 

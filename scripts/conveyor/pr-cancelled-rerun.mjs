@@ -2,7 +2,7 @@
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
-import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
+import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded, rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { isTrustedMarkerAuthor, countTrustedLeadingMarker } from '../lib/marker-authorship.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
@@ -205,11 +205,30 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     }
     const rows = checks.map(name => latestCheckNamed(pr.statusCheckRollup, name));
     const conclusion = row => String(row?.conclusion || row?.state || '').toUpperCase();
+    // Supersede attempts only within a source; independent namesakes keep their evidence.
+    const sources = new Map();
+    for (const row of pr.statusCheckRollup) {
+      const name = row?.name || row?.context;
+      if (!checks.includes(name)) continue;
+      const app = row.app?.id || row.app?.slug;
+      const workflow = row.workflowName;
+      const creator = row.creator?.login;
+      // Missing source identity cannot prove that another attempt supersedes this row.
+      const source = app || workflow || creator
+        ? JSON.stringify([name, rollupRowKind(row), app, workflow, creator]) : Symbol();
+      if (!sources.has(source)) sources.set(source, []);
+      sources.get(source).push(row);
+    }
+    const requiredRows = [...sources.values()].map(attempts =>
+      latestCheckNamed(attempts, attempts[0].name || attempts[0].context));
     if (rows.some(row => ['QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING'].includes(row?.status))) {
       refuse('required-pending', { ...detail, error: 'wait for the live required-check attempt to finish; retry next tick' });
       continue;
     }
-    if (rows.some(row => isFailedCheckRow(row) && conclusion(row) !== 'CANCELLED')) continue;
+    if (requiredRows.some(row => isFailedCheckRow(row) && conclusion(row) !== 'CANCELLED')) {
+      refuse('required-namesake-failure', { ...detail, error: 'inspect all required-check sources; retry next tick' });
+      continue;
+    }
     const cancelled = rows.filter(row => row?.status === 'COMPLETED' && conclusion(row) === 'CANCELLED');
     if (!cancelled.length) continue;
     if (checks.some(name => requiredCheckReadNeeded(pr, name))) {
@@ -219,6 +238,10 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     if (rows.some(row => !row || typeof row !== 'object' || Array.isArray(row) ||
       !(row.status === 'COMPLETED' && ['CANCELLED', 'SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(row.conclusion)))) {
       refuse('required-evidence-unreadable', { ...detail, error: 'inspect required-check evidence; retry next tick' });
+      continue;
+    }
+    if (requiredRows.some(row => !['CANCELLED', 'SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(conclusion(row)))) {
+      refuse('required-namesake-failure', { ...detail, error: 'inspect all required-check sources; retry next tick' });
       continue;
     }
     try {
