@@ -343,6 +343,10 @@ describe('forge leaked-state reaper', () => {
     expect(await uidBusy(workerUid, proc)).toBe(true);
     expect(await uidBusy(4000000123, proc)).toBe(false);
   });
+  it.runIf(process.platform === 'linux')('default filesystem wiring scans the real /proc and settles to a boolean', async () => {
+    // Wiring only: fail-closed busy under load is legitimate, so the value is not asserted, just that the scan completes.
+    expect(typeof await uidBusy(4000000123)).toBe('boolean');
+  });
   it('fails closed (busy) when a fixture entry keeps vanishing', async () => {
     const proc = procFixture({entries: ['42'], readStatus: () => { throw procError('ENOENT'); }});
     expect(await uidBusy(4000000123, proc)).toBe(true);
