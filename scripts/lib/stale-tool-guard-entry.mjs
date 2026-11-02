@@ -4,7 +4,7 @@
 import { guardToolCheckout } from './stale-tool-guard.mjs';
 
 // Vitest-spawned tool children run fixture checkouts with scrubbed PATH/env; vitest never exists in operator shells.
-if (!process.env.VITEST) try {
+if (process.env.VITEST !== 'true') try {
   const status = await guardToolCheckout({ entry: process.argv[1] });
   if (status !== undefined) process.exit(status);
 } catch (error) {
