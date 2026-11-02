@@ -14,6 +14,7 @@ import {
   acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock,
   resolveWriterPriorityMaxSkips, DEFAULT_WRITER_PRIORITY_MAX_SKIPS,
   resolveWriterPriorityAfter, DEFAULT_WRITER_PRIORITY_AFTER, resolveWriterClaimTtlMs, DEFAULT_WRITER_CLAIM_TTL_MS,
+  resolveWriterWaitPriorityMs, DEFAULT_WRITER_WAIT_PRIORITY_MS,
 } from '../daemon-clone-lock.mjs';
 import {
   withSelfSync, cloneStuckSmell, resolveCloneStuckSmellMs, DEFAULT_CLONE_STUCK_SMELL_MS,
@@ -248,5 +249,98 @@ describe('bounded writer-priority skips (live 2026-10-07: review ticks skipped b
     await acquireWrite(clone, { ...base, owner: 'W', waitMs: 5, pollMs: 1, now: () => t, sleep: async (ms) => { t += ms; } });
     releaseRead(clone, { lockRoot, owner: 'F' });
     expect(acquireRead(clone, { ...base, owner: 'R', nowMs: t }).ok).toBe(true);
+  });
+});
+
+// ── bounded wait: a writer that has waited past a threshold queues NEW readers behind it ───────────────────────
+// A steady stream of fresh readers is refused `writer-active` while the writer drains, each refusal builds a
+// reader-starvation claim, and after 3 the writer backed off `reader-priority` — so the stream starved the writer.
+describe('writer wait priority — a writer past its wait threshold is not displaced by a reader stream', () => {
+  const dead = () => 'dead';
+
+  /** R holds a read slot until `rReleaseMs`; a fresh reader (distinct owner + key) arrives every `arriveMs`
+   *  and retries 3 times (enough to claim starvation priority). Returns the writer result + wait + readers. */
+  async function simulate({ waitPriorityMs, rReleaseMs = 100_000, arriveMs = 5000 }) {
+    const lockRoot = mkTmp('dcww-root-');
+    const clone = mkTmp('dcww-clone-');
+    const common = { lockRoot, probe: alive, leaseMinutes: LEASE, writerClaimTtlMs: TTL, readerPriorityAfter: 3 };
+    let t = 0;
+    expect(acquireRead(clone, { ...common, owner: 'R', readerKey: 'R', nowMs: t }).ok).toBe(true);
+    let rHeld = true;
+    let n = 0;
+    const admitted = [];
+    let rEntryWhileWaiting = true;
+    const step = () => {
+      if (rHeld && t >= rReleaseMs) { releaseRead(clone, { lockRoot, owner: 'R' }); rHeld = false; }
+      if (rHeld) {
+        const snap = inspectCloneLock(clone, { lockRoot, probe: alive, leaseMinutes: LEASE });
+        if (!snap.readers.some((e) => e.owner === 'R')) rEntryWhileWaiting = false;
+      }
+      if (t % arriveMs === 0) {
+        n += 1;
+        for (let i = 0; i < 3; i += 1) {
+          const r = acquireRead(clone, { ...common, owner: `S${n}`, readerKey: `S${n}`, nowMs: t });
+          if (r.ok) { admitted.push(`S${n}`); break; }
+        }
+      }
+    };
+    const startedAt = t;
+    const w = await acquireWrite(clone, {
+      ...common, owner: 'W', waitMs: 600_000, pollMs: 1000, now: () => t, writerWaitPriorityMs: waitPriorityMs,
+      sleep: async (ms) => { t += ms; step(); },
+    });
+    return { w, waitedMs: t - startedAt, admitted, rEntryWhileWaiting, lockRoot, clone, rHeld };
+  }
+
+  it('BEFORE: with the wait priority off, the reader stream makes the writer back off reader-priority', async () => {
+    const r = await simulate({ waitPriorityMs: 0 });
+    expect(r.w.ok).toBe(false);
+    expect(r.w.reason).toBe('reader-priority');
+  });
+
+  it('AFTER: past the threshold the writer keeps waiting and acquires as soon as the held reader drains', async () => {
+    const r = await simulate({ waitPriorityMs: 20_000 });
+    expect(r.w).toEqual({ ok: true });
+    expect(r.waitedMs).toBeGreaterThanOrEqual(100_000);
+    expect(r.waitedMs).toBeLessThanOrEqual(101_000);
+    // New readers queued behind the writer: none was admitted while it waited.
+    expect(r.admitted).toEqual([]);
+    console.log(`writer wait under reader stream: off => gave up reader-priority; on => acquired after ${r.waitedMs}ms`);
+  });
+
+  it('never breaks an already-held reader lock while the writer waits past its threshold', async () => {
+    const r = await simulate({ waitPriorityMs: 20_000 });
+    expect(r.rEntryWhileWaiting).toBe(true);
+  });
+
+  it('readers are unaffected without a waiting writer: a starved reader still gets priority before the threshold', async () => {
+    const r = await simulate({ waitPriorityMs: 1e9 });
+    expect(r.w.ok).toBe(false);
+    expect(r.w.reason).toBe('reader-priority');
+  });
+
+  it('a crashed waiting writer never blocks readers: its intent lapses once its pid is dead', async () => {
+    const lockRoot = mkTmp('dcww-root-');
+    const clone = mkTmp('dcww-clone-');
+    let t = 0;
+    expect(acquireRead(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'R', nowMs: t }).ok).toBe(true);
+    // W2 starts waiting on R and holds its writer intent; the "crash" is modelled by probing its pid dead.
+    const w2 = acquireWrite(clone, {
+      lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'W2', waitMs: 1000, pollMs: 500, now: () => t,
+      writerWaitPriorityMs: 100, sleep: async (ms) => { t += ms; },
+    });
+    // While W2 is waiting a reader is queued behind it...
+    expect(acquireRead(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'S', readerKey: 'S', nowMs: t }).reason).toBe('writer-active');
+    // ...but once W2's pid is dead the reader gets in.
+    expect(acquireRead(clone, { lockRoot, probe: dead, leaseMinutes: LEASE, owner: 'S', readerKey: 'S', nowMs: t }).ok).toBe(true);
+    await w2;
+  });
+
+  it('resolves the setting with a safe default (0 = off, junk = default)', () => {
+    expect(DEFAULT_WRITER_WAIT_PRIORITY_MS).toBeGreaterThan(0);
+    expect(resolveWriterWaitPriorityMs({})).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
+    expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '0' })).toBe(0);
+    expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: '45000' })).toBe(45000);
+    expect(resolveWriterWaitPriorityMs({ WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS: 'x' })).toBe(DEFAULT_WRITER_WAIT_PRIORITY_MS);
   });
 });
