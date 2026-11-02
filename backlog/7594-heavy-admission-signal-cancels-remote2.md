@@ -1,4 +1,5 @@
 ---
+bornAs: x40a9dk
 kind: story
 size: 3
 status: open
