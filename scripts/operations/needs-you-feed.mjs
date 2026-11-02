@@ -9,6 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
+import { GATE_OUTCOMES, liveResultGateState } from '../lib/red-team-gate.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
@@ -65,10 +66,12 @@ const sectionReasons = {
   rulingNeeded: 'review parked with confirmed findings — your block/card/not-real ruling',
   stoodDown: 'fix agent asked a question — your judgment; no label changed',
 };
-// Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
+// Only these kinds can be represented (and therefore resolved by absence) by the report and its live gates.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
-export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
+export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down', 'confirmed-break-owed-send-back', 'red-team-undecided']);
+// Gate verdicts are new evidence about a head, never a repeat of the stall question: they are not suppressed by it.
+const GATE_KINDS = new Set(['confirmed-break-owed-send-back', 'red-team-undecided']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -191,27 +194,37 @@ async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
 /**
  * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
  * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
- * that cannot be read is KEPT (an alert is never suppressed on missing evidence); the failure is logged. Only items
+ * that cannot be read is kept as red-team-undecided; the failure is logged. Only items
  * that came from the queue's `ready` section are judged. Returns `{kept, held}`.
  */
 export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
   fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
   const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
+  const undecided = item => ({ ...item, kind: 'red-team-undecided',
+    reason: 'the red team has no explicit pass recorded on the live head' });
   const out = new Array(items.length); const held = [];
   const judge = async (index) => {
     const item = items[index];
     if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
-    // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
-    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
+    // Missing or late evidence keeps an alert without claiming that all gates passed.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = undecided(item); return; }
+    let checked = item;
     try {
       const view = await readLivePr(item, { gh, cwd });
+      // Publish the head actually checked, not a stale report head or a later lookup.
+      checked = { ...item, head: view.headRefOid };
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       if (reasons.length) { held.push({ item, reasons }); return; }
-      // Publish the head that was actually checked, not a stale one from the report or a later lookup.
-      out[index] = { ...item, head: view.headRefOid };
-    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
+      const state = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo);
+      if (state.sendBackOutcome === GATE_OUTCOMES.SENT_BACK || state.sendBackOutcome === GATE_OUTCOMES.ROUND_CAP) {
+        out[index] = { ...checked, kind: 'confirmed-break-owed-send-back',
+          reason: 'a confirmed red-team break is owed a send-back on the live head' };
+      } else if (state.result !== null && state.outcomes.has(GATE_OUTCOMES.NOTHING_TO_SEND) && state.sendBackOutcome === null) {
+        out[index] = checked;
+      } else out[index] = undecided(checked);
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };
   let next = 0;
   await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
@@ -295,7 +308,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
     // published twice (one already open stays, so it is never cleared by this filter).
     const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
-    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const asked = i => !GATE_KINDS.has(i.kind) && !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
