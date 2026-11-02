@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { heapCapArgs } from '../../../scripts/lib/node-heap-cap.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const templates = [root, join(root, 'launchd')].flatMap((dir) =>
@@ -56,6 +57,25 @@ describe('launchd templates', () => {
       const serialized = typeof value === 'boolean' ? (value ? '1' : '0') : Array.isArray(value) ? value.join(',') : String(value);
       expect(overrides[keys[key]], key).not.toBe(serialized);
     }
+  });
+
+  it.each([['review-daemon', 4608, 'review-daemon.mjs'], ['fix-daemon', 4096, 'reconcile-fix-dispatch-daemon.mjs']])(
+    'launches the %s with the configured V8 heap cap right after the node binary', (key, cap, script) => {
+      const file = key === 'fix-daemon' ? 'com.we.fix-dispatch-daemon.plist.example' : 'com.we.review-daemon.plist.example';
+      const text = templates.find(({ name }) => name === file)?.text ?? '';
+      const args = [...(text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1] ?? '')
+        .matchAll(/<string>([^<]*)<\/string>/g)].map(([, v]) => v);
+      expect(heapCapArgs(key)).toEqual([`--max-old-space-size=${cap}`]);
+      expect(args.length).toBe(3);
+      expect(args[0]).toMatch(/\/node$/);
+      expect(args[1]).toBe(heapCapArgs(key)[0]);
+      expect(args[2]).toMatch(new RegExp(`${script.replace('.', '\\.')}$`));
+    });
+
+  it('ships a portable review-daemon template', () => {
+    const text = templates.find(({ name }) => name === 'com.we.review-daemon.plist.example')?.text ?? '';
+    expect(text).toContain('<string>com.we.review-daemon</string>');
+    expect(text).not.toMatch(/\/Users\/(?!you\/)|\/home\//);
   });
 
   it('keeps private key paths as placeholders', () => {
