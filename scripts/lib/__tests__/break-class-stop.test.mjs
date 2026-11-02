@@ -125,4 +125,26 @@ describe('break-class policy and shadow observer', () => {
     expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: changed } })).toMatchObject({ kind: 'break-class-stop' });
     expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: changed } })).toMatchObject({ skipped: 'already-logged' });
   });
+
+  it('a possibly cut comment list (exactly one page, unmarked) is persisted as incomplete evidence, never as a clean no-stop', () => {
+    const dir = tmp(); const filler = Array.from({ length: 100 }, (_, i) => ({ author: { login: 'x' }, body: `c${i}`, createdAt: new Date(Date.UTC(2026, 9, 1, 0, i)).toISOString() }));
+    const args = { pr: PR, repo: 'org/repo', subject: { ...subject(), comments: filler }, env, dir, now: Date.UTC(2026, 9, 21), log: () => {} };
+    expect(observeBreakClassStop(args)).toMatchObject({ kind: 'break-class-stop', incompleteEvidence: true, wouldStop: false });
+    expect(observeBreakClassStop({ ...args, subject: { ...args.subject, commentsComplete: true } }).incompleteEvidence).toBeUndefined();
+  });
+  it('unreadable evidence is persisted with the human-review requirement, not silently skipped', () => {
+    const dir = tmp();
+    const args = { pr: PR, repo: 'org/repo', subject: { ...subject(), comments: 'garbage' }, env, dir, now: Date.UTC(2026, 9, 21), log: () => {} };
+    const r = observeBreakClassStop(args);
+    expect(r).toMatchObject({ kind: 'break-class-stop', incompleteEvidence: true });
+    expect(r.reason).toMatch(/human review/);
+    expect(readFileSync(join(dir, '2026-10.jsonl'), 'utf8')).toMatch(/incompleteEvidence/);
+  });
+  it('dedup hash includes comment author identity', () => {
+    const dir = tmp();
+    const args = { pr: PR, repo: 'org/repo', subject: subject(), env, dir, now: Date.UTC(2026, 9, 21), log: () => {} };
+    expect(observeBreakClassStop(args)).toMatchObject({ wouldStop: true });
+    const stranger = replay6033.map(c => ({ ...c, author: { login: 'stranger' } }));
+    expect(observeBreakClassStop({ ...args, subject: { ...subject(), comments: stranger } }).skipped).toBeUndefined();
+  });
 });
