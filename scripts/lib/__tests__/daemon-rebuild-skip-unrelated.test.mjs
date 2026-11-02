@@ -228,6 +228,19 @@ describe('the skip decision covers everything the shared candidate smoke exercis
     expect(smokeSurfaceEntries({ WE_SMOKE_DAEMON_ENTRIES: 'x/extra-daemon.mjs' })).toContain('x/extra-daemon.mjs');
   });
 
+  it('a missing default smoke entry keeps unrelated code conservative beside readable entries', () => {
+    const root = mktemp('we-skip-missing-surface-');
+    writeFile(root, entry, 'export {};\n');
+    for (const file of surface) writeFile(root, file, 'export {};\n');
+    const options = { root, entries: [entry], env: { WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' } };
+    expect(makeSkipCheck(options)(['scripts/unrelated.mjs']).skip).toBe(true);
+    rmSync(join(root, surface[0]));
+    const missing = makeSkipCheck(options);
+    expect(missing(['scripts/unrelated.mjs']).skip).toBe(false);
+    expect(missing([surface[0]]).skip).toBe(false);
+    expect(missing(['docs/a.md']).skip).toBe(true);
+  });
+
   it.each([
     ['a sibling daemon entry', 'skills-src/conveyor/review-daemon.mjs'],
     ['lane-pool.mjs (lane-pool-list / lane-acquire-release)', 'scripts/lane-pool.mjs'],
@@ -425,11 +438,13 @@ describe('a non-ASCII changed path is matched, not C-quoted past the closure', (
 // ── review round 2 (#4272): a script a daemon SPAWNS by path is code it runs, though no `import` names it ───────
 describe('a script the daemon spawns by path is part of what it runs (not "unrelated")', () => {
   const ENV = { WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' };
+  // These fixtures isolate spawn traversal; the shared smoke surface is covered in the describe above.
+  const surface = () => [];
   /** A throwaway tree (no git) holding `files`, and the real `makeSkipCheck` built over it. */
   function treeCheck(files, entries = ['scripts/d.mjs']) {
     const root = mktemp('we-skip-spawn-');
     for (const [name, body] of Object.entries(files)) writeFile(root, name, body);
-    return makeSkipCheck({ root, entries, env: ENV });
+    return makeSkipCheck({ root, entries, env: ENV, surface });
   }
   const spawnUrl = "import { spawn } from 'node:child_process';\nspawn(process.execPath, [new URL('./child.mjs', import.meta.url).pathname]);\n";
 
@@ -479,7 +494,7 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     for (const [name, body] of Object.entries(files)) writeFile(root, name, body);
     gitOk(root, ['init', '-q', '-b', 'main']);
     gitOk(root, ['add', '-A']);
-    return makeSkipCheck({ root, entries, env: ENV, ...extra });
+    return makeSkipCheck({ root, entries, env: ENV, surface, ...extra });
   }
 
   it('a path assembled from pieces (join(ROOT, "scripts", "tools", "c.mjs")) still reaches the child and ITS imports', () => {
@@ -540,10 +555,12 @@ describe('a script the daemon spawns by path is part of what it runs (not "unrel
     const root = mktemp('we-skip-unreadable-');
     writeFile(root, 'scripts/d.mjs', 'export {};\n');
     writeFile(root, 'scripts/other.mjs', '1;\n');
-    const broken = makeSkipCheck({ root, entries: ['scripts/d.mjs'], env: ENV, readFile: () => { throw new Error('EIO'); } });
+    const readFile = vi.fn(() => { throw new Error('EIO'); });
+    const broken = makeSkipCheck({ root, entries: ['scripts/d.mjs'], env: ENV, surface, readFile });
     expect(check(['scripts/other.mjs']).skip).toBe(true);
     expect(broken(['scripts/other.mjs']).skip).toBe(false);
     expect(broken(['docs/a.md']).skip).toBe(true);
+    expect(readFile).toHaveBeenCalledWith(join(root, 'scripts/d.mjs'));
   });
 
   it('the pure decision honours closure.spawnedNames and still skips unrelated code', () => {
