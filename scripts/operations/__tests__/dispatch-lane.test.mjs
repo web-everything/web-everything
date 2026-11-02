@@ -455,6 +455,8 @@ describe('the lane comes from the tick core or nowhere', () => {
           launchKind,
           launch: { num: '3037', lane: 8, pr: 6244, reason: 'red-ci' },
           laneRef: 'lane/dispatch-scope-multi',
+          // Repair briefs do not consume the build-only ITEM_SPEC_PATH token in BRIEF.
+          briefTemplate: 'scope: {{SCOPE}}',
           repoTokens: briefTokensForRepo('we', { itemNum: '3037' }),
         });
         const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' });
