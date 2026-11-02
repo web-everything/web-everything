@@ -400,3 +400,93 @@ describe('unlabeled unpublished red-team discovery', () => {
     expect(posts).toBe(0);
   });
 });
+
+describe('advisory label ledger shadow comparison', () => {
+  const github = () => [pr(1, ['advisory:accepted'], NEW_HEAD), pr(2, [], HEAD, [])];
+  const ledgerPr = (number, names, headRefOid = NEW_HEAD) => ({
+    number, headRefOid, isDraft: false, labels: names.map(name => ({ name })),
+  });
+  const ledger = (prs = [ledgerPr(1, ['advisory:accepted']), ledgerPr(2, [], HEAD)]) => ({
+    ok: true, source: 'ledger', repo: 'o/n', prs, stateCursor: 7,
+    lastDeliveryAt: Date.now(), ageMs: 0,
+  });
+  const compareLines = logs => logs.filter(line => line.startsWith('advisory-label-sweep ledger-compare'));
+  function run(options) {
+    const p = provider(), logs = [];
+    const results = sweepAdvisoryLabels({ repo: 'o/n', provider: p, listPrs: github,
+      log: line => logs.push(line), ...options });
+    return { results, writes: p.calls.set, logs };
+  }
+  function comparison(logs, agree, disagree, saved) {
+    const lines = compareLines(logs);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toMatch(/[\r\n]/);
+    expect(lines[0]).toMatch(/\bmode=shadow\b/);
+    expect(lines[0]).toMatch(new RegExp(`\\bagree=${agree}\\b`));
+    expect(lines[0]).toMatch(new RegExp(`\\bdisagree=${disagree}\\b`));
+    expect(lines[0]).toMatch(new RegExp(`\\bsaved=${saved}\\b`));
+    return lines[0];
+  }
+  function reasonFor(line, number, reason) {
+    // Delimiters are unspecified; the diagnostic must associate each number with its reason.
+    expect(line).toMatch(new RegExp(`(?:\\b${number}\\b\\D{0,30}${reason}|${reason}\\D{0,30}\\b${number}\\b)`));
+  }
+
+  it.each([
+    ['agreeing', () => ledger(), 2, 0],
+    ['different labels', () => ledger([ledgerPr(1, []), ledgerPr(2, [], HEAD)]), 1, 1],
+    ['ledger-only PR', () => ledger([...ledger().prs, ledgerPr(99, ['advisory:accepted'])]), 2, 1],
+  ])('keeps results and provider writes identical to off for an %s ledger', (_name, makeLedger, agree, disagree) => {
+    const snapshot = makeLedger();
+    const off = run({ ledgerMode: 'off', ledger: snapshot });
+    const shadow = run({ ledgerMode: 'shadow', ledger: snapshot });
+    expect(off.results).toEqual([{ num: 1, remove: ['advisory:accepted'] }]);
+    expect(off.writes).toEqual([{ repo: 'o/n', number: 1, spec: { remove: ['advisory:accepted'] } }]);
+    expect(shadow.results).toEqual(off.results);
+    expect(shadow.writes).toEqual(off.writes);
+    expect(compareLines(off.logs)).toEqual([]);
+    comparison(shadow.logs, agree, disagree, 1);
+  });
+
+  it('logs each disagreeing PR number with its reason in exactly one comparison line', () => {
+    const snapshot = ledger([ledgerPr(1, []), ledgerPr(99, ['advisory:accepted'])]);
+    const { logs } = run({ ledgerMode: 'shadow', ledger: snapshot });
+    const line = comparison(logs, 0, 3, 1);
+    reasonFor(line, 1, 'labels-differ');
+    reasonFor(line, 2, 'missing-in-ledger');
+    reasonFor(line, 99, 'missing-in-github');
+  });
+
+  it('logs an unavailable ledger fallback and still uses GitHub results and writes', () => {
+    const unavailable = { ok: false, source: 'unavailable', fallback: 'github', reason: 'coverage-gap' };
+    const off = run({ ledgerMode: 'off', ledger: unavailable });
+    const shadow = run({ ledgerMode: 'shadow', ledger: unavailable });
+    expect(shadow.results).toEqual(off.results);
+    expect(shadow.writes).toEqual(off.writes);
+    expect(shadow.writes).toHaveLength(1);
+    expect(compareLines(off.logs)).toEqual([]);
+    expect(comparison(shadow.logs, 0, 0, 0)).toContain('coverage-gap');
+  });
+
+  it('never reads or writes a ledger-only PR carrying an advisory label', () => {
+    const p = provider(), reads = [], logs = [];
+    const results = sweepAdvisoryLabels({ repo: 'o/n', provider: p,
+      listPrs: () => [], readPr: ({ number }) => { reads.push(number); return pr(number, ['advisory:accepted'], NEW_HEAD); },
+      ledger: ledger([ledgerPr(99, ['advisory:accepted'])]), ledgerMode: 'shadow',
+      log: line => logs.push(line) });
+    expect(results).toEqual([]);
+    expect(p.calls.set).toEqual([]);
+    expect(reads).toEqual([]);
+    reasonFor(comparison(logs, 0, 1, 1), 99, 'missing-in-github');
+  });
+
+  it('defaults to shadow when a ledger result is supplied', () => {
+    comparison(run({ ledger: ledger() }).logs, 2, 0, 1);
+  });
+
+  it('emits no comparison line for a null ledger', () => {
+    const result = run({ ledgerMode: 'shadow', ledger: null });
+    expect(compareLines(result.logs)).toEqual([]);
+    expect(result.results).toEqual(run({ ledgerMode: 'off', ledger: null }).results);
+  });
+});
