@@ -368,6 +368,18 @@ describe('gateReadyItems: a confirmed red-team break on the live head is owed a 
     const late = await gateReadyItems(itemsFromReport(report), report, { log: () => {}, deadlineMs: -1, gh: async () => { throw new Error('unused'); } });
     expect(late.kept[0].reason).toMatch(/red-team check unverified/);
   });
+  it('fails closed on a confirmed line the parser cannot read (no impact)', async () => {
+    const odd = advisory(head, '1. [**confirmed**] (logic) `scripts/run.mjs:485` — impact missing\n');
+    expect((await run([odd])).kept[0]).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
+  });
+  it('an unverified pass keeps open keys, so a read failure never clears a confirmed-break alert', async () => {
+    const open = diffFeed([], [{ repo, pr: 6239, head, kind: 'confirmed-break-owed-send-back', reason: 'r' }], at);
+    const { kept } = await gateReadyItems(itemsFromReport(report), report, { log: () => {}, gh: async () => { throw new Error('rate limited'); } });
+    expect(kept.incomplete).toBe(true);
+    const next = diffFeed(open.openKeys, kept, at, { clearKinds: REPORT_KINDS });
+    expect(next.openKeys).toContain(`${repo}#6239@${head}:confirmed-break-owed-send-back`);
+    expect(next.lines.join('\n')).not.toMatch(/NEEDS-YOU-CLEARED/);
+  });
   it('resolves by absence like the other report kinds', () => {
     const open = diffFeed([], [{ repo, pr: 6239, head, kind: 'confirmed-break-owed-send-back', reason: 'r' }], at);
     const next = diffFeed(open.openKeys, [], at, { clearKinds: REPORT_KINDS });

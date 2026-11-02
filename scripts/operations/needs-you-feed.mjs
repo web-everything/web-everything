@@ -8,7 +8,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
-import { liveResultGateState } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, redTeamMarker } from '../lib/red-team-gate.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -201,7 +202,8 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   const deadline = Date.now() + deadlineMs;
   const out = new Array(items.length); const held = [];
   // An alert is never dropped on missing evidence, but it must not claim the red-team check passed when it did not run.
-  const unverified = (i) => ({ ...i, reason: `${i.reason} (live red-team check unverified)` });
+  let unverifiedCount = 0;
+  const unverified = (i) => (unverifiedCount++, { ...i, reason: `${i.reason} (live red-team check unverified)` });
   const judge = async (index) => {
     const item = items[index];
     if (item.kind !== 'needs-you' || !ready.has(`${item.repo}#${item.pr}`)) { out[index] = item; return; }
@@ -215,6 +217,12 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       // The red-team gate only sends back BROKEN, so a clear label can hide a confirmed break of any severity. Read the
       // gate's own live result for exactly this head (trusted author only, carried results included); a break is owed a send-back, not a human review.
       const breaks = (liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo).result?.findings ?? []).filter(f => f.confirmed);
+      // Fail closed: the parser drops a confirmed line it cannot read (e.g. no impact). A trusted advisory for this exact
+      // head that shows more confirmed lines than were parsed still owes a send-back; the unreadable ones are named so.
+      const marker = redTeamMarker(item.pr, view.headRefOid).toLowerCase();
+      const shown = Math.max(0, ...(view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && String(c.body).trimStart().toLowerCase().startsWith(marker))
+        .map(c => (String(c.body).match(/^\d+\. \[\*\*confirmed\*\*\]/gm) ?? []).length));
+      for (let n = breaks.length; n < shown; n++) breaks.push({ index: '?', impact: 'unreadable', file: null, line: null, confirmed: true });
       if (breaks.length) {
         const named = breaks.map(f => `#${f.index} ${f.impact ?? 'impact?'}${f.file ? ` ${f.file}${f.line != null ? `:${f.line}` : ''}` : ''}`).join('; ');
         out[index] = { ...item, kind: 'confirmed-break-owed-send-back', head: view.headRefOid,
@@ -228,7 +236,8 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   let next = 0;
   await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
   const kept = out.filter(Boolean);
-  kept.incomplete = items.incomplete;
+  // An unverified alert may stand in for an open confirmed-break one: keep every open key rather than clear it by absence.
+  kept.incomplete = items.incomplete || unverifiedCount > 0;
   return { kept, held };
 }
 /**
