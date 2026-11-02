@@ -337,12 +337,22 @@ describe('forge leaked-state reaper', () => {
     expect((await makeRunner().telemetry()).activeRuns).toBe(1);
     expect(await exists(lock)).toBe(true);
   });
-  it.runIf(process.platform === 'linux')('sees a live process by its credentials, and a uid with none as idle', async () => {
-    // Real /proc credential format, but only this test process's own entry: a full /proc scan on a
-    // loaded shared runner sees other tests' children vanish and (by design) fails closed to busy.
-    const own = {readdir: async () => [String(process.pid)], readFile: path => readFile(path)};
-    expect(await uidBusy(process.getuid(), own)).toBe(true);
-    expect(await uidBusy(4000000123, own)).toBe(false);
+  it.runIf(process.platform === 'linux')('sees live credentials, and proves an absent uid idle in a stable process set', async () => {
+    expect(await uidBusy(process.getuid())).toBe(true);
+    // Unrelated host processes can vanish during every retry, correctly keeping a full scan busy.
+    // Pin only the listing to this live test process; still read its real /proc credentials.
+    const proc = {
+      async readdir(path) {
+        expect(path).toBe('/proc');
+        return [String(process.pid)];
+      },
+      async readFile(path) {
+        expect(path).toBe('/proc/' + process.pid + '/status');
+        return readFile(path);
+      },
+    };
+    expect(await uidBusy(process.getuid(), proc)).toBe(true);
+    expect(await uidBusy(4000000123, proc)).toBe(false);
   });
   it('keeps empty, malformed and pre-lease reservations even when old and idle', async () => {
     const old = new Date(Date.now() - 3600e3);

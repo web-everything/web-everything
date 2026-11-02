@@ -43,7 +43,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1824,4 +1824,79 @@ function safeJson(stdout) {
     try { return JSON.parse(lines[i]); } catch { /* keep walking back */ }
   }
   return null;
+}
+
+/** Advisory observations use a separate shadow ledger, never judgment-bearing verdict events. */
+export async function recordPostAcceptAdvisoryShadow(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryShadow', options);
+}
+
+export async function recordPostAcceptAdvisoryLoops(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryLoops', options);
+}
+
+export async function recordPostAcceptAdvisoryRating(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryRating', options);
+}
+
+// Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
+const advisoryWrites = new Map();
+async function recordAdvisoryObservation(recorder, options) {
+  try {
+    return await recordAdvisoryObservationContained(recorder, options);
+  } catch { return null; }
+}
+
+async function recordAdvisoryObservationContained(recorder, options) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
+  const injected = Object.hasOwn(options, 'readLedgerRows') || Object.hasOwn(options, 'appendLedgerRow');
+  const path = options.ledgerPath ?? join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
+  const previous = advisoryWrites.get(path) ?? Promise.resolve();
+  const pending = previous.then(async () => {
+    let lock;
+    const lockPath = `${path}.lock`;
+    try {
+      if (injected && (typeof options.readLedgerRows !== 'function' || typeof options.appendLedgerRow !== 'function')) {
+        throw new Error('incomplete shadow ledger IO; supply both reader and writer');
+      }
+      if (!injected) {
+        mkdirSync(dirname(path), { recursive: true });
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          try { lock = openSync(lockPath, 'wx'); break; }
+          catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            if (Date.now() >= deadline) throw new Error('shadow ledger lock busy after 2000ms; inspect writer before removing an orphaned lock');
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+        }
+      }
+      const policy = await import('../lib/review-loop-policy.mjs');
+      return await policy[recorder]({
+        readLedgerRows: () => {
+          let text;
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+          return text.split('\n').filter(Boolean).flatMap(line => {
+            try { return [JSON.parse(line)]; } catch { return []; }
+          });
+        },
+        appendLedgerRow: row => {
+          let text = '';
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+          const separator = text && !text.endsWith('\n') ? '\n' : '';
+          appendFileSync(path, `${separator}${JSON.stringify(row)}\n`);
+          return { ok: true };
+        },
+        ...options,
+      });
+    } catch (error) {
+      try { options.out?.(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+      return null;
+    } finally {
+      if (lock !== undefined) { closeSync(lock); unlinkSync(lockPath); }
+    }
+  });
+  advisoryWrites.set(path, pending);
+  try { return await pending; }
+  finally { if (advisoryWrites.get(path) === pending) advisoryWrites.delete(path); }
 }
