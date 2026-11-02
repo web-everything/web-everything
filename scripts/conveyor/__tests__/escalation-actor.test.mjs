@@ -382,6 +382,15 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
     expect(takeovers(plan({ comments: [finding(NEXT)] }))).toEqual([]);
   });
 
+  it('audit: an older head sharing the abbreviated round prefix cannot authorize a takeover', () => {
+    const older = HEAD.slice(0, 9) + 'c'.repeat(31);
+    const current = pr({ headRefOid: older, statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: older }] });
+    const clash = { body: `reviewed ${HEAD}` };
+    const result = plan({ headRefOid: older, comments: [finding(HEAD), clash], statusCheckRollup: current.statusCheckRollup },
+      { escalationStreaks: [item({ head: older, streak: 2 })] });
+    expect(takeovers(result)).toEqual([]);
+  });
+
   it('ignores an escalation for a stale head', () => {
     expect(takeovers(plan({}, { escalationStreaks: [item({ head: NEXT, streak: 9 })] }))).toEqual([]);
   });

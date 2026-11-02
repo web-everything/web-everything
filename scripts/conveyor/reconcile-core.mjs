@@ -3882,7 +3882,11 @@ export function planReconcile({
       row?.pr === prNumber && /^[a-f0-9]{40}$/i.test(row.head ?? '') && row.head === pr.headRefOid
       && Number.isSafeInteger(row.streak) && row.streak > 0 && typeof row.cause === 'string' && row.cause.trim());
     const defectRound = escalation && currentRound(pr.comments, pr.headRefOid, { strict: true });
-    const defects = defectRound?.head && sameHeadSha(defectRound.head, pr.headRefOid)
+    // Round heads are abbreviated, so a distinct full sha sharing that prefix could pass as this head: fail closed.
+    const prefixClash = defectRound?.head && (pr.comments ?? []).some(comment =>
+      (String(comment?.body ?? '').toLowerCase().match(/\b[a-f0-9]{40}\b/g) ?? [])
+        .some(sha => sha !== pr.headRefOid.toLowerCase() && sameHeadSha(defectRound.head, sha)));
+    const defects = defectRound?.head && sameHeadSha(defectRound.head, pr.headRefOid) && !prefixClash
       ? openDefects(pr.comments, pr.headRefOid) : null;
     // At the ordinary cap, fall through to its shared handler unchanged (including review grants and human parking).
     if (!isCardBatch && attempts < effectiveRoundCap
