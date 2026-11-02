@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
-import { laneGitConfigArgs } from './lane-git-hardening.mjs';
+import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { checkoutRootFor, guardedPoolRoot } from './lane-pool-paths.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -121,13 +121,9 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     const policy = resolveStaleToolSettings({ env, settings, log });
     // No inherited Git repository, executable, config or transport context may redirect this guard.
     const cleanEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
-    // Support HTTPS and SSH origins while keeping executable helpers and local transports denied.
-    const gitEnv = { ...cleanEnv, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: 'https:ssh' };
+    const gitEnv = laneGitHardeningEnv(scrubGitRepoEnv(cleanEnv), { remoteFetch: true });
     const git = (args, cwd = root) => {
-      const result = exec('git', ['-C', cwd, ...laneGitConfigArgs(),
-        '-c', 'protocol.ext.allow=never', '-c', 'protocol.allow=never',
-        '-c', 'protocol.https.allow=always', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.file.allow=never',
-        ...args], { cwd, env: gitEnv,
+      const result = exec('git', ['-C', cwd, ...args], { cwd, env: gitEnv,
         encoding: 'utf8', timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, shell: false });
       if (result?.error || result?.status !== 0 || typeof result.stdout !== 'string') {
         throw new Error(`Git ${args[0]} failed or exceeded its ${GIT_TIMEOUT_MS}ms / ${MAX_BUFFER}-byte bound`);
@@ -142,8 +138,11 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     const count = git(['rev-list', '--count', `HEAD..${upstream}`]).trim();
     const behind = /^\d+$/.test(count) ? Number(count) : NaN;
     if (!nonnegative(behind)) throw new Error('Unknown or oversized upstream commit count');
+    const mergeBase = git(['merge-base', 'HEAD', upstream]).trim();
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(mergeBase)) throw new Error('Invalid merge-base commit ID');
+    // Only changes on the upstream side count; local commits/edits are not upstream changes.
     // NUL avoids Git's quoted filename output and preserves whitespace in real paths.
-    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', 'HEAD', upstream, '--']);
+    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', mergeBase, upstream, '--']);
     const changedPaths = diff.includes('\0') ? diff.split('\0').filter(Boolean) : diff.split('\n').filter(Boolean);
     let depPaths;
     try { depPaths = await importClosure(entry, { root }); } catch (error) {

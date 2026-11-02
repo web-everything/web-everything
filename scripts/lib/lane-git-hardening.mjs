@@ -43,6 +43,20 @@ const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.ssh.allow', 'always'],
 ]);
 
+// Fetches from an untrusted lane must not invoke configured credential/prompt helpers
+// or opt into executable/local transports. Keep ordinary callers and remote proofs unchanged.
+const REMOTE_FETCH_CONFIG_PINS = Object.freeze([
+  ['credential.helper', ''],
+  ['core.askPass', ''],
+  ['protocol.allow', 'never'],
+  ['protocol.https.allow', 'always'],
+  ['protocol.ssh.allow', 'always'],
+  ['protocol.ext.allow', 'never'],
+  ['protocol.file.allow', 'never'],
+  ['protocol.http.allow', 'never'],
+  ['protocol.git.allow', 'never'],
+]);
+
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
 export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => ['-c', `${k}=${v}`]);
 
@@ -119,17 +133,23 @@ export function scrubGitRepoEnv(env) {
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
  * @param {Record<string,string|undefined>} env
- * @param {{remoteProbe?: boolean}} options Restrict transports only for an isolated remote proof.
+ * @param {{remoteProbe?: boolean, remoteFetch?: boolean}} options Remote proof or credential-free HTTPS/SSH fetch policy.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, remoteFetch = false } = {}) {
   // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
   // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
   const out = { ...env, GIT_NO_LAZY_FETCH: '1' };
   delete out.GIT_EXTERNAL_DIFF;
+  if (remoteFetch) {
+    for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE']) delete out[key];
+    out.GIT_TERMINAL_PROMPT = '0';
+    out.GIT_ALLOW_PROTOCOL = 'https:ssh';
+  }
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
-  const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;
+  const remotePins = remoteFetch ? REMOTE_FETCH_CONFIG_PINS : remoteProbe ? REMOTE_PROBE_CONFIG_PINS : [];
+  const pins = [...LANE_GIT_CONFIG_PINS, ...remotePins];
   pins.forEach(([k, v], i) => {
     out[`GIT_CONFIG_KEY_${start + i}`] = k;
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;

@@ -143,3 +143,37 @@ it('scrubs config-defined hooks, which run whatever core.hooksPath says', () => 
   expect(scrubRiskyLaneConfig(dir, { log: () => {} }).removed).toEqual(['hook.attack.event', 'hook.attack.command']);
   expect(riskyLaneConfig(git([...LANE_CONFIG_LIST_ARGS]))).toEqual([]);
 });
+
+it('remoteFetch resets credential helpers and askpass and allows only HTTPS and SSH without changing existing modes', () => {
+  const inherited = { PATH: '/bin', GIT_ASKPASS: 'attack', SSH_ASKPASS: 'attack', SSH_ASKPASS_REQUIRE: 'force',
+    GIT_TERMINAL_PROMPT: '1', GIT_ALLOW_PROTOCOL: 'ext:file',
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '!attack' };
+  const env = laneGitHardeningEnv(inherited, { remoteFetch: true });
+  const pins = Array.from({ length: Number(env.GIT_CONFIG_COUNT) },
+    (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+  expect(pins[0]).toEqual(['credential.helper', '!attack']);
+  expect(Object.fromEntries(pins)).toMatchObject({ ...Object.fromEntries(LANE_GIT_CONFIG_PINS),
+    'credential.helper': '', 'core.askPass': '', 'protocol.allow': 'never',
+    'protocol.https.allow': 'always', 'protocol.ssh.allow': 'always', 'protocol.ext.allow': 'never',
+    'protocol.file.allow': 'never', 'protocol.http.allow': 'never', 'protocol.git.allow': 'never' });
+  expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+  expect(env.GIT_ALLOW_PROTOCOL).toBe('https:ssh');
+  for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE']) expect(env[key]).toBeUndefined();
+  expect(inherited.GIT_ASKPASS).toBe('attack');
+  for (const options of [{}, { remoteProbe: true }]) {
+    const unchanged = laneGitHardeningEnv(inherited, options);
+    for (const key of Object.keys(inherited).filter(key => key !== 'GIT_CONFIG_COUNT')) {
+      expect(unchanged[key]).toBe(inherited[key]);
+    }
+    const keys = Array.from({ length: Number(unchanged.GIT_CONFIG_COUNT) }, (_, i) => unchanged[`GIT_CONFIG_KEY_${i}`]);
+    expect(keys.filter(key => key === 'credential.helper')).toHaveLength(1);
+    const pins = Object.fromEntries(Array.from({ length: Number(unchanged.GIT_CONFIG_COUNT) },
+      (_, i) => [unchanged[`GIT_CONFIG_KEY_${i}`], unchanged[`GIT_CONFIG_VALUE_${i}`]]));
+    if (options.remoteProbe) {
+      expect(pins).toMatchObject({ 'protocol.allow': 'never', 'protocol.https.allow': 'always',
+        'protocol.http.allow': 'always', 'protocol.git.allow': 'always', 'protocol.ssh.allow': 'always' });
+    } else {
+      expect(keys.some(key => key.startsWith('protocol.'))).toBe(false);
+    }
+  }
+});

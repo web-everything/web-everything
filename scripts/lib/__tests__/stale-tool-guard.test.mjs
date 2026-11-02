@@ -34,6 +34,9 @@ function put(root, path, text) {
 const success = (stdout = '') => ({ status: 0, stdout, stderr: '' });
 const failure = () => ({ status: 1, stdout: '', stderr: 'fixture git failure' });
 const UPSTREAM_COMMIT = 'a'.repeat(40);
+const MERGE_BASE_COMMIT = 'd'.repeat(40);
+const configPins = env => Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) },
+  (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
 
 describe('evaluateStaleness', () => {
   it.each([
@@ -126,7 +129,7 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', upstream =
     expect(command).toBe('git');
     expect(options.cwd).toBe(args.includes('--show-toplevel') ? process.cwd() : root);
     if (args.includes('--show-toplevel')) return failure(); // Model a non-Git invocation cwd.
-    const operation = ['fetch', 'rev-parse', 'rev-list', 'diff', 'worktree'].find((name) => args.includes(name));
+    const operation = ['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff', 'worktree'].find((name) => args.includes(name));
     const stage = operation === 'worktree' ? `worktree-${args[args.indexOf('worktree') + 1]}` : operation;
     if (stage === fail) {
       if (throws) throw new Error('fixture exec failure');
@@ -138,7 +141,14 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', upstream =
       return success(upstream);
     }
     if (operation === 'rev-list') return success(behind);
-    if (operation === 'diff') return success(changed);
+    if (operation === 'merge-base') {
+      expect(args.slice(2)).toEqual(['merge-base', 'HEAD', upstream.trim()]);
+      return success(`${MERGE_BASE_COMMIT}\n`);
+    }
+    if (operation === 'diff') {
+      expect(args.slice(2)).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', MERGE_BASE_COMMIT, upstream.trim(), '--']);
+      return success(changed);
+    }
     if (stage === 'worktree-add') {
       expect(args).toContain('--detach');
       expect(args.at(-1)).toBe(upstream.trim());
@@ -182,6 +192,9 @@ describe('review regressions', () => {
       if (!args.includes('fetch')) return runner(command, args, options);
       // Reuse the guard's exact config/env for a read-only transport probe; the
       // subsequent count/diff use the current-checkout fixture above.
+      expect(options.env.GIT_ALLOW_PROTOCOL).toBe('https:ssh');
+      expect(configPins(options.env)).toMatchObject({ 'protocol.ssh.allow': 'always',
+        'protocol.ext.allow': 'never', 'protocol.file.allow': 'never' });
       probe = spawnSync(command, [...args.slice(0, args.indexOf('fetch')), 'ls-remote', 'origin'], options);
       return probe;
     });
@@ -197,6 +210,35 @@ describe('review regressions', () => {
     expect(nodeCalls(h)).toHaveLength(0);
   });
 
+  it('does not execute a repo-configured credential helper during guard Git calls', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ behind: '0\n', changed: '' });
+    const marker = join(h.root, 'credential-helper-ran');
+    mkdirSync(join(h.root, 'objects'));
+    mkdirSync(join(h.root, 'refs'));
+    put(h.root, 'HEAD', 'ref: refs/heads/main\n');
+    put(h.root, 'config', `[core]\n bare = true\n[credential]\n helper = !touch '${marker}'\n`);
+    const runner = h.exec.getMockImplementation();
+    let credentialProbe;
+    h.exec.mockImplementation((command, args, options) => {
+      if (args.includes('fetch')) {
+        // Exercise Git's real credential path with the fetch's exact environment,
+        // without network access or fetching from another repository.
+        credentialProbe = spawnSync(command, ['-C', h.root, 'credential', 'fill'], {
+          ...options, input: 'protocol=https\nhost=fixture.invalid\n\n',
+        });
+        return success();
+      }
+      return runner(command, args, options);
+    });
+    await guardToolCheckout({ ...h, env: { ...process.env }, log: () => {} });
+    expect(credentialProbe.error).toBeUndefined();
+    expect(credentialProbe.status).not.toBe(0);
+    expect(credentialProbe.stderr).toContain('terminal prompts disabled');
+    expect(existsSync(marker)).toBe(false);
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(true);
+  });
+
   it('scrubs inherited Git context and pins every Git call to the tool checkout', async () => {
     const { guardToolCheckout } = await load();
     const h = harness();
@@ -210,17 +252,26 @@ describe('review regressions', () => {
       GIT_CONFIG_KEY_orphan: 'protocol.ext.allow', GIT_CONFIG_VALUE_orphan: 'always',
       GIT_ALLOW_PROTOCOL: 'ext:file', GIT_SSH_COMMAND: 'untrusted-command',
       GIT_EXTERNAL_DIFF: 'untrusted-diff', GIT_ASKPASS: 'untrusted-askpass', FIXTURE_TOKEN: 'keep',
+      SSH_ASKPASS: 'untrusted-ssh-askpass', SSH_ASKPASS_REQUIRE: 'force',
     };
     await guardToolCheckout({ ...h, env, settings: { mode: 'reexec' } });
     for (const [, args, options] of h.exec.mock.calls.filter(([cmd]) => cmd === 'git')) {
       expect(args.slice(0, 2)).toEqual(['-C', options.cwd]);
       for (const key of Object.keys(env).filter(key => key.startsWith('GIT_'))) {
-        expect(options.env[key], key).toBe(key === 'GIT_ALLOW_PROTOCOL' ? 'https:ssh' : undefined);
+        if (!key.startsWith('GIT_CONFIG_')) {
+          expect(options.env[key], key).toBe(key === 'GIT_ALLOW_PROTOCOL' ? 'https:ssh' : undefined);
+        }
       }
       expect(options.env.FIXTURE_TOKEN).toBe('keep');
-      for (const setting of ['protocol.ext.allow=never', 'protocol.allow=never',
-        'protocol.https.allow=always', 'protocol.ssh.allow=always', 'protocol.file.allow=never',
-        'core.sshCommand=ssh']) expect(args).toContain(setting);
+      expect(args[2]).not.toBe('-c');
+      expect(configPins(options.env)).toMatchObject({ 'protocol.ext.allow': 'never', 'protocol.allow': 'never',
+        'protocol.https.allow': 'always', 'protocol.ssh.allow': 'always', 'protocol.file.allow': 'never',
+        'protocol.http.allow': 'never', 'protocol.git.allow': 'never', 'core.sshCommand': 'ssh',
+        'credential.helper': '', 'core.askPass': '' });
+      expect(options.env.SSH_ASKPASS).toBeUndefined();
+      expect(options.env.SSH_ASKPASS_REQUIRE).toBeUndefined();
+      expect(options.env.GIT_CONFIG_KEY_orphan).toBeUndefined();
+      expect(options.env.GIT_CONFIG_VALUE_orphan).toBeUndefined();
       if (args.includes('fetch')) expect(args).toContain('--upload-pack=git-upload-pack');
     }
     const childEnv = nodeCalls(h)[0][2].env;
@@ -362,14 +413,14 @@ describe('guardToolCheckout', () => {
     }
   });
 
-  it.each(['fetch', 'rev-parse', 'rev-list', 'diff'])('fails closed on a nonzero %s exit even in reexec mode', async (fail) => {
+  it.each(['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff'])('fails closed on a nonzero %s exit even in reexec mode', async (fail) => {
     const { guardToolCheckout } = await load();
     const h = harness({ fail });
     await expect(async () => guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow(`Git ${fail}`);
     expect(nodeCalls(h)).toHaveLength(0);
   });
 
-  it.each(['fetch', 'rev-parse', 'rev-list', 'diff'])('fails closed when %s throws', async (fail) => {
+  it.each(['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff'])('fails closed when %s throws', async (fail) => {
     const { guardToolCheckout } = await load();
     await expect(async () => guardToolCheckout(harness({ fail, throws: true }))).rejects.toThrow('fixture exec failure');
   });
@@ -408,6 +459,20 @@ describe('guardToolCheckout', () => {
     expect(h.exec.mock.calls.find(([, args]) => args.includes('diff'))[1]).toContain(upstream);
     expect(h.exec.mock.calls.find(([, args]) => args.includes('add'))[1].at(-1)).toBe(upstream);
   });
+
+  it.each(['', 'HEAD\n', '--help\n', `${MERGE_BASE_COMMIT}\n${MERGE_BASE_COMMIT}\n`])(
+    'refuses malformed merge-base evidence %j before diff or reexec', async (mergeBase) => {
+      const { guardToolCheckout } = await load();
+      const h = harness();
+      const runner = h.exec.getMockImplementation();
+      h.exec.mockImplementation((command, args, options) => args.includes('merge-base')
+        ? success(mergeBase) : runner(command, args, options));
+      await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } }))
+        .rejects.toThrow('Invalid merge-base commit ID');
+      expect(h.exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(false);
+      expect(nodeCalls(h)).toHaveLength(0);
+    },
+  );
 
   it('refuses an unreadable dependency instead of assuming unrelated changes are safe', async () => {
     const { guardToolCheckout } = await load();
@@ -470,11 +535,13 @@ describe('guardToolCheckout', () => {
 
 describe('real local Git fixture (no network)', () => {
   it.each([
-    ['scripts/lib/dep.mjs', null], ['docs/unrelated.md', null],
-    ['scripts/lib/dep.mjs', 'refs/heads/origin/main'],
-    ['scripts/lib/dep.mjs', 'refs/tags/origin/main'],
-    ['scripts/lib/dep.mjs', 'refs/tags/refs/remotes/origin/main'],
-  ])('six upstream commits touching %s with shadow %s use real ancestry and diff evidence', async (changedPath, shadow) => {
+    ['scripts/lib/dep.mjs', null, 'none'], ['docs/unrelated.md', null, 'none'],
+    ['docs/unrelated.md', null, 'committed'], ['docs/unrelated.md', null, 'uncommitted'],
+    ['docs/unrelated.md', null, 'no-common-history'],
+    ['scripts/lib/dep.mjs', 'refs/heads/origin/main', 'none'],
+    ['scripts/lib/dep.mjs', 'refs/tags/origin/main', 'none'],
+    ['scripts/lib/dep.mjs', 'refs/tags/refs/remotes/origin/main', 'none'],
+  ])('six upstream commits touching %s with shadow %s and local change %s use real ancestry and diff evidence', async (changedPath, shadow, localChange) => {
     const { guardToolCheckout } = await load();
     const checkout = scratch();
     // Assemble a bare object store as files: all Git commands below are read-only,
@@ -500,13 +567,22 @@ describe('real local Git fixture (no network)', () => {
         + `committer Fixture <fixture@example.invalid> 1700000000 +0000\n\nversion ${version}\n`);
       if (version === 0) head = tip;
     }
+    if (['committed', 'no-common-history'].includes(localChange)) {
+      const blob = object('blob', 'export const version = 42;');
+      const lib = object('tree', Buffer.concat([Buffer.from('100644 dep.mjs\0'), Buffer.from(blob, 'hex')]));
+      const scripts = object('tree', Buffer.concat([Buffer.from('40000 lib\0'), Buffer.from(lib, 'hex')]));
+      const tree = object('tree', Buffer.concat([Buffer.from('40000 scripts\0'), Buffer.from(scripts, 'hex')]));
+      head = object('commit', `tree ${tree}\n${localChange === 'committed' ? `parent ${head}\n` : ''}`
+        + 'author Fixture <fixture@example.invalid> 1700000001 +0000\n'
+        + 'committer Fixture <fixture@example.invalid> 1700000001 +0000\n\nlocal dependency change\n');
+    }
     put(checkout, 'config', '[core]\n bare = true\n');
     put(checkout, 'HEAD', 'ref: refs/heads/main\n');
     put(checkout, 'refs/heads/main', `${head}\n`);
     put(checkout, 'refs/remotes/origin/main', `${head}\n`);
     if (shadow) put(checkout, shadow, `${head}\n`);
     put(checkout, 'scripts/tool.mjs', "import './lib/dep.mjs';");
-    put(checkout, 'scripts/lib/dep.mjs', 'export const version = 0;');
+    put(checkout, 'scripts/lib/dep.mjs', `export const version = ${localChange === 'none' ? 0 : 42};`);
     const exec = vi.fn((command, args, options) => {
       expect(command).toBe('git');
       expect(options.cwd).toBe(checkout);
@@ -514,10 +590,15 @@ describe('real local Git fixture (no network)', () => {
         put(checkout, 'refs/remotes/origin/main', `${tip}\n`);
         return success();
       }
-      expect(args.some(arg => ['rev-parse', 'rev-list', 'diff'].includes(arg))).toBe(true);
+      expect(args.some(arg => ['rev-parse', 'rev-list', 'merge-base', 'diff'].includes(arg))).toBe(true);
       return spawnSync(command, args, options);
     });
     const run = () => guardToolCheckout({ root: checkout, entry: join(checkout, 'scripts/tool.mjs'), exec, env: {} });
+    if (localChange === 'no-common-history') {
+      await expect(run()).rejects.toThrow('Git merge-base failed');
+      expect(exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(false);
+      return;
+    }
     if (changedPath === 'scripts/lib/dep.mjs') {
       await expect(async () => run()).rejects.toThrow('stale tool checkout (6 behind)');
     } else {
