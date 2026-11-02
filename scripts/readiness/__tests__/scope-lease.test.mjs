@@ -15,6 +15,11 @@ import {
 } from '../scope-lease.mjs';
 
 describe('normScope — dedupe + stringify + drop empties', () => {
+  it('R372 — splits a multi-path entry on whitespace/commas; unprefixed pieces inherit the entry repo', () => {
+    expect(normScope(['we:a.mjs b.mjs', 'we:c.mjs,we:d.mjs'])).toEqual(['we:a.mjs', 'we:b.mjs', 'we:c.mjs', 'we:d.mjs']);
+    expect(normScope(['a.mjs b.mjs'])).toEqual(['a.mjs', 'b.mjs']);
+    expect(normScope([' , '])).toEqual([]);
+  });
   it('dedupes and drops falsy', () => {
     expect(normScope(['we:a', 'we:a', '', null, 'we:b'])).toEqual(['we:a', 'we:b']);
   });

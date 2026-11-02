@@ -519,6 +519,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     ] }), { num: '3037', groupMembers: '3038' });
     expect(mk('we:docs/a.md b.md')().scope).toEqual(['we:scripts/operations/', 'we:docs/a.md', 'we:b.md']);
     for (const bad of ['we:../../x', 'we:a.md /etc/x', 'we:a;b']) expect(mk(bad), bad).toThrow(/cannot carry|unsafe scope/);
+    expect(mk(' , '), 'separators only').toThrow(/has no scope/);
   });
 
   it('R372 — an unprefixed piece inherits the entry repo prefix (lease overlap stays correct)', () => {

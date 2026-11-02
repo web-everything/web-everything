@@ -1140,7 +1140,9 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
       if (launchKind === 'prepare-item') scope.push(`we:${card.specPath}`);
       else {
         if (!Array.isArray(card.scope) || !card.scope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
-        for (const path of normalizeBriefScope(card.scope)) if (!scope.includes(path)) scope.push(path);
+        const memberScope = normalizeBriefScope(card.scope);
+        if (!memberScope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
+        for (const path of memberScope) if (!scope.includes(path)) scope.push(path);
       }
     }
   }

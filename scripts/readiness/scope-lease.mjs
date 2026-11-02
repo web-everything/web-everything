@@ -66,7 +66,18 @@ import { disjoint } from './lane-partition.mjs';
 /** Normalize a file/scope list → deduped array of non-empty repo-qualified strings. Mirrors
  *  `overlap-chain.mjs` `normFiles` (not exported there) — same contract, kept in sync by the test. */
 export function normScope(list) {
-  return [...new Set((Array.isArray(list) ? list : []).filter(Boolean).map((f) => String(f)).filter(Boolean))];
+  // R372 — one entry may name several paths (`we:a.mjs b.mjs`); split so overlap is judged per path. A piece with
+  // no `repo:` prefix inherits the nearest earlier prefix of the same entry.
+  const out = [];
+  for (const entry of Array.isArray(list) ? list : []) {
+    let repo = '';
+    for (const piece of String(entry ?? '').split(/[\s,]+/).filter(Boolean)) {
+      const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
+      if (own) repo = own;
+      out.push(own ? piece : repo + piece);
+    }
+  }
+  return [...new Set(out)];
 }
 
 /** Split a repo-qualified path into `[repo, path]` (repo `null` when unqualified). Mirrors the first-colon
