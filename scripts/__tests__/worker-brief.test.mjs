@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { main, renderWorkerBrief } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
@@ -15,6 +16,35 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('runs the printed plateau-app check outside WE and reports JSON for the explicit target', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-verify-'));
+    const target = path.join(root, 'plateau lane');
+    fs.mkdirSync(target);
+    try {
+      const brief = renderWorkerBrief({ ...params, repo: 'plateau-app' });
+      const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)[1]
+        .replace('<lane>', `'${target}'`);
+      const result = spawnSync(command, { shell: true, cwd: root, encoding: 'utf8', timeout: 10000 });
+      expect(result.error).toBeUndefined();
+      expect(result.stderr).not.toContain('MODULE_NOT_FOUND');
+      // A non-Git target must fail closed with JSON naming that target, not fail to locate WE's CLI.
+      expect(result.status).toBe(3);
+      expect(JSON.parse(result.stdout)).toMatchObject({ status: 'error', reason: 'no-head' });
+      expect(JSON.parse(result.stdout).detail).toContain(target);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['we', 'plateau-app'])('uses WE’s absolute verification CLI and an explicit lane for %s', repo => {
+    const brief = renderWorkerBrief({ ...params, repo });
+    const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)?.[1];
+    expect(command).toBeDefined();
+    expect(command).toContain(path.resolve('scripts/verify-lane.mjs'));
+    expect(command).toContain('check --wait=150000 --json --repo=<lane>');
+    const runner = fs.readFileSync(path.resolve('.claude/agents/codex-runner.md'), 'utf8');
+    expect(runner).toContain('node "<WE checkout>/scripts/verify-lane.mjs" check --wait=150000 --json --repo=<lane>');
+    expect(runner).toContain('absolute path');
+  });
+
   it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
     const brief = renderWorkerBrief(params);
     const lane = brief.slice(brief.indexOf('3. **Lane.**'), brief.indexOf('4. **Codex'));

@@ -1,6 +1,8 @@
 import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
 import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
 import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
+import { VERIFY_LANE_CLI } from './operations/verify-io.mjs';
+import { shellQuoteWord } from './readiness/heavy-admission.mjs';
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
@@ -143,8 +145,8 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
 
 6. **One PR.** Commit with a tight pathspec (your files only), verify ONCE at the end with
    \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it).
-   While verification is running, repeat \`node scripts/verify-lane.mjs check --wait=150000 --json\` in separate foreground calls
-   from the lane until it settles. Repeat only for a timeout with lastStatus=running;
+   While verification is running, repeat \`node ${shellQuoteWord(VERIFY_LANE_CLI)} check --wait=150000 --json --repo=<lane>\` in separate foreground calls
+   until it settles. Use the same lane path as verify's --checkout, quoting it if needed. Repeat only for a timeout with lastStatus=running;
    stop and report red, infrastructure-failure, or any other non-running result.
    If settled is not true, JSON is missing/unreadable, or the check command errors, pause dependent work,
    retain the lane and scope (keep renewing leases), and recover observation of the same verification.
