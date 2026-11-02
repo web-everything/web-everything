@@ -20,7 +20,7 @@ it('fetches the real pull head and excludes files main gained after the PR branc
     expect(git(['rev-parse', 'origin/main']).trim()).toBe(base);
 
     const deps = createCheckDeps({ cwd: clone });
-    expect(await deps.fetchNetDiff(6223, head)).toEqual(['docs/pr-first.md', 'docs/pr-second.md']);
+    expect(await deps.fetchNetDiff(6223, head)).toEqual({paths:['docs/pr-first.md', 'docs/pr-second.md'],base});
     expect(git(['rev-parse', 'origin/main']).trim()).toBe(main);
     expect(git(['rev-parse', 'FETCH_HEAD']).trim()).toBe(head);
     expect(git(['merge-base', 'origin/main', head]).trim()).toBe(base);

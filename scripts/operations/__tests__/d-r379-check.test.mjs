@@ -3,15 +3,23 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { checkPr, main, matchesGlob } from '../d-r379-check.mjs';
 import { createCheckDeps } from '../d-r379-check-io.mjs';
+import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
+import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 
 const settings = JSON.parse(readFileSync(fileURLToPath(new NodeURL('../../settings/d-r379-protected-paths.json', import.meta.url))));
 const fixture = pr => JSON.parse(readFileSync(fileURLToPath(new NodeURL(`../__fixtures__/d-r379/${pr}.json`, import.meta.url))));
 const audit = (head, extra = {}) => ({ head, base: 'a'.repeat(40), at: '2026-11-02T10:00:00Z',
   verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH, findings: [], ...extra });
+const base = 'a'.repeat(40);
+const verdict = (pr, headSha, extra = {}) => buildVerdictRecord({
+  repo: CONSTELLATION_REPOS.we.slug, pr, headSha, verdict: 'accepted',
+  at: '2026-11-02T10:00:00Z', source: 'd-r379-fixture', writer: 'fixture', ...extra,
+});
 function deps(f = fixture(6223), overrides = {}) {
   return { readPr: async () => f, readLabels: async () => f.labels,
-    fetchNetDiff: async () => f.netDiffPaths, readAudits: async () => [audit(f.headRefOid)],
+    fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
+    readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
     readSettings: async () => settings, readHeadFile: async () => '---\ntype: story\nstatus: open\n---\n',
     stdout: () => {}, stderr: () => {}, ...overrides };
 }
@@ -36,11 +44,11 @@ describe('fail-closed evidence', () => {
     const f = { ...fixture(6223), files: [{path:'AGENTS.md'}] };
     expect((await checkPr(1,deps(f))).eligible).toBe(true);
   });
-  it.each(['red-team:held','red-team:pending','review:changes'])('rejects %s', async label => {
+  it.each(['red-team:held','red-team:pending','red-team:blocked','red-team:future-hold','review:changes','review:blocked','review:held-mechanical'])('rejects %s', async label => {
     expect(condition(await checkPr(1,deps({...fixture(6223),labels:[...fixture(6223).labels,label]})),2).status).toBe('FAIL');
   });
-  it('review:human alongside acceptance is allowed', async () => {
-    expect((await checkPr(1,deps({...fixture(6223),labels:[...fixture(6223).labels,'review:human']}))).eligible).toBe(true);
+  it('review:human alongside acceptance fails', async () => {
+    expect((await checkPr(1,deps({...fixture(6223),labels:[...fixture(6223).labels,'review:human']}))).eligible).toBe(false);
   });
   it('label read failure is UNKNOWN', async () => {
     expect(condition(await checkPr(1,deps(undefined,{readLabels:()=>{throw Error();}})),2).status).toBe('UNKNOWN');
@@ -58,11 +66,11 @@ describe('fail-closed evidence', () => {
     expect(condition(r,2).evidence.join(' ')).toContain('no audit for head');
   });
   it('empty diff is UNKNOWN', async () => {
-    const r = await checkPr(1,deps(undefined,{fetchNetDiff:()=>[]}));
+    const r = await checkPr(1,deps(undefined,{fetchNetDiff:()=>({paths:[],base})}));
     expect(condition(r,4).status).toBe('UNKNOWN'); expect(r.eligible).toBe(false);
   });
   it('oversized diff stays closed and requests human review', async () => {
-    const r = await checkPr(1,deps(undefined,{fetchNetDiff:()=>Array(10001).fill('x')}));
+    const r = await checkPr(1,deps(undefined,{fetchNetDiff:()=>({paths:Array(10001).fill('x'),base})}));
     expect(r.eligible).toBe(false); expect(condition(r,4).evidence.join(' ')).toContain('human review');
   });
   it('no direction citation fails', async () => {
@@ -126,7 +134,7 @@ describe('CLI and real adapter with injected IO', () => {
       if(args[0]==='diff')return 'docs/a.md\0docs/b.md\0';
       throw Error('unexpected command');
     }});
-    expect(await d.fetchNetDiff(6223,head)).toEqual(['docs/a.md','docs/b.md']);
+    expect(await d.fetchNetDiff(6223,head)).toEqual({paths:['docs/a.md','docs/b.md'],base});
     expect(calls).toEqual([
       ['git','fetch','origin','main'],['git','fetch','origin','pull/6223/head'],
       ['git','rev-parse','--verify','FETCH_HEAD^{commit}'],['git','merge-base','origin/main',head],
@@ -249,7 +257,7 @@ describe('eligibility guard regression guarantees', () => {
   it.each([
     ['missing path policy', {readSettings:()=>({})}],
     ['incomplete path policy', {readSettings:()=>({...settings,protectedPaths:[]})}],
-    ['malformed diff', {fetchNetDiff:()=>['../AGENTS.md']}],
+    ['malformed diff', {fetchNetDiff:()=>({paths:['../AGENTS.md'],base})}],
     ['missing diff', {fetchNetDiff:()=>null}],
   ])('refuses eligibility for %s', async (_name, overrides) => {
     const r = await checkPr(6223,deps(undefined,overrides));
@@ -293,5 +301,116 @@ describe('eligibility guard regression guarantees', () => {
     const r = await checkPr(6223,deps(undefined,{readAudits:()=>records}));
     expect(condition(r,2).status).toBe('PASS');
     expect(r.eligible).toBe(true);
+  });
+});
+
+
+describe('audit range binding regressions', () => {
+  it.each(['head', 'different base'])('refuses a clear audit based on %s', async range => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, {
+      readAudits: () => [audit(head, {base: range === 'head' ? head : 'b'.repeat(40)})],
+    }));
+    expect(condition(r,2).status).toBe('FAIL');
+    expect(r.eligible).toBe(false);
+  });
+  it('cannot review an unknown merge-base', async () => {
+    const r = await checkPr(6223,deps(undefined,{fetchNetDiff:()=>({paths:['docs/a.md']})}));
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(r.eligible).toBe(false);
+  });
+});
+
+describe('current-head ledger acceptance regressions', () => {
+  it.each(['missing', 'stale', 'latest stale', 'changes', 'human', 'open finding'])('fails readable ledger with %s despite clear labels', async kind => {
+    const head = fixture(6223).headRefOid;
+    const accepted = verdict(6223,head);
+    const rows = kind === 'missing' ? [] : kind === 'stale' ? [verdict(6223,'f'.repeat(40))]
+      : kind === 'latest stale' ? [accepted,verdict(6223,'f'.repeat(40),{at:'2026-11-02T11:00:00Z'})]
+      : kind === 'changes' ? [accepted,verdict(6223,head,{verdict:'changes'})]
+      : kind === 'human' ? [accepted,verdict(6223,head,{verdict:'human'})]
+      : [accepted,buildLedgerEvent({type:'referral',repo:CONSTELLATION_REPOS.we.slug,pr:6223,
+        headSha:head,findingKeys:['unresolved'],at:'2026-11-02T11:00:00Z',source:'fixture',writer:'fixture'})];
+    const r = await checkPr(6223,deps(undefined,{readReviewLedger:()=>rows}));
+    expect(condition(r,2).status).toBe('FAIL');
+    expect(r.eligible).toBe(false);
+  });
+  it.each(['throw', 'null', 'malformed', 'oversized'])('returns UNKNOWN for %s ledger evidence with human fallback', async kind => {
+    const r = await checkPr(6223,deps(undefined,{readReviewLedger:()=>{
+      if (kind === 'throw') throw Error('unavailable');
+      return kind === 'null' ? null : kind === 'malformed' ? [{}] : Array(100001).fill({});
+    }}));
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+  it('reads configured ledger store through the shared reader', async () => {
+    const calls = [], rows = [verdict(6223,fixture(6223).headRefOid)];
+    const adapter = createCheckDeps({env:{FIXTURE:'yes'},readLedger:async (repo,opts)=>{
+      calls.push([repo,opts.env]); return {status:'ok',rows};
+    }});
+    expect(await adapter.readReviewLedger(6223)).toEqual(rows);
+    expect(calls).toEqual([[CONSTELLATION_REPOS.we.slug,{FIXTURE:'yes'}]]);
+  });
+  it('shared store unreadability remains UNKNOWN', async () => {
+    const adapter = createCheckDeps({readLedger:async()=>({status:'unreadable',reason:'ledger-exceeds-read-cap'})});
+    const r = await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}));
+    expect(condition(r,2).status).toBe('UNKNOWN');
+  });
+});
+
+describe('protected implementation and test regressions', () => {
+  it.each([
+    'scripts/operations/d-r379-check-io.mjs',
+    'scripts/operations/codex-audit.mjs',
+    'scripts/operations/codex-audit-io.mjs',
+    'scripts/lib/standards-sections.mjs',
+    'scripts/check-standards.mjs',
+    'scripts/check-standards-rules.mjs',
+    'scripts/check-demos.mjs',
+    'scripts/check-memory.mjs',
+    'scripts/lib/policy-cascade.mjs',
+    'scripts/lib/constellation-repos.mjs',
+    'scripts/lib/gh-throttle.mjs',
+    'scripts/lib/delivery-platform-preferences.json',
+    'scripts/lib/delivery-priority-settings.json',
+    'scripts/__tests__/check-standards.test.mjs',
+    'scripts/lib/review-core.mjs',
+    'scripts/lib/review-ledger-history.mjs',
+    'scripts/lib/verdict-ledger.mjs',
+    'scripts/lib/verdict-ledger-io.mjs',
+    'scripts/lib/pr-state.mjs',
+    'scripts/lib/review-escalation.mjs',
+    'scripts/lib/review-labels.mjs',
+    'scripts/review-ledger-check.mjs',
+    'scripts/settings/pr-limit.json',
+    'scripts/drain-gate-settings.json',
+    'scripts/lib/review-policy.contract.json',
+    'scripts/check-standards.contract.json',
+    'scripts/__tests__/guard-bash.test.mjs',
+    'scripts/__tests__/review-set-label.test.mjs',
+    'scripts/lib/__tests__/jury-core.test.mjs',
+    'scripts/operations/__tests__/d-r379-check.test.mjs',
+    'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
+    'scripts/lib/__tests__/verdict-ledger.test.mjs',
+    'scripts/lib/__tests__/pr-limit.test.mjs',
+    'scripts/lib/utc-day-slice-scan.mjs',
+    'scripts/lib/invisible-source-scan.mjs',
+    'scripts/lib/stdout-flush-scan.mjs',
+    'scripts/lib/rust-scan-bridge.mjs',
+    'scripts/lib/validate-rules-anchors.cjs',
+    'scripts/lib/memory-freshness.cjs',
+    'scripts/lib/verdict-totality.mjs',
+    'scripts/lib/jury-core.mjs',
+    'scripts/lib/review-skill-guard.mjs',
+    'scripts/lib/mandate-fence-scan.mjs'
+  ])('classifies %s as protected with the shipped glob policy', async path => {
+    expect(settings.protectedPaths.some(glob => matchesGlob(path,glob))).toBe(true);
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    expect(condition(r,4).status).toBe('FAIL');
+    expect(r.eligible).toBe(false);
+  });
+  it('keeps ordinary documentation outside protected paths', () => {
+    expect(settings.protectedPaths.some(glob=>matchesGlob('docs/harmless.md',glob))).toBe(false);
   });
 });

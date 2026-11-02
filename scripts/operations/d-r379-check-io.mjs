@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
+import { readLedgerEventsFromStore } from '../lib/verdict-ledger.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 const POLICY = new URL('../settings/d-r379-protected-paths.json', import.meta.url);
@@ -24,7 +25,7 @@ async function realExec(bin, args, options) {
 
 /** exec(bin, argv, options), fs, home, env, cwd and output streams are hermetically replaceable. */
 export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = process.env,
-  fs = realFs, exec = realExec, stdout = text => process.stdout.write(text),
+  fs = realFs, exec = realExec, readLedger = readLedgerEventsFromStore, stdout = text => process.stdout.write(text),
   stderr = text => process.stderr.write(text) } = {}) {
   const options = { cwd, env, encoding: 'utf8', timeout: 60_000, maxBuffer: MAX_BYTES, stdio: ['ignore', 'pipe', 'pipe'] };
   // Name-only rename output otherwise omits the protected source of a move. Disable
@@ -86,6 +87,14 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       if (snapshot.headRefOid !== head) throw new Error('PR head moved; retry');
       return snapshot.labels;
     },
+    async readReviewLedger(pr) {
+      checkPrNumber(pr);
+      const result = await readLedger(CONSTELLATION_REPOS.we.slug, {
+        env, log: text => stderr(`${safeLog(text)}\n`),
+      });
+      if (result?.status !== 'ok') throw new Error('verdict ledger unavailable; human review required');
+      return result.rows;
+    },
     async fetchNetDiff(pr, head) {
       checkPrNumber(pr);
       checkSha(head);
@@ -96,11 +105,11 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       const base = (await run('git', ['merge-base', 'origin/main', head])).trim();
       checkSha(base);
       const text = await run('git', ['diff', base, head, '--name-only', '-z']);
-      if (!text) return [];
+      if (!text) return {paths: [], base};
       if (!text.endsWith('\0')) throw new Error('incomplete NUL-delimited diff');
       const paths = text.slice(0, -1).split('\0');
       if (paths.length > 10_000) throw new Error('diff bound exceeded; human review required');
-      return paths;
+      return {paths, base};
     },
     readHeadFile(head, path) {
       checkSha(head);

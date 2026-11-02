@@ -4,6 +4,9 @@ import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import yaml from 'js-yaml';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
+import { derivePrState } from '../lib/pr-state.mjs';
+import { REVIEW_LABELS } from '../lib/review-labels.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { globToRegExp } from '../lib/standards-sections.mjs';
 
 const SHA = /^[a-f\d]{40}$/i;
@@ -63,12 +66,13 @@ function latestAudit(records, head) {
   return latest;
 }
 
-async function reviewed(pr, head, deps) {
+async function reviewed(pr, head, base, deps) {
   const name = 'Reviewed';
   let labels, audit;
   try { labels = labelNames(await deps.readLabels(pr, head)); }
   catch { return unknown(2, name, 'labels unavailable'); }
-  const blocked = labels.filter(l => ['review:changes', 'red-team:held', 'red-team:pending'].includes(l));
+  const blocked = labels.filter(l => (l.startsWith('red-team:') && l !== 'red-team:clear')
+    || [REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, 'review:blocked'].includes(l));
   const missing = ['review:accepted', 'red-team:clear'].filter(l => !labels.includes(l));
   if (blocked.length || missing.length) return result(2, name, 'FAIL', [
     ...blocked.map(l => `blocking label: ${l}`), ...missing.map(l => `missing label: ${l}`),
@@ -77,11 +81,24 @@ async function reviewed(pr, head, deps) {
   catch { return unknown(2, name, 'audits unavailable or oversized'); }
   if (!audit) return result(2, name, 'FAIL', ['no audit for head']);
   if (audit.verdict !== 'NOT WEAKENED') return result(2, name, 'FAIL', [`latest audit: ${audit.verdict}`]);
-  // readPrFacts gathers agents, comments, checks and constellation state as well as the ledger.
-  // It is not a cheap ledger-only read; this standalone command intentionally uses labels + audit.
-  return result(2, name, 'PASS', ['review:accepted', 'red-team:clear',
+  if (!base) return unknown(2, name, 'net diff merge-base unavailable');
+  if (audit.base === head || audit.base !== base) return result(2, name, 'FAIL', ['audit base does not match the classified net diff merge-base']);
+  let state;
+  try {
+    const events = await deps.readReviewLedger(pr);
+    if (!Array.isArray(events) || events.length > MAX_AUDITS) throw new Error('invalid or oversized verdict ledger');
+    // The shared derive owns validation, stale acceptance, human holds and open findings.
+    // These ledger-only facts need no unrelated live agents/checks/comment probes.
+    state = derivePrState(events, { repo: CONSTELLATION_REPOS.we.slug, pr,
+      head: { sha: head }, now: new Date().toISOString() });
+  } catch { return unknown(2, name, 'verdict ledger unavailable or oversized'); }
+  if (state.holds.some(h => ['ledger-unreadable', 'scope-unknown', 'derive-crashed'].includes(h.code)
+    || h.code.startsWith('rule-crashed:'))) return unknown(2, name, 'verdict ledger could not be derived');
+  if (!state.clears || state.reviewExempt || !state.verdict) return result(2, name, 'FAIL',
+    ['verdict ledger does not accept the current head', ...state.holds.map(h => `${h.code}: ${h.reason}`)]);
+  return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',
     `canonical audit NOT WEAKENED for head ${head}, base ${audit.base}, at ${audit.at}`,
-    'labels only for review verdict; ledger unavailable (shared reader requires broad live probes)']);
+    'verdict ledger accepts the current head with no holds']);
 }
 
 function isRulingPath(path) {
@@ -133,18 +150,21 @@ export async function checkPr(pr, deps) {
   const head = metadata.headRefOid;
   const citation = DIRECTION.exec(`${metadata.title}\n${metadata.body}`)?.[0];
   const conditions = [result(1, 'Direction source', citation ? 'PASS' : 'FAIL', [citation ?? 'no direction citation'])];
-  conditions.push(await reviewed(pr, head, deps));
-  let settings, netDiffPaths = [], failure;
+  let settings, netDiffPaths = [], base, failure;
   try { settings = validateSettings(await deps.readSettings()); }
   catch { failure = 'path policy unavailable or incomplete'; }
   try {
-    const paths = await deps.fetchNetDiff(pr, head);
+    const diff = await deps.fetchNetDiff(pr, head);
+    const paths = diff?.paths;
+    if (!SHA.test(diff?.base ?? '')) throw new Error('missing merge-base');
     if (!Array.isArray(paths) || paths.length > MAX_PATHS || paths.some(p => !validPath(p))) {
       throw new Error('invalid or oversized net diff');
     }
+    base = diff.base;
     netDiffPaths = [...new Set(paths)];
     if (!netDiffPaths.length) failure = 'empty net diff: cannot judge';
   } catch { failure = 'net diff unavailable, invalid or exceeds 10000 paths'; }
+  conditions.push(await reviewed(pr, head, base, deps));
   if (failure) {
     conditions.push(unknown(3, 'Sets no direction', failure), unknown(4, 'Not guard-loosening / hard to undo', failure));
   } else {
