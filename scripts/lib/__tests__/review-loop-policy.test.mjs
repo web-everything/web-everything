@@ -1,3 +1,9 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import {
   reviewLoopAutoConfirm, buildAcceptQueueEntry, acceptResumeCommand, isQueuedAcceptStop, ACCEPT_QUEUE_AREA,
@@ -141,6 +147,10 @@ describe('post-accept advisory settings cascade', () => {
   ])('invalid/unreadable settings fall back to shadow with an operator-visible warning: %j', async options => {
     const result = await resolve(options);
     expect(result.value.mode).toBe('shadow');
+    expect(result.invalid).toBe(true);
+    expect(reviewLoopPolicy.postAcceptAdvisoryDecision({ ...result.value, invalid: result.invalid,
+      verdict: { verdict: VERDICTS.ACCEPT, admittedFindings: [{ category: 'correctness/correctness', impactIfUnfixed: 'cosmetic' }] } }))
+      .toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
     expect(result.logs.join('\n')).toMatch(/invalid|unreadable|warn/i);
   });
 });
@@ -168,6 +178,79 @@ describe('post-accept advisory shadow ledger', () => {
     await recordPostAcceptAdvisoryShadow({ ...facts, head: 'b'.repeat(40) });
     await recordPostAcceptAdvisoryShadow({ ...facts, pr: 8 });
     expect(rows).toHaveLength(3);
+  });
+
+  it.each([null, 42, {}, { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head },
+    { kind: 'we.post-accept-advisory-shadow', pr: 7, headSha: head, ...decision }])(
+    'skips malformed or identity-only row %j without suppressing a valid observation', async bad => {
+      const rows = [bad];
+      const row = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision,
+        readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+      expect(row).toMatchObject({ wouldCard: true, loopsAfter: null });
+      expect(rows).toHaveLength(2);
+    });
+
+  it('serializes concurrent calls with independent ledger snapshots', async () => {
+    const { recordPostAcceptAdvisoryShadow } = await import('../../operations/review-pr-io.mjs');
+    const rows = [];
+    const facts = { repo: 'o/r', pr: 7, head, decision,
+      readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    await Promise.all([recordPostAcceptAdvisoryShadow(facts), recordPostAcceptAdvisoryShadow(facts)]);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('serializes concurrent persisted writers across processes to exactly one row', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'advisory-concurrency-'));
+    const ledgerPath = join(dir, 'shadow.jsonl');
+    const moduleUrl = pathToFileURL(resolve('scripts/operations/review-pr-io.mjs')).href;
+    const source = `import { recordPostAcceptAdvisoryShadow } from ${JSON.stringify(moduleUrl)};
+      await recordPostAcceptAdvisoryShadow(${JSON.stringify({ repo: 'o/r', pr: 7, head, decision, ledgerPath })});`;
+    try {
+      writeFileSync(ledgerPath, 'null\n');
+      await Promise.all([1, 2].map(() => promisify(execFile)(process.execPath, ['--input-type=module', '-e', source], { timeout: 10000, maxBuffer: 64 * 1024 })));
+      const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows).toHaveLength(2);
+      expect(rows[1]).toMatchObject({ repo: 'o/r', pr: 7, headSha: head, loopsAfter: null });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('bounds a busy ledger lock and reports a shadow miss without disturbing the lock or ledger', async () => {
+    const { recordPostAcceptAdvisoryShadow } = await import('../../operations/review-pr-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'advisory-lock-'));
+    const ledgerPath = join(dir, 'shadow.jsonl');
+    const logs = [];
+    try {
+      writeFileSync(ledgerPath, 'null\n');
+      writeFileSync(`${ledgerPath}.lock`, 'another writer');
+      expect(await recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision, ledgerPath,
+        out: line => logs.push(line) })).toBeNull();
+      expect(readFileSync(ledgerPath, 'utf8')).toBe('null\n');
+      expect(readFileSync(`${ledgerPath}.lock`, 'utf8')).toBe('another writer');
+      expect(logs.join('\n')).toMatch(/lock busy after 2000ms; inspect writer.*live review unaffected/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('records loops later, dedupes by identity/value, and reports latest measurement separately from unmeasured', async () => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../../operations/review-pr-io.mjs');
+    const rows = [];
+    const io = { repo: 'o/r', pr: 7, head, readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    await recordPostAcceptAdvisoryShadow({ ...io, decision });
+    await recordPostAcceptAdvisoryShadow({ ...io, pr: 8, decision });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ unmeasured: 2, loopsAfter: 0 });
+    await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 2 });
+    await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 4 });
+    await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 2 });
+    expect(rows).toHaveLength(4);
+    expect(rows[2]).toMatchObject({ kind: 'loops', repo: 'o/r', pr: 7, head, loopsAfter: 2 });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ prs: 2, wouldCard: 2, loopsAfter: 4, unmeasured: 1 });
+    await recordPostAcceptAdvisoryLoops({ ...io, pr: 8, loopsAfter: 0 });
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ loopsAfter: 4, unmeasured: 0 });
+    expect(report.text).toContain('Unmeasured: 0');
+    expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: -1 })).toBeNull();
+    expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
   });
 
   it('prints counts and counts only shadow-carded findings later re-rated broken, matched by identity', () => {

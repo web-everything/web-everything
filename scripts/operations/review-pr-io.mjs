@@ -43,7 +43,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, unlinkSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1828,19 +1828,57 @@ function safeJson(stdout) {
 
 /** Advisory observations use a separate shadow ledger, never judgment-bearing verdict events. */
 export async function recordPostAcceptAdvisoryShadow(options = {}) {
-  const { recordPostAcceptAdvisoryShadow: record } = await import('../lib/review-loop-policy.mjs');
-  const path = join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
-  return record({
-    readLedgerRows: () => {
-      let text;
-      try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-      return text.split('\n').filter(Boolean).map(line => JSON.parse(line));
-    },
-    appendLedgerRow: row => {
-      mkdirSync(dirname(path), { recursive: true });
-      appendFileSync(path, `${JSON.stringify(row)}\n`);
-      return { ok: true };
-    },
-    ...options,
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryShadow', options);
+}
+
+export async function recordPostAcceptAdvisoryLoops(options = {}) {
+  return recordAdvisoryObservation('recordPostAcceptAdvisoryLoops', options);
+}
+
+// Injected IO shares an in-process queue; persisted IO additionally locks beside the ledger across processes.
+const advisoryWrites = new Map();
+async function recordAdvisoryObservation(recorder, options) {
+  const path = options.ledgerPath ?? join(dirname(sharedRunsDir()), 'ledger-shadow', 'post-accept-advisory.jsonl');
+  const previous = advisoryWrites.get(path) ?? Promise.resolve();
+  const pending = previous.then(async () => {
+    let lock;
+    const lockPath = `${path}.lock`;
+    try {
+      if (!options.readLedgerRows && !options.appendLedgerRow) {
+        mkdirSync(dirname(path), { recursive: true });
+        const deadline = Date.now() + 2000;
+        for (;;) {
+          try { lock = openSync(lockPath, 'wx'); break; }
+          catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            if (Date.now() >= deadline) throw new Error('shadow ledger lock busy after 2000ms; inspect writer before removing an orphaned lock');
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+        }
+      }
+      const policy = await import('../lib/review-loop-policy.mjs');
+      return await policy[recorder]({
+        readLedgerRows: () => {
+          let text;
+          try { text = readFileSync(path, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+          return text.split('\n').filter(Boolean).flatMap(line => {
+            try { return [JSON.parse(line)]; } catch { return []; }
+          });
+        },
+        appendLedgerRow: row => {
+          appendFileSync(path, `${JSON.stringify(row)}\n`);
+          return { ok: true };
+        },
+        ...options,
+      });
+    } catch (error) {
+      try { options.out?.(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+      return null;
+    } finally {
+      if (lock !== undefined) { closeSync(lock); unlinkSync(lockPath); }
+    }
   });
+  advisoryWrites.set(path, pending);
+  try { return await pending; }
+  finally { if (advisoryWrites.get(path) === pending) advisoryWrites.delete(path); }
 }

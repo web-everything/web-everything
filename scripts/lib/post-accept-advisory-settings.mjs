@@ -5,7 +5,8 @@ import { REVIEW_SETTINGS_FILE } from './review-seat-settings.mjs';
 
 export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
   file = REVIEW_SETTINGS_FILE, readFile = path => readFileSync(path, 'utf8'), log = line => console.error(line) } = {}) {
-  const warn = message => { try { log(`post-accept-advisory warning: ${message}; using shadow`); } catch { /* telemetry */ } };
+  let invalid = false;
+  const warn = message => { invalid = true; try { log(`post-accept-advisory warning: ${message}; using shadow`); } catch { /* telemetry */ } };
   const project = (value, layer) => {
     if (value === undefined) return {};
     if (['off', 'shadow', 'on'].includes(value)) return { mode: value };
@@ -32,6 +33,7 @@ export function resolvePostAcceptAdvisorySettings({ env = process.env, platform,
     standard: { mode: 'shadow' }, platform: project(plat?.mode, 'platform'), env,
     envValues: project(env.WE_REVIEW_POST_ACCEPT_ADVISORY_MODE, 'env'),
   });
+  if (invalid) result.value.mode = 'shadow';
   try { log(formatCascadeSourcesLine('review.postAcceptAdvisory', result)); } catch { /* telemetry */ }
-  return result;
+  return { ...result, invalid };
 }

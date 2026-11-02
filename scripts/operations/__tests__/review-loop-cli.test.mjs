@@ -1582,6 +1582,48 @@ describe('unattended accept reads the live head', () => {
 
 
 describe('post-accept advisory shadow wiring', () => {
+  it.each(['shadow', 'on', 'invalid-settings', 'settings-error', 'recorder-error'])(
+    '%s preserves all live effects for an advisory-bearing would-card accept', async scenario => {
+      const execute = async mode => {
+        const { declaration, registry } = registryFor({ rev: HEAD_A });
+        const effects = [], rows = [], decisions = [];
+        const fileItem = vi.fn(async () => ({ code: 0, lines: [] }));
+        const out = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV,
+          store: createMemoryRunStore(), sinks: recordingSinks(effects), fileItem,
+          makeJudge: () => async request => judgeOutcome(request.lens === 'correctness' ? { summary: 'advisory only', findings: [{ file: NET_PATHS[0], line: 4,
+            summary: 'improve diagnostic', disposition: 'nit', category: 'correctness/correctness',
+            introduced: true, worseThanBase: true, parallelizable: true,
+            impactIfUnfixed: 'cosmetic' }] } : CLEAN_ANSWER, {}), mintRunId: () => 'r-advisory-effects',
+          advisorySettings: () => {
+            if (mode === 'settings-error') throw new Error('settings unavailable');
+            return { value: { mode: ['off', 'on'].includes(mode) ? mode : 'shadow' }, invalid: mode === 'invalid-settings' };
+          },
+          recordAdvisoryShadow: facts => {
+            decisions.push(facts.decision);
+            if (mode === 'recorder-error') throw new Error('ledger unavailable');
+            return recordPostAcceptAdvisoryShadow({ ...facts, readLedgerRows: () => rows,
+              appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+          }, advisoryLog: () => {},
+        });
+        return { out, effects, rows, decisions, filings: fileItem.mock.calls };
+      };
+      const baseline = await execute('off');
+      const result = await execute(scenario);
+      expect(result.out.code).toBe(0);
+      expect(result.out.stopped).toBe('complete');
+      expect(result.out.run.findings.confirm).toBe('accept');
+      expect(result.out.run.verdict).toEqual(baseline.out.run.verdict);
+      expect(result.out.lines).toEqual(baseline.out.lines);
+      expect(result.effects).toEqual(baseline.effects);
+      expect(result.filings).toEqual(baseline.filings);
+      expect(baseline.rows).toHaveLength(0);
+      expect(result.rows).toHaveLength(['shadow', 'on', 'invalid-settings'].includes(scenario) ? 1 : 0);
+      if (scenario !== 'settings-error') expect(result.decisions[0]).toMatchObject({
+        wouldCard: scenario !== 'invalid-settings', wouldPush: scenario === 'invalid-settings',
+      });
+      if (result.rows.length) expect(result.rows[0].loopsAfter).toBeNull();
+    });
+
   it.each(['off', 'shadow', 'on'])('%s preserves acceptance and effects, recording only when enabled', async mode => {
     const execute = async currentMode => {
       const { declaration, registry } = registryFor({ rev: HEAD_A });

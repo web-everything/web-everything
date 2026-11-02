@@ -598,8 +598,8 @@ export async function runReviewLoopOnce({
             const settings = advisorySettings({ log: advisoryLog });
             if (settings.value.mode !== 'off') {
               await recordAdvisoryShadow({ repo: out.run.input.repo, pr: Number(out.run.input.pr),
-                head: out.run.findings?.read?.netBasis?.rev, now, out: advisoryLog,
-                decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode }) });
+                head: out.run.findings?.read?.netBasis?.rev, loopsAfter: null, now, out: advisoryLog,
+                decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode, invalid: settings.invalid }) });
             }
           } catch (error) {
             try { advisoryLog(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
