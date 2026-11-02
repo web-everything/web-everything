@@ -120,6 +120,14 @@ describe('readLedgerPrs — real HTTP fixture', () => {
     unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), reason, fixture.url);
   });
 
+  it.each([
+    ['missing stateCursor', { stateCursor: undefined }], ['non-integer stateCursor', { stateCursor: 'x' }],
+    ['future lastDeliveryAt', { lastDeliveryAt: NOW + 24 * 3600_000 }],
+  ])('refuses incomplete freshness evidence as malformed: %s', async (_name, overrides) => {
+    const fixture = await serve(body(overrides));
+    unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'malformed', fixture.url);
+  });
+
   it('returns http-500 without leaking the response body', async () => {
     const fixture = await serve({ error: TOKEN }, { status: 500 });
     unavailable(await readLedgerPrs({ repo: REPO, env: fixture.env }), 'http-500', fixture.url);

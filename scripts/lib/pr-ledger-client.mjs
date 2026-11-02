@@ -54,6 +54,7 @@ export async function readLedgerPrs({
     if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.prs)) return unavailable('malformed');
     if (body.repo != null && !sameRepo(body.repo, repo)) return unavailable('wrong-repo');
     if (body.gap) return unavailable('gap');
+    if (!Number.isSafeInteger(body.stateCursor) || body.stateCursor < 0) return unavailable('malformed');
     if (!Array.isArray(body.coverage?.bootstrap)
       || !body.coverage.bootstrap.some(entry => entry && sameRepo(entry.repo, repo) && entry.status === 'complete')) {
       return unavailable('coverage-gap');
@@ -61,6 +62,8 @@ export async function readLedgerPrs({
     const now = Date.now();
     const feedNow = body.now ?? now;
     if (!Number.isFinite(feedNow) || (body.lastDeliveryAt != null && !Number.isFinite(body.lastDeliveryAt))) return unavailable('malformed');
+    // A delivery dated beyond the Worker's own clock (plus 60s skew) is not evidence of freshness.
+    if (body.lastDeliveryAt != null && body.lastDeliveryAt > feedNow + 60_000) return unavailable('malformed');
     if (classifyFeedHealth({ lastOkAt: now, lastFailAt: null, lastDeliveryAt: body.lastDeliveryAt,
       now: feedNow, staleAfterMs }) !== 'healthy') return unavailable('stale');
     const prs = [];
@@ -100,7 +103,7 @@ export function compareLedgerToGithub(githubPrs, ledger) {
     else if (!actual) { result.onlyLedger.push(number); reason = 'missing-in-github'; }
     else if (actual.headRefOid !== expected.headRefOid) reason = 'head-differs';
     else if (labels(actual) !== labels(expected)) reason = 'labels-differ';
-    else if (typeof actual.isDraft === 'boolean' && actual.isDraft !== expected.isDraft) reason = 'draft-differs';
+    // Draft state is NOT compared: the GitHub list this pass reads does not carry it, so a comparison would be vacuous.
     if (reason) result.disagreements.push({ number, reason });
   }
   return { ...result, ok: true, agree: result.disagreements.length === 0, savedListCalls: 1, fallbackReason: null };
