@@ -210,7 +210,10 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
   const last = numOrNull(storage.getMeta('lastProjectionPruneAt'));
   if (last != null && now >= last && now - last < PROJECTION_PRUNE_INTERVAL_MS) return;
   storage.setMeta('lastProjectionPruneAt', String(now));
+  let horizon = Number(storage.getMeta('tombstoneHorizonSeq') || 0);
+  const remember = (seq) => { if (Number.isSafeInteger(seq) && seq >= 0) horizon = Math.max(horizon, seq); };
   for (const { key, value: t } of storage.listProjection('tombstones', true)) {
+    remember(t?.closedSeq);
     if (!Number.isFinite(t?.prunedAt) || t.prunedAt < now - tombstoneRetentionMs) storage.deleteProjection('tombstones', key);
   }
   const expired = new Map(), deadShas = new Set();
@@ -221,8 +224,11 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
     if (row.sha) deadShas.add(JSON.stringify([row.repo, row.sha]));
     storage.putProjection('tombstones', key, { repo: row.repo, number: row.number, state: 'closed', merged: row.merged ?? null,
       closedSeq: row.fields?.state ?? row.seq ?? 0, prunedAt: now });
+    remember(row.fields?.state ?? row.seq ?? 0);
     storage.deleteProjection('prs', key);
   }
+  // This small permanent fence survives expiry of every individual tombstone.
+  storage.setMeta('tombstoneHorizonSeq', String(horizon));
   if (!expired.size) return;
   for (const { key, value: numbers } of storage.listProjection('shas', true)) {
     let repo;
@@ -247,7 +253,8 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
 
 /** The served per-PR rows (`GET /prs`'s `prs`) of a projection storage. Exported for the reader-side mirror. */
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const isPrRow = (r) => isObject(r) && typeof r.repo === 'string' && Number.isInteger(r.number);
+const isRepo = (v) => typeof v === 'string' && /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(v);
+const isPrRow = (r) => isObject(r) && isRepo(r.repo) && Number.isInteger(r.number);
 const comparePrKey = (a, b) => a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : a.number - b.number;
 
 export function projectPrRows(storage, malformed = () => {}) {
@@ -258,7 +265,7 @@ export function projectPrRows(storage, malformed = () => {}) {
   for (const { key, value: numbers } of storage.listProjection('shas', true)) {
     let identity;
     try { identity = JSON.parse(key); } catch { /* Count the unreadable map below. */ }
-    if (!Array.isArray(identity) || identity.length !== 2 || typeof identity[0] !== 'string' || typeof identity[1] !== 'string' ||
+    if (!Array.isArray(identity) || identity.length !== 2 || !isRepo(identity[0]) || typeof identity[1] !== 'string' ||
         !Array.isArray(numbers) || !numbers.every(Number.isInteger)) {
       malformed({ repo: typeof identity?.[0] === 'string' ? identity[0] : undefined });
       shaPrs.set(key, []);
@@ -270,7 +277,7 @@ export function projectPrRows(storage, malformed = () => {}) {
     byPr.get(k).add(c);
   };
   for (const c of storage.listProjection('checks')) {
-    if (!isObject(c) || typeof c.repo !== 'string' || (c.prs != null && !Array.isArray(c.prs))) {
+    if (!isObject(c) || !isRepo(c.repo) || (c.prs != null && !Array.isArray(c.prs))) {
       malformed(c); continue;
     }
     for (const number of c.prs || []) attach(c, number);
@@ -343,6 +350,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     }); },
     bootstrap(raw, now = Date.now()) { return storage.transaction(() => {
       const input = validateBootstrap(raw);
+      const horizon = Number(storage.getMeta('tombstoneHorizonSeq') || 0);
+      if (!Number.isSafeInteger(horizon) || horizon < 0 || input.baseCursor < horizon) throw new Error('stale bootstrap');
       const importKey = JSON.stringify([input.repo, input.importId]);
       const previous = storage.getProjection('imports', importKey);
       if (previous) {
@@ -367,7 +376,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     }); },
     readPrs(cursor, limit, now = Date.now(), { prsCursor = null, prsLimit = DEFAULT_PAGE_LIMIT, prsAfter = null } = {}) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
-      const truncated = { rows: 0, repos: {}, malformed: 0 }, incomplete = new Set();
+      const truncated = { rows: 0, repos: {}, malformed: 0, unattributed: 0 }, incomplete = new Set();
       const after = Number.isSafeInteger(prsCursor) && prsCursor >= 0 ? prsCursor : null;
       let key = null;
       if (prsAfter != null) {
@@ -378,7 +387,8 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       const pageSize = Math.max(1, Math.min(MAX_PAGE_LIMIT, Math.floor(Number(prsLimit) || DEFAULT_PAGE_LIMIT)));
       const projected = projectPrRows(storage, (row) => {
         truncated.malformed += 1;
-        if (typeof row?.repo === 'string') incomplete.add(row.repo);
+        if (isRepo(row?.repo)) incomplete.add(row.repo.toLowerCase());
+        else truncated.unattributed += 1;
       }).sort((a, b) => a.seq - b.seq || comparePrKey(a, b));
       // Stable identity within a sequence survives earlier rows advancing during concurrent deliveries.
       const eligible = projected.filter((r) => after == null || r.seq > after ||
@@ -401,6 +411,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         response.repos[repo].coverage = false;
       };
       incomplete.forEach(failClosed);
+      if (truncated.unattributed) Object.keys(response.repos).forEach(failClosed);
       const drop = (row) => {
         truncated.rows += 1;
         truncated.repos[row.repo] = (truncated.repos[row.repo] || 0) + 1;
@@ -547,7 +558,8 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
     let input;
     try { input = validateBootstrap(await request.json()); } catch { return json(400, { error: 'invalid bootstrap' }); }
     const log = await getLog();
-    try { return json(200, await log.bootstrap(input, now())); } catch { return json(409, { error: 'bootstrap rejected' }); }
+    try { return json(200, await log.bootstrap(input, now())); }
+    catch (error) { return json(409, { error: error?.message === 'stale bootstrap' ? 'stale bootstrap' : 'bootstrap rejected' }); }
   }
 
   if (url.pathname === '/events' || url.pathname === '/prs') {

@@ -112,6 +112,16 @@ describe('/prs response budget', () => {
 });
 
 describe('/prs legacy storage', () => {
+  it.each([
+    ['prs', null], ['checks', null], ['prs', { repo: 42, number: 1 }], ['checks', { repo: '', prs: [] }],
+  ])('counts unattributed malformed %s evidence and clears coverage for every repo', (bucket, invalid) => {
+    const h = fixture(); h.put(1); h.put(2, 'open', 'o/b');
+    h.storage.putProjection(bucket, 'unattributed', invalid);
+    const body = h.read();
+    expect(body.truncated).toMatchObject({ malformed: 1, unattributed: 1 });
+    expect(Object.values(body.repos).every((r) => r.coverage === false)).toBe(true);
+  });
+
   it.each([null, {}, 'legacy', [null], [1, 'two']].map((value) => [value]))('counts malformed SHA attachment maps (%j) once and clears only their repo coverage', (invalid) => {
     const h = fixture(); h.put(1); h.put(2, 'open', 'o/b');
     h.storage.putProjection('shas', JSON.stringify(['o/a', 'o/a-1']), invalid);
@@ -134,16 +144,16 @@ describe('/prs legacy storage', () => {
     expect(h.read().repos['o/a'].coverage).toBe(true);
   });
 
-  it('skips malformed PR and check rows, counts them and isolates lost coverage', () => {
+  it('counts malformed PR and check rows and clears all coverage when some cannot be attributed', () => {
     const h = fixture(); h.put(1, 'open', 'o/b');
     const bad = [null, 'legacy', [], { repo: 'o/a' }, { repo: 'o/a', number: 1.5 }, { repo: 42, number: 1 }];
     bad.forEach((row, n) => h.storage.putProjection('prs', `bad-${n}`, row));
     [null, 'legacy', [], { repo: 'o/a', prs: {} }].forEach((row, n) => h.storage.putProjection('checks', `bad-${n}`, row));
     const body = h.read();
     expect(body.prs.map((p) => p.number)).toEqual([1]);
-    expect(body.truncated).toMatchObject({ rows: 0, repos: {}, malformed: 10 });
+    expect(body.truncated).toMatchObject({ rows: 0, repos: {}, malformed: 10, unattributed: 7 });
     expect(body.repos['o/a'].coverage).toBe(false);
-    expect(body.repos['o/b'].coverage).toBe(true);
+    expect(body.repos['o/b'].coverage).toBe(false);
   });
 
   it.each([null, '', '{broken', 'null', '[]', '42', '"legacy"'])('tolerates invalid coverage metadata %j', (value) => {

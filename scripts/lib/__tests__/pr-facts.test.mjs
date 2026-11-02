@@ -74,8 +74,44 @@ function coveredWorker() {
 
 describe('full mirror pagination', () => {
   const row = (number) => ({ repo: REPO.toLowerCase(), number, seq: number, sha: HEAD, draft: false, state: 'open', labels: [], checks: [], suites: [] });
-  const first = { stateCursor: 9, lastDeliveryAt: T0, coverage: { bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0 }] } };
+  const first = { stateCursor: 9, lastDeliveryAt: T0, repos: { [REPO.toLowerCase()]: { coverage: true } },
+    coverage: { bootstrap: [{ repo: REPO, status: 'complete', baseCursor: 0 }] } };
   const options = { repo: REPO, url: 'https://w.local', token: 'read', nowMs: T0, pageLimit: 1 };
+
+  it.each(['stateCursor', 'bootstrap', 'repo coverage'])('restarts a full pull when %s changes and publishes only a consistent snapshot', async (field) => {
+    let calls = 0;
+    const base = { ...first, repos: { [REPO.toLowerCase()]: { coverage: true } } };
+    const changed = field === 'stateCursor' ? { ...base, stateCursor: 10 }
+      : field === 'bootstrap' ? { ...base, coverage: { bootstrap: [{ ...base.coverage.bootstrap[0], importId: 'new' }] } }
+      : { ...base, repos: { [REPO.toLowerCase()]: { coverage: false } } };
+    const queries = [];
+    const result = await refreshMirror(null, { ...options, fetchImpl: async (url) => {
+      queries.push(new URL(url).searchParams);
+      calls += 1;
+      return new Response(JSON.stringify(calls === 1 ? { ...base, prs: [row(1)], prsMore: true, prsCursor: 1 }
+        : calls === 2 ? { ...changed, prs: [row(2)], prsMore: false, prsCursor: 2 }
+        : { ...base, prs: [row(3)], prsMore: false, prsCursor: 3 }));
+    } });
+    expect(result.mode).toBe('full');
+    expect(mirrorRows(result.mirror).map((r) => r.number)).toEqual([3]);
+    expect(calls).toBe(3);
+    expect(queries[2].has('prsCursor')).toBe(false);
+  });
+
+  it.each(['stateCursor', 'bootstrap', 'repo coverage'])('allows at most two restarts for changing %s, then falls back to GitHub', async (field) => {
+    let calls = 0;
+    const result = await readPrFactsOrGithub({ repo: REPO, number: 7, dir, env: {}, now: () => T0,
+      url: options.url, token: 'read', exec: fakeGh(githubFixture()), fetchImpl: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ...first, stateCursor: field === 'stateCursor' ? calls : 9,
+          coverage: { bootstrap: [{ ...first.coverage.bootstrap[0], importId: field === 'bootstrap' ? `i${calls}` : 'stable' }] },
+          repos: { [REPO.toLowerCase()]: { coverage: field === 'repo coverage' ? calls % 2 === 1 : true } },
+          prs: [row(calls)], prsCursor: calls, prsMore: calls % 2 === 1,
+        }));
+      } });
+    expect(result).toMatchObject({ source: 'github', reason: 'feed-unreachable' });
+    expect(calls).toBe(6); // initial pull + exactly two fresh attempts, two pages each
+  });
 
   it.each([
     ['missing PR number', { ...row(7), number: null }],
@@ -115,7 +151,8 @@ describe('full mirror pagination', () => {
     expect(mirrorRows(mirror).map((r) => r.number).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]);
     expect(mirrorRows(mirror).find((r) => r.number === 1).sha).toBe(HEAD);
     expect(mirror.bootstrap.status).toBe('complete');
-    expect(pages).toBe(3);
+    expect(pages).toBe(5); // two interrupted pages, then all three pages of the new snapshot
+    expect(mirror.cursor).toBe(1);
   });
 
   it('reads all 501 tied bootstrap rows through the real Worker and retains complete coverage', async () => {
@@ -133,7 +170,7 @@ describe('full mirror pagination', () => {
       const q = new URL(url).searchParams; queries.push(q);
       return new Response(JSON.stringify(queries.length === 1
         ? { ...first, prs: [row(1)], prsCursor: 1, prsMore: true }
-        : { prs: [row(2)], prsCursor: 2, prsMore: false, truncated: { repos: {} } }));
+        : { ...first, prs: [row(2)], prsCursor: 2, prsMore: false, truncated: { repos: {} } }));
     } });
     expect(mode).toBe('full');
     expect(mirrorRows(mirror).map((r) => r.number)).toEqual([1, 2]);
@@ -151,7 +188,7 @@ describe('full mirror pagination', () => {
       calls += 1;
       if (calls === 1) return new Response(JSON.stringify({ ...first, prs: [row(1)], prsCursor: 1, prsMore: true }));
       if (failure === 'HTTP failure') return new Response('', { status: 503 });
-      return new Response(JSON.stringify({ prs: [row(2)], prsCursor: 1, prsMore: failure === 'stalled cursor' || failure === 'malformed cursor',
+      return new Response(JSON.stringify({ ...first, prs: [row(2)], prsCursor: 1, prsMore: failure === 'stalled cursor' || failure === 'malformed cursor',
         prsAfter: failure === 'malformed cursor' ? 'broken' : null,
         truncated: { repos: failure === 'truncated repo' ? { [REPO.toLowerCase()]: 1 } : {} } }));
     } });

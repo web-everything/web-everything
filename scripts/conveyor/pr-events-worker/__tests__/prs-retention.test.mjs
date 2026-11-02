@@ -10,6 +10,39 @@ const write = (log, now) => log.append({ repo: 'o/other', type: 'check_run', prs
 const seed = (baseCursor, importId = 'stale') => ({ repo: 'o/r', importId, baseCursor, status: 'complete',
   prs: [{ number: 1, sha: 'seed', draft: false, labels: [], state: 'open' }] });
 
+it('rejects stale bootstrap with HTTP 409 after all tombstones expire and the log restarts, without applying it', async () => {
+  const storage = core.createMemoryStorage(), options = { prRetentionMs: 0, tombstoneRetentionMs: 0 };
+  let log = core.createEventLog(storage, options);
+  log.append(event(1, 'closed'), T);
+  log.append(event(2, 'closed'), T);
+  log.append({ repo: 'o/r', prs: [2], sha: 'sha-2', type: 'check_run', name: 'ci' }, T);
+  write(log, T + INTERVAL);
+  write(log, T + 2 * INTERVAL);
+  expect(storage.listProjection('tombstones')).toEqual([]);
+  log = core.createEventLog(storage, options);
+  expect(() => log.bootstrap(seed(0), T + 2 * INTERVAL)).toThrow('stale bootstrap');
+  expect(Number(storage.getMeta('tombstoneHorizonSeq'))).toBe(2); // close clock, not last check's seq=3
+  const response = await core.handleRequest(new Request('https://test/prs/bootstrap', { method: 'POST',
+    headers: { authorization: 'Bearer boot' }, body: JSON.stringify(seed(0, 'http-stale')),
+  }), { PR_EVENTS_BOOTSTRAP_TOKEN: 'boot' }, { getLog: () => log, now: () => T + 2 * INTERVAL });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: 'stale bootstrap' });
+  expect(storage.listProjection('prs')).toEqual([]);
+  expect(storage.listProjection('imports')).toEqual([]);
+  log.bootstrap(seed(2, 'at-horizon'), T + 2 * INTERVAL);
+  expect(log.readPrs().prs[0].state).toBe('open');
+});
+
+it('raises the permanent horizon for legacy tombstones as they expire and never lowers it', () => {
+  const storage = core.createMemoryStorage(), log = core.createEventLog(storage, { tombstoneRetentionMs: 0 });
+  storage.setMeta('tombstoneHorizonSeq', '2');
+  storage.putProjection('tombstones', key('o/r', 1), { repo: 'o/r', number: 1, closedSeq: 7, prunedAt: T - INTERVAL });
+  write(log, T);
+  expect(Number(storage.getMeta('tombstoneHorizonSeq'))).toBe(7);
+  write(log, T + INTERVAL);
+  expect(Number(storage.getMeta('tombstoneHorizonSeq'))).toBe(7);
+});
+
 it('keeps an unserved tombstone with the close clock and rejects stale bootstrap after pruning and restart', () => {
   const storage = core.createMemoryStorage();
   let log = core.createEventLog(storage, { prRetentionMs: 0 });
@@ -21,7 +54,7 @@ it('keeps an unserved tombstone with the close clock and rejects stale bootstrap
     merged: true, closedSeq: 2, prunedAt: T + INTERVAL });
   expect(log.readPrs().prs).toEqual([]);
   log = core.createEventLog(storage, { prRetentionMs: 0 });
-  log.bootstrap(seed(1), T + INTERVAL + 1);
+  expect(() => log.bootstrap(seed(1), T + INTERVAL + 1)).toThrow('stale bootstrap');
   expect(log.readPrs().prs).toEqual([]);
   expect(storage.getProjection('prs', key('o/r', 1))).toBeNull();
 });
@@ -31,7 +64,7 @@ it('preserves the close clock when later check events recreate a pruned row, whi
   log.append(event(1, 'closed'), T);
   write(log, T + INTERVAL);
   log.append({ repo: 'o/r', prs: [1], sha: 'sha-1', type: 'check_run', name: 'ci' }, T + INTERVAL + 1);
-  log.bootstrap(seed(0), T + INTERVAL + 2);
+  expect(() => log.bootstrap(seed(0), T + INTERVAL + 2)).toThrow('stale bootstrap');
   expect(log.readPrs().prs[0]).toMatchObject({ number: 1, state: 'closed' });
   log.append(event(1, 'reopened'), T + INTERVAL + 3);
   expect(log.readPrs().prs[0].state).toBe('open');

@@ -44,6 +44,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, wri
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry } from './gh-throttle.mjs';
 import { PR_EVENTS_DEFAULTS, PR_EVENTS_FLAG_ENV, classifyFeedHealth, resolvePrEventsConfig } from './pr-events.mjs';
@@ -295,32 +296,41 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
   timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
   const io = { fetchImpl, timeoutMs };
   const full = async () => {
-    const prs = [];
-    let first, cursor = null, after = null, key = null;
-    for (;;) {
-      const q = new URLSearchParams({ prsLimit: String(pageLimit) });
-      if (cursor != null) q.set('prsCursor', String(cursor));
-      if (after != null) q.set('prsAfter', after);
-      const body = await getJson(`${url}/prs?${q}`, token, io);
-      if (!body || !Array.isArray(body.prs) || typeof body.prsMore !== 'boolean') throw new Error('malformed /prs page');
-      validateServedRows(body.prs, repo);
-      if ((body.truncated?.repos?.[repoKey(repo)] || 0) > 0 ||
-          (body.truncated?.malformed > 0 && body.repos?.[repoKey(repo)]?.coverage === false))
-        throw new Error('incomplete /prs coverage');
-      first ??= body;
-      prs.push(...body.prs);
-      if (!body.prsMore) return seedMirror({ repo, body: { ...first, prs }, nowMs });
-      const next = body.prsCursor, nextAfter = body.prsAfter ?? null;
-      let nextKey = null;
-      if (nextAfter != null) {
-        try { nextKey = JSON.parse(nextAfter); } catch { /* Rejected below. */ }
-        if (!Array.isArray(nextKey) || nextKey.length !== 2 || typeof nextKey[0] !== 'string' || !Number.isInteger(nextKey[1]))
-          throw new Error('malformed /prs cursor');
+    retry: for (let restarts = 0; restarts <= 2; restarts += 1) {
+      const prs = [];
+      let first, snapshot, cursor = null, after = null, key = null;
+      for (;;) {
+        const q = new URLSearchParams({ prsLimit: String(pageLimit) });
+        if (cursor != null) q.set('prsCursor', String(cursor));
+        if (after != null) q.set('prsAfter', after);
+        const body = await getJson(`${url}/prs?${q}`, token, io);
+        if (!body || !Array.isArray(body.prs) || typeof body.prsMore !== 'boolean') throw new Error('malformed /prs page');
+        validateServedRows(body.prs, repo);
+        if (!Number.isSafeInteger(body.stateCursor) || body.stateCursor < 0 || !Array.isArray(body.coverage?.bootstrap) ||
+            typeof body.repos?.[repoKey(repo)]?.coverage !== 'boolean') throw new Error('malformed /prs snapshot');
+        const current = { stateCursor: body.stateCursor, coverage: body.repos[repoKey(repo)].coverage,
+          bootstrap: body.coverage.bootstrap.find((b) => repoKey(b?.repo) === repoKey(repo)) ?? null };
+        if (snapshot && !isDeepStrictEqual(snapshot, current)) {
+          if (restarts === 2) throw new Error('inconsistent /prs snapshot after 2 restarts');
+          continue retry; // Discard every row and cursor from the interrupted pull.
+        }
+        if (body.truncated?.unattributed > 0 || (body.truncated?.repos?.[repoKey(repo)] || 0) > 0 ||
+            (body.truncated?.malformed > 0 && current.coverage === false)) throw new Error('incomplete /prs coverage');
+        first ??= body; snapshot ??= current;
+        prs.push(...body.prs);
+        if (!body.prsMore) return seedMirror({ repo, body: { ...first, prs }, nowMs });
+        const next = body.prsCursor, nextAfter = body.prsAfter ?? null;
+        let nextKey = null;
+        if (nextAfter != null) {
+          try { nextKey = JSON.parse(nextAfter); } catch { /* Rejected below. */ }
+          if (!Array.isArray(nextKey) || nextKey.length !== 2 || typeof nextKey[0] !== 'string' || !Number.isInteger(nextKey[1]))
+            throw new Error('malformed /prs cursor');
+        }
+        const keyAdvances = key && nextKey && (nextKey[0] > key[0] || (nextKey[0] === key[0] && nextKey[1] > key[1]));
+        if (!Number.isSafeInteger(next) || next < 0 ||
+            (cursor != null && (next < cursor || (next === cursor && !keyAdvances)))) throw new Error('stalled /prs cursor');
+        cursor = next; after = nextAfter; key = nextKey;
       }
-      const keyAdvances = key && nextKey && (nextKey[0] > key[0] || (nextKey[0] === key[0] && nextKey[1] > key[1]));
-      if (!Number.isSafeInteger(next) || next < 0 ||
-          (cursor != null && (next < cursor || (next === cursor && !keyAdvances)))) throw new Error('stalled /prs cursor');
-      cursor = next; after = nextAfter; key = nextKey;
     }
   };
   try {
