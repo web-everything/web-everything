@@ -52,6 +52,7 @@ import { fileURLToPath } from 'node:url';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { compareLedgerToGithub, readLedgerPrs, resolveLedgerMode } from '../lib/pr-ledger-client.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import {
   ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, latestAdvisory, planAdvisoryRepairLabels, planAdvisoryStaleLabels,
@@ -157,9 +158,26 @@ export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
   publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
+  ledger = null, ledgerMode = 'shadow',
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const prs = listPrs({ repo });
+  if (ledgerMode === 'shadow' && ledger !== null) {
+    let diagnostic;
+    try {
+      const comparison = compareLedgerToGithub(prs, ledger);
+      const disagree = comparison.disagreements.length;
+      const agree = comparison.ok ? new Set([...prs.map(pr => pr.number), ...ledger.prs.map(pr => pr.number)]).size - disagree : 0;
+      diagnostic = `agree=${agree} disagree=${disagree} saved=${comparison.savedListCalls}`
+        + (comparison.fallbackReason ? ` fallback=${comparison.fallbackReason}` : '')
+        + comparison.disagreements.map(({ number, reason }) => ` #${number}:${reason}`).join('');
+    } catch {
+      diagnostic = 'agree=0 disagree=0 saved=0 fallback=compare-failed';
+    }
+    try {
+      log(`advisory-label-sweep ledger-compare mode=shadow ${diagnostic}`.replace(/[\p{Cc}\p{Cf}]/gu, ' '));
+    } catch { /* Shadow diagnostics must never affect the sweep. */ }
+  }
   const results = [];
   // Resolved lazily and once, only when a live read or write is about to happen — `GH_ARGV.setLabels` splices
   // `--repo` into its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict
@@ -251,8 +269,19 @@ if (IS_CLI) {
     process.exitCode = 2;
   } else {
     try {
+      const { mode: ledgerMode, source } = resolveLedgerMode(process.env);
+      writeLineSync(2, `advisory-label-sweep ledger-mode mode=${ledgerMode} source=${source}`);
+      let ledger = null;
+      if (ledgerMode === 'shadow') {
+        try {
+          ledger = repo ? await readLedgerPrs({ repo })
+            : { ok: false, source: 'unavailable', fallback: 'github', reason: 'no-repo' };
+        } catch {
+          ledger = { ok: false, source: 'unavailable', fallback: 'github', reason: 'network' };
+        }
+      }
       const results = sweepAdvisoryLabels({
-        repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        repo, dryRun, ledger, ledgerMode, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
         if (r.skipped) { writeLineSync(2, `  ⚠ PR #${r.num}: no label change (${r.skipped})`); continue; }

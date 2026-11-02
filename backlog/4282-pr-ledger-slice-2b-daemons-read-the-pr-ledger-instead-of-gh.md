@@ -6,12 +6,16 @@ parent: "4075"
 status: open
 dateOpened: "2026-09-27"
 tags: []
-scope: ["we:scripts/lib/pr-ledger-client.mjs", "we:scripts/lib/__tests__/pr-ledger-client.test.mjs", "we:scripts/lib/pr-snapshot.mjs", "we:scripts/lib/__tests__/pr-snapshot.test.mjs", "we:scripts/lib/pr-events.mjs", "we:scripts/lib/__tests__/pr-events.test.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:skills-src/conveyor/__tests__/review-daemon.test.mjs", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs"]
+scope: ["we:scripts/lib/pr-ledger-client.mjs", "we:scripts/lib/__tests__/pr-ledger-client.test.mjs", "we:scripts/conveyor/advisory-label-sweep.mjs", "we:scripts/conveyor/__tests__/advisory-label-sweep.test.mjs"]
 ---
 
 # PR ledger slice 2b: daemons read the PR ledger instead of gh pr list
 
 The Worker now serves an authenticated per-PR projection, while shared snapshot discovery still pages GitHub. Add one shared ledger client and use its complete, fresh repo snapshot for review/fix discovery, retaining targeted GitHub hydration for fields the projection does not carry. Fall back to the existing bounded GitHub discovery path when feed health or coverage is inadequate; never mistake a partial ledger for an empty repo. Size 8 covers client/cache, snapshot integration and both daemon callers/tests. #4281 is resolved, so it is no longer an unmet dependency.
+
+## Narrowed scope (R416, 2026-11-02)
+
+This slice is now the PR-ledger client plus `advisory-label-sweep` as the pilot reader, run in SHADOW only (`WE_LABEL_SWEEP_LEDGER=off|shadow`, default shadow): the sweep still acts on the GitHub list, reads the ledger too and logs one compare line per pass. End rule: 3 days of shadow with 0 unexplained disagreements; flipping the sweep to ledger-primary is a later step. A2 and A4 (shared-snapshot and review/fix daemon integration) move to a follow-up card; A1, A3 and A5 stay here, where A5 is the shadow compare proof.
 
 ## Done when
 
