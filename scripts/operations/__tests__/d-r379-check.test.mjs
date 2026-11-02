@@ -1212,6 +1212,63 @@ describe('round 10 harmless-path allowlist', () => {
   });
 });
 
+describe('round 12 trusted minimum path policy', () => {
+  const canaries = ['scripts/guard-bash.mjs', 'scripts/lib/jury-core.mjs',
+    'scripts/review-set-label.mjs', '.github/workflows/ci.yml', 'package.json',
+    'tests/a/b.test.mjs', 'docs/agent/platform-decisions.md', 'AGENTS.md'];
+  const closed = async policy => {
+    const r = await checkPr(6223, deps(undefined, {readSettings: () => policy}));
+    for (const id of [3, 4]) {
+      expect(condition(r, id).status).toBe('UNKNOWN');
+      expect(condition(r, id).evidence.join(' ')).toContain('human review');
+    }
+    expect(r.eligible).toBe(false);
+  };
+  it('rejects a replacement policy containing only a universal harmless allowlist', async () => {
+    await closed({harmlessPaths: ['**']});
+  });
+  it.each(['**', '*', '**/*', ...canaries, 'docs/**/*.md'])
+  ('rejects dangerous harmless entry %s even beside a valid policy', async pattern => {
+    await closed({...settings, harmlessPaths: [...settings.harmlessPaths, pattern]});
+  });
+  it('rejects empty protectedPaths', async () => {
+    await closed({...settings, protectedPaths: []});
+  });
+  it.each(canaries.slice(0, 5))('rejects missing protection for canary %s', async missing => {
+    await closed({...settings, protectedPaths: canaries.slice(0, 5).filter(path => path !== missing),
+      enforcementTrees: ['unrelated/**']});
+  });
+  it('accepts canary coverage supplied entirely by enforcement trees', async () => {
+    const r = await checkPr(6223, deps(undefined, {readSettings: () => ({...settings,
+      protectedPaths: ['unrelated/**'], enforcementTrees: canaries.slice(0, 5)})}));
+    expect(r.eligible).toBe(true);
+  });
+  it('rejects a policy that no longer recognizes ordinary example Markdown', async () => {
+    await closed({...settings, harmlessPaths: ['backlog/*.md']});
+  });
+  it('shipped harmless entries exclude every canary and include ordinary example Markdown', () => {
+    for (const path of canaries) {
+      expect(settings.harmlessPaths.some(glob => matchesGlob(path, glob))).toBe(false);
+    }
+    expect(settings.harmlessPaths.some(glob => matchesGlob('docs/examples/x.md', glob))).toBe(true);
+  });
+  it.each(['scripts/settings/d-r379-protected-paths.json',
+    'scripts/operations/d-r379-check.mjs', 'scripts/operations/d-r379-check-io.mjs',
+    'scripts/operations/__tests__/d-r379-check.test.mjs',
+    'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
+    'scripts/operations/__fixtures__/d-r379/nested/policy.json'])
+  ('built-in protection for %s wins over permissive policy and reviewed-safe entries', async path => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
+      readSettings: () => ({...settings, protectedPaths: ['unrelated/**'],
+        enforcementTrees: canaries.slice(0, 5),
+        harmlessPaths: [...settings.harmlessPaths, path], reviewedSafePaths: ['**']}),
+    }));
+    expect(condition(r, 3).status).toBe('PASS');
+    expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
+    expect(r.eligible).toBe(false);
+  });
+});
+
 describe('round 11 equal-time hold and executable examples', () => {
   it('a docs/examples executable file is not harmless', async () => {
     const r = await checkPr(1, deps({ ...fixture(6223), netDiffPaths: ['docs/examples/access-control.tsx'] }));

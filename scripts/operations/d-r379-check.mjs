@@ -12,6 +12,23 @@ import { globToRegExp } from '../lib/standards-sections.mjs';
 const SHA = /^[a-f\d]{40}$/i;
 const MAX_PATHS = 10_000;
 const MAX_AUDITS = 100_000;
+// Checkout policy may extend this minimum, but cannot remove it or bless its own edits.
+const TRUSTED_MINIMUM = Object.freeze({
+  protectedPaths: Object.freeze([
+    'scripts/settings/d-r379-protected-paths.json',
+    'scripts/operations/d-r379-check*.mjs',
+    'scripts/operations/__tests__/d-r379-check*',
+    'scripts/operations/__fixtures__/d-r379/**',
+  ]),
+  enforcementCanaries: Object.freeze([
+    'scripts/guard-bash.mjs', 'scripts/lib/jury-core.mjs',
+    'scripts/review-set-label.mjs', '.github/workflows/ci.yml', 'package.json',
+  ]),
+  harmlessExclusions: Object.freeze([
+    'tests/a/b.test.mjs', 'docs/agent/platform-decisions.md', 'AGENTS.md',
+  ]),
+  harmlessExample: 'docs/examples/x.md',
+});
 const USAGE = 'usage: node scripts/operations/d-r379-check.mjs --pr=N [--json]\n';
 const DIRECTION = /\bD-R\d+\b|\bR\d{2,4}\b|#\d+\b|\b(?:card|story|item|focus(?:\s+item)?)\s*#?\d+\b/i;
 const RULING = /\b(?:D-)?R\d+\b/i;
@@ -42,6 +59,14 @@ function validateSettings(settings) {
   if (!Array.isArray(records) || !records.length || records.length > 1000
     || records.some(path => !validPath(path) || /[*?\[\]]/.test(path))
     || new Set(records).size !== records.length) throw new Error('invalid ruling record paths');
+  const canaries = [...TRUSTED_MINIMUM.enforcementCanaries, ...TRUSTED_MINIMUM.harmlessExclusions];
+  if (settings.harmlessPaths.some(glob => ['**', '*', '**/*'].includes(glob)
+    || canaries.some(path => matchesGlob(path, glob)))
+    || !settings.harmlessPaths.some(glob => matchesGlob(TRUSTED_MINIMUM.harmlessExample, glob))
+    || TRUSTED_MINIMUM.enforcementCanaries.some(path =>
+      ![...settings.protectedPaths, ...settings.enforcementTrees].some(glob => matchesGlob(path, glob)))) {
+    throw new Error('path policy fails trusted minimum canary probes');
+  }
   return { ...settings, reviewedSafePaths: settings.reviewedSafePaths ?? [] };
 }
 
@@ -296,7 +321,8 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
 }
 
 function protectedPaths(paths, settings) {
-  const hits = paths.filter(path => settings.protectedPaths.some(glob => matchesGlob(path, glob)));
+  const patterns = [...TRUSTED_MINIMUM.protectedPaths, ...settings.protectedPaths];
+  const hits = paths.filter(path => patterns.some(glob => matchesGlob(path, glob)));
   if (hits.length) return result(4, 'Not guard-loosening / hard to undo', 'FAIL',
     hits.map(path => `protected path: ${path}`));
   const unclassified = paths.filter(path => {

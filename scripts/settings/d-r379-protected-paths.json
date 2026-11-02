@@ -16,7 +16,7 @@
     "docs/examples/**/*.md",
     "backlog/*.md",
     "docs/*.md",
-    "docs/**/*.md",
+    "docs/topics/**/*.md",
     "README*.md",
     "**/*.png",
     "**/*.svg",
