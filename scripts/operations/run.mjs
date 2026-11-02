@@ -198,27 +198,26 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
 
-// codex-audit: the sink runs the audit in --json mode with stdout CAPTURED (never written to the process), so the
-// verdict travels as the operation result and `finish` alone decides what reaches stdout. Plain mode re-renders
-// the same `verdict` + findings lines `codex-audit.mjs` prints; --json prints only the envelope.
+// Capture both audit streams as the operation result. The CLI adapter owns the JSON envelope;
+// plain mode prints the captured verdict/findings or refusal diagnostic, preserving the audit exit code.
 export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = {}) {
   return async ({ base, head }) => {
-    const out = [];
-    const deps = makeDeps ? makeDeps() : { ...(await import('./codex-audit-io.mjs')).createAuditDeps() };
-    deps.stdout = (text) => { out.push(text); };
-    const code = await auditMain([`--base=${base}`, `--head=${head}`, '--json'], deps);
-    let result = {};
-    try { result = JSON.parse(out.join('')); } catch { /* incomplete audit: no envelope, code carries the refusal */ }
-    return { ok: code === 0, code, ...result };
+    let stdout = '', stderr = '';
+    const deps = makeDeps ? makeDeps() : (await import('./codex-audit-io.mjs')).createAuditDeps();
+    const code = await auditMain([`--base=${base}`, `--head=${head}`], {
+      ...deps,
+      stdout: text => { stdout += text; },
+      stderr: text => { stderr += text; },
+    });
+    return { ok: code === 0, code, stdout, stderr };
   };
 }
 
 export function finishCodexAudit({ run, code, lines, json }) {
   const v = run?.verdict;
   const outCode = v?.code ?? code;
-  if (typeof v?.verdict !== 'string') return { code: outCode, lines: [] };
-  const { ok: _ok, code: _code, ...envelope } = v;
-  return { code: outCode, lines: json ? [JSON.stringify(envelope)] : [v.verdict, ...(v.findings ?? [])] };
+  return { code: outCode, lines: json || !v ? lines
+    : [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd()) };
 }
 
 

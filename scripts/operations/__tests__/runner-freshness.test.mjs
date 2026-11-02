@@ -214,40 +214,55 @@ describe('runner freshness policy', () => {
       appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
     const run = async (answer, json) => {
       const written = [];
-      const sink = createCodexAuditSink({ makeDeps: () => deps(answer, written) });
-      const verdict = await sink({ base: 'm', head: HEAD, json });
-      return { written, verdict, out: finishCodexAudit({ run: { verdict }, code: 0, lines: [], json }) };
+      const auditDeps = { ...deps(answer, written), stderr: t => written.push(t), appendRecord: vi.fn() };
+      const sink = createCodexAuditSink({ makeDeps: () => auditDeps });
+      const binding = resolveOperation('codex-audit');
+      const outcome = await runOperationCli({ ...binding, sinks: { 'codex-audit.run': sink },
+        argv: ['--base=m', `--head=${HEAD}`, ...(json ? ['--json'] : [])],
+        store: createMemoryRunStore(), newRunId: () => 'audit-output',
+      });
+      return { written, verdict: outcome.run.verdict, records: auditDeps.appendRecord.mock.calls,
+        out: finishCodexAudit({ ...outcome, json }) };
     };
     it('json mode: nothing is written by the sink and stdout is only the parseable envelope', async () => {
-      const { written, verdict, out } = await run('NOT WEAKENED\n', true);
+      const { written, verdict, records, out } = await run('NOT WEAKENED\n', true);
       expect(written).toEqual([]);
       expect(out.code).toBe(0);
       expect(out.lines).toHaveLength(1);
       const env = JSON.parse(out.lines[0]);
-      expect(env).toMatchObject({ verdict: 'NOT WEAKENED', base: SHA, head: HEAD, findings: [] });
+      expect(env.verdict).toEqual({ ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' });
+      expect(records).toEqual([[expect.objectContaining({ verdict: 'NOT WEAKENED', base: SHA, head: HEAD, findings: [] })]]);
       expect(verdict.code).toBe(0);
     });
     it('json mode carries WEAKENED findings and a nonzero code', async () => {
-      const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', true);
+      const { written, records, out } = await run('WEAKENED\nrun.mjs:1 loosened\n', true);
       expect(out.code).toBe(1);
-      expect(JSON.parse(out.lines[0])).toMatchObject({ verdict: 'WEAKENED', findings: ['run.mjs:1 loosened'] });
+      expect(written).toEqual([]);
+      expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 1,
+        stdout: 'WEAKENED\nrun.mjs:1 loosened\n', stderr: '' });
+      expect(records).toEqual([[expect.objectContaining({ verdict: 'WEAKENED', findings: ['run.mjs:1 loosened'] })]]);
     });
     it('plain mode is unchanged: verdict then findings lines, no JSON', async () => {
       const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', false);
-      expect(out.lines).toEqual(['WEAKENED', 'run.mjs:1 loosened']);
+      expect(out.lines.join('\n')).toBe('WEAKENED\nrun.mjs:1 loosened');
     });
-    it('an incomplete audit keeps its code and prints no envelope', async () => {
-      const { out } = await run(undefined, true);
+    it('an incomplete audit keeps its code and returns its diagnostic in the operations envelope', async () => {
+      const { written, records, out } = await run(undefined, true);
       expect(out.code).toBe(3);
-      expect(out.lines).toEqual([]);
+      expect(written).toEqual([]);
+      expect(records).toEqual([]);
+      expect(out.lines).toHaveLength(1);
+      expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 3, stdout: '',
+        stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' });
     });
     it.each([
       ['NOT WEAKENED', [], 0],
       ['WEAKENED', ['run.mjs:1 loosened'], 1],
     ])('registered CLI --json emits only the %s envelope', async (verdict, findings, code) => {
       const written = [];
-      const auditDeps = vi.spyOn(auditIo, 'createAuditDeps').mockImplementation(() =>
-        deps([verdict, ...findings].join('\n'), written));
+      const injectedDeps = { ...deps([verdict, ...findings].join('\n'), written),
+        stderr: text => written.push(String(text)), appendRecord: vi.fn() };
+      const auditDeps = vi.spyOn(auditIo, 'createAuditDeps').mockReturnValue(injectedDeps);
       const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(text => {
         written.push(String(text));
         return true;
@@ -259,16 +274,38 @@ describe('runner freshness policy', () => {
           store: createMemoryRunStore(), newRunId: () => 'audit-json-regression',
         });
         expect(auditDeps).toHaveBeenCalledOnce();
-        expect(outcome.run.verdict).toMatchObject({ verdict, findings, code });
+        const captured = { ok: code === 0, code, stdout: `${[verdict, ...findings].join('\n')}\n`, stderr: '' };
+        expect(outcome.run.verdict).toEqual(captured);
+        expect(injectedDeps.appendRecord).toHaveBeenCalledOnce();
+        expect(injectedDeps.appendRecord).toHaveBeenCalledWith(expect.objectContaining({
+          verdict, findings, base: SHA, head: HEAD,
+        }));
         expect(written).toEqual([]);
         const output = binding.finish({ ...outcome, json: true });
         expect(output.code).toBe(code);
         process.stdout.write(`${output.lines.join('\n')}\n`);
-        expect(JSON.parse(written.join(''))).toMatchObject({ verdict, findings, base: SHA, head: HEAD });
+        expect(JSON.parse(written.join(''))).toMatchObject({ op: 'codex-audit', verdict: captured });
       } finally {
         stdout.mockRestore();
         auditDeps.mockRestore();
       }
+    });
+    it('captures both streams without mutating injected dependencies', async () => {
+      const stdout = vi.fn(), stderr = vi.fn();
+      const auditDeps = Object.freeze({ stdout, stderr });
+      const sink = createCodexAuditSink({ makeDeps: () => auditDeps,
+        auditMain: async (_argv, io) => { io.stdout('partial\n'); io.stderr('refused\n'); return 3; },
+      });
+      const verdict = await sink({ base: 'm', head: HEAD });
+      expect(verdict).toEqual({ ok: false, code: 3, stdout: 'partial\n', stderr: 'refused\n' });
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).not.toHaveBeenCalled();
+      expect(finishCodexAudit({ run: { verdict }, code: 0, lines: [], json: false }))
+        .toEqual({ code: 3, lines: ['partial', 'refused'] });
+    });
+    it.each([true, false])('preserves adapter diagnostics when no audit verdict exists (json=%s)', json => {
+      expect(finishCodexAudit({ run: {}, code: 1, lines: ['adapter refusal'], json }))
+        .toEqual({ code: 1, lines: ['adapter refusal'] });
     });
   });
 });
