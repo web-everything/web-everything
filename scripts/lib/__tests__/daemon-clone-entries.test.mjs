@@ -141,7 +141,7 @@ it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relati
   'daemon.mts', 'daemon.py', 'daemon.cts', 'daemon.tsx', '--import=./x', '--import=package',
   '--require=./x', '--loader=./x', '--experimental-loader=./x',
   '--import', '--require', '--loader', '--experimental-loader', '-r./relative-module.cjs', '-rpackage', '-r',
-  '--eval=import("./scripts/hidden.mjs")', '--eval', '-e', '-e=1', '--print', '-p', '--print=1', '--input-type=module'])(
+  '--eval=import("./scripts/hidden.mjs")', '--eval', '-e', '-e=1', '--print', '-p', '--print=1', '--input-type=module', '-pe', '-ep', '-pe=1'])(
   'refuses an unsupported LaunchAgent entrypoint/module argument: %s', entry => {
     const f = fixture();
     writeFileSync(join(f.launchAgentsDir, 'com.we.relative.plist'), 'plist');
@@ -175,6 +175,14 @@ it.each([
   expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
     stdout: JSON.stringify({ ProgramArguments: ['node', arg] }),
   }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.symlink.plist: ${arg}`);
+});
+
+it('refuses node eval after a flag that merely takes a script-shaped value', () => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.title.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--title', '/tmp/title.js', '-e', 'console.log(43)'] }),
+  }) })).toThrow('LaunchAgents unsupported entrypoint/module argument refused: com.we.title.plist: -e');
 });
 
 it('refuses --import=./x even when its target exists in the clone', () => {
