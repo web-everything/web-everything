@@ -25,19 +25,25 @@ describe('ci.yml queue-tested push relief and nightly full-run backstop', () => 
     expect(groupFor('workflow_dispatch', main)).toBe('ci-refs/heads/main');
   });
 
-  it('has exactly one cron entry for the nightly full-run backstop', () => {
-    expect(workflow.on.schedule).toEqual([{ cron: expect.any(String) }]);
-    expect(workflow.on.schedule[0].cron.trim()).not.toBe('');
+  it('has exactly one daily 06:17 UTC cron entry for the nightly full-run backstop', () => {
+    expect(workflow.on.schedule).toEqual([{ cron: '17 6 * * *' }]);
   });
 
   it('lets changes read Actions run evidence', () => {
     expect(jobs.changes.permissions).toMatchObject({ actions: 'read' });
   });
 
-  it('runs the queue detector in a continue-on-error step so failures retain full CI', () => {
+  it('wires the queue detector token, quoted event inputs and output in a continue-on-error step', () => {
     const queue = jobs.changes.steps.find((step) => step.id === 'queue');
     expect(queue).toBeDefined();
-    expect(queue.run).toMatch(/\bnode\s+scripts\/ci\/skip-queue-tested-push\.mjs\b/);
+    expect(queue.env).toEqual({
+      GH_TOKEN: '${{ github.token }}',
+      EVENT_NAME: '${{ github.event_name }}',
+      REF: '${{ github.ref }}',
+      SHA: '${{ github.sha }}',
+      REPO: '${{ github.repository }}',
+    });
+    expect(queue.run).toBe('node scripts/ci/skip-queue-tested-push.mjs --event="$EVENT_NAME" --ref="$REF" --sha="$SHA" --repo="$REPO" >> "$GITHUB_OUTPUT"');
     expect(queue['continue-on-error']).toBe(true);
   });
 
