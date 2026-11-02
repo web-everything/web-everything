@@ -69,24 +69,29 @@ const toDateString = (v) =>
 // overlapping items apart by SCRIPT (the judgment/deterministic split of platform-decisions.md
 // #deterministic-core-thin-judgment). The loader only sanitizes it to a clean string[] (drop non-strings /
 // blanks) or `undefined` when absent/empty — the array-of-strings SHAPE is enforced by check:standards; the
-// OVERLAP semantics live in the dispatcher, never here.
-const normalizeScope = (v) => {
+// OVERLAP semantics live in the dispatcher, never here. Repo prefixes must nevertheless be canonical BEFORE
+// the planner compares scopes: aliases/case/unqualified paths would otherwise bypass lease/rival exclusion.
+const normalizeScope = (v, defaultPrefix = 'we:') => {
   if (!Array.isArray(v)) return undefined;
   // R372 — an entry may name several paths (`we:a.mjs b.mjs`): split on whitespace/commas so every consumer sees one
   // path per entry; an unprefixed piece inherits the nearest earlier `repo:` prefix of the same entry.
   const list = [];
   for (const entry of v) {
-    let repo = '';
+    let repo = defaultPrefix; // this loader supplies the WE dispatching repo's backlog
     const text = entry == null ? '' : String(entry).trim();
     const pieces = text.split(/[\s,]+/).filter(Boolean);
     // A glob inside a multi-path entry stays UNSPLIT, so dispatch-lane refuses it (fail closed): the lease matcher
     // does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
     if (pieces.length > 1 && pieces.some((piece) => /[*?]/.test(piece))) { list.push(text); continue; }
     for (const piece of pieces) {
-      // Match dispatch-lane's prefix grammar, including underscores, without changing authored spelling.
+      // Match dispatch-lane's prefix grammar, including underscores. Keep path case unchanged.
       const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';
-      if (own) repo = own;
-      list.push(own ? piece : repo + piece);
+      if (own) {
+        const prefix = own.slice(0, -1).toLowerCase();
+        const locus = Object.hasOwn(SCOPE_PREFIX_LOCUS, prefix) ? SCOPE_PREFIX_LOCUS[prefix] : null;
+        repo = `${locus ? SCOPE_LOCUS_PREFIX[locus] : prefix}:`;
+      }
+      list.push(repo + piece.slice(own.length));
     }
   }
   return list.length ? list : undefined;
@@ -139,10 +144,13 @@ function inferLocusFromTags(tags) {
 const SCOPE_PREFIX_LOCUS = {
   we: 'webeverything', webeverything: 'webeverything',
   fui: 'frontierui', frontierui: 'frontierui',
-  plateau: 'plateau-app', 'plateau-app': 'plateau-app',
+  plateau: 'plateau-app', 'plateau-app': 'plateau-app', pa: 'plateau-app',
 };
+const SCOPE_LOCUS_PREFIX = { webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau' };
 function inferLocusFromScope(scope) {
-  const list = normalizeScope(scope);
+  // This inference helper reports only an explicit scope signal. Its callers may supply authored input;
+  // do not invent a locus for a bare path. Scheduling's normalizeScope still qualifies every bare path.
+  const list = normalizeScope(scope, '');
   if (!list) return null;
   for (const entry of list) {
     const m = /^([a-z][a-z0-9-]*):/i.exec(entry);
@@ -432,6 +440,8 @@ function buildBacklog(fileNames) {
         // Optional predicted touch-set (#x53zzf9) — sanitized to a clean string[] or undefined. Overrides the
         // raw `...data.scope` spread above so every consumer sees the normalized shape.
         scope: normalizeScope(data.scope),
+        // Authored spellings are display-only; scheduling must consume the canonical scope above.
+        scopeDisplay: Array.isArray(data.scope) ? [...data.scope] : undefined,
         details: src.details || data.details || undefined,
       };
       // Cache the authored body alongside the item; raises are merged after the cache read

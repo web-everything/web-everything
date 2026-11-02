@@ -445,9 +445,68 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(() => runTo(tickRead({ launch: { num: '3037', lane: null } }))).toThrow(/assigned it no lane/);
   });
 
-  it('dispatches a card whose scope names a test glob (#4701) — `*` is carried, the brief quotes it', () => {
+  it('refuses globs across the complete scope, including separate entries and grouped cards (send-back item 1)', () => {
+    for (const scope of [
+      ['we:src/a*b.mjs', 'we:src/ab*.mjs'],
+      ['we:src/a.mjs', 'we:src/ab*.mjs'],
+      ['we:src/a*b.mjs, we:src/ab*.mjs'],
+    ]) {
+      for (const launchKind of ['build', 'fix', 'ci-heal']) {
+        const read = tickRead({ launchKind });
+        expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' }))
+          .toThrow(/unsafe scope.*glob/);
+      }
+    }
+    const read = tickRead({ groupItems: [
+      { num: '3038', specPath: 'backlog/3038-member.md', scope: ['we:src/ab*.mjs'] },
+    ] });
+    expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:src/a*b.mjs'] } },
+      { num: '3037', groupMembers: '3038' })).toThrow(/unsafe scope.*glob/);
+  });
+
+  it('canonicalizes prefixes before lease overlap matching, including the dispatch repo default (send-back item 2)', async () => {
+    const { scopesOverlap } = await import('../../readiness/scope-lease.mjs');
+    const { repoProfile } = await import('../../lib/repo-profile.mjs');
+    for (const [input, expected] of [
+      ['WE:src/a.mjs', 'we:src/a.mjs'],
+      ['WebEverything:src/a.mjs', 'we:src/a.mjs'],
+      ['FrontierUI:src/a.mjs', 'fui:src/a.mjs'],
+      ['PLATEAU-APP:src/a.mjs', 'plateau:src/a.mjs'],
+      ['src/a.mjs', 'we:src/a.mjs'],
+    ]) {
+      const read = tickRead();
+      const authored = { ...read, item: { ...read.item, scope: [input] } };
+      const shaped = shapeDispatchRead(authored, { num: '3037' });
+      expect(scopesOverlap(shaped.scope, [expected]), input).toBe(true);
+      expect(shaped.scope).toEqual([expected]);
+      expect(shaped.prompt).toContain(`scope: ${expected}`);
+      const prefix = input.includes(':') ? input.split(':')[0].toLowerCase() : 'we';
+      expect(expected.split(':')[0]).toBe(repoProfile(prefix).canonicalPrefix);
+      expect(authored.item.scope).toEqual([input]);
+    }
+    const read = tickRead({ repoTokens: { WE_ROOT: REPO_ROOT, REPO: 'frontier-ui/frontierui' } });
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['src/a.mjs'] } }, { num: '3037' });
+    expect(shaped.scope).toEqual(['fui:src/a.mjs']);
+    const grouped = shapeDispatchRead({ ...read, groupItems: [
+      { num: '3038', specPath: 'backlog/3038-member.md', scope: ['src/b.mjs'] },
+    ] }, { num: '3037', groupMembers: '3038' });
+    expect(grouped.scope).toEqual(['we:scripts/operations/', 'fui:src/b.mjs']);
+    const switched = shapeDispatchRead({ ...read, item: { ...read.item,
+      scope: ['WE:src/A.mjs b.mjs,FrontierUI:src/C.mjs d.mjs', 'e.mjs'],
+    } }, { num: '3037' });
+    expect(switched.scope).toEqual(['we:src/A.mjs', 'we:b.mjs', 'fui:src/C.mjs', 'fui:d.mjs', 'fui:e.mjs']);
+  });
+
+  it('refuses the former #4701 file-plus-glob scope under the complete-scope glob policy', () => {
     const read = tickRead();
     const globScope = ['we:scripts/lib/daemon-rebuild/prepare.mjs', 'we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+    expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: globScope } }, { num: '3037' }))
+      .toThrow(/unsafe scope.*glob/);
+  });
+
+  it('still carries a standalone test glob in the quoted brief', () => {
+    const read = tickRead();
+    const globScope = ['we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
     const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: globScope } }, { num: '3037' });
     expect(shaped.dispatching).toBe(true);
     expect(shaped.scope).toEqual(globScope);
@@ -505,16 +564,17 @@ describe('the lane comes from the tick core or nowhere', () => {
   it.each([
     'plateau-app', 'frontierui', 'webeverything', 'FUI', 'WE', 'PLATEAU',
     'FrontierUI', 'WebEverything', 'Plateau-App', 'custom-repo', '',
-  ])('preserves legacy scope spelling %j for individual and grouped dispatches', (repo) => {
+  ])('accepts and canonicalizes legacy scope spelling %j for individual and grouped dispatches', (repo) => {
     const prefix = repo ? `${repo}:` : '';
+    const canonical = { 'plateau-app': 'plateau', frontierui: 'fui', webeverything: 'we' }[repo.toLowerCase()] ?? (repo.toLowerCase() || 'we');
     const read = tickRead();
     for (const scope of [
       [`${prefix}src/a.mjs`],
       [`${prefix}src/a.mjs src/b.mjs,${prefix}src/c.mjs`],
     ]) {
       const expected = scope.length === 1 && scope[0].includes(' ')
-        ? ['src/a.mjs', 'src/b.mjs', 'src/c.mjs'].map((path) => prefix + path)
-        : scope;
+        ? ['src/a.mjs', 'src/b.mjs', 'src/c.mjs'].map((path) => `${canonical}:${path}`)
+        : [`${canonical}:src/a.mjs`];
       const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' });
       expect(shaped.dispatching).toBe(true);
       expect(shaped.scope).toEqual(expected);
@@ -548,7 +608,7 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it.each([
     ['we', 'webeverything'], ['fui', 'frontierui'], ['plateau', 'plateau-app'],
-  ])('R372 — preserves both canonical %s scope and its legacy %s alias', (canonical, alias) => {
+  ])('R372 — accepts canonical %s scope and canonicalizes its legacy %s alias', (canonical, alias) => {
     const read = tickRead();
     const withScope = (prefix) => ({ ...read, item: { ...read.item, scope: [`${prefix}:src/a.mjs`] } });
     const shaped = shapeDispatchRead(withScope(canonical), { num: '3037' });
@@ -556,7 +616,7 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(shaped.scope).toEqual([`${canonical}:src/a.mjs`]);
     const legacy = shapeDispatchRead(withScope(alias), { num: '3037' });
     expect(legacy.dispatching).toBe(true);
-    expect(legacy.scope).toEqual([`${alias}:src/a.mjs`]);
+    expect(legacy.scope).toEqual([`${canonical}:src/a.mjs`]);
   });
 
   it('still refuses unsafe paths with legacy prefixes or no prefix', () => {
@@ -583,8 +643,8 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it('does not inherit a repository prefix across scope entries', () => {
     const read = tickRead();
-    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:a.mjs b.mjs', 'c.mjs'] } }, { num: '3037' });
-    expect(shaped.scope).toEqual(['we:a.mjs', 'we:b.mjs', 'c.mjs']);
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['FUI:a.mjs b.mjs', 'c.mjs'] } }, { num: '3037' });
+    expect(shaped.scope).toEqual(['fui:a.mjs', 'fui:b.mjs', 'we:c.mjs']);
   });
 
   it.each([

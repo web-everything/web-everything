@@ -23,6 +23,7 @@ export default {
     const loaded = normalizeScope?.(['we:scripts/readiness/heavy-admission.mjs scripts/readiness/remote-exec.mjs']) ?? [];
     if (loaded.length !== 2) violations.push('the loader left a multi-path scope entry unsplit');
     const { shapeDispatchRead } = await import(pathToFileURL(join(root, 'scripts/operations/dispatch-lane.mjs')).href);
+    const { dispatchPlan } = await import(pathToFileURL(join(root, 'scripts/readiness/dispatch-plan.mjs')).href);
     const read = (scope, launchKind = 'build') => shapeDispatchRead({
       launchKind,
       resolvedNum: '3037',
@@ -45,21 +46,35 @@ export default {
       if (JSON.stringify(shaped.scope) !== JSON.stringify(want)) violations.push(`the dispatched scope is ${JSON.stringify(shaped.scope)}, not ${JSON.stringify(want)}`);
       if (!String(shaped.prompt).includes(`scope: ${want.join(',')}`)) violations.push('the brief does not carry the comma-joined lease scope');
     } catch (e) { violations.push(`dispatch refused the flattened scope: ${String(e.message).slice(0, 120)}`); }
-    // PR #6244: adding multi-path support must preserve the scope spellings already accepted by dispatch.
+    // PR #6244: retain legacy input acceptance, but use canonical repo prefixes for the lease and brief.
     for (const prefix of ['plateau-app:', 'frontierui:', 'webeverything:', 'FUI:', 'WE:', 'custom_repo:', '']) {
       const input = [`${prefix}src/a.mjs src/b.mjs`];
-      const expected = [`${prefix}src/a.mjs`, `${prefix}src/b.mjs`];
+      const canonical = ({ 'plateau-app:': 'plateau:', 'frontierui:': 'fui:', 'webeverything:': 'we:', 'FUI:': 'fui:', 'WE:': 'we:', '': 'we:' })[prefix] ?? prefix;
+      const leaseScope = [`${canonical}src/a.mjs`, `${canonical}src/b.mjs`];
       try {
         const loadedScope = normalizeScope(input);
-        if (JSON.stringify(loadedScope) !== JSON.stringify(expected)) violations.push(`loader changed legacy prefix ${JSON.stringify(prefix)}`);
+        if (JSON.stringify(loadedScope) !== JSON.stringify(leaseScope)) violations.push(`loader did not canonicalize legacy prefix ${JSON.stringify(prefix)}`);
+        const leased = dispatchPlan({ queue: [{ num: 1, scope: loadedScope }], leases: [{ lane: 2, scope: leaseScope }], freeLanes: [3] });
+        if (leased.launch.length || leased.held[0]?.reason !== 'overlaps lane-2') violations.push(`legacy prefix ${JSON.stringify(prefix)} bypassed planner lease exclusion`);
+        const rivals = dispatchPlan({ queue: [{ num: 1, scope: leaseScope }, { num: 2, scope: loadedScope }], leases: [], freeLanes: [3, 4] });
+        if (rivals.launch.length !== 1 || rivals.held[0]?.reason !== 'overlaps lane-3') violations.push(`legacy prefix ${JSON.stringify(prefix)} bypassed planner rival exclusion`);
         for (const scope of [input, loadedScope]) {
           const shaped = read(scope);
-          if (shaped.dispatching !== true || JSON.stringify(shaped.scope) !== JSON.stringify(expected)
-            || !String(shaped.prompt).includes(`scope: ${expected.join(',')}`)) {
-            violations.push(`legacy scope ${JSON.stringify(prefix)} was not carried into the brief`);
+          if (shaped.dispatching !== true || JSON.stringify(shaped.scope) !== JSON.stringify(leaseScope)
+            || !String(shaped.prompt).includes(`scope: ${leaseScope.join(',')}`)) {
+            violations.push(`legacy scope ${JSON.stringify(prefix)} was not canonicalized in the brief`);
           }
         }
       } catch (e) { violations.push(`legacy scope ${JSON.stringify(prefix)} refused: ${String(e.message).slice(0, 120)}`); }
+    }
+    for (const scope of [
+      ['we:src/a*b.mjs', 'we:src/ab*.mjs'],
+      ['we:src/a.mjs', 'we:src/ab*.mjs'],
+      ['we:src/a*b.mjs we:src/ab*.mjs'],
+    ]) {
+      for (const kind of ['build', 'fix', 'ci-heal']) {
+        try { read(scope, kind); violations.push(`${kind} accepted a glob across multi-path scope entries`); } catch { /* fail closed */ }
+      }
     }
     // Preparation repairs the card itself, including malformed scope; it must remain dispatchable.
     for (const kind of ['prepare', 'prepare-item', 'prepare-decision', 'investigate']) {
