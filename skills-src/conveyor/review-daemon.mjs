@@ -74,6 +74,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
+import { createPlannerFactCache } from '../../scripts/conveyor/planner-fact-cache.mjs';
 import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs';
 import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1229,11 +1230,11 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
-export function cliReviewTickOpts({ log = console } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   return {
     log: line => log.error(line),
-    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: defaultReadPrs, readAgents: defaultReadAgents,
+    acquirableLanes: defaultAcquirableLaneNumbers, readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,
     liveReviewBudget: liveReviewRoundBudget(),
     redTeamOnSkip: o => runRedTeamOnSkip({ ...o,
@@ -1606,7 +1607,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 }
 
 export function buildCliDaemonEffects({
-  owner, intervalMs = DEFAULT_INTERVAL_MS, log = console,
+  owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
   reapSessions = defaultReapSessions,
   // Keep the production runReview closure testable without replacing its executor bindings.
   tick = runReviewTick,
@@ -1621,12 +1622,12 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
   reviewTickOpts = cliReviewTickOpts,
-  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log }), ...opts }),
+  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log, factCache }), ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).
   runConvertAdvisories = (opts) => runConvertAdvisoryTickAllRepos({
-    readPrs: defaultReadPrs, readAgents: defaultReadAgents, ...opts,
+    readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents, ...opts,
   }),
   // ON by default: the planner withholds a normal review from a convert-advisory-owed PR, so leaving
   // its executor off strands the PR forever (live #5020, 2026-10-12). The committed product knob is
@@ -1648,6 +1649,7 @@ export function buildCliDaemonEffects({
     intervalMs,
     tickOnce: async () => {
       const started = Date.now();
+      factCache?.resetStats();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
       const onPlan = sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null;
@@ -1712,10 +1714,19 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: prep-review stage failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
       }
       phaseMs.prep = Date.now() - phaseStarted;
+      let cacheTiming = '';
+      if (factCache) {
+        const stats = factCache.stats();
+        const diffCount = factCache.diffCount;
+        factCache.recordPass({ diffCount, compared: stats.compared });
+        try { await factCache.saveSnapshot(); }
+        catch (e) { log.error(`review-daemon: planner-cache snapshot failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+        cacheTiming = ` · planner-cache hits=${stats.hits} misses=${stats.misses} diffs=${diffCount} shadowEndRule=${JSON.stringify(factCache.shadowEndRule())}`;
+      }
       if (sharing.phaseTimings) {
         const seconds = (ms) => `${(ms / 1000).toFixed(1)}s`;
         const repos = Object.entries(result?.perRepoMs ?? {}).map(([repo, ms]) => `${repo.split('/').at(-1)} ${seconds(ms)}`).join(', ');
-        log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})`);
+        log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})${cacheTiming}`);
       }
       passCount += 1;
       logDaemonHeap({ daemon: 'review-daemon', pass: passCount, passMs: Date.now() - started, log });
@@ -1817,11 +1828,18 @@ async function main() {
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
     process.exit(0);
   };
+  const requestedCacheMode = process.env.WE_PLANNER_CACHE;
+  const cacheMode = requestedCacheMode === 'off' ? 'off' : 'shadow';
+  console.error(`review-daemon: planner-cache mode=${cacheMode} (source ${requestedCacheMode === undefined ? 'standard' : 'env'})${requestedCacheMode === 'on' ? '; on is not supported yet; using shadow' : ''}`);
+  const factCache = cacheMode === 'off' ? null : createPlannerFactCache({
+    mode: 'shadow', snapshotPath: join(selfRoot, '.conveyor', 'planner-facts.json'),
+  });
+  await factCache?.loadSnapshot();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged): a relevant PR event ends the sleep
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );
