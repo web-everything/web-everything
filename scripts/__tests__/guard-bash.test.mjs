@@ -3754,7 +3754,7 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   const runHook = (command, cwd, home) => {
     const res = execFileSync(process.execPath, [GUARD], {
       input: JSON.stringify({ tool_input: { command }, cwd }),
-      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home ? { HOME: home } : {}) },
+      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home !== undefined ? { HOME: home } : {}) },
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
@@ -3779,6 +3779,66 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
   it('ALLOWS the sanctioned overlay CLI invoked with --clone=<path> from a lane', () => {
     expect(runHook(`node scripts/daemon-overlay.mjs add --clone=${fakeClone} --ref=lane/fix`, lane)).toBeNull();
+  });
+
+  describe('home-spelled git targets use the same normalization at the CLI boundary', () => {
+    const homeClone = join(root, 'workspace', 'wev-review-daemon');
+    mkdirSync(homeClone, { recursive: true });
+    writeFileSync(join(overlayDir, 'home-clone.json'), JSON.stringify({ clone: homeClone, overlays: [{ ref: 'lane/x', pr: null }] }));
+
+    it.each([
+      'git -C ~/workspace/wev-review-daemon reset --hard',
+      'GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard',
+      'env GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard',
+      'export GIT_DIR=~/workspace/wev-review-daemon/.git; git clean -fd',
+      'export GIT_DIR=~/workspace/../workspace/wev-review-daemon/.git && git reset --hard',
+    ])('DENIES %s', (command) => {
+      const out = runHook(command, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it('ALLOWS git -C ~/workspace/wev-review-daemon log', () => {
+      expect(runHook('git -C ~/workspace/wev-review-daemon log', lane, root)).toBeNull();
+    });
+
+    it('DENIES an exported bare ~ when HOME itself is a daemon clone', () => {
+      const out = runHook('export GIT_DIR=~; git reset --hard', lane, homeClone);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it.each([
+      `GIT_WORK_TREE=${homeClone} git reset --hard`,
+      'GIT_WORK_TREE=~/workspace/wev-review-daemon git clean -fd',
+      'export GIT_WORK_TREE=~/workspace/wev-review-daemon; git clean -fd',
+    ])('DENIES GIT_WORK_TREE alone: %s', (command) => {
+      const out = runHook(command, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it.each([
+      `GIT_WORK_TREE=${homeClone} git status`,
+      'export GIT_WORK_TREE=~/workspace/wev-review-daemon; git log',
+    ])('ALLOWS reads with GIT_WORK_TREE alone: %s', (command) => {
+      expect(runHook(command, lane, root)).toBeNull();
+    });
+
+    it.each([
+      ['', 'export GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard'],
+      ['', 'git -C ~/workspace/wev-review-daemon reset --hard'],
+      ['relative-home', 'export GIT_WORK_TREE=~; git clean -fd'],
+      ['relative-home', `git -C ~ -C ${lane} reset --hard`],
+    ])('fails closed with unresolved HOME=%s: %s', (home, command) => {
+      const out = runHook(command, lane, home);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it('keeps reads allowed when a tilde target cannot be resolved', () => {
+      expect(runHook('export GIT_WORK_TREE=~; git log', lane, '')).toBeNull();
+    });
   });
   // These preserve main's single-directory behavior; the proposed shell strings are never executed.
   it.each([

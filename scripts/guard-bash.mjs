@@ -172,7 +172,7 @@ import { DECLARED_HOMES } from './operations/declared-homes.mjs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readdirSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, isAbsolute } from 'node:path';
 import { LEASE_FILENAME, isLeaseStale, isForeignLease, laneMarkedSlug, assertedLaneSlug, requiredAssertionSlug } from './lib/lane-lease.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { usageReportSecretDir, USAGE_REPORT_KEYCHAIN_SERVICE } from './lib/usage-report-secret-paths.mjs';
@@ -1964,6 +1964,17 @@ export function primaryTreeWriteReason(segment) {
 // why a hand-edit here is worse than a primary edit (it silently BLOCKS the daemon's own next rebuild until a
 // person notices, #xpt9fvd; caught+reverted 3x on 2026-09-26).
 
+/** Shared normalization for git flags, inline assignments and exports from earlier segments.
+ *  An unavailable HOME leaves a tilde target unknown (null), so mutations fail closed. */
+function absoluteGitTarget(base, p) {
+  const home = process.env.HOME;
+  if (p === '~' || p.startsWith('~/')) {
+    if (!home || !isAbsolute(home)) return null;
+    p = home + p.slice(1);
+  }
+  return resolve(base || '.', p);
+}
+
 /** Every directory a git invocation TARGETS, from its GLOBAL options only (those before the subcommand): the
  *  effective dir after applying ALL `-C <path>` in order exactly as git does (each relative to the previous,
  *  an absolute one resets), plus `--git-dir` / `--work-tree` (both `=` and separate-arg spellings, resolved
@@ -1974,8 +1985,6 @@ export function primaryTreeWriteReason(segment) {
 function gitTargetDirs(segment, cwd) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   if (!toks.length || toks[0] !== 'git') return [];
-  const home = process.env.HOME || '';
-  const abs = (base, p) => resolve(base || '.', p === '~' ? home : p.startsWith('~/') ? home + p.slice(1) : p);
   let dir = cwd || '.';
   let gitDir = null;
   let workTree = null;
@@ -1989,8 +1998,16 @@ function gitTargetDirs(segment, cwd) {
   }
   for (let i = 1; i < toks.length; i++) {
     const t = toks[i];
-    if (t === '-C' && i + 1 < toks.length) { dir = abs(dir, toks[++i]); continue; }
-    if (t.length > 2 && t.startsWith('-C')) { dir = abs(dir, t.slice(2)); continue; } // not valid git, fail closed
+    if (t === '-C' && i + 1 < toks.length) {
+      dir = absoluteGitTarget(dir, toks[++i]);
+      if (dir === null) return [null];
+      continue;
+    }
+    if (t.length > 2 && t.startsWith('-C')) { // not valid git, fail closed
+      dir = absoluteGitTarget(dir, t.slice(2));
+      if (dir === null) return [null];
+      continue;
+    }
     if (t === '--git-dir' && i + 1 < toks.length) { gitDir = toks[++i]; continue; }
     if (t === '--work-tree' && i + 1 < toks.length) { workTree = toks[++i]; continue; }
     if (t.startsWith('--git-dir=')) { gitDir = t.slice('--git-dir='.length); continue; }
@@ -2000,8 +2017,8 @@ function gitTargetDirs(segment, cwd) {
     break; // the subcommand — everything after it is the subcommand's own options
   }
   const out = [dir];
-  if (gitDir !== null) out.push(abs(dir, gitDir));
-  if (workTree !== null) out.push(abs(dir, workTree));
+  if (gitDir !== null) out.push(absoluteGitTarget(dir, gitDir));
+  if (workTree !== null) out.push(absoluteGitTarget(dir, workTree));
   return out;
 }
 
@@ -2109,13 +2126,13 @@ export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDir
     if (!GIT_STATE_SUBCOMMANDS.has(sub)) return null; // a read op (log/status/diff/show/…) — never denied
     // `envDirs`: GIT_DIR / GIT_WORK_TREE values assigned/exported by ANY segment of the same command (decide()
     // collects them), since `export GIT_DIR=<clone>/.git && git reset --hard` splits across segments.
-    const targets = gitTargetDirs(s, cwd).concat(envDirs.map((p) => resolve(cwd || '.', p)));
-    const hit = targets.find((d) => isDaemonCloneRealpath(d, roots));
-    if (!hit) return null;
+    const targets = gitTargetDirs(s, cwd).concat(envDirs.map((p) => absoluteGitTarget(cwd, p)));
+    const hit = targets.find((d) => d === null || isDaemonCloneRealpath(d, roots));
+    if (hit === undefined) return null;
     // #xpt9fvd — fetch diagnosis stays allowed (it only updates remote-tracking refs), UNLESS it writes a local
     // branch (a refspec `src:<branch>` or --update-head-ok can move the checked-out branch under the working tree).
     if (sub === 'fetch' && !fetchWritesLocalBranch(s)) return null;
-    return daemonCloneWriteMessage(hit);
+    return daemonCloneWriteMessage(hit ?? 'unresolved git target: HOME is unavailable or relative');
   }
   const prog = programWord(s);
   const isWrite = isFileWriteRedirect(s);
