@@ -144,3 +144,11 @@ describe('exit-code precedence and remote evidence', () => {
     expect(f.lines.join('')).not.toMatch(/confirming locally/);
   });
 });
+
+describe('signal-killed shard (128+signal from heavy-admission)', () => {
+  it('halts: no further shard starts and the 137 reaches the caller', async () => {
+    const f = fixture(['remote-red-137', 'pass', 'pass']);
+    expect(await f.run()).toBe(137);
+    expect(f.calls.length).toBe(1);
+  });
+});
