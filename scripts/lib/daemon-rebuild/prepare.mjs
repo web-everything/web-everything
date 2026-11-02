@@ -486,6 +486,7 @@ export async function prepareRebuild({
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (a, build) => overlayGraduated({
+          readyAt: ready.at ?? ready.passedAt,
           ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),

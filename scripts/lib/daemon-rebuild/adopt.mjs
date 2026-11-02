@@ -99,18 +99,26 @@ export function matchReadyCandidate({
 }
 
 /** Prove a removed overlay graduated into this build, including squash-merged content. Unknown evidence refuses. */
-export function overlayGraduated({ ref, sha, build, registered, events, git } = {}) {
+export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
   try {
     if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
     const last = events.findLast((event) => event?.ref === ref);
-    if (last?.kind !== 'removed' || typeof last.reason !== 'string') return false;
-    const merged = /^graduated #\d+ \(merged ([a-f0-9]{7,40})\)$/.exec(last.reason)?.[1];
-    if (!merged) return false;
-    const resolved = git(['rev-parse', '--verify', `${merged}^{commit}`]);
-    if (resolved?.status !== 0 || typeof resolved.stdout !== 'string') return false;
-    const mergeSha = resolved.stdout.trim();
-    if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
-    if (git(['merge-base', '--is-ancestor', mergeSha, build])?.status !== 0) return false;
+    if (last?.kind === 'auto-dropped' && last.reason === 'in-main') {
+      const timeMs = (value) => typeof value === 'number' ? value
+        : typeof value === 'string' ? Date.parse(value) : NaN;
+      const droppedMs = timeMs(last.at);
+      const readyMs = timeMs(readyAt);
+      if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;
+    } else {
+      if (last?.kind !== 'removed' || typeof last.reason !== 'string') return false;
+      const merged = /^graduated #\d+ \(merged ([a-f0-9]{7,40})\)$/.exec(last.reason)?.[1];
+      if (!merged) return false;
+      const resolved = git(['rev-parse', '--verify', `${merged}^{commit}`]);
+      if (resolved?.status !== 0 || typeof resolved.stdout !== 'string') return false;
+      const mergeSha = resolved.stdout.trim();
+      if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
+      if (git(['merge-base', '--is-ancestor', mergeSha, build])?.status !== 0) return false;
+    }
     const tree = git(['rev-parse', `${build}^{tree}`]);
     const mergedTree = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
     if (tree?.status !== 0 || mergedTree?.status !== 0
