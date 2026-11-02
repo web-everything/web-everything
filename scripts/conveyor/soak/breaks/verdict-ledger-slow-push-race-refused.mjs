@@ -29,7 +29,7 @@ export default {
       async perRound(w, round, ctx, api) {
         const { appendLedgerRows, LedgerAppendExhaustedError } = await import(pathToFileURL(join(w.simCloneRoot, PATHS[0])).href);
         const { buildVerdictRecord } = await import(pathToFileURL(join(w.simCloneRoot, PATHS[1])).href);
-        const repo = 'web-everything/web-everything';
+        const repo = 'example/soak-repo';
         const record = buildVerdictRecord({
           repo, pr: 365, verdict: 'accepted', at: '2026-11-01T12:00:00.000Z', source: 'soak',
         });
