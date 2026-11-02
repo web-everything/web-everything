@@ -5,7 +5,7 @@
 import { readFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { pathToFileURL, URL } from 'node:url';
-import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
+import { NEGOTIATION_ROUND_CAP, requiresMandatoryReferral } from '../lib/jury-core.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 import { resolveCascade, logCascadeSources, platformPreference } from '../lib/policy-cascade.mjs';
@@ -19,6 +19,8 @@ import { feedPath, parseFeedLine, unacknowledged } from '../operations/needs-you
 
 const SETTING = new URL('../settings/stale-referral-human-shadow.json', import.meta.url);
 const SHA = /^[a-f0-9]{40}$/;
+const isPlainObject = value => value !== null && typeof value === 'object'
+  && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 // Keep the event name assembled separately from any operational command vocabulary.
 const EVENT_KIND = ['would', 'clear', 'human', 'hold'].join('-');
 const CAUSES = ['round-cap', 'block-ruling', 'requested-changes', 'red-team-blocked', 'draft',
@@ -141,10 +143,11 @@ export async function decideStaleReferralHumanHold(pr, options = {}) {
     const escalationsKnown = Array.isArray(evidence?.escalations) && evidence.escalations.every(e => SHA.test(e?.head ?? ''));
     check('escalation', has('escalation') || escalationsKnown,
       has('escalation') || evidence?.escalations?.some(e => e.head === head), 'live-head escalations checked');
-    const findingsKnown = Array.isArray(evidence?.findings) && evidence.findings.every(f => SHA.test(f?.head ?? ''));
+    const findingsKnown = Array.isArray(evidence?.findings)
+      && evidence.findings.every(f => isPlainObject(f) && SHA.test(f.head ?? ''));
     const findings = findingsKnown ? evidence.findings.filter(f => f.head === head) : [];
     check('security-finding', findingsKnown, findings.some(f => f.lens === 'security' || f.security === true), 'independent live-head security findings checked');
-    check('mandatory-referral-finding', findingsKnown, findings.some(f => f.mandatoryReferral === true), 'independent live-head mandatory referral findings checked');
+    check('mandatory-referral-finding', findingsKnown, findings.some(requiresMandatoryReferral), 'independent live-head mandatory referral findings checked');
     check('advisory-push', has('advisory:changes') || findingsKnown,
       has('advisory:changes') || findings.some(f => f.advisory === true && f.requiresPush === true), 'advisory findings requiring a push checked');
     decision.wouldClear = decision.checked.every(c => c.status === 'absent');
@@ -305,9 +308,10 @@ export function createLiveShadowReaders({ repo, gh, readRuns = readShadowRuns, r
         if (run?.id === current.id && read?.repo === repo && Number(read.pr) === pr.number
           && read?.netBasis?.rev === pr.headRefOid && Array.isArray(final?.findings)
           && Array.isArray(final?.deferredAdvisory)
-          && [...final.findings, ...final.deferredAdvisory].every(f => f && typeof f === 'object')) {
+          && [...final.findings, ...final.deferredAdvisory].every(isPlainObject)) {
           evidence.findings = [...final.findings, ...final.deferredAdvisory].map(f => ({ ...f,
-            head: pr.headRefOid, ...(f.category === 'security' ? { security: true } : {}) }));
+            head: pr.headRefOid, ...(typeof f.category === 'string' && /^security(?:\/|$)/i.test(f.category)
+              ? { security: true } : {}) }));
         }
       }
       return evidence;

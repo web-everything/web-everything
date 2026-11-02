@@ -129,6 +129,52 @@ describe('CLI production evidence adapter', () => {
     checked(await decideStaleReferralHumanHold(pr, { ...options, ...readers }), 'security-finding', 'unknown');
   });
 
+  it.each(['security', 'security/authz', 'SeCuRiTy/AuThZ', 'SECURITY'])(
+    'security category %s produces a present security finding', async category => {
+      const { pr, options, io } = setup();
+      const run = io.readRun();
+      run.findings.referralVerdict.findings = [{ category, summary: 'Authorization bypass' }];
+      io.readRun.mockReturnValue(run);
+      checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }),
+        'security-finding', 'present');
+    });
+
+  it.each(['broken', 'unrecoverable'])(
+    'canonical mandatory finding with %s impact produces a present mandatory referral', async impactIfUnfixed => {
+      const { pr, options, io } = setup();
+      const run = io.readRun();
+      run.findings.referralVerdict.findings = [{
+        summary: 'Confirmed live-head defect', verdict: 'CONFIRMED', impactIfUnfixed,
+      }];
+      io.readRun.mockReturnValue(run);
+      checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }),
+        'mandatory-referral-finding', 'present');
+    });
+
+  it.each(['findings', 'deferredAdvisory'])(
+    '%s containing an array entry leaves findings unknown and wouldClear false', async field => {
+      const { pr, options, io } = setup();
+      const run = io.readRun();
+      run.findings.referralVerdict[field] = [[]];
+      io.readRun.mockReturnValue(run);
+      const readers = createLiveShadowReaders(io);
+      expect(await readers.readHoldEvidence(pr)).not.toHaveProperty('findings');
+      const decision = await decideStaleReferralHumanHold(pr, { ...options, ...readers });
+      for (const cause of ['security-finding', 'mandatory-referral-finding', 'advisory-push']) {
+        checked(decision, cause, 'unknown');
+      }
+    });
+
+  it.each([null, 'unreadable', 1, new Date(0)])(
+    'non-plain-object finding %j leaves findings unknown and wouldClear false', async entry => {
+      const { pr, options, io } = setup();
+      const run = io.readRun();
+      run.findings.referralVerdict.findings = [entry];
+      io.readRun.mockReturnValue(run);
+      checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }),
+        'security-finding', 'unknown');
+    });
+
   it('a referral comment without durable run provenance stays unknown', async () => {
     const { pr, options, io } = setup();
     io.readRuns.mockReturnValue([]);
@@ -259,7 +305,7 @@ describe('decideStaleReferralHumanHold: stale referral must be the ONLY cause', 
     ['no-verdict', { noVerdict: true }], ['same-head-hold', { sameHeadHold: true }],
     ['escalation', { escalations: [{ head: fixture.headRefOid, reason: 'operator decision required' }] }],
     ['security-finding', { findings: [{ head: fixture.headRefOid, lens: 'security', severity: 'broken', summary: 'Open security issue' }] }],
-    ['mandatory-referral-finding', { findings: [{ head: fixture.headRefOid, mandatoryReferral: true, summary: 'Unruled live finding' }] }],
+    ['mandatory-referral-finding', { findings: [{ head: fixture.headRefOid, verdict: 'CONFIRMED', impactIfUnfixed: 'broken', summary: 'Unruled live finding' }] }],
     ['advisory-push', { findings: [{ head: fixture.headRefOid, advisory: true, requiresPush: true, summary: 'Repair requires a push' }] }],
   ])('%s in persisted evidence independently retains the human hold', async (cause, patch) => {
     const { pr, evidence, options } = clean();
@@ -452,7 +498,7 @@ const independentCauses = [
   { cause: 'no-verdict', present: ({ evidence }) => { evidence.noVerdict = true; }, field: 'noVerdict' },
   { cause: 'same-head-hold', present: ({ evidence }) => { evidence.sameHeadHold = true; }, field: 'sameHeadHold' },
   { cause: 'security-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, lens: 'security' }]; }, field: 'findings' },
-  { cause: 'mandatory-referral-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, mandatoryReferral: true }]; }, field: 'findings' },
+  { cause: 'mandatory-referral-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, verdict: 'CONFIRMED', impactIfUnfixed: 'broken', summary: 'Unruled live finding' }]; }, field: 'findings' },
   { cause: 'advisory-push', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, advisory: true, requiresPush: true }]; }, field: 'findings' },
 ];
 
