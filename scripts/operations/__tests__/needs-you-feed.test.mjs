@@ -396,6 +396,12 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       gateComments({ broken: true, impact }).slice(0, 1)), log: () => {} });
     expect(kept.find(i => i.pr === 5768)).toMatchObject({ kind: 'confirmed-break-owed-send-back' });
   });
+  it('an incomplete re-check (unverifiable finding) is red-team-undecided, never all gates pass', async () => {
+    const comments = gateComments().slice(0, 1).map(c => ({ ...c, body: c.body.replace(/\n$/, '') +
+      '\n\n1. [unverifiable] (edge-case, broken) `scripts/x.mjs:3` — could not be re-checked\n' }));
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    expectUndecided(kept);
+  });
   it('a clean result on the live head alerts without any gate record', async () => {
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] },
       gateComments().slice(0, 1)), log: () => {} });

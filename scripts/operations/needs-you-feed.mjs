@@ -231,7 +231,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       if (owed) {
         out[index] = { ...checked, kind: 'confirmed-break-owed-send-back',
           reason: 'a confirmed red-team break is owed a send-back on the live head' };
-      } else if (state.result !== null) out[index] = checked;
+      } else if (state.result !== null && !state.result.findings.some(f => f.recheckOutcome === 'unverifiable')) out[index] = checked;
       else out[index] = undecided(checked);
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = undecided(checked); }
   };
