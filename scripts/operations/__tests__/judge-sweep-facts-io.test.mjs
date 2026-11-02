@@ -645,7 +645,9 @@ it('reads from a real origin/main worktree, links dependencies, and leaves no wo
 it('cleans up the worktree registration and temp dir when the fresh child fails', () => {
   const f = gitFixture();
   try {
-    writeFileSync(join(f.origin, 'scripts/operations/judge-sweep-facts-io.mjs'), 'throw new Error("child boom");\n');
+    // Preserve the child's named import so the fixture reaches the intended runtime failure.
+    writeFileSync(join(f.origin, 'scripts/operations/judge-sweep-facts-io.mjs'),
+      'export const createJudgeSweepFactsReader = () => { throw new Error("child boom"); };\n');
     git(f.origin, 'commit', '-qam', 'break'); git(f.clone, 'fetch', '-q', 'origin', 'main');
     const before = readdirSync(tmpdir()).filter(n => n.startsWith('judge-facts-fresh-')).length;
     expect(() => readFromFreshOrigin({ repo, root: f.clone })).toThrow(/fresh reader failed.*child boom/s);
