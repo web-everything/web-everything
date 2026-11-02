@@ -85,6 +85,7 @@ export async function dryRunRebuild({
           fetchMainAndOverlays({ git: scratchGit, overlays, edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0' });
 
           plan = await planRebuild({
+            adopted: state.adopted,
             git: scratchGit,
             headSha: head,
             mainRef: 'origin/main',
@@ -192,6 +193,7 @@ export async function previewOverlayConflict({
   const rootGit = makeGit({ run, cwd: root, env, extraEnv: { GIT_OPTIONAL_LOCKS: '0' } });
   const head = verifyRev(rootGit, 'HEAD');
   if (!head) return { ok: false, reason: 'head-unresolved' };
+  const adopted = readRebuildState(root, env).adopted;
 
   let url = originUrl;
   if (!url) {
@@ -239,6 +241,7 @@ export async function previewOverlayConflict({
     let planExisting;
     for (;;) {
       planExisting = await planRebuild({
+        adopted,
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -271,6 +274,7 @@ export async function previewOverlayConflict({
     // A carried ref re-registered at a conflicting tip can be pinned, which still requires an operator override.
     if (mt.status === 1) {
       const planCandidate = await planRebuild({
+        adopted,
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',

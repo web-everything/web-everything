@@ -2,11 +2,11 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
-import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
@@ -20,16 +20,22 @@ import {
   pruneLandedBacklogSidecars,
 } from './local-state.mjs';
 import {
-  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
+  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode,
+  persistStackBases, migrateRegistrationIds, appliedRowFor,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
+import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
+
+function validTipSha(raw) {
+  return typeof raw?.tipSha === 'string' && FULL_SHA_RE.test(raw.tipSha) ? raw.tipSha : null;
+}
 
 /** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
  * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
@@ -238,7 +244,55 @@ export async function prepareRebuild({
     alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
-  const overlaysBefore = overlayState.overlays;
+  let overlaysBefore = overlayState.overlays;
+  let snapshotGeneration = overlayState.generation;
+  if (!mainOnly && !overlayState.corrupt) {
+    // A ref-keyed snapshot cannot represent duplicate registrations, even with identical ids.
+    // Refuse before migration so legacy duplicates and their adopted evidence remain untouched
+    // for operator repair. Repeated ticks report the same registry defect, not a writer race.
+    const seenRefs = new Set();
+    const duplicateRefs = new Set();
+    for (const entry of overlaysBefore) {
+      if (typeof entry?.ref !== 'string' || !entry.ref) continue;
+      if (seenRefs.has(entry.ref)) duplicateRefs.add(entry.ref);
+      seenRefs.add(entry.ref);
+    }
+    if (duplicateRefs.size) {
+      const detail = { refs: [...duplicateRefs].sort() };
+      alert('overlay-registration-duplicate', detail);
+      return terminal({ moved: false, reason: 'overlay-registration-duplicate', detail });
+    }
+    const migrated = migrateRegistrationIds(root, { env, adopted: state.adopted });
+    if (migrated.adopted !== state.adopted) { state.adopted = migrated.adopted; writeState(); }
+    for (const detail of migrated.unprovable) alert('overlay-registration-unprovable', detail);
+    // A registration already identified by the first read cannot be replaced during migration.
+    if (overlayState.overlays.length !== migrated.list.length || overlayState.overlays.some((o) => o?.registrationId
+      && !migrated.list.some((m) => m?.ref === o.ref && m.registrationId === o.registrationId))) {
+      alert('overlay-registration-changed', {});
+      return terminal({ moved: false, reason: 'overlay-registration-changed' });
+    }
+    overlaysBefore = migrated.list;
+    snapshotGeneration = migrated.generation;
+  }
+  const snap = new Map(overlaysBefore.map((o) => [o?.ref, o?.registrationId]));
+  const snapshotHolds = () => {
+    if (mainOnly) return true;
+    const fresh = readOverlayState(root, { env });
+    // Check the generation again after reading: a registration writer may have run during the read.
+    let generation;
+    try { generation = JSON.parse(readFileSync(overlayFilePath(root, env), 'utf8')).generation ?? 0; }
+    catch (error) {
+      if (error.code !== 'ENOENT' || fresh.clone !== null || fresh.overlays.length) return false;
+      generation = 0;
+    }
+    const expected = snap;
+    return generation === snapshotGeneration && generation === fresh.generation && !fresh.corrupt && fresh.overlays.every((o) => o && expected.has(o.ref) && expected.get(o.ref) === o.registrationId)
+      && [...expected.keys()].every((ref) => fresh.overlays.some((o) => o?.ref === ref));
+  };
+  const registrationChanged = () => {
+    alert('overlay-registration-changed', {});
+    return terminal({ moved: false, reason: 'overlay-registration-changed' });
+  };
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
@@ -272,6 +326,70 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
+  // The existing fetch helper reports unavailable refs through goneRefs. Adapt that
+  // result locally; Slice A does not add retirement or change the fetch protocol.
+  const goneRefs = new Set(fetchResult.goneRefs);
+  fetchResult.refEvidence = new Map(overlaysBefore.map((o) =>
+    [o?.ref, !isSafeBranchName(o?.ref) || goneRefs.has(o.ref) ? 'unavailable' : 'refreshed']));
+  // Preserve unavailable registrations without building from cached tips. Unpinned overlays may be skipped,
+  // but an unavailable pin must use the normal refusal/last-good hold path before any new build is adopted.
+  const overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
+  const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed');
+  let unavailablePinned = null;
+  if (!mainOnly) {
+    for (const raw of unverified) {
+      if (!snapshotHolds()) return registrationChanged();
+      // Fetch cleanup may have deleted the tracking ref, and rebuild state may have been lost. Adopted
+      // inputs (bound to this registration) or a recorded full tip identify pins only, never fresh
+      // build/retirement inputs. When the running build's adopted record carries a row for this ref that is
+      // NOT bound to this registration (a re-registered overlay, or an unprovable legacy row), that row is
+      // another registration's evidence: this registration inherits no pin from it. The row still states
+      // what is RUNNING, though: if that content changes the mechanism, building without it would revert
+      // the live daemon, so hold under a distinct reason that claims nothing about this registration.
+      // With no row at all, or lost/mismatched rebuild state, the pin is unknown: refuse rather than
+      // silently dropping a possible mechanism overlay.
+      const adoptedRows = state.adopted?.head === prevHead && Array.isArray(state.adopted?.applied)
+        ? state.adopted.applied : null;
+      const pinMain = state.adopted?.mainSha ?? fetchedMainSha;
+      const adopted = adoptedRows ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
+      // Every running row for this ref not bound to this registration (duplicates included): the replacement's
+      // own tip says nothing about what is RUNNING, so these rows are checked even when that tip is harmless.
+      const unboundRows = adoptedRows ? adoptedRows.filter((row) => row?.ref === raw.ref && row !== adopted) : [];
+      const tipSha = adopted?.sha ?? validTipSha(raw);
+      let reason = 'pinned-overlay-unavailable';
+      let detailSha = tipSha ?? null;
+      let pin = { pinned: false };
+      if (tipSha || raw.pinned === true) pin = pinnedStatus(git, raw, pinMain, tipSha);
+      else if (!unboundRows.length) pin = { pinned: true, why: 'unknown' };
+      for (const row of pin.pinned ? [] : unboundRows) {
+        // Unparseable running evidence cannot prove the running content is harmless: fail closed.
+        const rowSha = FULL_SHA_RE.test(row?.sha ?? '') ? row.sha : null;
+        const rowPin = rowSha ? pinnedStatus(git, raw, pinMain, rowSha) : { pinned: true, why: 'unknown' };
+        if (!rowPin.pinned) continue;
+        pin = rowPin;
+        reason = 'pinned-overlay-unbound';
+        detailSha = rowSha;
+        break;
+      }
+      // pinnedStatus runs Git; the list may be re-registered meanwhile. Never refuse for a replaced registration.
+      if (!snapshotHolds()) return registrationChanged();
+      if (!pin.pinned) continue;
+      unavailablePinned = {
+        ok: false, reason,
+        detail: { ref: raw.ref, pr: raw.pr ?? null, registrationId: snap.get(raw.ref) ?? null, sha: detailSha,
+          dropReason: 'ref-unavailable', pinnedBy: pin.why,
+          message: reason === 'pinned-overlay-unbound'
+            ? 'the running build carries mechanism changes for this ref under an earlier registration, and the branch is unavailable — restore the branch, or remove the overlay to drop that content deliberately'
+            : PINNED_OVERLAY_GONE_MESSAGE },
+      };
+      break;
+    }
+  }
+  if (!snapshotHolds()) return registrationChanged();
+  if (!mainOnly && unverified.length && !unavailablePinned) {
+    const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
+    alert('overlay-fetch-unverifiable', detail);
+  }
   pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
@@ -285,12 +403,19 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
-  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
-  const plan = await planRebuild({
-    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
+  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
+  if (!snapshotHolds()) return registrationChanged();
+  const plan = unavailablePinned ?? await planRebuild({
+    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
+    adopted: state.adopted,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
+  if (!snapshotHolds()) return registrationChanged();
+  // Carry the captured ids through normal adoption too; adopt.mjs consumes these applied rows unchanged.
+  if (plan.applied) plan.applied = plan.applied.map((row) => ({
+    ...row, registrationId: row.registrationId ?? snap.get(row.ref),
+  }));
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
@@ -334,6 +459,7 @@ export async function prepareRebuild({
   }
   if (!plan.ok) {
     // A pinned refusal keeps the current tree AND the overlay list untouched (no decisions were applied).
+    if (plan === unavailablePinned && !snapshotHolds()) return registrationChanged();
     alert(plan.reason, plan.detail);
     // xpinskip — a pinned refusal that still stands (explicit pin, or main lacks the mechanism) must not freeze
     // dispatch either: when the clone sits on its last smoke-verified build, record it as HELD there, so
@@ -378,6 +504,7 @@ export async function prepareRebuild({
       try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
       catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
     }
+    if (!snapshotHolds()) return registrationChanged();
     alert('established-overlay-hold', detail);
     if (state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {
@@ -394,10 +521,25 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  if (!snapshotHolds()) return registrationChanged();
   for (const d of plan.decisions) {
+    if (!snapshotHolds()) return registrationChanged();
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
-      removeOverlay(root, d.ref, { env, why: d.reason });
+      try {
+        // Bind removal to the registration captured before planning.
+        const removed = removeOverlay(root, d.ref, {
+          env, why: d.reason, expectRegistrationId: snap.get(d.ref),
+        });
+        if (removed.removed) {
+          snapshotGeneration += 1;
+          snap.delete(d.ref);
+        }
+      } catch (error) {
+        if (!/registration changed/.test(String(error?.message))) throw error;
+        alert('overlay-registration-changed', {});
+        continue;
+      }
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
@@ -447,7 +589,7 @@ export async function prepareRebuild({
     if (ready) {
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
-      const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
+      const registeredRefs = new Set(overlaysForPlan.map((o) => o?.ref));
       for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
       const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
       for (const d of plan.decisions) {
@@ -503,6 +645,7 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          archiveGuard: !mainOnly,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -571,7 +714,7 @@ export async function prepareRebuild({
     if (d?.skip) {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
-        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null }, archiveGuard: !mainOnly,
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
       return {
@@ -585,6 +728,7 @@ export async function prepareRebuild({
   // PR #2731 review — single flight: phase 2 runs unlocked, so without this a sibling daemon sharing the clone
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
+  if (!snapshotHolds()) return registrationChanged();
   const lease = claimBuildLease({
     state, plan, root, run, env: stEnv, nowMs: nowMs(),
   });

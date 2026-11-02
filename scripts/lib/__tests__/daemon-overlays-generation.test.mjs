@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import * as overlays from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { finalizeRebuild, dropSuspectOverlays } from '../daemon-rebuild/adopt.mjs';
+import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild/shared.mjs';
 
@@ -487,7 +488,12 @@ describe('overlay registration generations', () => {
     expect(f.list()).toContainEqual(replacement);
   });
 
-  it.each(['already-adopted', 'moved'])('T10 archive guard: unreadable registry refuses %s without changing adopted evidence', async (branch) => {
+  it.each([
+    { branch: 'already-adopted', guard: 'default' },
+    { branch: 'moved', guard: 'default' },
+    { branch: 'already-adopted', guard: 'explicit true' },
+    { branch: 'moved', guard: 'explicit true' },
+  ])('T10 archive guard $guard: corrupt registry refuses $branch and preserves HEAD and adopted state', async ({ branch, guard }) => {
     const f = gitFixture();
     const before = readRebuildState(f.root, f.env).adopted;
     writeFileSync(f.file, '{broken');
@@ -498,7 +504,9 @@ describe('overlay registration generations', () => {
       plan: { finalSha: branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha,
         mainSha: f.adopted.mainSha, inputsKey: 'unreadable', applied: f.adopted.applied },
       run, onAdopted,
+      ...(guard === 'explicit true' ? { archiveGuard: true } : {}),
     });
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.adopted.head);
     expect(result).toMatchObject({ moved: false, reason: 'overlay-source-unverifiable' });
     expect(result.adopted).not.toBe(true);
     expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-source-unavailable',
@@ -509,18 +517,25 @@ describe('overlay registration generations', () => {
     expect(f.bytes()).toBe('{broken');
   });
 
-  it('T10 adopt CAS: mainOnly unreadable registry cannot establish registration evidence', async () => {
+  it.each(['already-adopted', 'moved'])('T10 archiveGuard false mainOnly bypass: corrupt registry permits %s adoption but cannot establish registration evidence', async (branch) => {
     const f = gitFixture();
     writeFileSync(f.file, '{broken');
     // mainOnly deliberately skips archive checks; its adoption CAS must still strip unprovable ids.
+    const finalSha = branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha;
+    const onAdopted = vi.fn();
     const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
-      archiveGuard: false,
-      lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha: f.adopted.head, mainSha: f.adopted.mainSha,
+      archiveGuard: false, onAdopted,
+      lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha, mainSha: f.adopted.mainSha,
         inputsKey: 'unreadable', applied: f.adopted.applied },
       run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),
     });
     expect(result.adopted).toBe(true);
+    expect(result.moved).toBe(branch === 'moved');
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(finalSha);
+    expect(onAdopted).toHaveBeenCalledTimes(1);
+    expect(result.alerts.map(a => a.kind)).not.toContain('overlay-source-unavailable');
     expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
+    expect(readRebuildState(f.root, f.env).adopted).toMatchObject({ head: finalSha, inputsKey: 'unreadable' });
     const { registrationId, ...unbound } = f.adopted.applied[0];
     expect(readRebuildState(f.root, f.env).adopted.applied).toEqual([unbound]);
     expect(f.bytes()).toBe('{broken');
@@ -561,5 +576,84 @@ describe('overlay registration generations', () => {
     expect(alert.mock.calls.map(([kind]) => kind)).toEqual(['overlay-dropped-smoke-failed']);
     const events = readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(events).toContainEqual(expect.objectContaining({ kind: 'dropped-smoke-failed', ref: REF }));
+  });
+});
+
+
+describe.each(['dispatch failure', 'plain-main fallback'])('T14 smoke removal CAS: %s', (path) => {
+  it.each([
+    { name: 'keeps a replacement registered during smoke', identity: 'replaced' },
+    { name: 'keeps a replacement when smoke evidence has no registration ID', identity: 'missing' },
+    { name: 'keeps a replacement when smoke evidence has a null registration ID', identity: 'null' },
+    { name: 'keeps a replacement when smoke evidence has an empty registration ID', identity: 'empty' },
+    { name: 'removes the original registration when its smoke evidence matches', identity: 'original' },
+  ])('$name', async ({ identity }) => {
+    const f = gitFixture();
+    const mainSha = f.adopted.mainSha;
+    f.ok(['reset', '--hard', mainSha]);
+    f.save(null);
+    // This overlay changes the dispatch path, but none of the rebuild mechanism.
+    const dispatchPath = 'scripts/operations/dispatch-lane-io.mjs';
+    mkdirSync(dirname(join(f.root, dispatchPath)), { recursive: true });
+    writeFileSync(join(f.root, dispatchPath), 'export const broken = true;\n');
+    f.ok(['add', dispatchPath]);
+    f.ok(['commit', '-qm', 'overlay dispatch change']);
+    const sha = f.ok(['rev-parse', 'HEAD']);
+    f.ok(['update-ref', `refs/remotes/origin/${REF}`, sha]);
+    f.ok(['reset', '--hard', mainSha]);
+    const applied = { ref: REF, pr: 17, sha };
+    if (identity !== 'missing') applied.registrationId = identity === 'null' ? null
+      : identity === 'empty' ? '' : f.old.registrationId;
+    const plan = { ok: true, finalSha: sha, mainSha, inputsKey: 'smoke-cas', applied: [applied] };
+    const pass = { verdict: 'pass', smoke: { results: [] } };
+    const fail = { verdict: 'code', smoke: { results: [{ name: 'fixture-check', ok: false, detail: 'broken code' }] } };
+    let replacement;
+    const replaceDuringSmoke = () => {
+      if (identity !== 'original') replacement = f.add();
+    };
+    const dispatch = vi.fn(async () => {
+      replaceDuringSmoke();
+      return { ok: false, reason: 'launch-failed' };
+    });
+    let smokeCalls = 0;
+    const runSmoke = vi.fn(async () => {
+      smokeCalls += 1;
+      if (path === 'dispatch failure') return pass;
+      if (smokeCalls === 1) return fail;
+      // Re-register after the fallback captured the failing candidate's suspects,
+      // while its passing smoke is running and before adoption drops those suspects.
+      replaceDuringSmoke();
+      return pass;
+    });
+    const result = await smokeAndAdopt({
+      root: f.root, env: f.env, stEnv: f.env, log: {}, run: f.git, runSmoke,
+      now: () => Date.parse(NOW), plan, prevHead: mainSha,
+      lease: { token: null, path: join(f.env.WE_DAEMON_STATE_DIR, 'smoke-cas-candidate') },
+      overlaysBefore: [f.old], prepAlerts: [], mainOnly: false,
+      finalLockOpts: { waitMs: 1500, pollMs: 20 },
+      dispatchSmoke: { settings: { dispatchSmoke: path === 'dispatch failure' ? 'on' : 'off',
+        dispatchPaths: [dispatchPath], noPr: 'warn', smokeTimeoutMs: 60_000, smokeKind: 'ci-heal' }, run: dispatch },
+    });
+    expect(result.reason).toBe(path === 'dispatch failure' ? 'dispatch-smoke-failed' : 'fallback-plain-main');
+    expect(runSmoke).toHaveBeenCalledTimes(path === 'dispatch failure' ? 1 : 2);
+    expect(dispatch).toHaveBeenCalledTimes(path === 'dispatch failure' ? 1 : 0);
+    expect(!!result.adopted).toBe(path === 'plain-main fallback');
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(mainSha);
+    const kinds = result.alerts.map(a => a.kind);
+    const dropKind = path === 'dispatch failure' ? 'dropped-dispatch-smoke-failed' : 'dropped-smoke-failed';
+    const eventFile = f.file.replace(/\.json$/, '.events.jsonl');
+    let events = [];
+    try { events = readFileSync(eventFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (identity === 'original') {
+      expect(f.list()).toEqual([]);
+      expect(kinds).not.toContain('overlay-registration-changed');
+      expect(events.filter(e => e.kind === dropKind)).toEqual([expect.objectContaining({ ref: REF })]);
+    } else {
+      expect(replacement.registrationId).not.toBe(f.old.registrationId);
+      expect(f.list()).toEqual([replacement]);
+      expect(kinds).toContain('overlay-registration-changed');
+      expect(events.filter(e => e.kind.startsWith('dropped-'))).toEqual([]);
+    }
   });
 });

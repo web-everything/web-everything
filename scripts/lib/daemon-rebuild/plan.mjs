@@ -331,7 +331,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(),
+  noPin = new Set(), adopted = null,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -616,7 +616,14 @@ export async function planRebuild({
         // content is exactly what already passed smoke here, and the build it lands in is still smoked as usual.
         // A ref with no adopted head (a brand-new registration) falls through to the plain drop below, as before.
         const adoptedTip = adoptedTips.get(ref);
-        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
+        // Merge subjects prove content was carried, but contain no registration identity. For a
+        // stamped registration, only the running build's matching adopted row can authorize a pin.
+        // Keep ref/PR history for loss protection even when it cannot authorize reusing that content.
+        const boundRows = adopted?.head === headSha && Array.isArray(adopted.applied)
+          ? adopted.applied.filter((row) => row?.ref === ref && row.registrationId === raw?.registrationId) : [];
+        const pinRegistrationMatches = !raw?.registrationId
+          || (boundRows.length === 1 && boundRows[0].sha === adoptedTip);
+        if (adoptedTip && pinRegistrationMatches && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
           const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
           const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
           // Adopted content already carried by another overlay (merge changes nothing): no pin — a pin that applies
@@ -759,7 +766,7 @@ export async function planRebuild({
   if (lostBases.length > 0) {
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, adopted,
     });
   }
 
@@ -859,7 +866,7 @@ export async function planRebuild({
       for (const refs of retryPinGroups()) {
         const alt = await planRebuild({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs),
+          keepIndependent, noPin: new Set(refs), adopted,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
