@@ -1,10 +1,11 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
+import { collectRunClosure, decideSkipRebuild } from '../daemon-rebuild/skip-unrelated.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -16,6 +17,40 @@ function fixture() {
   mkdirSync(root); mkdirSync(launchAgentsDir);
   return { dir, root, launchAgentsDir };
 }
+
+it.each([
+  [1, false], [1, true], [2, false], [2, true],
+])('a tracked-but-deleted spawn target at hop %i is incomplete (stopWhenIncomplete=%s)', (hop, stopWhenIncomplete) => {
+  const { root } = fixture();
+  mkdirSync(join(root, 'scripts'));
+  const spawns = "spawn(process.execPath, ['./child.mjs', './ghost.mjs']);\n";
+  writeFileSync(join(root, 'scripts/d.mjs'), hop === 1 ? spawns : "spawn(process.execPath, ['./launcher.mjs']);\n");
+  if (hop === 2) writeFileSync(join(root, 'scripts/launcher.mjs'), spawns);
+  writeFileSync(join(root, 'scripts/child.mjs'), "import './grand.mjs';\n");
+  writeFileSync(join(root, 'scripts/grand.mjs'), 'export {};\n');
+  writeFileSync(join(root, 'scripts/ghost.mjs'), 'export {};\n');
+  // Model git ls-files retaining a deleted worktree target without writing a Git index.
+  const byName = vi.fn(name => name === 'ghost.mjs' ? ['scripts/ghost.mjs'] : []);
+  rmSync(join(root, 'scripts/ghost.mjs'));
+
+  const closure = collectRunClosure({ root, entries: ['scripts/d.mjs'], byName, stopWhenIncomplete });
+  expect(byName).toHaveBeenCalledWith('ghost.mjs');
+  expect(decideSkipRebuild({ closure, changedFiles: ['scripts/grand.mjs'] }).skip).toBe(false);
+  expect(closure.complete).toBe(false);
+  expect(closure.files).toContain('scripts/d.mjs');
+  if (hop === 2) expect(closure.files).toContain('scripts/launcher.mjs');
+  expect(closure.spawnedNames).toContain('ghost.mjs');
+  expect(decideSkipRebuild({ closure, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(false);
+  expect(decideSkipRebuild({ closure, changedFiles: ['docs/a.md'] }).skip).toBe(true);
+
+  // A fresh walk after the missing target returns must recover normal filtering.
+  writeFileSync(join(root, 'scripts/ghost.mjs'), 'export {};\n');
+  const recovered = collectRunClosure({ root, entries: ['scripts/d.mjs'], byName, stopWhenIncomplete });
+  expect(recovered.complete).toBe(true);
+  expect(recovered.files).toContain('scripts/grand.mjs');
+  expect(decideSkipRebuild({ closure: recovered, changedFiles: ['scripts/grand.mjs'] }).skip).toBe(false);
+  expect(decideSkipRebuild({ closure: recovered, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(true);
+});
 
 it.each(['caller', 'LaunchAgent', 'mapped pass', 'boot entry', 'dangling caller symlink'])(
   'keeps the closure consumer conservative for a missing %s alongside readable entries', source => {

@@ -182,7 +182,8 @@ export function collectRunClosure({
     if (!fresh.length) break;
     if (hop >= MAX_SPAWN_HOPS) { closure = { ...closure, complete: false }; break; }
     for (const t of fresh) walked.add(t);
-    closure = imports() || closure;
+    // An unavailable spawn root invalidates completeness even when earlier hops were readable.
+    closure = imports() || { ...closure, complete: false };
   }
   return { ...closure, complete: closure.complete && !unreadable, spawnedNames };
 }
