@@ -77,6 +77,13 @@ describe('canonicalRepoSlug', () => {
 });
 
 describe('operator ruling repo spelling (#6170)', () => {
+  it('an unknown legacy-owner repository cannot adopt a current-owner record spelling', () => {
+    const { comments } = world({ rulingRepo: 'chalbert/unknown-repository' });
+    const record = { ...readReferralRecords(comments).records[0], repo: 'web-everything/unknown-repository' };
+    const thread = [post(renderReferralRecord(record), 'web-everything'), comments[1]];
+    expect(readOperatorRulings(thread).rulings.map(r => r.repo)).toEqual(['chalbert/unknown-repository']);
+    expect(state(thread, record.repo).pending).toContain(record.referrals[0].key);
+  });
   it('the production sink retains the hold instead of persisting a carry over the later old-owner block', async () => {
     const root = mkdtempSync(join(tmpdir(), 'repo-slug-sibling-'));
     try {
@@ -115,6 +122,19 @@ describe('operator ruling repo spelling (#6170)', () => {
         }
       }
     }
+  });
+  it.each(['card', 'not-real'])('an explicit current-owner target %s ruling clears a hidden sibling block hold', result => {
+    const w = siblings(result);
+    const comments = [...w.recordComments, w.clearance, w.ruling(w.third, 'block')];
+    const key = w.target.referrals[0].key;
+    expect(findSameHeadSiblingRuling(w.target.referrals[0], w.context(comments))).toBeNull();
+    expect(state(comments, NEW_REPO).pending).toContain(key);
+
+    const explicit = w.ruling(w.target, result, { repo: NEW_REPO });
+    const after = state([...comments, explicit], NEW_REPO);
+    expect(after.pending).not.toContain(key);
+    expect(after.blocked).not.toContain(key);
+    expect(after.pending).toContain(w.third.referrals[0].key);
   });
   it('a hidden block on an unrelated readable finding does not veto the sibling carry', () => {
     const w = siblings();
