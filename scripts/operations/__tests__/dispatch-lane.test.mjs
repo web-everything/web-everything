@@ -497,9 +497,9 @@ describe('the lane comes from the tick core or nowhere', () => {
     }, { num: '3037' });
     expect(shaped.dispatching).toBe(true);
     expect(shaped.scope).toEqual([
-      'we:scripts/readiness/heavy-admission.mjs', 'scripts/readiness/remote-exec.mjs', 'we:a.mjs', 'we:b.mjs', 'c.mjs',
+      'we:scripts/readiness/heavy-admission.mjs', 'we:scripts/readiness/remote-exec.mjs', 'we:a.mjs', 'we:b.mjs', 'we:c.mjs',
     ]);
-    expect(shaped.prompt).toContain('scope: we:scripts/readiness/heavy-admission.mjs,scripts/readiness/remote-exec.mjs,we:a.mjs,we:b.mjs,c.mjs');
+    expect(shaped.prompt).toContain('scope: we:scripts/readiness/heavy-admission.mjs,we:scripts/readiness/remote-exec.mjs,we:a.mjs,we:b.mjs,we:c.mjs');
   });
 
   it('R372 — fails closed when ANY entry of a multi-path scope is unsafe (metachar, `..`, absolute)', () => {
@@ -511,6 +511,20 @@ describe('the lane comes from the tick core or nowhere', () => {
       expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope: [bad] } }, { num: '3037' }), JSON.stringify(bad))
         .toThrow(/characters the brief cannot carry|unsafe scope entry/);
     }
+  });
+
+  it('R372 — a grouped build member scope is normalized and fails closed too', () => {
+    const mk = (scope) => () => shapeDispatchRead(tickRead({ groupItems: [
+      { num: '3038', specPath: 'backlog/3038-member.md', scope: [scope] },
+    ] }), { num: '3037', groupMembers: '3038' });
+    expect(mk('we:docs/a.md b.md')().scope).toEqual(['we:scripts/operations/', 'we:docs/a.md', 'we:b.md']);
+    for (const bad of ['we:../../x', 'we:a.md /etc/x', 'we:a;b']) expect(mk(bad), bad).toThrow(/cannot carry|unsafe scope/);
+  });
+
+  it('R372 — an unprefixed piece inherits the entry repo prefix (lease overlap stays correct)', () => {
+    const read = tickRead();
+    const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope: ['we:a.mjs b.mjs'] } }, { num: '3037' });
+    expect(shaped.scope).toEqual(['we:a.mjs', 'we:b.mjs']);
   });
 
   it('R372 — a scope that is only separators is refused as unscoped', () => {

@@ -419,7 +419,13 @@ export function normalizeBriefScope(raw) {
   if (!Array.isArray(raw)) return [];
   const out = [];
   for (const entry of raw) {
-    for (const piece of String(entry ?? '').split(/[\s,]+/).filter(Boolean)) {
+    // a piece with no `repo:` prefix inherits the nearest earlier prefix of the SAME entry, so `we:a.mjs b.mjs`
+    // is `we:a.mjs,we:b.mjs` and the lease overlap check sees both paths in the repo they belong to.
+    let inherited = '';
+    for (const raw0 of String(entry ?? '').split(/[\s,]+/).filter(Boolean)) {
+      const own = /^[A-Za-z][\w-]*:/.exec(raw0)?.[0] ?? '';
+      if (own) inherited = own;
+      const piece = own ? raw0 : inherited + raw0;
       if (!BRIEF_SCOPE_VALUE_RE.test(piece)) {
         throw new Error(
           `dispatch-lane: the value for {{SCOPE}} (${JSON.stringify(piece)}) has characters the brief cannot carry `
@@ -1134,7 +1140,7 @@ export function shapeDispatchRead(raw, { num, expectedWithinMinutes, groupMember
       if (launchKind === 'prepare-item') scope.push(`we:${card.specPath}`);
       else {
         if (!Array.isArray(card.scope) || !card.scope.length) throw new Error(`dispatch-lane.read: group member #${member} has no scope`);
-        for (const path of card.scope) if (!scope.includes(path)) scope.push(path);
+        for (const path of normalizeBriefScope(card.scope)) if (!scope.includes(path)) scope.push(path);
       }
     }
   }
