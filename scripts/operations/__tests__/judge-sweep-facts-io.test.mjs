@@ -499,7 +499,7 @@ it('takes the verdict from a ledger row at the PR head when no advisory comment 
 });
 
 it('takes an accepting ledger verdict at the PR head as accepted', () => {
-  const facts = ledgerFacts([ledgerRow({ verdict: 'accept' })]);
+  const facts = ledgerFacts([ledgerRow({ verdict: 'accepted' })]);
   expect(facts.latestVerdict).toMatchObject({ accepted: true, evidence: 'ledger' });
   expect(facts.evidenceErrors).toEqual([]);
 });
