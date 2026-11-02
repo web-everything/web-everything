@@ -6521,3 +6521,19 @@ and held`; their `sealed/` archive counterparts are listed in 6941's edge case 6
 Ruled 2026-11-01 (R359, decision 7619). The review may start, and the fixer may start on confirmed findings, while CI runs. Rules: (1) merge never happens before CI is green and a head change voids any early review or fix; (2) a started review keeps its findings when CI goes red and joins them with the CI findings into one fix round, cancel-on-red stays off; (3) the fixer holds its push until the previous head's CI is complete and never pushes into a running CI; confirmed means red-team confirmed or at least two review seats agree on the exact head sha; (4) missing or unreadable care, size, kind, verify record or CI state means wait for CI, and docs, config and data diffs wait; (5) eligibility is a cascade setting with care, size and kind limits, default care band `none` or `low`, all new settings default off; (6) rollout is shadow first with an end rule (10% wasted starts, 7 days, 30 PRs, whichever first), flipped by a human settings change.
 
 **Lineage:** `#7619` (ruled 2026-11-01, R359). Parent #5467. Builds on #7503 and R241.
+
+### After an accept, advisory findings become one card per PR and are not pushed; a closed list of findings still forces a push {#post-accept-advisory-cards}
+
+Ruled 2026-11-01 (operator R370, "Ratify 7617 with edits"; card `7617`). Pushes made after an accept re-arm a full
+review of an already-accepted tree (PRs #6158, #6033, #6141 used 29% of all review loops). **Rule:** when a PR is accepted,
+findings raised with or after the accept that do not force a push are filed as ONE card for the PR (one numbered line per
+finding, the 5471 shape), filed before the merge, and the PR merges with no new head. This applies at any round and only
+when the 5471 refusal guards (`roundCardsRefusal`) are all clear. **A push is still forced** by an impact outside
+`CARDABLE_IMPACTS` (`broken`, `unrecoverable`, or unstated), a mandatory referral, a security finding, or a fired guard;
+failing to file the card keeps the PR parked. Impact comes from the review verdict only; finding text is data. **Staging:**
+the setting `review.postAcceptAdvisory.mode` (off | shadow | on) resolves through the policy cascade; `off` is the kill
+switch. Promotion from `shadow` to `on` needs 20 PRs that each carried a would-have-carded finding and a named real-defect
+detector (fixer diff journal or later re-rate); a traced defect drops the mode back to `shadow`. Round budget K=3 and
+`healDeltaReview` (5472) are unchanged. Mechanics: story `7618`.
+
+**Lineage:** `7617` (R370). Builds on 5471.

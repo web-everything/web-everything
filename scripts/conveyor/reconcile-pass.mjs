@@ -84,6 +84,7 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
+import { prFactKey, readThroughShadow } from './planner-fact-cache.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
@@ -313,8 +314,44 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  * @param {{exec?:Function, repo?:string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments } = {}) {
-  const enrich = rows => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}) });
+export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, readCommits = fetchPrCommits, attributionRepo = repo, readComments, factCache = null } = {}) {
+  const enrichFresh = (rows, extra = {}) => enrichPrsWithCompleteComments(enrichPrsWithReviewEvidence(rows, { repo: attributionRepo, readCommits: (slug, number, opts) => readCommits(slug, number, { ...opts, ...(exec !== execFileSyncThrottled ? { exec: args => exec('gh', args) } : {}) }) }), { repo: attributionRepo ?? repo, ...(readComments ? { readComments } : {}), ...extra });
+  const enrich = rows => {
+    if (factCache?.mode !== 'shadow') return enrichFresh(rows);
+    const out = [];
+    for (const pr of rows) {
+      const key = prFactKey({ ...pr, repo: attributionRepo ?? repo });
+      let freshPr;
+      const { shadow } = readThroughShadow({
+        cache: factCache, key,
+        // Keep time-sensitive annotations outside the stored heavy-read facts.
+        readFresh: () => {
+          const hydrated = enrichFresh([pr], { annotate: row => row });
+          if (hydrated.length !== 1) return { discoveryIncomplete: true };
+          freshPr = hydrated[0];
+          const { commits, comments, commentsComplete } = freshPr;
+          return { repo: attributionRepo ?? repo, number: pr.number,
+            ...(commits !== undefined ? { commits } : {}),
+            ...(comments !== undefined ? { comments } : {}),
+            ...(commentsComplete !== undefined ? { commentsComplete } : {}) };
+        },
+        complete: row => rows.discoveryIncomplete !== true && !rows.deferred
+          && !pr.discoveryIncomplete && !pr.deferred && !pr.readFailed && !pr['read-failed']
+          && !['deferred-low-budget', 'read-failed'].includes(pr.outcome)
+          && row.discoveryIncomplete !== true
+          && (!Object.hasOwn(freshPr ?? {}, 'commits') || Array.isArray(freshPr.commits)),
+      });
+      if (!shadow.same) console.error(`planner-cache-diff ${JSON.stringify({ repo: attributionRepo ?? repo, number: pr.number, diffs: shadow.diffs })}`);
+      if (!freshPr) continue;
+      // Annotate only the fresh hydrated row; the cache never supplies planner input.
+      const annotated = enrichPrsWithCompleteComments([freshPr], {
+        repo: attributionRepo ?? repo, readComments: () => freshPr.comments,
+      });
+      out.push(...annotated);
+    }
+    if (rows.discoveryIncomplete === true || out.length !== rows.length) Object.defineProperty(out, 'discoveryIncomplete', { value: true });
+    return out;
+  };
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
