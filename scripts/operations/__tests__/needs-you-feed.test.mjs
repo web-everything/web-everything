@@ -8,6 +8,7 @@ import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
+import { escalationLedgerPath, loadEscalationLedger } from '../../conveyor/escalation-actor.mjs';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'needs-feed-')); dirs.push(d); return d; };
 afterEach(() => {
@@ -17,6 +18,80 @@ afterEach(() => {
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
 describe('feed', () => {
+  it('audit: a kept alert with failed live validation breaks its streak until positively confirmed again', async () => {
+    const home = temp(), path = join(home, 'needs-you-events.jsonl');
+    const repo = 'owner/repo', head = 'a'.repeat(40);
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 },
+      path: { value: path }, allowPrimary: { value: true } };
+    const report = { ready: [], rulingNeeded: [{ repo, number: 6023, head, reason: 'review parked' }] };
+    let readable = true;
+    const gh = vi.fn(async (_file, args) => {
+      if (!readable) throw new Error('live lookup failed');
+      return args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head,
+        labels: [{ name: 'review:human' }], body: '', createdAt: at });
+    });
+    const options = { home, checkoutRoot: home, settings, env: {}, log: () => {}, gh,
+      exec: () => JSON.stringify(report), rulingLookup: async () => ({ pending: true }) };
+    await runOnce({ ...options, now: '2026-11-02T12:00:00Z' });
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023])
+      .toMatchObject({ streak: 1, seenAt: '2026-11-02T12:00:00.000Z' });
+    readable = false;
+    const failed = await runOnce({ ...options, now: '2026-11-02T12:02:00Z' });
+    expect(failed.openKeys).toContain(`${repo}#6023@${head}:ruling-needed`);
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo]?.[6023]).toBeUndefined();
+    readable = true;
+    await runOnce({ ...options, now: '2026-11-02T12:04:00Z' });
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023].streak).toBe(1);
+    await runOnce({ ...options, now: '2026-11-02T12:06:00Z' });
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023].streak).toBe(2);
+  });
+
+  it.each(['at-round-limit', 'escalated'])('audit: a stale-head %s alert breaks its streak without rebinding to the live head', async kind => {
+    const home = temp(), path = join(home, 'needs-you-events.jsonl');
+    const repo = 'owner/repo', head = 'a'.repeat(40), next = 'b'.repeat(40);
+    let liveHead = head;
+    const reason = kind === 'at-round-limit' ? 'red-team-round-cap' : 'dispute';
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 },
+      path: { value: path }, allowPrimary: { value: true } };
+    const report = { ready: [], rulingNeeded: [{ repo, number: 6023, head, findings: [{ reason }] }] };
+    const options = { home, checkoutRoot: home, settings, env: {}, log: () => {},
+      exec: () => JSON.stringify(report),
+      gh: async (_file, args) => args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: liveHead,
+        labels: [{ name: 'review:human' }], body: '', createdAt: at }),
+      rulingLookup: async () => ({ head: liveHead, findings: [{ reason }] }) };
+    await runOnce({ ...options, now: '2026-11-02T12:00:00Z' });
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023]).toMatchObject({ head, streak: 1 });
+    liveHead = next;
+    const stale = await runOnce({ ...options, now: '2026-11-02T12:02:00Z' });
+    expect(stale.openKeys).toContain(`${repo}#6023@${head}:${kind}`);
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo]?.[6023]).toBeUndefined();
+    liveHead = head;
+    await runOnce({ ...options, now: '2026-11-02T12:04:00Z' });
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023]).toMatchObject({ head, streak: 1 });
+  });
+
+  it.each(['at-round-limit', 'escalated'])('audit: %s needs a live matching cause, not merely a readable PR', async kind => {
+    const home = temp(), path = join(home, 'needs-you-events.jsonl');
+    const repo = 'owner/repo', head = 'a'.repeat(40);
+    const reason = kind === 'at-round-limit' ? 'red-team-round-cap' : 'dispute';
+    let liveNeed = { head, findings: [{ reason }] };
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 },
+      path: { value: path }, allowPrimary: { value: true } };
+    const options = { home, checkoutRoot: home, settings, env: {}, log: () => {},
+      exec: () => JSON.stringify({ ready: [], rulingNeeded: [{ repo, number: 6023, head, findings: [{ reason }] }] }),
+      gh: async (_file, args) => args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head,
+        labels: [{ name: 'review:human' }], body: '', createdAt: at }),
+      rulingLookup: async () => liveNeed };
+    await runOnce({ ...options, now: '2026-11-02T12:00:00Z' });
+    expect(loadEscalationLedger(escalationLedgerPath(path))[repo][6023].streak).toBe(1);
+    for (const [index, need] of [null, undefined, { head, findings: [{ reason: 'pending' }] },
+      { head: 'b'.repeat(40), findings: [{ reason }] }].entries()) {
+      liveNeed = need;
+      const result = await runOnce({ ...options, now: `2026-11-02T12:0${index + 1}:00Z` });
+      expect(result.openKeys).toContain(`${repo}#6023@${head}:${kind}`);
+      expect(loadEscalationLedger(escalationLedgerPath(path))[repo]?.[6023]).toBeUndefined();
+    }
+  });
   it('does not publish quiet needsYourMergePending notes as needs-you items', () => {
     const items = itemsFromReport({ needsYourMergePending: [{ repo: 'web-everything/web-everything',
       number: 5990, title: 'fix CI workflow', reason: 'pending: no red-team result on current head' }] });
