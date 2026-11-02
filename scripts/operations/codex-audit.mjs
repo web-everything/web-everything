@@ -8,6 +8,14 @@ export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).dig
 const SHA = /^[a-fA-F0-9]{40}(?![\s\S])/;
 const USAGE = 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n';
 const clean = text => stripVTControlCharacters(text).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '');
+const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
+
+// Check whole verdict lines, including controls/Unicode that can disguise a contradiction.
+function hasConflictingVerdict(verdict, findings) {
+  const opposite = verdict === 'NOT WEAKENED' ? 'WEAKENED' : 'NOT WEAKENED';
+  return findings.some(line => typeof line === 'string' && [...line.split(LINE_BREAK), clean(line)].some(part =>
+    clean(part).normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').trim() === opposite));
+}
 
 function parseArgs(argv) {
   const flags = {};
@@ -29,6 +37,7 @@ export function findAudit(records, { head, base, questionHash }) {
   for (const record of records) {
     if (record?.head !== head || record.base !== base || record.questionHash !== QUESTION_HASH || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
+    if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
     if (!latest || Date.parse(record.at) >= Date.parse(latest.at)) latest = record;
   }
   return latest;
@@ -59,6 +68,7 @@ export async function main(argv, deps) {
     while (lines.length && !lines[0].trim()) lines.shift();
     const verdict = lines.shift();
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
+    if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     const findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
     try {

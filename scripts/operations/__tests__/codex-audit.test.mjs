@@ -96,6 +96,53 @@ describe('canonical audit', () => {
     expect(f.records).toEqual([]);
   });
 
+  const conflictingAnswers = [
+    'NOT WEAKENED\nWEAKENED\nscripts/gate.mjs:12 the fail-closed guard was removed',
+    'WEAKENED\nNOT WEAKENED',
+    'NOT WEAKENED\nscripts/gate.mjs:12 guard removed\n\nWEAKENED\n',
+    'NOT WEAKENED\r\nWEAKENED',
+    'NOT WEAKENED\rWEAKENED',
+    'NOT WEAKENED\u2028WEAKENED',
+    'NOT WEAKENED\u2029WEAKENED',
+    'NOT WEAKENED\n \tWEAKENED\t ',
+    'NOT WEAKENED\n\x1b[31mWEAKENED\x1b[0m\x07',
+    'NOT WEAKENED\nＷＥＡＫＥＮＥＤ',
+    'NOT WEAKENED\nWEAK\u200bENED',
+    'NOT WEAKENED\nWEAK\rENED',
+    'WEAKENED\nＮＯＴ ＷＥＡＫＥＮＥＤ',
+  ];
+
+  it.each(conflictingAnswers)('rejects contradictory verdicts without publishing or recording: %j', async answer => {
+    for (const args of [ARGS, [...ARGS, '--json']]) {
+      const f = fixture(answer);
+      expect(await main(args, f.deps)).toBe(3);
+      expect(f.errors.join('')).toMatch(/UNPARSEABLE/);
+      expect(f.output).toEqual([]);
+      expect(f.deps.appendRecord).not.toHaveBeenCalled();
+      expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBeNull();
+    }
+  });
+
+  it.each(['NOT WEAKENED', 'WEAKENED'])('preserves repeated agreeing verdicts and findings mentioning verdict words: %s', async verdict => {
+    const f = fixture(`${verdict}\n${verdict}\nscripts/gate.mjs:12 checks WEAKENED and NOT WEAKENED, \`WEAKENED\`, "NOT WEAKENED", --head and ../paths`);
+    expect(await main(ARGS, f.deps)).toBe(verdict === 'NOT WEAKENED' ? 0 : 1);
+    expect(f.records).toHaveLength(1);
+    expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH })).toBe(f.records[0]);
+  });
+
+  it.each(conflictingAnswers)('findAudit ignores historical contradictory records: %j', async answer => {
+    const verdict = answer.startsWith('WEAKENED') ? 'WEAKENED' : 'NOT WEAKENED';
+    const f = fixture(verdict);
+    await main(ARGS, f.deps);
+    const valid = { ...f.records[0], at: '2026-01-01T00:00:00.000Z' };
+    const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
+    for (const findings of [answer.slice(verdict.length).split(/\r?\n/), [answer]]) {
+      const invalid = { ...valid, at: AT, findings };
+      expect(findAudit([invalid], query)).toBeNull();
+      expect(findAudit([valid, invalid], query)).toBe(valid);
+    }
+  });
+
   it('prints no verdict if the record cannot be appended', async () => {
     const f = fixture();
     f.deps.appendRecord.mockRejectedValue(new Error('permission denied'));
@@ -174,6 +221,19 @@ function adapter(report = { exitCode: 0, timedOut: false, lastMessage: 'NOT WEAK
 }
 
 describe('audit IO with injected filesystem and subprocesses', () => {
+  it('refuses a contradictory launcher report before the persistence adapter runs', async () => {
+    const f = adapter({ exitCode: 0, timedOut: false,
+      lastMessage: 'NOT WEAKENED\nWEAKENED\nscripts/gate.mjs:12 the fail-closed guard was removed' });
+    f.deps.resolveSha = ref => ref === 'origin/main' ? BASE : HEAD;
+    f.deps.stdout = vi.fn();
+    f.deps.stderr = vi.fn();
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.deps.stderr).toHaveBeenCalledWith(expect.stringContaining('UNPARSEABLE'));
+    expect(f.deps.stdout).not.toHaveBeenCalled();
+    expect(f.fs.appendFileSync).not.toHaveBeenCalled();
+    expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
+  });
+
   it('resolves commits using verify and commit peeling with argv, never a shell', () => {
     const f = adapter();
     f.spawnSync.mockReturnValue({ status: 0, stdout: BASE + '\n' });
