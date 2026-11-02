@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from '../drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, sameHeadFailedDecision, sameHeadFailedHold } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -425,5 +425,54 @@ describe('confirmed dequeue', () => {
   it('recognizes ready removal and leaves ready accepted PRs alone', () => {
     expect(sendBackReason([])).toContain('ready-to-merge');
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();
+  });
+});
+
+describe('mq-same-head-failed: never re-enqueue a head whose own merge_group run failed', () => {
+  const H = 'b'.repeat(40), OTHER = 'c'.repeat(40);
+  const run = (conclusion, at, prHead = H) => ({ conclusion, completedAt: at, prHead });
+  const decide = (over = {}) => sameHeadFailedDecision({ pr: 6215, head: H, runs: [], freshGreenAt: null, ...over });
+
+  it('#6215 pattern: its own gate failed at H, so no enqueue at H and one named line', () => {
+    const d = decide({ runs: [run('failure', 100)] });
+    expect(d.hold).toBe(true);
+    expect(d.kind).toBe('mq-same-head-failed');
+    expect(d.line).toBe(`mq-same-head-failed: #6215 head ${H.slice(0, 12)} — waiting for a new head or green rerun`);
+  });
+  it('a run cancelled because an entry ahead failed re-enqueues', () => {
+    expect(decide({ runs: [run('cancelled', 100)] }).hold).toBe(false);
+  });
+  it('a new head enqueues (failure was at another head)', () => {
+    expect(decide({ runs: [run('failure', 100, OTHER)] }).hold).toBe(false);
+  });
+  it('a green rerun on H enqueues (later success run or fresh green check)', () => {
+    expect(decide({ runs: [run('failure', 100), run('success', 200)] }).hold).toBe(false);
+    expect(decide({ runs: [run('failure', 100)], freshGreenAt: 150 }).hold).toBe(false);
+    expect(decide({ runs: [run('failure', 100)], freshGreenAt: 50 }).hold).toBe(true);
+  });
+  it('an errored failure read holds and says so', () => {
+    const d = decide({ readError: new Error('gh boom') });
+    expect(d.hold).toBe(true);
+    expect(d.kind).toBe('mq-same-head-unreadable');
+    expect(d.line).toContain('mq-same-head-unreadable: #6215');
+  });
+  it('sameHeadFailedHold reads runs through gh, logs the line, and fails closed on a gh error', () => {
+    const lines = [];
+    const calls = [];
+    const exec = (_c, args) => { calls.push(args.join(' '));
+      if (args[1].includes('actions/runs')) return JSON.stringify({ workflow_runs: [
+        { head_branch: 'gh-readonly-queue/main/pr-6215-abc', head_sha: 'g1', conclusion: 'failure', status: 'completed', updated_at: '2026-11-02T10:00:00Z' },
+        { head_branch: 'gh-readonly-queue/main/pr-6216-abc', head_sha: 'g2', conclusion: 'failure', status: 'completed', updated_at: '2026-11-02T10:00:00Z' }] });
+      if (args[1].includes('commits/g1')) return JSON.stringify({ parents: [{ sha: 'base' }, { sha: H }] });
+      if (args[1].includes('check-runs')) return JSON.stringify({ check_runs: [] });
+      throw new Error(`unexpected ${args}`); };
+    const r = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec, log: l => lines.push(l) });
+    expect(r.hold).toBe(true);
+    expect(calls.some(c => c.includes('commits/g2'))).toBe(false);
+    expect(lines).toEqual([r.line]);
+    const bad = sameHeadFailedHold({ repo: 'o/r', pr: 6215, head: H, exec: () => { throw new Error('net'); }, log: l => lines.push(l) });
+    expect(bad.hold).toBe(true);
+    expect(bad.kind).toBe('mq-same-head-unreadable');
+    expect(lines.at(-1)).toContain('mq-same-head-unreadable');
   });
 });
