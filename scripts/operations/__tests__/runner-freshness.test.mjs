@@ -207,12 +207,12 @@ describe('runner freshness policy', () => {
 
   describe('codex-audit --json', () => {
     const SHA = 'a'.repeat(40), HEAD = 'b'.repeat(40);
-    const deps = (answer, out = []) => ({ resolveSha: ref => (ref === 'h' ? HEAD : SHA), runCodex: () => answer,
+    const deps = (answer, out = []) => ({ resolveSha: ref => (ref === HEAD ? HEAD : SHA), runCodex: () => answer,
       appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
     const run = async (answer, json) => {
       const written = [];
       const sink = createCodexAuditSink({ makeDeps: () => deps(answer), write: t => written.push(t) });
-      const verdict = await sink({ base: 'm', head: 'h', json });
+      const verdict = await sink({ base: 'm', head: HEAD, json });
       return { written, verdict, out: finishCodexAudit({ run: { verdict }, code: 0, lines: [], json }) };
     };
     it('json mode: nothing is written by the sink and stdout is only the parseable envelope', async () => {

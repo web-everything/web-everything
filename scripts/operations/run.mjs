@@ -198,6 +198,30 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
 
+// codex-audit: the sink runs the audit in --json mode with stdout CAPTURED (never written to the process), so the
+// verdict travels as the operation result and `finish` alone decides what reaches stdout. Plain mode re-renders
+// the same `verdict` + findings lines `codex-audit.mjs` prints; --json prints only the envelope.
+export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = {}) {
+  return async ({ base, head }) => {
+    const out = [];
+    const deps = makeDeps ? makeDeps() : { ...(await import('./codex-audit-io.mjs')).createAuditDeps() };
+    deps.stdout = (text) => { out.push(text); };
+    const code = await auditMain([`--base=${base}`, `--head=${head}`, '--json'], deps);
+    let result = {};
+    try { result = JSON.parse(out.join('')); } catch { /* incomplete audit: no envelope, code carries the refusal */ }
+    return { ok: code === 0, code, ...result };
+  };
+}
+
+export function finishCodexAudit({ run, code, lines, json }) {
+  const v = run?.verdict;
+  const outCode = v?.code ?? code;
+  if (typeof v?.verdict !== 'string') return { code: outCode, lines: [] };
+  const { ok: _ok, code: _code, ...envelope } = v;
+  return { code: outCode, lines: json ? [JSON.stringify(envelope)] : [v.verdict, ...(v.findings ?? [])] };
+}
+
+
 export const OPERATIONS = Object.freeze({
   [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
   [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
@@ -481,11 +505,8 @@ export const OPERATIONS = Object.freeze({
         return entry.result;
       } }),
     }),
-    sinks: { 'codex-audit.run': async ({ base, head }) => {
-      const code = await codexAuditMain([`--base=${base}`, `--head=${head}`]);
-      return { ok: code === 0, code };
-    } },
-    finish: ({ run, code, lines }) => ({ code: run?.verdict?.code ?? code, lines }),
+    sinks: { 'codex-audit.run': createCodexAuditSink() },
+    finish: finishCodexAudit,
   }),
   [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
     sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },
