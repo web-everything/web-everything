@@ -43,26 +43,49 @@ function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () =>
   return { run, calls, lines, releases: () => releases };
 }
 describe('fail-closed wrapper', () => {
-  it.each([
+  // Every JSON failure signal, through every channel the inventory can arrive on, with the shard process exiting 0.
+  // The exit code never carries the failure here, so a red verdict can only come from the JSON evidence itself.
+  const JSON_FAILURE_SIGNALS = [
     ['report.success=false', { success: false }, 'passed', 'passed'],
     ['failed suite', { success: true }, 'failed', 'passed'],
     ['failed assertion', { success: true }, 'passed', 'failed'],
-  ])('%s cannot turn green even when the process exits zero', async (_label, summary, status, assertionStatus) => {
-    const reportText = JSON.stringify({ ...summary, testResults: [
-      { name: 'a', status, assertionResults: [{ status: assertionStatus }] },
-    ] });
-    expect(inventoryVerdict(reportText, ['a'])).toBe('FAIL');
+  ];
+  const EVIDENCE_CHANNELS = {
+    // executeShard's result already carries the streamed inventory.
+    'streamed result': reportText => ({ fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: () => { throw Error('missing'); } },
+      tmpdir: () => '/scratch', execute: async () => ({ exitCode: 0, reportText }) }),
+    // No reportText key: the wrapper reads the per-shard report file instead.
+    'report file': reportText => ({ fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {},
+      readFileSync: p => { if (p === '/scratch/shards/0.initial.json') return reportText; throw Error('missing'); } },
+    tmpdir: () => '/scratch', execute: async () => ({ exitCode: 0 }) }),
+    // A real child prints the JSON on stdout and exits 0; executeShard must stream it into the verdict.
+    'real child stdout': reportText => ({ fs, execute: async options => {
+      const result = await executeShard({ ...options, command: process.execPath,
+        args: ['-e', `console.log('install output'); console.log(${JSON.stringify(reportText)});`] });
+      expect(result).toMatchObject({ exitCode: 0, reportText });
+      return result;
+    } }),
+  };
+  const runOneShard = (deps, lines) => runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs: 10000 },
+    { discover: () => null, env: { PATH: process.env.PATH }, log: line => lines.push(line), ...deps });
+  it.each(Object.keys(EVIDENCE_CHANNELS))('%s: passing JSON with exit 0 is GREEN (control for the failure cases)', async channel => {
+    const reportText = JSON.stringify({ success: true, testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] });
     const lines = [];
-    const code = await runShards({ argv: ['npx', 'vitest', 'run', 'a'], shards: 1, parallel: 1, budgetMs: 1000 }, {
-      discover: () => null, env: {}, log: line => lines.push(line),
-      tmpdir: () => '/scratch',
-      fs: { mkdtempSync: () => '/scratch/shards', rmSync: () => {}, readFileSync: () => { throw Error('missing'); } },
-      execute: async () => ({ exitCode: 0, reportText }),
-    });
-    expect(code).toBe(1);
-    expect(lines.join('\n')).toContain('FAIL');
-    expect(lines.join('\n')).not.toContain('GREEN');
+    expect(await runOneShard(EVIDENCE_CHANNELS[channel](reportText), lines)).toBe(0);
+    expect(lines.join('')).toContain('verify-shard 1/1: PASS');
   });
+  it.each(Object.keys(EVIDENCE_CHANNELS).flatMap(channel => JSON_FAILURE_SIGNALS.map(signal => [channel, ...signal])))(
+    '%s: %s cannot turn green even when the process exits zero', async (channel, _label, summary, status, assertionStatus) => {
+      const reportText = JSON.stringify({ ...summary, testResults: [
+        { name: 'a', status, assertionResults: [{ status: assertionStatus }] },
+      ] });
+      expect(inventoryVerdict(reportText, ['a'])).toBe('FAIL');
+      const lines = [];
+      expect(await runOneShard(EVIDENCE_CHANNELS[channel](reportText), lines)).toBe(1);
+      // FAIL from the JSON evidence, not INVENTORY-INCOMPLETE from a lost or unreadable report.
+      expect(lines.join('')).toMatch(/verify-shard 1\/1: FAIL /);
+      expect(lines.join('')).not.toContain('GREEN');
+    });
   it('all pass exits zero and prints GREEN plus a line per shard', async () => {
     const f = fixture(); expect(await f.run()).toBe(0);
     expect(f.lines.join('')).toContain('GREEN (all 3 shards, 3 files executed and passed)');
