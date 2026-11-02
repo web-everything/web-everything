@@ -1,6 +1,6 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason } from '../drain-queue-safety.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -8,6 +8,213 @@ import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escal
 
 const head = '5300b9ec377a' + '0'.repeat(28);
 const prior = 'a'.repeat(40);
+
+describe('merge-queue same-head failure admission', () => {
+  const pr = 6215, repo = 'fixture/drain';
+  const removed = (reason = 'failed_checks', testedHead = head) => ({
+    __typename: 'RemovedFromMergeQueueEvent', reason, createdAt: '2026-11-01T12:00:00Z',
+    // beforeCommit is the merge-group commit: only its SECOND parent binds the tested PR head.
+    beforeCommit: { oid: 'b'.repeat(40), parents: { nodes: [{ oid: prior }, { oid: testedHead }] } },
+  });
+  const added = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T13:00:00Z' };
+  const pushed = (after = head, createdAt = '2026-11-01T13:00:00Z') => ({
+    __typename: 'HeadRefForcePushedEvent', createdAt, beforeCommit: { oid: prior }, afterCommit: { oid: after },
+  });
+  const timeline = (...nodes) => ({ nodes, hasPreviousPage: false });
+  const decide = evidence => decideMqSameHead({ pr, head, timeline: evidence });
+  const released = { hold: false, line: null };
+  const expectHold = (decision, detail) => {
+    expect(decision.hold).toBe(true);
+    expect(decision.line).toEqual(expect.stringContaining(`mq-same-head-failed: #${pr} head ${head} — `));
+    expect(decision.line.split(' — ')[1]?.trim().length).toBeGreaterThan(0);
+    expect(decision.line).toMatch(detail);
+  };
+  const response = evidence => JSON.stringify({ data: { repository: { pullRequest: {
+    timelineItems: { nodes: evidence.nodes, pageInfo: { hasPreviousPage: evidence.hasPreviousPage } },
+  } } } });
+  const queueResponse = (inQueue = false, queueHead = head) => JSON.stringify({ data: { repository: {
+    pullRequest: { isInMergeQueue: inQueue, headRefOid: queueHead },
+  } } });
+  const withQueue = read => vi.fn((command, args) => args.some(arg => arg.includes('isInMergeQueue'))
+    ? queueResponse() : read(command, args));
+
+  it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
+    expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
+  });
+  it.each(['branch_protection_failure', 'invalid_merge_commit', 'merge_conflict'])('removal for %s holds the tested head', reason => {
+    expect(decide(timeline(removed(reason)))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — ${reason}` });
+  });
+  it.each(['manual', 'merged', ' MANUAL ', ' MERGED '])('removed with release reason %s permits re-enqueue regardless of binding', reason => {
+    for (const beforeCommit of [removed(reason).beforeCommit, null, { parents: { nodes: [] } }]) {
+      expect(decide(timeline({ ...removed(reason), beforeCommit }))).toEqual(released);
+    }
+  });
+  it('removed with merge-group parent pointing at an OLDER head releases the new head', () => {
+    const event = removed('failed_checks', prior);
+    event.beforeCommit.oid = head;
+    event.beforeCommit.parents.nodes[0].oid = head;
+    expect(decide(timeline(event))).toEqual(released);
+  });
+  it('an earlier failed removal at an old head releases a current head with no removal', () => {
+    expect(decide(timeline(removed('failed_checks', prior), added))).toEqual(released);
+  });
+  it('a PR with no removals releases', () => {
+    expect(decide(timeline())).toEqual(released);
+    expect(decide(timeline(added))).toEqual(released);
+  });
+  it('a later addition or manual removal cannot erase any failure at the same head', () => {
+    expectHold(decide(timeline(removed(), added, removed('manual'))), /failed_checks/);
+  });
+  it.each(['future_failure', undefined, null, ''])('unknown or missing reason %s holds the same head', reason => {
+    expectHold(decide(timeline({ ...removed(), reason })), /.+/);
+  });
+  it('compares reasons case-insensitively and trims whitespace', () => {
+    expect(decide(timeline(removed(' FaIlEd_ChEcKs ')))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
+  });
+  it.each([[head.toUpperCase(), head], [head, head.toUpperCase()], [head.toUpperCase(), head.toUpperCase()]])(
+    'compares tested OID %s and current OID %s case-insensitively', (testedHead, currentHead) => {
+      expect(decideMqSameHead({ pr, head: currentHead, timeline: timeline(removed('failed_checks', testedHead)) }).hold).toBe(true);
+    });
+  // Prevention owed: add recorded GitHub merge_conflict and branch_protection_failure payloads here.
+  // These null-beforeCommit fixtures are synthetic; this repair runs without live GitHub access.
+  it('releases old unbound failures after a server-timestamped force push to the current head', () => {
+    for (const reason of ['merge_conflict', 'branch_protection_failure', 'invalid_merge_commit']) {
+      expect(decide(timeline({ ...removed(reason), beforeCommit: null }, pushed()))).toEqual(released);
+    }
+  });
+  it('property: any number of older unbound failures cannot hold a proven new head forever', () => {
+    // Deterministically vary heads, event counts, timestamps and payload order.
+    for (let seed = 1; seed <= 64; seed++) {
+      const currentHead = seed.toString(16).padStart(40, '0');
+      const events = Array.from({ length: seed % 20 + 1 }, (_, i) => ({
+        ...removed(i % 2 ? 'merge_conflict' : 'branch_protection_failure'), beforeCommit: null,
+        createdAt: new Date(Date.UTC(2026, 10, 1, 0, 0, i)).toISOString(),
+      }));
+      events.push(pushed(currentHead));
+      if (seed % 2) events.reverse();
+      expect(decideMqSameHead({ pr, head: currentHead, timeline: timeline(...events) })).toEqual(released);
+    }
+  });
+  it.each([
+    ['other head', pushed(prior)],
+    ['same timestamp', pushed(head, '2026-11-01T12:00:00Z')],
+    ['earlier push', pushed(head, '2026-11-01T11:00:00Z')],
+    ['invalid push time', pushed(head, 'invalid')],
+    ['missing prior binding', { ...pushed(), beforeCommit: null }],
+    ['unchanged head', { ...pushed(), beforeCommit: { oid: head } }],
+  ])('an unbound failure still holds with insufficient head-change proof: %s', (_label, event) => {
+    expectHold(decide(timeline({ ...removed(), beforeCommit: null }, event)), /no commit binding/i);
+  });
+  it.each([undefined, 'invalid', '2026-11-01T14:00:00Z'])('an unbound failure with missing/invalid/newer time %s still holds', createdAt => {
+    expectHold(decide(timeline({ ...removed(), beforeCommit: null, createdAt }, pushed())), /no commit binding/i);
+  });
+  it('a head-change event cannot erase a bound failure on this head or a later unbound failure', () => {
+    expectHold(decide(timeline(pushed(), removed())), /failed_checks/);
+    expectHold(decide(timeline({ ...removed(), beforeCommit: null }, pushed(),
+      { ...removed(), beforeCommit: null, createdAt: '2026-11-01T14:00:00Z' })), /no commit binding/i);
+    expect(decide(timeline(pushed(head.toUpperCase()), { ...removed(), beforeCommit: null }))).toEqual(released);
+  });
+  it('restoring a previously failed head does not erase its unbound failure', () => {
+    const away = { ...pushed(prior, '2026-11-01T12:30:00Z'), beforeCommit: { oid: head } };
+    const failure = { ...removed(), beforeCommit: null };
+    // An already-observed head at failure time is not a new head when it is restored later.
+    expectHold(decide(timeline(pushed(head, '2026-11-01T11:00:00Z'), failure, away, pushed())), /no commit binding/i);
+    // Nor can the first observation being a push AWAY from this head prove it was new later.
+    expectHold(decide(timeline(failure, away, pushed())), /no commit binding/i);
+    // A failure between the first introduction and a later restoration also stays held.
+    expectHold(decide(timeline(pushed(head, '2026-11-01T11:00:00Z'), failure, pushed())), /no commit binding/i);
+  });
+  it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
+    expectHold(decide(evidence), /unreadable/i);
+  });
+  it('hasPreviousPage holds at the 100-event cap and exposes the incomplete timeline', () => {
+    expectHold(decide({ nodes: Array.from({ length: 100 }, () => added), hasPreviousPage: true }), /cap|truncat|incomplete|previous/i);
+  });
+  it.each([null, { parents: { nodes: [] } }, { parents: { nodes: [{ oid: head }] } }])('an unbound failure removal holds with no commit binding (%j)', beforeCommit => {
+    expectHold(decide(timeline({ ...removed(), beforeCommit })), /no commit binding/i);
+  });
+  it.each(['', undefined, null, 'invalid', 'g'.repeat(40), `${head}\n`])('an empty, missing or malformed head %s holds', missingHead => {
+    const result = decideMqSameHead({ pr, head: missingHead, timeline: timeline() });
+    expect(result.hold).toBe(true);
+    expect(result.line).toMatch(/head/i);
+  });
+
+  it('readMqTimeline issues exactly one gh graphql call with last:100 and reads the second-parent binding and cap', () => {
+    const evidence = { nodes: [removed(), added, pushed()], hasPreviousPage: true };
+    const exec = vi.fn(() => response(evidence));
+    expect(readMqTimeline({ repo, pr, exec })).toEqual(evidence);
+    expect(exec).toHaveBeenCalledTimes(1);
+    const [command, args, opts] = exec.mock.calls[0];
+    expect(command).toBe('gh');
+    expect(args.slice(0, 2)).toEqual(['api', 'graphql']);
+    expect(args).not.toContain('--paginate');
+    const query = args.find(arg => arg.startsWith('query='));
+    expect(query).toBeDefined();
+    const compact = query.replace(/\s+/g, '');
+    expect(compact).toMatch(/timelineItems\(last:100,itemTypes:\[REMOVED_FROM_MERGE_QUEUE_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,HEAD_REF_FORCE_PUSHED_EVENT\]\)/);
+    expect(compact).toContain('pageInfo{hasPreviousPage}');
+    expect(compact).toMatch(/\.\.\.onRemovedFromMergeQueueEvent\{/);
+    expect(compact).toContain('beforeCommit{oidparents(first:2){nodes{oid}}}');
+    expect(compact).toContain('reason');
+    expect(compact).toContain('createdAt');
+    expect(compact).toContain('...onHeadRefForcePushedEvent{createdAtbeforeCommit{oid}afterCommit{oid}}');
+    // Arguments may use GraphQL variables or literals, but must identify this repo and PR.
+    expect(args.join(' ')).toContain('fixture');
+    expect(args.join(' ')).toContain('drain');
+    expect(args.join(' ')).toContain('6215');
+    expect(opts.encoding).toBe('utf8');
+    expect(opts.timeout).toBeGreaterThan(0);
+  });
+  it.each([
+    ['exec throws', () => { throw new Error('offline'); }],
+    ['bad JSON', () => '{'],
+    ['GraphQL errors with partial data', () => JSON.stringify({ ...JSON.parse(response(timeline())), errors: [{ message: 'denied' }] })],
+    ['missing pull request', () => JSON.stringify({ data: { repository: { pullRequest: null } } })],
+    ['malformed timeline nodes', () => response({ nodes: null, hasPreviousPage: false })],
+  ])('unreadable timeline (%s) returns an error and the guard holds and logs it', (_label, read) => {
+    const exec = withQueue(read);
+    expect(readMqTimeline({ repo, pr, exec })).toEqual({ error: expect.any(String) });
+    expect(exec).toHaveBeenCalledTimes(1);
+    exec.mockClear();
+    const log = vi.fn();
+    const result = mqSameHeadGuard({ repo, pr, head, exec, log });
+    expectHold(result, /unreadable/i);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls).toEqual([[result.line]]);
+  });
+  it('mqSameHeadGuard composes the read and decision and logs the exact hold line', () => {
+    const exec = withQueue(() => response(timeline(removed()))), log = vi.fn();
+    const result = mqSameHeadGuard({ repo, pr, head, exec, log });
+    expect(result).toEqual(decide(timeline(removed())));
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(log.mock.calls).toEqual([[result.line]]);
+  });
+  it('mqSameHeadGuard releases manual removal without logging a hold', () => {
+    const exec = withQueue(() => response(timeline(removed('manual')))), log = vi.fn();
+    expect(mqSameHeadGuard({ repo, pr, head, exec, log })).toEqual(released);
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(log).not.toHaveBeenCalled();
+  });
+  it('a manual same-head retry already in the live queue bypasses historical failures', () => {
+    const exec = vi.fn((_command, args) => args.some(arg => arg.includes('isInMergeQueue'))
+      ? queueResponse(true) : response(timeline(removed()))), log = vi.fn();
+    expect(mqSameHeadGuard({ repo, pr, head, exec, log })).toEqual(released);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][1].join(' ')).toContain('isInMergeQueue');
+    expect(log).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['moved head', () => queueResponse(true, prior)],
+    ['missing head', () => queueResponse(true, null)],
+    ['malformed membership', () => queueResponse(null)],
+    ['failed read', () => { throw new Error('offline'); }],
+  ])('unreadable or mismatched live queue state holds: %s', (_label, read) => {
+    const exec = vi.fn(read), log = vi.fn();
+    expectHold(mqSameHeadGuard({ repo, pr, head, exec, log }), /live.*queue|queue.*state/i);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+});
 const bot = { author: { login: 'web-everything' } };
 const clean = (rev = head, login = 'web-everything', findings = []) => ({ author: { login }, body: renderRedTeamComment({ pr: 5283, rev, findings, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: findings.length ? 'changes' : 'accept' }) });
 const hold = (over = {}) => redTeamEnqueueHold({ scheduled: over.loopPayload !== null && over.loopPayload?.verdict?.verdict !== 'needs-human', loopPayload: { verdict: { verdict: 'accept' } }, labels: ['review:accepted'], comments: [], pr: 5283, head, env: {}, ...over });
