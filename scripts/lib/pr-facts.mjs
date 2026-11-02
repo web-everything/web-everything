@@ -48,7 +48,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled, deriveGhCaller, ghThrottleLockRoot, ghThrottleLogPath, recordGhCallLogEntry } from './gh-throttle.mjs';
 import { PR_EVENTS_DEFAULTS, PR_EVENTS_FLAG_ENV, classifyFeedHealth, resolvePrEventsConfig } from './pr-events.mjs';
-import { checkProjectionKey, foldObservation, projectPrRows, evidenceCovered } from '../conveyor/pr-events-worker/core.mjs';
+import { checkProjectionKey, foldObservation, projectPrRows, evidenceCovered, validateStored } from '../conveyor/pr-events-worker/core.mjs';
 
 // Older mirrors could bless reopened rows without any loss annotation. Force a fresh baseline.
 export const PR_FACTS_VERSION = 2;
@@ -120,19 +120,10 @@ function validateServedRows(rows, repo) {
   const r = repoKey(repo);
   if (!Array.isArray(rows)) throw new Error('malformed /prs rows');
   for (const row of rows) {
-    if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.repo !== 'string' || !isSlug(row.repo))
-      throw new Error('malformed /prs row');
+    if (!validateStored('servedPr', row)) throw new Error('malformed /prs row');
     if (repoKey(row.repo) !== r) continue;
-    if (!Number.isInteger(row.number)) throw new Error('malformed /prs row');
-    for (const [field, type] of [['checks', 'check_run'], ['suites', 'check_suite']]) {
-      const checks = row[field] === undefined ? [] : row[field];
-      if (!Array.isArray(checks)) throw new Error('malformed /prs checks');
-      for (const c of checks) {
-        if (!c || typeof c !== 'object' || Array.isArray(c) || typeof c.repo !== 'string' || !isSlug(c.repo) ||
-            repoKey(c.repo) !== r || c.type !== type ||
-            (c.prs != null && (!Array.isArray(c.prs) || !c.prs.every(Number.isInteger)))) throw new Error('malformed /prs check');
-      }
-    }
+    for (const c of [...(row.checks || []), ...(row.suites || [])])
+      if (repoKey(c.repo) !== r) throw new Error('malformed /prs check');
   }
 }
 
@@ -159,12 +150,19 @@ export function seedMirror({ repo, body, nowMs }) {
       buckets.checks[k] = { ...c, repo: r, prs: [...new Set([...(prev?.prs || []), ...(c.prs || []), row.number])] };
     }
   }
+  const lostEvidence = body.prs.some((row) => repoKey(row.repo) === r && row.state === 'open' && !evidenceCovered(row));
   const bootstrap = (body.coverage?.bootstrap || []).find((x) => repoKey(x?.repo) === r) || null;
+  if (bootstrap && !validateStored('bootstrap', bootstrap)) throw new Error('malformed /prs bootstrap');
+  const { bootstrap: _boots, ...coverage } = body.coverage || {};
+  if (Object.keys(coverage).length && !validateStored('coverage', coverage)) throw new Error('malformed /prs coverage');
   return {
     v: PR_FACTS_VERSION, repo: r, buckets, cursor: body.stateCursor ?? body.head ?? null,
     fetchedAtMs: nowMs, lastOkAt: nowMs, lastFailAt: null, lastError: null,
     lastDeliveryAt: body.lastDeliveryAt ?? null, lastEventAt: body.lastEventAt ?? null,
-    bootstrap: bootstrap ? { status: bootstrap.status, baseCursor: bootstrap.baseCursor, importId: bootstrap.importId } : null,
+    bootstrap: bootstrap ? { status: bootstrap.status, baseCursor: bootstrap.baseCursor,
+      ...(bootstrap.importId === undefined ? {} : { importId: bootstrap.importId }) } : null,
+    ...((body.repos?.[r]?.coverage === false && (!lostEvidence || body.truncated?.malformed > 0)) || body.truncated?.unattributed > 0 || body.truncated?.repos?.[r] > 0
+      ? { untrusted: true } : {}),
     fullPulls: 1,
   };
 }
@@ -173,10 +171,13 @@ export function seedMirror({ repo, body, nowMs }) {
 export function applyDelta(mirror, events) {
   const next = structuredClone(mirror);
   const storage = bucketStorage(next.buckets);
+  projectPrRows(storage);
   for (const e of events || []) {
     if (!e || repoKey(e.repo) !== next.repo || !Number.isInteger(e.seq)) continue;
+    if (['check_run', 'check_suite'].includes(e.type) && !validateStored('checks', e)) throw new Error('malformed /events check');
     foldObservation(storage, e);
   }
+  projectPrRows(storage);
   return next;
 }
 
@@ -224,9 +225,11 @@ export function mirrorHealth(mirror, { nowMs, staleAfterMs = PR_FACTS_DEFAULTS.s
  */
 export function judgeMirror(mirror, { nowMs, ttlMs = PR_FACTS_DEFAULTS.ttlMs, staleAfterMs = PR_FACTS_DEFAULTS.staleAfterMs }) {
   if (!mirror || mirror.v !== PR_FACTS_VERSION) return { ok: false, reason: 'no-mirror' };
+  if (mirror.untrusted) return { ok: false, reason: 'incomplete-coverage' };
   const health = mirrorHealth(mirror, { nowMs, staleAfterMs });
   if (health !== 'healthy') return { ok: false, reason: `feed-${health}` };
   if (!mirror.bootstrap) return { ok: false, reason: 'no-bootstrap' };
+  if (!validateStored('bootstrap', { ...mirror.bootstrap, repo: mirror.repo })) return { ok: false, reason: 'malformed-bootstrap' };
   if (mirror.bootstrap.status !== 'complete') return { ok: false, reason: `bootstrap-${mirror.bootstrap.status}` };
   const age = nowMs - mirror.fetchedAtMs;
   if (!(age >= 0 && age < ttlMs)) return { ok: false, reason: 'ttl-expired' };
@@ -242,8 +245,10 @@ export function mirrorRows(mirror) {
 export function lookupInMirror(mirror, { number, nowMs, ttlMs, staleAfterMs }) {
   const verdict = judgeMirror(mirror, { nowMs, ttlMs, staleAfterMs });
   if (!verdict.ok) return { facts: null, reason: verdict.reason };
-  const row = mirrorRows(mirror).find((r) => r.number === Number(number));
-  if (!row) return { facts: null, reason: 'no-row' };
+  let row;
+  try { row = mirrorRows(mirror).find((r) => r.number === Number(number)); }
+  catch { return { facts: null, reason: 'malformed-row' }; }
+  if (!row || repoKey(row.repo) !== repoKey(mirror.repo)) return { facts: null, reason: 'no-row' };
   if (!evidenceCovered(row)) return { facts: null, reason: 'evidence-lost' };
   if (!row.sha || !row.state || row.draft == null || !Array.isArray(row.labels)) return { facts: null, reason: 'incomplete-row' };
   return { facts: { ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor } };
@@ -432,7 +437,8 @@ export async function readPrFacts(opts = {}) {
 export async function readRepoFacts({ repo, caller = null, env = process.env, now = () => Date.now(), ...o } = {}) {
   const { mirror, settings } = await loadMirror({ repo, env, now, ...o });
   if (!mirror || !judgeMirror(mirror, { nowMs: now(), ...settings }).ok) return null;
-  const rows = mirrorRows(mirror);
+  let rows;
+  try { rows = mirrorRows(mirror); } catch { return null; }
   if (rows.some((row) => row.state === 'open' && !evidenceCovered(row))) return null;
   const prs = rows
     .filter((row) => evidenceCovered(row) && row.sha && row.state && row.draft != null && Array.isArray(row.labels))

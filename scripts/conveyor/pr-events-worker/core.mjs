@@ -204,9 +204,13 @@ function withEvidenceLoss(markers, row) {
 
 /** Fold only received evidence. Field clocks protect concurrent bootstrap imports. */
 export function foldObservation(storage, observed, now = Date.parse(observed.at)) {
+  storage = storedView(storage);
+  if (observed.evidenceLostByPr !== undefined && !dictionary(losses)(observed.evidenceLostByPr)) malformedStored();
   // GitHub spells a repo one way, an operator may type another: the projection identifies a repo case-insensitively.
   const event = { ...observed, repo: String(observed.repo).toLowerCase() };
   const { repo, seq, sha, type } = event;
+  // Raw cursor-log records may lack a projectable repository identity.
+  if (!isRepo(repo)) return {};
   const evidenceLostByPr = {};
   const key = (...parts) => JSON.stringify(parts);
   const put = (bucket, k, value) => storage.putProjection(bucket, k, value);
@@ -296,10 +300,12 @@ export function foldObservation(storage, observed, now = Date.parse(observed.at)
 
 /** Remove expired closed rows and their exclusive evidence; shared SHA/check attachments survive. */
 function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
+  storage = storedView(storage);
   const last = numOrNull(storage.getMeta('lastProjectionPruneAt'));
   if (last != null && now >= last && now - last < PROJECTION_PRUNE_INTERVAL_MS) return;
   storage.setMeta('lastProjectionPruneAt', String(now));
-  let horizon = Number(storage.getMeta('tombstoneHorizonSeq') || 0);
+  let horizon = storage.getMeta('tombstoneHorizonSeq') == null ? 0 : toSeq(storage.getMeta('tombstoneHorizonSeq'));
+  if (horizon == null) malformedStored();
   const remember = (seq) => { if (Number.isSafeInteger(seq) && seq >= 0) horizon = Math.max(horizon, seq); };
   for (const { key, value: t } of storage.listProjection('tombstones', true)) {
     remember(t?.closedSeq);
@@ -307,7 +313,7 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
   }
   const expired = new Map(), deadShas = new Set();
   for (const { key, value: row } of storage.listProjection('prs', true)) {
-    if (!isPrRow(row) || row.state !== 'closed' || (Number.isFinite(row.updatedAt) && row.updatedAt >= now - retentionMs)) continue;
+    if (row.state !== 'closed' || (Number.isFinite(row.updatedAt) && row.updatedAt >= now - retentionMs)) continue;
     if (!expired.has(row.repo)) expired.set(row.repo, new Set());
     expired.get(row.repo).add(row.number);
     if (row.sha) deadShas.add(JSON.stringify([row.repo, row.sha]));
@@ -356,26 +362,119 @@ function pruneProjection(storage, now, retentionMs, tombstoneRetentionMs) {
   }
 }
 
-/** The served per-PR rows (`GET /prs`'s `prs`) of a projection storage. Exported for the reader-side mirror. */
+/** Stored schemas: one trust boundary shared by the Worker and its disk mirrors.
+ * Legacy projections omit fields that were never observed; present fields must always match their schema.
+ * Sequence clocks alone also accept the historical digit-string representation.
+ */
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isRepo = (v) => typeof v === 'string' && /^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(v);
-const isPrRow = (r) => isObject(r) && isRepo(r.repo) && Number.isInteger(r.number);
+const toSeq = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : typeof v === 'string' && /^\d+$/.test(v) && Number.isSafeInteger(Number(v)) ? Number(v) : null);
+const sequence = (v) => toSeq(v) !== null;
+const positive = (v) => Number.isSafeInteger(v) && v > 0;
+const time = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+const string = (v) => typeof v === 'string';
+const nonempty = (v) => string(v) && v.length > 0;
+const boolean = (v) => typeof v === 'boolean';
+const nullable = (rule) => (v) => v === null || rule(v);
+const array = (rule) => (v) => Array.isArray(v) && v.every(rule);
+const dictionary = (rule) => (v) => isObject(v) && Object.values(v).every(rule);
+const shape = (required, fields) => (v) => isObject(v) && required.every((k) => Object.hasOwn(v, k)) &&
+  Object.entries(fields).every(([k, rule]) => !Object.hasOwn(v, k) || rule(v[k]));
+const loss = shape(['kind'], { kind: (v) => Object.hasOwn(EVIDENCE_KINDS, v), id: string });
+const losses = array((v) => loss(v) && Object.keys(v).every((k) => ['kind', 'id'].includes(k)));
+const reviewShape = shape(['sha', 'state', 'action', 'seq'], {
+  sha: nullable(nonempty), state: nullable(nonempty), action: nonempty, seq: sequence,
+});
+const checkShape = shape(['repo', 'prs', 'type'], {
+  repo: isRepo, prs: array(positive), type: (v) => ['check_run', 'check_suite'].includes(v),
+  sha: nullable(nonempty), seq: sequence, name: nullable(string), app: nullable(string), conclusion: nullable(string),
+  id: nullable(string), action: nonempty, at: (v) => string(v) && Number.isFinite(Date.parse(v)),
+});
+const bootShape = shape(['repo', 'status', 'baseCursor'], {
+  repo: isRepo, status: (v) => ['complete', 'truncated', 'failed'].includes(v), baseCursor: sequence,
+  cursor: sequence, importId: (v) => string(v) && /^[\w.-]{1,128}$/.test(v), at: time,
+});
+const prFields = {
+  repo: isRepo, number: (v) => Number.isSafeInteger(v) && v >= 0, sha: nullable(nonempty),
+  draft: nullable(boolean), labels: nullable(array(string)), labelChanges: dictionary(boolean),
+  state: nullable((v) => ['open', 'closed'].includes(v)), merged: nullable(boolean), review: nullable(reviewShape),
+  checks: array((v) => checkShape(v) && v.type === 'check_run'),
+  suites: array((v) => checkShape(v) && v.type === 'check_suite'), seq: sequence,
+  fields: dictionary(sequence), updatedAt: time, evidenceLost: losses,
+};
+const storedSchemas = {
+  prs: shape(['repo', 'number'], prFields),
+  servedPr: shape(['repo', 'number'], prFields),
+  evidenceLost: losses,
+  evidenceLoss: (v) => shape(['repo', 'evidenceLost'], { repo: isRepo, number: positive, sha: nonempty, evidenceLost: losses })(v) &&
+    (Object.hasOwn(v, 'number') !== Object.hasOwn(v, 'sha')),
+  tombstones: shape(['repo', 'number', 'closedSeq', 'prunedAt'], {
+    repo: isRepo, number: positive, closedSeq: sequence, prunedAt: time,
+    state: (v) => v === 'closed', merged: nullable(boolean), evidenceLost: losses,
+  }),
+  shas: array(positive), checks: checkShape,
+  repoEvents: shape(['repo', 'lastEventAt'], { repo: isRepo, lastEventAt: time }),
+  repoImports: shape(['repo', 'listed', 'others'], { repo: isRepo, listed: array(positive), others: array(sequence) }),
+  bootstrap: bootShape,
+  imports: shape(['input', 'result'], {
+    input: (v) => { if (!string(v)) return false; try { validateBootstrap(JSON.parse(v)); return true; } catch { return false; } },
+    result: bootShape,
+  }),
+  sequence,
+  coverage: shape(['partial', 'observedSince', 'retainedReplayBoundary', 'historyComplete'], {
+    partial: boolean, observedSince: sequence, retainedReplayBoundary: nullable(sequence), historyComplete: boolean,
+  }),
+  prunedEvidence: shape(['repo', 'sha'], { repo: isRepo, sha: nonempty }),
+};
+export function validateStored(kind, value) {
+  try { return Object.hasOwn(storedSchemas, kind) && storedSchemas[kind](value); } catch { return false; }
+}
 const comparePrKey = (a, b) => a.repo < b.repo ? -1 : a.repo > b.repo ? 1 : a.number - b.number;
 
+// Cache a single validation pass. Attribution follows the value for rows and the key for SHA maps.
+// Every invalid shape reaches projectPrRows' existing callback exactly once.
+const STORED_VIEW = Symbol('validated stored projections');
+const malformedStored = () => { throw new Error('malformed stored projection'); };
+function storedView(storage, malformed = malformedStored) {
+  if (storage[STORED_VIEW]) return storage;
+  const cache = new Map();
+  return { ...storage, [STORED_VIEW]: true,
+    getProjection(bucket, key) {
+      const value = storage.getProjection(bucket, key);
+      if (value == null && !storage.listProjection(bucket, true).some((entry) => entry.key === key)) return null;
+      if (validateStored(bucket, value)) return value;
+      malformed(value);
+      return null;
+    },
+    putProjection(bucket, key, value) { cache.delete(bucket); return storage.putProjection(bucket, key, value); },
+    deleteProjection(bucket, key) { cache.delete(bucket); return storage.deleteProjection(bucket, key); },
+    listProjection(bucket, withKeys = false) {
+      if (!cache.has(bucket)) cache.set(bucket, storage.listProjection(bucket, true).filter(({ key, value }) => {
+        let identity;
+        if (bucket === 'shas') {
+          try { identity = JSON.parse(key); } catch { /* Invalid identity below. */ }
+        }
+        const validKey = bucket !== 'shas' || (Array.isArray(identity) && identity.length === 2 && isRepo(identity[0]) && nonempty(identity[1]));
+        if (validKey && validateStored(bucket, value)) return true;
+        malformed(bucket === 'shas' ? { repo: identity?.[0] } : value);
+        return false;
+      }));
+      return cache.get(bucket).map((entry) => withKeys ? entry : entry.value);
+  } };
+}
+
 export function projectPrRows(storage, malformed = () => { throw new Error('malformed PR projection'); }) {
+  storage = storedView(storage, malformed);
+  // Validate even unattached evidence and historical metadata before any projection is trusted.
+  for (const bucket of ['evidenceLoss', 'tombstones', 'shas', 'checks', 'prs', 'repoEvents', 'repoImports', 'bootstrap', 'imports', 'prunedEvidence'])
+    storage.listProjection(bucket);
   const markers = evidenceLossIndex(storage);
   // One pass over checks, one SHA→PRs lookup per distinct (repo, sha): bounded by distinct SHAs, never PRs × checks.
   const byPr = new Map();
   const shaPrs = new Map();
   // Walking stored keys distinguishes an absent (unmatched check) map from an explicitly corrupt null map.
   for (const { key, value: numbers } of storage.listProjection('shas', true)) {
-    let identity;
-    try { identity = JSON.parse(key); } catch { /* Count the unreadable map below. */ }
-    if (!Array.isArray(identity) || identity.length !== 2 || !isRepo(identity[0]) || typeof identity[1] !== 'string' ||
-        !Array.isArray(numbers) || !numbers.every(Number.isInteger)) {
-      malformed({ repo: typeof identity?.[0] === 'string' ? identity[0] : undefined });
-      shaPrs.set(key, []);
-    } else shaPrs.set(key, numbers);
+    shaPrs.set(key, numbers);
   }
   const attach = (c, number) => {
     const k = JSON.stringify([c.repo, number]);
@@ -383,16 +482,12 @@ export function projectPrRows(storage, malformed = () => { throw new Error('malf
     byPr.get(k).add(c);
   };
   for (const c of storage.listProjection('checks')) {
-    if (!isObject(c) || !isRepo(c.repo) || (c.prs != null && !Array.isArray(c.prs))) {
-      malformed(c); continue;
-    }
     for (const number of c.prs || []) attach(c, number);
     if (!c.sha) continue;
     const shaKey = JSON.stringify([c.repo, c.sha]);
     for (const number of shaPrs.get(shaKey) || []) attach(c, number);
   }
   return storage.listProjection('prs').flatMap((stored) => {
-    if (!isPrRow(stored)) { malformed(stored); return []; }
     const { fields, ...row } = withEvidenceLoss(markers, stored);
     const matches = [...(byPr.get(JSON.stringify([row.repo, row.number])) || [])];
     return [{ ...row, seq: matches.reduce((seq, c) => Math.max(seq, c.seq || 0), row.seq || 0),
@@ -427,12 +522,19 @@ export function validateBootstrap(input) {
 export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS,
   prsBudgetBytes = PRS_RESPONSE_BUDGET_BYTES, prRetentionMs = DEFAULT_PR_RETENTION_MS,
   tombstoneRetentionMs = DEFAULT_TOMBSTONE_RETENTION_MS } = {}) {
-  const head = () => Number(storage.getMeta('head') || 0);
+  const head = () => {
+    const raw = storage.getMeta('head');
+    return raw == null ? 0 : toSeq(raw);
+  };
   storage.transaction(() => {
     for (const { key, value: legacy } of storage.listProjection('prunedEvidence', true)) {
-      const [, , type] = JSON.parse(key);
+      if (!validateStored('prunedEvidence', legacy)) continue;
+      let identity;
+      try { identity = JSON.parse(key); } catch { continue; }
+      if (!Array.isArray(identity) || !['check_run', 'check_suite'].includes(identity[2])) continue;
+      const [, , type] = identity;
       const markerKey = JSON.stringify([legacy.repo, legacy.sha]);
-      const previous = storage.getProjection('evidenceLoss', markerKey);
+      const previous = storedView(storage).getProjection('evidenceLoss', markerKey);
       storage.putProjection('evidenceLoss', markerKey, { repo: legacy.repo, sha: legacy.sha,
         evidenceLost: mergeLoss(previous?.evidenceLost || [], [{ kind: type === 'check_suite' ? 'suites' : 'checks', id: key }]) });
       storage.deleteProjection('prunedEvidence', key);
@@ -450,6 +552,7 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     append(record, now = Date.now()) { return storage.transaction(() => {
       storage.setMeta('lastDeliveryAt', String(now));
       if (record.id && storage.hasDelivery(record.id)) return { seq: null, duplicate: true };
+      if (head() == null) malformedStored();
       const seq = head() + 1;
       const stored = { ...record, seq };
       storage.setMeta('head', String(seq));
@@ -465,10 +568,11 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
     }); },
     bootstrap(raw, now = Date.now()) { return storage.transaction(() => {
       const input = validateBootstrap(raw);
-      const horizon = Number(storage.getMeta('tombstoneHorizonSeq') || 0);
-      if (!Number.isSafeInteger(horizon) || horizon < 0 || input.baseCursor < horizon) throw new Error('stale bootstrap');
+      const horizon = storage.getMeta('tombstoneHorizonSeq') == null ? 0 : toSeq(storage.getMeta('tombstoneHorizonSeq'));
+      if (horizon == null || input.baseCursor < horizon) throw new Error('stale bootstrap');
       const importKey = JSON.stringify([input.repo, input.importId]);
-      const previous = storage.getProjection('imports', importKey);
+      const view = storedView(storage);
+      const previous = view.getProjection('imports', importKey);
       if (previous) {
         if (previous.input !== JSON.stringify(input)) throw new Error('import ID conflict');
         return { ...previous.result, duplicate: true };
@@ -481,19 +585,18 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         type: 'bootstrap', action: 'seed', baseCursor: input.baseCursor, seq: input.baseCursor }, now);
       const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
       // Import history for the NEW per-repo coverage only (fail closed); it changes no seeding behaviour.
-      const seen = storage.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
-      const priorLatest = storage.getProjection('bootstrap', input.repo);
+      const seen = view.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
+      const priorLatest = view.getProjection('bootstrap', input.repo);
       storage.putProjection('repoImports', input.repo, { repo: input.repo, listed: input.prs.map((p) => p.number),
         others: priorLatest ? [...seen.others, priorLatest.baseCursor] : seen.others });
       storage.putProjection('bootstrap', input.repo, result);
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
       return { ...result, duplicate: false };
     }); },
-    readPrs(cursor, limit, now = Date.now(), { prsCursor = null, prsLimit = DEFAULT_PAGE_LIMIT, prsAfter = null } = {}) { return storage.transaction(() => {
+    readPrs(cursor, limit, now = Date.now(), { prsCursor = null, prsLimit = DEFAULT_PAGE_LIMIT, prsAfter = null, rejectMalformedCursor = false } = {}) { return storage.transaction(() => {
       const envelope = log.read(cursor, limit);
       const truncated = { rows: 0, repos: {}, malformed: 0, unattributed: 0 }, incomplete = new Set();
       // One canonical integer form: a safe integer or its canonical digit string; anything else is rejected, never coerced to a tie-breaker.
-      const toSeq = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : typeof v === 'string' && /^\d+$/.test(v) && Number.isSafeInteger(Number(v)) ? Number(v) : null);
       const after = toSeq(prsCursor);
       let key = null;
       if (prsAfter != null) {
@@ -502,11 +605,21 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
           throw new RangeError('invalid PR row cursor');
       }
       const pageSize = Math.max(1, Math.min(MAX_PAGE_LIMIT, Math.floor(Number(prsLimit) || DEFAULT_PAGE_LIMIT)));
-      const projected = projectPrRows(storage, (row) => {
+      const malformed = (row) => {
         truncated.malformed += 1;
         if (isRepo(row?.repo)) incomplete.add(row.repo.toLowerCase());
         else truncated.unattributed += 1;
-      }).map((r) => {
+        if (rejectMalformedCursor && isObject(row) && Object.hasOwn(row, 'seq') && !validateStored('sequence', row.seq))
+          throw new RangeError('invalid PR row cursor');
+      };
+      if (enc.encode(JSON.stringify(storage.listProjection('bootstrap'))).length > prsBudgetBytes)
+        throw new RangeError(PRS_ENVELOPE_OVERFLOW);
+      const view = storedView(storage, malformed);
+      for (const name of ['head', 'tombstoneHorizonSeq']) {
+        const value = storage.getMeta(name);
+        if (value != null && !validateStored('sequence', value)) malformed(null);
+      }
+      const projected = projectPrRows(view, malformed).map((r) => {
         const seq = toSeq(r.seq);
         if (seq == null) throw new RangeError('invalid PR row cursor');
         return seq === r.seq ? r : { ...r, seq };
@@ -520,10 +633,10 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       const rawCoverage = storage.getMeta('coverage');
       if (rawCoverage != null) {
         try { coverage = JSON.parse(rawCoverage); } catch { /* Counted below. */ }
-        if (!isObject(coverage)) { badCoverage = true; truncated.malformed += 1; }
+        if (!validateStored('coverage', coverage)) { badCoverage = true; malformed(null); coverage = undefined; }
       }
-      const response = { ...envelope, prs: [], stateCursor: envelope.head, repos: repoFreshness(storage, envelope.head, now),
-        coverage: { ...(isObject(coverage) ? coverage : {}), bootstrap: storage.listProjection('bootstrap') }, truncated,
+      const response = { ...envelope, prs: [], stateCursor: envelope.head, repos: repoFreshness(view, envelope.head, now),
+        coverage: { ...(isObject(coverage) ? coverage : {}), bootstrap: view.listProjection('bootstrap') }, truncated,
         prsCursor: rows.at(-1)?.seq ?? after ?? 0, prsMore: eligible.length > rows.length, prsAfter: null };
       const pagePosition = (kept) => {
         response.prsCursor = kept.at(-1)?.seq ?? after ?? 0;
@@ -601,10 +714,10 @@ function repoFreshness(storage, head, now) {
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
   const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i]));
   const markers = evidenceLossIndex(storage);
-  const openRows = storage.listProjection('prs').filter((r) => isPrRow(r) && r.state === 'open').map((r) => withEvidenceLoss(markers, r));
+  const openRows = storage.listProjection('prs').filter((r) => r.state === 'open').map((r) => withEvidenceLoss(markers, r));
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
   const out = {};
-  for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
+  for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys(), ...openRows.map((r) => r.repo)])].sort()) {
     const b = boots.get(repo);
     const bootstrapAt = b ? clamp(b.at) : null;
     const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
@@ -707,7 +820,7 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
       const rowCursor = url.searchParams.get('prsCursor');
       const prsCursor = rowCursor != null && /^\d+$/.test(rowCursor) ? Number(rowCursor) : null;
       const rowPage = { prsCursor, prsLimit: Number(url.searchParams.get('prsLimit')) || DEFAULT_PAGE_LIMIT,
-        prsAfter: url.searchParams.get('prsAfter') };
+        prsAfter: url.searchParams.get('prsAfter'), rejectMalformedCursor: true };
       return json(200, { ...(await (url.pathname === '/prs' ? log.readPrs(cursor, limit, timestamp, rowPage) : log.read(cursor, limit))), now: timestamp });
     } catch (error) {
       // Match the message because Durable Object RPC preserves standard errors, not custom properties.
