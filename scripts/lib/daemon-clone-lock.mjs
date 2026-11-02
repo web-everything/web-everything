@@ -168,7 +168,8 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
     if (rec.owner === owner) continue;
     // Bounded: the override lives only inside one writer wait (capped by waitMs); the starved reader's claim is
     // kept, so the writer's NEXT attempt (and its start check) yields to it again. A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
-    if (startedBeforeMs !== null && !(isoMs(rec.firstRefusedAt) < startedBeforeMs)) continue;
+    // Fail closed: a record with a missing/invalid timestamp is treated as older, so the writer still yields.
+    if (startedBeforeMs !== null && Number.isFinite(isoMs(rec.firstRefusedAt)) && !(isoMs(rec.firstRefusedAt) < startedBeforeMs)) continue;
     if (rec.count >= after) return rec;
   }
   return null;

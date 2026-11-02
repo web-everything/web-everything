@@ -7,11 +7,11 @@
  *   reader and writer priority never both back off (the older claim wins); the #4039 reader fairness still holds.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock,
+  cloneLockDirs, acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock,
   resolveWriterPriorityMaxSkips, DEFAULT_WRITER_PRIORITY_MAX_SKIPS,
   resolveWriterPriorityAfter, DEFAULT_WRITER_PRIORITY_AFTER, resolveWriterClaimTtlMs, DEFAULT_WRITER_CLAIM_TTL_MS,
   resolveWriterWaitPriorityMs, DEFAULT_WRITER_WAIT_PRIORITY_MS,
@@ -372,6 +372,31 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     expect(acquireRead(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'R', nowMs: 0 }).ok).toBe(true);
     const w = await acquireWrite(clone, { lockRoot, probe: alive, leaseMinutes: LEASE, owner: 'W', waitMs: 0, now: () => 0, sleep: async () => {} });
     expect(w.reason).toBe('tick-in-progress');
+  });
+
+  it('fails closed: a starved record with an invalid timestamp still makes an override-enabled writer yield', async () => {
+    const lockRoot = mkTmp('dcww-root-');
+    const clone = mkTmp('dcww-clone-');
+    const common = { lockRoot, probe: alive, leaseMinutes: LEASE, writerClaimTtlMs: TTL, readerPriorityAfter: 3 };
+    let t = 0;
+    expect(acquireRead(clone, { ...common, owner: 'R', readerKey: 'R', nowMs: t }).ok).toBe(true);
+    const p = acquireWrite(clone, {
+      ...common, owner: 'W', waitMs: 60_000, pollMs: 1000, now: () => t, writerWaitPriorityMs: 1000,
+      sleep: async (ms) => {
+        t += ms;
+        if (t === 5000) {
+          for (let i = 0; i < 3; i += 1) acquireRead(clone, { ...common, owner: 'S', readerKey: 'S', nowMs: t });
+          const dir = cloneLockDirs(clone, lockRoot).starvedRoot;
+          for (const f of readdirSync(dir).filter((n) => n.endsWith('.json'))) {
+            const rec = JSON.parse(readFileSync(`${dir}/${f}`, 'utf8'));
+            delete rec.firstRefusedAt;
+            writeFileSync(`${dir}/${f}`, JSON.stringify(rec));
+          }
+        }
+      },
+    });
+    const w = await p;
+    expect(w.reason).toBe('reader-priority');
   });
 
   it('an infinite wait is not honoured: it falls back to the bounded default', async () => {
