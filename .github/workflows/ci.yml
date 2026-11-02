@@ -50,6 +50,9 @@ on:
   # pull_request) and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
   merge_group:
   workflow_dispatch:
+  # Nightly full-CI backstop for the queue-tested push skip.
+  schedule:
+    - cron: '17 6 * * *'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -64,8 +67,11 @@ jobs:
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
   # independent `standards` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
   # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
-  # light ONLY for a `pull_request` whose every changed path is under `backlog/`; a push to main, a manual
-  # dispatch, an empty diff, or any other path is the full suite. Fail closed: if this job fails, `light` is
+  # Card-only is light ONLY for a `pull_request` whose every changed path is under `backlog/`.
+  # A push to main whose tree equals a successful merge_group run is also light, using the same mechanism:
+  # required jobs still report as real running jobs. The nightly schedule always runs the full suite.
+  # A manual dispatch, an empty diff, or any other path is the full suite unless queue-tested.
+  # Fail closed: if this job fails, `light` is
   # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
   #
   # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
@@ -73,10 +79,11 @@ jobs:
   # reads `skipped`, which the drain's `reviewCiGate` (scripts/lib/review-ci-gate.mjs) does NOT treat as
   # success. `daemon-soak` already finishes in seconds when no daemon code is touched (a card-only PR never is).
   changes:
+    permissions: {contents: read, actions: read}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      light: ${{ steps.detect.outputs.light }}
+      light: ${{ steps.queue.outputs.queue_tested == 'true' && 'true' || steps.detect.outputs.light }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,6 +108,16 @@ jobs:
             fi
           fi
           node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
+      - name: Was this push tree already queue-tested?
+        id: queue
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: node scripts/ci/skip-queue-tested-push.mjs --event="$EVENT_NAME" --ref="$REF" --sha="$SHA" --repo="$REPO" >> "$GITHUB_OUTPUT"
 
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but
@@ -140,6 +157,10 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
+      - name: Resolve FUI SHA
+        id: fui-sha
+        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -148,7 +169,19 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
+      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
+      - name: Cache FUI tools
+        id: fui-tools
+        if: ${{ steps.fui-sha.outcome == 'success' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            frontierui/node_modules
+            frontierui/dist/tools
+          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
+
       - name: Install + build FUI tools
+        if: ${{ steps.fui-tools.outputs.cache-hit != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
@@ -229,6 +262,11 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
+      - name: Resolve FUI SHA
+        id: fui-sha
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v4
         if: ${{ needs.changes.outputs.light != 'true' }}
         with:
@@ -240,8 +278,19 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
       # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
-      - name: Install + build FUI tools
+      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
+      - name: Cache FUI tools
+        id: fui-tools
         if: ${{ needs.changes.outputs.light != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            frontierui/node_modules
+            frontierui/dist/tools
+          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
+
+      - name: Install + build FUI tools
+        if: ${{ needs.changes.outputs.light != 'true' && steps.fui-tools.outputs.cache-hit != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
@@ -251,6 +300,17 @@ jobs:
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
         run: npm ci
+
+      # Vite keys content-hash its own entries, so reuse across WE commits is safe.
+      - name: Cache Vite transforms
+        id: vite-cache
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: web-everything/node_modules/.vite
+          key: ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-
 
       # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
       # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
@@ -454,6 +514,11 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
+      - name: Resolve FUI SHA
+        id: fui-sha
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v4
         if: ${{ steps.gate.outputs.run == 'true' }}
         with:
@@ -463,8 +528,19 @@ jobs:
             web-everything/package-lock.json
             frontierui/package-lock.json
 
-      - name: Install + build FUI tools
+      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
+      - name: Cache FUI tools
+        id: fui-tools
         if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            frontierui/node_modules
+            frontierui/dist/tools
+          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
+
+      - name: Install + build FUI tools
+        if: ${{ steps.gate.outputs.run == 'true' && steps.fui-tools.outputs.cache-hit != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
@@ -474,6 +550,17 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
         run: npm ci
+
+      # Vite keys content-hash its own entries, so reuse across WE commits is safe.
+      - name: Cache Vite transforms
+        id: vite-cache
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: web-everything/node_modules/.vite
+          key: ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-vite-node22-${{ hashFiles('web-everything/package-lock.json') }}-
 
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -516,7 +603,8 @@ jobs:
   #                 scope job itself failed (fail closed), otherwise red unless EVERY shard succeeded. Full coverage is preserved — sharding only changes WHERE
   #                 each scenario runs, never WHETHER it runs; every scenario still runs on every daemon PR.
   daemon-soak-scope:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -531,10 +619,17 @@ jobs:
       - name: Does this PR touch daemon code?
         id: scope
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          LIGHT: ${{ needs.changes.outputs.light }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$EVENT_NAME" = "push" ] && [ "$LIGHT" = "true" ]; then
+            echo "Push tree already queue-tested — soak not needed."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           # Only the PR's contribution: base may have advanced, and HEAD is checkout's synthetic merge.
           # --no-renames preserves the source path when daemon code is moved outside the scope.
           changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" --)"
@@ -592,7 +687,7 @@ jobs:
   # silently read as satisfied, same guard the `test` aggregator above uses for `test-shard`.
   daemon-soak:
     needs: [daemon-soak-scope, soak-shard]
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -675,6 +770,11 @@ jobs:
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
+      - name: Resolve FUI SHA
+        id: fui-sha
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v4
         if: ${{ needs.changes.outputs.light != 'true' }}
         with:
@@ -686,8 +786,19 @@ jobs:
 
       # FUI first (ratified #1946/#2016 ordering): the `@frontierui/*` alias resolves to sibling source and
       # `build:docs` calls the pinned component-render CLI produced by build:tools.
-      - name: Install + build FUI tools
+      # Exact FUI SHA key, with no restore prefix: a stale FUI is never restored.
+      - name: Cache FUI tools
+        id: fui-tools
         if: ${{ needs.changes.outputs.light != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            frontierui/node_modules
+            frontierui/dist/tools
+          key: ${{ runner.os }}-${{ runner.arch }}-fui-tools-node22-${{ hashFiles('frontierui/package-lock.json') }}-${{ steps.fui-sha.outputs.sha }}
+
+      - name: Install + build FUI tools
+        if: ${{ needs.changes.outputs.light != 'true' && steps.fui-tools.outputs.cache-hit != 'true' }}
         working-directory: frontierui
         run: |
           npm ci
