@@ -486,3 +486,41 @@ it('shape child receives filenames unchanged as JSON stdin with bounded output a
   expect(opts).toMatchObject({ encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
   expect(opts.env.WE_HUMAN_REVIEW_SURFACES).toBe(resolveHumanReviewSurfaces().categories.join(','));
 });
+
+// A verdict row in the ledger at the PR head is real evidence even before its advisory comment is published.
+const ledgerRow = (extra = {}) => ({ type: 'verdict', repo, pr: 1, verdict: 'changes', at, coverage: { headSha: head }, ...extra });
+const ledgerFacts = (rows, labels = [{ name: 'review:pending' }]) => read({
+  gh: () => JSON.stringify([pr({ labels })]), readLedgerRows: () => rows });
+
+it('takes the verdict from a ledger row at the PR head when no advisory comment exists', () => {
+  const facts = ledgerFacts([ledgerRow()]);
+  expect(facts.latestVerdict).toMatchObject({ accepted: false, findings: null, evidence: 'ledger' });
+  expect(facts.evidenceErrors).toEqual([]);
+});
+
+it('takes an accepting ledger verdict at the PR head as accepted', () => {
+  const facts = ledgerFacts([ledgerRow({ verdict: 'accept' })]);
+  expect(facts.latestVerdict).toMatchObject({ accepted: true, evidence: 'ledger' });
+  expect(facts.evidenceErrors).toEqual([]);
+});
+
+it('fails closed when the ledger row head differs from the PR head', () => {
+  const facts = ledgerFacts([ledgerRow({ coverage: { headSha: 'c'.repeat(40) } })], [{ name: 'review:accepted' }]);
+  expect(facts.latestVerdict).toBeNull();
+  expect(facts.evidenceErrors).toContain('accepted label lacks live verdict evidence');
+});
+
+it.each([
+  ['missing verdict', { verdict: undefined }],
+  ['non-string verdict', { verdict: 7 }],
+  ['unparseable time', { at: 'not-a-time' }],
+  ['malformed head', { coverage: { headSha: head.slice(0, 7) } }],
+])('fails closed on a malformed ledger row (%s)', (_name, extra) => {
+  const facts = ledgerFacts([ledgerRow(extra)]);
+  expect(facts.latestVerdict).toBeNull();
+});
+
+it('flags a ledger row that names the PR head but is malformed as unreadable evidence', () => {
+  const facts = ledgerFacts([ledgerRow({ verdict: 7 })]);
+  expect(facts.evidenceErrors).toContain('verdict ledger row malformed');
+});
