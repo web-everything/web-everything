@@ -44,6 +44,15 @@ function assertReleaseRefused(result, marker, leaseBefore, reason) {
   expect.soft(result.status).not.toBeNull();
   expect.soft(result.status).not.toBe(0);
 }
+function assertOriginReleaseRefused(result, marker, leaseBefore) {
+  expect(result.status, result.stderr).toBe(1);
+  expect(result.signal).toBeNull();
+  expect(result.stderr).toMatch(/ERROR .*lane-1: canonical origin unresolved.*release refused/);
+  expect(result.stderr + result.stdout).not.toContain('releasing anyway');
+  expect(JSON.parse(result.stdout).released).toBe(0);
+  expect(existsSync(marker)).toBe(true);
+  expect(readFileSync(marker, 'utf8')).toBe(leaseBefore);
+}
 function commitLocalWork() {
   writeFileSync(join(laneDir, 'local-work.txt'), 'work that must survive release\n');
   git(['add', 'local-work.txt'], laneDir);
@@ -184,27 +193,46 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
     const caller = primaryCaller();
     git(['clone', '--quiet', origin, join(base, 'releasesalvage')]);
     git(['remote', 'remove', 'origin'], caller.cwd);
-    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
-      ...caller, referencePath: caller.cwd,
-      stderr: /WARNING.*canonical origin unresolved.*skipping salvage/,
-    }));
+    const marker = join(laneDir, '.git', '.lane-lease');
+    const leaseBefore = readFileSync(marker, 'utf8');
+    assertOriginReleaseRefused(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
+      ...caller, referencePath: caller.cwd, raw: true,
+    }), marker, leaseBefore);
     expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
     expect(salvageBranches()).toEqual([]);
     expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
     expect(recordFiles(backupRoot)).toEqual([]);
   });
 
-  it.each(['missing primary', 'primary without origin'])('skips salvage and still releases when --pool has a %s', state => {
-    commitLocalWork();
+  it.each([
+    ['missing primary', '--lane=1', 'clean'], ['primary without origin', '--lane=1', 'clean'],
+    ['missing primary', '--all-pools', 'clean'], ['primary without origin', '--all-pools', 'clean'],
+    ['missing primary', '--lane=1', 'ahead'], ['primary without origin', '--lane=1', 'ahead'],
+    ['missing primary', '--all-pools', 'ahead'], ['primary without origin', '--all-pools', 'ahead'],
+    ['missing primary', '--lane=1', 'unreadable'], ['missing primary', '--all-pools', 'unreadable'],
+  ])('handles unresolved origin with %s: release %s, %s ahead evidence', (state, selector, evidence) => {
+    const sha = evidence === 'ahead' ? commitLocalWork() : git(['rev-parse', 'HEAD'], laneDir);
+    if (evidence === 'unreadable') git(['update-ref', '-d', 'refs/remotes/origin/main'], laneDir);
+    if (evidence === 'clean') expect(git(['rev-list', 'origin/main..HEAD'], laneDir)).toBe('');
     const caller = primaryCaller();
     if (state === 'primary without origin') {
       const selectedPrimary = join(base, 'releasesalvage');
       git(['clone', '--quiet', origin, selectedPrimary]);
       git(['remote', 'remove', 'origin'], selectedPrimary);
     }
-    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
-      ...caller, stderr: /WARNING.*canonical origin unresolved.*skipping salvage/,
-    }));
+    const marker = join(laneDir, '.git', '.lane-lease');
+    const leaseBefore = readFileSync(marker, 'utf8');
+    const args = ['release', selector, '--pool=releasesalvage'];
+    if (evidence === 'clean') {
+      assertReleased(runPool(args, {}, {
+        ...caller, stderr: /WARNING.*canonical origin unresolved.*no local commits ahead.*skipping salvage/,
+      }));
+    } else {
+      const result = runPool(args, {}, { ...caller, raw: true });
+      assertOriginReleaseRefused(result, marker, leaseBefore);
+      expect(result.stderr).toContain(evidence === 'ahead' ? 'local commits are ahead' : 'local ahead check could not be completed');
+    }
+    expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
     expect(salvageBranches()).toEqual([]);
     expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
     expect(recordFiles(backupRoot)).toEqual([]);

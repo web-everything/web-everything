@@ -2827,6 +2827,17 @@ function assertReleaseReservedScoped() {
 // by-session sweep needs no separate `(pool, lane)` ledger — the markers ARE that record. A blanket cross-pool
 // `--all` would nuke every session's leases everywhere, so `--all-pools` REQUIRES `--session` and refuses
 // `--all`. Reserved (permanent memory) leases are always skipped — a sweep never un-reserves.
+function releaseWithoutCanonicalOrigin(repo, dir, label) {
+  const ahead = tryGit(['rev-list', `origin/${repo.branch}..HEAD`], dir);
+  if (ahead !== '') {
+    log(`  ERROR ${label}: canonical origin unresolved for pool ${repo.name}; ${ahead === null ? 'local ahead check could not be completed' : 'local commits are ahead'}; release refused — lane kept held, resolve the canonical origin and retry`);
+    process.exitCode = 1;
+    return false;
+  }
+  log(`  WARNING ${label}: canonical origin unresolved for pool ${repo.name}; no local commits ahead, skipping salvage — inspect the lane before reuse`);
+  return true;
+}
+
 async function cmdReleaseAllPools(repo) {
   const session = flags.session || process.env.LANE_SESSION || null;
   // #x2psfwz — an OPTIONAL co-selector alongside `--session`, never alone: a PR_KIND session name (`review-`/
@@ -2903,13 +2914,17 @@ async function cmdReleaseAllPools(repo) {
         // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote.
         salvageRepo ??= name === repo.name ? repo
           : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
-        if (salvage.status === 'failed') {
-          log(`  ERROR ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; release refused — lane kept held, fix the cause and retry`);
-          process.exitCode = 1;
-          continue;
+        if (!salvageRepo.originUrl) {
+          if (!releaseWithoutCanonicalOrigin(salvageRepo, dir, `${name}/lane-${n}`)) continue;
+        } else {
+          const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
+          if (salvage.status === 'failed') {
+            log(`  ERROR ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; release refused — lane kept held, fix the cause and retry`);
+            process.exitCode = 1;
+            continue;
+          }
+          else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
         }
-        else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
       }
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
@@ -3088,7 +3103,7 @@ async function cmdRelease(repo) {
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
     if (recoveryEnabled()) {
       if (!repo.originUrl) {
-        log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
+        if (!releaseWithoutCanonicalOrigin(repo, dir, `lane-${n}`)) continue;
       } else {
         const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
         if (salvage.status === 'failed') {
