@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {describe, it, expect, afterEach} from 'vitest';
-import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync} from 'node:fs';
+import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync, statSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import * as pidProbe from '../pid-liveness.mjs';
@@ -14,9 +14,9 @@ const NOW = Date.parse('2026-11-01T12:00:00-05:00');
 const iso = ms => new Date(ms).toISOString().replace('Z', '+00:00');
 function setup(markers) {
   const root = mkdtempSync(join(tmpdir(), 'slot-markers-')); roots.push(root);
-  for (const [index, {pid, ageMs = 600_000, run}] of Object.entries(markers)) {
+  for (const [index, {pid, ageMs = 600_000, run, ceilingMs}] of Object.entries(markers)) {
     const file = join(root, `slot-${index}.unconfirmed`);
-    writeFileSync(file, pid === undefined ? 'remote termination unconfirmed\n' : markerContent({owner: 'o', pid, nowMs: NOW - ageMs, host: 'forge', run}));
+    writeFileSync(file, pid === undefined ? 'remote termination unconfirmed\n' : markerContent({owner: 'o', pid, nowMs: NOW - ageMs, host: 'forge', run, ceilingMs}));
     const t = (NOW - ageMs) / 1000; utimesSync(file, t, t);
   }
   return root;
@@ -71,6 +71,81 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(tel(0, undefined, recent))).toEqual([]);
     expect(names(root)).toEqual(['0']);
   });
+  it.each([30, 180].flatMap(minutes => [0, 1].map(over => ({minutes, over}))))(
+    'uses the originating ceiling plus ten minutes and inclusive skew despite a different recovering ceiling: %j', async ({minutes, over}) => {
+      const ceilingMs = minutes * 60_000, root = setup({0: {pid: 111, ceilingMs}});
+      const reaper = createMarkerReaper({root, host: 'forge', ceilingMs: (minutes === 30 ? 180 : 30) * 60_000, clock: () => NOW, liveness: liveness([111])});
+      const started = NOW - 600_000 + ceilingMs + 600_000 + 60_000 + over;
+      expect(await reaper.step(tel(1, undefined, [done(RUN_B), going(RUN_A, started)])))
+        .toEqual(over ? ['slot-0.unconfirmed'] : []);
+    });
+  it.each([30, 180].flatMap(minutes => [0, 1].map(over => ({minutes, over}))))(
+    'discounts stage-zero prepares only strictly beyond the originating ceiling despite a different recovering ceiling: %j', async ({minutes, over}) => {
+      const ceilingMs = minutes * 60_000, abandonMs = ceilingMs + 600_000;
+      const started = NOW + 120_000 - abandonMs - over;
+      const root = setup({0: {pid: 111, ageMs: NOW - started + 120_000, ceilingMs}});
+      const reaper = createMarkerReaper({root, host: 'forge', ceilingMs: (minutes === 30 ? 180 : 30) * 60_000, clock: () => NOW, liveness: liveness([111])});
+      const recent = [{...going(RUN_A, started), stageMs: {install: 0, run: 0}},
+        {...done(RUN_B), startedAtET: iso(started - 180_000)}];
+      expect(await reaper.step(tel(1, undefined, recent))).toEqual(over ? ['slot-0.unconfirmed'] : []);
+    });
+  it.each([null, -1, 0, 999, 1.5, '7200000', Number.MAX_SAFE_INTEGER + 1])(
+    'retains quarantine for malformed originating ceiling metadata, requiring operator cleanup: %j', async ceilingMs => {
+      const root = setup({0: {pid: 111, ceilingMs}});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      expect(await reaper.step(tel(0))).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+    });
+  it.each([60, 180])('keeps historical markers under a conservative ceiling when the recovering ceiling is %s minutes', async minutes => {
+    const root = setup({0: {pid: 111}}), file = join(root, 'slot-0.unconfirmed');
+    const at = NOW - 180 * 60_000;
+    // Pin the on-disk format predating originating-ceiling persistence.
+    writeFileSync(file, JSON.stringify({v: 1, host: 'forge', owner: 'o', pid: 111, at}));
+    utimesSync(file, at / 1000, at / 1000);
+    const reaper = createMarkerReaper({root, host: 'forge', ceilingMs: minutes * 60_000, clock: () => NOW, liveness: liveness([111])});
+    const started = at + (minutes === 60 ? 100 : 170) * 60_000;
+    const recent = [{...done(RUN_B), startedAtET: iso(at - 60_000)}, going(RUN_A, started)];
+    expect(await reaper.step(tel(1, undefined, recent))).toEqual([]);
+    expect(names(root)).toEqual(['0']);
+  });
+  it.each(['inline', 'sidecar', 'sidecar-with-other-inline'].flatMap(binding => [222, 111].map(pid => ({binding, pid}))))(
+    'keeps an old stage-zero receipt bound by another extant marker, including dead owners: %j', async ({binding, pid}) => {
+      const root = setup({0: {pid: 111, ageMs: 10_800_000}});
+      const other = join(root, 'slot-9.unconfirmed');
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]), startMs: () => null});
+      const telemetry = await tel(1, undefined, [
+        {...done(RUN_B), startedAtET: iso(NOW - 10_860_000)},
+        {...going(RUN_A, NOW - 8_000_000), stageMs: {install: 0, run: 0}},
+      ])();
+      expect(await reaper.step(async () => {
+        // Arrives during the telemetry await, outside the original listing and this reaper's host.
+        writeFileSync(other, markerContent({owner: 'other', pid, host: 'other-forge', nowMs: NOW,
+          run: binding === 'inline' ? RUN_A : binding === 'sidecar-with-other-inline' ? RUN_C : undefined}));
+        if (binding !== 'inline') expect(recordMarkerRun(other, {owner: 'other', run: RUN_A})).toBe(true);
+        return telemetry;
+      })).toEqual([]);
+      expect(existsSync(join(root, 'slot-0.unconfirmed'))).toBe(true);
+      rmSync(other);
+      // An orphan sidecar alone does not bind a run.
+      expect(await reaper.step(async () => telemetry)).toEqual(['slot-0.unconfirmed']);
+    });
+  it.each(['unreadable-marker', 'unreadable-directory'])(
+    'retains stage-zero quarantine when other marker bindings cannot be ruled out: %s', async failure => {
+      const root = setup({0: {pid: 111, ageMs: 10_800_000}});
+      let reads = 0;
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111]),
+        fs: {readdirSync: dir => {
+          if (++reads > 1 && failure === 'unreadable-directory') throw new Error('unreadable');
+          return readdirSync(dir);
+        }, statSync}});
+      const recent = [{...done(RUN_B), startedAtET: iso(NOW - 10_860_000)},
+        {...going(RUN_A, NOW - 8_000_000), stageMs: {install: 0, run: 0}}];
+      expect(await reaper.step(async () => {
+        if (failure === 'unreadable-marker') writeFileSync(join(root, 'slot-9.unconfirmed'), '{broken');
+        return await tel(1, undefined, recent)();
+      })).toEqual([]);
+      expect(names(root)).toEqual(['0']);
+    });
   it('logs one line for each reclaimed marker', async () => {
     const root = setup({0: {pid: 111}, 1: {pid: 112}}), logs = [];
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111, 112]), log: line => logs.push(line)});
@@ -105,7 +180,8 @@ describe('stale remote slot markers (perf10)', () => {
       const root = setup({0: {pid: 111, run: binding === 'inline' ? RUN_A : undefined}});
       if (binding === 'sidecar') recordMarkerRun(join(root, 'slot-0.unconfirmed'), {owner: 'o', run: RUN_A});
       const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-      const recent = [{...done(RUN_A, code), startedAtET: iso(NOW - 590_000)}];
+      // Cover the run-less window start so the supervisor code itself must prevent reaping.
+      const recent = [done(RUN_B), {...done(RUN_A, code), startedAtET: iso(NOW - 590_000)}];
       expect(await reaper.step(tel(1, undefined, recent))).toEqual([]);
       expect([...blockedSlots(root, 1)]).toEqual([0]);
       expect(await reaper.step(tel(0, NOW + 30_000, recent))).toEqual([]);

@@ -3821,8 +3821,14 @@ verify the production scanner's fail-closed behavior without relying on host qui
 
 ## Run-less Forge slot recovery
 
-`forge-slot-markers.test.mjs` covers the 130-minute dispatch window, inclusive clock-skew
-bounds, capped-recent coverage, and strictly older stage-zero leaked prepares. Unknown
+`forge-slot-markers.test.mjs` covers the persisted originating client ceiling plus ten-minute dispatch window,
+inclusive clock-skew bounds, capped-recent coverage, and strictly older stage-zero leaked prepares.
+Stage-zero `code:null` prepares never executed a remote command; discount them only after that
+ceiling plus ten minutes and with no other extant marker binding their run (inline or owner-bound sidecar).
+Codes 97/254 require zero active runs as cleanup evidence, including for run-less markers.
+Malformed ceiling metadata retains quarantine; historical markers without it use the larger of
+120 minutes and the recovering caller's ceiling. Test mixed ceilings so a shorter recovering caller
+cannot exclude an older client's unfinished receipt. Operator-confirmed remote cleanup remains the fallback. Unknown
 start timestamps, unreachable telemetry, and unknown PID birth times retain markers.
 When the newest 50 receipts no longer cover a marker's window start, retain quarantine
 until zero-active telemetry or operator-confirmed remote cleanup; never infer cleanup
