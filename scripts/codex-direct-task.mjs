@@ -69,6 +69,8 @@
  * Runs inline by default. --detach launches a persistent background job with stdout/stderr files;
  * wait --job=<id>: poll until the requested deadline (exit 75 means still running).
  * A terminal task exit 75 is preserved in JSON but wait exits 1, so callers stop retrying.
+ * Waiter IO/probe errors return status=wait-error with exit 2, not a terminal worker verdict.
+ * Retain ownership and recover the same job; a waiter error never stops its worker.
  * Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.
  * Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.
  * All IO shares that single requested deadline; no floor or additional grace.
@@ -1469,6 +1471,9 @@ export async function waitForJob({
   };
   let record = { status: 'running', exitCode: null, resultPath: null };
   const result = () => ({ status: record.status, exitCode: record.exitCode, resultPath: record.resultPath });
+  // An observation/bookkeeping failure says nothing about worker completion.
+  // Never impersonate a terminal record or release the caller's ownership.
+  const waitError = () => ({ status: 'wait-error', exitCode: null, resultPath: record.resultPath, code: 2 });
   const terminalResult = () => {
     const code = record.status === 'done' ? 0 : record.exitCode || 1;
     // Exit 75 is exclusively the wait-again signal; retain the task code in JSON.
@@ -1477,14 +1482,14 @@ export async function waitForJob({
   for (;;) {
     let snapshot;
     try { snapshot = await withinBudget(() => readRecord(jobId)); }
-    catch { return { status: 'failed', exitCode: null, resultPath: null, code: 2 }; }
+    catch { return waitError(); }
     if (snapshot === expired) return { ...result(), code: 75 };
     record = snapshot;
     if (record.status !== 'running') return terminalResult();
     if (now() >= deadline) return { ...result(), code: 75 };
     let alive;
     try { alive = await withinBudget(() => isAlive(record)); }
-    catch { return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 }; }
+    catch { return waitError(); }
     if (alive === expired) return { ...result(), code: 75 };
     if (!alive) {
       if (now() >= deadline) return { ...result(), code: 75 };
@@ -1496,7 +1501,7 @@ export async function waitForJob({
         record = snapshot;
       } catch (e) {
         if (e === expired) return { ...result(), code: 75 };
-        return { status: 'failed', exitCode: null, resultPath: record.resultPath, code: 2 };
+        return waitError();
       }
     }
     if (record.status !== 'running') return terminalResult();
@@ -1565,6 +1570,8 @@ async function main() {
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    Aliases: --id=<id> for --job=<id>, --wait=<ms> for --max-ms=<ms> (same validation).\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
+      + '    Waiter IO/probe errors: status=wait-error, exit 2; the worker may still be running.\n'
+      + '    Retain lane/scope ownership, report the waiter error, and retry the same job after recovery.\n'
       + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
       + '    Omitted defaults to 540000 ms; values above 540000 are clamped to 540000 ms.\n'
       + '    All IO shares that single requested deadline; no floor or additional grace.\n'

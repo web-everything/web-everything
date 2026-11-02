@@ -44,11 +44,24 @@ describe('renderWorkerBrief', () => {
     for (const text of [brief, runner]) {
       expect(text).toContain('Repeat only on exit 75');
       expect(text).toContain('exit 0 = success');
-      expect(text).toContain('any other exit = stop and report the failure');
+      expect(text).toContain('status=failed is a terminal worker failure');
+      expect(text).toContain('status=wait-error');
+      expect(text).toContain('does not prove the worker stopped');
+      expect(text).toContain('retain the lane and scope');
+      expect(text).toContain('keep renewing leases');
+      expect(text).toContain('missing/unreadable JSON');
+      expect(text).toContain('retry the same job');
+      expect(text).toContain('confirmed terminal');
+      expect(text).toContain('supervised termination');
+      expect(text).toContain('confirm the worker stopped before cleanup');
+      expect(text).not.toContain('any other exit = stop and report the failure');
       expect(text).not.toContain('until it exits 0');
       expect(text).toContain('check --wait=150000 --json');
       expect(text).toContain('Repeat only for a timeout with lastStatus=running');
       expect(text).toContain('stop and report red, infrastructure-failure, or any other non-running result');
+      expect(text).toContain('If settled is not true');
+      expect(text).toContain('recover observation of the same verification');
+      expect(text).toContain('until verification is confirmed terminal');
     }
   });
 

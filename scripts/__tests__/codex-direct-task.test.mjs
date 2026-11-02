@@ -1723,6 +1723,48 @@ describe('detached jobs', () => {
     expect(f.sleep).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['stat=', 'ETIMEDOUT'], ['stat=', 'EPERM'],
+    ['lstart=', 'ETIMEDOUT'], ['lstart=', 'EPERM'],
+  ])('wait CLI distinguishes %s/%s probe errors from a live detached worker failure, then recovers the same job after exit', async (probe, errorCode) => {
+    const worker = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 10000 })], {
+      detached: true, stdio: 'ignore',
+    });
+    const exited = new Promise(resolveExit => worker.once('exit', resolveExit));
+    try {
+      await new Promise((resolveSpawn, reject) => { worker.once('spawn', resolveSpawn); worker.once('error', reject); });
+      const record = { id: 'probe-error', pid: worker.pid, pidStart: 'fixture-start', status: 'running', exitCode: null, resultPath: 'result.json' };
+      writeJobRecord(record, { jobsDir });
+      const preload = `import cp from 'node:child_process';
+        import { syncBuiltinESMExports } from 'node:module';
+        const exec = cp.execFileSync;
+        cp.execFileSync = (bin, args, ...rest) => {
+          if (bin === 'ps' && args.includes('${probe}')) throw Object.assign(new Error('probe unavailable'), { code: '${errorCode}' });
+          if (bin === 'ps' && args.includes('stat=')) return 'S';
+          return exec(bin, args, ...rest);
+        };
+        syncBuiltinESMExports();`;
+      const wait = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+        'scripts/codex-direct-task.mjs', 'wait', `--job=${record.id}`, '--wait=1000'], {
+        env: { ...process.env, CODEX_JOBS_DIR: jobsDir }, encoding: 'utf8', timeout: 4000,
+      });
+      expect(wait.status, wait.stderr).toBe(2);
+      const result = JSON.parse(wait.stdout);
+      // Observe the real CLI and PID before asserting the distinguishing status.
+      expect(() => process.kill(worker.pid, 0)).not.toThrow();
+      expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
+      expect(result).toEqual({ status: 'wait-error', exitCode: null, resultPath: record.resultPath });
+      worker.kill('SIGKILL');
+      await exited;
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+        .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+      expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
+    } finally {
+      worker.kill('SIGKILL');
+      await exited;
+    }
+  });
+
   it.each([0, 20, 100, 249, 249.9, 'abc', -1, NaN, Infinity, ''])('rejects invalid maxMs=%s before any IO in the exported wait', async maxMs => {
     const f = fixture();
     const isAlive = vi.fn();
@@ -2009,7 +2051,8 @@ describe('detached jobs', () => {
     const record = { id: 'ps-state-hung', pid: process.pid, status: 'running', exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     const isAlive = rec => jobIsAlive(rec, { readState: () => { throw new Error('ps timed out'); } });
-    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 })).toMatchObject({ code: 2 });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 }))
+      .toMatchObject({ status: 'wait-error', exitCode: null, code: 2 });
     expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
   });
 
@@ -2046,7 +2089,8 @@ describe('detached jobs', () => {
       exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
     const isAlive = rec => jobIsAlive(rec, { readStart: () => { throw new Error('ps timed out'); } });
-    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 })).toMatchObject({ code: 2 });
+    expect(await waitForJob({ jobId: record.id, jobsDir, isAlive, maxMs: 1000 }))
+      .toMatchObject({ status: 'wait-error', exitCode: null, code: 2 });
     expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'running', exitCode: null });
   });
 
@@ -2144,7 +2188,7 @@ describe('detached jobs', () => {
     expect(f.sleep).toHaveBeenCalledOnce();
   });
 
-  it.each([7, 0, null])('failed: propagates exit code %s with fallback 1', async exitCode => {
+  it.each([2, 7, 0, null])('failed: propagates exit code %s with fallback 1', async exitCode => {
     const f = fixture();
     f.child.emit('exit', exitCode);
     // A failed record with a legacy zero code must never report success.
@@ -2236,7 +2280,7 @@ describe('detached jobs', () => {
   it.each([
     ['EPERM', 'running', null, 75],
     ['ESRCH', 'failed', 1, 1],
-    ['EIO', 'failed', null, 2],
+    ['EIO', 'wait-error', null, 2],
   ])('default PID probe receiving %s returns %s with code %s/%s', async (errorCode, status, exitCode, code) => {
     // A real, live, non-zombie PID: the default state probe runs real ps after an EPERM, so a made-up PID
     // would (correctly) read as gone.
@@ -2261,7 +2305,7 @@ describe('detached jobs', () => {
     ['done', 0, { status: 'done', exitCode: 0, resultPath: 'result.json', code: 0 }],
     ['failed', 23, { status: 'failed', exitCode: 23, resultPath: 'result.json', code: 23 }],
     ['running', null, { status: 'running', exitCode: null, resultPath: 'result.json', code: 75 }],
-    ['missing', null, { status: 'failed', exitCode: null, resultPath: null, code: 2 }],
+    ['missing', null, { status: 'wait-error', exitCode: null, resultPath: null, code: 2 }],
   ])('max-ms=250 reports a %s job through the default async reader within the requested deadline', async (status, exitCode, expected) => {
     const record = { id: 'minimum-budget', pid: process.pid, status, exitCode, resultPath: 'result.json' };
     if (status !== 'missing') writeJobRecord(record, { jobsDir });
@@ -2327,7 +2371,7 @@ describe('detached jobs', () => {
       await vi.advanceTimersByTimeAsync(1);
       await waiting;
       expect(result).toEqual(status === 'missing'
-        ? { status: 'failed', exitCode: null, resultPath: null, code: 2 }
+        ? { status: 'wait-error', exitCode: null, resultPath: null, code: 2 }
         : { status, exitCode: status === 'done' ? 0 : 23, resultPath: 'test-job.result.json', code: status === 'done' ? 0 : 23 });
       expect(readRecord).toHaveBeenCalledOnce();
       expect(isAlive).not.toHaveBeenCalled();
@@ -2512,7 +2556,7 @@ describe('detached jobs', () => {
       await vi.advanceTimersByTimeAsync(250);
       expect(await waiting).toMatchObject(outcome === 'timeout'
         ? { status: 'running', exitCode: null, code: 75 }
-        : { status: 'failed', exitCode: null, code: 2 });
+        : { status: 'wait-error', exitCode: null, code: 2 });
       expect(readRecord).toHaveBeenCalledTimes(2);
       expect(f.writeRecord).not.toHaveBeenCalled();
       if (outcome === 'timeout') {
@@ -2553,7 +2597,7 @@ describe('detached jobs', () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, maxMs: 250, now: Date.now, sleep: undefined,
       isAlive: () => false, [operation]: async () => { throw new Error('IO unavailable'); },
-    })).toMatchObject({ status: 'failed', exitCode: null, code: 2 });
+    })).toMatchObject({ status: 'wait-error', exitCode: null, code: 2 });
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
@@ -2561,7 +2605,7 @@ describe('detached jobs', () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, isAlive: () => false,
       updateRecord: () => { throw new Error('record unreadable'); },
-    })).toMatchObject({ status: 'failed', code: 2 });
+    })).toMatchObject({ status: 'wait-error', code: 2 });
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 
@@ -2606,7 +2650,7 @@ describe('detached jobs', () => {
   it.each([250, undefined])('unknown and unreadable jobs fail closed with exit 2 at maxMs=%s', async maxMs => {
     for (const jobId of ['missing', '../escape', undefined]) {
       expect(await waitForJob({ jobId, jobsDir, maxMs }))
-        .toEqual({ status: 'failed', exitCode: null, resultPath: null, code: 2 });
+        .toEqual({ status: 'wait-error', exitCode: null, resultPath: null, code: 2 });
     }
     writeFileSync(join(jobsDir, 'broken.json'), '{');
     expect(await waitForJob({ jobId: 'broken', jobsDir, maxMs })).toMatchObject({ code: 2 });
