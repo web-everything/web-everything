@@ -24,6 +24,7 @@ function deps(f = fixture(6223), overrides = {}) {
     fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
     readLabelEvents: async () => ['review:human','review:pending'].map(name =>
       ({event:'labeled',label:{name},created_at:'2026-11-02T09:00:00Z'})),
+    readHeadPushedAt: async () => '2026-11-02T09:30:00Z',
     readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
     readRulingFile: async (sha) => sha === base ? 'Original rule.\n' : `Original rule.\n${rulingEntry}`,
     readRulingDiff: async () => rulingDiff(rulingEntry),
@@ -953,8 +954,27 @@ describe('round 7 live hold chronology', () => {
     expect(condition(r,2).evidence.join(' ')).toContain('human review');
     expect(calls).toBe(8);
   });
-  it('does not read timeline when no live hold exists', async () => {
-    expect((await checkPr(6223,deps(undefined,{readLabelEvents:()=>{throw Error('must not read');}}))).eligible).toBe(true);
+  const clean = (readLabelEvents, extra = {}) => checkPr(6223,deps(undefined,{readLabelEvents,...extra}));
+  it.each(['review:human','review:pending','red-team:blocked','review:changes','review:held-mechanical','advisory:x'])(
+    'fails a %s hold applied after the head push and removed again', async label => {
+    const r = await clean(()=>[event(label,'2026-11-02T09:40:00Z'),event(label,'2026-11-02T09:50:00Z','unlabeled')]);
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:[`hold applied since head push: ${label}`]});
+  });
+  it('permits a hold applied and removed before the head push', async () => {
+    const r = await clean(()=>[event('review:human','2026-11-02T09:00:00Z'),event('review:human','2026-11-02T09:10:00Z','unlabeled')]);
+    expect(condition(r,2).status).toBe('PASS');
+  });
+  it('fails a live hold that was also applied and removed since the head push', async () => {
+    const r = await checkPr(6223,deps({...fixture(6223),labels:['red-team:clear','review:accepted','review:pending']},{readLabelEvents:()=>[
+      event('review:pending','2026-11-02T09:35:00Z'),event('review:pending','2026-11-02T09:36:00Z','unlabeled'),
+      event('review:pending','2026-11-02T09:37:00Z')]}));
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['hold applied since head push: review:pending']});
+  });
+  it.each(['timeline throws','head time throws','head time malformed'])('is UNKNOWN when %s with no live hold', async kind => {
+    const r = await clean(kind === 'timeline throws' ? ()=>{throw Error('x');} : ()=>[],
+      kind === 'timeline throws' ? {} : {readHeadPushedAt: kind === 'head time throws' ? ()=>{throw Error('x');} : async()=>'bad'});
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
   });
   it('paginates explicit-repo issue events and filters hold label events', async () => {
     const calls = [];
