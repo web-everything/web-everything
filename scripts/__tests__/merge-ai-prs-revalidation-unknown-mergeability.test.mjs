@@ -71,6 +71,52 @@ describe('setting', () => {
 });
 
 describe('revalidateWithUnknownRetry', () => {
+  it('persistent UNKNOWN remains refused when recovery hooks throw', async () => {
+    const fresh = pr({ mergeable: 'UNKNOWN' });
+    const calls = [];
+    const verdict = await revalidateWithUnknownRetry({
+      repo: 'example/web', num: fresh.number, opts,
+      read: async () => fresh, setting: { retries: 0, delayMs: 0 },
+      sleep: () => { throw new Error('zero retries must not sleep'); },
+      onPersistentUnknown: async payload => {
+        calls.push(['persist', payload]);
+        throw new Error('marks file unavailable');
+      },
+      nudge: async payload => {
+        calls.push(['nudge', payload]);
+        throw new Error('mergeability read unavailable');
+      },
+    });
+    expect(verdict).toEqual(revalidateForMerge(fresh, opts));
+    expect(verdict.decision).toBe('skip');
+    expect(isTransientUnknownMergeability(verdict)).toBe(true);
+    const payload = { repo: 'example/web', num: fresh.number, verdict };
+    expect(calls).toEqual([['persist', payload], ['nudge', payload]]);
+  });
+
+  it('nudge runs when persistence hook throws', async () => {
+    const fresh = pr({ mergeable: 'UNKNOWN' });
+    const calls = [];
+    const verdict = await revalidateWithUnknownRetry({
+      repo: 'example/web', num: fresh.number, opts,
+      read: async () => fresh, setting: { retries: 0, delayMs: 0 },
+      sleep: () => { throw new Error('zero retries must not sleep'); },
+      onPersistentUnknown: payload => {
+        calls.push(['persist', payload]);
+        throw new Error('marks file unavailable');
+      },
+      nudge: async payload => {
+        calls.push(['nudge', payload]);
+        return { decision: 'merge', mergeable: 'MERGEABLE' };
+      },
+    });
+    expect(verdict).toEqual(revalidateForMerge(fresh, opts));
+    expect(verdict.decision).toBe('skip');
+    expect(isTransientUnknownMergeability(verdict)).toBe(true);
+    const payload = { repo: 'example/web', num: fresh.number, verdict };
+    expect(calls).toEqual([['persist', payload], ['nudge', payload]]);
+  });
+
   const run = (reads, setting = { retries: 4, delayMs: 3000 }) => {
     const slept = [];
     let i = 0;

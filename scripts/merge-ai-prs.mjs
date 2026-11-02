@@ -140,9 +140,10 @@ import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs'
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, spawnSync } from 'node:child_process';
+import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
-import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -1167,13 +1168,71 @@ export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
  * Fails closed exactly as before: an UNKNOWN that never resolves within the bound returns that same refusal.
  * IO is injected (`read` → the fresh PR or null; `sleep(ms)`), so the bound is testable without GitHub.
  */
-export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
+export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep, repo, num, onPersistentUnknown, nudge }) {
   let verdict = revalidateForMerge(await read(), opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
     await sleep(setting.delayMs);
     verdict = revalidateForMerge(await read(), opts);
   }
+  if (isTransientUnknownMergeability(verdict)) {
+    const payload = { repo, num, verdict };
+    // Recovery is advisory: failed hooks cannot turn a refusal into admission or abort the drain.
+    try { await onPersistentUnknown?.(payload); } catch { /* best effort */ }
+    try { await nudge?.(payload); } catch { /* best effort */ }
+  }
   return verdict;
+}
+
+export function markStuckUnknown(marks, { repo, num, now }) {
+  const next = new Map(marks);
+  const key = `${repo}#${num}`;
+  if (!next.has(key)) next.set(key, { repo, num, since: now });
+  return next;
+}
+
+export function pruneStuckUnknown(marks, { prs }) {
+  const next = new Map(marks);
+  for (const pr of prs) {
+    if (['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable) || ['CLOSED', 'MERGED'].includes(pr.state)) {
+      next.delete(`${pr.repo}#${pr.num}`);
+    }
+  }
+  return next;
+}
+
+export function orderStuckUnknownFirst(prs, marks) {
+  const marked = pr => marks.has(`${pr.repo}#${pr.num}`);
+  return [...prs.filter(marked), ...prs.filter(pr => !marked(pr))];
+}
+
+export function nudgeMergeability({ repo, num, read }) {
+  return read({ repo, num, fields: ['mergeable'] });
+}
+
+export function decideStuckUnknownAlert(marks, { now, afterMinutes = 30 }) {
+  const bound = Number.isFinite(afterMinutes) && afterMinutes > 0 ? afterMinutes : 30;
+  return [...marks.values()].filter(mark => now - mark.since > bound * 60_000)
+    .map(mark => ({ kind: 'stuck-unknown-mergeability', ...mark, ageMinutes: (now - mark.since) / 60_000,
+      reason: 'mergeability remains UNKNOWN; inspect the PR on GitHub and retry the drain; merge remains refused' }));
+}
+
+function loadStuckUnknown(path) {
+  try {
+    const rows = JSON.parse(readFileSync(path, 'utf8'));
+    if (!Array.isArray(rows)) return new Map();
+    return new Map(rows.filter(row => typeof row?.repo === 'string' && Number.isInteger(row.num) && row.num > 0
+      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since }]));
+  } catch { return new Map(); }
+}
+
+function saveStuckUnknown(path, marks) {
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(temporary, JSON.stringify([...marks.values()]) + '\n', { mode: 0o600 });
+    renameSync(temporary, path);
+  } catch { /* best-effort state never affects admission */ }
+  finally { try { unlinkSync(temporary); } catch { /* absent or unwritable */ } }
 }
 
 /** The pass's ordering: UNKNOWN listings are re-polled BEFORE the head-bound open-PR context is collected. */
@@ -1203,8 +1262,14 @@ export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, 
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
-export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map() }) {
   const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+  const marked = [...prsByRepo].flatMap(([repo, prs]) => prs
+    .filter(pr => marks.has(`${repo}#${pr.number}`)).map(pr => ({ repo, pr })));
+  await mapWithConcurrency(marked, concurrency, async ({ repo, pr }) => {
+    const fresh = await read(repo, pr.number);
+    if (fresh?.number === pr.number) Object.assign(pr, fresh);
+  });
   let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
   for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
     await sleep(setting.delayMs);
@@ -4778,13 +4843,19 @@ async function runCli() {
     });
   };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
-  const fetchFreshPrForRevalidation = async (repo, num) => {
+  const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
       const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
-        'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
+        fields ? fields.join(',') : 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
-      if (!data || data.number == null) return null;
+      if (!data || (!fields && data.number !== num)) return null;
+      const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
+      if (pruned.size !== stuckUnknownMarks.size) {
+        stuckUnknownMarks = pruned;
+        if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+      }
+      if (fields) return data;
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
     } catch { return null; }
@@ -4792,6 +4863,27 @@ async function runCli() {
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const stuckUnknownPath = join(dirname(refreshedStatePath()), 'stuck-unknown-mergeability.json');
+  let stuckUnknownMarks = loadStuckUnknown(stuckUnknownPath);
+  // Persist canonical slugs; adapt keys to the pass's null-for-local convention without changing candidates.
+  const passStuckUnknownMarks = () => new Map([...stuckUnknownMarks.values()].flatMap(mark =>
+    [mark.repo, ...REPOS.filter(repo => (repo || localSlug) === mark.repo)]
+      .map(repo => [`${repo}#${mark.num}`, mark])));
+  let stuckUnknownTool;
+  try { stuckUnknownTool = readDeclaredDrainSettings()?.drain?.stuckUnknownMergeability; } catch { /* standard */ }
+  const stuckUnknownSetting = cascadePolicy('drain.stuckUnknownMergeability', stuckUnknownTool, {
+    standard: { afterMinutes: 30 }, env: process.env,
+    valid: { afterMinutes: v => Number.isFinite(v) && v > 0 },
+  });
+  process.stderr.write(`merge-ai-prs: stuckUnknownMergeability.afterMinutes=${stuckUnknownSetting.value.afterMinutes} (${stuckUnknownSetting.sources.afterMinutes})\n`);
+  const stuckUnknownAlerts = new Map();
+  const emitStuckUnknownAlerts = () => {
+    for (const alert of decideStuckUnknownAlert(stuckUnknownMarks, { now: Date.now(), ...stuckUnknownSetting.value })) {
+      const key = `${alert.repo}#${alert.num}`;
+      if (!stuckUnknownAlerts.has(key)) process.stderr.write(`merge-ai-prs · alert: ${JSON.stringify(alert)}\n`);
+      stuckUnknownAlerts.set(key, alert);
+    }
+  };
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -5360,7 +5452,7 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
+    repoll: async () => { await repollUnknownListings({ marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
@@ -5575,6 +5667,14 @@ async function runCli() {
   };
   // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
   const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    repo: repo || localSlug, num,
+    onPersistentUnknown: ({ repo: slug, num }) => {
+      stuckUnknownMarks = markStuckUnknown(stuckUnknownMarks, { repo: slug, num, now: Date.now() });
+      if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+      emitStuckUnknownAlerts();
+    },
+    nudge: ({ repo: slug, num }) => nudgeMergeability({ repo: slug, num,
+      read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) }),
     read: async () => {
       const pr = await fetchFreshPrForRevalidation(repo, num);
       return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
@@ -6507,6 +6607,7 @@ async function runCli() {
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
+    p.ready = orderStuckUnknownFirst(p.ready, passStuckUnknownMarks());
     logDrainOrder(p);
     return p;
   };
@@ -7443,7 +7544,8 @@ async function runCli() {
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const alerts = [...stuckUnknownAlerts.values()].filter(alert => stuckUnknownMarks.has(`${alert.repo}#${alert.num}`));
+  const result = { alerts, ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
