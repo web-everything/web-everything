@@ -23,6 +23,8 @@ const items = [
 ];
 const q = (...nums) => nums.map((num) => ({ num, addedAt: OLD }));
 
+// The shared fetch stamp lives outside the test; window 0 keeps every confirm on its own fetch path.
+process.env.WE_GIT_FETCH_FRESH_SECONDS = '0';
 describe('planPrune', () => {
   it('drops resolved, missing-card and duplicate alias; renames a landed hash; keeps live cards', () => {
     const p = planPrune({ queue: q('10', '11', '12', 'xaaaaaa', 'xbbbbbb', 'x999999'), items });
@@ -72,7 +74,7 @@ describe('makeConfirmMissingOnMain (origin/main evidence, fail-safe)', () => {
   /** exec stub: `grep` exit status decides the bornAs probe; `fail` makes the named git subcommand throw. */
   const execFor = ({ grepStatus = 1, fail = null, listing = lsTree, calls = [] } = {}) => (_git, args) => {
     const sub = args.find((a) => ['fetch', 'ls-tree', 'grep'].includes(a));
-    calls.push(sub);
+    calls.push([...args]);
     if (fail === sub) throw Object.assign(new Error('git failed'), { status: 128 });
     if (sub === 'grep') { if (grepStatus === 0) return ''; throw Object.assign(new Error('no match'), { status: grepStatus }); }
     return sub === 'ls-tree' ? listing : '';
@@ -94,8 +96,16 @@ describe('makeConfirmMissingOnMain (origin/main evidence, fail-safe)', () => {
   it('after a failure it never retries git (no repeated blocking fetches)', () => {
     const calls = [];
     const confirm = makeConfirmMissingOnMain({ exec: execFor({ fail: 'fetch', calls }) });
-    confirm('x999999'); confirm('x888888'); confirm('x777777');
-    expect(calls).toEqual(['fetch']);
+    expect(confirm('x999999')).toBe(false);
+    expect(calls.filter((args) => args[0] === 'fetch')).toEqual([
+      ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
+    ]);
+    expect(calls.at(-1)?.[0]).toBe('fetch');
+    // The first attempt may probe remote identity; later calls must do no Git IO at all.
+    const afterFailure = calls.map((args) => [...args]);
+    expect(confirm('x888888')).toBe(false);
+    expect(confirm('x777777')).toBe(false);
+    expect(calls).toEqual(afterFailure);
   });
 });
 

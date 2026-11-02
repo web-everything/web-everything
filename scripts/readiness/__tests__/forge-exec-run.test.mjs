@@ -10,6 +10,7 @@ import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 import {verifiedCopySource} from '../forge-exec-bases.mjs';
+import {scanScope} from '../../lib/repo-scan-tests.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -51,6 +52,7 @@ cat > stdin-seen
 node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "$@" > argv-seen
 printf '%s\n' "$*|$NODE_ENV" > task-seen
 echo forged > .exit-code
+printf '%s' "$VERIFY_SCAN_FILES" > scan-files-seen
 echo '{"phase":"test","code":0}' > receipt.json
 exit 3
 `, {mode:0o755});
@@ -150,6 +152,66 @@ describe('sibling root snapshot acceptance', () => {
   });
 });
 
+describe('gate option and scan-file allowlist (R314, R309)', () => {
+  it.each([
+    ['scripts/a.mjs', ['scripts/a.mjs']],
+    ['scripts/a.mjs,src/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['scripts/a.mjs\nsrc/b.ts', ['scripts/a.mjs', 'src/b.ts']],
+    ['[ "scripts/a.mjs", "src/b.ts" ]', ['scripts/a.mjs', 'src/b.ts']],
+    ['[]', []],
+  ])('executes direct runner scan list %j as JSON consumable by scanScope', async (value, paths) => {
+    request.env.VERIFY_SCAN_FILES = value;
+    expect((await runner.run(request)).code).toBe(3);
+    const actual = await readFile(join(work,'scan-files-seen'),'utf8');
+    expect([...scanScope({VERIFY_SCAN_FILES:actual})]).toEqual(paths);
+    expect(actual).toBe(JSON.stringify(paths));
+    expect(request.env.VERIFY_SCAN_FILES).toBe(value);
+  });
+  const unit = (...args) => ['npm','run','test:unit','--','a.test.mjs',...args];
+  it.each([
+    ['--passWithNoTests'], ['--testTimeout=15000'], ['--hookTimeout=30000'], ['--testTimeout=1'], ['--hookTimeout=3600000'],
+    ['--passWithNoTests','--testTimeout=15000','--hookTimeout=30000'],
+  ])('accepts the gate options %j', (...args) => {
+    expect(manifestAPI.allowedCommand(unit(...args))).toBe(true);
+    expect(manifestAPI.allowedCommand(['npx','vitest','run','a.test.mjs',...args])).toBe(true);
+  });
+  it.each([
+    '--testTimeout=abc', '--testTimeout=', '--testTimeout', '--testTimeout=0', '--testTimeout=015000', '--testTimeout=-1',
+    '--testTimeout=1.5', '--testTimeout=3600001', '--testTimeout=99999999', '--hookTimeout=1e3', '--hookTimeout=abc',
+    '--test-timeout=15000', '--TestTimeout=15000', '--testTimeout=15000 ', '--passWithNoTests=true', '--pass-with-no-tests',
+    '--reporter=x', '--maxWorkers=1', '--teardownTimeout=1000',
+  ])('rejects %s', arg => {
+    expect(manifestAPI.allowedCommand(unit(arg))).toBe(false);
+  });
+  it('rejects a separated value after --testTimeout and a boolean after --passWithNoTests', () => {
+    expect(manifestAPI.allowedCommand(unit('--testTimeout','15000'))).toBe(false);
+    expect(manifestAPI.allowedCommand(['npx','vitest','run','a.test.mjs','--passWithNoTests','false'])).toBe(false);
+  });
+  it.each([
+    '["scripts/a.mjs","scripts/b.test.mjs"]', '[]', 'scripts/a.mjs', 'scripts/a.mjs,scripts/b.mjs', 'scripts/a.mjs\nsrc/b.ts',
+    '[".github/workflows/ci.yml"]', '["a/@scope/b+c-d_e.mjs"]',
+  ])('accepts VERIFY_SCAN_FILES=%j', value => {
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:value})).toBe(true);
+  });
+  it.each([
+    '/etc/passwd', '["/etc/passwd"]', '../x', '["../x"]', 'a/../b', 'a..b', '..', '["a/./b"]', './a', 'a;rm', '["a;rm -rf /"]', 'a b', '$(id)',
+    '`id`', 'a|b', 'a&b', 'a>b', "a'b", 'a"b', 'a\\b', '-rf', '', 'a,,b', 'a//b', 'a/', '["a",1]', '{"a":1}', '[', '["a"',
+    'a\0b', 'x'.repeat(65537),
+  ])('rejects VERIFY_SCAN_FILES=%j', value => {
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:value})).toBe(false);
+  });
+  it('bounds canonical JSON size and entry count before client or runner execution', () => {
+    const expanded = Array(1024).fill('a'.repeat(62)).join(',');
+    expect(expanded.length).toBeLessThan(65536);
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:expanded})).toBe(false);
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:Array(4097).fill('a').join(',')})).toBe(false);
+    const boundary = JSON.stringify([...Array(15).fill('a'.repeat(4096)), 'a'.repeat(4047)]);
+    expect(boundary.length).toBe(65536);
+    expect(manifestAPI.allowedEnv({VERIFY_SCAN_FILES:boundary})).toBe(true);
+    expect(manifestAPI.normalizeScanFilesValue(boundary)).toBe(boundary);
+  });
+});
+
 describe('fixed wrapper security boundary', () => {
   it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
     const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
@@ -196,7 +258,7 @@ test('executes probe', () => {writeFileSync('executed', 'yes'); expect(true).toB
   }, 65000);
 
   it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
-    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
+    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']).filter(arg => arg !== '--passWithNoTests'))
   ('rejects arguments outside the allowlist: %s before installing or executing', async arg => {
     const command = ['npm','run','test:unit','--','a.test.mjs',arg];
     expect(manifestAPI.allowedCommand(command)).toBe(false);
@@ -225,7 +287,7 @@ test('executes probe', () => {writeFileSync('executed', 'yes'); expect(true).toB
 
   it.each([
     '--shard=1/2', '--bail=1', '--unknown', '--RUN', '--Silent', '--noColor',
-    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=json', '--reporter=DOT',
+    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=JSON', '--reporter=junit', '--reporter=DOT',
     '--reporter', '--run=true', '--silent=false', '--no-color=true', '-t', '-tcase',
     '--testNamePattern', '--', '--CONFIG=other', '--dangerously-ignore-unhandled-errors',
   ])('fails closed for unsupported option spelling or missing value: %s', async arg => {

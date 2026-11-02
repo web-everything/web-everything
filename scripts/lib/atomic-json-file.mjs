@@ -146,28 +146,32 @@ function probeLockHolderLiveness(lockPath, readFileSyncFn) {
  * and recorded pid are re-checked immediately after the rename; if it turns out not to have actually been
  * stale/dead after all, it is put straight back and this caller backs off to retry normally, never proceeding
  * into `fn()` on a bad steal.
+ * `holderText` and `probeHolderLiveness` opt a caller into richer process identity. The probe runs
+ * both before and after takeover; it must preserve live or unreadable identities as 'alive'.
  * @param {string} lockPath
  * @param {() => any} fn
- * @param {{timeoutMs?: number, pollMs?: number, staleMs?: number, onBeforeStaleTakeover?: (() => void)|null}} [o]
+ * @param {{timeoutMs?: number, pollMs?: number, staleMs?: number, onBeforeStaleTakeover?: (() => void)|null,
+ *   holderText?: string, probeHolderLiveness?: Function}} [o]
  * @returns {any} whatever `fn` returns
  */
 export function withFileLock(lockPath, fn, {
   timeoutMs = LOCK_TIMEOUT_MS_DEFAULT, pollMs = LOCK_POLL_MS_DEFAULT, staleMs = LOCK_STALE_MS_DEFAULT,
   onBeforeStaleTakeover = null,
+  holderText = `${process.pid}\n`, probeHolderLiveness = probeLockHolderLiveness,
 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       // Resolve through the shared fs object so runtime instrumentation sees acquisition.
       const fd = fs.openSync(lockPath, 'wx');
-      try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
+      try { writeSync(fd, holderText); } finally { closeSync(fd); }
       break; // acquired
     } catch (e) {
       if (e?.code !== 'EEXIST') throw e; // any other failure (no permission, bad path) — never silently proceed unlocked
       let claimed = false;
       try {
         const isStale = Date.now() - statSync(lockPath).mtimeMs > staleMs;
-        const holderLiveness = isStale ? probeLockHolderLiveness(lockPath, readFileSync) : 'alive';
+        const holderLiveness = isStale ? probeHolderLiveness(lockPath, readFileSync) : 'alive';
         if (isStale && holderLiveness !== 'alive') {
           // TEST-ONLY SYNCHRONIZATION SEAM (never used by a real caller): lets a test simulate the exact
           // decide-then-act gap PR #2735 finding 2 needs to reproduce. A no-op by default.
@@ -184,7 +188,7 @@ export function withFileLock(lockPath, fn, {
             let genuinelyStale = false;
             try {
               genuinelyStale = Date.now() - statSync(stolenPath).mtimeMs > staleMs
-                && probeLockHolderLiveness(stolenPath, readFileSync) !== 'alive';
+                && probeHolderLiveness(stolenPath, readFileSync) !== 'alive';
             } catch { genuinelyStale = false; }
             if (genuinelyStale) {
               try { unlinkSync(stolenPath); } catch { /* best-effort cleanup of the now-confirmed-dead lock's own file */ }

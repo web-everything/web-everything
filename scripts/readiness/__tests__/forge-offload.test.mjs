@@ -566,7 +566,7 @@ describe('runner base materialization refuses before install',()=>{
     if(mode==='delta') {
       expect(ignoredCalls).toBe(1);
       const substages=result.timings.find(stage=>stage.stage==='manifest-build').substages;
-      expect(substages.map(stage=>stage.stage).sort()).toEqual(['base-blob-verification','git-evidence','hashing','ignored-file-listing','inventory-walk','lstat-pass']);
+      expect(substages.map(stage=>stage.stage).sort()).toEqual(['base-blob-verification','cross-check','git-evidence','hashing','ignored-file-listing','inventory-walk','lstat-pass']);
       expect(substages.every(stage=>Number.isFinite(stage.ms)&&stage.ms>=0)).toBe(true);
     }
     const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
@@ -786,6 +786,146 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     await f.runner.finish(request);
   });
 
+  // Card 7515: presync ships delta leaves ahead of the run; the run offers them
+  // only as an rsync --copy-dest basis, and Forge still verifies every byte.
+  describe('presync',()=>{
+    const gitDir=()=>join(repo,'.git');
+    // Fake transport around the real runner: presync rsync mirrors the stage
+    // into a local cache dir; run rsync honours --copy-dest like real rsync,
+    // or plants wrong bytes when tamper is set.
+    function presyncTransport(f,{tamper=false,presyncCopyCode=0,mkdirCode=0}={}) {
+      const calls=[],cacheRoot=join(f.server,'presync');
+      const transport=vi.fn(async call=>{
+        calls.push(call);
+        if(call.file==='git')return exec(call);
+        if(call.file==='rsync') {
+          const target=call.args.at(-1).split(':').slice(1).join(':');
+          if(target.startsWith('/srv/forge-exec/presync/')) {
+            if(presyncCopyCode)return {code:presyncCopyCode,stdout:Buffer.alloc(0)};
+            const dest=target.replace('/srv/forge-exec/presync',cacheRoot);
+            await fs.rm(dest,{recursive:true,force:true});await fs.cp(call.cwd,dest,{recursive:true});
+            return {code:0,stdout:Buffer.alloc(0)};
+          }
+          const copyDest=call.args.find(arg=>arg.startsWith('--copy-dest='))?.slice(12).replace('/srv/forge-exec/presync',cacheRoot);
+          const destination=target.replace('/srv/forge-exec',join(f.server,'runs'));
+          for(const name of call.input.toString().split('\0').filter(Boolean)){
+            const rel=name.slice(2),out=join(destination,rel);await fs.mkdir(join(out,'..'),{recursive:true});
+            const cached=copyDest&&await fs.readFile(join(copyDest,rel)).catch(()=>null);
+            if(cached&&tamper)await fs.writeFile(out,'tamper');
+            else if(cached&&cached.equals(await fs.readFile(join(call.cwd,rel))))await fs.writeFile(out,cached);
+            else await fs.copyFile(join(call.cwd,rel),out);
+          }
+          return {code:0,stdout:Buffer.alloc(0)};
+        }
+        const command=call.args.at(-1);
+        if(command.includes('mkdir -p -m 0711 /srv/forge-exec/presync'))return {code:mkdirCode,stdout:''};
+        const action=command.split(' ').at(-1);
+        if(action==='true')return {code:0,stdout:''};
+        const value=await f.runner[action](JSON.parse(call.input));
+        if(action==='run')return {code:value.code,stdout:''};
+        return {code:0,stdout:JSON.stringify(value)};
+      });
+      return {transport,calls,cacheRoot};
+    }
+    const runRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/work/'));
+    const presyncRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/presync/'));
+    it('ships only delta leaves with no env, then the run claims them as a checksum basis and verifies',async()=>{
+      const f=await setup(),t=presyncTransport(f);
+      const round=await remote.presync({cwd:repo,exec:t.transport,sshOptions:[],env:{GITHUB_TOKEN:'ghs_secret',ANTHROPIC_API_KEY:'sk-secret',PATH:process.env.PATH}});
+      expect(round).toMatchObject({status:'synced',count:1,bytes:7});
+      const state=await remote.readPresyncState(gitDir());
+      expect(state.baseManifestDigest).toBe(f.base.manifestDigest);
+      const [copy]=presyncRsync(t.calls);
+      expect(copy.args).toEqual(expect.arrayContaining(['--no-links','--safe-links','--delete']));
+      expect(copy.args.at(-1)).toBe(`forge:/srv/forge-exec/presync/${state.key}/`);
+      // Only the changed public leaf is cached: no credentials, deletions or unchanged files.
+      expect((await fs.readdir(join(t.cacheRoot,state.key))).sort()).toEqual(['a.test.mjs']);
+      expect(((await fs.stat(join(t.cacheRoot,state.key))).mode&0o777)).toBe(0o711);
+      for(const call of t.calls.filter(c=>c.file!=='git')) {
+        expect(call.env).toBeUndefined();
+        expect(JSON.stringify(call)).not.toMatch(/ghs_secret|sk-secret/);
+      }
+      const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]});
+      expect(result).toMatchObject({mode:'remote',code:0});
+      const [shipped]=runRsync(t.calls);
+      expect(shipped.args).toEqual(expect.arrayContaining(['--checksum',`--copy-dest=/srv/forge-exec/presync/${state.key}/`,'--no-links','--safe-links','--no-recursive']));
+      expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'delta',presyncClaimed:{count:1,bytes:7}});
+    },30_000);
+    it('catches a wrong cached basis with the Forge manifest check and retries a full ship',async()=>{
+      const f=await setup(),t=presyncTransport(f,{tamper:true});
+      expect((await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
+      const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]});
+      // Never a pass on the wrong bytes: the delta run is refused, the full ship runs clean.
+      expect(result).toMatchObject({mode:'remote',code:0});
+      const ships=runRsync(t.calls);
+      expect(ships).toHaveLength(2);
+      expect(ships[1].args.some(a=>a.startsWith('--copy-dest='))).toBe(false);
+      expect(result.timings.filter(s=>s.stage==='rsync').every(s=>s.shipMode==='delta-then-full')).toBe(true);
+    },30_000);
+    it.each(['other base','edited after presync','other host','corrupt state','no state'])('offers no basis for a stale or mismatched presync: %s',async fault=>{
+      const f=await setup(),t=presyncTransport(f);
+      expect((await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
+      const path=join(gitDir(),'forge-presync.json'),state=JSON.parse(await fs.readFile(path,'utf8'));
+      if(fault==='other base')state.baseManifestDigest='0'.repeat(64);
+      if(fault==='other host')state.host='elsewhere';
+      await fs.writeFile(path,fault==='corrupt state'?'{':JSON.stringify(state));
+      if(fault==='no state')await fs.rm(path);
+      if(fault==='edited after presync')await fs.writeFile(join(repo,'a.test.mjs'),'edited again');
+      const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]});
+      expect(result).toMatchObject({mode:'remote',code:0});
+      const [shipped]=runRsync(t.calls);
+      expect(shipped.args.some(a=>a.startsWith('--copy-dest=')||a==='--checksum')).toBe(false);
+      expect(result.timings.find(s=>s.stage==='rsync').presyncClaimed).toEqual({count:0,bytes:0});
+    },30_000);
+    it.each(['rsync fails','cache dir refused','ssh throws'])('records a presync failure and leaves the run unchanged: %s',async fault=>{
+      const f=await setup(),t=presyncTransport(f,{presyncCopyCode:fault==='rsync fails'?23:0,mkdirCode:fault==='cache dir refused'?1:0});
+      const transport=fault==='ssh throws'?vi.fn(async call=>{if(call.file==='ssh')throw new Error('ssh down');return t.transport(call);}):t.transport;
+      const round=await remote.presync({cwd:repo,exec:transport,sshOptions:[]});
+      expect(round.status).toBe('failed');
+      const state=await remote.readPresyncState(gitDir());
+      expect(state.error).toEqual(expect.any(String));
+      expect(state.files).toBeUndefined();
+      await expect(fs.stat(join(gitDir(),'forge-presync.lock'))).rejects.toMatchObject({code:'ENOENT'});
+      const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]});
+      expect(result).toMatchObject({mode:'remote',code:0});
+      expect(runRsync(t.calls)[0].args.some(a=>a.startsWith('--copy-dest='))).toBe(false);
+    },30_000);
+    it('holds one round per lane and takes over only a dead holder lock',async()=>{
+      const f=await setup(),t=presyncTransport(f),lock=join(gitDir(),'forge-presync.lock');
+      await fs.writeFile(lock,`${process.pid}\n`);
+      expect(await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).toEqual({status:'busy'});
+      expect(t.calls.some(c=>c.file!=='git')).toBe(false);
+      const dead=spawnSync(process.execPath,['-e','process.stdout.write(String(process.pid))']).stdout.toString();
+      await fs.writeFile(lock,`${dead}\n`);
+      expect((await remote.presync({cwd:repo,exec:t.transport,sshOptions:[]})).status).toBe('synced');
+    },30_000);
+    it('reuses a cached base manifest only when it hashes to the freshly advertised digest',async()=>{
+      const f=await setup(),t=presyncTransport(f);
+      const fetches=()=>t.calls.filter(c=>c.file==='ssh'&&c.args.at(-1).endsWith(' base-manifest')).length;
+      expect((await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]})).mode).toBe('remote');
+      expect(fetches()).toBe(1);
+      expect(await remote.readCachedBaseManifest(gitDir(),'forge',f.base.manifestDigest)).toEqual(f.base.manifest);
+      expect((await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]})).mode).toBe('remote');
+      expect(fetches()).toBe(1);
+      // A valid cache for another host is never used.
+      expect(await remote.readCachedBaseManifest(gitDir(),'elsewhere',f.base.manifestDigest)).toBeUndefined();
+      // Tampered bytes under the right digest label are refetched.
+      const path=join(gitDir(),'forge-presync-base.json'),record=JSON.parse(await fs.readFile(path,'utf8'));
+      record.wire.hashes[0]='0'.repeat(64);await fs.writeFile(path,JSON.stringify(record));
+      expect(await remote.readCachedBaseManifest(gitDir(),'forge',f.base.manifestDigest)).toBeUndefined();
+      expect((await remote.runRemote({argv:f.request.argv,cwd:repo,exec:t.transport,log:vi.fn(),sshOptions:[]})).mode).toBe('remote');
+      expect(fetches()).toBe(2);
+    },30_000);
+    it('starts the next round detached with only PATH, HOME and SSH_AUTH_SOCK',()=>{
+      const spawnFn=vi.fn(()=>({on(){},unref(){}}));
+      remote.spawnPresync({cwd:repo,host:'forge',env:{PATH:'/bin',HOME:'/h',SSH_AUTH_SOCK:'/s',GITHUB_TOKEN:'ghs_secret',ANTHROPIC_API_KEY:'sk-secret'},spawnFn});
+      const [file,args,options]=spawnFn.mock.calls[0];
+      expect(file).toBe(process.execPath);
+      expect(args.slice(1)).toEqual(['presync','--host=forge']);
+      expect(options).toMatchObject({cwd:repo,detached:true,stdio:'ignore'});
+      expect(options.env).toEqual({PATH:'/bin',HOME:'/h',SSH_AUTH_SOCK:'/s'});
+    });
+  });
 });
 
 // The warm tick's process boundary is injected: no network or registry access.

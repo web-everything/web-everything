@@ -277,6 +277,16 @@ describe('killProcessTree', () => {
     expect(sent).toEqual([40, 11, 10]);
   });
 
+  it('orphansOfGroup never kills a group member whose parent is outside the group (a pipeline sibling such as tee)', () => {
+    // Leading the group does not prove ancestry: `verify-lane | tee` puts tee in verify-lane's group with the shell
+    // (outside the group) as its parent. A Linux subreaper-adopted orphan looks the same, so it is left to the env
+    // marker and output-pipe sweeps rather than widening this one (Codex audit of #6141).
+    const sent = [];
+    const ps = ['900 1 5', '10 77 77', '11 10 77', '42 900 77', '77 900 77'].join('\n');
+    killProcessTree(10, 'SIGKILL', { orphansOfGroup: 77, selfPid: 77, listProcesses: () => ps, kill: (pid) => sent.push(pid) });
+    expect(sent).toEqual([11, 10]);
+  });
+
   it('also kills escaped descendants found by the env marker and by the caller output pipes, never self or init', () => {
     const sent = [];
     const asked = {};
@@ -296,6 +306,9 @@ describe('killProcessTree', () => {
     killProcessTree(child.pid, 'SIGKILL');
     await closed;
     await new Promise((r) => setTimeout(r, 200));
-    expect(() => process.kill(grandchild, 0)).toThrow();
+    // Its parent died too, so a Linux subreaper (Forge's runner supervisor) may hold it as an unreaped zombie, where
+    // kill(pid, 0) still succeeds. Dead means gone or zombie; an unreadable probe is not dead.
+    const { pidIdentity } = await import('../pid-alive.mjs');
+    expect(pidIdentity(grandchild)).toMatchObject({ alive: false });
   });
 });

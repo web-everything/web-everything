@@ -64,7 +64,7 @@ export function createStaleStateReader({
     };
     try {
       const scan = () => {
-        const status = JSON.parse(exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'], { cwd: root }));
+        const status = JSON.parse(exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json', '--max-age-ms=0'], { cwd: root }));
         if (!Array.isArray(status.lanes)) throw new Error('status returned no lanes array');
         return status.lanes.map(lane => {
           let ahead = null;
