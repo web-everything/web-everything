@@ -1782,6 +1782,24 @@ describe('detached jobs', () => {
     expect(JSON.parse(child.stdout)).toEqual({ status: 'done', exitCode: 0, resultPath: record.resultPath });
   });
 
+  it.each([['--job=aliased', '--wait=150000'], ['--id=aliased', '--wait=250'], ['--id=aliased', '--max-ms=250']])(
+    'wait CLI accepts %s %s (short-call alias for agent callers) and reports a completed job', (idFlag, waitFlag) => {
+    const record = { id: 'aliased', pid: process.pid, status: 'done', exitCode: 0, resultPath: 'result.json' };
+    writeJobRecord(record, { jobsDir });
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', idFlag, waitFlag], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024, env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ status: 'done', exitCode: 0, resultPath: record.resultPath });
+  });
+
+  it('wait CLI rejects a --wait below 250 as a usage error like --max-ms', () => {
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', '--job=x', '--wait=20'], {
+      encoding: 'utf8', timeout: 4000, env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(child.status).toBe(2);
+  });
+
   it('bounds a never-resolving reader by the requested 250 ms deadline', async () => {
     const maxMs = 250;
     const readRecord = vi.fn(() => new Promise(() => {}));

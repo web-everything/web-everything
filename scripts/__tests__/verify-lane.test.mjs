@@ -695,6 +695,17 @@ describe('verify-lane check --wait= (#4358) — a bounded internal wait, one CLI
     expect(json.waited.ms).toBeGreaterThanOrEqual(200);
   });
 
+  it('warns on stderr when --wait exceeds 170000ms (agent Bash calls over ~180s are backgrounded) but still waits', () => {
+    runVerify('true');
+    const long = runCheckWait(200_000);
+    expect(long.code).toBe(0);
+    expect(long.stderr).toMatch(/170000/);
+    expect(long.stderr).toMatch(/--wait=150000/);
+    const ok = runCheckWait(150_000);
+    expect(ok.code).toBe(0);
+    expect(ok.stderr).not.toMatch(/170000/);
+  });
+
   it('rejects a non-positive/non-numeric --wait as a usage error (exit 3), never a silent 0ms wait', () => {
     for (const bad of ['0', '-5', 'nope']) {
       const { code, json } = runCheckWait(bad);
