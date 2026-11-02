@@ -695,6 +695,41 @@ describe('verify-lane check --wait= (#4358) — a bounded internal wait, one CLI
     expect(json.waited.ms).toBeGreaterThanOrEqual(200);
   });
 
+  it('warns on stderr when --wait exceeds 170000ms (agent Bash calls over ~180s are backgrounded) but still waits', () => {
+    runVerify('true');
+    const long = runCheckWait(200_000);
+    expect(long.code).toBe(0);
+    expect(long.stderr).toMatch(/170000/);
+    expect(long.stderr).toMatch(/--wait=150000/);
+    const ok = runCheckWait(150_000);
+    expect(ok.code).toBe(0);
+    expect(ok.stderr).not.toMatch(/170000/);
+  });
+
+  it('warns above 170000ms without shortening the actual CLI wait budget', () => {
+    runRequestOnly(); // keep the marker running, so the deadline must be consumed
+    const preload = `
+      let now = Date.now();
+      Date.now = () => now;
+      const timer = globalThis.setTimeout;
+      globalThis.setTimeout = (callback, ms, ...args) => {
+        now += ms;
+        return timer(callback, 0, ...args);
+      };`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      VERIFY_LANE, 'check', '--wait=200000', '--json'], {
+      cwd: dir, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(2);
+    expect(child.stderr).toContain('exceeds 170000 ms');
+    expect(child.stderr).toContain('--wait=150000');
+    expect(child.stderr).not.toContain('clamped');
+    const result = JSON.parse(child.stdout);
+    expect(result).toMatchObject({ status: 'timeout', lastStatus: 'running', settled: false,
+      waited: { ms: 200000 } });
+  });
+
   it('rejects a non-positive/non-numeric --wait as a usage error (exit 3), never a silent 0ms wait', () => {
     for (const bad of ['0', '-5', 'nope']) {
       const { code, json } = runCheckWait(bad);

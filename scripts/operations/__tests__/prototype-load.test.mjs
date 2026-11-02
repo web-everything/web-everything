@@ -52,6 +52,7 @@ function fixture(options = {}) {
   const fs = {
     readFileSync(p) {
       reads.push(p);
+      if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
       if (p === '/home/test/canonical-audits.jsonl') {
@@ -459,13 +460,37 @@ describe('prototype-load canonical audit admission', () => {
     expect(out.fallback).toContain(`--head=${MERGE}`);
     expect(f.calls).toEqual([]);
   });
-  it.each(['invalid', '', null, false, 0])('unknown mode %j is treated as refuse', async mode => {
+  it.each(['invalid', '', null, false, 0, {}, { nested: {} }, { nested: 'warn' }, [], ['warn']].map(mode => [mode]))('unknown mode %j is treated as refuse', async mode => {
     const f = auditedFixture(mode);
     const out = await f.run();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
       canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
     expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
     expect(f.calls).toEqual([]);
+  });
+  it.each([
+    ['platform empty object', {}, undefined, 'refuse'],
+    ['platform nested empty object', { nested: {} }, undefined, 'refuse'],
+    ['platform nested warn', { nested: 'warn' }, undefined, 'refuse'],
+    ['platform array', [], undefined, 'refuse'],
+    ['platform refuse', 'refuse', undefined, 'refuse'],
+    ['tool empty object over platform warn', 'warn', {}, 'refuse'],
+    ['tool empty object over platform refuse', 'refuse', {}, 'refuse'],
+    ['explicit tool warn over invalid platform', {}, 'warn', 'warn'],
+    ['explicit tool refuse over invalid platform', {}, 'refuse', 'refuse'],
+  ])('%s preserves scalar mode precedence', async (_, platformMode, toolMode, expectedMode) => {
+    const f = auditedFixture(toolMode, {
+      env: { WE_PLATFORM_PREFERENCES_FILE: '/home/test/platform-preferences.json' },
+      platformSettings: { canonicalAuditMode: platformMode },
+    });
+    const out = await f.run();
+    expect(out.canonicalAudit).toMatchObject({ mode: expectedMode, ok: false, reason: 'no-record' });
+    if (expectedMode === 'refuse') {
+      expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit' });
+      expect(f.calls).toEqual([]);
+    } else {
+      expect(out).toMatchObject({ ok: true, registered: true });
+    }
   });
 });
 describe('default combined-tree test proof', () => {
