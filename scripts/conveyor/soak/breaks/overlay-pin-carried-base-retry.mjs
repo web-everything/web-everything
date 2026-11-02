@@ -21,6 +21,8 @@ export default {
       setup(w) {
         w.env.WE_DAEMON_CLONE_LOCK_ROOT = join(w.root, 'clone-lock');
         w.env.WE_DAEMON_OVERLAY_DIR = join(w.root, 'daemon-overlays');
+        // This replay requires all four registrations to exercise the carried-base retry path.
+        w.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
         w.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
         w.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
         w.env.WE_DAEMON_OVERLAY_STACK_MODE = 'tops';

@@ -14,11 +14,15 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
+let loadN = 0;
 async function load(args = []) {
-  vi.resetModules();
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
-  return import('../pr-land.mjs');
+  // Re-evaluate the module-scope flags without rebuilding the entire transitive graph.
+  // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
+  // @vite-ignore: under --coverage the variable query is otherwise rewritten into a glob map that
+  // has no `?fresh=N` key ("Unknown variable dynamic import"); the plain specifier resolves normally.
+  return import(/* @vite-ignore */ `../pr-land.mjs?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
