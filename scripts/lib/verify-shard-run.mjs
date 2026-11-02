@@ -3,7 +3,7 @@ import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { tmpdir as nodeTmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { readRemoteReport } from './verify-remote-routing.mjs';
+import { readRemoteReport, shouldConfirmRemoteRed } from './verify-remote-routing.mjs';
 import { killProcessTree } from './bounded-child.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
@@ -94,12 +94,13 @@ async function acquireLocalDefault({ cwd, env, remainingMs }) {
 // A selected path the config excludes (e.g. a trial directory) can never execute under ANY run, local or CI; it is
 // named loudly and dropped instead of turning every run red, while every runnable file still has to run and pass.
 const VITEST_SELECT_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'forge-vitest-select.mjs');
+const canonical = p => { try { return nodeFs.realpathSync(p); } catch { return resolve(p); } };
 function discoverDefault({ files, cwd }) {
   try {
     const out = execFileSync(process.execPath, [VITEST_SELECT_SCRIPT, JSON.stringify({ options: { watch: false, run: true }, filters: files })],
       { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
     const found = JSON.parse(out);
-    return Array.isArray(found) ? new Set(found.map(f => resolve(String(f)))) : null;
+    return Array.isArray(found) ? new Set(found.map(f => canonical(String(f)))) : null;
   } catch { return null; }
 }
 
@@ -112,15 +113,13 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     if (!positive(parallel) || !Number.isSafeInteger(budgetMs) || budgetMs < 0) throw Error('invalid parallelism or budget');
     const planned = splitVitestArgs(argv, 1).shards.flat();
     const found = planned.length ? discover({ files: planned, cwd }) : null;
-    const excluded = found ? planned.filter(f => !found.has(resolve(cwd, f))) : [];
+    let excluded = found ? planned.filter(f => !found.has(canonical(resolve(cwd, f)))) : [];
+    // Discovery that rejects EVERY selected file is more likely a path/config mismatch than a fully excluded selection:
+    // keep them all so any file that really cannot run shows up as INVENTORY-INCOMPLETE (red) instead of a vacuous green.
+    if (excluded.length === planned.length) excluded = [];
     if (excluded.length) {
       log(`verify-shards: NOTE ${excluded.length} selected file(s) are excluded by the vitest config (never runnable here or in CI), not run: ${excluded.join(' ')}\n`);
       argv = argv.filter(a => !excluded.includes(a));
-    }
-    if (excluded.length === planned.length && planned.length) {
-      const ok = argv.includes('--passWithNoTests');
-      log(`verify-shards: ${ok ? 'GREEN' : 'RED'} (no selected file is runnable under the vitest config${ok ? '; --passWithNoTests' : ''})\n`);
-      return ok ? 0 : 1;
     }
     const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
     const deadline = now() + budgetMs, results = new Array(shards.length);
@@ -137,6 +136,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
+        let lastResult = null;
         async function attempt(local) {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${local ? 'local' : 'initial'}.json`);
@@ -145,6 +145,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             args: local ? args : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
             files, report, remoteReport, cwd, env: local ? { ...childEnv, [ADMISSION_HELD_ENV]: '1' } : childEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
+          lastResult = result;
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
           let inventory;
           try { inventory = inventoryVerdict(fs.readFileSync(report, 'utf8'), files, cwd); }
@@ -160,7 +161,10 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             const lines = readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding));
             remote = lines.length > 0 && lines.every(r => r.location === 'remote');
           } catch { /* Unknown location cannot authorize replacing a red verdict. */ }
-          if (remote && ['FAIL', 'INVENTORY-INCOMPLETE'].includes(status)) {
+          // Same predicate verify-lane uses: a signal, timeout or infrastructure exit (e.g. 137) is never replaced by a local pass.
+          if (remote && ['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
+            && shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: lastResult.exitCode, signal: lastResult.signal,
+              timedOut: lastResult.timedOut, ranOn: { location: 'remote', failureLocation: 'remote' } })) {
             log(`verify-shard ${index + 1}/${shards.length}: remote red; confirming locally\n`);
             if (!remaining()) status = 'NOT-RUN';
             else {

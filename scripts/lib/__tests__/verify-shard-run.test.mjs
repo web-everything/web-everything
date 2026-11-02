@@ -21,9 +21,9 @@ function fixture(modes = [], budgetMs = 100, parallel = 1, acquire = async () =>
     calls.push({ command, args, files, env, timeoutMs });
     const mode = modes[calls.length - 1] ?? 'pass';
     if (mode === 'timeout') { time += timeoutMs; return { exitCode: 124, timedOut: true }; }
-    if (mode !== 'unreadable') reports.set(report, JSON.stringify({ testResults: (mode === 'missing' ? [] : files).map(name => ({ name, status: mode === 'red' || mode === 'remote-red' ? 'failed' : 'passed', assertionResults: [{ status: 'passed' }] })) }));
-    if (mode === 'remote-red') reports.set(remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
-    return { exitCode: ['red', 'remote-red'].includes(mode) ? 1 : 0 };
+    if (mode !== 'unreadable') reports.set(report, JSON.stringify({ testResults: (mode === 'missing' ? [] : files).map(name => ({ name, status: mode === 'red' || mode === 'remote-red' || mode === 'remote-red-137' ? 'failed' : 'passed', assertionResults: [{ status: 'passed' }] })) }));
+    if (mode === 'remote-red' || mode === 'remote-red-137') reports.set(remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
+    return { exitCode: mode === 'remote-red-137' ? 137 : ['red', 'remote-red'].includes(mode) ? 1 : 0 };
   };
   const run = () => runShards({ argv: ['npx', 'vitest', 'run', 'a', 'b', 'c'], shards: 3, parallel, budgetMs }, { discover,
     fs, execute, now: () => time, tmpdir: () => '/scratch', log: s => lines.push(s), env: {},
@@ -117,9 +117,14 @@ describe('config-excluded selected files', () => {
     expect(f.calls.flatMap(c => c.files)).toEqual(['a', 'b', 'c']);
     expect(f.lines.join('')).not.toMatch(/NOTE/);
   });
-  it('nothing runnable is red without --passWithNoTests', async () => {
+  it('discovery that rejects every file is treated as unreliable: all files stay selected', async () => {
     const f = fixture([], 100, 1, undefined, () => new Set());
-    expect(await f.run()).toBe(1);
-    expect(f.calls).toEqual([]);
+    await f.run();
+    expect(f.calls.flatMap(c => c.files)).toEqual(['a', 'b', 'c']);
+  });
+  it('a remote infrastructure exit (137) is never replaced by a local pass', async () => {
+    const f = fixture(['remote-red-137']);
+    expect(await f.run()).not.toBe(0);
+    expect(f.lines.join('')).not.toMatch(/confirming locally/);
   });
 });
