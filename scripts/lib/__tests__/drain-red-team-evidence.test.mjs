@@ -489,8 +489,10 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
         pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
     expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
-      failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false });
+      failedSeatCount: variant === 'live-head seat' ? 1 : 0,
+      scheduled: variant === 'live-head seat', inFlight: false });
   });
+
 
 it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
   'counts failed %s seats only for the exact repo/PR/head', (status, failedSeatCount, completedRecorded) => {

@@ -151,8 +151,8 @@ export default {
         { status: 'not-owed', policy: 'card-only' },
         { status: 'not-owed', reason: 'review verdict is needs-human, not accept' },
       ].entries()) {
-        replay({ name: '#5890 accepted code head with contradictory not-owed',
-          pr: 9310 + index, redTeam, loopPayload: codePayload });
+        replay({ name: '#5890 R100 accepted code head with not-owed is policy-clear',
+          pr: 9310 + index, redTeam, loopPayload: codePayload, policyExpected: true });
       }
       const codeResult = await runRedTeam({ repo, pr: 9300, loopPayload: codePayload, env }, producerIo);
       check(providerChecks > 0 && codeResult.status === 'skipped' && codeResult.policy !== 'card-only',

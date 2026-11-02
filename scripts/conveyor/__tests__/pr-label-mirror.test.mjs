@@ -628,6 +628,7 @@ describe('#5647 single ruling-needed writer', () => {
       'review-ledger-check.mjs': 'read-only label family comparison',
       'conveyor/pr-lifecycle.mjs': 'lifecycle render vocabulary',
       'lib/pr-state/holds/label-input.mjs': 'hold vocabulary',
+      'lib/review-labels.mjs': 'read-only R130 delegated-clearance ineligible-label vocabulary',
       'conveyor/review-hold-reconcile.mjs': 'read-only sweep diagnostics',
       'conveyor/referral-auto-block.mjs': 'documentation of the ruling signal',
       'conveyor/review-hold-ledger-shadow.mjs': 'documentation of the shadow input',

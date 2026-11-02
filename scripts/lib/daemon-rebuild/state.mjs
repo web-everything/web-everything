@@ -57,7 +57,8 @@ const EMPTY_STATE = Object.freeze({
  * @param {string} root
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {{adopted:object|null, rejected:object|null, inProgress:object|null, quarantine:object|null,
- *   unverified:{head:string, prevHead:string}|null, building:object|null, smokePassed:Array<{key:string, tree:string, passedAt:string}>|null}}
+ *   unverified:{head:string, prevHead:string, quick?:boolean, sha?:string, adoptedAt?:string, deadline?:number, token?:string, pid?:number, procStart?:string, jobId?:string}|null,
+ *   building:object|null, smokePassed:Array<{key:string, tree:string, passedAt:string}>|null}}
  */
 export function readRebuildState(root, env = process.env) {
   try {

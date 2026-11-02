@@ -503,7 +503,7 @@ describe('review-job red-team skip settlement', () => {
     expect(f.io.log).toHaveBeenCalledWith(expect.stringContaining('settlement unavailable'));
   });
 
-  it.each([false, true])('not-owed on an accepted head publishes needs-you (redTeamOnly=%s)', redTeamOnly => {
+  it.each([false, true])('not-owed on an accepted head settles policy-clear without an alert (redTeamOnly=%s)', redTeamOnly => {
     const root = mkdtempSync(join(tmpdir(), 'review-not-owed-'));
     const postComment = vi.fn(), publishNeedsYou = vi.fn();
     try {
@@ -522,14 +522,12 @@ describe('review-job red-team skip settlement', () => {
       expect(f.io.runRedTeam).toHaveBeenCalledOnce();
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
       expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({
-        redTeam: { status: 'not-owed' }, repo, pr, head, readHead: head,
+        redTeam: { status: 'not-owed' }, repo, pr, head, readHead: head, accepted: true,
       }));
-      expect(publishNeedsYou).toHaveBeenCalledOnce();
-      expect(publishNeedsYou.mock.calls[0][0]).toMatchObject({
-        repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
-      });
-      expect(postComment).not.toHaveBeenCalled();
-      expect(out.redTeam.outcome).toBe('non-policy');
+      expect(publishNeedsYou).not.toHaveBeenCalled();
+      expect(postComment).toHaveBeenCalledOnce();
+      expect(postComment.mock.calls[0][0].body).toContain('not-owed on an accepted head');
+      expect(out.redTeam.outcome).toBe('policy-clear');
       expect(f.events).toEqual(['queued', 'red-team', 'settle', 'finished', 'gate']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
