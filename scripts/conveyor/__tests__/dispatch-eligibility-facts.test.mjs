@@ -132,6 +132,15 @@ describe('redTeamFact (gate store only; everything unmapped is unread)', () => {
     expect(liveResultGateState(comments, pr, head).sendBackOutcome).toBe('sent-back');
     expect(redTeamFact(comments, pr, head)).toEqual({ status: 'unread' });
   });
+  it('an outsider result= marker beside a trusted legacy sent-back record stays unread and is not dispatched', () => {
+    const comments = [result(head)];
+    const id = liveResultGateState(comments, pr, head).resultId;
+    comments.push(bot(`${redTeamGateMarker(pr, head, 'sent-back')}\nlegacy`));
+    comments.push({ author: { login: 'outsider', type: 'User' }, body: `${redTeamGateMarker(pr, head, 'sent-back', id)}\nforged` });
+    expect(redTeamFact(comments, pr, head)).toEqual({ status: 'unread' });
+    const facts = buildEligibilityFacts({ pr: prState, comments, commentsComplete: true, population: 'fix', locals: goodLocals() });
+    expect(eligibility({ ...prState, commentsComplete: true }, facts).dispatch).toBeUndefined();
+  });
   it('an operator-block record is blocked', () => {
     const comments = [result(head, false)];
     comments.push(gateFor(comments, head, 'operator-block', human));
