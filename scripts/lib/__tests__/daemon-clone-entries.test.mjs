@@ -39,6 +39,8 @@ function fixture() {
 }
 const plistJSON = (f, plist) => JSON.stringify({ WorkingDirectory: f.root, ...plist });
 
+// @repo-scanning-test scope=full - walks `scripts/` and `skills-src/` to prove nothing wires the clone discovery
+// (registered in repo-scan-tests.mjs; the manifest itself is excluded below because it only names this test).
 it('keeps clone discovery unwired pending inert-source proof', () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), '../../..');
   const references = [];
@@ -48,7 +50,7 @@ it('keeps clone discovery unwired pending inert-source proof', () => {
       if (entry.isDirectory()) {
         if (!['__tests__', 'soak', 'node_modules'].includes(entry.name)) visit(path);
       } else if (entry.isFile() && /\.[cm]?[jt]s$/.test(path) && !/\.(test|spec)\./.test(path)
-        && path !== 'scripts/lib/daemon-clone-entries.mjs') {
+        && !['scripts/lib/daemon-clone-entries.mjs', 'scripts/lib/repo-scan-tests.mjs'].includes(path)) {
         if (/daemon-clone-entries|\bcloneRuntimeEntries\b/.test(readFileSync(join(root, path), 'utf8'))) references.push(path);
       }
     }

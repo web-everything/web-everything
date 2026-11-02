@@ -35,6 +35,7 @@ describe('selectScanTests', () => {
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],
       ['scripts/lib/__tests__/permission-change.test.mjs', 'full'],
+      ['scripts/lib/__tests__/daemon-clone-entries.test.mjs', 'full'],
     ]);
   });
 
