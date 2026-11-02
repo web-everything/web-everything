@@ -460,6 +460,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // review-job.mjs (the default dispatch mode, which the daemon runs) — its own direct imports. review-job is
   // matched by REVIEW_CODE_PATH_RE; the rest of its imports (dispatch-lane-io, review-dispatch, review-independence,
   // review-extra-seats, jury-core, write-all-sync) are covered above.
+  // Review child heap caps and the settings the helper reads at runtime must stay current together.
+  'scripts/lib/node-heap-cap.mjs', 'scripts/settings/node-heap-cap.json',
   // red-team skip settlement, run evidence and status liveness: direct imports of review-job.mjs
   'scripts/lib/red-team-skip-outcome.mjs', 'scripts/lib/red-team-run-result.mjs',
   'scripts/lib/pid-alive.mjs', 'scripts/operations/needs-you-feed.mjs',

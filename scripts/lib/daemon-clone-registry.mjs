@@ -52,6 +52,7 @@ const SEP = path.sep;
  *   - `wev-merge-daemon`     — com.we.conveyor-pass-daemon.merge-orphan-sweep
  *   - `wev-health-watch`     — com.we.health-watch
  *   - `wev-host-sampler`     — com.webeverything.host-sampler, com.webeverything.claude-otel-collector
+ *   - `wev-pass-readers`     — the 12 reader pass daemons (R418)
  *   - `plateau-drain-daemon` — com.plateau.drain-daemon
  *   - `.lanes/we-drain-daemon/lane-1` — the WE drain's own dedicated clone (docs/agent/platform-decisions.md
  *     #resident-daemon-reload-lifecycle) — NOT a pool lane: never leased/refreshed like one, rebuilt the same
@@ -67,6 +68,7 @@ export const DAEMON_CLONE_SEED = [
   'wev-health-watch',
   'wev-health-responder',
   'wev-host-sampler',
+  'wev-pass-readers',
   'plateau-drain-daemon',
   `.lanes${SEP}we-drain-daemon${SEP}lane-1`,
   `.lanes${SEP}we-drain-daemon${SEP}code`,
@@ -133,6 +135,7 @@ function readRecords(env) {
   try { entries = readdirSync(dir); } catch { return out; }
   for (const name of entries) {
     if (!name.endsWith('.json')) continue; // skips the sibling `.events.jsonl` audit trail too
+    if (name.includes('.json.')) continue; // sidecars such as `<key>.json.main-sync.json` are not overlay records
     try {
       const file = path.join(dir, name);
       out.push({ file, record: JSON.parse(readFileSync(file, 'utf8')) });

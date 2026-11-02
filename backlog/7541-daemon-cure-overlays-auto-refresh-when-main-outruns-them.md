@@ -97,3 +97,7 @@ In we:scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs (injected git/co
 - A Codex judge that reads `overlay-refresh-needs-judge` entries and proposes a resolution for the operator to accept.
 - Health-watch bundle-repair: route its `unresolvable-conflict` stop into this same kick.
 - Prune stale `.auto-rebase/*.lock` files (some date from 10-25) in the lease reaper.
+
+## Held-card additions (2026-11-01, themes: loader and overlay lifecycle)
+
+- Live overlay tops that conflict with main are never refreshed automatically (overlay-main-sync-failed fires repeatedly on review/health-watch tops -1101a; #6159 auto-retire correctly skips them as unmerged). After N consecutive sync failures for a live top, build a refreshed top on current main in a lane, run the combined test, and swap it via prototype-load --replace; conflicts it cannot resolve raise one needs-you with the file list.

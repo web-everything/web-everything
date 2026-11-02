@@ -67,6 +67,7 @@ describe('runner freshness policy', () => {
         "clear-claim",
         "clear-stuck-session",
         "close-items",
+        "codex-audit",
         "daemon-status",
         "dispatch-eligibility",
         "dispatch-lane",
@@ -129,6 +130,7 @@ describe('runner freshness policy', () => {
         "unpark",
         "verify",
         "why",
+        "worker-capacity",
       ]
     `);
     for (const name of ['close-items', 'reopen-items', 'graduate-chain', 'prototype-load', 'routing-override']) {
