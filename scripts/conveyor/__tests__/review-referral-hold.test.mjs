@@ -1066,3 +1066,38 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
     });
   });
 });
+
+
+describe('R372 accepted same-head CI rerun release', () => {
+  const marker = h => `<!-- pr-ci-cancelled-rerun: ${repo}#3481@${h} -->`;
+  function accepted() {
+    const r = run();
+    r.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
+    r.verdict = r.findings.referralVerdict;
+    return reviewRunEvidence(r);
+  }
+  const acceptedPr = comments => pr({ labels: [{ name: 'review:accepted' }], comments: [
+    comment(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, at), ...comments,
+  ] });
+  it('releases an accepted unchanged head once after a trusted CI rerun marker', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).toBeNull();
+    expect(decideSameHeadHold(p, [accepted(), { ...accepted(), startedAt: at + 2, completedAt: at + 3 }],
+      { repo, now: at + 4 })).not.toBeNull();
+  });
+  it('releases a stacked accept without a reviewed-sha stamp', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.comments.shift();
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).toBeNull();
+  });
+  it.each(['missing', 'foreign-head', 'untrusted', 'old', 'not-accepted', 'pending', 'no-verdict'])('keeps the hold when accepted + same head + CI-only gap is unproven (%s)', mode => {
+    const c = comment(marker(mode === 'foreign-head' ? 'b'.repeat(40) : head), mode === 'old' ? at - 1 : at + 1,
+      mode === 'untrusted' ? 'stranger' : 'web-everything');
+    const p = acceptedPr(mode === 'missing' ? [] : [c]);
+    let row = accepted();
+    if (mode === 'not-accepted') row = evidence();
+    if (mode === 'pending') row = { ...row, pending: ['unknown-gap'] };
+    if (mode === 'no-verdict') row = { ...row, verdict: undefined };
+    expect(decideSameHeadHold(p, [row], { repo, now: at + 2 })).not.toBeNull();
+  });
+});

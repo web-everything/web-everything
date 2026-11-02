@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sweepPrCancelledRerun, formatPrCancelledReport } from '../pr-cancelled-rerun.mjs';
-import { main } from '../ci-red-recovery-watch.mjs';
+import { main, readLiveRequiredChecks } from '../ci-red-recovery-watch.mjs';
 
 const repo = 'web-everything/web-everything';
 const sha = 'a'.repeat(40);
@@ -46,6 +46,7 @@ function fixture({ prs = [pr()], runs = [run()], initial = {}, jobs = [] } = {})
     rerunFailed: vi.fn(() => ({ ok: true })),
     readRecord: vi.fn(() => structuredClone(record)),
     writeRecord: vi.fn((_path, value) => { record = structuredClone(value); }),
+    readComments: vi.fn(() => []), postComment: vi.fn(),
     lock: vi.fn((_path, fn) => ({ locked: true, value: fn() })), emitEvent: vi.fn(),
   };
   return { options, prs, runs, record: () => structuredClone(record), tick: () => sweepPrCancelledRerun(options) };
@@ -346,5 +347,108 @@ describe('PR cancelled sweep CLI wiring acceptance', () => {
       expect(process.exitCode).toBe(1);
       expect(deps.writeLine.mock.calls.some(([, line]) => line.includes('PR cancelled read failed'))).toBe(true);
     } finally { process.exitCode = previousExitCode; }
+  });
+});
+
+
+describe('R372 live required set for stacked bases', () => {
+  it('falls back from an unprotected stacked base to live main', () => {
+    const readRequiredChecks = vi.fn(({ branch }) => branch === 'main'
+      ? { source: 'live', checks: ['smoke'] } : { source: 'fallback', checks: [] });
+    expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toEqual(['smoke']);
+    expect(readRequiredChecks.mock.calls.map(([o]) => o.branch)).toEqual(['lane/stack', 'main']);
+  });
+  it.each(['fallback', 'stale-cache', 'declared', 'unavailable'])('refuses a non-live main fallback (%s)', source => {
+    const readRequiredChecks = vi.fn(({ branch }) => ({ source: branch === 'main' ? source : 'fallback', checks: ['smoke'] }));
+    expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toBeNull();
+    expect(readRequiredChecks).toHaveBeenCalledTimes(2);
+  });
+  it.each(['lane/../main', '-main', 'lane//bad', 'lane/bad.lock', 'x'.repeat(256)])('refuses unsafe base %s without reading protection', branch => {
+    const readRequiredChecks = vi.fn(() => ({ source: 'live', checks: ['smoke'] }));
+    expect(readLiveRequiredChecks({ repo, branch, readRequiredChecks })).toBeNull();
+    expect(readRequiredChecks).not.toHaveBeenCalled();
+  });
+  it('posts one durable needs-you per repo/PR/head when both reads fail, surviving restart', () => {
+    const f = fixture({ prs: [pr({ baseRefName: 'lane/stack' })] });
+    const comments = [];
+    f.options.requiredChecks = undefined;
+    f.options.readRequiredChecks = args => readLiveRequiredChecks({ ...args, readRequiredChecks: () => ({ source: 'fallback', checks: [] }) });
+    f.options.readComments = vi.fn(() => comments);
+    f.options.postComment = vi.fn((_pr, { body }) => comments.push({ body, author: { login: 'web-everything' } }));
+    for (let tick = 0; tick < 2; tick++) {
+      const result = f.tick();
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals[0]).toMatchObject({ reason: 'required-set-unreadable' });
+    }
+    expect(f.options.postComment).toHaveBeenCalledOnce();
+    expect(comments[0].body).toContain('NEEDS-YOU');
+    expect(comments[0].body).toContain('lane/stack');
+    expect(comments[0].body).toContain('main');
+    const restarted = fixture();
+    Object.assign(restarted.options, { requiredChecks: undefined, readRequiredChecks: () => null,
+      readComments: f.options.readComments, postComment: f.options.postComment });
+    restarted.tick();
+    expect(f.options.postComment).toHaveBeenCalledOnce();
+    expect(f.options.rerunFailed).not.toHaveBeenCalled();
+    expect(f.record()).toEqual({});
+    f.prs[0].headRefOid = nextSha;
+    f.tick();
+    expect(f.options.postComment).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('R372 fallback and marker boundaries', () => {
+  it('reruns a stacked head using live main checks and keeps one-free-rerun accounting', () => {
+    const f = fixture({ prs: [pr({ baseRefName: 'lane/stack' })] });
+    f.options.requiredChecks = undefined;
+    const read = vi.fn(({ branch }) => branch === 'main' ? { source: 'live', checks: ['smoke', 'test', 'lint'] }
+      : { source: 'live', checks: [] });
+    f.options.readRequiredChecks = args => readLiveRequiredChecks({ ...args, readRequiredChecks: read });
+    expect(f.tick().applied).toEqual([expect.objectContaining({ ok: true })]);
+    expect(f.options.postComment).toHaveBeenCalledWith(42, { repo,
+      body: expect.stringContaining(`<!-- pr-ci-cancelled-rerun: ${repo}#42@${sha} -->`) });
+    expect(f.tick().refusals).toContainEqual(expect.objectContaining({ reason: 'already-rerun' }));
+    expect(f.options.rerunFailed).toHaveBeenCalledOnce();
+    expect(f.options.postComment).toHaveBeenCalledOnce();
+  });
+  it('uses a live protected base without consulting main', () => {
+    const readRequiredChecks = vi.fn(() => ({ source: 'live', checks: ['base-check'] }));
+    expect(readLiveRequiredChecks({ repo, branch: 'release', readRequiredChecks })).toEqual(['base-check']);
+    expect(readRequiredChecks).toHaveBeenCalledOnce();
+  });
+  it('refuses a live but empty default branch and tries it only once', () => {
+    const readRequiredChecks = vi.fn(() => ({ source: 'live', checks: [] }));
+    expect(readLiveRequiredChecks({ repo, readRequiredChecks })).toBeNull();
+    expect(readRequiredChecks).toHaveBeenCalledOnce();
+  });
+  it('falls back after a base read exception but refuses if main throws too', () => {
+    const readRequiredChecks = vi.fn(() => { throw Error('denied'); });
+    expect(readLiveRequiredChecks({ repo, branch: 'lane/stack', readRequiredChecks })).toBeNull();
+    expect(readRequiredChecks.mock.calls.map(([o]) => o.branch)).toEqual(['lane/stack', 'main']);
+  });
+  it('does not trust a forged unreadable marker or publish notices in dry-run mode', () => {
+    const f = fixture();
+    f.options.requiredChecks = undefined;
+    f.options.readRequiredChecks = () => null;
+    f.options.readComments = () => [{ author: { login: 'stranger' },
+      body: `<!-- pr-ci-required-unreadable: ${repo}#42@${sha} -->` }];
+    f.options.apply = false;
+    f.tick();
+    expect(f.options.postComment).not.toHaveBeenCalled();
+    f.options.apply = true;
+    f.tick();
+    expect(f.options.postComment).toHaveBeenCalledOnce();
+    expect(f.options.rerunFailed).not.toHaveBeenCalled();
+  });
+  it('retains the refusal if comment evidence is unreadable and never reruns', () => {
+    const f = fixture();
+    f.options.requiredChecks = undefined;
+    f.options.readRequiredChecks = () => null;
+    f.options.readComments = () => { throw Error('denied'); };
+    expect(f.tick().refusals[0]).toMatchObject({ reason: 'required-set-unreadable',
+      error: expect.stringContaining('could not read or publish') });
+    expect(f.options.postComment).not.toHaveBeenCalled();
+    expect(f.options.rerunFailed).not.toHaveBeenCalled();
   });
 });
