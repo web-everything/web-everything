@@ -22,6 +22,8 @@ function canonicalArgument(path) {
   }
 }
 
+const NODE_SAFE_FLAGS = new Set(['--no-warnings', '--enable-source-maps', '--trace-warnings']);
+
 export function cloneRuntimeEntries({ root, entries = [], env = process.env,
   launchAgentsDir = join(env.HOME || homedir(), 'Library', 'LaunchAgents'), run = spawnSync,
 }) {
@@ -69,6 +71,11 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
           && [path, rel].some(entry => !['.mjs', '.js', '.cjs'].includes(extname(entry)))) {
           throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
         }
+      }
+      // Allowlist, not denylist: before the script, only these inert node flags are accepted.
+      if (!scriptSeen && index >= (args[0] === '/usr/bin/env' ? 2 : 1) && arg.startsWith('-')
+        && !arg.startsWith('--pass=') && !NODE_SAFE_FLAGS.has(arg) && !/^--(?:repo|path|watch)(?:=|$)/.test(arg)) {
+        throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
       }
       if (isAbsolute(arg) || arg.startsWith('--pass=')) continue;
       if (/^--(?:import|require|(?:experimental-)?loader)(?:=|$)/.test(arg)
