@@ -2,10 +2,12 @@
 kind: decision
 size: 3
 parent: "5467"
-status: open
+status: resolved
 scaffoldedBy: "post-accept-advisory"
 dateScaffolded: "2026-11-01"
 dateOpened: "2026-11-01"
+dateResolved: "2026-11-01"
+codifiedIn: "docs/agent/platform-decisions.md#post-accept-advisory-cards"
 tags: [review]
 relatedTo: ["5471", "5472", "x5vjl3o"]
 ---
@@ -39,26 +41,25 @@ Screen: clear (rescreen, fresh agent): rules on merge and review policy, invisib
 Fork-existence: the flawed branch is "nothing forces a push", which would merge a confirmed bug; "everything forces a push" is Fork 1 (c). The line sits between, so where to draw it is a real either/or.
 
 - (a) **A finding forces a push when its impact is not in `CARDABLE_IMPACTS` (so `broken`, `unrecoverable`, or unstated), or `requiresMandatoryReferral` is true, or it is a security finding, or any `roundCardsRefusal` guard fires (default).** The rule calls the 5471 function and does not restate it. "Security finding" is the one addition to the 5471 split: the review seat's security lens tags it, and it forces a push at any impact.
-- (b) Only confirmed broken correctness or security; unstated impact is carded. Fewer pushes, but a missing label then silently downgrades a finding.
-- (c) A wider list that also pushes `degraded` findings on a trust boundary (auth, secrets, writes outside the repo). Safer, but a second list to maintain; rejected as a config extension of (a), not a separate branch.
+Minor variants of (a), folded in as configuration and not separate branches: carding unstated impact (fail-open, so a missing label would silently downgrade a finding), and a wider list that also pushes `degraded` findings on a trust boundary (auth, secrets, writes outside the repo). The merit: (a) fails closed on unstated impact; the variants fail open.
 
 **Default: (a).** Fail closed on doubt. A CI failure or a drain re-check failure is not a review finding and still blocks as today.
 
 Skeptic: SURVIVES-WITH-AMENDMENT. Folded in: the rule reuses the 5471 function and `requiresMandatoryReferral` rather than restating them; "exactly the 5471 split" claim removed; security tag named as the one addition; guard failures force a push.
-Screen: flagged(prio) (rescreen, fresh agent) -> merge (b) and (c) into (a) as config variants and state the merit as fail-closed vs fail-open on unstated impact. Not applied: the one fix-and-rescreen allowed was spent; for the operator to rule or send back.
+Screen: flagged(prio), edit applied on ratification (R370): minor options folded into (a).
 
 ## Fork 3 — End rule and evidence bar
 
 Fork-existence: the flawed branches are "ship on with no evidence" and "shadow forever": the first changes what merges without measurement, the second never removes the churn. The bar has to be named.
 
-- (a) **Steady state is `on`; `off` is the kill switch; the setting is `review.postAcceptAdvisory.mode` (off | shadow | on) through the policy cascade (default).** Promotion from `shadow` to `on` needs at least 20 shadow PRs that EACH carried at least one would-have-carded finding, with a named detector: in shadow the fixer still pushes, so the fixer's diff journals whether each would-have-carded finding was a real defect (fixer-confirmed, or re-rated by a later review). One `broken` re-rate counts against promotion. After promotion, the mode drops back to `shadow` on a post-merge defect traced to a carded finding (detector: a carded finding re-rated `broken`, or a revert of the merge), or if open carded lines from this rule exceed a count set in the build child.
+- (a) **Steady state is `on`; `off` is the kill switch; the setting is `review.postAcceptAdvisory.mode` (off | shadow | on) through the policy cascade (default).** One evidence bar: promotion from `shadow` to `on` needs at least 20 PRs that EACH carried at least one would-have-carded finding, plus a named real-defect detector (in shadow the fixer still pushes, so the fixer's diff journals whether each would-have-carded finding was a real defect: fixer-confirmed, or re-rated by a later review). One `broken` re-rate counts against promotion. After promotion the mode drops back to `shadow` on a post-merge defect traced to a carded finding (a carded finding re-rated `broken`, or a revert of the merge). Other thresholds (days, card-debt count) are tuning set in the build child.
 - (b) Ship `on` directly with only the replay of the three PRs as evidence.
 - (c) Shadow only, report only.
 
 **Default: (a).** Staging and the cascade wiring live in the build child x5vjl3o; only the bar and the end rule are decided here. Same pattern as 5469 and the 5471 `roundBudget`.
 
 Skeptic: SURVIVES-WITH-AMENDMENT. Folded in: the promotion bar now counts only PRs that had would-have-carded findings, names a detector (fixer diff journal or re-rate), and adds a revert detector and a card-debt trigger to the end rule.
-Screen: flagged(prio) (rescreen, fresh agent) -> reduce to the evidence bar and end rule as one ratified default; thresholds (20 PRs, 14 days, card-debt count) are tuning, and off|shadow|on staging is rollout order. Not applied: the one fix-and-rescreen allowed was spent; for the operator to rule or send back.
+Screen: flagged(prio), edit applied on ratification (R370): cut to one evidence bar.
 
 ## Composition with the round budget (K=3) and `healDeltaReview` (5472) — not a fork
 
@@ -75,7 +76,7 @@ Assume it shipped and failed. The likely stories:
 1. Cards pile up and are never fixed (card debt). Mitigation: the count and the cards' fix rate are reported (build A3); one card per PR, not one per finding.
 2. A real bug was classed `degraded` and merged. Mitigation: only confirmed broken, security or unknown block; shadow mode measures this before `on`; the end rule drops back to shadow on a traced defect.
 3. A fixer or reviewer learns to label findings `degraded` to avoid a push. Mitigation: impact comes from the review verdict, not the PR author; finding text is data.
-4. The shadow window is too small to show anything. Mitigation: 20 PRs or 14 days, whichever is later, and the replay of the three live PRs.
+4. The shadow window is too small to show anything. Mitigation: the 20-PR bar (each with a would-have-carded finding) and the replay of the three live PRs.
 5. The card filing fails. Mitigation: the card is filed BEFORE the merge; if filing fails the accept is not merged and the PR stays parked, never merges silently.
 6. Card debt grows without a cap. Mitigation: a card-debt trigger in the Fork 3 end rule drops the mode to shadow.
 
@@ -110,3 +111,14 @@ The rule trusts review verdicts and ledger rows, never the PR author's text. Fin
 5. **Identity scoping** — the accept is per PR, bound to the reviewed head.
 6. **State over time** — a new head from anyone else voids the accept as today.
 7. **Who wrote it** — impact is assigned by the review verdict only.
+
+## Ratified — 2026-11-01 (R370)
+
+Operator, 2026-11-01 19:21 ET, verbatim: "Ratify xu34pnv with edits". The two screen edits are applied above (Fork 2 minor options folded into (a); Fork 3 cut to one evidence bar). Ratified defaults:
+
+- Fork 1: (a) cards, no push.
+- Fork 2: (a) a push is forced by impact broken/unrecoverable/unstated, a mandatory referral, a security finding, or a fired guard.
+- Fork 3: (a) shadow, then on, with off as the kill switch.
+- Round budget K=3 and card 5472 (`healDeltaReview`) untouched.
+
+Codified in `we:docs/agent/platform-decisions.md#post-accept-advisory-cards`. Build child: x5vjl3o.
