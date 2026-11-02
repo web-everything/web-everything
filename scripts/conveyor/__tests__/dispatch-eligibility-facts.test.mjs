@@ -126,6 +126,12 @@ describe('redTeamFact (gate store only; everything unmapped is unread)', () => {
     const id = liveResultGateState(comments, pr, head).resultId;
     expect(redTeamFact(comments, pr, head).value).toEqual({ state: 'send-back', resultId: id, sendBackResultId: id });
   });
+  it('a legacy sent-back marker WITHOUT result= is unread, never a fabricated digest binding', () => {
+    const comments = [result(head)];
+    comments.push(bot(`${redTeamGateMarker(pr, head, 'sent-back')}\nlegacy`));
+    expect(liveResultGateState(comments, pr, head).sendBackOutcome).toBe('sent-back');
+    expect(redTeamFact(comments, pr, head)).toEqual({ status: 'unread' });
+  });
   it('an operator-block record is blocked', () => {
     const comments = [result(head, false)];
     comments.push(gateFor(comments, head, 'operator-block', human));

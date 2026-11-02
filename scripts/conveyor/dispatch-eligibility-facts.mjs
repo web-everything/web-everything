@@ -1,6 +1,6 @@
 /** Pure adapters from read evidence to fail-closed dispatch eligibility facts. */
 import { known, unread, POPULATIONS } from './dispatch-eligibility.mjs';
-import { liveResultGateState } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, parseRedTeamGateMarker } from '../lib/red-team-gate.mjs';
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -50,7 +50,15 @@ export function redTeamFact(comments, prNumber, head) {
   const bound = state => known({ state, resultId: s.resultId, sendBackResultId: state === 'send-back' ? s.resultId : null });
   if (s.outcomes.has('operator-block')) return bound('blocked');
   if (s.sendBackOutcome === 'round-cap') return bound('held');
-  if (s.sendBackOutcome === 'sent-back') return bound('send-back');
+  if (s.sendBackOutcome === 'sent-back') {
+    // Fail closed: only a marker that NAMES this result may bind a send-back; a legacy marker without `result=`
+    // is associated by thread order, which is not a digest binding.
+    const named = comments.some(c => {
+      const m = parseRedTeamGateMarker(typeof c === 'string' ? c : c?.body);
+      return m?.pr === Number(prNumber) && m.rev === head.toLowerCase() && m.outcome === 'sent-back' && m.result === s.resultId;
+    });
+    return named ? bound('send-back') : unread();
+  }
   return unread();
 }
 
