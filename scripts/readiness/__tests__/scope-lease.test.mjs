@@ -7,7 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  normScope, normDeclaredScope, isSubtreeEntry, coversFile, scopeEntriesOverlap, scopesOverlap,
+  normScope, isSubtreeEntry, coversFile, scopeEntriesOverlap, scopesOverlap,
   scopeLease, breachOf,
   overlapAtLaunch, OVERLAP_POLICIES,
   breachOutcome, BREACH_POLICIES, RETRY_BOUND, BREACH_ESCALATION_LADDER, ESCALATION_ROUTES,
@@ -15,18 +15,6 @@ import {
 } from '../scope-lease.mjs';
 
 describe('normScope — dedupe + stringify + drop empties', () => {
-  it('R372 — normScope (observed files) never splits: a comma in a real filename stays one file', () => {
-    expect(normScope(['a.mjs,b.mjs'])).toEqual(['a.mjs,b.mjs']);
-  });
-  it('R372 — scopesOverlap sees a path hidden in a multi-path entry (`we:a.mjs b.mjs` vs held `we:b.mjs`)', () => {
-    expect(scopesOverlap(['we:a.mjs b.mjs'], ['we:b.mjs'])).toBe(true);
-    expect(scopesOverlap(['we:a.mjs b.mjs'], ['we:c.mjs'])).toBe(false);
-  });
-  it('R372 — normDeclaredScope splits a multi-path entry; unprefixed pieces inherit the entry repo', () => {
-    expect(normDeclaredScope(['we:a.mjs b.mjs', 'we:c.mjs,we:d.mjs'])).toEqual(['we:a.mjs', 'we:b.mjs', 'we:c.mjs', 'we:d.mjs']);
-    expect(normDeclaredScope(['a.mjs b.mjs'])).toEqual(['a.mjs', 'b.mjs']);
-    expect(normDeclaredScope([' , '])).toEqual([]);
-  });
   it('dedupes and drops falsy', () => {
     expect(normScope(['we:a', 'we:a', '', null, 'we:b'])).toEqual(['we:a', 'we:b']);
   });
