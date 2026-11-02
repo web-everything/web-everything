@@ -5,6 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
+import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
 export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
@@ -18,6 +19,20 @@ export function readyEvidence(records, input) {
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   return record ? { source: 'ready-record', record } : null;
+}
+/** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
+ * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
+ * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
+ * whole change, not just its last commit). */
+export function canonicalAuditEvidence(records, sha, covers = () => true) {
+  const bases = new Set(records.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base));
+  let pass = null;
+  for (const base of bases) {
+    const record = findAudit(records, { head: sha, base, questionHash: QUESTION_HASH });
+    if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
+    if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+  }
+  return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 export function changedPaths(text) {
@@ -45,7 +60,7 @@ export function refusal(records, ref, since, alerts = false) {
     && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(r.kind || r.event || r.type || '')));
 }
 export function prototypeLoadOperation() {
-  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace'].map((key) => [key, { type: 'string', required: false, default: '' }]));
+  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms'].map((key) => [key, { type: 'string', required: false, default: '' }]));
   input['dry-run'] = { type: 'boolean', required: false, default: false };
   // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
   input.retire = { type: 'boolean', required: false, default: false };
@@ -53,7 +68,7 @@ export function prototypeLoadOperation() {
     input, verdictFrom: 'assess',
     load: effect({ reads: Object.keys(input).map((key) => `input.${key}`),
       effects: ({ input: values }) => [{ type: PROTOTYPE_LOAD_EFFECT,
-        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'] }, idempotent: false }] }),
+        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'], waitAdoptionMs: values['wait-adoption-ms'] }, idempotent: false }] }),
     assess: compute({ reads: ['findings.load'], fn: ({ findings }) => {
       const entry = findings.load?.effects?.[0];
       if (entry?.status !== 'applied' || !entry.result) throw new Error('prototype-load: transaction did not complete');

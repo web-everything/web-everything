@@ -1,0 +1,11 @@
+{
+  "description": "V8 old-space caps for review child processes and the review and fix daemons themselves. Child caps are twice measured peak RSS with a 1024 MB floor. Daemon caps (2026-11-02, 37 review and 51 fix passes) sit above heapTotal max 2297/2303 MB; the launchd templates carry the same flag and the host plists must be redeployed from them.",
+  "floorMb": 1024,
+  "caps": {
+    "review-job": 2400,
+    "review-set-label": 1024,
+    "review-extra-seats": 1536,
+    "review-daemon": 4608,
+    "fix-daemon": 4096
+  }
+}

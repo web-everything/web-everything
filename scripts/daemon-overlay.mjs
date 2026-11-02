@@ -285,7 +285,68 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
     const repo = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
     return planRetirements({ rows: [entry], git, gh, repo: repo.code === 0 ? repo.stdout.trim() : '' })[0];
   });
+  if (result?.action === 'retire') return result;
+  // Only a branch that is GONE from origin can have been squash-merged and deleted; anything else stays as proved above.
+  if (!result || result.reason === 'fetch-failed') {
+    const squash = proveSquashMerged({ root, entry, env, run });
+    if (squash) return squash;
+  }
   return result?.action ? result : { ref: entry.ref, action: 'keep', reason: result?.reason || 'unprovable' };
+}
+
+/**
+ * A squash merge leaves the branch tip off main and (after deletion) unfetchable, so the ancestry proof cannot see it.
+ * Prove it from GitHub instead: the ref is absent on origin, exactly ONE merged PR headed it, that PR's head commit is
+ * the tip, and its merge commit is an ancestor of origin/main. Any missing, unreadable or ambiguous answer returns null.
+ * @returns {{ref:string, action:'retire', reason:'pr-squash-merged', tip:string, pr:number, evidence:object}|null}
+ */
+export function proveSquashMerged({ root, entry, env = process.env, run = spawnSync }) {
+  if (entry.edgeResolution) return null;
+  if (remoteTip({ root, ref: entry.ref, env, run }) !== null) return null; // still on origin (or unreadable): not this case
+  const gh = (args) => { const r = run('gh', args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
+  const repo = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+  const slug = repo.code === 0 ? repo.stdout.trim() : '';
+  if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
+  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'merged', '--json', 'number,state,headRefName,headRefOid,mergeCommit', '--limit', '10']);
+  if (list.code !== 0) return null;
+  let prs;
+  try { prs = JSON.parse(list.stdout || 'null'); } catch { return null; }
+  if (!Array.isArray(prs)) return null;
+  const hits = prs.filter((p) => p?.headRefName === entry.ref && p?.state === 'MERGED');
+  if (hits.length !== 1) return null;
+  const [pr] = hits;
+  if (Number.isInteger(entry.pr) && entry.pr !== pr.number) return null;
+  const tip = String(pr.headRefOid ?? '');
+  const mergeOid = String(pr.mergeCommit?.oid ?? '');
+  if (!/^[0-9a-f]{40}$/.test(tip) || !/^[0-9a-f]{40}$/.test(mergeOid) || !Number.isInteger(pr.number)) return null;
+  const landed = withScratchFetch({ root, env, run, prefix: 'we-daemon-overlay-squash-', refspecs: ['+refs/heads/main:refs/remotes/origin/main'] },
+    (git) => git(['merge-base', '--is-ancestor', mergeOid, 'origin/main']).code === 0);
+  if (landed !== true) return null;
+  return { ref: entry.ref, action: 'retire', reason: 'pr-squash-merged', tip, pr: pr.number,
+    evidence: { refGone: true, prState: 'MERGED', mergeCommit: mergeOid, prVia: 'head-ref' } };
+}
+
+/** The single open origin PR headed by `ref`, or null (none, several, or incomplete evidence).
+ * Fork branches with the same name cannot authorize dropping an origin overlay when their PR closes. */
+export function inferPrNumber({ root, ref, env = process.env, run = spawnSync }) {
+  try {
+    const call = (cmd, args) => { const r = run(cmd, args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
+    const origin = call('git', ['remote', 'get-url', 'origin']);
+    if (origin.code !== 0 || !origin.stdout.trim()) return null;
+    // gh's default repository can be an upstream or GH_REPO; overlays always load refs from origin.
+    const repo = call('gh', ['repo', 'view', origin.stdout.trim(), '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    const slug = repo.code === 0 ? repo.stdout.trim() : '';
+    if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
+    const list = call('gh', ['pr', 'list', '--repo', slug, '--head', ref, '--state', 'open', '--json', 'number,headRefName,headRepository,isCrossRepository', '--limit', '5']);
+    if (list.code !== 0) return null;
+    const prs = JSON.parse(list.stdout || 'null');
+    // A full page cannot prove uniqueness. Leave --pr to the operator rather than infer from a partial list.
+    if (!Array.isArray(prs) || prs.length >= 5) return null;
+    const hits = prs.filter((p) => p?.headRefName === ref && Number.isSafeInteger(p?.number) && p.number > 0
+      && p.isCrossRepository === false && typeof p.headRepository?.nameWithOwner === 'string'
+      && p.headRepository.nameWithOwner.toLowerCase() === slug.toLowerCase());
+    return hits.length === 1 ? hits[0].number : null;
+  } catch { return null; }
 }
 
 /** Put a dropped registration back (same fields, at the end of the list) in ONE store write. Entries with an approved
@@ -338,7 +399,8 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
     if (list.some((o) => o?.ref === record.ref)) { clearPending(root, env, record.ref); settled.push({ ref: record.ref, outcome: 'still-registered' }); continue; }
     const tipNow = tip(record.ref);
     const newNow = record.newRef ? tip(record.newRef) : undefined;
-    if (tipNow === record.tip && (!record.newRef || newNow === record.newTip)) {
+    // A squash-merged retire was proved on a DELETED branch: only a still-deleted branch confirms it.
+    if ((record.refGone === true ? tipNow === null : tipNow === record.tip) && (!record.newRef || newNow === record.newTip)) {
       clearPending(root, env, record.ref);
       appendOverlayEvent(root, { kind: record.kind === 'replace' ? 'replaced' : 'auto-retired', ref: record.ref, by, tip: record.tip, recovered: true }, { env });
       settled.push({ ref: record.ref, outcome: 'drop-confirmed' });
@@ -377,7 +439,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     const proof = prove(entry);
     if (proof.action !== 'retire') return refuse('not-proved', { proof });
     if (proof.tip !== expectedTip) return refuse('tip-moved', { proof, tipNow: proof.tip });
-    addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, at: new Date().toISOString() });
+    addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, ...(proof.evidence?.refGone === true ? { refGone: true } : {}), at: new Date().toISOString() });
     let removed;
     try {
       ({ removed } = removeOverlay(root, ref, { env, why: proof.reason, expectedOverlay: entry }));
@@ -386,7 +448,9 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
     deps.afterDrop?.(); // test seam: a process killed here leaves the intent for settlePendingDrops
     let after;
     try { after = tip(ref); } catch { after = undefined; } // an exception is an unreadable tip: restore
-    if (after !== expectedTip) {
+    // A squash-merged branch is deleted on origin: its tip reads null, and the PR's recorded head is the proof, and a branch back on origin (even at that tip) restores the registration.
+    const tipHeld = proof.evidence?.refGone === true ? after === null : after === expectedTip;
+    if (!tipHeld) {
       const restored = restoreRegistration(root, entry, env);
       clearPending(root, env, ref);
       appendOverlayEvent(root, { kind: 'auto-retire-reverted', ref, by, tip: expectedTip, tipNow: after ?? null, restored }, { env });
@@ -654,6 +718,10 @@ async function main() {
     pr = Number(flags.pr);
     if (!Number.isInteger(pr)) return fail(`--pr must be an integer, got ${JSON.stringify(flags.pr)}`);
   }
+  // Record the PR when GitHub knows exactly one open PR for the ref, so a later retire can follow it.
+  // Hermetic runs pin WE_DAEMON_OVERLAY_STACK_BASES (no live GitHub); WE_DAEMON_OVERLAY_INFER_PR=1 turns the lookup back on.
+  const liveGithub = process.env.WE_DAEMON_OVERLAY_STACK_BASES === undefined || process.env.WE_DAEMON_OVERLAY_INFER_PR === '1';
+  if (pr == null && liveGithub && (cmd === 'add' || cmd === 'replace')) pr = inferPrNumber({ root, ref: flags.ref, env: process.env });
   const reason = typeof flags.reason === 'string' ? flags.reason : null;
   const by = typeof flags.by === 'string' ? flags.by : (process.env.USER || null);
   // `--pinned`: the rebuild refuses (keeps the current tree) rather than ever conflict-drop this overlay.

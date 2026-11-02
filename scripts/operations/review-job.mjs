@@ -7,6 +7,7 @@ import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
+import { resolveFinalHeadSeats, decideFinalHeadSeats } from '../lib/review-final-head-seats.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { readRun, writeRun } from './run-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
@@ -84,6 +85,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
@@ -102,7 +104,7 @@ import { publishAttention } from './needs-you-feed.mjs';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './dispatch-lane-io.mjs';
@@ -321,7 +323,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
+  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -485,7 +487,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
       exec: (f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
-      const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
+      const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
         '--to=restamp', '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`],
       { cwd: planReviewDispatch({ pr, repo }).laneRepo, env, encoding: 'utf8', timeout: 180e3 });
       return { ok: r.status === 0, reason: String(r.stderr || r.stdout || r.error || `exit ${r.status}`) };
@@ -594,6 +596,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    // R365 fix 5 — `review.finalHeadSeats` (see `../lib/review-final-head-seats.mjs`) and the PR's live head.
+    finalHeadSeatsSetting: () => resolveFinalHeadSeats({ env }),
+    liveHead: ({ pr, repo }) => {
+      try { return JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })).headRefOid ?? null; } catch { return null; }
+    },
     // Read the existing quota and queue signals; never invent a second outage detector.
     reviewInfraBlock: () => {
       const now = Date.now();
@@ -623,6 +630,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const fd = openSync(handle.logFile, 'w');
       try {
         const child = spawn(process.execPath, [
+          ...heapCapArgs('review-extra-seats'),
           'scripts/operations/review-extra-seats.mjs', 'red-team-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
           `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
         ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
@@ -860,7 +868,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   if (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function') {
     let extraSeats;
     try {
-      extraSeats = io.runExtraSeats(seatsBox.input);
+      let gate;
+      try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
+      extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
     } catch (e) {
       extraSeats = { status: 'error', reason: tail(e?.message ?? e, 300) };
     }
@@ -1020,6 +1030,25 @@ export function prepareReviewArc(input, io) {
   } catch (e) {
     throw Error(`review lane setup failed: ${tail(e?.message ?? e, 300)}; inspect the PR head and retry`);
   }
+}
+
+/** R365 fix 5 — gate the added seats on the final head. Fail-open: any lookup problem runs the seats. */
+function finalHeadSeatsGate(input, io) {
+  let setting;
+  try { setting = io.finalHeadSeatsSetting?.(); } catch { setting = null; }
+  if (!setting) return { run: true, skip: false, reason: 'no final-head setting' };
+  let d = decideFinalHeadSeats({ loopPayload: input.loopPayload, setting });
+  // Only a potential final head needs supersession evidence. Off, definitive changes
+  // (including shadow), and missing verdicts already have a decision without a lookup.
+  if (d.reason === 'final head') {
+    let liveHead = null;
+    try { liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo }) ?? null; } catch { liveHead = null; }
+    d = decideFinalHeadSeats({ loopPayload: input.loopPayload, liveHead, setting });
+  }
+  if (d.reason !== 'final head' && d.reason !== 'final-head seats off') {
+    io.log(`review-job: final-head seats (${setting.mode}): ${d.skip ? 'SKIP' : 'would skip (shadow, running)'} — ${d.reason}`);
+  }
+  return d;
 }
 
 function runReviewArc({
@@ -1365,10 +1394,10 @@ export function dispatchReviewJob({
 
 /** The real detached spawn: stdout/stderr appended to the job's own log, the child unref'd so the daemon's
  *  event loop never waits on it. */
-export function defaultSpawnJob({ argv, cwd, env, logPath }) {
+export function defaultSpawnJob({ argv, cwd, env, logPath }, { spawnChild = spawn } = {}) {
   const fd = openSync(logPath, 'a');
   try {
-    const child = spawn(process.execPath, argv, { cwd, env, detached: true, stdio: ['ignore', fd, fd] });
+    const child = spawnChild(process.execPath, [...heapCapArgs('review-job'), ...argv], { cwd, env, detached: true, stdio: ['ignore', fd, fd] });
     child.unref();
     return child.pid;
   } finally {
@@ -1471,7 +1500,7 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
       `**Stacked accept carried forward.** This PR was accepted against #${m.bottom}'s head (\`${m.bottomRef}\` @ ${String(m.contained).slice(0, 12)}).`,
       `#${m.bottom} is no longer below it, and its net diff vs main is byte-identical to the accepted diff (fingerprint \`${m.fingerprint.slice(0, 16)}\`), so the accept stands without another review.`,
     ].join('\n\n'), 'utf8');
-    const res = run([join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`, '--to=accepted',
+    const res = run([...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`, '--to=accepted',
       `--actor=${UNATTENDED_REVIEW_ACTOR}`, `--body-file=${bodyPath}`, `--expect-head=${head}`, `--expect-fingerprint=${fingerprint}`],
     { cwd: root, encoding: 'utf8', timeout: 180e3, env: { ...env, [ACTOR_ENV]: `review-stack-carry-${randomUUID()}` } });
     try { rmSync(bodyPath, { force: true }); } catch { /* tmp */ }
