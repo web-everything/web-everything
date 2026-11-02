@@ -4,6 +4,7 @@
     "excludeStackedAwaitingBase": true,
     "excludeFocus": true,
     "focusRefs": [
+      "lane/rebuild-spawner-reader-thin",
       "lane/pr-limit-focus-exempt",
       "lane/overlay-sync-conflict-stop",
       "lane/r375-stale-referral-shadow",
