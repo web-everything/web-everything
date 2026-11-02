@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
   fixPushGate, reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
+import * as reviewTiming from '../review-timing.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 const head = 'a'.repeat(40);
@@ -190,4 +191,122 @@ it('push gating refuses unknown required evidence and waits for remaining requir
   const args = { previousHeadChecks: [check('test')], firstHeldAt: 0, now: 0, policy: { ...fix, pushAfterCi: true } };
   for (const requiredChecks of [null, undefined, []]) expect(fixPushGate({ ...args, requiredChecks }).action).toBe('wait');
   expect(fixPushGate({ ...args, requiredChecks: ['test', 'smoke'], previousHeadChecks: [check('test', 'failure'), check('smoke', null, { status: 'queued' })] }).action).toBe('wait');
+});
+
+
+describe('R359 early start shadow (xtxt36v / xrz0ezn)', () => {
+  const policy = { ...review, earlyStartShadow: true, earlyStartCare: ['none', 'low'],
+    earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: ['code'] };
+  const args = { headSha: head, checks: [check('test', null, { status: 'in_progress' })],
+    requiredChecks: ['test'], verifyGreen: true, care: 'low', lines: 100, files: 3,
+    kinds: ['code'], isDraft: false, policy };
+  const shadow = overrides => reviewTiming.earlyStartShadow({ ...args, ...overrides });
+  const waits = result => {
+    expect(result).toEqual({ wouldStartEarly: false, reason: expect.any(String), mergeAllowed: false });
+    expect(result.reason.length).toBeGreaterThan(0);
+  };
+
+  it('waits on incomplete or malformed CI evidence and never throws', () => {
+    for (const requiredChecks of [null, undefined, []]) waits(shadow({ requiredChecks }));
+    for (const checks of [[], [{}], [null], null, undefined]) waits(shadow({ checks }));
+  });
+  it('waits when a required check row is missing, unreadable, or belongs to another head', () => {
+    waits(shadow({ requiredChecks: ['test', 'smoke'] }));
+    waits(shadow({ checks: [{ name: 'test' }] }));
+    waits(shadow({ checks: [check('test', null, { status: 'in_progress', head_sha: 'other-head' })] }));
+  });
+  it('waits on unknown status values and completed checks without a conclusion', () => {
+    waits(shadow({ checks: [check('test', null, { status: 'garbage' })] }));
+    waits(shadow({ checks: [check('test', null, { status: 'completed' })] }));
+  });
+  it('waits on a malformed conclusion or head_sha field', () => {
+    waits(shadow({ checks: [check('test', null, { status: 'in_progress', conclusion: 'garbage' })] }));
+    waits(shadow({ checks: [check('test', null, { status: 'in_progress', head_sha: 0 })] }));
+  });
+  it('waits on padded or upper-case conclusions that ciRedOnHead would not read as red', () => {
+    for (const conclusion of [' failure ', 'FAILURE']) waits(shadow({ checks: [check('test', conclusion, { status: 'completed' })] }));
+  });
+  it('waits when an unrelated row has a malformed head_sha', () => {
+    waits(shadow({ checks: [...args.checks, { name: 'smoke', status: 'in_progress', head_sha: 123 }] }));
+  });
+  it('waits on sparse arrays', () => {
+    waits(shadow({ kinds: new Array(1) }));
+    waits(shadow({ requiredChecks: new Array(1) }));
+    waits(shadow({ checks: new Array(1) }));
+  });
+  it('waits on a conclusion without a status', () => {
+    waits(shadow({ checks: [{ name: 'test', conclusion: 'success' }] }));
+  });
+  it('waits on a sparse array that also carries an extra property', () => {
+    const holey = Object.assign(new Array(1), { extra: true });
+    waits(shadow({ kinds: holey }));
+    waits(shadow({ requiredChecks: holey }));
+  });
+  it('waits when an explicit row kind does not match its fields', () => {
+    waits(shadow({ checks: [{ __typename: 'CheckRun', name: 'test', state: 'success' }] }));
+    waits(shadow({ checks: [{ __typename: 'Mystery', name: 'test', status: 'in_progress' }] }));
+  });
+  it('waits on raw rows that collapse away or contradict themselves', () => {
+    waits(shadow({ checks: [{ name: 'test', status: 'in_progress', head_sha: 123 }, ...args.checks] }));
+    waits(shadow({ checks: [{ name: 'test', state: 'failure', conclusion: 'success' }] }));
+  });
+  it('waits on an unfinished check that already carries a conclusion', () => {
+    waits(shadow({ checks: [{ name: 'test', status: 'in_progress', conclusion: 'success' }] }));
+  });
+  it('exports a pure earlyStartShadow decision', () => {
+    expect(reviewTiming.earlyStartShadow).toBeTypeOf('function');
+  });
+  it('defaults to shadow-off and explicitly disables evaluation', () => {
+    for (const off of [review, { ...policy, earlyStartShadow: false }])
+      expect(shadow({ policy: off })).toEqual({ wouldStartEarly: false, reason: 'shadow-off', mergeAllowed: false });
+  });
+  it.each(['none', 'low'])('would start verified %s-care code, including drafts, at inclusive limits', care => {
+    for (const isDraft of [false, true]) {
+      const result = shadow({ care, isDraft, lines: 400, files: 12 });
+      expect(result).toEqual({ wouldStartEarly: true, reason: expect.any(String), mergeAllowed: false });
+      expect(result.reason.length).toBeGreaterThan(0);
+    }
+  });
+  it.each(['elevated', 'high'])('waits for %s care', care => waits(shadow({ care })));
+  it.each(['docs', 'config', 'data'])('waits when kinds contain %s alongside code', kind => {
+    waits(shadow({ kinds: ['code', kind] }));
+  });
+  it.each(['care', 'lines', 'files', 'kinds', 'verifyGreen', 'headSha'])('fails closed on absent %s', key => {
+    for (const value of [undefined, null]) {
+      const result = shadow({ [key]: value });
+      waits(result);
+      if (key === 'care') expect(result.reason).toBe('missing-care');
+    }
+  });
+  it.each([
+    ['care', 'unknown'], ['care', ''], ['lines', NaN], ['lines', -1], ['lines', '100'],
+    ['files', NaN], ['files', -1], ['files', '3'], ['kinds', []], ['kinds', ['unknown']],
+    ['kinds', 'code'], ['verifyGreen', false], ['verifyGreen', 'true'], ['headSha', ''],
+  ])('fails closed on unknown or invalid %s=%j', (key, value) => waits(shadow({ [key]: value })));
+  it.each([{ lines: 401 }, { files: 13 },
+    { lines: 101, policy: { ...policy, earlyStartMaxLines: 100 } },
+    { files: 4, policy: { ...policy, earlyStartMaxFiles: 3 } },
+  ])('waits beyond configured bounds: %j', over => waits(shadow(over)));
+  it('waits on healable CI red on the current head', () => {
+    expect(shadow({ checks: [check('test', 'failure')] }))
+      .toEqual({ wouldStartEarly: false, reason: 'ci-red', mergeAllowed: false });
+    expect(shadow({ checks: [check('test', 'failure', { head_sha: 'b'.repeat(40) }), ...args.checks] }).wouldStartEarly).toBe(true);
+  });
+  it.each(['fast-checks', 'ci-green', 'push'])('never changes reviewStartGate under %s', startAfter => {
+    for (const checks of [args.checks, [check('test')], [check('test', 'failure')]]) {
+      const input = { ...args, checks, policy: { ...policy, startAfter } };
+      expect(reviewStartGate(input)).toEqual(reviewStartGate({ ...input, policy: { ...input.policy, earlyStartShadow: false } }));
+    }
+  });
+  it('never grants merge permission, even after CI turns green', () => {
+    for (const checks of [args.checks, [check('test')], [check('test', 'failure')]])
+      for (const earlyStartShadow of [false, true])
+        expect(shadow({ checks, policy: { ...policy, earlyStartShadow } }).mergeAllowed).toBe(false);
+  });
+  it('does not mutate inputs and returns the same decision for the same evidence', () => {
+    const input = structuredClone(args);
+    const before = structuredClone(input);
+    expect(reviewTiming.earlyStartShadow(input)).toEqual(reviewTiming.earlyStartShadow(input));
+    expect(input).toEqual(before);
+  });
 });
