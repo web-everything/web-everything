@@ -324,7 +324,7 @@ describe('gateReadyItems: a confirmed red-team break on the live head is owed a 
   const head = '28374514' + 'a'.repeat(32);
   const old = 'deadbeef' + 'b'.repeat(32);
   const report = { ready: [{ repo, number: 6239, title: 't' }] };
-  const advisory = (rev, findings) => ({ user: { login: 'plateau-worker[bot]' }, created_at: '2026-11-02T12:00:00Z',
+  const advisory = (rev, findings) => ({ user: { login: 'web-everything' }, created_at: '2026-11-02T12:00:00Z',
     body: `<!-- we:red-team-advisory pr=6239 rev=${rev} -->\n${findings}` });
   const confirmed = '1. [**confirmed**] (logic, degraded) `scripts/run.mjs:485` — the loop drops the last row\n';
   const unconfirmed = '1. [not confirmed] (logic, degraded) `scripts/run.mjs:485` — maybe drops a row\n';

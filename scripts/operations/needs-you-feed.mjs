@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
+import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -68,7 +69,7 @@ const sectionReasons = {
 // Only these kinds can be represented (and therefore resolved by absence) in itemsFromReport.
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
-export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
+export const REPORT_KINDS = new Set(['needs-you', 'confirmed-break-owed-send-back', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -209,6 +210,15 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       if (reasons.length) { held.push({ item, reasons }); return; }
+      // The red-team gate only sends back BROKEN, so a clear label can hide a confirmed break of any severity. Read the
+      // parsed result for exactly this head (trusted author only); a break is owed a send-back, not a human review.
+      const breaks = (redTeamForHead(view.comments, item.pr, view.headRefOid)?.findings ?? []).filter(f => f.confirmed);
+      if (breaks.length) {
+        const named = breaks.map(f => `#${f.index} ${f.impact ?? 'impact?'}${f.file ? ` ${f.file}${f.line != null ? `:${f.line}` : ''}` : ''}`).join('; ');
+        out[index] = { ...item, kind: 'confirmed-break-owed-send-back', head: view.headRefOid,
+          reason: `send-back owed, ${breaks.length} confirmed: ${named}` };
+        return;
+      }
       // Publish the head that was actually checked, not a stale one from the report or a later lookup.
       out[index] = { ...item, head: view.headRefOid };
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} live gate unreadable, keeping: ${error.message}`); out[index] = item; }
