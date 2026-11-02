@@ -192,6 +192,81 @@ it('marks a CommonJS file incomplete without require references', () => {
   expect(closureHits({ closure, changedFiles: ['dep.js'] })).toBeNull();
 });
 
+it.each(['entry', 'imported', 'spawned'])('refuses CommonJS hidden behind a %s symlink', mode => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'worker.cjs'), 'module.exports = 1;');
+  symlinkSync('worker.cjs', join(f.root, 'worker.mjs'));
+  writeFileSync(join(f.root, 'entry.mjs'), mode === 'imported'
+    ? "import './worker.mjs';" : "spawn(process.execPath, ['./worker.mjs']);");
+  const entries = [mode === 'entry' ? 'worker.mjs' : 'entry.mjs'];
+  const options = { root: f.root, entries };
+  const closure = mode === 'spawned'
+    ? collectRunClosure({ ...options, byName: () => [], importClosure: collectCloneImportClosure })
+    : collectCloneImportClosure(options);
+  expect(closure?.complete).not.toBe(true);
+  expect(decideSkipRebuild({ closure, changedFiles: ['scripts/changed.mjs'] }).skip).toBe(false);
+  expect(() => cloneRuntimeEntries({ ...f, entries: ['entry.mjs'] }))
+    .toThrow('runtime dependency proof incomplete');
+});
+
+it.each(['outside', 'missing', 'loop'])('refuses an imported symlink whose target is %s', target => {
+  const f = fixture();
+  writeFileSync(join(f.dir, 'foreign.mjs'), 'export {};');
+  writeFileSync(join(f.root, 'entry.mjs'), "import './alias.mjs';");
+  symlinkSync(target === 'outside' ? '../foreign.mjs' : target === 'missing' ? 'absent.mjs' : 'alias.mjs',
+    join(f.root, 'alias.mjs'));
+  // The legacy resolver's extension fallback must not hide a failed realpath.
+  writeFileSync(join(f.root, 'alias.mjs.mjs'), 'export {};');
+  const closure = collectCloneImportClosure({ root: f.root, entries: ['entry.mjs'] });
+  expect(closure?.complete).not.toBe(true);
+  expect(decideSkipRebuild({ closure, changedFiles: ['scripts/changed.mjs'] }).skip).toBe(false);
+  expect(() => cloneRuntimeEntries({ ...f, entries: ['entry.mjs'] }))
+    .toThrow('runtime dependency proof incomplete');
+});
+
+it('walks ESM symlink imports from the real directory and retains both path identities', () => {
+  const { root } = fixture();
+  mkdirSync(join(root, 'actual'));
+  writeFileSync(join(root, 'actual/worker.mjs'), "import './dependency.mjs';");
+  writeFileSync(join(root, 'actual/dependency.mjs'), 'export {};');
+  writeFileSync(join(root, 'entry.mjs'), "import './alias.mjs';");
+  symlinkSync('actual/worker.mjs', join(root, 'alias.mjs'));
+  const closure = collectCloneImportClosure({ root, entries: ['entry.mjs'] });
+  expect(closure?.complete).toBe(true);
+  for (const path of ['alias.mjs', 'actual/worker.mjs', 'actual/dependency.mjs']) {
+    expect(closureHits({ closure, changedFiles: [path] })).toEqual([path]);
+  }
+});
+
+it('refuses an outside entry even beside a readable clone entry', () => {
+  const f = fixture();
+  writeFileSync(join(f.root, 'entry.mjs'), 'export {};');
+  writeFileSync(join(f.dir, 'foreign.mjs'), 'export {};');
+  const closure = collectCloneImportClosure({ root: f.root, entries: ['entry.mjs', '../foreign.mjs'] });
+  expect(closure?.complete).not.toBe(true);
+});
+
+it.each(['*.mjs', 'worker?.mjs', '[ab].mjs', '{a,b}.mjs', '\\*.mjs', '"*.mjs"'])(
+  'refuses LaunchAgent glob arguments even when a literal file exists: %s', pattern => {
+    const f = fixture();
+    writeFileSync(join(f.root, pattern), 'export {};');
+    writeFileSync(join(f.launchAgentsDir, 'org.example.glob.plist'), 'plist');
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
+      EnableGlobbing: true, ProgramArguments: ['node', join(f.root, pattern)],
+    }) }) })).toThrow('LaunchAgents glob argument refused');
+  });
+
+it.each([true, false, undefined])('refuses glob tokens in any argument with EnableGlobbing=%s', EnableGlobbing => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'org.example.glob.plist'), 'plist');
+  for (const args of [['node', '*.mjs'], ['node', join(f.root, '*.mjs')],
+    ['node', join(f.root, 'worker.mjs'), '--path=*.mjs'], ['n?de', join(f.root, 'worker.mjs')]]) {
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0, stdout: plistJSON(f, {
+      EnableGlobbing, ProgramArguments: args,
+    }) }) })).toThrow('LaunchAgents glob argument refused');
+  }
+});
+
 it('does not reuse legacy parsed completeness as strict clone proof', () => {
   const { root } = fixture();
   writeFileSync(join(root, 'worker.mjs'), "require('./dep.js');");

@@ -13,9 +13,21 @@ import { collectRunClosure } from './daemon-rebuild/skip-unrelated.mjs';
  * Reject hints even in comments/strings; this is not the planned inert-source grammar.
  * A refused read uses the collector's ordinary incomplete-evidence fallback. */
 export function collectCloneImportClosure({ readFile = path => readFileSync(path, 'utf8'), ...options }) {
+  let realRoot;
+  try { realRoot = realpathSync(options.root); } catch { return null; }
   // Never accept parsed results from the legacy policy as strict proof. Spawn walks
   // still share raw reads, but each strict traversal validates its own source.
-  return collectImportClosure({ ...options, parsed: new Map(), readFile: path => {
+  return collectImportClosure({ ...options, root: realRoot, parsed: new Map(), canonicalize: path => {
+    const realPath = realpathSync(path);
+    const rel = relative(realRoot, realPath);
+    if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
+      throw new Error('clone dependency outside clone');
+    }
+    if ([path, realPath].some(entry => extname(entry) === '.cjs')) {
+      throw new Error('unsupported clone dependency syntax');
+    }
+    return realPath;
+  }, readFile: path => {
     const source = readFile(path);
     if (extname(path) === '.cjs' || /\b(?:require|createRequire)\b|\\u/.test(source)) {
       throw new Error('unsupported clone dependency syntax');
@@ -72,6 +84,11 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     const args = plist.ProgramArguments;
     if (!Array.isArray(args) || !args.length || args.some(arg => typeof arg !== 'string')) {
       throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
+    }
+    // launchd globbing can select code other than the literal path inspected below.
+    // Refuse metacharacters even when quoted/escaped or EnableGlobbing is absent.
+    if (args.some(arg => /[*?\[\]{}]/.test(arg))) {
+      throw new Error(`LaunchAgents glob argument refused: ${name}`);
     }
     // Fail closed on launchd inputs that can run code this scan cannot see.
     const refuse = why => { throw new Error(`LaunchAgents unsupported dynamic execution refused: ${name}: ${why}`); };

@@ -33,13 +33,15 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * the closure incomplete. Both use the caller's conservative fallback, even when other entries are readable.
  * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
  * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
- * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map}} o
+ * `canonicalize`, when supplied by strict clone discovery, validates every entry/import before
+ * classification. Resolution failures (including missing imports) make that proof incomplete.
+ * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map, canonicalize?:(p:string)=>string}} o
  * @returns {{files:Set<string>, complete:boolean, bareDeps:boolean, jsonNames:Set<string>}|null}
  */
 export function collectImportClosure({
   root, entries, readFile = (p) => readFileSync(p, 'utf8'),
   exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
-  parsed = new Map(),
+  parsed = new Map(), canonicalize,
 }) {
   const absRoot = resolvePath(root);
   // Shared dependencies occur on many edges. Cache probes for this tree snapshot only;
@@ -50,7 +52,7 @@ export function collectImportClosure({
     return presence.get(path);
   };
   const starts = (entries || []).filter(Boolean).map((e) => (isAbsolute(e) ? e : resolvePath(absRoot, e)))
-    .filter((e) => !relative(absRoot, e).startsWith('..'));
+    .filter((e) => canonicalize || !relative(absRoot, e).startsWith('..'));
   // Missing runtime roots are unknown evidence, not permission to narrow the closure to readable siblings.
   if (!starts.length || starts.some((e) => !existsOnce(e))) return null;
   const seen = new Set();
@@ -59,9 +61,16 @@ export function collectImportClosure({
   let bareDeps = false;
   const stack = [...starts];
   while (stack.length) {
-    const file = stack.pop();
+    let file = stack.pop();
     if (seen.has(file)) continue;
     seen.add(file);
+    if (canonicalize) {
+      try {
+        file = canonicalize(file);
+        // Keep both the alias and its target relevant to changed-file decisions.
+        seen.add(file);
+      } catch { complete = false; continue; }
+    }
     let info = parsed.get(file);
     if (!info) {
       info = { imports: [], jsonNames: new Set(), complete: true, bareDeps: false };
@@ -71,8 +80,10 @@ export function collectImportClosure({
         for (const m of src.matchAll(IMPORT_SPEC_RE)) {
           const spec = m[2];
           if (spec.startsWith('./') || spec.startsWith('../')) {
-            const hit = resolveRelativeSpec(file, spec, existsOnce);
-            if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
+            // Strict ESM proof must inspect the named path itself: a missing/broken
+            // link cannot be substituted with an extension or index-file candidate.
+            const hit = canonicalize ? resolvePath(dirname(file), spec) : resolveRelativeSpec(file, spec, existsOnce);
+            if (hit && (canonicalize || !relative(absRoot, hit).startsWith('..'))) info.imports.push(hit);
           } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
             info.bareDeps = true;
           }
