@@ -48,7 +48,7 @@ function sidecarRun(file, owner) {
 }
 
 /**
- * What Forge's recent-run telemetry says about one run: `finished` (a result code was published), `inflight` (listed
+ * What Forge's recent-run telemetry says about one run: `finished` (a settled result), `inflight` (listed
  * without a code), `absent` (not listed, with no active runs) or `unknown` (incomplete evidence).
  * The caller guarantees the sample postdates the owner's death by a margin.
  */
@@ -57,6 +57,11 @@ export function runVerdict(telemetry, run) {
   if (!evidence) return 'unknown';
   const entry = telemetry.recent.find(item => item?.runId === run);
   if (!entry) return evidence.complete ? 'absent' : 'unknown';
+  // The install/supervisor catch paths publish 97/254 even when descendants may survive. Their executing lock
+  // and prepared/running state remain until finish confirms worker cleanup. Only zero active runs proves that
+  // cleanup through this telemetry schema; it has no per-run cleanup field. A normal exit using either code
+  // is deliberately treated conservatively too.
+  if ((entry.code === 97 || entry.code === 254) && !evidence.complete) return 'unknown';
   return Number.isInteger(entry.code) ? 'finished' : 'inflight';
 }
 
@@ -162,15 +167,16 @@ function ownerGone(root, index, file, liveness, selfPid) {
 /**
  * Stateful reaper for one wait loop. `step()` is cheap and idempotent. It reads Forge telemetry (a lazy async getter)
  * only when a dead-owner marker exists, so a loop with no dead markers costs one readdir.
- * Decided PER RUN; a matching finished receipt suffices even while Forge is busy. A dead-owner,
+ * Decided PER RUN; a matching settled receipt suffices even while Forge is busy, except ambiguous supervisor
+ * failure codes (97/254), which require zero active runs as cleanup evidence. A dead-owner,
  * host-bound marker is reaped when it is past the grace window, the telemetry sample was taken at least
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
  * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
  * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
  * was never recorded (the client died before prepare returned) is kept while Forge reports any active runs or any
  * run started inside its own possible window ([at - skew, first-seen-dead + skew]) is still unfinished.
- * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run to ask Forge about: it is
- * reaped past the grace window once no live local process holds its slot lock.
+ * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run binding: retain it
+ * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
  */
 export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync}}) {
@@ -221,9 +227,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         if (marker.unreadable) continue;
         const key = `${name}:${ino}:${mtimeMs}`; // a replacement marker never inherits a predecessor's death stamp
         if (marker.legacy) {
-          // No host, run or Forge question applies: reap on proof that no live local process owns the slot.
-          if (now - mtimeMs < graceMs || !ownerGone(root, index, file, liveness, selfPid)) continue;
-          if (claimAndRemove({file, name, ino, mtimeMs, index})) reaped.push(name);
+          // Neither a missing/dead local lock holder nor this host's telemetry proves an unbound job stopped.
           continue;
         }
         // Telemetry only speaks for its own Forge host: a marker not provably bound to this host is retained.

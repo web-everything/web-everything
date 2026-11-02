@@ -666,7 +666,7 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     const remoteRoot = join(f.lockRoot, '..', 'remote');
     mkdirSync(remoteRoot, { recursive: true });
     const marker = join(remoteRoot, 'slot-0.unconfirmed');
-    // A live owner (this process): a bare text marker with no lock holder would now be reaped as having no live owner.
+    // A structured marker owned by this live process must keep its slot quarantined.
     writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: Date.now() }) + '\n');
     const base = Date.now();
     let t = base;
@@ -722,6 +722,28 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
     expect(existsSync(marker)).toBe(true);
     expect(f.remoteExec).not.toHaveBeenCalled();
+  });
+  it.each(['legacy', 97, 254])('does not dispatch into a quarantined slot after %s leaves remote work unconfirmed', async failure => {
+    const f = await overloadFixture({overloaded: false, freeAtMs: null});
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    const run = 'r-' + 'a'.repeat(32);
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    expect(child.status).toBe(0);
+    writeFileSync(marker, failure === 'legacy' ? 'remote termination unconfirmed\n'
+      : JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1, run}));
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    const st = statSync(marker);
+    writeFileSync(marker + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000}));
+    const health = f.readTelemetry;
+    f.readTelemetry = async () => {
+      const telemetry = await health();
+      return {...telemetry, activeRuns: 1, recent: [{runId: run, startedAtET: telemetry.sampledAtET,
+        stageMs: {install: 0, run: 0}, code: failure === 'legacy' ? null : failure}]};
+    };
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(existsSync(marker)).toBe(true);
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('remote-full (30s wait exhausted)');
   });
   it('reaps stale markers before acquiring an available slot', async () => {
     const f = await overloadFixture({overloaded: false, freeAtMs: null, remote: {mode: 'always', maxConcurrent: 2}});

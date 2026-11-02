@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {lockDirFor} from '../file-locks.mjs';
 import {parseTelemetry, easternTimestamp} from '../forge-exec-run.mjs';
-import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun} from '../forge-slot-markers.mjs';
+import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun, runVerdict} from '../forge-slot-markers.mjs';
 
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, {recursive: true, force: true}); });
@@ -28,6 +28,36 @@ const liveness = dead => pid => (dead.includes(pid) ? 'dead' : 'alive');
 const names = root => ['0', '1', '2'].filter(i => existsSync(join(root, `slot-${i}.unconfirmed`)));
 
 describe('stale remote slot markers (perf10)', () => {
+  it.each([97, 254])('does not classify supervisor failure code %s as confirmed cleanup while Forge is active', async code => {
+    const telemetry = await tel(1, undefined, [done(RUN_A, code)])();
+    expect(runVerdict(telemetry, RUN_A)).toBe('unknown');
+    expect(runVerdict({...telemetry, activeRuns: 0}, RUN_A)).toBe('finished');
+  });
+  it.each([97, 254].flatMap(code => ['inline', 'sidecar', 'run-less'].map(binding => ({code, binding}))))(
+    'keeps quarantine after supervisor failure until Forge confirms cleanup: %j', async ({code, binding}) => {
+      const root = setup({0: {pid: 111, run: binding === 'inline' ? RUN_A : undefined}});
+      if (binding === 'sidecar') recordMarkerRun(join(root, 'slot-0.unconfirmed'), {owner: 'o', run: RUN_A});
+      const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+      const recent = [{...done(RUN_A, code), startedAtET: iso(NOW - 590_000)}];
+      expect(await reaper.step(tel(1, undefined, recent))).toEqual([]);
+      expect([...blockedSlots(root, 1)]).toEqual([0]);
+      expect(await reaper.step(tel(0, NOW + 30_000, recent))).toEqual([]);
+      expect(await reaper.step(tel(0, undefined, recent))).toEqual(['slot-0.unconfirmed']);
+    });
+  it.each(['missing', 'dead', 'alive'])('retains a legacy marker with a %s lock holder while remote work may survive', async holder => {
+    const root = setup({0: {}});
+    if (holder !== 'missing') {
+      const lock = lockDirFor(root, 'slot-0');
+      mkdirSync(lock, {recursive: true});
+      writeFileSync(join(lock, 'lock.json'), JSON.stringify({owner: 'old', pid: 111, heartbeatAt: iso(NOW), acquiredAt: iso(NOW), path: 'slot-0'}));
+    }
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: () => holder});
+    expect(await reaper.step(tel(1, undefined, [going(RUN_A)]))).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+    // Legacy text has no host binding: even an idle configured host cannot speak for its job.
+    expect(await reaper.step(tel(0))).toEqual([]);
+    expect([...blockedSlots(root, 1)]).toEqual([0]);
+  });
   it('never removes a replacement marker created after the one it judged', async () => {
     const root = setup({0: {pid: 111}});
     const file = join(root, 'slot-0.unconfirmed');
@@ -182,18 +212,19 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await r2.step(tel(1, undefined, [mine]))).toEqual([]);
     expect(await r2.step(tel(0, undefined, [mine]))).toEqual([]);
   });
-  it('reaps a bare legacy marker once no live local process holds its slot lock', async () => {
+  it('retains bare legacy markers without remote termination evidence', async () => {
     const root = setup({0: {}, 1: {}});
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW});
-    expect(await reaper.step(async () => null)).toEqual(['slot-0.unconfirmed', 'slot-1.unconfirmed']);
+    expect(await reaper.step(async () => null)).toEqual([]);
+    expect(names(root)).toEqual(['0', '1']);
   });
-  it('reaps a legacy marker whose slot-lock holder is provably dead', async () => {
+  it('retains a legacy marker whose dead slot-lock holder cannot prove remote termination', async () => {
     const root = setup({0: {}}), lock = lockDirFor(root, 'slot-0');
     mkdirSync(lock, {recursive: true});
     writeFileSync(join(lock, 'lock.json'), JSON.stringify({owner: 'old', pid: 111, heartbeatAt: iso(NOW), acquiredAt: iso(NOW), path: 'slot-0'}));
     const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-    expect(await reaper.step(async () => null)).toEqual(['slot-0.unconfirmed']);
-    expect(names(root)).toEqual([]);
+    expect(await reaper.step(async () => null)).toEqual([]);
+    expect(names(root)).toEqual(['0']);
   });
   it('keeps a bare legacy marker inside the grace window or while its slot lock owner is alive', async () => {
     const root = setup({0: {ageMs: 30_000}, 1: {}});
