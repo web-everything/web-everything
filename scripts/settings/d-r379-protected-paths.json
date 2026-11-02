@@ -1,0 +1,36 @@
+{
+  "directionPaths": [
+    "**/AGENTS.md",
+    "docs/agent/platform-decisions.md",
+    "standards/**",
+    "contracts/**",
+    "src/_data/**",
+    "src/_includes/*-descriptions/**"
+  ],
+  "protectedPaths": [
+    "**/guard-*.mjs",
+    ".claude/hooks/**",
+    ".githooks/**",
+    "scripts/hooks/**",
+    "**/settings.json",
+    "scripts/review-set-label*",
+    "scripts/conveyor/review-referral-hold.mjs",
+    "scripts/lib/pr-state/holds/**",
+    "scripts/lib/pr-state/referrals.mjs",
+    "scripts/lib/*referral*.mjs",
+    "scripts/lib/*red-team*.mjs",
+    "scripts/conveyor/*red-team*.mjs",
+    "scripts/settings/*referral*.json",
+    "scripts/settings/*red-team*.json",
+    "scripts/lib/jury-core.mjs",
+    "scripts/lib/secret-scrub.mjs",
+    "scripts/lib/github-app-token.mjs",
+    "scripts/readiness/forge-setup.sh",
+    "scripts/readiness/forge-exec-limits.mjs",
+    "**/forge-exec/limits.json",
+    "**/migrations/**",
+    "scripts/operations/d-r379-check.mjs",
+    "scripts/operations/d-r379-check-io.mjs",
+    "scripts/settings/d-r379-protected-paths.json"
+  ]
+}
