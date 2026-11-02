@@ -24,10 +24,11 @@ function parseArgs(argv) {
 
 /** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. */
 export function findAudit(records, { head, base, questionHash }) {
-  if (!SHA.test(base ?? '') || questionHash !== QUESTION_HASH) return null;
+  if (!SHA.test(base ?? '') || !SHA.test(head ?? '') || questionHash !== QUESTION_HASH) return null;
   let latest = null;
   for (const record of records) {
-    if (record?.head !== head || record.base !== base || record.questionHash !== QUESTION_HASH || !Number.isFinite(Date.parse(record.at))) continue;
+    if (record?.head !== head || record.base !== base || record.questionHash !== QUESTION_HASH || !Number.isFinite(Date.parse(record.at))
+      || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (!latest || Date.parse(record.at) >= Date.parse(latest.at)) latest = record;
   }
   return latest;

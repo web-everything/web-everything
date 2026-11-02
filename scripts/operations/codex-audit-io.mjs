@@ -3,6 +3,7 @@ import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
 
 const DEFAULT_RECORD_PATH = '~/workspace/.operations/coordination/audits.jsonl';
 const SETTINGS = new URL('../settings/prototype-load.json', import.meta.url);
@@ -16,9 +17,13 @@ function readReport(stdout) {
   throw new Error('missing JSON report');
 }
 
-/** All filesystem and subprocess effects are injectable; no shell interprets refs or prompts. */
+/**
+ * All filesystem and subprocess effects are injectable; no shell interprets refs or prompts.
+ * Run the op from a trusted checkout's script path against the audited repo as cwd.
+ */
 export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
-  scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync } = {}) {
+  scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync,
+  launcherPath = fileURLToPath(new NodeURL('../codex-direct-task.mjs', import.meta.url)) } = {}) {
   const run = (command, args, timeout, env) => {
     const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout, ...(env ? { env } : {}) });
     if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
@@ -38,7 +43,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         }
         const taskFile = join(scratch, 'task.md');
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
-        const report = readReport(run(process.execPath, ['scripts/codex-direct-task.mjs', '--review', '--json',
+        const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
           { ...process.env, GIT_INDEX_FILE: scratchIndex }));
         if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
