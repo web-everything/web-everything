@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { DAEMON_CLONE_SEED, daemonCloneRoots, isDaemonCloneRealpath } from '../daemon-clone-registry.mjs';
 
-const WORKSPACE = path.join(path.sep, 'ws', 'webeverything');
+const WORKSPACE = path.join(path.sep, 'ws');
 
 describe('wev-pass-readers daemon clone', () => {
   it('is in the seed, named by basename like the other daemon clones', () => {
@@ -10,7 +10,7 @@ describe('wev-pass-readers daemon clone', () => {
   });
   it('is recognized as a daemon clone root', () => {
     const roots = daemonCloneRoots(WORKSPACE, { env: { WE_DAEMON_OVERLAY_DIR: path.join(path.sep, 'nonexistent-overlay-dir') } });
-    const real = path.join(path.dirname(WORKSPACE), 'wev-pass-readers');
+    const real = path.join(WORKSPACE, 'wev-pass-readers');
     expect(isDaemonCloneRealpath(real, roots)).toBe(true);
     expect(isDaemonCloneRealpath(path.join(real, 'scripts'), roots)).toBe(true);
   });
