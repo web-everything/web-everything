@@ -616,7 +616,10 @@ export async function checkPr(pr, deps) {
   let settings, netDiffPaths = [], base, failure;
   try { settings = validateSettings(await deps.readSettings()); }
   catch { failure = 'path policy unavailable or incomplete'; }
-  try {
+  // The adapter classifies against origin/main; another target needs human review
+  // because this diff and its audit can omit changes inherited from main.
+  if (metadata.baseRefName !== 'main') failure = 'PR target is not main or is unavailable; human review required';
+  else try {
     const diff = await deps.fetchNetDiff(pr, head);
     const paths = diff?.paths;
     if (!SHA.test(diff?.base ?? '')) throw new Error('missing merge-base');

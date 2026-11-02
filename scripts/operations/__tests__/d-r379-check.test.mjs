@@ -43,6 +43,58 @@ describe('D-R379 synthetic PR scenarios (not captured PR evidence)', () => {
     expect(condition(await checkPr(pr, deps(fixture(pr))), id).status).toBe('FAIL');
   });
 });
+describe('PR target branch evidence', () => {
+  it.each(['release', 'lane/stacked', undefined, null, '', 42, 'MAIN', 'main\n', ' main', 'ｍａｉｎ', 'ma\u200bin'])
+    ('refuses target %j before reading a main-based diff', async baseRefName => {
+      let fetched = false;
+      const f = {...fixture(6223), baseRefName};
+      const r = await checkPr(6223, deps(f, {fetchNetDiff: () => {
+        fetched = true;
+        return {paths:['docs/examples/example.md'],base};
+      }}));
+      expect(r.eligible).toBe(false);
+      expect(condition(r,3).status).toBe('UNKNOWN');
+      expect(condition(r,4).status).toBe('UNKNOWN');
+      expect(condition(r,4).evidence.join(' ')).toContain('human review');
+      expect(r.netDiffPaths).toEqual([]);
+      expect(fetched).toBe(false);
+    });
+
+  it.each(['main', 'release'])('wires live target %s from the adapter through the JSON CLI', async baseRefName => {
+    const f = {...fixture(6223), baseRefName};
+    const calls = [];
+    const adapter = createCheckDeps({exec:(bin,args) => {
+      calls.push([bin,...args]);
+      if (bin === 'gh') return JSON.stringify(f);
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return f.headRefOid;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'diff') return 'docs/examples/example.md\0';
+      throw Error('unexpected command');
+    }});
+    let output = '';
+    const code = await main(['--pr=6223','--json'],deps(f, {
+      readPr:adapter.readPr, readLabels:adapter.readLabels,
+      fetchNetDiff:adapter.fetchNetDiff, stdout:s=>{output+=s;},
+    }));
+    expect(code).toBe(baseRefName === 'main' ? 0 : 1);
+    expect(JSON.parse(output).eligible).toBe(baseRefName === 'main');
+    expect(calls[0].at(-1).split(',')).toContain('baseRefName');
+    expect(calls.some(([bin])=>bin === 'git')).toBe(baseRefName === 'main');
+  });
+
+  it.each(['release', undefined, null])('refuses a retargeted or missing live label target %j', async baseRefName => {
+    const f = fixture(6223), calls = [];
+    const adapter = createCheckDeps({exec:(bin,args)=>{
+      calls.push([bin,...args]);
+      return JSON.stringify({...f,baseRefName});
+    }});
+    const r = await checkPr(6223,deps(f,{readLabels:adapter.readLabels}));
+    expect(r.eligible).toBe(false);
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(calls[0].at(-1).split(',')).toContain('baseRefName');
+  });
+});
 describe('fail-closed evidence', () => {
   it('fetch failure is UNKNOWN and ineligible', async () => {
     const r = await checkPr(1, deps(undefined, { fetchNetDiff: async () => { throw Error(); } }));
