@@ -98,16 +98,21 @@ function fetchOverlay(run, root, env, ref, registration, io = fs) {
 const retryKeys = ['retryMain', 'retryTries', 'retryAfter'];
 function clearRetry(state, ref) { for (const key of retryKeys) delete state[key][ref]; }
 function readSyncState(file, io = fs) {
-  let data;
   // Migration and mixed-version rollout: a legacy file written after the new one (by a not-yet-reloaded worker)
   // is authoritative, so its cooldowns and retry stops are never bypassed. The next write lands in the new file.
   const legacyFile = file.replace(/\.state$/, '.json');
   const mtime = path => { try { return io.statSync(path).mtimeMs; } catch (error) { if (error.code === 'ENOENT') return -1; throw error; } };
   const source = mtime(legacyFile) > mtime(file) ? legacyFile : file;
-  // Both files must parse: a corrupt one fails closed whichever is newer.
-  const parsed = path => { try { return JSON.parse(io.readFileSync(path, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; } };
-  parsed(source === file ? legacyFile : file);
-  data = parsed(source) ?? { lastSyncedMain: {} };
+  // Both files are fully validated: a corrupt or invalid one fails closed whichever is newer.
+  const load = path => {
+    let raw;
+    try { raw = JSON.parse(io.readFileSync(path, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+    return validateSyncState(raw);
+  };
+  load(source === file ? legacyFile : file);
+  return load(source) ?? validateSyncState({ lastSyncedMain: {} });
+}
+function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
   for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
