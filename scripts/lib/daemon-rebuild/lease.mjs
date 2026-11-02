@@ -113,6 +113,7 @@ const PID_REUSE_SLACK_MS = 2000;
 /** Does `pid` exist? ESRCH = no. Any other error (EPERM: another user's process) = it exists, so the pid-reuse
  *  start-time check still applies to it. */
 function pidExists(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false; // a malformed pid names no process (fail open, per the lease doc)
   try { process.kill(pid, 0); return true; } catch (e) { return !(e && e.code === 'ESRCH'); }
 }
 

@@ -95,9 +95,22 @@ describe('claimBuildLease candidate teardown (leaseOwnerIsGone pid-reuse guard)'
     expect(got).not.toBeNull();
     expect(removed).toBe(false);
   });
-  it('does not delete a start time within the 2 s slack of the lease', () => {
-    const { removed } = claim({ leaseAgeMs: AGED, startTimeOf: () => nowMs - AGED + 1_500 });
+  it('does not delete a start time within the 2 s slack of the lease, but does just past it', () => {
+    expect(claim({ leaseAgeMs: AGED, startTimeOf: () => nowMs - AGED + 1_500 }).removed).toBe(false);
+    expect(claim({ leaseAgeMs: AGED, startTimeOf: () => nowMs - AGED + 2_500 }).removed).toBe(true);
+  });
+  it('single-flight: a FRESH lease held by a live owner (started before it) is not taken over and its tree is kept', () => {
+    const { got, removed } = claim({ leaseAgeMs: FRESH, startTimeOf: () => nowMs - FRESH - 3_600_000 });
+    expect(got).toBeNull();
     expect(removed).toBe(false);
+  });
+  it('a malformed (non-integer) pid never counts as a live owner, and never throws', () => {
+    const calls = [];
+    const state = { building: { host: hostname(), pid: 'abc', token: 'old-token', path: OLD_PATH, startedAt: new Date(nowMs - FRESH).toISOString() } };
+    const got = claimBuildLease({ state, plan: { finalSha: 'abc', inputsKey: 'k' }, root: ROOT, run: run(calls), env: ENV, nowMs, startTimeOf: () => null });
+    if (got) ACTIVE_BUILD_TOKENS.delete(got.token);
+    expect(got).not.toBeNull();
+    expect(buildLeaseIsLive(state.building, { nowMs, startTimeOf: () => null })).toBe(false);
   });
   it('an EPERM (not signalable) owner still gets the start-time check: reused is deleted, unreadable is kept', () => {
     const eperm = () => { throw Object.assign(new Error('nope'), { code: 'EPERM' }); };
