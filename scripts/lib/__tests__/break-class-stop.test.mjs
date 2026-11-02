@@ -19,7 +19,7 @@ describe('breakClassStop', () => {
   it('replays three new-class red-team rounds: stop at round 3, not round 2', () => {
     expect(breakClassStop(input())).toMatchObject({ applies: true, wouldStop: true, consecutive: 3 });
     expect(breakClassStop(input(replay6033.slice(0, 2))).wouldStop).toBe(false);
-    expect(breakClassStop(input()).rounds.map(r => r.newClasses)).toEqual([['failing-input@worker.mjs'], ['security@worker.mjs'], ['concurrency@worker.mjs']]);
+    expect(breakClassStop(input()).rounds.map(r => r.newClasses)).toEqual([['failing-input@scripts/conveyor/worker.mjs'], ['security@scripts/conveyor/worker.mjs'], ['concurrency@scripts/conveyor/worker.mjs']]);
   });
   it('a repeated class resets the streak and remains old after intervening rounds', () => {
     const repeated = { ...replay6033[2], body: replay6033[2].body.replace('concurrency', 'failing-input') };
