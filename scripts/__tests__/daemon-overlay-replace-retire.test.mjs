@@ -51,7 +51,7 @@ function fixture() {
     gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
     return gitOk(author, ['rev-parse', 'HEAD']);
   };
-  const run = (args) => spawnSync(process.execPath, [CLI, ...args, `--clone=${clone}`, '--json'], { encoding: 'utf8', timeout: 60_000, env });
+  const run = (args, extraEnv = {}) => spawnSync(process.execPath, [CLI, ...args, `--clone=${clone}`, '--json'], { encoding: 'utf8', timeout: 60_000, env: { ...env, ...extraEnv } });
   const list = () => {
     const name = readdirSync(state).find((n) => n.endsWith('.json'));
     return name ? JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.map((o) => o.ref) : [];
@@ -347,7 +347,7 @@ describe('daemon-overlay.mjs add records the PR when GitHub knows it', () => {
     const f = fixture();
     f.push('lane/known', 'a.txt', 'a\n');
     f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known' }]);
-    expect(f.run(['add', '--ref=lane/known']).status).toBe(0);
+    expect(f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' }).status).toBe(0);
     expect(f.entry('lane/known').pr).toBe(9);
   });
 
@@ -355,7 +355,7 @@ describe('daemon-overlay.mjs add records the PR when GitHub knows it', () => {
     const f = fixture();
     f.push('lane/known', 'a.txt', 'a\n');
     f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known' }, { number: 10, state: 'OPEN', headRefName: 'lane/known' }]);
-    expect(f.run(['add', '--ref=lane/known']).status).toBe(0);
+    expect(f.run(['add', '--ref=lane/known'], { WE_DAEMON_OVERLAY_INFER_PR: '1' }).status).toBe(0);
     expect(f.entry('lane/known').pr).toBe(null);
   });
 });

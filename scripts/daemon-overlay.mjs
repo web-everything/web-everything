@@ -709,7 +709,9 @@ async function main() {
     if (!Number.isInteger(pr)) return fail(`--pr must be an integer, got ${JSON.stringify(flags.pr)}`);
   }
   // Record the PR when GitHub knows exactly one open PR for the ref, so a later retire can follow it.
-  if (pr == null && (cmd === 'add' || cmd === 'replace')) pr = inferPrNumber({ root, ref: flags.ref, env: process.env });
+  // Hermetic runs pin WE_DAEMON_OVERLAY_STACK_BASES (no live GitHub); WE_DAEMON_OVERLAY_INFER_PR=1 turns the lookup back on.
+  const liveGithub = process.env.WE_DAEMON_OVERLAY_STACK_BASES === undefined || process.env.WE_DAEMON_OVERLAY_INFER_PR === '1';
+  if (pr == null && liveGithub && (cmd === 'add' || cmd === 'replace')) pr = inferPrNumber({ root, ref: flags.ref, env: process.env });
   const reason = typeof flags.reason === 'string' ? flags.reason : null;
   const by = typeof flags.by === 'string' ? flags.by : (process.env.USER || null);
   // `--pinned`: the rebuild refuses (keeps the current tree) rather than ever conflict-drop this overlay.
