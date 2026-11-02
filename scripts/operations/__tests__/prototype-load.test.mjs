@@ -318,6 +318,18 @@ describe('canonicalAuditEvidence', () => {
   });
 });
 
+describe('canonicalAuditEvidence hardening', () => {
+  it('ignores an empty-diff audit (base equals head) that would mask a WEAKENED audit of the real change', () => {
+    const weak = auditRecord({ verdict: 'WEAKENED' });
+    const empty = auditRecord({ base: SHA, at: '2026-10-22T12:00:00Z' });
+    expect(prototypeLoad.canonicalAuditEvidence([weak, empty], SHA)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('rejects a NOT WEAKENED record whose findings contradict the verdict', () => {
+    const bad = auditRecord({ findings: ['WEAKENED'] });
+    expect(prototypeLoad.canonicalAuditEvidence([bad], SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+});
+
 describe('prototype-load canonical audit admission', () => {
   it('ships canonicalAuditMode warn in the default settings', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
