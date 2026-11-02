@@ -1,0 +1,100 @@
+/** Clone-specific runtime roots. Throws on unreadable/malformed LaunchAgents evidence;
+ * callers must retain the full conflict rather than proceed with narrowed entries. */
+import { readdirSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { DAEMON_ENTRY_MODULES } from './daemon-boot-smoke.mjs';
+import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
+
+// Canonicalize both sides of containment, including aliases of a missing entry's
+// existing parent. Missing entries still reach closure/smoke's unreadable fallback;
+// other filesystem errors must refuse discovery rather than narrow its evidence.
+function canonicalArgument(path) {
+  const suffix = [];
+  for (;;) {
+    try { return join(realpathSync(path), ...suffix); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || dirname(path) === path) throw error;
+      suffix.unshift(basename(path));
+      path = dirname(path);
+    }
+  }
+}
+
+const NODE_SAFE_FLAGS = new Set(['--no-warnings', '--enable-source-maps', '--trace-warnings']);
+
+export function cloneRuntimeEntries({ root, entries = [], env = process.env,
+  launchAgentsDir = join(env.HOME || homedir(), 'Library', 'LaunchAgents'), run = spawnSync,
+}) {
+  const realRoot = realpathSync(root);
+  const inside = path => {
+    const rel = relative(realRoot, canonicalArgument(path));
+    return rel && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel) ? rel : null;
+  };
+  const out = new Set(DAEMON_ENTRY_MODULES);
+  for (const entry of entries) {
+    const rel = inside(resolve(realRoot, entry));
+    if (!rel) throw new Error('runtime entry outside clone');
+    out.add(rel);
+  }
+  for (const name of readdirSync(launchAgentsDir).sort()) {
+    if (!/^com\.(we|plateau|webeverything)\..+\.plist$/.test(name)) continue;
+    const result = run('plutil', ['-convert', 'json', '-o', '-', '--', join(launchAgentsDir, name)], {
+      encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+    });
+    if (result.error || result.status !== 0) throw new Error(`LaunchAgents plist unreadable: ${name}`);
+    const plist = JSON.parse(result.stdout);
+    const args = plist.ProgramArguments;
+    if (!Array.isArray(args) || !args.length || args.some(arg => typeof arg !== 'string')) {
+      throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
+    }
+    // Fail closed on launchd inputs that can run code this scan cannot see.
+    const refuse = why => { throw new Error(`LaunchAgents unsupported dynamic execution refused: ${name}: ${why}`); };
+    if (plist.Program !== undefined && plist.Program !== args[0]) refuse('Program differs from ProgramArguments[0]');
+    if (plist.EnvironmentVariables && Object.keys(plist.EnvironmentVariables).some(key => /^NODE_/.test(key))) {
+      refuse('NODE_* environment variable');
+    }
+    const interpreter = basename(args[0] === '/usr/bin/env' ? args[1] ?? '' : args[0]);
+    if (interpreter !== 'node' && interpreter !== 'nodejs') refuse(`interpreter ${interpreter}`);
+    // Eval flags are node's own only before the script; after it they are script arguments.
+    let scriptSeen = false;
+    // Only a script not preceded by a flag counts (a flag may take it as a value, e.g. --title /x.js).
+    for (const [index, arg] of args.entries()) {
+      if (isAbsolute(arg) && ['.mjs', '.js', '.cjs'].includes(extname(arg)) && !args[index - 1]?.startsWith('-')) scriptSeen = true;
+      if (!arg.startsWith('-')) {
+        const path = resolve(realRoot, arg);
+        // Canonicalize even missing paths: only ENOENT may mean absent evidence.
+        const rel = inside(path);
+        const file = statSync(path, { throwIfNoEntry: false });
+        if (rel && file?.isFile()
+          && [path, rel].some(entry => !['.mjs', '.js', '.cjs'].includes(extname(entry)))) {
+          throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
+        }
+      }
+      // Allowlist, not denylist: before the script, only these inert node flags are accepted.
+      if (!scriptSeen && index >= (args[0] === '/usr/bin/env' ? 2 : 1) && arg.startsWith('-')
+        && !arg.startsWith('--pass=') && !NODE_SAFE_FLAGS.has(arg) && !/^--(?:repo|path|watch)(?:=|$)/.test(arg)) {
+        throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
+      }
+      if (isAbsolute(arg) || arg.startsWith('--pass=')) continue;
+      if (/^--(?:import|require|(?:experimental-)?loader)(?:=|$)/.test(arg)
+        || /^-r/.test(arg)
+        || (!scriptSeen && /^(?:--(?:eval|print|input-type)(?:=|$)|-[a-zA-Z]*[ep](?:=|$))/.test(arg))
+        || (!arg.startsWith('-')
+          && (arg.includes('/') || /^\.{1,2}$/.test(arg) || /\.[a-z][a-z0-9]*$/i.test(arg)))) {
+        throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
+      }
+    }
+    const paths = args.filter(isAbsolute).map(inside).filter(Boolean);
+    for (const path of paths) out.add(path);
+    if (paths.some(path => basename(path) === 'pass-daemon.mjs')) {
+      const passes = args.filter(arg => arg.startsWith('--pass='));
+      const pass = passes.length === 1 ? passes[0].slice('--pass='.length) : null;
+      const script = Object.hasOwn(DAEMON_MANIFEST, pass) && DAEMON_MANIFEST[pass].script;
+      if (!script) throw new Error(`LaunchAgents pass unknown: ${name}`);
+      out.add(script);
+    }
+  }
+  return [...out];
+}
