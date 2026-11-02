@@ -1,13 +1,16 @@
 /** Hermetic append/read contract and fail-closed ledger probes. */
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { tmpdir, homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { appendRound, readSlice, ledgerDir, ROUND_LEDGER_SCHEMA } from '../round-ledger.mjs';
 
 const dirs = [];
 const temp = () => { const dir = fs.mkdtempSync(join(tmpdir(), 'round-ledger-')); dirs.push(dir); return dir; };
-afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.unstubAllEnvs();
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 const rec = (extra = {}) => ({ schema: 1, pr: 6033, head: 'a', resultId: 'r1', source: 'gate', findings: [], complete: true, ...extra });
 
 it('I1 ledger reads missing files as complete, read failures as incomplete', () => {
@@ -47,7 +50,8 @@ it('ledger append validates, creates directories, assigns PR-wide rounds, dedupe
 
 it('ledgerDir accepts only the named override and defaults portably', () => {
   const base = temp();
-  const fallback = join(homedir(), 'workspace', '.operations', 'round-ledger');
+  vi.stubEnv('HOME', base);
+  const fallback = join(base, 'workspace', '.operations', 'round-ledger');
   expect(ledgerDir({})).toBe(fallback);
   expect(ledgerDir({ WE_ROUND_LEDGER_DIR: base })).toBe(fallback);
   expect(ledgerDir({ WE_ROUND_LEDGER_DIR: ` ${join(base, 'round-ledger')} ` })).toBe(resolve(base, 'round-ledger'));
