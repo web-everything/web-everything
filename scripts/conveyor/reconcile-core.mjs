@@ -2715,10 +2715,15 @@ export function planReconcile({
     }
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
-    const phase = classifyPr({
+    let phase = classifyPr({
       state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
+    // GitHub can report a definite conflict while mergeStateStatus is BLOCKED or UNKNOWN.
+    // Preserve existing phase owners; only rescue otherwise queued/open PRs from nothing-owed.
+    const mergeableConflict = (phase === 'queued' || phase === 'open')
+      && pr?.mergeable === 'CONFLICTING' && pr?.mergeStateStatus !== 'DIRTY';
+    if (mergeableConflict) phase = 'conflicted';
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
     const withPhase = { phase, check: check.state, labels: labelNames(pr?.labels) };
 
@@ -3767,6 +3772,25 @@ export function planReconcile({
         }
         continue;
       }
+    }
+
+    // Stacked bases were handled above. A definite mergeability conflict on the default
+    // base needs the same bounded mechanical repair as a stale base, with the same holds.
+    if (mergeableConflict && pr?.baseRefName === defaultBranch) {
+      if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
+      const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
+        currentRef: defaultBranch, currentSha: mainSha,
+      });
+      const why = `GitHub mergeable is CONFLICTING — rebase onto current ${defaultBranch}`;
+      if (attempts >= conflictFixCapHere || total >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+        refuseCapExhausted({ ...withPhase, attempts, cap: conflictFixCapHere, capKind: 'conflicting-rebase',
+          why: `${why}; durable conflict-fix count ${attempts}/${conflictFixCapHere}, total ${total}/${CONFLICT_FIX_ABSOLUTE_CEILING} — mechanical repair exhausted; a person must take it` });
+      } else {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', isConflict: true, mode: 'conflicting-rebase',
+          attempts, cap: conflictFixCapHere, why });
+      }
+      continue;
     }
 
     if (!OWED[phase]) {

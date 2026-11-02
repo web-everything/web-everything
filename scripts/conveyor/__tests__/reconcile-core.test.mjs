@@ -2672,7 +2672,7 @@ describe('case 6 — the discovery queries, pinned literally (#3296)', () => {
     expect(jsonAt).toBeGreaterThan(-1);
     const fields = String(calls[0].argv[jsonAt + 1]).split(',');
     expect(fields).toEqual(expect.arrayContaining([
-      'number', 'headRefName', 'headRefOid', 'labels', 'statusCheckRollup', 'mergeStateStatus', 'comments',
+      'number', 'headRefName', 'headRefOid', 'labels', 'statusCheckRollup', 'mergeStateStatus', 'mergeable', 'comments',
     ]));
     expect(PR_LIST_JSON_FIELDS.split(',')).toEqual(fields);
   });
@@ -4650,5 +4650,77 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(off.refusals[0].kind).toBe(isDraft ? 'draft' : 'review-ci');
     expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
     expect(off.dispatch).toEqual(baseline.dispatch);
+  });
+});
+
+
+describe('CONFLICTING mergeability outside DIRTY still owes a mechanical rebase', () => {
+  const mainSha = 'b'.repeat(40);
+  const pr = (over = {}) => pr1563({ baseRefName: 'main', labels: lbl('review:accepted', 'ready-to-merge'),
+    mergeStateStatus: 'BLOCKED', mergeable: 'CONFLICTING', comments: [], ...over });
+  const plan = (over = {}, options = {}) => planReconcile({ prs: [pr(over)], agents: [], now: NOW, mainSha, ...options });
+  const roundAt = sha => ({ author: AUTOMATION,
+    body: `${CONFLICT_FIX_COMMENT_MARKER}\n<!-- conveyor-conflict-fix-target: main@${sha} -->` });
+
+  it.each(['BLOCKED', 'UNKNOWN'])('dispatches queued CONFLICTING + %s as conflicting-rebase', mergeStateStatus => {
+    const result = plan({ mergeStateStatus });
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatch).toMatchObject([{ phase: 'conflicted', kind: 'fix', isConflict: true,
+      mode: 'conflicting-rebase', attempts: 0, cap: CONFLICT_FIX_ROUND_CAP }]);
+  });
+  it('also reclassifies an open PR without review labels', () => {
+    expect(plan({ labels: [] }).dispatch).toMatchObject([{ phase: 'conflicted', mode: 'conflicting-rebase' }]);
+  });
+  it('routes a CONFLICTING stacked base through stacked-rebase', () => {
+    const result = plan({ baseRefName: 'lane/stacked' });
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatch).toMatchObject([{ mode: 'stacked-rebase', baseRefName: 'lane/stacked' }]);
+  });
+  it.each([undefined, 'UNKNOWN', 'MERGEABLE'])('leaves mergeable %s as nothing-owed', mergeable => {
+    const result = plan({ mergeable });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ phase: 'queued', kind: 'nothing-owed' }]);
+  });
+  it.each(['DIRTY', 'BEHIND'])('leaves existing %s main-base conflicts owed to the drain', mergeStateStatus => {
+    const result = plan({ mergeStateStatus });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ phase: 'conflicted', kind: 'owed-elsewhere' }]);
+  });
+  it('counts repairs against the current main SHA toward the conflict cap', () => {
+    const result = plan({ comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => roundAt(mainSha)) });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'conflicting-rebase',
+      attempts: CONFLICT_FIX_ROUND_CAP, cap: CONFLICT_FIX_ROUND_CAP }]);
+    expect(result.refusals[0].why).toContain('a person must take it');
+  });
+  it('does not spend the current-target cap on repairs against older main tips', () => {
+    const result = plan({ comments: Array.from({ length: CONFLICT_FIX_ROUND_CAP }, () => roundAt('a'.repeat(40))) });
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatch).toMatchObject([{ mode: 'conflicting-rebase', attempts: 0 }]);
+  });
+  it('enforces the absolute ceiling even when every repair targeted an older tip', () => {
+    const result = plan({ comments: Array.from({ length: CONFLICT_FIX_ABSOLUTE_CEILING }, () => roundAt('a'.repeat(40))) });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'conflicting-rebase', attempts: 0 }]);
+    expect(result.refusals[0].why).toContain('a person must take it');
+  });
+  it('uses the configured default branch for main-base routing', () => {
+    expect(plan({ baseRefName: 'trunk' }, { defaultBranch: 'trunk' }).dispatch)
+      .toMatchObject([{ mode: 'conflicting-rebase' }]);
+  });
+  it.each([
+    ['referral', { referralHold: { why: 'waiting for referral' } }, 'review-referrals-pending'],
+    ['scope', { scopeBloat: { why: 'oversized diff' } }, 'scope-bloat'],
+  ])('preserves the %s hold before mechanical dispatch', (_name, over, kind) => {
+    const result = plan(over);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toMatchObject([{ kind }]);
+  });
+  it('carries fetched mergeable through discovery enrichment into the planner', () => {
+    const { exec } = spyExec(JSON.stringify([pr()]));
+    const prs = defaultReadPrs({ exec });
+    expect(prs[0].mergeable).toBe('CONFLICTING');
+    expect(planReconcile({ prs, agents: [], now: NOW, mainSha }).dispatch)
+      .toMatchObject([{ mode: 'conflicting-rebase' }]);
   });
 });
