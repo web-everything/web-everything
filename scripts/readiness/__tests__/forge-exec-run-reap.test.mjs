@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, readdir, utimes, realpath, stat} from 'node:fs/promises';
 import {join} from 'node:path';
-import {createRunner, uidBusy} from '../forge-exec-run.mjs';
+import {createRunner, uidBusy, DEFAULT_PROC_ROOT} from '../forge-exec-run.mjs';
 // R333: the runner reaps leaked reservations/receipts only on proof the owner is gone.
 let root, receipts, probe, calls;
 const nonce = 'a'.repeat(32);
@@ -343,9 +343,15 @@ describe('forge leaked-state reaper', () => {
     expect(await uidBusy(workerUid, proc)).toBe(true);
     expect(await uidBusy(4000000123, proc)).toBe(false);
   });
-  it.runIf(process.platform === 'linux')('default filesystem binding sees this live process as busy', async () => {
-    // Stable even when the scan fails closed (busy), and proves the default binding on the real /proc.
-    expect(await uidBusy(process.getuid())).toBe(true);
+  it('defaults its scan root to DEFAULT_PROC_ROOT, which is /proc', async () => {
+    expect(DEFAULT_PROC_ROOT).toBe('/proc');
+    const paths = [];
+    const spy = {
+      async readdir(path) { paths.push(path); return ['42']; },
+      async readFile(path) { paths.push(path); return Buffer.from(procStatus()); },
+    };
+    expect(await uidBusy(workerUid, spy)).toBe(false);
+    expect(paths).toEqual([DEFAULT_PROC_ROOT, DEFAULT_PROC_ROOT + '/42/status']);
   });
   it('fails closed (busy) when a fixture entry keeps vanishing', async () => {
     const proc = procFixture({entries: ['42'], readStatus: () => { throw procError('ENOENT'); }});
