@@ -170,3 +170,27 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     return keep('unique-commits-not-on-main', { tip, pr: prNumber, evidence });
   });
 }
+
+/**
+ * A registration whose branch could not be fetched (usually deleted after its PR merged). Retire it only when GitHub
+ * names exactly ONE MERGED PR headed by the ref (matching a recorded PR number) and that PR's merge commit is an
+ * ancestor of `mainRef`. The overlay CLI re-proves the same facts before it drops anything. Any unreadable,
+ * ambiguous or missing answer keeps the row as `fetch-failed`.
+ */
+export function planFetchFailed({ row, git, gh, repo, mainRef = 'origin/main' }) {
+  const keep = { ref: row.ref, action: 'keep', reason: 'fetch-failed' };
+  if (row.edgeResolution || !/^[\w.-]+\/[\w.-]+$/.test(String(repo || ''))) return keep;
+  const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', row.ref, '--state', 'merged',
+    '--json', 'number,state,headRefName,headRefOid,mergeCommit', '--limit', '10']);
+  if (!list.ok || !Array.isArray(list.value)) return keep;
+  const hits = list.value.filter((pr) => pr?.headRefName === row.ref && pr?.state === 'MERGED');
+  if (hits.length !== 1) return keep;
+  const [pr] = hits;
+  if (Number.isInteger(row.pr) && row.pr !== pr.number) return keep;
+  const tip = String(pr.headRefOid ?? '');
+  const mergeOid = String(pr.mergeCommit?.oid ?? '');
+  if (!SHA.test(tip) || !SHA.test(mergeOid) || !Number.isInteger(pr.number)) return keep;
+  if (git(['merge-base', '--is-ancestor', mergeOid, mainRef]).code !== 0) return keep;
+  return { ref: row.ref, action: 'retire', reason: 'pr-squash-merged', tip, pr: pr.number,
+    evidence: { refGone: true, prState: 'MERGED', mergeCommit: mergeOid, prVia: 'head-ref' } };
+}
