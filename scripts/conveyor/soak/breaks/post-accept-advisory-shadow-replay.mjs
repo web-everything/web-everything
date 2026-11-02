@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const CLI = 'scripts/operations/review-loop-cli.mjs';
 const PATH = 'scripts/operations/review-pr.mjs';
-const REPO = 'web-everything/web-everything';
+const REPO = 'example/advisory-shadow-replay';
 const HEAD_A = 'a'.repeat(40), HEAD_B = 'b'.repeat(40);
 
 export default {
