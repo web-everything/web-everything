@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import yaml from 'js-yaml';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { decideQueueTestedSkip, MAX_RUNS_CHECKED, INPUT_SETTLE_MS, SIBLING_REPO, SIBLING_BRANCH } from '../skip-queue-tested-push.mjs';
 
 const sha = 'a'.repeat(40);
@@ -75,8 +76,7 @@ const kind = command === 'gh'
   : args[0] === 'rev-parse' ? (args[1] === '--verify' ? 'q-tip' : 'git') : \`q-\${args[0]}\`;
 if (kind === ${JSON.stringify(fail)} || kind === 'unknown') process.exit(1);
 if (kind === ${JSON.stringify(hang)}) {
-  process.on('SIGTERM', () => {});
-  setInterval(() => {}, 1000);
+  ${keepAliveScript({ maxLifetimeMs: 60_000, prelude: "process.on('SIGTERM', () => {});" })}
 } else {
 const responses = ${JSON.stringify({ git: gitTree, runs, tree, 'q-fetch': '', 'q-tip': qTip, 'q-ls-tree': qListed,
     'q-show': qList, 'q-activity': qActivity, 'fui-branch': fuiBranch, 'fui-tip': fuiTipOut, 'fui-activity': fuiActivity })};
