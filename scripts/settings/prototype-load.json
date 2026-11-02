@@ -19,6 +19,5 @@
   "recordPath": "~/workspace/.operations/coordination/prototype-loads.jsonl",
   "readyRecordPath": "~/workspace/.operations/coordination/fix-ready.jsonl",
   "auditRecordPath": "~/workspace/.operations/coordination/audits.jsonl",
-  "canonicalAuditMode": "warn",
   "loaderCli": "scripts/daemon-overlay.mjs"
 }

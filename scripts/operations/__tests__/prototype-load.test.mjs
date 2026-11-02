@@ -336,9 +336,9 @@ describe('canonicalAuditEvidence hardening', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
-  it('ships canonicalAuditMode warn in the default settings', () => {
+  it('keeps the warn default in the standard cascade layer, not the tool file, so a platform refuse is not overridden', () => {
     const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
-    expect(shipped.canonicalAuditMode).toBe('warn');
+    expect(shipped).not.toHaveProperty('canonicalAuditMode');
   });
   it.each([
     ['explicit warn', 'warn', [], 'no-record'],
