@@ -71,7 +71,7 @@ export function parseRedTeamComment(body) {
   const findings = [];
   const shapedLines = [];
   for (const line of text.split('\n')) {
-    if (FINDING_SHAPED_RE.test(line)) shapedLines.push(line.trim());
+    if (FINDING_SHAPED_RE.test(line) && !FINDING_RE.test(line)) shapedLines.push(line.trim());
     const f = FINDING_RE.exec(line);
     if (f) {
       const [path, ln] = f[5] ? (/^(.*?):(\d+)$/.exec(f[5])?.slice(1) ?? [f[5], null]) : [null, null];
@@ -102,10 +102,11 @@ const RESULT_ID_FIELDS = ['index', 'confirmed', 'recheckOutcome', 'category', 'i
 export function redTeamResultId(parsed) {
   if (!parsed) return null;
   const findings = (parsed.findings ?? []).map(f => RESULT_ID_FIELDS.map(k => f?.[k] ?? null));
-  // v2: also covers every finding-shaped line (even ones the strict parser skips), so an appended, indented or malformed
-  // finding re-keys the result. Records keyed on a v1 id no longer match: they are ignored (fail closed).
-  const shaped = Array.isArray(parsed.shapedLines) ? parsed.shapedLines : [];
-  return createHash('sha256').update(JSON.stringify(['v2', findings, shaped])).digest('hex').slice(0, 16);
+  // A finding-shaped line the strict parser skipped (indented, other case, malformed) also keys the result, so adding
+  // one re-keys it and voids every record for the old id (fail closed). A result with none keeps its v1 id, so existing
+  // records, operator rulings included, keep applying to results nobody has tampered with.
+  const extra = Array.isArray(parsed.shapedLines) ? parsed.shapedLines : [];
+  return createHash('sha256').update(JSON.stringify(extra.length ? ['v2', findings, extra] : ['v1', findings])).digest('hex').slice(0, 16);
 }
 
 /**

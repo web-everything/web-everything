@@ -348,6 +348,9 @@ describe('redTeamResultId digest covers every finding-shaped line (card 43)', ()
       expect(redTeamResultId(parseRedTeamComment(added(line)))).not.toBe(ID);
     });
   }
+  it('a result with no extra finding-shaped lines keeps its pre-change v1 id (existing records still apply)', () => {
+    expect(ID).toBe(redTeamResultId({ findings: parseRedTeamComment(BODY_4722).findings }));
+  });
   it('a removed or changed finding changes the digest', () => {
     expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace('Restarting with', 'Restarted with')))).not.toBe(ID);
     expect(redTeamResultId(parseRedTeamComment(BODY_4722.replace(/\n2\. \[\*\*confirmed.*?\n/s, '\n')))).not.toBe(ID);
