@@ -342,7 +342,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       let auditRecords = [];
       try { auditRecords = jsonLines(read(expand(config.auditRecordPath))); } catch { /* Unreadable evidence cannot qualify. */ }
       const mode = config.canonicalAuditMode === 'warn' ? 'warn' : 'refuse';
-      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha) };
+      let fetchedMain = false;
+      const covers = (base) => { try {
+        if (!fetchedMain) { requireGit('fetch', 'origin', 'main'); fetchedMain = true; }
+        return ancestor(base, 'origin/main');
+      } catch { return false; } };
+      out.canonicalAudit = { mode, ...canonicalAuditEvidence(auditRecords, input.sha, covers) };
       if (!out.canonicalAudit.ok) {
         const fallback = `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load.`;
         if (mode === 'refuse') return stop('no-canonical-audit', { fallback });

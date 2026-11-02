@@ -189,6 +189,7 @@ function fixture(options = {}) {
     }
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
+      if (options.auditBaseInMain && args[3] === 'origin/main' && args[2] === options.auditBaseInMain) return '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
       if ([...establishedTips.values()].includes(args[2])) {
         if (options.refreshError === 'ancestry') return fail(128);
@@ -386,11 +387,16 @@ describe('prototype-load canonical audit admission', () => {
   });
   it.each(['warn', 'refuse'])('%s accepts a canonical NOT WEAKENED audit read from the configured JSONL path', async mode => {
     const record = auditRecord();
-    const f = auditedFixture(mode, { audits: `malformed json\n${auditLines([record])}` });
+    const f = auditedFixture(mode, { auditBaseInMain: TREE, audits: `malformed json\n${auditLines([record])}` });
     const out = await f.run();
     expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode, ok: true } });
     expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
     expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('refuse rejects a pass whose base is not in origin/main (it audited only part of the change)', async () => {
+    const f = auditedFixture('refuse', { audits: auditLines([auditRecord()]) });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('checks ready evidence before reading canonical audits, including when explicit ready arguments pass', async () => {
     const f = auditedFixture('refuse', { ready: '', auditReadError: 'EACCES' });

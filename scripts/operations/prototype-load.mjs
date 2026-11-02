@@ -22,14 +22,15 @@ export function readyEvidence(records, input) {
 }
 /** Canonical audit for this head. Each non-empty base (base!==head) is judged by findAudit (latest wins within a
  * base, file order breaks ties, contradictory findings rejected). Fail closed: ANY base whose latest verdict is
- * WEAKENED blocks, so a pass over a narrower base can never mask a WEAKENED audit of the fuller change. */
-export function canonicalAuditEvidence(records, sha) {
+ * WEAKENED blocks, and a pass only counts when covers(base) proves the base is already in main (the audit spans the
+ * whole change, not just its last commit). */
+export function canonicalAuditEvidence(records, sha, covers = () => true) {
   const bases = new Set(records.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base));
   let pass = null;
   for (const base of bases) {
     const record = findAudit(records, { head: sha, base, questionHash: QUESTION_HASH });
     if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
-    if (record && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
+    if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
   }
   return pass ? { ok: true, record: pass } : { ok: false, reason: 'no-record' };
 }
