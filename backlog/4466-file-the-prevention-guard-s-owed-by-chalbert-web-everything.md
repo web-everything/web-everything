@@ -5,6 +5,7 @@ size: 3
 parent: "4075"
 status: open
 scope: ["we:scripts/lib/__tests__/gh-throttle.fidelity.test.mjs", "we:eslint.config.mjs", "we:__tests__/eslint.config*.test.mjs", "we:package.json", "we:package-lock.json", "we:scripts/lib/__tests__/library-no-undef.test.mjs"]
+scopeRationale: "The six scoped entries are the predicted edits. Acceptance A3 names we:scripts/lib/gh-throttle.mjs only as a required read-only member of the production-library scan; no runtime edit is planned. Any defect exposed by that scan requires an explicit source/test scope correction before implementation."
 dateOpened: "2026-09-29"
 preparedDate: "2026-11-02"
 preparedAgainstSha: "230db4555dd82de1bd165453d678ad02e591951c"
