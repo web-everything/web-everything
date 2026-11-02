@@ -21,6 +21,8 @@ const verdict = (pr, headSha, extra = {}) => buildVerdictRecord({
 function deps(f = fixture(6223), overrides = {}) {
   return { readPr: async () => f, readLabels: async () => f.labels,
     fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
+    readLabelEvents: async () => ['review:human','review:pending'].map(name =>
+      ({event:'labeled',label:{name},created_at:'2026-11-02T09:00:00Z'})),
     readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
     readRulingFile: async (sha) => sha === base ? 'Original rule.\n' : `Original rule.\n${rulingEntry}`,
     readRulingDiff: async () => rulingDiff(rulingEntry),
@@ -817,7 +819,7 @@ describe('round 6 enforcement-tree classification', () => {
     }));
     expect(condition(r,4).status).toBe('PASS');
   });
-  it.each([[],['scripts/**']])('protected FAIL wins with reviewedSafePaths %j', async reviewedSafePaths => {
+  it.each([[[]],[['scripts/**']]])('protected FAIL wins with reviewedSafePaths %j', async reviewedSafePaths => {
     const path = 'scripts/check-standards.mjs';
     const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs',path]}, {
       readSettings:()=>({...settings,reviewedSafePaths}),
@@ -890,5 +892,140 @@ describe('round 6 ruling-entry content evidence', () => {
     const r = await check('- **R999** (date) Operator: "..."\n',{readRulingDiff:adapter.readRulingDiff});
     expect(condition(r,3).status).toBe('UNKNOWN');
     expect(condition(r,3).evidence.join(' ')).toContain('human review');
+  });
+});
+
+
+describe('round 7 path and audit evidence', () => {
+  it('matches globstars across newline segments', () => {
+    expect(matchesGlob('scripts/hidden\n/guard-custom.mjs', '**/guard-*.mjs')).toBe(true);
+    expect(matchesGlob('scripts/hidden\n/guard-custom.mjs', 'scripts/**')).toBe(true);
+  });
+  it.each(['scripts/hidden\n/guard-custom.mjs','docs/a\r.md','docs/a\t.md',
+    'docs/a\x7f.md','docs/a\x85.md','docs/\ud800.md'])
+  ('keeps unsafe path %j UNKNOWN in both path conditions', async path => {
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    for (const id of [3,4]) {
+      expect(condition(r,id).status).toBe('UNKNOWN');
+      expect(condition(r,id).evidence.join(' ')).toContain('human review');
+    }
+    expect(r.eligible).toBe(false);
+  });
+  it('preserves valid UTF8 path bytes including a leading BOM', async () => {
+    const head = fixture(6223).headRefOid;
+    const adapter = createCheckDeps({exec:(_bin,args) => {
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return head;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'diff') return Buffer.from('\ufeffdocs/caf\u00e9.md\0');
+      throw Error('unexpected command');
+    }});
+    expect(await adapter.fetchNetDiff(6223,head)).toEqual({paths:['\ufeffdocs/caf\u00e9.md'],base});
+  });
+  it('rejects non-UTF8 net-diff bytes before lossy decoding', async () => {
+    const head = fixture(6223).headRefOid;
+    const adapter = createCheckDeps({exec:(_bin,args,options) => {
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return head;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'diff') {
+        expect(options.encoding).toBe(null);
+        return Buffer.concat([Buffer.from('docs/'),Buffer.from([0xff]),Buffer.from('.md\0')]);
+      }
+      throw Error('unexpected command');
+    }});
+    const r = await checkPr(6223,deps(undefined,{fetchNetDiff:adapter.fetchNetDiff}));
+    expect([condition(r,3).status,condition(r,4).status]).toEqual(['UNKNOWN','UNKNOWN']);
+    expect(r.eligible).toBe(false);
+  });
+  it.each([null,undefined,'finding',[null],[42],['finding',42],{}])('rejects invalid findings %j', async findings => {
+    const r = await checkPr(6223,deps(undefined,{
+      readAudits:()=>[audit(fixture(6223).headRefOid,{findings})],
+    }));
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['no audit for head']});
+  });
+  it('does not hide an intervening foreign-base WEAKENED behind a later foreign-base clear', async () => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223,deps(undefined,{readAudits:()=>[
+      audit(head),
+      audit(head,{base:'b'.repeat(40),at:'2026-11-02T11:00:00Z',verdict:'WEAKENED'}),
+      audit(head,{base:'b'.repeat(40),at:'2026-11-02T12:00:00Z'}),
+    ]}));
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['latest audit: WEAKENED']});
+  });
+});
+
+describe('round 7 live hold chronology', () => {
+  const event = (name, at, kind = 'labeled') => ({event:kind,label:{name},created_at:at});
+  const check = (label, readLabelEvents) => checkPr(6223,deps({
+    ...fixture(6223),labels:['red-team:clear','review:accepted',label],
+  },{readLabelEvents}));
+  it.each(['review:human','review:pending'])('%s applied after acceptance fails even before ledger mirror', async label => {
+    const r = await check(label,()=>[
+      event(label,'2026-11-02T09:00:00Z'),event(label,'2026-11-02T09:30:00Z','unlabeled'),
+      event(label,'2026-11-02T11:00:00Z'),
+    ]);
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:[`hold applied after acceptance: ${label}`]});
+  });
+  it.each(['2026-11-02T09:00:00Z','2026-11-02T10:00:00Z'])('permits a hold applied at %s before or at acceptance', async at => {
+    expect(condition(await check('review:human',()=>[event('review:human',at)]),2).status).toBe('PASS');
+  });
+  it.each(['throw','missing','malformed','invalid time','oversized'])('keeps %s timeline UNKNOWN with human fallback', async kind => {
+    const r = await check('review:human',()=>{
+      if (kind === 'throw') throw Error('unreadable');
+      if (kind === 'missing') return [];
+      if (kind === 'malformed') return null;
+      if (kind === 'oversized') return Array(1001).fill(event('review:human','2026-11-02T09:00:00Z'));
+      return [event('review:human','bad time')];
+    });
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
+  });
+  it('checks both live holds independently instead of accepting the older one', async () => {
+    const r = await checkPr(6223,deps({...fixture(6223),
+      labels:['red-team:clear','review:accepted','review:human','review:pending'],
+    },{readLabelEvents:()=>[
+      event('review:human','2026-11-02T09:00:00Z'),event('review:pending','2026-11-02T11:00:00Z'),
+    ]}));
+    expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:['hold applied after acceptance: review:pending']});
+  });
+  it('bounds cumulative timeline bytes across individually bounded pages', async () => {
+    let calls = 0;
+    const rows = Array.from({length:100},()=>({event:'commented'}));
+    rows[0].body = 'x'.repeat(1024*1024);
+    const adapter = createCheckDeps({exec:()=>{ calls++; return JSON.stringify(rows); }});
+    const r = await check('review:human',adapter.readLabelEvents);
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
+    expect(calls).toBe(8);
+  });
+  it('does not read timeline when no live hold exists', async () => {
+    expect((await checkPr(6223,deps(undefined,{readLabelEvents:()=>{throw Error('must not read');}}))).eligible).toBe(true);
+  });
+  it('paginates explicit-repo issue events and filters hold label events', async () => {
+    const calls = [];
+    const rows = Array.from({length:100},()=>({event:'commented'}));
+    rows[0] = event('review:human','2026-11-02T09:00:00Z');
+    const adapter = createCheckDeps({exec:(bin,args)=>{
+      calls.push([bin,args]);
+      return JSON.stringify(calls.length === 1 ? rows : [event('review:pending','2026-11-02T11:00:00Z')]);
+    }});
+    expect(await adapter.readLabelEvents(6223)).toEqual([rows[0],event('review:pending','2026-11-02T11:00:00Z')]);
+    expect(calls).toEqual([1,2].map(page=>['gh',['api',
+      `repos/${CONSTELLATION_REPOS.we.slug}/issues/6223/events?per_page=100&page=${page}`]]));
+  });
+  it.each(['unreadable','non-array','oversized page','page cap','byte cap'])('adapter keeps %s timeline closed', async kind => {
+    let calls = 0;
+    const adapter = createCheckDeps({exec:()=>{
+      calls++;
+      if (kind === 'unreadable') throw Error('gh unavailable');
+      if (kind === 'non-array') return '{}';
+      if (kind === 'byte cap') return 'x'.repeat(8*1024*1024+1);
+      return JSON.stringify(Array(kind === 'oversized page' ? 101 : 100).fill({event:'commented'}));
+    }});
+    const r = await check('review:human',adapter.readLabelEvents);
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
+    expect(calls).toBe(kind === 'page cap' ? 10 : 1);
   });
 });

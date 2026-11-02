@@ -20,12 +20,14 @@ const result = (id, name, status, evidence) => ({ id, name, status, evidence });
 const unknown = (id, name, detail) => result(id, name, 'UNKNOWN', [`${detail}; request human review of the full diff or repair evidence and retry`]);
 const validPr = pr => Number.isSafeInteger(pr) && pr > 0;
 const validPath = path => typeof path === 'string' && path.length > 0 && path.length <= 4096
-  && !path.startsWith('/') && !path.includes('\\') && !path.includes('\0')
+  && !path.startsWith('/') && !path.includes('\\')
+  && !/[\x00-\x1f\x7f-\x9f]/.test(path) && Buffer.from(path, 'utf8').toString('utf8') === path
   && !path.split('/').some(part => !part || part === '.' || part === '..');
 
 /** Shared anchored matcher: ** crosses directories, * and ? stay within a segment. */
 export function matchesGlob(path, glob) {
-  return typeof path === 'string' && typeof glob === 'string' && globToRegExp(glob).test(path);
+  return typeof path === 'string' && typeof glob === 'string'
+    && new RegExp(globToRegExp(glob).source, 's').test(path);
 }
 
 function validateSettings(settings) {
@@ -52,20 +54,26 @@ function labelNames(labels) {
   });
 }
 
-/** findAudit owns canonical validation. Across bases, latest time / append order still wins. */
-function latestAudit(records, head) {
+/** Validate every head record, retaining cross-base weakened evidence newer than the bound clear. */
+function latestAudit(records, head, base) {
   if (!Array.isArray(records) || records.length > MAX_AUDITS) throw new Error('invalid or oversized audit ledger');
-  const byBase = new Map();
-  for (const record of records) {
-    if (record?.head !== head) continue;
-    if (!byBase.has(record.base)) byBase.set(record.base, []);
-    byBase.get(record.base).push(record);
+  const valid = records.filter(record => record?.head === head
+    && Array.isArray(record.findings) && record.findings.every(line => typeof line === 'string')
+    && findAudit([record], { head, base: record.base, questionHash: QUESTION_HASH }));
+  const newer = (record, previous) => !previous || Date.parse(record.at) >= Date.parse(previous.at);
+  let latest = null, accepting = null;
+  for (const record of valid) {
+    if (newer(record, latest)) latest = record;
+    if (record.base === base && newer(record, accepting)) accepting = record;
   }
-  const candidates = new Set([...byBase].map(([base, group]) =>
-    findAudit(group, { head, base, questionHash: QUESTION_HASH })).filter(Boolean));
-  let latest = null;
-  for (const record of records) {
-    if (candidates.has(record) && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
+  if (accepting?.verdict === 'NOT WEAKENED') {
+    const acceptedAt = Date.parse(accepting.at), acceptedIndex = valid.indexOf(accepting);
+    for (let i = 0; i < valid.length; i++) {
+      const record = valid[i], at = Date.parse(record.at);
+      if (record.verdict === 'WEAKENED' && (at > acceptedAt || (at === acceptedAt && i > acceptedIndex))) {
+        return record;
+      }
+    }
   }
   return latest;
 }
@@ -85,7 +93,7 @@ async function reviewed(pr, head, base, deps) {
   if (blocked.length || missing.length) return result(2, name, 'FAIL', [
     ...blocked.map(l => `blocking label: ${l}`), ...missing.map(l => `missing label: ${l}`),
   ]);
-  try { audit = latestAudit(await deps.readAudits(), head); }
+  try { audit = latestAudit(await deps.readAudits(), head, base); }
   catch { return unknown(2, name, 'audits unavailable or oversized'); }
   if (!audit) return result(2, name, 'FAIL', ['no audit for head']);
   if (audit.verdict !== 'NOT WEAKENED') return result(2, name, 'FAIL', [`latest audit: ${audit.verdict}`]);
@@ -109,6 +117,29 @@ async function reviewed(pr, head, base, deps) {
   }
   if (!state.clears || state.reviewExempt || !state.verdict) return result(2, name, 'FAIL',
     ['verdict ledger does not accept the current head', ...state.holds.map(h => `${h.code}: ${h.reason}`)]);
+  const liveHolds = labels.filter(label => ['review:pending', REVIEW_LABELS.human].includes(label));
+  if (liveHolds.length) {
+    let applications;
+    try {
+      const events = await deps.readLabelEvents(pr);
+      if (!Array.isArray(events) || events.length > 1000) throw new Error('invalid or oversized label timeline');
+      applications = new Map();
+      for (const event of events) {
+        if (!['labeled', 'unlabeled'].includes(event?.event) || typeof event.label?.name !== 'string'
+          || typeof event.created_at !== 'string' || !Number.isFinite(Date.parse(event.created_at))) {
+          throw new Error('invalid label event');
+        }
+        if (event.event !== 'labeled' || !liveHolds.includes(event.label.name)) continue;
+        const at = Date.parse(event.created_at);
+        applications.set(event.label.name, Math.max(applications.get(event.label.name) ?? -Infinity, at));
+      }
+      if (!Number.isFinite(Date.parse(current.at)) || liveHolds.some(label => !applications.has(label))) {
+        throw new Error('missing hold application or acceptance time');
+      }
+    } catch { return unknown(2, name, 'hold label timeline unavailable, incomplete or oversized'); }
+    const later = liveHolds.filter(label => applications.get(label) > Date.parse(current.at));
+    if (later.length) return result(2, name, 'FAIL', later.map(label => `hold applied after acceptance: ${label}`));
+  }
   return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',
     `canonical audit NOT WEAKENED for head ${head}, base ${audit.base}, at ${audit.at}`,
     'verdict ledger accepts the current head with no holds']);

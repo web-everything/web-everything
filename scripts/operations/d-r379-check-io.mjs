@@ -39,11 +39,13 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
   gitEnv.GIT_CONFIG_COUNT = String(configCount + 1);
   gitEnv[`GIT_CONFIG_KEY_${configCount}`] = 'diff.renames';
   gitEnv[`GIT_CONFIG_VALUE_${configCount}`] = 'false';
-  const run = async (bin, args) => {
-    const output = await exec(bin, args, bin === 'git' ? { ...options, env: gitEnv } : options);
+  const run = async (bin, args, strictUtf8 = false) => {
+    const execOptions = { ...options, ...(bin === 'git' ? { env: gitEnv } : {}),
+      ...(strictUtf8 ? { encoding: null } : {}) };
+    const output = await exec(bin, args, execOptions);
     if (typeof output !== 'string' && !Buffer.isBuffer(output)) throw new Error('incomplete command output');
     if (Buffer.byteLength(output) > MAX_BYTES) throw new Error('output bound exceeded; human review required');
-    return String(output);
+    return strictUtf8 && Buffer.isBuffer(output) ? new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(output) : String(output);
   };
   const read = path => {
     const fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
@@ -89,6 +91,28 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       const snapshot = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--json', 'labels,headRefOid']));
       if (snapshot.headRefOid !== head) throw new Error('PR head moved; retry');
       return snapshot.labels;
+    },
+    async readLabelEvents(pr) {
+      checkPrNumber(pr);
+      const events = [];
+      let bytes = 0;
+      // At most ten calls / 1000 issue events; a full final page cannot prove completeness.
+      for (let page = 1; page <= 10; page++) {
+        const text = await run('gh', ['api',
+          `repos/${CONSTELLATION_REPOS.we.slug}/issues/${pr}/events?per_page=100&page=${page}`]);
+        bytes += Buffer.byteLength(text);
+        if (bytes > MAX_BYTES) throw new Error('label timeline byte bound exceeded; human review required');
+        const rows = JSON.parse(text);
+        if (!Array.isArray(rows) || rows.length > 100) throw new Error('invalid label timeline page; human review required');
+        for (const row of rows) {
+          if (!row || typeof row.event !== 'string') throw new Error('invalid issue event; human review required');
+          if (!['labeled', 'unlabeled'].includes(row.event)) continue;
+          if (typeof row.label?.name !== 'string') throw new Error('invalid label event; human review required');
+          if (['review:human', 'review:pending'].includes(row.label.name)) events.push(row);
+        }
+        if (rows.length < 100) return events;
+      }
+      throw new Error('label timeline page bound exceeded; human review required');
     },
     async readReviewLedger(pr) {
       checkPrNumber(pr);
@@ -139,7 +163,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       if (fetched !== head) throw new Error('fetched head differs from PR head; retry');
       const base = (await run('git', ['merge-base', 'origin/main', head])).trim();
       checkSha(base);
-      const text = await run('git', ['diff', base, head, '--name-only', '-z']);
+      const text = await run('git', ['diff', base, head, '--name-only', '-z'], true);
       if (!text) return {paths: [], base};
       if (!text.endsWith('\0')) throw new Error('incomplete NUL-delimited diff');
       const paths = text.slice(0, -1).split('\0');
