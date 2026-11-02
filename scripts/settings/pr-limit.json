@@ -8,7 +8,14 @@
       "lane/pr-limit-focus-exempt",
       "lane/overlay-sync-conflict-stop",
       "lane/r375-stale-referral-shadow",
-      "lane/ci-run-less-g"
+      "lane/ci-run-less-g",
+      "lane/adopt-graduated-overlay-thin",
+      "lane/drain-unknown-mergeability",
+      "lane/codex-detach-wait",
+      "lane/codex-audit-op",
+      "lane/lane-salvage-refuse-release",
+      "lane/overlay-generations-slice-a",
+      "lane/clone-entries-slice-d"
     ]
   }
 }
