@@ -49,7 +49,6 @@
     "**/*.csh",
     "**/*.fish"
   ],
-  "reviewedSafePaths": [],
   "protectedPaths": [
     "tests/**",
     "**/*.spec.*",

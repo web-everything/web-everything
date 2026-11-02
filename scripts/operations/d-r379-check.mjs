@@ -48,9 +48,13 @@ export function matchesGlob(path, glob) {
 }
 
 function validateSettings(settings) {
-  for (const key of ['directionPaths', 'protectedPaths', 'harmlessPaths', 'enforcementTrees', 'reviewedSafePaths']) {
-    const patterns = key === 'reviewedSafePaths' && settings?.[key] === undefined ? [] : settings?.[key];
-    if (!Array.isArray(patterns) || (key !== 'reviewedSafePaths' && !patterns.length) || patterns.length > 1000
+  if (settings?.reviewedSafePaths !== undefined
+    && (!Array.isArray(settings.reviewedSafePaths) || settings.reviewedSafePaths.length !== 0)) {
+    throw new Error('reviewedSafePaths is no longer supported; human review required');
+  }
+  for (const key of ['directionPaths', 'protectedPaths', 'harmlessPaths', 'enforcementTrees']) {
+    const patterns = settings?.[key];
+    if (!Array.isArray(patterns) || !patterns.length || patterns.length > 1000
       || patterns.some(p => typeof p !== 'string' || !p.trim() || p.length > 4096)) {
       throw new Error('incomplete path policy');
     }
@@ -67,7 +71,7 @@ function validateSettings(settings) {
       ![...settings.protectedPaths, ...settings.enforcementTrees].some(glob => matchesGlob(path, glob)))) {
     throw new Error('path policy fails trusted minimum canary probes');
   }
-  return { ...settings, reviewedSafePaths: settings.reviewedSafePaths ?? [] };
+  return settings;
 }
 
 function labelNames(labels) {
@@ -327,14 +331,11 @@ function protectedPaths(paths, settings) {
   const hits = paths.filter(path => patterns.some(glob => matchesGlob(path, glob)));
   if (hits.length) return result(4, 'Not guard-loosening / hard to undo', 'FAIL',
     hits.map(path => `protected path: ${path}`));
-  const unclassified = paths.filter(path => {
-    if (settings.reviewedSafePaths.some(glob => matchesGlob(path, glob))) return false;
-    return !settings.harmlessPaths.some(glob => matchesGlob(path, glob))
-      || settings.enforcementTrees.some(glob => matchesGlob(path, glob));
-  });
+  const unclassified = paths.filter(path => !settings.harmlessPaths.some(glob => matchesGlob(path, glob))
+    || settings.enforcementTrees.some(glob => matchesGlob(path, glob)));
   return result(4, 'Not guard-loosening / hard to undo', unclassified.length ? 'UNKNOWN' : 'PASS',
     unclassified.length ? unclassified.map(path => `unclassified path: ${path}; operator review`)
-      : ['all paths harmless or explicitly reviewed safe; no protected paths']);
+      : ['all paths harmless; no protected paths']);
 }
 
 /** Return all five conditions; seats are informational and never authorize approval. */

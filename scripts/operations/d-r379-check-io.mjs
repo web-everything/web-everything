@@ -219,7 +219,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       }
     },
     readSettings() {
-      return configuredPolicy('d-r379-protected-paths', JSON.parse(read(POLICY)), { reviewedSafePaths: [] });
+      return configuredPolicy('d-r379-protected-paths', JSON.parse(read(POLICY)), {});
     },
     readAudits() {
       let tool;

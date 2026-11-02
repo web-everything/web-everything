@@ -811,24 +811,25 @@ describe('round 6 enforcement-tree classification', () => {
   it.each(['docs/examples/x.md','backlog/123-story.md','README.md'])('passes allowlisted content path %s', async path => {
     expect(condition(await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]})),4).status).toBe('PASS');
   });
-  it('allows an explicitly reviewed safe path', async () => {
+  it('rejects a non-empty reviewedSafePaths policy for an enforcement path', async () => {
     const path = 'scripts/lib/format-date.mjs';
     const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}, {
       readSettings:()=>({...settings,reviewedSafePaths:[path]}),
     }));
-    expect(condition(r,4).status).toBe('PASS');
+    expect(condition(r,4).status).toBe('UNKNOWN');
+    expect(condition(r,4).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
   });
-  it.each([[[]],[['scripts/**']]])('protected FAIL wins with reviewedSafePaths %j', async reviewedSafePaths => {
+  it('ignores empty reviewedSafePaths and still fails protected paths', async () => {
     const path = 'scripts/check-standards.mjs';
     const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs',path]}, {
-      readSettings:()=>({...settings,reviewedSafePaths}),
+      readSettings:()=>({...settings,reviewedSafePaths:[]}),
     }));
     expect(condition(r,4)).toMatchObject({status:'FAIL',evidence:[`protected path: ${path}`]});
   });
-  it('defaults absent reviewedSafePaths to empty for old settings', async () => {
-    const {reviewedSafePaths, ...oldSettings} = settings;
+  it.each([{}, {reviewedSafePaths:[]}])('ignores absent/empty reviewedSafePaths: %j', async extra => {
     const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs']}, {
-      readSettings:()=>oldSettings,
+      readSettings:()=>({...settings,...extra}),
     }));
     expect(condition(r,4).status).toBe('UNKNOWN');
   });
@@ -838,6 +839,28 @@ describe('round 6 enforcement-tree classification', () => {
     const r = await checkPr(6223,deps(undefined,{readSettings:()=>({...settings,...extra})}));
     expect(condition(r,4).status).toBe('UNKNOWN'); expect(r.eligible).toBe(false);
     expect(condition(r,4).evidence.join(' ')).toContain('human review');
+  });
+});
+
+describe('round 15 removed reviewedSafePaths policy', () => {
+  it.each([['**'], ['docs/examples/x.md'], ['unrelated/**'], [''], Array(1001).fill('docs/**')]
+    .map(reviewedSafePaths => ({reviewedSafePaths})))
+  ('rejects non-empty reviewedSafePaths even for a harmless diff: %j', async ({reviewedSafePaths}) => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md']}, {
+      readSettings: () => ({...settings, reviewedSafePaths}),
+    }));
+    for (const id of [3, 4]) {
+      expect(condition(r, id).status).toBe('UNKNOWN');
+      expect(condition(r, id).evidence.join(' ')).toContain('human review');
+    }
+    expect(r.eligible).toBe(false);
+  });
+  it.each([{}, {reviewedSafePaths: []}])('absent/empty legacy key preserves harmless eligibility: %j', async extra => {
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: ['docs/examples/x.md']}, {
+      readSettings: () => ({...settings, ...extra}),
+    }));
+    expect(condition(r, 4)).toMatchObject({status: 'PASS', evidence: ['all paths harmless; no protected paths']});
+    expect(r.eligible).toBe(true);
   });
 });
 
@@ -1178,19 +1201,29 @@ describe('round 10 harmless-path allowlist', () => {
     expect(condition(r, 4)).toMatchObject({status: 'UNKNOWN',
       evidence: [`unclassified path: ${path}; operator review`]});
   });
-  it('reviewed safe paths can explicitly classify paths outside the allowlist', async () => {
+  it('non-empty reviewedSafePaths cannot classify paths outside the allowlist', async () => {
     const path = 'new-tree/future.code';
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
       readSettings: () => ({...settings, reviewedSafePaths: [path]}),
     }));
-    expect(condition(r, 4).status).toBe('PASS');
+    expect(condition(r, 4).status).toBe('UNKNOWN');
+    expect(condition(r, 4).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
   });
-  it('protected paths win even over a harmless allowlist match and explicit review', async () => {
+  it('non-empty reviewedSafePaths makes a protected harmless match ineligible', async () => {
     const path = 'tests/image.svg';
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
       readSettings: () => ({...settings, reviewedSafePaths: [path]}),
     }));
+    expect(condition(r, 4).status).toBe('UNKNOWN');
+    expect(condition(r, 4).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+  it('protected paths fail even when they match harmlessPaths', async () => {
+    const path = 'tests/image.svg';
+    const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}));
     expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
+    expect(r.eligible).toBe(false);
   });
   it.each([undefined, null, [], [''], Array(1001).fill('docs/**'), ['x'.repeat(4097)]]
     .map(harmlessPaths => ({harmlessPaths})))
@@ -1257,11 +1290,11 @@ describe('round 12 trusted minimum path policy', () => {
     'scripts/operations/__tests__/d-r379-check.test.mjs',
     'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
     'scripts/operations/__fixtures__/d-r379/nested/policy.json'])
-  ('built-in protection for %s wins over permissive policy and reviewed-safe entries', async path => {
+  ('built-in protection for %s wins over permissive policy', async path => {
     const r = await checkPr(6223, deps({...fixture(6223), netDiffPaths: [path]}, {
       readSettings: () => ({...settings, protectedPaths: ['unrelated/**'],
         enforcementTrees: canaries.slice(0, 5),
-        harmlessPaths: [...settings.harmlessPaths, path], reviewedSafePaths: ['**']}),
+        harmlessPaths: [...settings.harmlessPaths, path]}),
     }));
     expect(condition(r, 3).status).toBe('PASS');
     expect(condition(r, 4)).toMatchObject({status: 'FAIL', evidence: [`protected path: ${path}`]});
