@@ -20,8 +20,9 @@ import { buildHeavyTestInvocation, runHeavyTests } from './auto-rebase.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
-const sidecar = (root, env) => `${overlayFilePath(root, env)}.main-sync.json`;
-const cloneLock = (root, env) => `${sidecar(root, env)}.clone.lock`;
+const sidecar = (root, env) => `${overlayFilePath(root, env)}.main-sync.state`;
+// The clone-wide fence keeps its original name so old and new workers still exclude each other.
+const cloneLock = (root, env) => `${overlayFilePath(root, env)}.main-sync.json.clone.lock`;
 const failureMarker = (root, env, ref) => join(`${alertsFilePath(root, env)}.main-sync`,
   `${createHash('sha256').update(ref).digest('hex')}.json`);
 const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-rebase`, `${encodeURIComponent(ref)}.lock`);
@@ -97,12 +98,23 @@ function fetchOverlay(run, root, env, ref, registration, io = fs) {
 const retryKeys = ['retryMain', 'retryTries', 'retryAfter'];
 function clearRetry(state, ref) { for (const key of retryKeys) delete state[key][ref]; }
 function readSyncState(file, io = fs) {
-  let data;
-  try {
-    data = JSON.parse(io.readFileSync(file, 'utf8'));
-  } catch (error) { if (error.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw error; }
+  // Migration and mixed-version rollout: a legacy file written after the new one (by a not-yet-reloaded worker)
+  // is authoritative, so its cooldowns and retry stops are never bypassed. The next write lands in the new file.
+  const legacyFile = file.replace(/\.state$/, '.json');
+  const mtime = path => { try { return io.statSync(path).mtimeMs; } catch (error) { if (error.code === 'ENOENT') return -1; throw error; } };
+  const source = mtime(legacyFile) >= mtime(file) && mtime(legacyFile) >= 0 ? legacyFile : file;
+  // Both files are fully validated: a corrupt or invalid one fails closed whichever is newer.
+  const load = path => {
+    let raw;
+    try { raw = JSON.parse(io.readFileSync(path, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+    return validateSyncState(raw);
+  };
+  load(source === file ? legacyFile : file);
+  return load(source) ?? validateSyncState({ lastSyncedMain: {} });
+}
+function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', ...retryKeys]) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
     const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries', 'firstFailureAt', 'failureAlertedAt', 'staleRef'].includes(key);
     const invalid = value => {
@@ -121,6 +133,10 @@ function readSyncState(file, io = fs) {
   if ([...staleRefs].some(ref => !Object.hasOwn(data.staleRef, ref) || !Object.hasOwn(data.staleRegistration, ref))) {
     throw new Error('incomplete stale registration state; operator repair required');
   }
+  const pairRefs = new Set([...Object.keys(data.conflictMain), ...Object.keys(data.conflictTip)]);
+  if ([...pairRefs].some(ref => !Object.hasOwn(data.conflictMain, ref) || !Object.hasOwn(data.conflictTip, ref))) {
+    throw new Error('incomplete conflict pair state; operator repair required');
+  }
   const retryRefs = new Set(retryKeys.flatMap(key => Object.keys(data[key])));
   if ([...retryRefs].some(ref => retryKeys.some(key => !Object.hasOwn(data[key], ref)))) {
     throw new Error('incomplete main-sync retry state; operator repair required');
@@ -129,7 +145,15 @@ function readSyncState(file, io = fs) {
 }
 function writeSyncState(file, data, io) {
   const temp = `${file}.${randomUUID()}.tmp`;
-  try { io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file); }
+  try {
+    io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file);
+    // Rollout: not-yet-reloaded workers still read the pre-rename file, so keep it in step.
+    if (file.endsWith('.state')) {
+      const legacyTemp = `${file}.${randomUUID()}.legacy.tmp`;
+      try { io.writeFileSync(legacyTemp, JSON.stringify(data)); io.renameSync(legacyTemp, file.replace(/\.state$/, '.json')); }
+      finally { io.rmSync(legacyTemp, { force: true }); }
+    }
+  }
   finally { io.rmSync(temp, { force: true }); }
 }
 const transactionWait = new Int32Array(new SharedArrayBuffer(4));
@@ -137,7 +161,8 @@ function transaction(file, fn, io = fs) {
   // The shared fence covers the entire callback, including read and rename. Even an
   // expired holder cannot resume a write after a successor has acquired the fence.
   for (let attempt = 0; attempt < 100; attempt++) {
-    const lease = tryLease({ path: `${file}.lock`, owner: { pid: process.pid, host: hostname() },
+    const lease = tryLease({ path: `${file.replace(/\.state$/, '.json')}.lock`, // pre-rename lock name: old and new workers share it
+      owner: { pid: process.pid, host: hostname() },
       staleMs: 30_000, fs: io });
     if (!lease.ok) { Atomics.wait(transactionWait, 0, 0, 10); continue; }
     try {
@@ -278,10 +303,49 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       if (!fetchOverlay(run, root, env, ref, registration)) { skip('stale-registration'); continue; }
       const main = sha(run(['rev-parse', 'origin/main']));
       if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { skip('cooldown'); continue; }
+      const tip = sha(run(['rev-parse', `origin/${ref}`]));
+      const pairKnown = synced.conflictMain[ref] === main && synced.conflictTip[ref] === tip;
+      // A known conflicting (main, tip) pair is final: silent skip (its one conflict event was already emitted).
+      if (pairKnown) {
+        if (Object.hasOwn(synced.firstFailureAt, ref) && !Object.hasOwn(synced.failureAlertedAt, ref)) failureAlert(root, env, ref);
+        result.skipped.push(ref); continue;
+      }
+      if (Object.hasOwn(synced.conflictMain, ref)) {
+        const old = synced.conflictMain[ref];
+        if (old === main) {
+          // Only the ref tip moved: lift the terminal stop ONLY on evidence that the new tip merges cleanly
+          // with the same main (side-effect-free merge-tree). A conflict or an error keeps the stop.
+          let check;
+          try { check = run(['merge-tree', '--write-tree', '--name-only', main, tip]); }
+          catch (error) { check = { error }; }
+          // Evidence must be complete: a tree id on the first line, whatever the exit status.
+          const treeOk = !check?.error && typeof check?.stdout === 'string' && /^[a-f0-9]{40}$/.test(check.stdout.split(/\r?\n/)[0]);
+          if (!treeOk) { skip('conflict-check-error'); continue; }
+          if (check.status === 1) {
+            const files = check.stdout.split(/\r?\n/).slice(1).map(cleanText);
+            const conflicted = files.slice(0, files.indexOf('') < 0 ? files.length : files.indexOf('')).filter(Boolean);
+            if (conflicted.length) {
+              updateSyncState(sidecar(root, env), state => { state.conflictTip[ref] = tip; });
+              outcome(root, env, ref, 'conflict', { step: 'merge', main, tip, files: conflicted,
+                stderrTail: '', reason: `merge conflicts remain after the ref tip moved: ${conflicted.join(', ')}` }, deps);
+            } else skip('conflict-check-error');
+            result.skipped.push(ref); continue;
+          }
+          if (check?.status !== 0 || check.error) { skip('conflict-check-error'); continue; }
+        }
+        // Clean after the move (or main moved): forget the pair so the normal retry cap governs later failures.
+        updateSyncState(sidecar(root, env), state => {
+          delete state.conflictMain[ref]; delete state.conflictTip[ref];
+          if (state.attemptedMain[ref] === old) delete state.attemptedMain[ref];
+        });
+        delete synced.conflictMain[ref]; delete synced.conflictTip[ref];
+        if (synced.attemptedMain[ref] === old) delete synced.attemptedMain[ref];
+      }
       const last = synced.lastSyncedMain[ref];
-      if (synced.attemptedMain[ref] === main && Object.hasOwn(synced.firstFailureAt, ref)
+      const attemptedHere = synced.attemptedMain[ref] === main;
+      if (attemptedHere && Object.hasOwn(synced.firstFailureAt, ref)
         && !Object.hasOwn(synced.failureAlertedAt, ref)) failureAlert(root, env, ref);
-      if (last === main || synced.attemptedMain[ref] === main || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
+      if (last === main || attemptedHere || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
         skip('up-to-date'); continue;
       }
       const base = last ?? sha(run(['merge-base', 'origin/main', `origin/${ref}`]));
@@ -349,7 +413,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     await outcome(root, env, ref, 'skipped', { reason }, deps);
     return { skipped: true, reason };
   };
-  let cloneToken, scratchParent, heartbeat, main, mergeConflict = false, publicationStarted = false;
+  let cloneToken, scratchParent, heartbeat, main, conflictInfo, mergeConflict = false, publicationStarted = false;
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
     cloneToken = acquire(clone, io);
@@ -382,6 +446,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
     main = sha(git(['rev-parse', 'origin/main'], scratch));
+    if (synced.conflictMain[ref] === main && synced.conflictTip[ref] === from) return await skip('conflict-known');
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
     let merge, mergeError;
@@ -401,13 +466,15 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
     if (conflicts.length) {
       mergeConflict = true;
+      conflictInfo = { files: conflicts, tip: from,
+        stderrTail: stderrTail(merge) || cleanText(merge?.stdout).slice(-500) };
       event(root, { kind: 'overlay-main-merge-conflict', ref, files: conflicts }, { env });
       if (old.pr) markOverlayConflictWake(env, { pr: old.pr, ref, files: conflicts, at: now(), clone: root });
       else publishNeedsYou(root, env, ref, 'overlay-main-merge-conflict',
         `Merge conflicts on ${ref}: ${conflicts.join(', ')}`, { files: conflicts });
       output(git(['merge', '--abort'], scratch));
       throw Object.assign(new Error(`merge conflicts require operator resolution: ${conflicts.join(', ')}`),
-        { step: 'merge', stderrTail: stderrTail(merge) });
+        { step: 'merge', stderrTail: conflictInfo.stderrTail });
     }
     if (mergeError) throw mergeError;
     output(merge);
@@ -485,6 +552,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       delete state.firstFailureAt[ref]; delete state.failureAlertedAt[ref]; delete state.failureReason[ref];
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
+      delete state.conflictMain[ref]; delete state.conflictTip[ref];
     }, io);
     const diagnostic = failureMarker(root, env, ref);
     transaction(diagnostic, () => io.rmSync(diagnostic, { force: true }), io);
@@ -504,6 +572,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
           const tries = state.retryMain[ref] === main ? state.retryTries[ref] : 0;
           if (mergeConflict || tries >= RETRY_DELAYS.length) {
             state.attemptedMain[ref] = main;
+            if (mergeConflict) { state.conflictMain[ref] = main; state.conflictTip[ref] = conflictInfo.tip; }
             clearRetry(state, ref);
           } else {
             state.retryMain[ref] = main;
@@ -513,7 +582,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         }, io);
       }
     } catch { /* The diagnostic below can keep an independent failure streak. */ }
-    await failureEvent(error);
+    // One conflict event per (main, tip) pair replaces the repeating failed event; the wake / needs-you
+    // rebase request was already raised once at detection above.
+    if (mergeConflict) await outcome(root, env, ref, 'conflict', { step: 'merge', main, tip: conflictInfo.tip,
+      files: conflictInfo.files, stderrTail: conflictInfo.stderrTail, reason: error.message }, deps);
+    else await failureEvent(error);
     failureAlert(root, env, ref, error, io, mergeConflict); throw error;
   }
   finally {
