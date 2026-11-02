@@ -2,9 +2,13 @@
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
+import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
+import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
@@ -12,13 +16,105 @@ import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-ou
 import { runGhSync } from './gh-throttle.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-result.mjs';
+import { failedRedTeamRetry, redTeamStatusWithoutRun, completedRedTeamSeat } from './red-team-run-result.mjs';
 
 import { redTeamRequired } from './jury-core.mjs';
 import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
+
+export const staleRunDeadlineMs = (env = process.env) => /^\d+$/.test(env.WE_RED_TEAM_STALE_RUN_MS ?? '')
+  && Number.isSafeInteger(Number(env.WE_RED_TEAM_STALE_RUN_MS)) ? Number(env.WE_RED_TEAM_STALE_RUN_MS) : 7_200_000;
+
+const pendingAbandonment = w => w.markers.redispatch?.priorWriter === w.rawWriter.sha256
+  && w.markers.redispatch?.evidence === w.evidenceSha256
+  && typeof w.markers.redispatch?.abandonedAt === 'string';
+
+/** Pure decision on a raw witness. Probes and time are supplied by the caller. */
+export function planRedTeamRecovery(w, { now, probe, deadlineMs } = {}) {
+  const raw = w.rawWriter.parsed;
+  let executionPrior = raw;
+  const reject = why => ({ rawWriter: w.rawWriter, executionPrior, mode: 'skip', why });
+  const payload = w.newest;
+  if (!redTeamOwedFor(payload) || payload?.carriedFrom || payload?.findings?.read?.netBasis?.rev !== w.head) return reject('newest review does not owe a pass');
+  const active = ['queued', 'running'].includes(raw?.status);
+  let dead = !active;
+  if (active) {
+    dead = false;
+    if (raw.host === probe.host && raw.pidNamespace === probe.namespace && Number.isInteger(raw.pid) && raw.pid > 0) {
+      try {
+        const alive = probe.isAlive(raw.pid);
+        if (alive === false) dead = true;
+        else if (alive === true) {
+          // An existence probe already proved a live pid. Only a verified birth-time
+          // mismatch proves reuse; an unavailable ps probe must never fall back to age.
+          let start;
+          try { start = raw.pidStart ? probe.readPidStart?.(raw.pid) : null; }
+          catch { return reject('owner live; start unreadable'); }
+          if (!raw.pidStart || start == null || start === raw.pidStart) return reject('owner live');
+          dead = true;
+        }
+      } catch { /* Unprobeable owners use the explicit age deadline. */ }
+    }
+    if (!dead) {
+      const stamp = raw.pidStart;
+      const at = Date.parse(/^\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.test(stamp ?? '') ? `${stamp} UTC` : stamp);
+      dead = Number.isFinite(at) && now - at > deadlineMs;
+    }
+    if (!dead) return reject('owner live or age unknown');
+  }
+  const marker = w.markers.redispatch;
+  if (marker && !raw) return reject('stale marker without writer; inspect stored evidence');
+  if (raw?.staleAbandoned && (!marker || marker.writer !== w.rawWriter.sha256 || marker.evidence !== w.evidenceSha256)) return reject('abandonment witness changed');
+  if (marker && active && !raw?.staleAbandoned && !pendingAbandonment(w)) return reject('stale re-dispatch already spent');
+  const completed = w.seats.some(completedRedTeamSeat);
+  const resumable = ['ran', 'resumed'].includes(normalizeRedTeamResult(raw?.result).priorResult);
+  const failedSeatCount = w.seats.filter(r => !completedRedTeamSeat(r)).length;
+  if (active && dead) {
+    // A running writer can crash after appending its failed seat, before finishing.
+    // Queued state cannot establish that an existing seat belongs to this writer.
+    const interruptedFailure = raw.status === 'running' && failedSeatCount === 1 && raw.result == null
+      && (raw.retryCount === undefined || raw.retryCount === 0);
+    executionPrior = completed || resumable ? { ...raw, status: 'finished', result: resumable ? raw.result : 'ran' }
+      : interruptedFailure ? { ...raw, status: 'finished', result: 'failed' } : null;
+  }
+  const retry = failedRedTeamRetry(executionPrior, { failedSeatCount, completedRecorded: completed });
+  const priorResult = normalizeRedTeamResult(executionPrior?.result).priorResult;
+  const mode = completed ? 'resume' : 'fresh';
+  if (mode === 'resume' && (executionPrior?.status !== 'finished' || !['ran', 'resumed'].includes(priorResult)
+    || normalizeRedTeamResult(executionPrior.result).priorComment === 'posted')) return reject('prior result not resumable');
+  if (mode === 'fresh' && (w.markers.retry && !retry || w.seats.length && !retry
+    || executionPrior && !retry && !redTeamStatusWithoutRun(executionPrior) && !redTeamSkipNeedsSettlement(executionPrior))) return reject('prior pass cannot restart');
+  if (mode === 'fresh' && !retry) executionPrior = null;
+  return { rawWriter: w.rawWriter, executionPrior, mode, payload, retry, abandon: active && !raw.staleAbandoned };
+}
+
+export const recoveryProbe = () => ({ host: hostname(), namespace: pidNamespace(), isAlive: pidAlive, readPidStart: pidStartTime });
+
+/** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
+export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
+  probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), writeJson = writeJsonAtomic } = {}) {
+  const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
+  try {
+    return withRedTeamStatusClaim(path, () => {
+      const w = readWitness(), p = planRedTeamRecovery(w, { now: now(), probe, deadlineMs });
+      if (p.mode !== 'skip' && w.rawWriter.parsed?.staleAbandoned) return { ok: true };
+      if (!p.abandon || p.mode === 'skip' || (w.markers.redispatch && !pendingAbandonment(w))) return { ok: false };
+      const marker = `${path}.stale-redispatch-1`;
+      const abandonedAt = w.markers.redispatch?.abandonedAt ?? new Date(now()).toISOString();
+      const next = { ...w.rawWriter.parsed, staleAbandoned: { at: abandonedAt } };
+      // Bind the exact writeJsonAtomic rendering before publishing either file. A crash
+      // leaves either the old writer plus this complete intent, or the bound new writer.
+      const writer = createHash('sha256').update(`${JSON.stringify(next, null, 2)}\n`).digest('hex');
+      if (w.markers.redispatch && w.markers.redispatch.writer !== writer) return { ok: false };
+      if (!w.markers.redispatch) writeJson(marker, { writer, evidence: w.evidenceSha256,
+        priorWriter: w.rawWriter.sha256, abandonedAt }, { mode: 0o600 });
+      writeJson(path, next);
+      return { ok: true };
+    }, { readPidStart: probe.readPidStart });
+  } catch { return { ok: false }; }
+}
 
 // review-labels.mjs exports names only. Fail closed for every review hold namespace,
 // including future merge holds, rather than maintaining a partial list here.
@@ -113,7 +209,7 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 
 /** PURE: readers are injected; each refusal produces one decision, including unreadable evidence. */
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now,
-  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null }) {
+  setting, lastDispatch, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -132,6 +228,14 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (!Array.isArray(rawPr.comments)) return skip('PR comments unreadable');
       const journal = readCarry({ repo, pr, head });
       if (redTeamForHead(rawPr.comments, pr, head) && (!journal || journal.step === 'done')) return skip('red-team result already on head');
+      if (readWitness) {
+        const w = readWitness({ repo, pr, head });
+        if (['queued', 'running'].includes(w.rawWriter.parsed?.status) || w.rawWriter.parsed?.staleAbandoned) {
+          const recovery = planRedTeamRecovery(w, recoveryOptions);
+          return recovery.mode === 'skip' ? skip(recovery.why)
+            : dispatchDecision({ action: 'dispatch', mode: recovery.mode, staleRecovery: true, why: 'dead owner recovery' });
+        }
+      }
       const evidence = readEvidence({ repo, pr, head });
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
@@ -207,7 +311,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
                 && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
                 && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap));
           })()
-          && redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+          // The stored verdict may predate the acceptance (a round-budget accept leaves `changes` behind);
+          // a finished not-owed status on this accepted head settles as policy-clear (R100/R338).
+          && (redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+            || [evidence.status, status].every(candidate => candidate?.status === 'finished'
+              && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'))
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
           if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
           const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
@@ -260,6 +368,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   ], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews,
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
+  readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus ? key => readRecoveryWitness({ ...key, env }) : null,
+  abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
@@ -286,7 +396,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
-      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry }));
+      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness,
+      recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env) } }));
     for (const row of rows) {
       let started = false;
       if (row.action === 'carry') {
@@ -334,6 +445,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
+            if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw Error('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });

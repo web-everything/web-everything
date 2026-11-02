@@ -45,8 +45,10 @@ export function refusal(records, ref, since, alerts = false) {
     && (alerts ? /reject|drop|refus|conflict/i.test(JSON.stringify(r)) : /removed|dropped/.test(r.kind || r.event || r.type || '')));
 }
 export function prototypeLoadOperation() {
-  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit'].map((key) => [key, { type: 'string', required: false, default: '' }]));
+  const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace'].map((key) => [key, { type: 'string', required: false, default: '' }]));
   input['dry-run'] = { type: 'boolean', required: false, default: false };
+  // R310: retire-only run — drop registrations proved merged, in main, or superseded, and load nothing.
+  input.retire = { type: 'boolean', required: false, default: false };
   return op(PROTOTYPE_LOAD_OP, {
     input, verdictFrom: 'assess',
     load: effect({ reads: Object.keys(input).map((key) => `input.${key}`),

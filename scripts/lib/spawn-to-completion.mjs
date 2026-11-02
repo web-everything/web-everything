@@ -84,6 +84,7 @@ export function spawnToCompletion(cmd, argv, opts = {}, { spawnFn = spawn } = {}
     let stderrLen = 0;
     let overBuffer = false;
     let timedOut = false;
+    let exited = false;
     let timer = null;
 
     const finish = (fn) => {
@@ -94,20 +95,26 @@ export function spawnToCompletion(cmd, argv, opts = {}, { spawnFn = spawn } = {}
     };
 
     const killChild = (signal) => { try { child.kill(signal); } catch { /* already gone */ } };
+    // A descendant can retain the pipes after the direct child exits. Preserve
+    // the timeout/output bounds while waiting for close to drain ordinary output.
+    const boundDrain = () => {
+      if (!exited) return;
+      child.stdout?.destroy(); child.stderr?.destroy();
+    };
 
     if (timeout > 0) {
-      timer = setTimeout(() => { timedOut = true; killChild(killSignal); }, timeout);
+      timer = setTimeout(() => { timedOut = true; killChild(killSignal); boundDrain(); }, timeout);
       if (typeof timer.unref === 'function') timer.unref();
     }
 
     child.stdout?.on('data', (chunk) => {
       stdoutLen += chunk.length;
-      if (stdoutLen > maxBuffer) { overBuffer = true; killChild(killSignal); return; }
+      if (stdoutLen > maxBuffer) { overBuffer = true; killChild(killSignal); boundDrain(); return; }
       stdoutChunks.push(chunk);
     });
     child.stderr?.on('data', (chunk) => {
       stderrLen += chunk.length;
-      if (stderrLen > maxBuffer) { overBuffer = true; killChild(killSignal); return; }
+      if (stderrLen > maxBuffer) { overBuffer = true; killChild(killSignal); boundDrain(); return; }
       stderrChunks.push(chunk);
     });
 
@@ -115,14 +122,19 @@ export function spawnToCompletion(cmd, argv, opts = {}, { spawnFn = spawn } = {}
     // exactly the class of error `execFileSync` throws untouched for the same condition.
     child.on('error', (err) => { finish(() => reject(err)); });
 
-    child.on('exit', (code, signal) => {
+    child.on('exit', () => {
+      exited = true;
+      if (timedOut || overBuffer) boundDrain();
+    });
+    // exit can arrive before the last stdout/stderr data; close follows both pipes.
+    child.on('close', (code, signal) => {
       finish(() => {
         const stdout = Buffer.concat(stdoutChunks).toString(encoding);
         const stderr = Buffer.concat(stderrChunks).toString(encoding);
         let resourceUsage = null;
         try { resourceUsage = typeof child.resourceUsage === 'function' ? child.resourceUsage() : null; } catch { resourceUsage = null; }
 
-        if (signal || overBuffer) {
+        if (signal || overBuffer || timedOut) {
           const e = new Error(
             `spawnToCompletion: ${cmd} exited via signal ${signal || killSignal}`
             + `${overBuffer ? ' (maxBuffer exceeded)' : ''}`,

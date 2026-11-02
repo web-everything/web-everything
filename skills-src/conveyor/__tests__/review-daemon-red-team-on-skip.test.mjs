@@ -13,8 +13,9 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
       verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } },
     },
   });
-  const readStatus = vi.spyOn(reviewJob, 'readRedTeamRecoveryStatus')
+  const readStatus = vi.spyOn(redTeamEvidence, 'readRedTeamStatus')
     .mockReturnValue(mode === 'resume' ? { status: 'finished', result: 'ran' } : null);
+  const witness = vi.spyOn(redTeamEvidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
   const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockReturnValue({ jobPid: 42 });
   vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
   try {

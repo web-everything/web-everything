@@ -20,10 +20,12 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
     expect(raw.split('\n').filter((l) => /^ {4}runs-on: .*vars\.WE_SHARD_RUNNER/.test(l))).toHaveLength(1);
   });
 
-  it('every other job stays on ubuntu-latest (the switch must not widen)', () => {
+  it('every other job stays on ubuntu-latest (the switch must not widen); smoke alone is pinned to ubuntu-24.04', () => {
     for (const [name, j] of Object.entries(jobs)) {
       if (name === 'test-shard') continue;
-      expect(j['runs-on'], `${name} must not follow the Arm switch`).toBe('ubuntu-latest');
+      // smoke runs `playwright install --with-deps`, which rejects ubuntu-latest (26.04); see ci-smoke-runner-pin.test.mjs.
+      const expected = name === 'smoke' ? 'ubuntu-24.04' : 'ubuntu-latest';
+      expect(j['runs-on'], `${name} must not follow the Arm switch`).toBe(expected);
     }
     for (const name of ['test', 'changes', 'daemon-soak-scope', 'soak-shard']) expect(jobs[name]).toBeDefined();
   });

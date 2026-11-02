@@ -172,6 +172,7 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
+import { createMarkerReaper, markerContent, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -733,6 +734,25 @@ export function createRemoteExec({
   };
 }
 
+/** Best-effort audit handoff to verify-lane; never affects admission or exit status. */
+export function appendVerifyRemoteReport(env, result) {
+  if (!env?.WE_VERIFY_REMOTE_REPORT) return;
+  try { appendFileSync(env.WE_VERIFY_REMOTE_REPORT, JSON.stringify(result) + '\n', { mode: 0o600 }); } catch { /* best-effort */ }
+}
+
+/** How long a remote-routed run waits for a free Forge slot before local admission (unless the host is overloaded). */
+export const REMOTE_FULL_WAIT_MS = 30_000;
+
+/** 7579: true only on a definite local-overload verdict: a measured load ratio over its limit, or measured memory
+ * headroom/pressure below its minimum. Anything else (unknown readings, the cpu-mem capacity verdict, which cannot
+ * tell "low" from "unknown") is not an overload here and keeps today's routing. Held re-entrant runs never count. */
+export const DEFINITE_OVERLOAD = /^host (load \d|memory (headroom|pressure) )/;
+export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmission) {
+  if (env?.[ADMISSION_HELD_ENV] === '1') return false;
+  const verdict = admit({ env, interactive: !!process.stdin.isTTY, log: () => {} });
+  return verdict?.admitted === false && DEFINITE_OVERLOAD.test(String(verdict.reason ?? ''));
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -746,17 +766,30 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec, remoteClientOverride = null,
+  remoteExec, remoteClientOverride = null, onDecision,
   log = (line) => process.stderr.write(line),
+  // Under test the real host's load must not change routing; tests inject this seam.
+  hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
-  const decision = decideRemote({ policy, loadPerCore: load, argv });
+  // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite
+  // overload verdict counts; an unreadable or throwing host check keeps today's routing.
+  let overloaded = null;
+  const isOverloaded = () => {
+    if (overloaded === null) { try { overloaded = hostOverloaded() === true; } catch { overloaded = false; } }
+    return overloaded;
+  };
+  let decision = decideRemote({ policy, loadPerCore: load, argv });
+  if (!decision.remote && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
+    && Number.isFinite(load) && isOverloaded()) decision = { remote: true, reason: `${decision.reason}; host overloaded` };
+  onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
-  const { checkRemoteHealth, recordRemoteResult } = await import('./forge-remote-health.mjs');
+  const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
@@ -770,14 +803,42 @@ export async function runWithRemoteDecision({
   const slotOptions = {lockRoot:remoteRoot,cap,owner,pid:process.pid};
   const waitAt = clock();
   let slot;
+  let healthAt = waitAt;
+  let reapedAt = -Infinity;
+  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log});
+  let overloadWaitLogged = false;
   try {
     for (;;) {
       const nowMs = clock();
-      const slots=Array.from({length:cap},(_,i)=>i).filter(i=>!existsSync(join(remoteRoot,`slot-${i}.unconfirmed`)));
+      // The extended overload wait never acquires a slot past the run's own timeout.
+      if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
+      const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
       slot = tryAcquireSlot({...slotOptions,slots,nowMs,nowIso:new Date(nowMs).toISOString()});
       if(slot.ok)break;
-      if(nowMs-waitAt>=30000)return localFallback('remote-full (30s wait exhausted)');
-      await new Promise(resolve=>setTimeout(resolve,Math.min(1000,30000-(nowMs-waitAt))));
+      // Dead clients' markers must not wall off the cap while Forge is idle: reap by owner liveness plus Forge's own state.
+      if(nowMs-reapedAt>=2000){
+        reapedAt=nowMs;
+        const reaped=await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs);
+        if(reaped.length)continue;
+      }
+      const waited = nowMs - waitAt;
+      if (waited >= REMOTE_FULL_WAIT_MS) {
+        // 7579: local admission would defer an overloaded host at once, so keep queueing for a Forge slot
+        // (same cap, same slot locks, health rechecked) up to the run's own timeout instead.
+        overloaded = null;
+        if (!isOverloaded()) return localFallback('remote-full (30s wait exhausted)');
+        if (waited >= timeoutMs) return localFallback(`remote-full (host overloaded; ${Math.round(waited / 1000)}s wait exhausted)`);
+        if (!overloadWaitLogged) {
+          log(`heavy-admission: remote full (cap=${cap}) and host overloaded - waiting for a remote slot instead of deferring locally\n`);
+          overloadWaitLogged = true;
+        }
+        if (nowMs - healthAt >= 10000) {
+          const checked = await health();
+          if (!checked.ok) return localFallback(checked.reason);
+          healthAt = clock();
+        }
+      }
+      await sleep(waited >= REMOTE_FULL_WAIT_MS ? 1000 : Math.min(1000, REMOTE_FULL_WAIT_MS - waited));
     }
   } catch { return localFallback('remote-slot-unreadable'); }
   const heartbeat = setInterval(() => heartbeatOwnedSlot({...slotOptions,fastSlots:0}),60000);
@@ -805,7 +866,12 @@ export async function runWithRemoteDecision({
     // Exclusive creation also catches a marker created after the slot scan;
     // never overwrite another execution's outstanding evidence.
     try {
-      writeFileSync(executionMarker,'remote termination unconfirmed\n',{flag:'wx',mode:0o600});
+      // A held tombstone for this slot (an in-flight or interrupted reap) still means termination is unconfirmed.
+      if(blockedSlots(remoteRoot,slot.slot+1).has(slot.slot))return localFallback('remote-slot-held');
+      writeFileSync(executionMarker,markerContent({owner,pid:process.pid,nowMs:clock(),host}),{flag:'wx',mode:0o600});
+      // A reaper may have parked a tombstone for this slot between the check and the create. Nothing has been
+      // dispatched yet, so withdraw our own marker and fall back; the tombstone keeps its evidence.
+      if(heldTombstone(remoteRoot,slot.slot)){unlinkSync(executionMarker);return localFallback('remote-slot-held');}
       outstanding = true;
     } catch { return localFallback('remote-execution-marker-unwritable'); }
     const timeout = new Promise((resolve) => {
@@ -834,7 +900,7 @@ export async function runWithRemoteDecision({
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
       await record(result);
-      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code };
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
@@ -2382,6 +2448,9 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     // Forge. Consume this internal handoff once; local fallback stays reentrant.
     const forgeGate=process.env.WE_FORGE_GATE_DISPATCH==='1';
     delete process.env.WE_FORGE_GATE_DISPATCH;
+    // Preflight may have chosen remote before policy/load changed or admission was bypassed.
+    // Every local completion of that handoff still needs evidence of the first local verdict.
+    let reportLocalExecution = forgeGate;
     if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
@@ -2398,9 +2467,13 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
+        onDecision: decision => { reportLocalExecution ||= decision.remote; },
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) {
+        if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
+          location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
+        });
         // An unref'd drain timer permits natural exit if no IO remains; preserve the remote code there too.
         process.exitCode = result.exitCode;
         await settleClientProvenance();
@@ -2431,6 +2504,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
+    if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }
   process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);

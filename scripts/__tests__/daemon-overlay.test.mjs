@@ -86,7 +86,9 @@ function asGhLogin(env, login) {
 }
 
 function runCli(args, env) {
-  return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env });
+  return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL',
+    // Node deprecation warnings (e.g. DEP0040) are host noise on stderr, not CLI output the tests assert on.
+    env: { ...env, NODE_NO_WARNINGS: '1' } });
 }
 
 function overlayStateFile(overlayDir, cloneDir) {

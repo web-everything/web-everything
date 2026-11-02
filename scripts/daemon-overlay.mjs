@@ -49,6 +49,17 @@
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
+ *   node scripts/daemon-overlay.mjs replace --clone=<path> --ref=<new> --replaces=<old> --expected-sha=<40-hex> [--pr=N] [--check] [--reason=..] [--by=..] [--json]
+ *   node scripts/daemon-overlay.mjs retire  --clone=<path> --ref=<branch> --expected-tip=<40-hex> [--expected-entry=<json>] [--reason=..] [--by=..] [--json]
+ *   node scripts/daemon-overlay.mjs recover-drops --clone=<path> [--json]   (settle drop intents an interrupted retire/replace left)
+ *
+ * `replace` (R310, incident 2026-11-01) registers `--ref` and drops `--replaces` in one command, only when every
+ * commit of the old ref is an ancestor of the new tip (proved in a scratch repo), the new tip is `--expected-sha`,
+ * and the new ref merges clean against main + the other registrations. New first, old second: the list never holds
+ * neither. If either remote tip moved by the time the old entry is dropped, the old entry is restored (exit 3).
+ * `retire` re-proves retirement itself (`operations/prototype-retire.mjs`), drops the entry only while it equals
+ * `--expected-entry` and its tip is `--expected-tip`, re-checks the tip after the drop (restoring on a move), and
+ * appends an `auto-retired` event.
  *
  * `approve-edge` records, on an already-registered overlay, the exact tip of its `origin/edge/<ref>` branch as
  * the approved conflict resolution. A rebuild resolves an overlay conflict through an edge branch ONLY when its
@@ -97,11 +108,14 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, statSync, rmSync, renameSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
-  addOverlay, removeOverlay, readOverlayState, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
-  readOverrideViewerLogin,
+  addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
+  readOverrideViewerLogin, registrationIdentity,
 } from './lib/daemon-overlays.mjs';
+import { planRetirements } from './operations/prototype-retire.mjs';
+import { isDeepStrictEqual } from 'node:util';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
@@ -202,6 +216,251 @@ export async function stackAwareOverlayCheck({
     ...sa, ...evidence,
     ...(sa.clean ? { stackConflictIgnored: { files: full.files, conflicting: full.conflicting } } : {}),
   };
+}
+
+/** `git ls-remote` tip of `refs/heads/<ref>` on root's origin: a sha, `null` when the ref is absent, `undefined` when unreadable. */
+export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
+  const opts = { cwd: root, encoding: 'utf8', timeout: 30_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } };
+  const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts);
+  if (url?.status !== 0) return undefined;
+  const ls = run('git', ['ls-remote', String(url.stdout).trim(), `refs/heads/${ref}`], opts);
+  if (ls?.status !== 0) return undefined;
+  const match = new RegExp(`^([0-9a-f]{40})\\s+refs/heads/${ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm').exec(String(ls.stdout ?? ''));
+  return match ? match[1] : null;
+}
+
+/** Run `fn(git, scratch)` in a scratch bare repo that borrows root's objects and fetches `refspecs` from root's origin. */
+function withScratchFetch({ root, refspecs, env, run, prefix }, fn) {
+  const opts = (cwd) => ({ cwd, encoding: 'utf8', timeout: 120_000, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } });
+  const url = run('git', ['-C', root, 'remote', 'get-url', 'origin'], opts(root));
+  const common = run('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], opts(root));
+  if (url?.status !== 0 || common?.status !== 0) return { ok: false, reason: 'root-unreadable' };
+  const scratch = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    if (run('git', ['init', '--bare', '-q', scratch], opts(scratch))?.status !== 0) return { ok: false, reason: 'scratch-init-failed' };
+    mkdirSync(join(scratch, 'objects', 'info'), { recursive: true });
+    writeFileSync(join(scratch, 'objects', 'info', 'alternates'), `${join(String(common.stdout).trim(), 'objects')}\n`, 'utf8');
+    const fetched = run('git', ['fetch', '--no-tags', '-q', String(url.stdout).trim(), ...refspecs], opts(scratch));
+    if (fetched?.status !== 0) return { ok: false, reason: 'fetch-failed' };
+    const git = (args) => { const r = run('git', args, opts(scratch)); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
+    return fn(git);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * R310 (incident 2026-11-01): the safe form of "remove the old top before adoption". Prove, with git, that every
+ * commit of `oldRef` is contained in `newRef`'s tip (ancestry), and that `newRef` is at `expectedSha`. Read-only:
+ * a scratch bare repo borrows root's objects through alternates and does its own fetch, so root is never touched.
+ * @returns {{ok:true, contained:boolean, oldTip:string, newTip:string}|{ok:false, reason:string}}
+ */
+export function proveReplaceContainment({ root, oldRef, newRef, expectedSha, env = process.env, run = spawnSync }) {
+  return withScratchFetch({
+    root, env, run, prefix: 'we-daemon-overlay-replace-',
+    refspecs: [`+refs/heads/${oldRef}:refs/replace-check/old`, `+refs/heads/${newRef}:refs/replace-check/new`],
+  }, (git) => {
+    const rev = (name) => git(['rev-parse', '--verify', `${name}^{commit}`]).stdout.trim();
+    const oldTip = rev('refs/replace-check/old');
+    const newTip = rev('refs/replace-check/new');
+    if (!/^[0-9a-f]{40}$/.test(oldTip) || !/^[0-9a-f]{40}$/.test(newTip)) return { ok: false, reason: 'tip-unresolved' };
+    if (expectedSha && newTip !== expectedSha) return { ok: false, reason: 'sha-moved', newTip, expectedSha };
+    const anc = git(['merge-base', '--is-ancestor', oldTip, newTip]);
+    if (anc.code !== 0 && anc.code !== 1) return { ok: false, reason: 'ancestry-unverifiable' };
+    return { ok: true, contained: anc.code === 0, oldTip, newTip };
+  });
+}
+
+/**
+ * R310: re-prove, here, that a registration is retired (`prototype-retire.mjs#planRetirements`) — the caller's own
+ * plan is never trusted. Fresh fetch of main and the ref into a scratch repo; GitHub answers come from `gh` in root.
+ * @returns {{ref:string, action:'retire'|'keep', reason:string, tip?:string, evidence?:object}}
+ */
+export function proveRetirement({ root, entry, env = process.env, run = spawnSync }) {
+  const result = withScratchFetch({
+    root, env, run, prefix: 'we-daemon-overlay-retire-',
+    refspecs: ['+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`],
+  }, (git) => {
+    const gh = (args) => { const r = run('gh', args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
+    const repo = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
+    return planRetirements({ rows: [entry], git, gh, repo: repo.code === 0 ? repo.stdout.trim() : '' })[0];
+  });
+  return result?.action ? result : { ref: entry.ref, action: 'keep', reason: result?.reason || 'unprovable' };
+}
+
+/** Put a dropped registration back (same fields, at the end of the list) in ONE store write. Entries with an approved
+ *  edge resolution are never dropped by retire/replace, so there is no second write to lose.
+ *  Only while the ref is absent: a newer registration of the same ref always wins over the old snapshot. */
+function restoreRegistration(root, entry, env) {
+  if (readOverlays(root, { env }).some((o) => o?.ref === entry.ref)) return 'skipped-reregistered';
+  addOverlay(root, {
+    ref: entry.ref, pr: entry.pr ?? null, addedBy: entry.addedBy ?? null, reason: entry.reason ?? null, now: entry.addedAt,
+    ...(entry.pinned === true ? { pinned: true } : {}), stackBases: entry.stackBases, conflictOverride: entry.conflictOverride,
+  }, { env });
+  return 'restored';
+}
+
+// ── durable drop intents (R310 audit) ─────────────────────────────────────────────────────────────────────────
+// A retire/replace writes its intent BEFORE dropping a registration and clears it only after the post-drop tip
+// check. A process killed in between leaves the intent behind, and the next add/retire/replace/recover-drops run
+// settles it FIRST, under the add-guard lock: tip unchanged -> the drop stands; tip moved or unreadable -> the
+// registration is restored. Because every guarded add settles intents before its own check, no add is ever admitted
+// against a list that is missing an unsettled registration, so a restore returns the list to its pre-drop state.
+// No `.json` suffix: `pruneStaleOverlayRecords` deletes every clone-less `*.json` in the overlay dir.
+const pendingPath = (root, env) => `${overlayFilePath(root, env)}.drop-pending`;
+export function readPendingDrops(root, env = process.env) {
+  try {
+    const parsed = JSON.parse(readFileSync(pendingPath(root, env), 'utf8'));
+    if (!Array.isArray(parsed?.pending)) throw new Error('bad shape');
+    return parsed.pending;
+  } catch (e) {
+    if (e?.code === 'ENOENT') return [];
+    throw new Error(`drop-intent record ${pendingPath(root, env)} is unreadable — refusing to drop anything until it is fixed`);
+  }
+}
+function writePendingDrops(root, env, pending) {
+  const file = pendingPath(root, env);
+  if (!pending.length) { rmSync(file, { force: true }); return; }
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify({ pending }, null, 2), 'utf8');
+  renameSync(tmp, file);
+}
+const addPending = (root, env, record) => writePendingDrops(root, env, [...readPendingDrops(root, env).filter((p) => p.ref !== record.ref), record]);
+const clearPending = (root, env, ref) => writePendingDrops(root, env, readPendingDrops(root, env).filter((p) => p.ref !== ref));
+
+/** Settle every drop intent left by an interrupted retire/replace. Call only under the add-guard lock. */
+export async function settlePendingDrops({ root, env = process.env, by = null, deps = {} }) {
+  const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
+  const settled = [];
+  for (const record of readPendingDrops(root, env)) {
+    const list = readOverlays(root, { env });
+    if (list.some((o) => o?.ref === record.ref)) { clearPending(root, env, record.ref); settled.push({ ref: record.ref, outcome: 'still-registered' }); continue; }
+    const tipNow = tip(record.ref);
+    const newNow = record.newRef ? tip(record.newRef) : undefined;
+    if (tipNow === record.tip && (!record.newRef || newNow === record.newTip)) {
+      clearPending(root, env, record.ref);
+      appendOverlayEvent(root, { kind: record.kind === 'replace' ? 'replaced' : 'auto-retired', ref: record.ref, by, tip: record.tip, recovered: true }, { env });
+      settled.push({ ref: record.ref, outcome: 'drop-confirmed' });
+      continue;
+    }
+    // Not proved: put it back. It was registered when the drop began, and no guarded add ran since (see above).
+    restoreRegistration(root, record.entry, env);
+    clearPending(root, env, record.ref);
+    appendOverlayEvent(root, { kind: 'drop-reverted', ref: record.ref, by, tip: record.tip, tipNow: tipNow ?? null, recovered: true }, { env });
+    settled.push({ ref: record.ref, outcome: 'restored' });
+  }
+  return settled;
+}
+
+/**
+ * R310 `retire`: drop `ref` only when (a) its entry still equals `expectedEntry` (the one the caller proved),
+ * (b) this process re-proves it retired at `expectedTip`, and (c) its remote tip is still `expectedTip` AFTER the
+ * write. Branch pushes hold no lock, so (c) is checked after removal: a push that landed before the drop is seen and
+ * the registration is restored (`tip-moved-restored`). A push after the check is a push to an unregistered ref.
+ * Runs under the add-guard lock (no guarded add can interleave) with a durable drop intent (see settlePendingDrops).
+ * `deps` ({prove, tip, afterDrop}) is a test seam; production passes none.
+ * Same race class as the rebuild's own auto-drop (`daemon-rebuild/prepare.mjs` removes `in-main`/`pr-merged` decisions by
+ * name with no tip re-check at all); this path adds a re-proof, a pre- and post-drop tip check and a durable intent.
+ */
+export async function retireRegistration({ root, ref, expectedTip, expectedEntry, by = null, env = process.env, deps = {} }) {
+  const prove = deps.prove ?? ((entry) => proveRetirement({ root, entry, env }));
+  const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
+  return withAddGuardLock(root, env, async () => {
+    const settled = await settlePendingDrops({ root, env, by, deps });
+    const state = readOverlayState(root, { env });
+    if (state.corrupt) throw new Error(`overlay state file ${overlayFilePath(root, env)} is corrupt — refusing to overwrite it; fix or remove it by hand`);
+    const entry = state.overlays.find((o) => o?.ref === ref);
+    const refuse = (refused, extra = {}) => ({ retired: false, refused, settled, list: readOverlays(root, { env }), ...extra });
+    if (!entry) return refuse('not-registered');
+    if (expectedEntry !== undefined && !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(expectedEntry))) return refuse('registration-changed');
+    const proof = prove(entry);
+    if (proof.action !== 'retire') return refuse('not-proved', { proof });
+    if (proof.tip !== expectedTip) return refuse('tip-moved', { proof, tipNow: proof.tip });
+    addPending(root, env, { kind: 'retire', ref, entry, tip: expectedTip, at: new Date().toISOString() });
+    let removed;
+    try {
+      ({ removed } = removeOverlay(root, ref, { env, why: proof.reason, expectedOverlay: entry }));
+    } catch (e) { clearPending(root, env, ref); return refuse('registration-changed', { error: String(e?.message || e) }); }
+    if (!removed) { clearPending(root, env, ref); return refuse('not-registered'); }
+    deps.afterDrop?.(); // test seam: a process killed here leaves the intent for settlePendingDrops
+    let after;
+    try { after = tip(ref); } catch { after = undefined; } // an exception is an unreadable tip: restore
+    if (after !== expectedTip) {
+      const restored = restoreRegistration(root, entry, env);
+      clearPending(root, env, ref);
+      appendOverlayEvent(root, { kind: 'auto-retire-reverted', ref, by, tip: expectedTip, tipNow: after ?? null, restored }, { env });
+      return refuse(after === undefined ? 'tip-unreadable-restored' : 'tip-moved-restored', { tipNow: after ?? null });
+    }
+    clearPending(root, env, ref);
+    appendOverlayEvent(root, { kind: 'auto-retired', ref, pr: entry.pr ?? null, by, reason: proof.reason, tip: expectedTip, evidence: proof.evidence }, { env });
+    return { retired: true, refused: null, reason: proof.reason, evidence: proof.evidence, settled, list: readOverlays(root, { env }) };
+  });
+}
+
+/**
+ * R310 `replace`: register `ref` and drop `old`, only when every commit of `old` is an ancestor of `ref`'s tip,
+ * `ref` is at `expectedSha`, and `ref` merges clean against main + every other registration. New first, old second
+ * (`requireRef`), so the list never holds neither. After the drop both remote tips must still be the proved ones;
+ * otherwise `old` is restored (`replace-raced-restored`). Same lock and drop intent as retire.
+ * `deps` ({contain, check, tip, afterDrop}) is a test seam.
+ */
+export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, deps = {} }) {
+  const contain = deps.contain ?? (() => proveReplaceContainment({ root, oldRef: old, newRef: ref, expectedSha, env }));
+  const conflictCheck = deps.check ?? ((existingOverlays) => stackAwareOverlayCheck({ root, ref, pr, existingOverlays, env }));
+  const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
+  const prove = async () => {
+    const state = readOverlayState(root, { env });
+    if (state.corrupt) return { ok: false, refused: 'overlay-store-corrupt', code: 1 };
+    const oldEntry = state.overlays.find((o) => o?.ref === old);
+    if (!oldEntry) return { ok: false, refused: 'replaced-not-registered', code: 3 };
+    // An approved edge can carry conflict-resolution commits the new top lacks; containment of the tip says nothing about it.
+    if (oldEntry.edgeResolution) return { ok: false, refused: 'replaced-has-edge-resolution', code: 3 };
+    const containment = contain();
+    if (!containment.ok) return { ok: false, refused: containment.reason, containment, code: containment.reason === 'sha-moved' ? 3 : 1 };
+    if (!containment.contained) return { ok: false, refused: 'not-contained', containment, code: 3 };
+    const check = await conflictCheck(state.overlays.filter((o) => o?.ref !== old));
+    warnSetAside(check);
+    if (!check.ok) return { ok: false, refused: check.reason, containment, check, code: 1 };
+    if (check.candSha !== expectedSha) return { ok: false, refused: 'sha-moved', containment, check, code: 3 };
+    if (!check.clean) return { ok: false, refused: 'conflict', containment, check, code: 3 };
+    return { ok: true, oldEntry, containment, check };
+  };
+  if (checkOnly) return prove();
+  return withAddGuardLock(root, env, async () => {
+    const settled = await settlePendingDrops({ root, env, by, deps: { tip } });
+    const proof = await prove();
+    if (!proof.ok) return { ...proof, settled };
+    // The replacement carries the old work, so it inherits an explicit pin unless the caller set one itself.
+    const pin = pinned !== undefined ? pinned : (proof.oldEntry.pinned === true ? true : undefined);
+    addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin }, { env });
+    appendOverlayEvent(root, {
+      kind: 'added', ref, pr, by, reason, replaces: old, ...(pin !== undefined ? { pinned: pin } : {}), ...(pr == null ? { noPr: true } : {}),
+    }, { env });
+    const { oldTip, newTip } = proof.containment;
+    addPending(root, env, { kind: 'replace', ref: old, entry: proof.oldEntry, tip: oldTip, newRef: ref, newTip, at: new Date().toISOString() });
+    let removed;
+    try {
+      ({ removed } = removeOverlay(root, old, { env, why: 'replaced', requireRef: ref, expectedOverlay: proof.oldEntry }));
+    } catch (e) {
+      clearPending(root, env, old);
+      return { ...proof, ok: false, registered: true, refused: 'replaced-changed', error: String(e?.message || e), code: 3 };
+    }
+    if (!removed) { clearPending(root, env, old); return { ...proof, ok: false, registered: true, refused: 'replaced-not-registered', code: 3 }; }
+    deps.afterDrop?.();
+    const safeTip = (r) => { try { return tip(r); } catch { return undefined; } };
+    const oldNow = safeTip(old);
+    const newNow = safeTip(ref);
+    if (oldNow !== oldTip || newNow !== newTip) {
+      const restored = restoreRegistration(root, proof.oldEntry, env);
+      clearPending(root, env, old);
+      appendOverlayEvent(root, { kind: 'replace-reverted', ref: old, by, replacedBy: ref, oldTip, newTip, oldNow: oldNow ?? null, newNow: newNow ?? null, restored }, { env });
+      return { ...proof, ok: false, registered: true, refused: 'replace-raced-restored', oldNow, newNow, code: 3, list: readOverlays(root, { env }) };
+    }
+    clearPending(root, env, old);
+    appendOverlayEvent(root, { kind: 'replaced', ref: old, by, reason, replacedBy: ref, oldTip, newTip }, { env });
+    return { ...proof, registered: true, replaced: true, settled, list: readOverlays(root, { env }) };
+  });
 }
 
 function parseFlags(argv) {
@@ -367,8 +626,8 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
-  if (cmd !== 'add' && cmd !== 'remove' && cmd !== 'list' && cmd !== 'approve-edge') {
-    fail(`expected add|remove|list|approve-edge, got ${JSON.stringify(cmd ?? null)}`);
+  if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops'].includes(cmd)) {
+    fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops, got ${JSON.stringify(cmd ?? null)}`);
     return;
   }
 
@@ -380,7 +639,7 @@ async function main() {
   if (!clone) return fail('--clone=<path> is required');
   const root = resolve(clone);
 
-  if ((cmd === 'add' || cmd === 'remove' || cmd === 'approve-edge') && typeof flags.ref !== 'string') {
+  if (cmd !== 'list' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
     return fail(`--ref=<branch> is required for ${cmd}`);
   }
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
@@ -496,6 +755,8 @@ async function main() {
     // Only guarded adds take this lock; the list's own millisecond mutex (and so a rebuild's auto-remove) never
     // waits on it.
     const registered = await withAddGuardLock(root, env, async () => {
+      // R310: settle drop intents an interrupted retire/replace left, so this add is checked against the full list.
+      await settlePendingDrops({ root, env, by });
       const check = await runGuard();
       if (check.corruptStore) {
         throw new Error(`overlay state file ${overlayFilePath(root, env)} is corrupt — refusing to overwrite it; fix or remove it by hand`);
@@ -554,6 +815,58 @@ async function main() {
         ? registerPr({ pr, ref: flags.ref, remoteUrl: String(url.stdout).trim(), env, by, reason })
         : { ok: false, reason: 'no-origin-url' };
     }
+  } else if (cmd === 'replace') {
+    // R310: see replaceRegistration.
+    const old = flags.replaces;
+    if (typeof old !== 'string' || old === flags.ref) return fail('--replaces=<registered ref> is required for replace and must differ from --ref');
+    if (!/^[a-f0-9]{40}$/.test(flags['expected-sha'] || '')) return fail('--expected-sha=<full 40-hex tip of --ref> is required for replace');
+    if (flags['allow-conflict']) return fail('replace has no --allow-conflict; a conflicting replacement must be fixed first');
+    // The same no-PR policy as `add`: a warning by default, a refusal under noPr=refuse unless --allow-no-pr --reason.
+    const allowNoPr = !!flags['allow-no-pr'];
+    if (allowNoPr && !reason?.trim()) return fail('--allow-no-pr requires --reason=<why>');
+    if (pr == null) {
+      const { noPr } = overlaySafetySettings(process.env);
+      const refused = noPr === 'refuse' && !allowNoPr;
+      process.stderr.write(`daemon-overlay: WARNING — ${flags.ref} is being added with NO PR. Nothing reviewed this code and nothing ties it to a merge.\n`
+        + `  Pass --pr=<N>. (overlaySafety.noPr=${noPr}; set WE_OVERLAY_NO_PR=refuse or overlaySafety.noPr=refuse to block this.)\n`);
+      if (refused) {
+        process.stderr.write(`daemon-overlay: REFUSED — ${flags.ref} has NO PR. Pass --pr=<N> or --allow-no-pr --reason=<why>.\n`);
+        if (asJson) process.stdout.write(`${JSON.stringify({ replaced: false, registered: false, refused: 'no-pr', wouldReplace: false })}\n`);
+        process.exitCode = 3;
+        return;
+      }
+    }
+    const r = await replaceRegistration({
+      root, ref: flags.ref, old, expectedSha: flags['expected-sha'], pr, by, reason, pinned, env, checkOnly: !!flags.check,
+    });
+    if (r.code) process.exitCode = r.code;
+    if (!asJson && !r.ok) {
+      process.stderr.write(`daemon-overlay: REFUSED replace ${old} -> ${flags.ref}: ${r.refused}`
+        + `${r.refused === 'not-contained' ? ` (${old} at ${r.containment.oldTip} is not an ancestor of ${r.containment.newTip})` : ''}`
+        + `${r.registered ? `; ${flags.ref} is registered and ${old} was kept` : ''}\n`);
+    }
+    if (flags.check) {
+      process.stdout.write(`${JSON.stringify({ check: r.check ?? null, containment: r.containment ?? null, wouldReplace: !!r.ok, refused: r.refused ?? null })}\n`);
+      return;
+    }
+    output = {
+      replaced: !!r.replaced, registered: !!r.registered, refused: r.refused ?? null, replaces: old,
+      containment: r.containment ?? null, conflictCheck: r.check ?? null, list: r.list ?? readOverlays(root, { env }),
+    };
+  } else if (cmd === 'retire') {
+    // R310: see retireRegistration. The CLI re-proves retirement itself; --reason is bookkeeping only.
+    const expectedTip = flags['expected-tip'];
+    if (!/^[a-f0-9]{40}$/.test(expectedTip || '')) return fail('--expected-tip=<full 40-hex tip that was proved retired> is required for retire');
+    let expectedEntry;
+    if (typeof flags['expected-entry'] === 'string') {
+      try { expectedEntry = JSON.parse(flags['expected-entry']); } catch { return fail('--expected-entry must be the JSON registration that was proved'); }
+    }
+    output = await retireRegistration({ root, ref: flags.ref, expectedTip, expectedEntry, by, env });
+    if (output.refused) process.exitCode = 3;
+  } else if (cmd === 'recover-drops') {
+    // R310: settle drop intents an interrupted retire/replace left behind (see settlePendingDrops).
+    output = { settled: await withAddGuardLock(root, env, () => settlePendingDrops({ root, env, by })), pending: readPendingDrops(root, env), list: readOverlays(root, { env }) };
+    if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
     const { removed, list } = removeOverlay(root, flags.ref, { env, why: reason || 'operator' });
     if (removed) appendOverlayEvent(root, { kind: 'removed', ref: flags.ref, by, reason }, { env });
@@ -575,6 +888,10 @@ async function main() {
     process.stdout.write(`daemon-overlay: approved edge/${flags.ref} @ ${flags.sha} by ${by} list=${JSON.stringify(output.list)}\n`);
   } else if (cmd === 'remove') {
     process.stdout.write(`daemon-overlay: removed=${output.removed} list=${JSON.stringify(output.list)}\n`);
+  } else if (cmd === 'replace') {
+    process.stdout.write(`daemon-overlay: replaced=${output.replaced} registered=${output.registered} list=${JSON.stringify(output.list)}\n`);
+  } else if (cmd === 'retire') {
+    process.stdout.write(`daemon-overlay: retired=${output.retired}${output.refused ? ` refused=${output.refused}` : ''} list=${JSON.stringify(output.list)}\n`);
   } else {
     process.stdout.write(`daemon-overlay: list=${JSON.stringify(output.list)}\n`);
   }

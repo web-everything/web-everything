@@ -21,6 +21,11 @@ import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUT
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { pidIdentity } from '../lib/pid-alive.mjs';
+// A killed process whose parent died too is adopted by its reaper. On Linux that can be a PR_SET_CHILD_SUBREAPER
+// ancestor that reaps only when its own task ends (the Forge runner supervisor), so the corpse stays a zombie and
+// `kill(pid, 0)` still succeeds. Dead means gone or zombie; an unreadable probe is not proof of death.
+const expectDead = (pid, message) => expect(pidIdentity(pid), message).toMatchObject({ alive: false });
 import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
 import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
@@ -166,13 +171,15 @@ const orphan = Number(sleeper.stdout.trim());
 if (sleeper.status !== 0 || !Number.isInteger(orphan) || orphan <= 1) throw new Error('could not start unrelated sleeper');
 let verify;
 try {
+  // Its parent exited, so the reaper adopted it: init, or on Linux the nearest subreaper (Forge's runner supervisor).
   let before;
   const deadline = Date.now() + 10_000;
   do {
     before = snapshot(orphan);
-    if (Number(before[1]) === 1) break;
+    if (Number(before[1]) !== sleeper.pid) break;
     await new Promise((r) => setTimeout(r, 20));
   } while (Date.now() < deadline);
+  const reaper = snapshot(Number(before[1]));
   verify = spawn(process.execPath, [${JSON.stringify(VERIFY_LANE)}, '--gate=sleep 120', '--json'], {
     cwd: ${JSON.stringify(dir)}, detached: false, stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -184,7 +191,7 @@ try {
   const result = await closed;
   let after = null;
   try { process.kill(orphan, 0); after = snapshot(orphan); } catch {}
-  console.log(JSON.stringify({ leader: process.pid, before, verifier, after, ...result, stdout, stderr }));
+  console.log(JSON.stringify({ leader: process.pid, spawner: sleeper.pid, before, reaper, verifier, after, ...result, stdout, stderr }));
 } finally {
   try { process.kill(orphan, 'SIGKILL'); } catch {}
   if (verify && verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch {} }
@@ -198,7 +205,12 @@ try {
     expect(r.error).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
     const result = JSON.parse(r.stdout.trim());
-    expect(Number(result.before[1])).toBe(1);
+    // Reparented out of the group, to init or (Linux) a subreaper outside it. Where init reaps (macOS) this is exactly
+    // what the leader's ppid-1 orphan sweep targets, so the test proves the leader guard. Under a subreaper (Forge) that
+    // sweep never targets it; there the test proves only that no other sweep (env marker, output pipes) kills it.
+    expect(Number(result.before[1])).not.toBe(result.spawner);
+    expect(Number(result.reaper[0])).toBe(Number(result.before[1]));
+    expect(Number(result.reaper[2])).not.toBe(result.leader);
     expect(Number(result.before[2])).toBe(result.leader);
     expect(Number(result.verifier[2])).toBe(result.leader);
     expect(Number(result.verifier[0])).not.toBe(result.leader);
@@ -228,7 +240,7 @@ try {
     expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout', ceilingMs: 2000, signal: 'SIGKILL' });
     expect(onDisk.infrastructure.detail).toContain('verify-lane killed the process tree');
     const grandchild = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(grandchild, 0)).toThrow();
+    expectDead(grandchild);
   }, 70_000);
 
   it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
@@ -243,7 +255,7 @@ try {
     expect(Date.now() - started).toBeLessThan(45_000);
     expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
     const orphan = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(orphan, 0)).toThrow();
+    expectDead(orphan);
     expect(r.status).not.toBe(0);
   }, 70_000);
 
@@ -274,7 +286,7 @@ ${keepAliveScript()}
       detached = Number(readFileSync(pidFile, 'utf8'));
       expect(r.status).not.toBe(0);
       expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
-      expect(() => process.kill(detached, 0), 'the detached descendant must not survive the timeout').toThrow();
+      expectDead(detached, 'the detached descendant must not survive the timeout');
     } finally {
       if (detached) { try { process.kill(detached, 'SIGKILL'); } catch { /* gone */ } }
     }
@@ -1477,13 +1489,18 @@ process.exit(${standardsExit});
     for (const name of ['npx', 'npm']) {
       writeFileSync(join(dir, 'bin', name), fake); chmodSync(join(dir, 'bin', name), 0o755);
     }
+    // Pin the local slot layout instead of inheriting host admission preferences.
+    const preferences = join(dir, 'admission-preferences.json');
+    writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
+      cap: 1, fastSlots: 1, fastScale: { maxSlots: 1 }, remote: { enabled: false },
+    } }));
     // Keep fixture infrastructure out of the change's own edited set.
     writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\n*.attempt\n');
     execFileSync('git', ['add', '.'], { cwd: dir });
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
+    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
       expect(result.error, result.stderr).toBeUndefined();

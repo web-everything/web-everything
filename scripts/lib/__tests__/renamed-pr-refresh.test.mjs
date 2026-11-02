@@ -228,7 +228,7 @@ describe('conflict refresh IO boundaries', () => {
     let fetched = false;
     const rows = [pr({ statusCheckRollup: [], isDraft: true }), pr({ number: 5051, headRefName: 'lane/second', statusCheckRollup: [] }), pr({ number: 5052, headRefName: 'lane/fork', isCrossRepository: true, statusCheckRollup: [] })];
     const run = vi.fn((_cmd, args) => {
-      if (args[0] === 'fetch' && args[2] !== 'main') fetched = true;
+      if (args[0] === 'fetch' && args.some(a => a.includes('lane/'))) fetched = true;
       if (args[0] === 'rev-parse') return { status: 0, stdout: fetched ? 'abc123' : 'old' };
       if (args[0] === 'merge-tree') return { status: 1, stdout: conflict(args.at(-1) === 'origin/lane/second' ? ['.fix-evidence.md', 'src/real.js'] : ['.fix-4958-evidence.md']) };
       return { status: 0, stdout: '' };
@@ -238,7 +238,8 @@ describe('conflict refresh IO boundaries', () => {
     const result = await runRenamedPrRefresh({ prs: rows, slug: 'web-everything/web-everything', root, settings, exec, run, refresh, mainAccepts: () => false, statePath: join(root, 'state.json'), log() {} });
     expect(exec).not.toHaveBeenCalled();
     expect(run.mock.calls.filter(([, args]) => args[0] === 'fetch').map(([, args]) => args)).toEqual([
-      ['fetch', 'origin', 'main'], ['fetch', 'origin', '+refs/heads/lane/example:refs/remotes/origin/lane/example', '+refs/heads/lane/second:refs/remotes/origin/lane/second'],
+      ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
+      ['fetch', '--quiet', 'origin', '+refs/heads/lane/example:refs/remotes/origin/lane/example', '+refs/heads/lane/second:refs/remotes/origin/lane/second'],
     ]);
     expect(refresh).toHaveBeenCalledTimes(1); expect(result.evidenceOnly).toEqual([5050]); expect(result.errors).toEqual([]);
   }));
