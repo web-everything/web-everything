@@ -3669,6 +3669,28 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason(`git -C ${CLONE} commit -C HEAD`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
   });
 
+  it.each(['--git-dir', '--work-tree'].flatMap((option) =>
+    ['separate', 'equals'].flatMap((spelling) =>
+      ['before', 'between', 'after'].map((position) => ({ option, spelling, position })))))(
+    'resolves relative $option ($spelling, $position repeated -C) against the final directory',
+    ({ option, spelling, position }) => {
+      const relative = option === '--git-dir' ? 'wev-review-daemon/.git' : 'wev-review-daemon';
+      const target = spelling === 'equals' ? `${option}='${relative}'` : `${option} '${relative}'`;
+      const command = (first, last) => {
+        const args = position === 'before' ? `${target} -C ${first} -C ${last}`
+          : position === 'between' ? `-C ${first} ${target} -C ${last}`
+            : `-C ${first} -C ${last} ${target}`;
+        return `git ${args} clean -fd`;
+      };
+      // Neither the original cwd nor the first -C reaches the protected target.
+      const inside = command('/elsewhere', '/ws');
+      expect(daemonCloneWriteReason(inside, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+      expect(decide(inside, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      // Resolving at the original cwd or the first -C would falsely deny this write.
+      const outside = command('/ws', '/safe');
+      expect(daemonCloneWriteReason(outside, { cwd: '/ws', roots })).toBeNull();
+    });
+
   it('ALLOWS legitimate repeated -C and read-only git on a daemon clone', () => {
     expect(daemonCloneWriteReason(`git -C ${LANE} -C sub status`, { cwd: LANE, roots })).toBeNull();
     expect(daemonCloneWriteReason('git -C /ws/wev-review-daemon log', { cwd: LANE, roots })).toBeNull();
