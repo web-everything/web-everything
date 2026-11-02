@@ -46,7 +46,10 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     if (!Array.isArray(args) || !args.length || args.some(arg => typeof arg !== 'string')) {
       throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
     }
+    // Eval flags are node's own only before the script; after it they are script arguments.
+    let scriptSeen = false;
     for (const arg of args) {
+      if (isAbsolute(arg) && ['.mjs', '.js', '.cjs'].includes(extname(arg))) scriptSeen = true;
       if (!arg.startsWith('-')) {
         const path = resolve(realRoot, arg);
         // Canonicalize even missing paths: only ENOENT may mean absent evidence.
@@ -60,6 +63,7 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
       if (isAbsolute(arg) || arg.startsWith('--pass=')) continue;
       if (/^--(?:import|require|(?:experimental-)?loader)(?:=|$)/.test(arg)
         || /^-r/.test(arg)
+        || (!scriptSeen && /^(?:--(?:eval|print|input-type)(?:=|$)|-[ep](?:=|$))/.test(arg))
         || (!arg.startsWith('-')
           && (arg.includes('/') || /^\.{1,2}$/.test(arg) || /\.[a-z][a-z0-9]*$/i.test(arg)))) {
         throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
