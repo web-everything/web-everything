@@ -125,11 +125,12 @@ export function mergeSettingsLayers(layers) {
 /**
  * Read the legacy file, then every `<dir>/*.json` (sorted), and merge them. An unreadable or invalid file is
  * skipped and named in `errors`. Never throws.
- * @param {{dir?:string, legacyPath?:string|null}} [o]
+ * `strict` reports every read failure, including a missing layer/directory, for fail-closed consumers.
+ * @param {{dir?:string, legacyPath?:string|null, strict?:boolean}} [o]
  * @returns {{settings:object, owners:Record<string,string>, duplicates:Array<{path:string,sources:string[]}>,
  *   sources:string[], errors:Array<{source:string, error:string}>}}
  */
-export function readDeclaredSettings({ dir = SETTINGS_DIR, legacyPath = LEGACY_SETTINGS_PATH } = {}) {
+export function readDeclaredSettings({ dir = SETTINGS_DIR, legacyPath = LEGACY_SETTINGS_PATH, strict = false } = {}) {
   const layers = [];
   const errors = [];
   const load = (source, path) => {
@@ -138,12 +139,14 @@ export function readDeclaredSettings({ dir = SETTINGS_DIR, legacyPath = LEGACY_S
       if (!isPlainObject(data)) { errors.push({ source, error: 'not a JSON object' }); return; }
       layers.push({ source, data });
     } catch (e) {
-      if (e?.code !== 'ENOENT') errors.push({ source, error: String(e?.message ?? e) });
+      if (strict || e?.code !== 'ENOENT') errors.push({ source, error: String(e?.message ?? e) });
     }
   };
   if (legacyPath) load('dispatch-settings.json', legacyPath);
   let names = [];
-  try { names = readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch { names = []; }
+  try { names = readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch (e) {
+    if (strict) errors.push({ source: 'settings/', error: String(e?.message ?? e) });
+  }
   for (const f of names) load(`settings/${f}`, join(dir, f));
   return { ...mergeSettingsLayers(layers), sources: layers.map((l) => l.source), errors };
 }

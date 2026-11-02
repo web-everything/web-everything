@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -127,15 +127,17 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', upstream =
       return { status: childStatus, stdout: '', stderr: '' };
     }
     expect(command).toBe('git');
-    expect(options.cwd).toBe(args.includes('--show-toplevel') ? process.cwd() : root);
+    expect(options.cwd).toBe(args.includes('--show-toplevel') ? process.cwd()
+      : args.includes('config') || args.includes('reset') ? worktree : root);
     if (args.includes('--show-toplevel')) return failure(); // Model a non-Git invocation cwd.
-    const operation = ['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff', 'worktree'].find((name) => args.includes(name));
+    const operation = ['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff', 'worktree', 'config', 'reset'].find((name) => args.includes(name));
     const stage = operation === 'worktree' ? `worktree-${args[args.indexOf('worktree') + 1]}` : operation;
     if (stage === fail) {
       if (throws) throw new Error('fixture exec failure');
       return failure();
     }
     if (operation === 'fetch') return success();
+    if (args.includes('config') || args.includes('reset')) return success();
     if (operation === 'rev-parse') {
       expect(args.slice(args.indexOf('rev-parse'))).toEqual(['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}']);
       return success(upstream);
@@ -150,6 +152,7 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', upstream =
       return success(changed);
     }
     if (stage === 'worktree-add') {
+      expect(args).toContain('--no-checkout');
       expect(args).toContain('--detach');
       expect(args.at(-1)).toBe(upstream.trim());
       worktree = args[args.indexOf('--detach') + 1];
@@ -259,7 +262,9 @@ describe('review regressions', () => {
       expect(args.slice(0, 2)).toEqual(['-C', options.cwd]);
       for (const key of Object.keys(env).filter(key => key.startsWith('GIT_'))) {
         if (!key.startsWith('GIT_CONFIG_')) {
-          expect(options.env[key], key).toBe(key === 'GIT_ALLOW_PROTOCOL' ? 'https:ssh' : undefined);
+          const expected = key === 'GIT_ALLOW_PROTOCOL' ? 'https:ssh'
+            : key === 'GIT_WORK_TREE' && args.includes('reset') ? h.worktree : undefined;
+          expect(options.env[key], key).toBe(expected);
         }
       }
       expect(options.env.FIXTURE_TOKEN).toBe('keep');
@@ -402,15 +407,75 @@ describe('guardToolCheckout', () => {
       .rejects.toThrow('stale tool checkout (6 behind)');
   });
 
-  it('only the exact re-exec marker 1 bypasses all Git IO', async () => {
+  it('the re-exec marker never bypasses validation and refuses a second re-exec', async () => {
     const { guardToolCheckout } = await load();
     const h = harness();
-    await guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: '1' } });
-    expect(h.exec).not.toHaveBeenCalled();
-    for (const marker of ['0', 'true', '']) {
+    await expect(guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: '1' }, settings: { mode: 'reexec' } }))
+      .rejects.toThrow('refusing a second re-exec');
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(true);
+    expect(nodeCalls(h)).toHaveLength(0);
+    for (const marker of ['1', '0', 'true', '']) {
       await expect(async () => guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: marker } }))
         .rejects.toThrow('stale tool checkout (6 behind)');
     }
+  });
+
+  it('disables every configured filter and hooks during re-exec checkout and cleanup', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    const runner = h.exec.getMockImplementation();
+    const keys = ['filter.Lfs.smudge', 'filter.two.words.process', 'filter.quote"name.clean'];
+    h.exec.mockImplementation((command, args, options) => {
+      if (args.includes('config')) return success(keys.join('\0') + '\0');
+      return runner(command, args, options);
+    });
+    await guardToolCheckout({ ...h, settings: { mode: 'reexec' } });
+    const calls = h.exec.mock.calls.filter(([, args]) => args.includes('reset') || args.includes('remove'));
+    expect(calls).toHaveLength(2);
+    for (const [, , options] of calls) {
+      const pins = configPins(options.env);
+      expect(pins['core.hooksPath']).toBe('/dev/null');
+      for (const key of keys) {
+        const prefix = key.slice(0, key.lastIndexOf('.'));
+        for (const kind of ['smudge', 'process', 'clean']) expect(pins[`${prefix}.${kind}`]).toBe('');
+        expect(pins[`${prefix}.required`]).toBe('false');
+      }
+    }
+    const add = h.exec.mock.calls.find(([, args]) => args.includes('add'));
+    expect(add[1]).toContain('--no-checkout');
+    expect(configPins(add[2].env)['core.hooksPath']).toBe('/dev/null');
+    const config = h.exec.mock.calls.find(([, args]) => args.includes('config'));
+    expect(config[2].cwd).toBe(h.worktree);
+    const reset = h.exec.mock.calls.find(([, args]) => args.includes('reset'));
+    expect(reset[2].env.GIT_WORK_TREE).toBe(h.worktree);
+  });
+
+  it('a marked current child still validates before continuing', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness({ behind: '0\n', changed: '' });
+    await guardToolCheckout({ ...h, env: { WE_TOOL_FRESH_REEXEC: '1' } });
+    expect(h.exec.mock.calls.some(([, args]) => args.includes('diff'))).toBe(true);
+    expect(nodeCalls(h)).toHaveLength(0);
+  });
+
+  it('a marked child refuses failed Git evidence and invalid settings', async () => {
+    const { guardToolCheckout } = await load();
+    await expect(guardToolCheckout({ ...harness({ fail: 'fetch' }), env: { WE_TOOL_FRESH_REEXEC: '1' } }))
+      .rejects.toThrow('Git fetch');
+    await expect(guardToolCheckout({ ...harness(), env: { WE_TOOL_FRESH_REEXEC: '1' }, settings: { threshold: -1 } }))
+      .rejects.toThrow('Invalid staleToolGuard');
+  });
+
+  it.each(['config', 'reset'])('refuses a failed re-exec %s and cleans up without running filters or a child', async (stage) => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    const runner = h.exec.getMockImplementation();
+    h.exec.mockImplementation((command, args, options) => args.includes(stage) ? failure() : runner(command, args, options));
+    await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow(`Git ${stage}`);
+    expect(nodeCalls(h)).toHaveLength(0);
+    expect(removals(h)).toHaveLength(1);
+    expect(removals(h)[0][1].filter(arg => arg === '--force')).toHaveLength(2);
+    expect(existsSync(h.worktree)).toBe(false);
   });
 
   it.each(['fetch', 'rev-parse', 'rev-list', 'merge-base', 'diff'])('fails closed on a nonzero %s exit even in reexec mode', async (fail) => {
@@ -534,6 +599,46 @@ describe('guardToolCheckout', () => {
 });
 
 describe('real local Git fixture (no network)', () => {
+  it.each(['smudge', 'process'])('checkout hardening prevents a real %s filter from executing', async (kind) => {
+    const { laneGitCheckoutEnv, laneGitHardeningEnv, scrubGitRepoEnv } = await import('../lane-git-hardening.mjs');
+    const root = scratch();
+    const repo = join(root, 'objects-repo');
+    const worktree = join(root, 'files');
+    const marker = join(root, 'filter-ran');
+    const filter = join(root, 'filter.sh');
+    put(root, 'filter.sh', `#!/bin/sh\nprintf ran > '${marker}'\n${kind === 'smudge' ? 'cat' : 'exit 1'}\n`);
+    chmodSync(filter, 0o755);
+    mkdirSync(join(repo, 'refs'), { recursive: true });
+    put(repo, 'HEAD', 'ref: refs/heads/main\n');
+    put(repo, 'config', `[core]\n bare = true\n[filter "Exact.Case"]\n ${kind} = ${JSON.stringify(filter)}\n required = true\n`);
+    put(worktree, '.gitattributes', '*.txt filter=Exact.Case\n');
+    const blob = Buffer.from('fixture content\n');
+    const bytes = Buffer.concat([Buffer.from(`blob ${blob.length}\0`), blob]);
+    const oid = createHash('sha1').update(bytes).digest('hex');
+    put(repo, `objects/${oid.slice(0, 2)}/${oid.slice(2)}`, deflateSync(bytes));
+    // Read-only Git filtering exercises the same drivers checkout uses without .git writes.
+    const env = laneGitHardeningEnv(scrubGitRepoEnv(process.env));
+    const args = [`--git-dir=${repo}`, `--work-tree=${worktree}`];
+    const run = (extra, commandEnv = env) => spawnSync('git', [...args, ...extra], {
+      cwd: worktree, env: commandEnv, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    const command = ['cat-file', '--filters', '--path=probe.txt', oid];
+    run(command);
+    expect(existsSync(marker)).toBe(true); // positive control: attributes activate this driver
+    rmSync(marker);
+    const keys = run(['config', '--includes', '--null', '--name-only', '--list']);
+    expect(keys.status, keys.stderr).toBe(0);
+    const result = run(command, laneGitCheckoutEnv(env, keys.stdout));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe(blob.toString());
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('refuses a truncated filter configuration listing', async () => {
+    const { laneGitCheckoutEnv } = await import('../lane-git-hardening.mjs');
+    expect(() => laneGitCheckoutEnv({}, 'filter.x.smudge')).toThrow('Unreadable checkout filter configuration');
+  });
+
   it.each([
     ['scripts/lib/dep.mjs', null, 'none'], ['docs/unrelated.md', null, 'none'],
     ['docs/unrelated.md', null, 'committed'], ['docs/unrelated.md', null, 'uncommitted'],
@@ -627,6 +732,55 @@ describe('lane-pool entry wiring', () => {
 });
 
 describe('guard bounds and settings', () => {
+  it('refuses unreadable declared settings instead of losing a stricter threshold', async () => {
+    const { readDeclaredSettings } = await import('../settings-files.mjs');
+    const { resolveStaleToolSettings } = await load();
+    const dir = join(scratch(), 'settings');
+    // ENOTDIR is deterministic even under privileged test runners.
+    writeFileSync(dir, 'unreadable settings directory');
+    const readSettings = options => readDeclaredSettings({ ...options, dir, legacyPath: null });
+    expect(readSettings({ strict: true }).errors).toEqual([
+      expect.objectContaining({ source: 'settings/', error: expect.stringContaining('ENOTDIR') }),
+    ]);
+    expect(() => resolveStaleToolSettings({ platform: {}, env: {}, readSettings }))
+      .toThrow('Unreadable staleToolGuard declared settings');
+  });
+
+  it.each(['missing-directory', 'missing-legacy', 'disappeared-feature', 'malformed', 'non-object'])(
+    'strict settings fail closed on %s with the source named', async (kind) => {
+      const { readDeclaredSettings } = await import('../settings-files.mjs');
+      const { resolveStaleToolSettings } = await load();
+      const root = scratch();
+      const dir = join(root, 'settings');
+      const legacyPath = join(root, 'dispatch-settings.json');
+      mkdirSync(dir);
+      writeFileSync(legacyPath, '{}');
+      let source = 'settings/';
+      if (kind === 'missing-directory') rmSync(dir, { recursive: true });
+      if (kind === 'missing-legacy') { rmSync(legacyPath); source = 'dispatch-settings.json'; }
+      if (kind === 'disappeared-feature') {
+        symlinkSync(join(root, 'gone'), join(dir, 'strict.json'));
+        source = 'settings/strict.json';
+      }
+      if (kind === 'malformed' || kind === 'non-object') {
+        writeFileSync(join(dir, 'strict.json'), kind === 'malformed' ? '{broken' : '[]');
+        source = 'settings/strict.json';
+      }
+      const readSettings = options => readDeclaredSettings({ ...options, dir, legacyPath });
+      expect(() => resolveStaleToolSettings({ platform: {}, env: {}, readSettings }))
+        .toThrow(`Unreadable staleToolGuard declared settings: ${source}`);
+    },
+  );
+
+  it('strict declared settings retain a configured zero threshold', async () => {
+    const { readDeclaredSettings } = await import('../settings-files.mjs');
+    const { resolveStaleToolSettings } = await load();
+    const dir = scratch();
+    writeFileSync(join(dir, 'strict.json'), '{"staleToolGuard":{"threshold":0}}');
+    expect(resolveStaleToolSettings({ platform: {}, env: {}, log: () => {},
+      readSettings: options => readDeclaredSettings({ ...options, dir, legacyPath: null }) }))
+      .toEqual({ threshold: 0, mode: 'refuse' });
+  });
   it('resolves each setting through standard, platform, tool and environment with provenance', async () => {
     const { resolveStaleToolSettings } = await load();
     const log = vi.fn();
@@ -704,7 +858,22 @@ describe('guard bounds and settings', () => {
 });
 
 describe('side-effect entry exit behavior', () => {
-  it('refusal prevents sibling dependency side effects', () => {
+  it('the test loader injects its check through the parameter without VITEST', () => {
+    const root = scratch();
+    const entry = join(ROOT, 'scripts/lib/stale-tool-guard-entry.mjs');
+    put(root, 'tool.mjs', `import ${JSON.stringify(entry)}; console.log('injected check passed');`);
+    const env = { ...process.env };
+    delete env.VITEST;
+    env.NODE_OPTIONS = `--import=${new URL('../../__tests__/fixtures/stale-tool-check-preload.mjs', import.meta.url).href}`;
+    const result = spawnSync(process.execPath, [join(root, 'tool.mjs')], {
+      env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('injected check passed\n');
+  });
+
+  it.each([undefined, 'true'])('refusal prevents sibling dependency side effects with VITEST=%s', (vitest) => {
     const root = scratch();
     const marker = join(root, 'sibling-ran');
     // Exercise the actual lane-pool bootstrap, including its dependency loading strategy.
@@ -722,7 +891,7 @@ describe('side-effect entry exit behavior', () => {
       writeFileSync(${JSON.stringify(marker)}, 'stale side effect');
       ${firstDependency[1].split(',').map(name => `export const ${name.trim()} = undefined;`).join('\n')}`);
     const result = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs')], {
-      env: (({ VITEST, ...e }) => e)(process.env), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, VITEST: vitest }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(1);

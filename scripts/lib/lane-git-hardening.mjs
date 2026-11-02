@@ -10,8 +10,9 @@ import { basename } from 'node:path';
  * (e.g. `verify-lane.mjs request --repo=<lane>`) cannot be handed `-c` flags for the git calls it makes itself, so this
  * module pins the same keys through git's own environment overrides (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` /
  * `GIT_CONFIG_VALUE_n`, command-scope: they beat the repo's config), and gives the child's git helper the argument
- * rewrites config cannot express (`--no-ext-diff`, `--no-textconv`, `--no-filters`). A `filter.*` driver cannot be neutralized
- * either way, so {@link laneFilterDrivers} lets the caller refuse such a lane up front. Pure.
+ * rewrites config cannot express (`--no-ext-diff`, `--no-textconv`, `--no-filters`). Unknown `filter.*` names cannot be
+ * pinned with a wildcard: {@link laneFilterDrivers} lets ordinary callers refuse them, while {@link laneGitCheckoutEnv}
+ * pins each exact driver after a metadata-only worktree creation and before checkout. Pure.
  */
 
 /** The lane-config keys that execute code, each pinned to an inert value. `core.hooksPath=/dev/null`, not a lane path:
@@ -161,6 +162,31 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, re
 /** The argv that lists a lane's effective config with each entry's scope, NUL-separated (`scope\0key\nvalue\0…`). Reading
  *  config executes nothing. */
 export const LANE_CONFIG_LIST_ARGS = Object.freeze(['config', '--show-scope', '--list', '--includes', '-z']);
+
+/** Disable every effective filter by its exact name (Git has no wildcard config overrides).
+ * Read keys in the TARGET worktree with `config --includes --null --name-only --list`
+ * before checkout: conditional includes can differ from the source repository's config.
+ */
+export function laneGitCheckoutEnv(env, configKeys) {
+  if (typeof configKeys !== 'string' || (configKeys && !configKeys.endsWith('\0'))) {
+    throw new Error('Unreadable checkout filter configuration');
+  }
+  const out = laneGitHardeningEnv(env);
+  let index = Number(out.GIT_CONFIG_COUNT);
+  const drivers = new Set();
+  for (const key of configKeys.split('\0').slice(0, -1)) {
+    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/is.exec(key);
+    if (match) drivers.add(match[1]);
+  }
+  for (const driver of drivers) {
+    for (const kind of ['clean', 'smudge', 'process', 'required']) {
+      out[`GIT_CONFIG_KEY_${index}`] = `filter.${driver}.${kind}`;
+      out[`GIT_CONFIG_VALUE_${index++}`] = kind === 'required' ? 'false' : '';
+    }
+  }
+  out.GIT_CONFIG_COUNT = String(index);
+  return out;
+}
 
 const FILTER_DRIVER_KEY_RE = /^filter\..+\.(clean|smudge|process)$/is;
 

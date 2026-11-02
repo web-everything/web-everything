@@ -12,6 +12,14 @@ const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
 // Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell
 // pinned (an operator's CONVEYOR_STATE_ROOT, a daemon's WE_DAEMON_STATE_DIR).
 const ambientEnv = { ...process.env };
+// CLI fixtures inject the freshness check through its parameter seam; production always
+// validates even with VITEST=true. The loader targets only this checkout's real guard entry.
+const freshnessPreload = new URL('./scripts/__tests__/fixtures/stale-tool-check-preload.mjs', import.meta.url).href;
+process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${freshnessPreload}`].filter(Boolean).join(' ');
+afterAll(() => {
+  if (ambientEnv.NODE_OPTIONS === undefined) delete process.env.NODE_OPTIONS;
+  else process.env.NODE_OPTIONS = ambientEnv.NODE_OPTIONS;
+});
 // Decided by the CONFIG (`test.env.WE_TEST_HERMETIC`), read before the strip removes every WE_* key.
 const hermetic = isHermetic(process.env);
 
