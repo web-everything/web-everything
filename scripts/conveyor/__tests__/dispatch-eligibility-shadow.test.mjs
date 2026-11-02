@@ -1,7 +1,10 @@
+// @vitest-environment node
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 // Deliberately missing in slice 3 step 1: collection must fail here until implementation.
-import { resolveShadowMode, runEligibilityShadow, createBoundedShadowLog } from '../dispatch-eligibility-shadow.mjs';
+import { resolveShadowMode, runEligibilityShadow, createBoundedShadowLog, eligibilityShadowDeps } from '../dispatch-eligibility-shadow.mjs';
+import { runReconcileFixDispatch } from '../reconcile-fix-dispatch.mjs';
+import { detectStacks, PR_STACK_DEFAULTS } from '../pr-stack.mjs';
 import { eligibility } from '../dispatch-eligibility.mjs';
 import { buildEligibilityFacts } from '../dispatch-eligibility-facts.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -147,6 +150,19 @@ describe('runEligibilityShadow observational contract', () => {
 });
 
 describe('resolveShadowMode', () => {
+  it('resolves dispatch.eligibility.mode through platform, tool, and environment', () => {
+    const layers = { platform: { mode: 'off' }, tool: {}, hermetic: true };
+    expect(resolveShadowMode({}, layers)).toEqual({ mode: 'off', source: 'platform' });
+    layers.tool = { mode: 'shadow' };
+    expect(resolveShadowMode({}, layers)).toEqual({ mode: 'shadow', source: 'tool' });
+    expect(resolveShadowMode({ WE_DISPATCH_ELIGIBILITY_MODE: 'off' }, layers)).toEqual({ mode: 'off', source: 'env' });
+  });
+  it('default local adapter supplies only entry rounds and leaves other evidence unread', () => {
+    const deps = eligibilityShadowDeps({ hermetic: true });
+    expect(deps.readLocals({ attempts: 1, cap: 2 })).toEqual({ rounds: { attempts: 1, cap: 2 } });
+    const p = sentBackPr();
+    expect(gateFor(p, 'fix', deps.readLocals({}))).toEqual({ unknown: 'referral' });
+  });
   it('defaults to shadow with setting provenance', () => {
     expect(resolveShadowMode({})).toEqual({ mode: 'shadow', source: expect.stringMatching(/standard|default/) });
   });
@@ -208,6 +224,50 @@ describe('createBoundedShadowLog', () => {
 });
 
 describe('shadow wiring in existing dispatch paths', () => {
+  it('idle-restack observes the planned fix and contains logger failure without changing dispatch', () => {
+    const bottom = { pr: 6001, headRefName: 'lane/shadow-bottom', headRefOid: head };
+    const top = { pr: 6002, headRefName: 'lane/shadow-top', headRefOid: 'b'.repeat(40) };
+    // A held launch leaves the process's restack-used memory untouched between observations.
+    const dispatch = vi.fn(() => ({ held: true, reason: 'fixture', heldBy: 'fixture' }));
+    const execute = shadowDeps => {
+      const stacks = detectStacks([bottom, top], {
+        isAncestor: (a, b) => a === bottom.headRefOid && b === top.headRefOid,
+      });
+      stacks.pairs[0].bottomHead = 'c'.repeat(40);
+      stacks.pairs[0].inSync = false;
+      return runReconcileFixDispatch({ root: '.', repo: 'we', shadowDeps,
+        checkStaleness: () => ({ stale: false }),
+        reconcile: () => ({ dispatch: [], refusals: [{ kind: 'nothing-owed', prNumber: top.pr }] }),
+        prStack: () => stacks, prStackSettings: PR_STACK_DEFAULTS,
+        readPrForRestack: () => ({ ...top, prNumber: top.pr, kind: 'fix', labels: [], body: '',
+          isCrossRepository: false, attempts: 1, cap: 2 }),
+        readLaneTips: () => new Map([[top.headRefName, top.headRefOid]]),
+        findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1],
+        dispatch, fetchItemlessDiffPaths: () => ['scripts/example.mjs'],
+        resolveFallbackScope: () => ['we:scripts/example.mjs'],
+        resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+        listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null,
+      });
+    };
+    const baseline = execute({ mode: 'off' });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    const planned = structuredClone(dispatch.mock.calls[0][0]);
+    expect(planned).toMatchObject({ pr: top.pr, restack: { idle: true } });
+    const appendLine = vi.fn();
+    const readLocals = vi.fn(locals);
+    const onError = vi.fn();
+    const deps = { mode: 'shadow', now, appendLine, readLocals, onError };
+    expect(execute(deps)).toEqual(baseline);
+    expect(dispatch.mock.calls[1][0]).toEqual(planned);
+    expect(readLocals).toHaveBeenCalledWith(expect.objectContaining({ kind: 'fix', prNumber: top.pr, attempts: 1, cap: 2 }),
+      expect.objectContaining({ number: top.pr }));
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ pathId: 'reconcile-fix-dispatch-idle-restack',
+      pr: top.pr, gate: 'unknown', reasons: ['thread'] });
+    appendLine.mockImplementation(() => { throw new Error('log unavailable'); });
+    expect(execute(deps)).toEqual(baseline);
+    expect(dispatch.mock.calls[2][0]).toEqual(planned);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
   it('planReconcile imports and calls runEligibilityShadow', () => {
     const source = readFileSync(new URL('../reconcile-core.mjs', import.meta.url), 'utf8');
     expect(source).toMatch(/import\s*\{[^}]*\brunEligibilityShadow\b[^}]*\}\s*from\s*['"]\.\/dispatch-eligibility-shadow\.mjs['"]/);
