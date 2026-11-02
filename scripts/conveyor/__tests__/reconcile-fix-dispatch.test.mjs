@@ -2130,6 +2130,39 @@ describe('routed Codex fallback', () => {
 });
 
 
+describe.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])('conflicting-rebase dispatch: %s', headRefName => {
+  const plan = () => planFixesFromReconcile([{
+    kind: 'fix', prNumber: 1764, headRefName, isConflict: true, mode: 'conflicting-rebase',
+    labels: ['review:accepted'], attempts: 1, cap: 2,
+  }], findItemStub, () => [], () => [], 'we', () => ['src/x.ts']);
+
+  it('preserves the repair mode through planning without review:changes', () => {
+    const { planned, refusals } = plan();
+    expect(refusals).toEqual([]);
+    expect(planned).toMatchObject([{ mode: 'conflicting-rebase', isConflict: true, attempts: 1, cap: 2 }]);
+  });
+
+  it('launches a default-base conflict brief with the stale-base marker hand-back and no rearm-review', () => {
+    const { planned } = plan();
+    const prompts = [];
+    dispatchFix({ ...planned[0], lane: 9 }, {
+      root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, mintSessionId: () => 'conflicting-rebase-test',
+      executorDecision: { executor: 'claude', reason: 'test' }, wrapFix: false,
+      spawnAgent: argv => { prompts.push(argv.at(-1)); return ''; },
+      grantConflictHelper: () => {}, isolateSession: () => ({}), ensureSessionCwd: d => d,
+      resolveSettingsEnv: () => null,
+    });
+    expect(prompts).toHaveLength(1);
+    const prompt = prompts[0];
+    for (const text of ['Conflicting-rebase mode', 'rebase (or merge)', 'origin/main', 'resolve the conflict',
+      'push', 'never touch any review:* label', 'post the conflict-fix marker',
+      'conflict-fix-mark.mjs --base-ref=main', 'completion-cli report', 'fix-end']) {
+      expect(prompt).toContain(text);
+    }
+    expect(prompt).not.toContain('rearm-review');
+  });
+});
+
 describe('stale-base mechanical fix brief', () => {
   const staleBase = { missing: ['standards', 'new-job'], defaultBranch: 'main' };
   it('leaves ordinary prompts alone and spells out the mechanical-only hand-back', () => {
