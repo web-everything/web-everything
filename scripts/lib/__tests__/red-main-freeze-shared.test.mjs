@@ -883,4 +883,11 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     await run(() => CLEAR, m);
     expect((await run(() => ({ error: 'freeze.json is not JSON' }), { ...m, t: m.t + 1000 })).s.frozen).toBe(true);
   });
+  it('ignores a cache recorded for another repo/branch; newest record (disk) wins over memory', async () => {
+    const m = mk(); await run(() => CLEAR, m, { key: 'other|branch' });
+    expect((await run(() => T, { ...m, t: m.t + 1000 }, { key: 'mine' })).s.frozen).toBe(true);
+    await run(() => CLEAR, m, { key: 'k' });
+    writeFileSync(m.file, JSON.stringify({ key: 'k', at: m.t + 500, result: FROZEN }));
+    expect((await run(() => T, { ...m, t: m.t + 1000 }, { key: 'k' })).s.frozen).toBe(true);
+  });
 });

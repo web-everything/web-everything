@@ -347,6 +347,7 @@ const TIMEOUT_RE = /ETIMEDOUT|timed out/i;
 const LKG_RETRIES = 2;
 const LKG_BACKOFF_MS = 1000;
 const LKG_DEFAULT_MINUTES = 5;
+const LKG_MAX_MINUTES = 15; // upper bound: a setting can never turn the cache into a long freeze bypass
 const lkgMemory = new Map(); // per drain process; the disk copy below survives a restart
 
 /**
@@ -359,7 +360,8 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
   const sleepSync = lkg.sleepSync ?? (ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
   const file = lkg.file ?? env.WE_RED_MAIN_FREEZE_LKG_FILE ?? resolve(tmpdir(), 'we-red-main-freeze-lkg.json');
   const minutesRaw = lkg.minutes ?? Number(env.WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES ?? LKG_DEFAULT_MINUTES);
-  const minutes = Number.isFinite(minutesRaw) && minutesRaw >= 0 ? minutesRaw : LKG_DEFAULT_MINUTES;
+  const minutes = Number.isFinite(minutesRaw) && minutesRaw >= 0 ? Math.min(minutesRaw, LKG_MAX_MINUTES) : LKG_DEFAULT_MINUTES;
+  const key = lkg.key ?? '';
   const once = () => { try { return readShared(); } catch (e) { return { error: flatText(e?.message ?? e) }; } };
   let r = once();
   for (let i = 0; i < LKG_RETRIES && r?.error && TIMEOUT_RE.test(r.error); i++) {
@@ -367,14 +369,16 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
     r = once();
   }
   if (typeof r?.frozen === 'boolean' && !r.error) {
-    const rec = { at: now(), result: r };
+    const rec = { key, at: now(), result: r };
     lkgMemory.set(file, rec);
     try { mkdirSync(dirname(file), { recursive: true }); const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(rec)); renameSync(tmp, file); } catch { /* cache is best-effort */ }
     return r;
   }
   if (!r?.error || !TIMEOUT_RE.test(r.error) || minutes === 0) return r;
-  let rec = lkgMemory.get(file);
-  if (!rec) { try { rec = JSON.parse(readFileSync(file, 'utf8')); } catch { rec = null; } }
+  // The newest record wins (memory vs disk): another drain process may have recorded a later read, e.g. a frozen one.
+  let disk = null; try { disk = JSON.parse(readFileSync(file, 'utf8')); } catch { /* none */ }
+  const cands = [lkgMemory.get(file), disk].filter(x => x && x.key === key && Number.isFinite(x.at));
+  const rec = cands.sort((a, b) => b.at - a.at)[0] ?? null;
   const age = rec ? now() - rec.at : Infinity;
   if (rec?.result?.frozen === false && !rec.result.error && age >= 0 && age <= minutes * 60_000) {
     stderr(`red-main freeze: freeze read timed out — using last-known-good from ${Math.round(age / 1000)}s ago\n`);
@@ -385,7 +389,7 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
 
 export async function prepareDrainFreeze({ local = null, settings = resolveDrainFreezeSettings(), shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true, lkg = {} } = {}) {
   if (logSettings) for (const [key, setting] of Object.entries(settings)) stderr(`red-main freeze: ${key} setting ${setting.value} via ${setting.source}\n`);
-  const read = () => readSharedWithFallback({ readShared, env, stderr, lkg });
+  const read = () => readSharedWithFallback({ readShared, env, stderr, lkg: { key: `${repo ?? REPO_ROOT}|${branch ?? resolveFreezeBranch()}`, ...lkg } });
   if (settings.redMainFreezeReader.value === 'shared-first' && shared === undefined) shared = read();
   let state = evaluateDrainFreeze({ local, shared, settings });
   if (state.unpublished) {
