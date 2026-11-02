@@ -60,3 +60,9 @@ it('Replay #6033: nine rounds, six edge-case paths; STOP first appears at round 
 it('I1 an empty history is UNKNOWN (a missing ledger is no evidence, never CONTINUE)', () => {
   expect(classify([]).verdict).toBe('UNKNOWN');
 });
+
+it('I6 distinct structured identities never collide even with separator characters in fields', () => {
+  expect(classKey({ category: 'a\u0000b', path: 'c' })).not.toBe(classKey({ category: 'a', path: 'b\u0000c' }));
+  const rounds = [round(1, [finding('x', { category: 'a\u0000b' })]), round(2, [finding('b\u0000x', { category: 'a' })]), round(3, [finding('y')])];
+  expect(classify(rounds).verdict).toBe('STOP');
+});

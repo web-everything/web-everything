@@ -7,7 +7,7 @@ export function classKey(f) {
       (f.mechanism !== undefined && typeof f.mechanism !== 'string')) return null;
   const path = f.path.trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^(\.\/)+/, '');
   if (!path) return null;
-  return `${f.category}\u0000${path}\u0000${f.mechanism ?? ''}`;
+  return JSON.stringify([f.category, path, f.mechanism ?? '']);
 }
 
 /** Shared wire-record validation, including unconfirmed findings. */

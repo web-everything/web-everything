@@ -39,7 +39,8 @@ export function readSlice(dir, pr, io = fs) {
 export function appendRound(dir, rec, io = fs) {
   const slice = readSlice(dir, rec?.pr, io);
   if (!slice.complete || slice.malformed) throw new Error('round ledger is unreadable or malformed');
-  const record = { ...rec, round: rec?.round ?? slice.records.reduce((max, r) => Math.max(max, r.round), 0) + 1 };
+  // Serialize FIRST and validate the parsed copy: what is validated is exactly what is persisted (no toJSON/getter drift).
+  const record = JSON.parse(JSON.stringify({ ...rec, round: rec?.round ?? slice.records.reduce((max, r) => Math.max(max, r.round), 0) + 1 }));
   if (!validRoundRecord(record)) throw new TypeError('invalid round record');
   const line = `${JSON.stringify(record)}\n`;
   const same = slice.records.find(r => r.head === record.head && r.resultId === record.resultId);

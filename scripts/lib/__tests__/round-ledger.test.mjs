@@ -61,3 +61,13 @@ it('I4 a conflicting duplicate (pr, head, resultId) is rejected, an identical on
   expect(() => appendRound(dir, worse)).toThrow(/conflicting duplicate/);
   expect(fs.readFileSync(join(dir, 'round-ledger.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1);
 });
+
+it('I2/I8 the persisted evidence is exactly the validated evidence (toJSON cannot change it after validation)', () => {
+  const dir = temp();
+  let calls = 0;
+  const f = { category: 'edge', path: 'a.mjs', confirmed: true, toJSON() { calls++; return { category: 'edge', path: 'a.mjs', confirmed: calls > 1 }; } };
+  appendRound(dir, rec({ round: 1, findings: [f] }));
+  const saved = readSlice(dir, 6033).records[0].findings[0];
+  expect(typeof saved.confirmed).toBe('boolean');
+  expect(calls).toBe(1);
+});
