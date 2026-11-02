@@ -142,7 +142,11 @@ jobs:
 
       - name: Resolve FUI SHA
         id: fui-sha
-        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          sha="$(git -C frontierui rev-parse HEAD)"
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
@@ -248,7 +252,11 @@ jobs:
       - name: Resolve FUI SHA
         id: fui-sha
         if: ${{ needs.changes.outputs.light != 'true' }}
-        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          sha="$(git -C frontierui rev-parse HEAD)"
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         if: ${{ needs.changes.outputs.light != 'true' }}
@@ -500,7 +508,11 @@ jobs:
       - name: Resolve FUI SHA
         id: fui-sha
         if: ${{ steps.gate.outputs.run == 'true' }}
-        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          sha="$(git -C frontierui rev-parse HEAD)"
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -748,7 +760,11 @@ jobs:
       - name: Resolve FUI SHA
         id: fui-sha
         if: ${{ needs.changes.outputs.light != 'true' }}
-        run: echo "sha=$(git -C frontierui rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          sha="$(git -C frontierui rev-parse HEAD)"
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         if: ${{ needs.changes.outputs.light != 'true' }}
