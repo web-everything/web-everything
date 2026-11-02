@@ -44,7 +44,7 @@ describe('merge-queue same-head failure admission', () => {
         if (putError) throw putError;
         return '{}';
       });
-      const pass = () => mqSameHeadGuard({ repo, pr, head, exec, log, refresh: { store } });
+      const pass = allow => mqSameHeadGuard({ repo, pr, head, exec, log, refresh: { store, allow } });
       const puts = () => exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       return { store, log, exec, pass, puts };
     }
@@ -61,6 +61,30 @@ describe('merge-queue same-head failure admission', () => {
       f.pass();
       expect(f.puts()).toHaveLength(1);
       expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'pr')).toHaveLength(1);
+    });
+    it('allow false retains the approved head without spending its key', () => {
+      const f = fixture();
+      const allow = vi.fn(() => {
+        expect(f.exec.mock.calls.at(-1)[1][0]).toBe('pr');
+        expect(f.store.size).toBe(0);
+        return false;
+      });
+      f.pass(allow);
+      expect(allow).toHaveBeenCalledTimes(1);
+      expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+      f.pass(() => true);
+      expect(f.puts()).toHaveLength(1);
+    });
+    it('allow throws retains the head without spending its key', () => {
+      const f = fixture();
+      expect(() => f.pass(() => { throw new Error('proof unavailable'); })).not.toThrow();
+      expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+    });
+    it('allow is lazy and is not called before checks are green', () => {
+      const f = fixture({ ...green, statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+      const allow = vi.fn();
+      f.pass(allow);
+      expect(allow).not.toHaveBeenCalled(); expect(f.store.size).toBe(0);
     });
     it('CLEAN permits refresh without a rollup', () => {
       const f = fixture({ headRefOid: head, mergeStateStatus: 'CLEAN' });
@@ -142,22 +166,33 @@ describe('merge-queue same-head failure admission', () => {
       run(makeStore()); run(makeStore());
       expect(exec).toHaveBeenCalledTimes(2); expect(write).toHaveBeenCalledTimes(1);
     });
-    it.each(['unreadable', 'bad JSON', 'wrong schema', 'bad key'])('%s file falls back to memory', kind => {
-      const log = vi.fn();
+    it.each(['unreadable', 'bad JSON', 'wrong schema', 'bad key'])('%s state refuses refresh without a PUT', kind => {
+      const log = vi.fn(), write = vi.fn();
       const read = () => {
-        if (kind === 'unreadable') throw new Error('EACCES');
+        if (kind === 'unreadable') throw Object.assign(new Error('denied'), { code: 'EACCES' });
         return kind === 'bad JSON' ? '{' : kind === 'bad key' ? '[null]' : '{}';
       };
-      const store = createMqSameHeadRefreshStore({ read, write: vi.fn(), log });
-      expect(store.has('key')).toBe(false);
-      store.add('key'); expect(store.has('key')).toBe(true);
-      expect(log).toHaveBeenCalledWith('mq-same-head-refresh: state unreadable; using in-memory deduplication');
+      const store = createMqSameHeadRefreshStore({ read, write, log });
+      const exec = vi.fn(() => JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' }));
+      expect(() => mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store, log })).not.toThrow();
+      expect(exec.mock.calls.filter(([, args]) => args.includes('PUT'))).toHaveLength(0);
+      expect(write).not.toHaveBeenCalled();
+      expect(store.add('key')).toBe(false);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — state unavailable; not requesting`);
     });
-    it('failed writes retain the spent head in memory and warn the operator', () => {
+    it('write failure refuses refresh and disables further requests from that store', () => {
       const log = vi.fn(), write = vi.fn(() => { throw new Error('EACCES'); });
       const store = createMqSameHeadRefreshStore({ read: () => '[]', write, log });
-      store.add('key'); expect(store.has('key')).toBe(true);
-      expect(log).toHaveBeenCalledWith('mq-same-head-refresh: state write failed; using in-memory deduplication');
+      const exec = vi.fn(() => JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' }));
+      expect(() => mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store, log })).not.toThrow();
+      expect(exec.mock.calls.filter(([, args]) => args.includes('PUT'))).toHaveLength(0);
+      expect(store.has(`${repo}#${pr}@${head}`)).toBe(false);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — state unavailable; not requesting`);
+      write.mockImplementation(() => {});
+      expect(store.add('other-key')).toBe(false);
+      expect(write).toHaveBeenCalledTimes(1);
     });
     it('a missing file starts fresh without an unreadable warning', () => {
       const log = vi.fn();

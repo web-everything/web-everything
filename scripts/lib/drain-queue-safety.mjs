@@ -62,10 +62,10 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
 }
 
 /** Append-only spent-head ledger: no expiry, since old heads must never be retried.
- * Persistence is best-effort; an unavailable file retains deduplication for this process.
+ * Persistence must succeed before requesting; unavailable state disables refresh.
  */
-export function createMqSameHeadRefreshStore({ read, write, log = () => {} }) {
-  let keys;
+export function createMqSameHeadRefreshStore({ read, write }) {
+  let keys, unavailable = false;
   const load = () => {
     if (keys) return;
     keys = new Set();
@@ -74,22 +74,26 @@ export function createMqSameHeadRefreshStore({ read, write, log = () => {} }) {
       if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid ledger');
       keys = new Set(saved);
     } catch (error) {
-      if (error?.code !== 'ENOENT') log('mq-same-head-refresh: state unreadable; using in-memory deduplication');
+      if (error?.code !== 'ENOENT') unavailable = true;
     }
   };
   return {
     has(key) { load(); return keys.has(key); },
     add(key) {
-      load(); keys.add(key);
-      try { write(JSON.stringify([...keys]) + '\n'); }
-      catch { log('mq-same-head-refresh: state write failed; using in-memory deduplication'); }
+      load();
+      if (unavailable) return false;
+      const next = new Set(keys).add(key);
+      try { write(JSON.stringify([...next]) + '\n'); }
+      catch { unavailable = true; return false; }
+      keys = next;
+      return true;
     },
   };
 }
 
 /** Owns recovery of a confirmed removal; the admission hold remains until the head changes. */
 export function mqSameHeadRefresh({ repo, pr, head, decision, exec = execFileSyncThrottled,
-  log = () => {}, store } = {}) {
+  log = () => {}, store, allow } = {}) {
   if (!decision?.hold || !decision.removal || !store) return;
   const key = `${repo}#${pr}@${head}`;
   if (store.has(key)) return;
@@ -107,17 +111,24 @@ export function mqSameHeadRefresh({ repo, pr, head, decision, exec = execFileSyn
     return ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state);
   });
   if (live.mergeStateStatus !== 'CLEAN' && !green) return;
-  // Spend before IO: even a refused request (including a head race/422) is never repeated.
-  store.add(key);
+  // Evaluate retention lazily, after green evidence and immediately before spending.
+  try { if (allow && !allow()) return; } catch { return; }
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
-  const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — update-branch`;
+  const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
+  // Persist before IO: even a refused request (including a head race/422) is never repeated.
+  try {
+    if (store.add(key) === false) throw new Error('state unavailable');
+  } catch {
+    log(`${prefix}state unavailable; not requesting`);
+    return;
+  }
   try {
     exec('gh', ['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`,
       '-f', `expected_head_sha=${head}`], opts);
-    log(`${prefix} requested`);
+    log(`${prefix}update-branch requested`);
   } catch (error) {
     const message = safe(String(error?.stderr || error?.message || error).split('\n')[0]).slice(0, 240);
-    log(`${prefix} refused (${message}); not retrying at this head`);
+    log(`${prefix}update-branch refused (${message}); not retrying at this head`);
   }
 }
 
@@ -125,7 +136,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   const decision = decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
   if (decision.hold) {
     log(decision.line);
-    if (refresh) mqSameHeadRefresh({ repo, pr, head, decision, exec, log, store: refresh.store });
+    if (refresh) mqSameHeadRefresh({ repo, pr, head, decision, exec, log, store: refresh.store, allow: refresh.allow });
   }
   return decision;
 }

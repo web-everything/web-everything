@@ -4831,7 +4831,8 @@ async function runCli() {
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options) {
     const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
-      refresh: DRY_RUN ? undefined : { store: mqSameHeadRefreshStore },
+      refresh: DRY_RUN ? undefined : { store: mqSameHeadRefreshStore,
+        allow: () => !approvedHeadHold({ repo: c.repo, num: c.num }, sha) },
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
     return mergeStrategy.enqueue(c, sha, options);
