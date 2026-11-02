@@ -6,7 +6,7 @@
  *   off, resolves with it on, and a writer that already holds the clone is never interrupted (the #4044
  *   never-read-a-tree-mid-move guarantee).
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -71,6 +71,10 @@ async function simulate({ rounds, readerPriorityAfter }) {
 }
 
 describe('reader fairness — the livelock', () => {
+  // These pin the LEGACY reader-priority protocol: hard writer promotion (clone single-owner) is switched off here,
+  // and covered by daemon-clone-lock-hard-writer.test.mjs.
+  beforeEach(() => { vi.stubEnv('WE_DAEMON_CLONE_LOCK_WRITER_HARD_AFTER', '0'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
   it('REPRODUCES with reader priority off: the reader is refused every single round', async () => {
     const { log, readerIn } = await simulate({ rounds: 12, readerPriorityAfter: 0 });
     expect(readerIn).toBeNull();
