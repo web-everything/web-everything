@@ -444,7 +444,7 @@ const HEAD_2752 = '253d75c2b82988be773903cba4e5ed172be57fb8';
 const BASE_2752 = '06d01a43e0000000000000000000000000000000';
 const BLOB = 'b'.repeat(40);
 
-it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting label entirely — zero extra IO', async () => {
+it('enrichPrsWithAlreadyLandedFacts skips an unlabelled PR without a default-base conflict — zero extra IO', async () => {
   const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
   const fetchRef = vi.fn();
   const readMergeBase = vi.fn();
@@ -454,6 +454,34 @@ it('enrichPrsWithAlreadyLandedFacts skips a PR with no merge-status:conflicting 
   expect(readMergeBase).not.toHaveBeenCalled();
   expect(out).toEqual(prs);
   expect(out[0].alreadyLandedInMain).toBeUndefined();
+});
+
+it.each([
+  ['main', { mergeable: 'CONFLICTING' }],
+  ['main', { mergeStateStatus: 'DIRTY' }],
+  ['trunk', { mergeable: 'CONFLICTING' }],
+  ['trunk', { mergeStateStatus: 'DIRTY' }],
+])('checks unlabelled %s default-base conflicts for containment (%o)', async (defaultBranch, conflict) => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefOid: HEAD_2752, labels: [], baseRefName: defaultBranch, ...conflict };
+  const readMergeBase = vi.fn(() => BASE_2752);
+  const findMatchingCommit = vi.fn(() => 'c'.repeat(40));
+  const options = { defaultBranch, fetchRef: vi.fn(), readMergeBase,
+    readChanges: () => [{ status: 'A', path: 'a.txt', dstMode: '100644', dstBlob: BLOB }],
+    findMatchingCommit, readPulls: () => [2759] };
+  expect(enrichPrsWithAlreadyLandedFacts([pr], options)[0].alreadyLandedInMain).toEqual({ carrierPr: 2759 });
+  expect(readMergeBase).toHaveBeenCalledWith(HEAD_2752, `origin/${defaultBranch}`, {});
+  findMatchingCommit.mockReturnValue(null);
+  expect(enrichPrsWithAlreadyLandedFacts([pr], options)[0]).toBe(pr);
+});
+
+it.each([null, 'lane/stacked', 'main'])('skips unlabelled conflicts off the configured default base (%s)', async baseRefName => {
+  const { enrichPrsWithAlreadyLandedFacts } = await import('../reconcile-pass.mjs');
+  const pr = { number: 2752, headRefOid: HEAD_2752, labels: [], baseRefName,
+    mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' };
+  const fetchRef = vi.fn();
+  expect(enrichPrsWithAlreadyLandedFacts([pr], { defaultBranch: 'trunk', fetchRef })[0]).toBe(pr);
+  expect(fetchRef).not.toHaveBeenCalled();
 });
 
 it('enrichPrsWithAlreadyLandedFacts attaches alreadyLandedInMain with the attributed carrier PR when every change matches (PR #2752\'s real shape)', async () => {

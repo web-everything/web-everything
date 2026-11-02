@@ -2163,6 +2163,20 @@ describe.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])('con
   });
 });
 
+it.each(['lane/3438-wire-reconcile-pass', 'some-hand-opened-branch'])('threads trunk into the conflicting-rebase brief for %s', headRefName => {
+  const { planned, refusals } = planFixesFromReconcile([{
+    kind: 'fix', prNumber: 1764, headRefName, isConflict: true, mode: 'conflicting-rebase',
+    defaultBranch: 'trunk', baseRefName: 'trunk', labels: [], attempts: 0, cap: 2,
+  }], findItemStub, () => [], () => [], 'we', () => ['src/x.ts']);
+  expect(refusals).toEqual([]);
+  expect(planned).toMatchObject([{ defaultBranch: 'trunk', baseRefName: 'trunk' }]);
+  const prompt = withPlannedContext('brief', planned[0]);
+  expect(prompt).toContain('origin/trunk');
+  expect(prompt).toContain('conflict-fix-mark.mjs --base-ref=trunk');
+  expect(prompt).not.toContain('origin/main');
+  expect(prompt).not.toContain('--base-ref=main');
+});
+
 describe('stale-base mechanical fix brief', () => {
   const staleBase = { missing: ['standards', 'new-job'], defaultBranch: 'main' };
   it('leaves ordinary prompts alone and spells out the mechanical-only hand-back', () => {

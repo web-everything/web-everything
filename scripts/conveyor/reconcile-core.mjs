@@ -3791,7 +3791,7 @@ export function planReconcile({
         refuseCapExhausted({ ...withPhase, attempts, cap: conflictFixCapHere, capKind: 'conflicting-rebase',
           why: `${why}; durable conflict-fix count ${attempts}/${conflictFixCapHere}, total ${total}/${CONFLICT_FIX_ABSOLUTE_CEILING} — mechanical repair exhausted; a person must take it` });
       } else {
-        dispatch.push({ ...base, ...withPhase, kind: 'fix', isConflict: true, mode: 'conflicting-rebase',
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', isConflict: true, mode: 'conflicting-rebase', defaultBranch,
           attempts, cap: conflictFixCapHere, why });
       }
       continue;

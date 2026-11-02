@@ -1087,11 +1087,10 @@ export function defaultReadPullsForCommit(sha, { exec = execFileSyncThrottled, r
  * file-by-file, present on `main` — see `we:scripts/lib/already-landed-content.mjs`'s own header for the full
  * incident and why this needs blob identity rather than a plain diff.
  *
- * PAYS THE EXTRA READS ONLY FOR A PR CARRYING `merge-status:conflicting` — the population
- * `we:scripts/conveyor/parked-pr-conflict-watch.mjs` already narrows this to (a real merge conflict on a
- * review-parked PR), and the ONLY phase `reconcile-core.mjs`'s own `isConflictBounce` would otherwise dispatch a
- * mechanical conflict-fix for. A pass with no such PR (the common case) costs nothing beyond the label scan
- * `defaultReadPrs` already fetched every field for.
+ * Pays the extra reads for PRs carrying `merge-status:conflicting`, plus default-base PRs whose
+ * mergeable is CONFLICTING or mergeStateStatus is DIRTY. The latter population can dispatch a
+ * conflicting-rebase without the label, and needs the same containment guard before repair.
+ * Other PRs cost no extra IO; `defaultReadPrs` already fetched all eligibility fields.
  * @param {Array<object>} prs
  * @param {{fetchRef?:Function, readMergeBase?:Function, readChanges?:Function, findMatchingCommit?:Function,
  *   readPulls?:Function, repo?:string|null, defaultBranch?:string}} [o]
@@ -1105,7 +1104,9 @@ export function enrichPrsWithAlreadyLandedFacts(prs, {
   const list = Array.isArray(prs) ? prs : [];
   const mainRef = mainRefFor(defaultBranch);
   return list.map((pr) => {
-    if (!hasLabel(pr?.labels, CONFLICT_LABEL)) return pr;
+    const defaultBaseConflict = pr?.baseRefName === defaultBranch
+      && (pr?.mergeable === 'CONFLICTING' || pr?.mergeStateStatus === 'DIRTY');
+    if (!hasLabel(pr?.labels, CONFLICT_LABEL) && !defaultBaseConflict) return pr;
     const prNumber = Number(pr?.number);
     const headSha = pr?.headRefOid;
     if (!Number.isInteger(prNumber) || prNumber <= 0 || !isSha(headSha) || !mainRef) return pr;
@@ -1550,9 +1551,8 @@ export function runReconcilePass({
     });
   } catch { /* An unreadable verdict must retain the original red checks. */ }
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
-  // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
-  // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
-  // beyond the label scan `readPrs` already fetched every field for when no PR carries that label.
+  // Attach containment evidence before either label-based conflict repair or unlabelled default-base
+  // conflicting-rebase can dispatch. PRs outside those populations incur no extra IO.
   const alreadyLandedPrs = enrichAlreadyLanded(redPrs, { repo: resolvedRepo, defaultBranch });
   // #4265 — attach each stacked PR's own base ref's current tip, purely locally, no `gh` cost.
   const baseRefPrs = enrichBaseRef(alreadyLandedPrs, { defaultBranch });

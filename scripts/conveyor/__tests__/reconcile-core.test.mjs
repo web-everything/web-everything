@@ -4706,7 +4706,7 @@ describe('main-base conflicts owe a bounded mechanical rebase', () => {
   });
   it('uses the configured default branch for main-base routing', () => {
     expect(plan({ baseRefName: 'trunk' }, { defaultBranch: 'trunk' }).dispatch)
-      .toMatchObject([{ mode: 'conflicting-rebase' }]);
+      .toMatchObject([{ mode: 'conflicting-rebase', defaultBranch: 'trunk' }]);
   });
   it.each([
     ['referral', { referralHold: { why: 'waiting for referral' } }, 'review-referrals-pending'],
