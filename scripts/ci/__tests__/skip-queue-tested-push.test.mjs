@@ -1,4 +1,9 @@
 // @vitest-environment node
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { decideQueueTestedSkip, MAX_RUNS_CHECKED } from '../skip-queue-tested-push.mjs';
 
@@ -21,6 +26,107 @@ const expectClosed = (result) => {
   expect(result.reason.trim()).not.toBe('');
   expect(result.matchedSha).toBeUndefined();
 };
+
+// Spawn the shipped entry point; only fixture binaries are on PATH. Each stub records
+// argv independently of its response, so a wrong API filter cannot silently pass.
+function runCli({ args = {}, runs = JSON.stringify({ workflow_runs: [run()] }), tree = pushTree,
+  gitTree = pushTree, fail = '' } = {}) {
+  const cwd = mkdtempSync(join(tmpdir(), 'queue-tested-cli-'));
+  const callsFile = join(cwd, 'calls.jsonl');
+  writeFileSync(callsFile, '');
+  try {
+    for (const command of ['git', 'gh']) {
+      writeFileSync(join(cwd, command), `#!${process.execPath}
+const { appendFileSync } = require('node:fs');
+const command = ${JSON.stringify(command)};
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify([command, ...args]) + '\\n');
+const kind = command === 'git' ? 'git' : args[1]?.includes('/actions/workflows/') ? 'runs' : 'tree';
+if (kind === ${JSON.stringify(fail)}) process.exit(1);
+const responses = ${JSON.stringify({ git: gitTree, runs, tree })};
+process.stdout.write(responses[kind] + '\\n');
+`, { mode: 0o755 });
+    }
+    const options = { event: 'push', ref: 'refs/heads/main', sha, repo: 'example/project', ...args };
+    const result = spawnSync(process.execPath, [
+      fileURLToPath(new URL('../skip-queue-tested-push.mjs', import.meta.url)),
+      ...Object.entries(options).filter(([, value]) => value !== undefined)
+        .map(([key, value]) => `--${key}=${value}`),
+    ], { cwd, env: { PATH: cwd }, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(0);
+    return { ...result, calls: readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map(JSON.parse) };
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+describe('queue-tested CLI adapter', () => {
+  it('CLI queries only successful merge_group runs from ci.yml and emits the matching-tree decision', () => {
+    const result = runCli();
+    expect(result.calls).toEqual([
+      ['git', 'rev-parse', `${sha}^{tree}`],
+      ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
+      ['gh', 'api', `repos/example/project/git/commits/${otherSha}`, '--jq', '.tree.sha'],
+    ]);
+    expect(result.stdout).toBe('queue_tested=true\n');
+    expect(result.stderr).toContain('push tree already passed merge-group CI');
+  });
+
+  it('uses the supplied repository for both API endpoints', () => {
+    const result = runCli({ args: { repo: 'another-owner/another-repo' } });
+    expect(result.calls.slice(1)).toEqual([
+      ['gh', 'api', 'repos/another-owner/another-repo/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
+      ['gh', 'api', `repos/another-owner/another-repo/git/commits/${otherSha}`, '--jq', '.tree.sha'],
+    ]);
+    expect(result.stdout).toBe('queue_tested=true\n');
+  });
+
+  it('emits an exact-head match without requesting its tree', () => {
+    const result = runCli({ runs: JSON.stringify({ workflow_runs: [run(sha)] }) });
+    expect(result.stdout).toBe('queue_tested=true\n');
+    expect(result.calls).toHaveLength(2);
+  });
+
+  it.each([
+    ['git tree lookup error', { fail: 'git' }],
+    ['run listing API error', { fail: 'runs' }],
+    ['commit tree API error', { fail: 'tree' }],
+    ['malformed API JSON', { runs: '{' }],
+    ['missing workflow_runs', { runs: '{}' }],
+    ['non-array workflow_runs', { runs: '{"workflow_runs":null}' }],
+    ['empty workflow_runs', { runs: '{"workflow_runs":[]}' }],
+    ['unsuccessful matching head', { runs: JSON.stringify({ workflow_runs: [run(sha, { conclusion: 'failure' })] }) }],
+    ['invalid push tree', { gitTree: 'bad-tree' }],
+    ['invalid queue tree', { tree: 'bad-tree' }],
+    ['different queue tree', { tree: otherTree }],
+  ])('emits only queue_tested=false with a successful exit on %s', (_name, fixture) => {
+    const result = runCli(fixture);
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('running full CI');
+  });
+
+  it.each([
+    { repo: undefined }, { repo: 'missing-owner' }, { repo: 'owner/repo/extra' },
+    { repo: 'owner/repo\n' }, { sha: undefined }, { sha: 'g'.repeat(40) },
+    { sha: `${sha}\n` }, { unknown: 'option' },
+  ])('rejects invalid CLI arguments %j before invoking either binary', (args) => {
+    const result = runCli({ args });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('running full CI');
+    expect(result.calls).toEqual([]);
+  });
+
+  it.each([
+    { event: 'pull_request' }, { event: 'merge_group' }, { event: 'schedule' },
+    { event: 'workflow_dispatch' }, { ref: 'refs/heads/feature' },
+  ])('does not query queue evidence for ineligible CLI context %j', (args) => {
+    const result = runCli({ args });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.calls).toEqual([['git', 'rev-parse', `${sha}^{tree}`]]);
+  });
+});
 
 describe('decideQueueTestedSkip (pure function, no CLI or main export required)', () => {
   it('exports the decision function and fixes the lookup bound at 20', () => {

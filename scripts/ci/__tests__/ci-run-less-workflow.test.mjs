@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import yaml from 'js-yaml';
 
@@ -23,12 +24,32 @@ describe('ci.yml queue-tested push relief and nightly full-run backstop', () => 
     expect(queue['continue-on-error']).toBe(true);
   });
 
-  it('combines queue-tested and card-only evidence into the light job output', () => {
+  it.each([
+    ['true', 'true', 'true'],
+    ['true', 'false', 'true'],
+    ['true', '', 'true'],
+    ['false', 'true', 'true'],
+    ['false', 'false', 'false'],
+    ['false', '', ''],
+    ['', 'true', 'true'],
+    ['', 'false', 'false'],
+    ['', '', ''],
+  ])('combines queue=%j and card-only=%j into light=%j (missing evidence stays full)', (queue, card, expected) => {
     const light = jobs.changes.outputs.light;
     expect(light).toMatch(/^\$\{\{[\s\S]*\}\}$/);
     expect(light).toContain('steps.queue.outputs.queue_tested');
     expect(light).toContain('steps.detect.outputs.light');
     expect(light).toContain('true');
+    // Evaluate the shipped expression, not a copy of its logic. This restricted
+    // string/boolean operator subset has the same semantics in Actions and JS;
+    // missing Actions outputs resolve to ''. Reject syntax outside that subset.
+    const expression = light.slice(3, -2)
+      .replaceAll('steps.queue.outputs.queue_tested', JSON.stringify(queue))
+      .replaceAll('steps.detect.outputs.light', JSON.stringify(card));
+    expect(expression.replace(/'true'|'false'|"true"|"false"|""|==|!=|&&|\|\||[()\s]/g, '')).toBe('');
+    const actual = runInNewContext(expression, Object.create(null), { timeout: 100 });
+    expect(actual).toBe(expected);
+    expect(actual === 'true').toBe(queue === 'true' || card === 'true');
   });
 
   it('makes soak scope depend on changes so it can consume queue-tested light output', () => {
