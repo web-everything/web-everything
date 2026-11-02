@@ -66,7 +66,20 @@ function fixture() {
     const name = readdirSync(state).find((n) => n.endsWith('.json'));
     return JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.find((o) => o.ref === ref);
   };
-  return { push, run, list, events, land, entry, clone, env };
+  /** Replace the gh stub: `prs` is what every `pr list` answers; `repo view` still names the repo. */
+  const ghPrs = (prs) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo web-everything/web-everything; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+  /** Squash-merge: main gets the same content in a NEW commit, then the branch is deleted. Returns the main commit. */
+  const squash = (ref, file, content) => {
+    gitOk(author, ['fetch', '-q', 'origin']);
+    gitOk(author, ['checkout', '-q', '-B', 'sq-main', 'origin/main']);
+    writeFileSync(join(author, file), content);
+    gitOk(author, ['add', '-A']);
+    gitOk(author, ['commit', '-q', '-m', `squash ${ref}`]);
+    gitOk(author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    gitOk(author, ['push', '-q', 'origin', `:refs/heads/${ref}`]);
+    return gitOk(author, ['rev-parse', 'HEAD']);
+  };
+  return { push, run, list, events, land, entry, clone, env, ghPrs, squash, author };
 }
 
 describe('daemon-overlay.mjs replace', () => {
@@ -262,6 +275,88 @@ describe('daemon-overlay.mjs retire', () => {
       expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => 'f'.repeat(40) } })).toEqual([{ ref: 'lane/done', outcome: 'still-registered' }]);
       expect(f.entry('lane/done')).toMatchObject({ reason: 'newer' });
     });
+  });
+});
+
+describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
+  const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip, mergeCommit: { oid: mergeOid } });
+  const setup = () => {
+    const f = fixture();
+    const tip = f.push('lane/sq', 'a.txt', 'squashed\n');
+    expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
+    const mergeOid = f.squash('lane/sq', 'a.txt', 'squashed\n');
+    return { f, tip, mergeOid };
+  };
+  const retire = (f, tip) => f.run(['retire', '--ref=lane/sq', `--expected-tip=${tip}`]);
+
+  it('retires when the merged PR headed this ref at the expected tip and its merge commit is on main', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    const r = retire(f, tip);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: true, reason: 'pr-squash-merged' });
+    expect(f.list()).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
+  });
+
+  it('refuses when the merge commit is not an ancestor of main', () => {
+    const { f, tip } = setup();
+    f.ghPrs([merged('lane/sq', tip, tip)]); // the (deleted) branch tip is not on main
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+
+  it('refuses when the merged PR head was a different commit than the expected tip', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', 'e'.repeat(40), mergeOid)]);
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+
+  it('refuses when two merged PRs headed this ref (ambiguous)', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', tip, mergeOid, 7), merged('lane/sq', tip, mergeOid, 8)]);
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+  });
+
+  it('refuses when the PR is not merged', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), state: 'CLOSED' }]);
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+  });
+
+  it('refuses when GitHub gives no PR at all', () => {
+    const { f, tip } = setup();
+    expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+  });
+
+  it('does not use the squash proof while the branch still exists with unmerged work', () => {
+    const f = fixture();
+    const tip = f.push('lane/sq', 'a.txt', 'first\n');
+    expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
+    const mergeOid = f.squash('lane/sq', 'a.txt', 'first\n');
+    const tip2 = f.push('lane/sq', 'b.txt', 'extra unmerged work\n', tip);
+    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    expect(JSON.parse(retire(f, tip2).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
+    expect(f.list()).toEqual(['lane/sq']);
+  });
+});
+
+describe('daemon-overlay.mjs add records the PR when GitHub knows it', () => {
+  it('fills in the PR of the single open PR headed by the ref', () => {
+    const f = fixture();
+    f.push('lane/known', 'a.txt', 'a\n');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known' }]);
+    expect(f.run(['add', '--ref=lane/known']).status).toBe(0);
+    expect(f.entry('lane/known').pr).toBe(9);
+  });
+
+  it('leaves the PR empty when two PRs head the ref', () => {
+    const f = fixture();
+    f.push('lane/known', 'a.txt', 'a\n');
+    f.ghPrs([{ number: 9, state: 'OPEN', headRefName: 'lane/known' }, { number: 10, state: 'OPEN', headRefName: 'lane/known' }]);
+    expect(f.run(['add', '--ref=lane/known']).status).toBe(0);
+    expect(f.entry('lane/known').pr).toBe(null);
   });
 });
 
