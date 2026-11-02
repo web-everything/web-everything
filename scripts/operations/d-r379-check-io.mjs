@@ -221,6 +221,14 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
     readSettings() {
       return configuredPolicy('d-r379-protected-paths', JSON.parse(read(POLICY)), {});
     },
+    readRulings(configured = env.D_R379_RULINGS_FILE) {
+      if (typeof configured !== 'string' || !configured.trim()) {
+        throw new Error('missing or invalid rulings path; supply --rulings=<path> or D_R379_RULINGS_FILE');
+      }
+      const path = configured.startsWith('~/') ? join(home, configured.slice(2))
+        : configured === '~' ? home : resolve(cwd, configured);
+      return read(path);
+    },
     readAudits() {
       let tool;
       try { tool = JSON.parse(read(AUDIT_SETTINGS)); }

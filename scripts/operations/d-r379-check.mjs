@@ -53,6 +53,18 @@ const PROTECTED_PATHS = Object.freeze([
   '**/d-r379-check*.mjs',
   'scripts/operations/__fixtures__/d-r379/**',
   '.github/workflows/**',
+  'scripts/lib/pr-state.mjs',
+  'scripts/lib/pr-state/**',
+  'scripts/lib/standards-sections.mjs',
+  'scripts/operations/codex-audit*.mjs',
+  'vitest.config.*',
+  'package.json',
+  'scripts/test-cache/**',
+  'scripts/readiness/heavy-admission*.mjs',
+  'scripts/verify-lane.mjs',
+  'scripts/lib/hermetic-tests.mjs',
+  'scripts/operations/d-r379-check*.mjs',
+  'scripts/operations/__tests__/d-r379-check*',
 ]);
 const DIRECTION_PATHS = Object.freeze([
   '**/AGENTS.md',
@@ -72,7 +84,7 @@ const PROTECTED_CANARIES = Object.freeze([
   'scripts/lib/secret-scrub.mjs', 'scripts/lib/github-app-token.mjs',
   '.claude/hooks/x.mjs',
 ]);
-const USAGE = 'usage: node scripts/operations/d-r379-check.mjs --pr=N [--json]\n';
+const USAGE = 'usage: node scripts/operations/d-r379-check.mjs --pr=N [--json] [--rulings=<path>]\nRulings path: --rulings overrides D_R379_RULINGS_FILE; required for the R391 exception.\n';
 const DIRECTION = /\bD-R\d+\b|\bR\d{2,4}\b|#\d+\b|\b(?:card|story|item|focus(?:\s+item)?)\s*#?\d+\b/i;
 const RULING = /\b(?:D-)?R\d+\b/i;
 const clean = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, ' ');
@@ -277,22 +289,50 @@ function rulingAddedLines(patch, appended, expectedCount) {
   return added;
 }
 
-function isCitedRulingEntry(lines, metadata) {
+function operatorRulingEntries(text) {
+  if (typeof text !== 'string' || Buffer.byteLength(text) > 8 * 1024 * 1024) {
+    throw new Error('invalid or oversized operator rulings');
+  }
+  const entries = new Map();
+  let current;
+  for (const line of text.split(/\r?\n/)) {
+    const entry = /^- \*\*R(\d+)\*\*(?:[ \t]|$)/.exec(line);
+    if (entry) {
+      current = { text: line.trim() };
+      if (!entries.has(entry[1])) entries.set(entry[1], []);
+      entries.get(entry[1]).push(current);
+    } else if (current && /^[ \t]+\S/.test(line)) {
+      current.text += `\n${line.trim()}`;
+    } else {
+      current = undefined;
+    }
+  }
+  return entries;
+}
+
+function isCitedRulingEntry(lines, metadata, rulings) {
   const cited = new Set([...`${metadata.title}\n${metadata.body}`.matchAll(/\b(?:D-)?R(\d+)\b/gi)]
     .map(match => match[1]));
-  let inEntry = false, entries = 0;
+  let candidates = [], excerpt = [], entries = 0;
+  const matchesExcerpt = () => {
+    const text = excerpt.join('\n');
+    return candidates.some(entry => entry.text.includes(text));
+  };
   for (const line of lines) {
     if (!line.trim()) continue;
     const entry = /^- \*\*(?:D-)?R(\d+)\*\*(?:[ \t]|$)/.exec(line);
     if (entry) {
+      if (entries && !matchesExcerpt()) return false;
       if (!cited.has(entry[1])) return false;
-      inEntry = true;
+      candidates = rulings.get(entry[1]) ?? [];
+      excerpt = [];
       entries++;
-    } else if (!inEntry || !/^(?: {2,}|\t)/.test(line)) {
+    } else if (!entries || !/^(?: {2,}|\t)/.test(line)) {
       return false;
     }
+    excerpt.push(line.trim());
   }
-  return entries > 0;
+  return entries > 0 && matchesExcerpt();
 }
 
 async function directionPaths(paths, settings, metadata, head, base, deps) {
@@ -340,6 +380,9 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
     if (rows.some(row => row.deleted !== 0 || row.added === 0)) {
       return result(3, 'Sets no direction', 'FAIL', hits.map(path => `direction path (not append-only): ${path}`));
     }
+    let rulings;
+    try { rulings = operatorRulingEntries(await deps.readRulings()); }
+    catch { return unknown(3, 'Sets no direction', 'operator rulings unavailable, invalid or oversized; supply --rulings=<path> or D_R379_RULINGS_FILE'); }
     // Counts alone admit prepends and interior insertions. Preserve the entire
     // base blob as a prefix of the head blob to prove additions occur only at EOF.
     for (const path of hits) {
@@ -358,13 +401,12 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
         added = rulingAddedLines(await deps.readRulingDiff(base, head, [path]),
           after.slice(before.length), rows.find(row => row.path === path).added);
       } catch { return unknown(3, 'Sets no direction', `ruling added-line evidence unavailable, invalid or oversized: ${path}`); }
-      if ((before && !before.endsWith('\n')) || !isCitedRulingEntry(added, metadata)) {
-        return result(3, 'Sets no direction', 'FAIL', [`direction path (not a cited ruling entry): ${path}`,
-          'provenance claimed by PR, not verified']);
+      if ((before && !before.endsWith('\n')) || !isCitedRulingEntry(added, metadata, rulings)) {
+        return result(3, 'Sets no direction', 'FAIL', [`direction path (not a cited verbatim operator ruling entry): ${path}`]);
       }
     }
   }
-  return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', 'provenance claimed by PR, not verified', ...hits] : ['no direction paths or touched decision cards']);
+  return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', 'operator rulings verified', ...hits] : ['no direction paths or touched decision cards']);
 }
 
 function protectedPaths(paths, settings) {
@@ -411,13 +453,16 @@ export async function checkPr(pr, deps) {
 }
 
 function parseArgs(argv) {
-  let pr, json = false;
+  let pr, rulings, json = false;
   for (const arg of argv) {
     if (arg === '--json' && !json) { json = true; continue; }
     if (/^--pr=[1-9]\d*$/.test(arg) && pr === undefined) { pr = Number(arg.slice(5)); continue; }
+    if (arg.startsWith('--rulings=') && rulings === undefined && arg.slice(10).trim()) {
+      rulings = arg.slice(10); continue;
+    }
     return null;
   }
-  return validPr(pr) ? { pr, json } : null;
+  return validPr(pr) ? { pr, json, rulings } : null;
 }
 
 export async function main(argv, deps) {
@@ -426,7 +471,8 @@ export async function main(argv, deps) {
   if (!flags) { stderr(USAGE); return 2; }
   try {
     deps ??= (await import('./d-r379-check-io.mjs')).createCheckDeps();
-    const checked = await checkPr(flags.pr, deps);
+    const checked = await checkPr(flags.pr, flags.rulings === undefined ? deps
+      : { ...deps, readRulings: () => deps.readRulings(flags.rulings) });
     const human = [`PR #${checked.pr} @ ${checked.head}: ${checked.eligible ? 'eligible' : 'not eligible'}`,
       ...checked.conditions.map(c => `${c.id}. ${c.name}: ${c.status}\n   ${c.evidence.map(clean).join('; ')}`)].join('\n');
     deps.stdout(flags.json ? `${JSON.stringify(checked)}\n` : `${human}\n`);

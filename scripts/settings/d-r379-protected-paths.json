@@ -53,6 +53,18 @@
     "scripts/settings/d-r379-protected-paths.json",
     "**/d-r379-check*.mjs",
     "scripts/operations/__fixtures__/d-r379/**",
-    ".github/workflows/**"
+    ".github/workflows/**",
+    "scripts/lib/pr-state.mjs",
+    "scripts/lib/pr-state/**",
+    "scripts/lib/standards-sections.mjs",
+    "scripts/operations/codex-audit*.mjs",
+    "vitest.config.*",
+    "package.json",
+    "scripts/test-cache/**",
+    "scripts/readiness/heavy-admission*.mjs",
+    "scripts/verify-lane.mjs",
+    "scripts/lib/hermetic-tests.mjs",
+    "scripts/operations/d-r379-check*.mjs",
+    "scripts/operations/__tests__/d-r379-check*"
   ]
 }

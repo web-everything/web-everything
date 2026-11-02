@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
+import { resolve } from 'node:path';
 import { checkPr, main, matchesGlob } from '../d-r379-check.mjs';
 import { createCheckDeps } from '../d-r379-check-io.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
@@ -26,6 +27,7 @@ function deps(f = fixture(6223), overrides = {}) {
     readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
     readRulingFile: async (sha) => sha === base ? 'Original rule.\n' : `Original rule.\n${rulingEntry}`,
     readRulingDiff: async () => rulingDiff(rulingEntry),
+    readRulings: async () => rulingEntry,
     readRulingNumstat: async (_base, _head, paths) => paths.map(path => `1\t0\t${path}\0`).join(''),
     readBaseFile: async () => '---\ntype: story\nstatus: open\n---\n',
     readSettings: async () => settings, readHeadFile: async () => '---\ntype: story\nstatus: open\n---\n',
@@ -147,6 +149,21 @@ describe('CLI and real adapter with injected IO', () => {
   it('validates usage', async () => {
     expect(await main(['--pr=x'],deps())).toBe(2);
     expect(await main(['--pr=1','--pr=2'],deps())).toBe(2);
+  });
+  it.each([
+    ['--rulings='], ['--rulings=  '], ['--rulings=a.md', '--rulings=b.md'],
+    ['--rulings=a.md', '--unknown'], ['--json', '--json'],
+  ])('rejects invalid, duplicate or unknown flags %j', async flags => {
+    expect(await main(['--pr=6223', ...flags], deps())).toBe(2);
+  });
+  it('parses --rulings and passes its path to the evidence reader', async () => {
+    const calls = [];
+    const f = {...fixture(6223), title:'R391 record', body:'Recorded verbatim',
+      netDiffPaths:['docs/agent/platform-decisions.md']};
+    expect(await main(['--pr=6223', '--rulings=operator/rulings.md'], deps(f, {
+      readRulings:path=>{ calls.push(path); return rulingEntry; },
+    }))).toBe(0);
+    expect(calls).toEqual(['operator/rulings.md']);
   });
   it('prints JSON and uses eligibility exit codes', async () => {
     let output='';
@@ -690,10 +707,11 @@ describe('round 6 ruling-entry content evidence', () => {
   ('rejects free-form, orphan or mismatched additions: %s', async added => {
     expect(condition(await check(added),3).status).toBe('FAIL');
   });
-  it.each(['R999','D-R999'])('accepts a cited %s entry with indented continuations', async id => {
-    const r = await check(`- **${id}** (date) Operator: "..."\n\n  Continuation.\n- **${id}** (date) Operator: "More."\n`);
+  it('accepts a cited entry with verified indented continuations', async () => {
+    const added = '- **R999** (date) Operator: "..."\n\n  Continuation.\n';
+    const r = await check(added, {readRulings:()=>'- **R999** (date) Operator: "..."\n  Continuation.\n'});
     expect(condition(r,3)).toMatchObject({status:'PASS',
-      evidence:expect.arrayContaining(['provenance claimed by PR, not verified'])});
+      evidence:expect.arrayContaining(['operator rulings verified'])});
   });
   it.each(['unavailable','oversized','empty','truncated'])('keeps %s added-line evidence UNKNOWN with human fallback', async kind => {
     const r = await check('- **R999** (date) Operator: "..."\n',{readRulingDiff:()=>{
@@ -712,6 +730,7 @@ describe('round 6 ruling-entry content evidence', () => {
     }});
     expect(condition(await check('- **R999** (date) Operator: "..."\n',{
       readRulingDiff:adapter.readRulingDiff,
+      readRulings:()=>'- **R999** (date) Operator: "..."\n',
     }),3).status).toBe('PASS');
     expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-relative','--no-ext-diff','--no-textconv',
       '--unified=0',base,f.headRefOid,'--',path]]]);
@@ -963,6 +982,150 @@ describe('round 16 svg and unknown review labels', () => {
 });
 
 
+describe('R391 operator ruling provenance', () => {
+  const path = 'docs/agent/platform-decisions.md';
+  const rulings = readFileSync(new NodeURL('../__fixtures__/d-r379/operator-rulings.md', import.meta.url), 'utf8');
+  const realEntry = rulings.split('\n')[0];
+  const check = (added, overrides = {}, metadata = {}) => checkPr(6223, deps({
+    ...fixture(6223), title:'Record R391 R392 R999', body:'Recorded verbatim', netDiffPaths:[path], ...metadata,
+  }, {
+    readRulings:()=>rulings,
+    readRulingNumstat:()=>`${added.slice(0, -1).split('\n').length}\t0\t${path}\0`,
+    readRulingFile:sha=>sha === base ? 'Original.\n' : `Original.\n${added}`,
+    readRulingDiff:()=>rulingDiff(added), ...overrides,
+  }));
+  it('rejects an appended R999 absent from operator rulings despite its PR citation', async () => {
+    expect(condition(await check('- **R999** Invented operator ruling.\n'), 3).status).toBe('FAIL');
+  });
+  it('rejects an empty operator rulings file', async () => {
+    expect(condition(await check(`${realEntry}\n`, {readRulings:()=>''}), 3).status).toBe('FAIL');
+  });
+  it.each([realEntry, realEntry.split('. D-R379')[0]])('accepts a verbatim substring of the real R391 entry: %s', async line => {
+    const r = await check(`${line}\n`);
+    expect(condition(r, 3)).toMatchObject({status:'PASS', evidence:expect.arrayContaining(['operator rulings verified'])});
+  });
+  it('rejects altered text with the same real R391 id', async () => {
+    expect(condition(await check(`${realEntry.replace('"Yes"', '"No"')}\n`), 3).status).toBe('FAIL');
+  });
+  it('rejects reordered fragments that contradict the cited ruling', async () => {
+    const added = `${realEntry}\n  PR\n  does\n  "set direction"\n`;
+    expect(condition(await check(added), 3).status).toBe('FAIL');
+  });
+  it('rejects duplicated source fragments within a cited entry', async () => {
+    const added = '- **R392** Synthetic continuation fixture.\n  Only this indented continuation belongs to R392.\n  Only this indented continuation belongs to R392.\n';
+    expect(condition(await check(added), 3).status).toBe('FAIL');
+  });
+  it('rejects source fragments in order when the excerpt is not contiguous', async () => {
+    const added = `${realEntry}\n  D-R379 condition 3 amended:\n  is delegable if the other conditions hold.\n`;
+    expect(condition(await check(added), 3).status).toBe('FAIL');
+  });
+  it('accepts trimmed continuation text from its own operator entry', async () => {
+    expect(condition(await check('- **R392** Synthetic continuation fixture.\n    Only this indented continuation belongs to R392.  \n'), 3).status).toBe('PASS');
+  });
+  it.each(['This continuation belongs to R393.', 'Unindented text outside the entry.'])
+  ('rejects continuation text outside the cited entry: %s', async text => {
+    expect(condition(await check(`- **R392** Synthetic continuation fixture.\n  ${text}\n`), 3).status).toBe('FAIL');
+  });
+  it('still rejects a genuine entry when the PR cites a different id', async () => {
+    expect(condition(await check(`${realEntry}\n`, {}, {title:'Record R999'}), 3).status).toBe('FAIL');
+  });
+  it.each(['unreadable', 'missing reader', 'invalid', 'oversized'])
+  ('keeps %s operator rulings UNKNOWN with a human-review fallback', async kind => {
+    const readRulings = kind === 'missing reader' ? undefined : () => {
+      if (kind === 'unreadable') throw Error('unreadable');
+      return kind === 'oversized' ? 'x'.repeat(8 * 1024 * 1024 + 1) : null;
+    };
+    const r = await check(`${realEntry}\n`, {readRulings});
+    expect(condition(r, 3).status).toBe('UNKNOWN');
+    expect(condition(r, 3).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+  it('does not use a legacy settings rulingsFile as an evidence source', async () => {
+    const calls = [];
+    const reader = createCheckDeps({env:{}}).readRulings;
+    const r = await check(`${realEntry}\n`, {
+      readSettings:()=>({...settings, rulingsFile:'operator/rulings.md'}),
+      readRulings:(...args)=>{ calls.push(args); return reader(...args); },
+    });
+    expect(calls).toEqual([[]]);
+    expect(condition(r, 3).status).toBe('UNKNOWN');
+    expect(r.eligible).toBe(false);
+  });
+  it('no path makes condition 3 UNKNOWN when the R391 exception is needed', async () => {
+    const r = await check(`${realEntry}\n`, {readRulings:createCheckDeps({env:{}}).readRulings});
+    expect(condition(r, 3).status).toBe('UNKNOWN');
+    expect(condition(r, 3).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+    expect(condition(r, 4).status).toBe('PASS');
+  });
+  it('missing path leaves conditions that do not need the exception unaffected', async () => {
+    const r = await checkPr(6223, deps(undefined, {readRulings:createCheckDeps({env:{}}).readRulings}));
+    expect(r.conditions.slice(0, 4).map(c=>c.status)).toEqual(['PASS','PASS','PASS','PASS']);
+    expect(r.eligible).toBe(true);
+  });
+});
+
+describe('operator rulings filesystem adapter', () => {
+  function adapter(content, {size = Buffer.byteLength(content), ...options} = {}) {
+    const bytes = Buffer.from(content), opened = [], closed = [];
+    let position = 0;
+    const deps = createCheckDeps({home:'fixture-home', cwd:'fixture-checkout', env:{}, stderr:()=>{}, ...options, fs:{
+      constants:{O_RDONLY:0, O_NONBLOCK:2048},
+      openSync:path=>{ opened.push(path); return 79; },
+      fstatSync:()=>({size, isFile:()=>true}),
+      readSync:(_fd, buffer, offset, length)=>{
+        const count = Math.min(length, bytes.length - position);
+        bytes.copy(buffer, offset, position, position + count);
+        position += count;
+        return count;
+      },
+      closeSync:fd=>closed.push(fd),
+    }});
+    return {deps, opened, closed};
+  }
+  it('uses D_R379_RULINGS_FILE as the env fallback', async () => {
+    const {deps, opened, closed} = adapter(rulingEntry, {env:{D_R379_RULINGS_FILE:'operator/env-rulings.md'}});
+    expect(await deps.readRulings()).toBe(rulingEntry);
+    expect(opened).toEqual([resolve('fixture-checkout', 'operator/env-rulings.md')]);
+    expect(closed).toEqual([79]);
+  });
+  it('CLI --rulings overrides the environment path', async () => {
+    const {deps:reader, opened} = adapter(rulingEntry, {env:{D_R379_RULINGS_FILE:'operator/env-rulings.md'}});
+    const f = {...fixture(6223), title:'R391 record', body:'Recorded verbatim',
+      netDiffPaths:['docs/agent/platform-decisions.md']};
+    expect(await main(['--pr=6223', '--rulings=operator/flag-rulings.md'], deps(f, {
+      readRulings:reader.readRulings,
+    }))).toBe(0);
+    expect(opened).toEqual([resolve('fixture-checkout', 'operator/flag-rulings.md')]);
+  });
+  it.each(['~/custom/rulings.md', 'operator/rulings.md'])('reads explicit rulings path %s', async rulingsFile => {
+    const {deps, opened} = adapter(rulingEntry);
+    expect(await deps.readRulings(rulingsFile)).toBe(rulingEntry);
+    const expected = rulingsFile.startsWith('~/') ? 'fixture-home/custom/rulings.md'
+      : resolve('fixture-checkout', rulingsFile);
+    expect(opened).toEqual([expected]);
+  });
+  it('rejects oversized rulings before reading and closes the evidence descriptor', async () => {
+    const {deps, closed} = adapter('', {size:8 * 1024 * 1024 + 1});
+    await expect(Promise.resolve().then(()=>deps.readRulings('operator/rulings.md'))).rejects.toThrow(/human review/);
+    expect(closed).toEqual([79]);
+  });
+  it.each([undefined, '', '  ', null, 42])('rejects missing or invalid rulings path %j', async rulingsFile => {
+    const {deps, opened} = adapter(rulingEntry);
+    await expect(Promise.resolve().then(()=>deps.readRulings(rulingsFile))).rejects.toThrow(/rulings/i);
+    expect(opened).toEqual([]);
+  });
+  it('unreadable env rulings make condition 3 UNKNOWN when the exception is needed', async () => {
+    const reader = createCheckDeps({env:{D_R379_RULINGS_FILE:'operator/unreadable.md'},
+      fs:{constants:{O_RDONLY:0, O_NONBLOCK:2048}, openSync:()=>{ throw Error('unreadable'); }}});
+    const f = {...fixture(6223), title:'R391 record', body:'Recorded verbatim',
+      netDiffPaths:['docs/agent/platform-decisions.md']};
+    const r = await checkPr(6223, deps(f, {readRulings:reader.readRulings}));
+    expect(condition(r, 3).status).toBe('UNKNOWN');
+    expect(r.eligible).toBe(false);
+  });
+});
+
 describe('condition 4 operator exclusions', () => {
   const minimal = {rulingRecordPaths: settings.rulingRecordPaths};
   const empty = {...minimal, protectedPaths: [], directionPaths: []};
@@ -987,6 +1150,13 @@ describe('condition 4 operator exclusions', () => {
     'scripts/operations/__tests__/d-r379-check.test.mjs',
     'scripts/operations/__tests__/d-r379-check-io-real.test.mjs',
     'scripts/operations/__fixtures__/d-r379/6223.json',
+    'scripts/lib/pr-state.mjs', 'scripts/lib/pr-state/snapshot.mjs',
+    'scripts/lib/pr-state/holds/index.mjs', 'scripts/lib/standards-sections.mjs',
+    'scripts/operations/codex-audit.mjs', 'scripts/operations/codex-audit-io.mjs',
+    'vitest.config.ts', 'vitest.config.mjs', 'vitest.config.cjs', 'vitest.config.js',
+    'package.json', 'scripts/test-cache/runner.mjs', 'scripts/test-cache/nested/cache.mjs',
+    'scripts/readiness/heavy-admission.mjs', 'scripts/readiness/heavy-admission-io.mjs',
+    'scripts/verify-lane.mjs', 'scripts/lib/hermetic-tests.mjs',
     ...['gate','guard','verdict','ledger','codeql','secret','approval','permission','label','policy']
       .flatMap(name => ['scripts', '.github'].flatMap(tree => [
         `${tree}/lib/custom-${name}-helper.mjs`,
@@ -1009,12 +1179,12 @@ describe('condition 4 operator exclusions', () => {
     'blocks/__tests__/e2e/helper.js', 'blocks/widget.js', 'blocks/foo/README.md',
     'src/assets/js/runtime.js', 'src/assets/active.svg', 'src/content.md',
     'docs/examples/access-control.tsx', 'docs/agent/testing.md', 'docs/gate-policy.md',
-    'scripts/lib/format-date.mjs', 'scripts/lib/standards-sections.mjs',
-    'scripts/check-standards.mjs', 'scripts/operations/codex-audit.mjs',
+    'scripts/lib/format-date.mjs',
+    'scripts/check-standards.mjs',
     'scripts/gen-inventory.mjs', 'scripts/lib/gh-throttle.mjs',
-    'scripts/lib/pr-state.mjs', 'scripts/settings/pr-limit.json',
-    'scripts/ci/shard-runner.mjs', 'scripts/readiness/heavy-admission.mjs',
-    'package.json', 'package-lock.json', 'vitest.config.ts', 'playwright.config.ts',
+    'scripts/settings/pr-limit.json',
+    'scripts/ci/shard-runner.mjs',
+    'package-lock.json', 'playwright.config.ts',
     'skills-src/review/SKILL.md', 'packages/reviewer/CLAUDE.md',
     'prompts/review.md', '.claude/commands/review.md', '.github/helper.yml',
     'scripts/image.svg', '.github/image.png', 'new-tree/future.code',
