@@ -1,15 +1,16 @@
 ---
+bornAs: x77rm8g
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/worker-brief.mjs", "we:scripts/operations/prototype-load.mjs", "we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs", "we:scripts/lib/daemon-overlays.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# One path rebuilds a daemon top: worker top-refresh and bundle-repair check each other's hold
+# Overlay main-sync refresher iterates only currently-registered overlays
 
-Held card 2026-11-01 15:16 ET. An orchestrator top-refresh worker (health-watch 1101c) raced the daemon's automatic bundle-repair (1101d); repair stood down and escalated. Fix: the worker brief and the loader check for an active bundle-repair hold on that daemon before building a top, and bundle-repair checks for an in-flight loader lane, so only one path rebuilds a top.
+Held card 2026-11-01 17:02 ET. we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs keeps syncing refs registered on no daemon (proto-daemon-resources, perf10-forge-fallbacks-m1) and fires overlay-main-sync-failed. Fix: iterate only the overlays a clone currently registers and drop stale entries from the refresher's own list.
 
 ## Acceptance
 

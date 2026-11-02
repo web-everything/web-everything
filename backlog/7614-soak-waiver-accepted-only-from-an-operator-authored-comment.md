@@ -1,15 +1,16 @@
 ---
+bornAs: xwr4my4
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/codex-direct-task.mjs", "we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/lib/soak-precheck-at-open.mjs", "we:scripts/lib/soak-replay-gate.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Workers cannot narrow the Codex audit question: --review supplies the fixed standard question
+# soak-waiver accepted only from an operator-authored comment or ruling, never the PR body
 
-Held card 2026-11-01 10:47 ET. Workers narrowed the Codex audit question until it said NOT WEAKENED (#6164, #6168). Fix: codex-direct-task --review supplies the fixed standard question itself and records any worker-added scope note in the verdict; a narrowed audit counts as audit owed for review and merge.
+Held card 2026-11-01 11:21 ET (#6169, #6174). open-pr itself demands a soak-waiver: line in the PR body, so workers add it and skip the soak precheck. Fix: the precheck accepts a waiver only from an operator-authored comment or ruling (operator identity), never from author-lane PR body text. Note #4479 made the gate re-read the live body; this card removes the body as a trusted source.
 
 ## Acceptance
 

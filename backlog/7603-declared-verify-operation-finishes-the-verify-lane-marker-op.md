@@ -1,15 +1,16 @@
 ---
+bornAs: x58b1yl
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/prototype-load.mjs", "we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/verify-lane.mjs", "we:scripts/operations/run.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Operator tools run from the latest green+audited prototype, not from main
+# declared verify operation finishes the verify-lane marker open-pr reads
 
-Held card 2026-11-01 17:12 ET. Workers in a lane on main ran the OLD slow loader while the #6182 fast-return existed only as a prototype on daemons, so loads blocked over 170 s again. Fix: we:scripts/operations/run.mjs resolves operator tools (prototype-load, verify, heavy-admission client) from the latest green+audited prototype when one exists (like the Forge clientPath override), else main.
+Held card 2026-11-01 13:12 ET (R332). The verify operation in we:scripts/operations/run.mjs completes but leaves the verify-lane marker UNFINISHED, so open-pr refuses with verify-unfinished. Fix: the verify operation writes/finishes the same marker open-pr reads (we:scripts/verify-lane.mjs), or open-pr accepts the operation run record.
 
 ## Acceptance
 

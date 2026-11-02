@@ -1,15 +1,16 @@
 ---
+bornAs: xr26f8p
 kind: story
-size: 1
+size: 3
 status: open
-scope: ["we:scripts/settings/prototype-load.json", "we:scripts/operations/prototype-load-io.mjs"]
+scope: ["we:scripts/backlog.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Add wev-merge-daemon to prototype-load settings; check-standards flags daemon clones with no loader entry
+# we:scripts/backlog.mjs ratify command writes the ratified block and marks forks
 
-Held card 2026-11-01 12:16 ET. The merge-orphan-sweep daemon wev-merge-daemon is missing from we:scripts/settings/prototype-load.json, so fixes to code it runs (e.g. #6171 job store) cannot be prototype-loaded. Add it, and make check-standards flag any launchd daemon clone with no loader entry.
+Held card 2026-11-01 15:45 ET. The ratification block of x1bppc5 was hand-written. Add a ratify subcommand to we:scripts/backlog.mjs: ratify <id> with a quote and a ruling id, writing the ratified block and marking the forks.
 
 ## Acceptance
 

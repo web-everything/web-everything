@@ -1,15 +1,16 @@
 ---
+bornAs: xlp8jj8
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs", "we:scripts/lib/daemon-overlays.mjs"]
+scope: ["we:scripts/codex-direct-task.mjs", "we:scripts/verify-lane.mjs", "we:scripts/operations/prototype-load.mjs", "we:scripts/worker-brief.mjs", "we:CLAUDE.md"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Overlay main-sync refresher iterates only currently-registered overlays
+# Slow worker tools return a job id fast (--async) plus a bounded status/result subcommand
 
-Held card 2026-11-01 17:02 ET. we:scripts/lib/daemon-rebuild/overlay-main-sync.mjs keeps syncing refs registered on no daemon (proto-daemon-resources, perf10-forge-fallbacks-m1) and fires overlay-main-sync-failed. Fix: iterate only the overlays a clone currently registers and drop stale entries from the refresher's own list.
+Held card 2026-11-01 17:19 ET, HIGH. Subagent Bash calls over about 180 s are auto-backgrounded, and we:scripts/codex-direct-task.mjs, we:scripts/verify-lane.mjs and we:scripts/operations/prototype-load.mjs routinely exceed that: the root cause of most worker-ended-turn-waiting slips. Fix: each tool takes --async and returns a job id fast, with a status/result subcommand using --wait=150000 (each call under 180 s). we:scripts/worker-brief.mjs teaches the pattern; update the pinned rule in we:CLAUDE.md, since codex-direct-task is no longer always foreground-synchronous in practice.
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: x9jv9q3
 kind: story
-size: 3
+size: 1
 status: open
-scope: ["we:scripts/verify-lane.mjs", "we:scripts/operations/run.mjs"]
+scope: ["we:scripts/settings/prototype-load.json", "we:scripts/operations/prototype-load-io.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# declared verify operation finishes the verify-lane marker open-pr reads
+# Add wev-merge-daemon to prototype-load settings; check-standards flags daemon clones with no loader entry
 
-Held card 2026-11-01 13:12 ET (R332). The verify operation in we:scripts/operations/run.mjs completes but leaves the verify-lane marker UNFINISHED, so open-pr refuses with verify-unfinished. Fix: the verify operation writes/finishes the same marker open-pr reads (we:scripts/verify-lane.mjs), or open-pr accepts the operation run record.
+Held card 2026-11-01 12:16 ET. The merge-orphan-sweep daemon wev-merge-daemon is missing from we:scripts/settings/prototype-load.json, so fixes to code it runs (e.g. #6171 job store) cannot be prototype-loaded. Add it, and make check-standards flag any launchd daemon clone with no loader entry.
 
 ## Acceptance
 

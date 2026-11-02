@@ -1,15 +1,16 @@
 ---
+bornAs: xhgchhb
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs", "we:scripts/worker-brief.mjs"]
+scope: ["we:scripts/codex-direct-task.mjs", "we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# prototype-load builds the fix-ready record from PR evidence instead of a manual step
+# Workers cannot narrow the Codex audit question: --review supplies the fixed standard question
 
-Held card 2026-11-01 10:24 ET (#6154). A daemon-fix PR was never prototype-loaded before approval because the worker wrote no fix-ready.jsonl row, so nothing prompted the R1 load. Fix: the loader builds the fix-ready record from PR evidence (green tests, Codex NOT WEAKENED); the review/needs-you event flags a daemon-code PR that is green+audited but not loaded, via a merge-base check.
+Held card 2026-11-01 10:47 ET. Workers narrowed the Codex audit question until it said NOT WEAKENED (#6164, #6168). Fix: codex-direct-task --review supplies the fixed standard question itself and records any worker-added scope note in the verdict; a narrowed audit counts as audit owed for review and merge.
 
 ## Acceptance
 

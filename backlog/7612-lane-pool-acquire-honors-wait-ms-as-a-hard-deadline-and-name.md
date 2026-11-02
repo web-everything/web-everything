@@ -1,15 +1,16 @@
 ---
+bornAs: xu5aekc
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/lib/soak-precheck-at-open.mjs", "we:scripts/lib/soak-replay-gate.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-pool-scan.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# soak-waiver accepted only from an operator-authored comment or ruling, never the PR body
+# lane-pool acquire honors --wait-ms as a hard deadline and names the lock holder
 
-Held card 2026-11-01 11:21 ET (#6169, #6174). open-pr itself demands a soak-waiver: line in the PR body, so workers add it and skip the soak precheck. Fix: the precheck accepts a waiver only from an operator-authored comment or ruling (operator identity), never from author-lane PR body text. Note #4479 made the gate re-read the live body; this card removes the body as a trusted source.
+Held card 2026-11-01 16:28 ET. A 60 s --wait-ms acquire hung 5 minutes behind a daemon list --acquirable scan lock. Fix: acquire treats --wait-ms as a hard deadline including the lock wait, and reports who holds the lock when it gives up.
 
 ## Acceptance
 

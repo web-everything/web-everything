@@ -1,15 +1,16 @@
 ---
+bornAs: xuspar8
 kind: story
-size: 2
+size: 5
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-pool-scan.mjs"]
+scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/prototype-load.mjs", "we:scripts/verify-lane.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# lane-pool acquire honors --wait-ms as a hard deadline and names the lock holder
+# Operator tools run from the latest green+audited prototype, not from main
 
-Held card 2026-11-01 16:28 ET. A 60 s --wait-ms acquire hung 5 minutes behind a daemon list --acquirable scan lock. Fix: acquire treats --wait-ms as a hard deadline including the lock wait, and reports who holds the lock when it gives up.
+Held card 2026-11-01 17:12 ET. Workers in a lane on main ran the OLD slow loader while the #6182 fast-return existed only as a prototype on daemons, so loads blocked over 170 s again. Fix: we:scripts/operations/run.mjs resolves operator tools (prototype-load, verify, heavy-admission client) from the latest green+audited prototype when one exists (like the Forge clientPath override), else main.
 
 ## Acceptance
 

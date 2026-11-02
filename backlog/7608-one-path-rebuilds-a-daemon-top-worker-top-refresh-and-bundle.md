@@ -1,15 +1,16 @@
 ---
+bornAs: xizlly0
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/prototype-load.mjs", "we:scripts/operations/prototype-load-io.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs"]
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/operations/prototype-load.mjs", "we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# prototype-load reports registered-pending (not FAIL adoption-timeout) and the rebuild emits overlay-adopted / overlay-adoption-overdue
+# One path rebuilds a daemon top: worker top-refresh and bundle-repair check each other's hold
 
-Held card 2026-11-01 12:03 ET. #6182 made the load return fast, but a registered overlay that simply waits for the next rebuild must read registered-pending, never FAIL adoption-timeout (4x on 2026-11-01: build, review, drain x2). The rebuild itself (we:scripts/lib/daemon-rebuild/adopt.mjs) then emits overlay-adopted, or overlay-adoption-overdue after a bound, so nobody polls merge-base by hand. File only what #6182 left undone; check its landed behavior first.
+Held card 2026-11-01 15:16 ET. An orchestrator top-refresh worker (health-watch 1101c) raced the daemon's automatic bundle-repair (1101d); repair stood down and escalated. Fix: the worker brief and the loader check for an active bundle-repair hold on that daemon before building a top, and bundle-repair checks for an in-flight loader lane, so only one path rebuilds a top.
 
 ## Acceptance
 

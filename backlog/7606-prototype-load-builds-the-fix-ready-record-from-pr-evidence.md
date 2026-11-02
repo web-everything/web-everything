@@ -1,15 +1,16 @@
 ---
+bornAs: xdpqigh
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/backlog.mjs"]
+scope: ["we:scripts/operations/prototype-load.mjs", "we:scripts/worker-brief.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# we:scripts/backlog.mjs ratify command writes the ratified block and marks forks
+# prototype-load builds the fix-ready record from PR evidence instead of a manual step
 
-Held card 2026-11-01 15:45 ET. The ratification block of x1bppc5 was hand-written. Add a ratify subcommand to we:scripts/backlog.mjs: ratify <id> with a quote and a ruling id, writing the ratified block and marking the forks.
+Held card 2026-11-01 10:24 ET (#6154). A daemon-fix PR was never prototype-loaded before approval because the worker wrote no fix-ready.jsonl row, so nothing prompted the R1 load. Fix: the loader builds the fix-ready record from PR evidence (green tests, Codex NOT WEAKENED); the review/needs-you event flags a daemon-code PR that is green+audited but not loaded, via a merge-base check.
 
 ## Acceptance
 

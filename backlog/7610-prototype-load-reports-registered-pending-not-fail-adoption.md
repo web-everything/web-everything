@@ -1,15 +1,16 @@
 ---
+bornAs: xqb5ctv
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:scripts/codex-direct-task.mjs", "we:scripts/verify-lane.mjs", "we:scripts/operations/prototype-load.mjs", "we:scripts/worker-brief.mjs", "we:CLAUDE.md"]
+scope: ["we:scripts/operations/prototype-load.mjs", "we:scripts/operations/prototype-load-io.mjs", "we:scripts/lib/daemon-rebuild/adopt.mjs"]
 dateOpened: "2026-11-01"
 tags: []
 ---
 
-# Slow worker tools return a job id fast (--async) plus a bounded status/result subcommand
+# prototype-load reports registered-pending (not FAIL adoption-timeout) and the rebuild emits overlay-adopted / overlay-adoption-overdue
 
-Held card 2026-11-01 17:19 ET, HIGH. Subagent Bash calls over about 180 s are auto-backgrounded, and we:scripts/codex-direct-task.mjs, we:scripts/verify-lane.mjs and we:scripts/operations/prototype-load.mjs routinely exceed that: the root cause of most worker-ended-turn-waiting slips. Fix: each tool takes --async and returns a job id fast, with a status/result subcommand using --wait=150000 (each call under 180 s). we:scripts/worker-brief.mjs teaches the pattern; update the pinned rule in we:CLAUDE.md, since codex-direct-task is no longer always foreground-synchronous in practice.
+Held card 2026-11-01 12:03 ET. #6182 made the load return fast, but a registered overlay that simply waits for the next rebuild must read registered-pending, never FAIL adoption-timeout (4x on 2026-11-01: build, review, drain x2). The rebuild itself (we:scripts/lib/daemon-rebuild/adopt.mjs) then emits overlay-adopted, or overlay-adoption-overdue after a bound, so nobody polls merge-base by hand. File only what #6182 left undone; check its landed behavior first.
 
 ## Acceptance
 
