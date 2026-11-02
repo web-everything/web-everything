@@ -1066,7 +1066,7 @@ describe('#5128 — bounded related-test selection', () => {
     const selectedTestCommand = new RegExp(pattern[1]);
     for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
     expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
-    expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
+    expect(source).toMatch(/const retryableGate = isSelectedTestCommand\(resolvedGate\?\.testCommand \?\? ''\)/);
   });
 });
 
