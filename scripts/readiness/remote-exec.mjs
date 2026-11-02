@@ -1280,7 +1280,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // x40a9dk: a cancelled client is terminated only when the protected finish succeeded (it reaps the worker
       // UID and removes the run), answering either a matching receipt or the null of a run killed before one.
       if(cancel.signal.aborted && !(result && verifyReceipt(text,expected,result.code))) {
-        return reply === null || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
+        return (reply && reply.cancelAck === true && reply.v === 1 && reply.nonce === nonce && reply.run === run) || (reply && verifyReceipt(text,expected,reply.code)) ? {mode:'cancelled',terminated:true,reason:'client-signal'} : {mode:'unconfirmed',reason:'ambiguous-result'};
       }
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {

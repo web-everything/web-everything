@@ -1289,7 +1289,7 @@ export function createRunner({testRoot, testPath, testReapProbe, testCleanupExec
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
       });
     },

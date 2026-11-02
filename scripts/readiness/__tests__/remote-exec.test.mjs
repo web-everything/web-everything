@@ -768,7 +768,9 @@ describe('standards input parity', () => {
     expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
   });
 
-  it.each([['a null finish (run killed before a receipt)', 'null', 'cancelled'], ['a finish that failed to parse', 'untrusted', 'unconfirmed']])(
+  const ackReceipt = (_nonce, value) => JSON.stringify({v:1,nonce:value.nonce,run:value.run,cancelAck:true});
+  it.each([['a cancel-acknowledged finish (run killed before a receipt)', ackReceipt, 'cancelled'], ['a legacy runner null finish that never acknowledged cancel', 'null', 'unconfirmed'], ['a finish that failed to parse', 'untrusted', 'unconfirmed'],
+    ['a cancel ack for another run', (_n, value) => JSON.stringify({v:1,nonce:value.nonce,run:'other',cancelAck:true}), 'unconfirmed']])(
     'x40a9dk: an aborted client reports %s as %s', async (_name, receipt, mode) => {
     const controller = new AbortController(), abort = () => controller.abort();
     const f = fixture({receipt}), original = f.exec;
