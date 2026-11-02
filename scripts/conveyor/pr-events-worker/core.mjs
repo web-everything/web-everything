@@ -294,6 +294,11 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
         }
       }
       const result = { repo: input.repo, status: input.status, baseCursor: input.baseCursor, cursor: head(), importId: input.importId, at: now };
+      // Import history for the NEW per-repo coverage only (fail closed); it changes no seeding behaviour.
+      const seen = storage.getProjection('repoImports', input.repo) || { repo: input.repo, others: [] };
+      const priorLatest = storage.getProjection('bootstrap', input.repo);
+      storage.putProjection('repoImports', input.repo, { repo: input.repo,
+        others: priorLatest ? [...seen.others, priorLatest.baseCursor] : seen.others });
       storage.putProjection('bootstrap', input.repo, result);
       storage.putProjection('imports', importKey, { input: JSON.stringify(input), result });
       return { ...result, duplicate: false };
@@ -334,6 +339,7 @@ function repoFreshness(storage, head, now) {
   const clamp = (v) => (Number.isFinite(v) && v <= now + FUTURE_SKEW_MS ? v : null); // a future time is rejected, never shown as fresh
   const oldest = storage.minSeq();
   const boots = new Map(storage.listProjection('bootstrap').map((b) => [b.repo, b]));
+  const imports = new Map(storage.listProjection('repoImports').map((i) => [i.repo, i.others]));
   const lastEvent = new Map(storage.listProjection('repoEvents').map((e) => [e.repo, e.lastEventAt]));
   const out = {};
   for (const repo of [...new Set([...boots.keys(), ...lastEvent.keys()])].sort()) {
@@ -342,7 +348,8 @@ function repoFreshness(storage, head, now) {
     const gap = b ? head > b.baseCursor && (oldest == null || b.baseCursor < oldest - 1) : true;
     const lastEventAt = clamp(lastEvent.get(repo));
     const badEvent = lastEvent.has(repo) && lastEventAt == null; // an unreadable/future event time voids coverage
-    out[repo] = { bootstrapAt, lastEventAt, coverage: !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent };
+    out[repo] = { bootstrapAt, lastEventAt, coverage: !!b && b.status === 'complete' && bootstrapAt != null && !gap && !badEvent &&
+      (imports.get(repo) || []).every((c) => c < b.baseCursor) };
   }
   return out;
 }

@@ -64,6 +64,16 @@ describe('GET /prs per-repo freshness', () => {
     expect(log.readPrs(null, 10, T).prs[0].state).toBe('open');
   });
 
+  it('a same-cursor complete import after a truncation gives coverage false until a later cursor', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.bootstrap({ ...seed('o/a', 0, 'truncated', 't'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
+    log.bootstrap(seed('o/a', 0, 'complete', 'c'), T);
+    expect(log.readPrs(null, 10, T).repos['o/a'].coverage).toBe(false);
+    log.append(ev('o/b', 9), T);
+    log.bootstrap(seed('o/a', 1, 'complete', 'c2'), T);
+    expect(log.readPrs(null, 10, T).repos['o/a'].coverage).toBe(true);
+  });
+
   it('a complete re-import closes open rows it omits so coverage is never true over a stale open PR', () => {
     const log = createEventLog(createMemoryStorage());
     log.bootstrap({ ...seed('o/a'), prs: [{ number: 1, sha: 'a', draft: false, labels: [], state: 'open' }] }, T);
