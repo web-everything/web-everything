@@ -157,7 +157,7 @@ function clearReaderStarved(starvedRoot, readerKey) {
 /** The live starved reader (if any, other than `owner`) that writers must yield to. A claim lapses with the same
  *  lease as a lock entry (`lastRefusedAt` older than `leaseMinutes`) or when its same-host pid is dead — those
  *  are removed on sight, so a crashed reader can never hold writers off. */
-function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after }) {
+function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null }) {
   if (!(after > 0)) return null;
   for (const rec of readStarvedRecords(starvedRoot)) {
     const asEntry = { owner: rec.owner, pid: rec.pid, heartbeatAt: rec.lastRefusedAt };
@@ -166,6 +166,8 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
       continue;
     }
     if (rec.owner === owner) continue;
+    // A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
+    if (startedBeforeMs !== null && !(isoMs(rec.firstRefusedAt) < startedBeforeMs)) continue;
     if (rec.count >= after) return rec;
   }
   return null;
@@ -192,6 +194,21 @@ export const DEFAULT_WRITER_PRIORITY_AFTER = 1;
  *  start re-tries; a claim never outlives a dead owner pid). Default 30 min — longer than one sibling tick. */
 export const WRITER_CLAIM_TTL_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_CLAIM_TTL_MS';
 export const DEFAULT_WRITER_CLAIM_TTL_MS = 30 * 60_000;
+
+/** Setting: how long (ms) a writer must have waited for readers to drain before it stops backing off to readers
+ *  that began starving AFTER its wait began (the reader stream its own reservation refuses). Already-held
+ *  reader locks are never broken; the writer intent is its ordinary lease/pid-liveness reservation, so a crashed
+ *  writer's intent lapses on its own. Default 30 s; `0` = off (the pre-fix behaviour). */
+export const WRITER_WAIT_PRIORITY_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS';
+export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 30_000;
+
+/** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default; 0 = off). */
+export function resolveWriterWaitPriorityMs(env = process.env) {
+  const raw = env?.[WRITER_WAIT_PRIORITY_ENV];
+  if (raw === undefined || raw === '') return DEFAULT_WRITER_WAIT_PRIORITY_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WRITER_WAIT_PRIORITY_MS;
+}
 
 /** PURE: the writer-priority threshold from env (a non-negative integer, else the default; 0 = off). */
 export function resolveWriterPriorityAfter(env = process.env) {
@@ -483,6 +500,7 @@ export async function acquireWrite(root, opts = {}) {
     readerPriorityAfter = resolveReaderPriorityAfter(),
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
+    writerWaitPriorityMs = resolveWriterWaitPriorityMs(),
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
 
@@ -498,8 +516,10 @@ export async function acquireWrite(root, opts = {}) {
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
+    const waitedPast = writerWaitPriorityMs > 0 && nowMsN - startMs >= writerWaitPriorityMs;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+      startedBeforeMs: waitedPast ? startMs : null,
     });
     if (!r) return null;
     const mine = ownClaim();

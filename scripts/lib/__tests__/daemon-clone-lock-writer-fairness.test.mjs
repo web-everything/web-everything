@@ -259,7 +259,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
   const dead = () => 'dead';
 
   /** R holds a read slot until `rReleaseMs`; a fresh reader (distinct owner + key) arrives every `arriveMs`
-   *  and retries 3 times (enough to claim starvation priority). Returns the writer result + wait + readers. */
+   *  and keeps retrying each tick, so it reaches starvation priority (3 refusals) 10s after arriving. Returns the writer result + wait + readers. */
   async function simulate({ waitPriorityMs, rReleaseMs = 100_000, arriveMs = 5000 }) {
     const lockRoot = mkTmp('dcww-root-');
     const clone = mkTmp('dcww-clone-');
@@ -269,6 +269,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
     let rHeld = true;
     let n = 0;
     const admitted = [];
+    const active = [];
     let rEntryWhileWaiting = true;
     const step = () => {
       if (rHeld && t >= rReleaseMs) { releaseRead(clone, { lockRoot, owner: 'R' }); rHeld = false; }
@@ -278,9 +279,11 @@ describe('writer wait priority — a writer past its wait threshold is not displ
       }
       if (t % arriveMs === 0) {
         n += 1;
-        for (let i = 0; i < 3; i += 1) {
-          const r = acquireRead(clone, { ...common, owner: `S${n}`, readerKey: `S${n}`, nowMs: t });
-          if (r.ok) { admitted.push(`S${n}`); break; }
+        active.push(`S${n}`);
+        // Every still-waiting reader retries once per arrival tick, so each builds a starvation count over time.
+        for (const key of [...active]) {
+          const r = acquireRead(clone, { ...common, owner: key, readerKey: key, nowMs: t });
+          if (r.ok) { admitted.push(key); active.splice(active.indexOf(key), 1); }
         }
       }
     };
@@ -299,7 +302,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
   });
 
   it('AFTER: past the threshold the writer keeps waiting and acquires as soon as the held reader drains', async () => {
-    const r = await simulate({ waitPriorityMs: 20_000 });
+    const r = await simulate({ waitPriorityMs: 8000 });
     expect(r.w).toEqual({ ok: true });
     expect(r.waitedMs).toBeGreaterThanOrEqual(100_000);
     expect(r.waitedMs).toBeLessThanOrEqual(101_000);
@@ -309,7 +312,7 @@ describe('writer wait priority — a writer past its wait threshold is not displ
   });
 
   it('never breaks an already-held reader lock while the writer waits past its threshold', async () => {
-    const r = await simulate({ waitPriorityMs: 20_000 });
+    const r = await simulate({ waitPriorityMs: 8000 });
     expect(r.rEntryWhileWaiting).toBe(true);
   });
 
