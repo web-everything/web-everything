@@ -12,6 +12,18 @@ import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
+// Explicit failure reasons only; future enum values require operator inspection.
+const mqFailureReasons = new Set(['failed_checks', 'ci_failure', 'merge_conflict',
+  'branch_protection_failure', 'invalid_merge_commit']);
+const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reason.trim().toLowerCase() : '';
+
+function mqLiveReadOptions() {
+  const env = { ...process.env };
+  delete env.WE_GH_READ_MEMO_DIR;
+  // gh-throttle consults throttle.env for memoization independently of the child env.
+  return { env, throttle: { env } };
+}
+
 function mqSameHeadHold({ pr, head }, reason) {
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
   return { hold: true, line: `mq-same-head-failed: #${safe(pr)} head ${safe(head)} — ${safe(reason)}` };
@@ -32,8 +44,10 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
   for (const event of timeline.nodes) {
     if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
-    const reason = typeof event.reason === 'string' ? event.reason.trim().toLowerCase() : '';
+    const reason = mqRemovalReason(event);
     if (reason === 'manual' || reason === 'merged') continue;
+    if (!mqFailureReasons.has(reason))
+      return hold('unknown removal reason; operator must inspect history and enqueue manually');
     const testedHead = mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid);
     if (!testedHead) {
       return hold('no commit binding for merge-queue removal; operator must inspect history and enqueue manually');
@@ -63,7 +77,7 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
     }`;
     const result = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`,
       '-f', `owner=${parts[0]}`, '-f', `name=${parts[1]}`, '-F', `number=${pr}`],
-    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+    { ...mqLiveReadOptions(), encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
     const items = result?.data?.repository?.pullRequest?.timelineItems;
     if (result?.errors?.length || !Array.isArray(items?.nodes) || typeof items?.pageInfo?.hasPreviousPage !== 'boolean')
       return { error: 'unreadable merge-queue timeline' };
@@ -113,8 +127,9 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
   const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
   const unavailable = () => log(`${prefix}state unavailable; not requesting; inspect shared refresh ledger and lock before retrying`);
   try { if (store.has(key)) return; } catch { unavailable(); return; }
-  const opts = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
+  const liveOptions = mqLiveReadOptions();
+  const opts = { ...liveOptions, encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], throttle: { ...liveOptions.throttle, maxAttempts: 1 } };
   try {
     const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
       '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
@@ -155,7 +170,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
   // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
-    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
+    { ...mqLiveReadOptions(), encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
   let timeline;
   const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
@@ -169,11 +184,12 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
       && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
         event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
         || (event?.__typename === 'RemovedFromMergeQueueEvent'
-          && (['manual', 'merged'].includes(String(event.reason ?? '').trim().toLowerCase())
-            || mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid))))
+          && (['manual', 'merged'].includes(mqRemovalReason(event))
+            || (mqFailureReasons.has(mqRemovalReason(event))
+              && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
       && timeline.nodes.some(event =>
       event?.__typename === 'RemovedFromMergeQueueEvent'
-      && !['manual', 'merged'].includes(String(event.reason ?? '').trim().toLowerCase())
+      && mqFailureReasons.has(mqRemovalReason(event))
       && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);
     if (refresh && confirmed) mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh });
   }

@@ -5350,6 +5350,9 @@ async function runCli() {
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
     if (!mergeStrategy.queueOwnsFreshness(v.repo)) return false;
     try {
+      if (strict && (!['on', 'off'].includes(approvedHeadSetting?.value)
+          || !['env', 'settings'].includes(approvedHeadSetting?.source)))
+        throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
       if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
       const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
@@ -5358,7 +5361,7 @@ async function runCli() {
       return decision.hold;
     } catch (e) {
       process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: approved-head proof unreadable (${String(e?.message ?? e).replace(/[\r\n]+/g, ' ')}); ${strict ? 'not requesting same-head refresh' : 'using legacy rebase/refresh path'}\n`);
-      if (strict) throw e;
+      if (strict) return true;
       return false;
     }
   };

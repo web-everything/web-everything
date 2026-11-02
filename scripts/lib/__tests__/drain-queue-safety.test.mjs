@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
@@ -9,6 +9,7 @@ import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId 
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { enqueuePr } from '../merge-queue-enqueue.mjs';
+import { resolveSkipRebaseApprovedHumanSurface } from '../approved-human-surface-hold.mjs';
 import { decideDrainWorkflowEditHold } from '../drain-workflow-edit-hold.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
@@ -71,6 +72,88 @@ describe('merge-queue same-head failure admission', () => {
       f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
     }
+    it.each([undefined, null, '', '   ', 'future_failure', 'ALREADY_MERGED'])(
+      'unconfirmed removal reason %s stays operator-only without refresh or ledger spend', reason => fixture(f => {
+        const event = { ...removed(), reason };
+        for (const nodes of [[event], [event, removed()], [removed(), event]]) {
+          f.timeline = timeline(...nodes);
+          expect(f.run().hold).toBe(true);
+        }
+        expect(f.requests()).toHaveLength(0);
+        expect(existsSync(f.path)).toBe(false);
+        expect(f.approvedHeadHold).not.toHaveBeenCalled();
+        expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/operator.*inspect/i));
+      }));
+    it.each(['CI_FAILURE', 'MERGE_CONFLICT', 'FAILED_CHECKS', 'BRANCH_PROTECTION_FAILURE', 'INVALID_MERGE_COMMIT'])(
+      'explicit failure %s bound to the current head permits one refresh', reason => fixture(f => {
+        f.timeline = timeline(removed(reason));
+        expect(f.run().hold).toBe(true);
+        expect(f.requests()).toHaveLength(1);
+      }));
+    it.each(['queue', 'checks', 'labels'])(
+      'refresh authorizing %s read bypasses a configured memo and observes live refusal', stage => fixture(f => {
+        const previousMemo = process.env.WE_GH_READ_MEMO_DIR;
+        process.env.WE_GH_READ_MEMO_DIR = join(process.env.TMPDIR, 'stale-read-memo');
+        const originalExec = f.exec.getMockImplementation();
+        const liveReads = [];
+        f.exec.mockImplementation((command, args, opts) => {
+          const target = stage === 'queue' ? args.some(arg => arg.includes('isInMergeQueue'))
+            : args.includes(stage === 'checks' ? 'mergeStateStatus,headRefOid,statusCheckRollup' : 'labels,headRefOid');
+          if (target) {
+            // Match gh-throttle: memo configuration comes from throttle.env, not child env.
+            const memoEnv = opts?.throttle?.env ?? process.env;
+            liveReads.push({ opts, memoEnv });
+            if (!memoEnv.WE_GH_READ_MEMO_DIR) {
+              if (stage === 'queue') return queueResponse(false, prior);
+              if (stage === 'checks') return JSON.stringify({ ...f.live, mergeStateStatus: 'BEHIND' });
+              return JSON.stringify({ headRefOid: head, labels: ['review:human'] });
+            }
+          }
+          return originalExec(command, args, opts);
+        });
+        try {
+          expect(f.run().hold).toBe(true);
+          expect(f.requests()).toHaveLength(0);
+          expect(existsSync(f.path)).toBe(false);
+          expect(liveReads).toHaveLength(1);
+          expect(liveReads[0].memoEnv).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+          expect(liveReads[0].opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+          expect(liveReads[0].opts.env.PATH).toBe(process.env.PATH);
+          expect(process.env.WE_GH_READ_MEMO_DIR).toContain('stale-read-memo');
+        } finally {
+          if (previousMemo === undefined) delete process.env.WE_GH_READ_MEMO_DIR;
+          else process.env.WE_GH_READ_MEMO_DIR = previousMemo;
+        }
+      }));
+    it.each(['unreadable', 'malformed', 'unresolvable'])(
+      'strict production approvedHeadHold refuses %s settings before refresh', kind => fixture(f => {
+        const setting = resolveSkipRebaseApprovedHumanSurface({ env: {}, readFile: () => {
+          if (kind === 'unreadable') throw new Error('offline');
+          return kind === 'malformed' ? '{' : JSON.stringify({ mergeQueue: { skipRebaseApprovedHumanSurface: 'unknown' } });
+        } });
+        expect(setting).toEqual({ value: 'off', source: 'default' });
+        const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+        const start = source.indexOf('  const approvedHeadHold = ');
+        const end = source.indexOf('  const prestageSetting = ', start);
+        expect(start).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        const readHold = vi.fn(() => ({ hold: false }));
+        const stderr = { write: vi.fn() };
+        // Execute the production closure with hermetic dependencies; importing the CLI runs its driver.
+        const makeHold = new Function('approvedHeadSetting', 'mergeStrategy', 'isLocalRepo', 'siblingCloneDir',
+          'readApprovedHumanSurfaceHold', 'AS_JSON', 'process', 'repoTag', 'localSlug',
+          source.slice(start, end) + '\nreturn approvedHeadHold;');
+        f.approvedHeadHold = makeHold(setting, { queueOwnsFreshness: () => true }, () => true, () => null,
+          readHold, false, { cwd: () => '/fixture', stderr }, () => '', repo);
+        expect(f.approvedHeadHold({ repo, num: pr }, head)).toBe(false);
+        readHold.mockClear();
+        expect(f.approvedHeadHold({ repo, num: pr }, head, { strict: true })).toBe(true);
+        f.run();
+        expect(f.requests()).toHaveLength(0);
+        expect(existsSync(f.path)).toBe(false);
+        expect(readHold).not.toHaveBeenCalled();
+        expect(stderr.write).toHaveBeenCalledWith(expect.stringMatching(/unreadable.*not requesting same-head refresh/));
+      }));
     it('uses shared home state with an explicit test override', () => {
       expect(mqSameHeadRefreshStatePath({})).toBe(join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json'));
       expect(mqSameHeadRefreshStatePath({ WE_DRAIN_MQ_REFRESH_STATE_PATH: '/fixture/state.json' })).toBe('/fixture/state.json');
