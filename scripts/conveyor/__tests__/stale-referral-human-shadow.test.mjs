@@ -9,7 +9,7 @@ import {
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import {
-  decideStaleReferralHumanHold, emitShadowEvent, resolveStaleReferralHumanShadow,
+  createLiveShadowReaders, decideStaleReferralHumanHold, emitShadowEvent, resolveStaleReferralHumanShadow,
 } from '../stale-referral-human-shadow.mjs';
 
 // Spy on the shared writer while retaining real JSONL persistence for dedup tests.
@@ -76,6 +76,94 @@ function checked(decision, cause, status) {
     expect.objectContaining({ cause, status, detail: expect.any(String) }),
   ]));
 }
+
+describe('CLI production evidence adapter', () => {
+  function setup() {
+    const { pr, record, options } = clean();
+    pr.baseRefName = 'main';
+    pr.labels.push({ name: 'review-round:1' });
+    const run = { id: record.runId, repo, pr: pr.number, head: record.head,
+      parked: true, attempted: true, persistenceFailed: false, pending: [finding.key],
+      startedAt: Date.parse('2026-10-21T11:59:00Z'), completedAt: Date.parse('2026-10-21T12:00:00Z') };
+    const io = { repo, env: {}, now: Date.parse('2026-10-21T12:02:00Z'),
+      gh: vi.fn(() => { throw new Error('unexpected network'); }),
+      readRuns: vi.fn(() => [run]), readAttention: vi.fn(() => []),
+      readRequired: vi.fn(() => ['test']),
+      readRun: vi.fn(() => ({ id: run.id, findings: {
+        read: { repo, pr: pr.number, netBasis: { rev: record.head } },
+        referralVerdict: { findings: [], deferredAdvisory: [] },
+      } })),
+    };
+    return { pr, record, options, io };
+  }
+
+  it('durable referral-only pause with a ruling yields wouldClear using production hold rules', async () => {
+    const { pr, record, options, io } = setup();
+    const readers = createLiveShadowReaders(io);
+    expect(await readers.readHoldEvidence(pr, { cardReadable: () => false })).toMatchObject({
+      cause: 'referral', head: record.head, runId: record.runId, key: finding.key,
+      round: 1, findings: [], escalations: [], needsYou: false, operatorRulingNeeded: false,
+      sameHeadHold: false, noVerdict: false,
+    });
+    expect((await decideStaleReferralHumanHold(pr, { ...options, ...readers })).wouldClear).toBe(true);
+    expect(io.readRequired).toHaveBeenCalledWith(expect.objectContaining({ repo, branch: 'main' }));
+    expect(io.readRuns).toHaveBeenCalledTimes(1);
+    expect(io.gh).not.toHaveBeenCalled();
+  });
+
+  it('missing needs-you source is omitted and keeps independent hold causes unknown', async () => {
+    const { pr, options, io } = setup();
+    io.readAttention.mockImplementation(() => { throw new Error('feed unreadable'); });
+    const readers = createLiveShadowReaders(io);
+    const evidence = await readers.readHoldEvidence(pr);
+    for (const field of ['needsYou', 'operatorRulingNeeded', 'escalations']) expect(evidence).not.toHaveProperty(field);
+    const decision = await decideStaleReferralHumanHold(pr, { ...options, ...readers });
+    for (const cause of ['needs-you', 'operator-ruling-needed', 'escalation']) checked(decision, cause, 'unknown');
+  });
+
+  it('missing durable findings never becomes an empty clean finding list', async () => {
+    const { pr, options, io } = setup();
+    io.readRun.mockReturnValue(null);
+    const readers = createLiveShadowReaders(io);
+    expect(await readers.readHoldEvidence(pr)).not.toHaveProperty('findings');
+    checked(await decideStaleReferralHumanHold(pr, { ...options, ...readers }), 'security-finding', 'unknown');
+  });
+
+  it('a referral comment without durable run provenance stays unknown', async () => {
+    const { pr, options, io } = setup();
+    io.readRuns.mockReturnValue([]);
+    const readers = createLiveShadowReaders(io);
+    expect(await readers.readHoldEvidence(pr)).not.toHaveProperty('runId');
+    checked(await decideStaleReferralHumanHold(pr, { ...options, ...readers }), 'referral-provenance', 'unknown');
+  });
+
+  it('missing round label stays unknown instead of assuming round zero', async () => {
+    const { pr, options, io } = setup();
+    pr.labels = pr.labels.filter(l => !l.name.startsWith('review-round:'));
+    checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }), 'round-cap', 'unknown');
+  });
+
+  it('required-check read failure stays unknown', async () => {
+    const { pr, options, io } = setup();
+    io.readRequired.mockImplementation(() => { throw new Error('policy unavailable'); });
+    checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }), 'required-checks', 'unknown');
+  });
+
+  it('live-head attention entries preserve each independent hold cause', async () => {
+    const { pr, options, io } = setup();
+    io.readAttention.mockReturnValue(['needs-you', 'ruling-needed', 'escalated'].map(kind => ({
+      repo, pr: pr.number, head: pr.headRefOid, kind,
+    })));
+    const decision = await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) });
+    for (const cause of ['needs-you', 'operator-ruling-needed', 'escalation']) checked(decision, cause, 'present');
+  });
+
+  it('round cap from the real label remains a hold', async () => {
+    const { pr, options, io } = setup();
+    pr.labels.push({ name: `review-round:${NEGOTIATION_ROUND_CAP}` });
+    checked(await decideStaleReferralHumanHold(pr, { ...options, ...createLiveShadowReaders(io) }), 'round-cap', 'present');
+  });
+});
 
 describe('decideStaleReferralHumanHold: stale referral must be the ONLY cause', () => {
   it('referral ruled on live head + all else clean -> wouldClear', async () => {
@@ -394,6 +482,15 @@ describe('referral-only safety predicate: every independent cause fails closed',
     checked(decision, row.cause, 'unknown');
     await emitShadowEvent(decision, pr, { repo, settings: enabled, env: {} });
     expect(appendDaemonEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('benign status labels', () => {
+  it('status:awaiting-review, red-team:pending and red-team:clear do not make the labels unknown', async () => {
+    const { pr, options } = clean();
+    pr.labels.push({ name: 'status:awaiting-review' }, { name: 'red-team:pending' }, { name: 'red-team:clear' });
+    const decision = await decideStaleReferralHumanHold(pr, options);
+    expect(decision.checked).toContainEqual(expect.objectContaining({ cause: 'labels', status: 'absent' }));
   });
 });
 

@@ -11,6 +11,11 @@ import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 import { resolveCascade, logCascadeSources, platformPreference } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { defaultListPrComments } from './pr-comments-list.mjs';
+import { readReviewRunEvidence, decideReferralHold, decideSameHeadHold, verdictNeverLanded } from './review-referral-hold.mjs';
+import { sharedRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { resolve } from 'node:path';
+import { defaultReadRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { feedPath, parseFeedLine, unacknowledged } from '../operations/needs-you-feed.mjs';
 
 const SETTING = new URL('../settings/stale-referral-human-shadow.json', import.meta.url);
 const SHA = /^[a-f0-9]{40}$/;
@@ -21,7 +26,9 @@ const CAUSES = ['round-cap', 'block-ruling', 'requested-changes', 'red-team-bloc
   'no-verdict', 'same-head-hold', 'security-finding', 'mandatory-referral-finding', 'advisory-push'];
 const KNOWN_LABELS = new Set(['review:human', 'review:changes', 'review:needed', 'review:accepted',
   'red-team:blocked', 'red-team:passed', 'needs-you', 'operator-ruling-needed', 'escalation',
-  'advisory:changes', 'advisory:accept', 'advisory:needs-human', 'review:no-verdict', 'review:same-head-hold']);
+  'advisory:changes', 'advisory:accept', 'advisory:needs-human', 'review:no-verdict', 'review:same-head-hold',
+  // Benign status markers (not hold causes): a panel not yet run, a clean red team, the awaiting-review status.
+  'status:awaiting-review', 'red-team:pending', 'red-team:clear']);
 
 /** Pure cascade when layers are supplied; the standalone resolver reads only its tool setting. */
 export function resolveStaleReferralHumanShadow({ env = process.env, tool, platform } = {}) {
@@ -203,6 +210,111 @@ export function emitShadowEvent(decision, pr, options = {}) {
   return result;
 }
 
+/** CLI IO only: do not migrate runs or write the projection cache during a shadow read. */
+function readShadowRuns() {
+  const dir = process.env.OPERATION_RUNS_DIR?.trim()
+    ? resolve(process.env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir();
+  return readReviewRunEvidence({ dir, persist: false, readRun: (id) => {
+    const run = tryReadRun(id, dir);
+    if (!run) throw new Error('durable review run unreadable; operator inspection required');
+    return run;
+  } });
+}
+
+function readShadowRun(id) {
+  const dir = process.env.OPERATION_RUNS_DIR?.trim()
+    ? resolve(process.env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir();
+  return tryReadRun(id, dir);
+}
+
+function readShadowAttention() {
+  const path = feedPath();
+  // The shared replay tolerates absent files and bad lines for display. Neither proves absence here.
+  const lines = readFileSync(path, 'utf8').split('\n').filter(line => line.trim());
+  if (lines.some(line => !parseFeedLine(line))) throw new Error('needs-you feed incomplete; operator inspection required');
+  return unacknowledged({ path });
+}
+
+/** Injectable production adapter, used by the CLI only. Missing sources leave fields omitted. */
+export function createLiveShadowReaders({ repo, gh, readRuns = readShadowRuns, readRun = readShadowRun,
+  readAttention = readShadowAttention, readRequired = defaultReadRequiredStatusChecks,
+  referralHold = decideReferralHold, sameHeadHold = decideSameHeadHold,
+  now = Date.now(), env = process.env } = {}) {
+  const safely = async reader => { try { return await reader(); } catch { return undefined; } };
+  // Share local scans and policy reads across the bounded PR list; never cache a fabricated empty result.
+  let runsPromise, attentionPromise;
+  const policies = new Map();
+  return {
+    readRequiredChecks: async pr => {
+      if (typeof pr.baseRefName !== 'string' || !pr.baseRefName) return undefined;
+      if (!policies.has(pr.baseRefName)) policies.set(pr.baseRefName, safely(() => readRequired({
+        repo, branch: pr.baseRefName, gh: argv => JSON.stringify(gh(argv)),
+      })));
+      return policies.get(pr.baseRefName);
+    },
+    readHoldEvidence: async (pr, context = {}) => {
+      const evidence = {};
+      const labels = Array.isArray(pr.labels) ? pr.labels.map(l => typeof l === 'string' ? l : l?.name) : null;
+      const labelsKnown = labels?.every(l => typeof l === 'string');
+      const has = label => labels?.includes(label) === true;
+      const rounds = labels?.filter(l => /^review-round:\d+$/.test(l)).map(l => Number(l.split(':')[1]));
+      if (rounds?.length && rounds.every(Number.isSafeInteger)) evidence.round = Math.max(...rounds);
+      const attention = await (attentionPromise ??= safely(readAttention));
+      if (Array.isArray(attention) && attention.every(e => typeof e?.repo === 'string'
+        && Number.isInteger(e.pr) && SHA.test(e.head ?? '') && typeof e.kind === 'string') && labelsKnown) {
+        const items = attention.filter(e => e.repo === repo && e.pr === pr.number && e.head === pr.headRefOid);
+        evidence.needsYou = has('needs-you') || items.some(e => e.kind === 'needs-you');
+        evidence.operatorRulingNeeded = has('operator-ruling-needed') || items.some(e => e.kind === 'ruling-needed');
+        evidence.escalations = items.filter(e => !['needs-you', 'ruling-needed'].includes(e.kind));
+        if (has('escalation')) evidence.escalations.push({ head: pr.headRefOid });
+      }
+      const runs = await (runsPromise ??= safely(readRuns));
+      if (!Array.isArray(runs)) return evidence;
+      const history = runs.filter(r => r.repo === repo && r.pr === pr.number);
+      const live = await safely(() => liveReferralState(pr, { ...context, repo, pr: pr.number }));
+      const parked = history.filter(r => r.parked && r.attempted && !r.persistenceFailed)
+        .sort((a, b) => b.completedAt - a.completedAt);
+      // A comment identifies the finding only after independent durable evidence pins the parked run.
+      const source = parked.find(r => live?.records?.some(record => record.runId === r.id
+        && record.head === r.head && record.repo === repo && record.pr === pr.number
+        && record.referrals.some(f => r.pending?.includes(f.key))));
+      if (source) {
+        const record = live.records.find(r => r.runId === source.id && r.head === source.head
+          && r.repo === repo && r.pr === pr.number);
+        Object.assign(evidence, { cause: 'referral', head: source.head, runId: source.id,
+          key: record.referrals.find(f => source.pending.includes(f.key)).key });
+      }
+      if (labelsKnown && history.length) {
+        const opts = { ...context, repo, now, env };
+        const hold = await safely(() => referralHold(pr, runs, opts));
+        const same = await safely(() => sameHeadHold(pr, runs, opts));
+        // The production same-head guard yields to a released referral. Establish that release explicitly.
+        const released = source?.head === pr.headRefOid && !live?.malformed && live?.pending?.length === 0
+          && live?.pendingReasons?.length === 0 && hold === null;
+        if (same !== undefined && hold !== undefined) evidence.sameHeadHold = !released && same !== null;
+        const current = history.filter(r => r.head === pr.headRefOid)
+          .sort((a, b) => (b.completedAt ?? b.startedAt) - (a.completedAt ?? a.startedAt))[0];
+        if (current) evidence.noVerdict = has('review:no-verdict') || verdictNeverLanded(pr, current, now);
+      }
+      const current = history.filter(r => r.head === pr.headRefOid)
+        .sort((a, b) => (b.completedAt ?? b.startedAt) - (a.completedAt ?? a.startedAt))[0];
+      if (current && !current.incomplete) {
+        const run = await safely(() => readRun(current.id));
+        const read = run?.findings?.read;
+        const final = run?.findings?.referralVerdict;
+        if (run?.id === current.id && read?.repo === repo && Number(read.pr) === pr.number
+          && read?.netBasis?.rev === pr.headRefOid && Array.isArray(final?.findings)
+          && Array.isArray(final?.deferredAdvisory)
+          && [...final.findings, ...final.deferredAdvisory].every(f => f && typeof f === 'object')) {
+          evidence.findings = [...final.findings, ...final.deferredAdvisory].map(f => ({ ...f,
+            head: pr.headRefOid, ...(f.category === 'security' ? { security: true } : {}) }));
+        }
+      }
+      return evidence;
+    },
+  };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (!args.includes('--live') || args.some(a => !/^(--live|--dry|--repo=[\w.-]+\/[\w.-]+|--pr=\d+(,\d+)*)$/.test(a))) {
@@ -220,10 +332,11 @@ async function main() {
       { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   };
   const prs = gh(['pr', 'list', '--state', 'open', '--label', 'review:human',
-    '--repo', repo, '--limit', '100', '--json', 'number,headRefOid,labels,comments,isDraft,mergeable,statusCheckRollup,body,createdAt,reviews'],
+    '--repo', repo, '--limit', '100', '--json', 'number,headRefOid,baseRefName,labels,comments,isDraft,mergeable,statusCheckRollup,body,createdAt,reviews'],
   );
   if (!Array.isArray(prs)) throw new Error('PR list unreadable');
   if (prs.length === 100) console.error('PR list capped at 100; operator must inspect remaining human holds');
+  const readers = createLiveShadowReaders({ repo, gh });
   for (const pr of prs.filter(p => !selected || selected.includes(p.number))) {
     if (pr.comments?.length >= 100) {
       try {
@@ -231,9 +344,7 @@ async function main() {
         pr.commentsComplete = true;
       } catch { pr.comments = undefined; }
     }
-    // List comments are not complete evidence. Without independent provenance readers the
-    // standalone probe deliberately reports unknown, rather than guessing a referral-only hold.
-    const decision = await decideStaleReferralHumanHold(pr, { repo, settings });
+    const decision = await decideStaleReferralHumanHold(pr, { repo, settings, ...readers });
     const reason = decision.wouldClear ? decision.why
       : decision.checked.find(c => c.status !== 'absent')?.detail ?? decision.why;
     console.log(`${pr.number} wouldClear=${decision.wouldClear} ${String(reason).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}`);
