@@ -3,13 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'no
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
+import * as queueSafety from '../drain-queue-safety.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { enqueuePr } from '../merge-queue-enqueue.mjs';
-import { resolveSkipRebaseApprovedHumanSurface } from '../approved-human-surface-hold.mjs';
+import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold } from '../approved-human-surface-hold.mjs';
 import { decideDrainWorkflowEditHold } from '../drain-workflow-edit-hold.mjs';
 
 const head = '5300b9ec377a' + '0'.repeat(28);
@@ -120,6 +121,72 @@ describe('merge-queue same-head failure admission', () => {
           expect(liveReads[0].opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
           expect(liveReads[0].opts.env.PATH).toBe(process.env.PATH);
           expect(process.env.WE_GH_READ_MEMO_DIR).toContain('stale-read-memo');
+        } finally {
+          if (previousMemo === undefined) delete process.env.WE_GH_READ_MEMO_DIR;
+          else process.env.WE_GH_READ_MEMO_DIR = previousMemo;
+        }
+      }));
+    it.each(['labels', 'comments', 'unreadable'])(
+      'strict production approvedHeadHold bypasses stale approval %s memo and refuses refresh', stage => fixture(f => {
+        const previousMemo = process.env.WE_GH_READ_MEMO_DIR;
+        process.env.WE_GH_READ_MEMO_DIR = join(process.env.TMPDIR, 'stale-approval-memo');
+        const reads = [];
+        const readGh = vi.fn((args, opts) => {
+          const memoEnv = opts?.throttle?.env ?? process.env;
+          const cached = Boolean(memoEnv.WE_GH_READ_MEMO_DIR);
+          reads.push({ opts, cached });
+          if (!cached && stage === 'unreadable') throw new Error('approval offline');
+          const approved = !cached || stage === 'labels';
+          if (args.includes('headRefOid,labels,mergeable')) return JSON.stringify({
+            headRefOid: head, labels: cached && stage === 'labels' ? [] : ['review:accepted'], mergeable: 'MERGEABLE',
+          });
+          if (args.includes('--paginate')) return approved
+            ? `<!-- reviewed-sha: ${head} -->\\n<!-- cleared-human: operator -->\t2026-11-01T12:00:00Z\tchalbert\tIC_fixture\thttps://example.test/comment\n` : '';
+          if (args.some(arg => arg.includes('comments{totalCount}'))) return JSON.stringify({
+            data: { repository: { pullRequest: { comments: { totalCount: approved ? 1 : 0 } } } },
+          });
+          throw new Error('unexpected approval read');
+        });
+        const git = vi.fn((file, args) => {
+          expect(file).toBe('git');
+          if (args[0] === 'merge-base') return prior;
+          if (args[0] === 'ls-tree') return '';
+          if (args.includes('--name-only')) return '.github/workflows/test.yml\0';
+          return '';
+        });
+        const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+        const start = source.indexOf('  const approvedHeadHold = ');
+        const end = source.indexOf('  const prestageSetting = ', start);
+        expect(start).toBeGreaterThan(0);
+        expect(end).toBeGreaterThan(start);
+        const stderr = { write: vi.fn() };
+        const makeHold = new Function('approvedHeadSetting', 'mergeStrategy', 'isLocalRepo', 'siblingCloneDir',
+          'readApprovedHumanSurfaceHold', 'AS_JSON', 'process', 'repoTag', 'localSlug', 'readGh', 'execFileSync', 'mqLiveReadOptions',
+          source.slice(start, end) + '\nreturn approvedHeadHold;');
+        f.approvedHeadHold = makeHold({ value: 'on', source: 'settings' }, { queueOwnsFreshness: () => true },
+          () => true, () => null, readApprovedHumanSurfaceHold, false, { cwd: () => '/fixture', stderr },
+          () => '', repo, readGh, git, queueSafety.mqLiveReadOptions);
+        try {
+          // Legacy callers still see the memo's missing approval, with unchanged read options.
+          expect(f.approvedHeadHold({ repo, num: pr }, head)).toBe(false);
+          expect(reads).toHaveLength(3);
+          expect(reads.every(read => read.cached)).toBe(true);
+          expect(reads.every(read => !read.opts.env && !read.opts.throttle)).toBe(true);
+          reads.length = 0;
+          f.run();
+          expect(f.requests()).toHaveLength(0);
+          expect(existsSync(f.path)).toBe(false);
+          expect(f.exec.mock.calls.some(([, args]) => args.includes('labels,headRefOid'))).toBe(false);
+          expect(reads).toHaveLength(stage === 'unreadable' ? 1 : 3);
+          for (const { opts, cached } of reads) {
+            expect(cached).toBe(false);
+            expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+            expect(opts.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+            expect(opts.env.PATH).toBe(process.env.PATH);
+          }
+          expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/authorization refused or unreadable.*inspect/));
+          if (stage === 'unreadable') expect(stderr.write).toHaveBeenCalledWith(expect.stringMatching(/approval offline.*not requesting same-head refresh/));
+          expect(process.env.WE_GH_READ_MEMO_DIR).toContain('stale-approval-memo');
         } finally {
           if (previousMemo === undefined) delete process.env.WE_GH_READ_MEMO_DIR;
           else process.env.WE_GH_READ_MEMO_DIR = previousMemo;

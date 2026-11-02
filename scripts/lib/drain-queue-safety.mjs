@@ -17,7 +17,7 @@ const mqFailureReasons = new Set(['failed_checks', 'ci_failure', 'merge_conflict
   'branch_protection_failure', 'invalid_merge_commit']);
 const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reason.trim().toLowerCase() : '';
 
-function mqLiveReadOptions() {
+export function mqLiveReadOptions() {
   const env = { ...process.env };
   delete env.WE_GH_READ_MEMO_DIR;
   // gh-throttle consults throttle.env for memoization independently of the child env.

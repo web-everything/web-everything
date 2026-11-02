@@ -2,7 +2,7 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { mqLiveReadOptions, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
@@ -5355,8 +5355,11 @@ async function runCli() {
         throw new Error('approval settings unreadable or unresolvable; operator must inspect approval configuration');
       const cwd = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
       if (approvedHeadSetting.value === 'on' && !cwd) throw new Error('no PR clone for approved-head proof');
+      // Refresh authorization must observe approval added since the memo was populated.
       const decision = readApprovedHumanSurfaceHold({ setting: approvedHeadSetting.value, pr: v.num, repo: v.repo || localSlug,
-        expectedHead: headSha, exec: (file, args, opts) => file === 'gh' ? readGh(args, opts) : execFileSync(file, args, { ...opts, cwd }) });
+        expectedHead: headSha, exec: (file, args, opts) => file === 'gh'
+          ? readGh(args, strict ? { ...opts, ...mqLiveReadOptions() } : opts)
+          : execFileSync(file, args, { ...opts, cwd }) });
       if (decision.hold && !AS_JSON) process.stderr.write(`  ⏸ PR ${repoTag(v.repo)}${v.num}: ${decision.reason}\n`);
       return decision.hold;
     } catch (e) {
