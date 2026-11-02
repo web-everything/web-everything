@@ -3,7 +3,9 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
+import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
@@ -129,6 +131,22 @@ describe('feed', () => {
     expect(cleared.lines[0]).toMatch(/^NEEDS-YOU-CLEARED /);
     expect(parseFeedLine(cleared.lines[0])).toMatchObject({ kind: 'cleared', was: 'needs-you', head: 'abc', pr: 12 });
     expect(diffFeed(first.openKeys, [{ ...item, head: 'def' }], at).lines).toHaveLength(2);
+  });
+  it('dedupes two stalled events while needs-you and red-team-undecided have distinct keys on the same PR/head', () => {
+    const stalled = { ...item, kind: 'stalled' };
+    const undecided = { ...item, kind: 'red-team-undecided' };
+    const first = diffFeed([], [stalled, stalled, item, undecided], at);
+    expect(first.openKeys).toEqual([
+      'owner/repo#12@abc:stalled', 'owner/repo#12@abc:needs-you', 'owner/repo#12@abc:red-team-undecided',
+    ]);
+    expect(first.lines).toHaveLength(3);
+    expect(diffFeed(first.openKeys, [stalled, stalled, item, undecided], at).lines).toEqual([]);
+  });
+  it.each(['red-team-undecided', 'confirmed-break-owed-send-back'])('clears report kind %s by absence while retaining event-only stalled keys', kind => {
+    const first = diffFeed([], [{ ...item, kind }, { ...item, kind: 'stalled' }], at);
+    const cleared = diffFeed(first.openKeys, [], at, { clearKinds: REPORT_KINDS });
+    expect(cleared.openKeys).toEqual(['owner/repo#12@abc:stalled']);
+    expect(cleared.lines.map(parseFeedLine)).toEqual([expect.objectContaining({ kind: 'cleared', was: kind })]);
   });
   it('maps real queue row shapes and incomplete flag', () => {
     const row = { repo: item.repo, number: 12, head: 'abc' };
@@ -325,6 +343,55 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   const report = { ready: [{ repo, number: 5768, title: 't' }], needsYourMerge: [{ repo, number: 9, title: 'm' }] };
   const gate = (view, comments) => async (_f, args) => (args[0] === 'api' ? JSON.stringify([comments]) : JSON.stringify(view));
   const items = () => itemsFromReport(report);
+  const gateComments = ({ pr = 5768, rev = head, outcome = GATE_OUTCOMES.NOTHING_TO_SEND, broken = false } = {}) => {
+    const body = renderRedTeamComment({ pr, rev, provider: 'codex', model: 'm', recheckStatus: 'ok',
+      foldedVerdict: broken ? 'changes' : 'accepted', findings: broken ? [{ summary: 'confirmed break',
+        category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 3,
+        confirmedByRecheck: true, recheckReason: 'real' }] : [] });
+    return [
+      { user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
+      { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+        body: redTeamGateMarker(pr, rev, outcome, redTeamResultId(parseRedTeamComment(body))) },
+    ];
+  };
+  const expectUndecided = (kept, pr = 5768) => {
+    const row = kept.find(i => i.pr === pr);
+    expect(row.kind).toBe('red-team-undecided');
+    expect(row.reason).toMatch(/red team.*no explicit pass.*live head/i);
+    expect(row.reason).not.toContain('all gates pass');
+    return row;
+  };
+
+  it.each([GATE_OUTCOMES.SENT_BACK, GATE_OUTCOMES.ROUND_CAP])('#6239: clear labels cannot hide a confirmed break with %s on the live head', async outcome => {
+    const r = { ready: [{ repo, number: 6239, title: 'confirmed break', head: 'stale' }] };
+    const original = itemsFromReport(r);
+    const { kept, held } = await gateReadyItems(original, r, {
+      gh: gate({ headRefOid: head, labels: [] }, [...gateComments({ pr: 6239, outcome, broken: true }),
+        // The operator reply clears humanReviewHold, but is no explicit gate pass.
+        { user: { login: 'chalbert' }, body: 'Please continue', created_at: '2026-10-10T02:06:00Z' }]), log: () => {},
+    });
+    expect(held).toEqual([]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toEqual({ ...original[0], head, kind: 'confirmed-break-owed-send-back', reason: expect.any(String) });
+    expect(kept[0].reason).toMatch(/confirmed red-team break.*owed.*send-back/i);
+    expect(kept[0].reason).not.toContain('all gates pass');
+  });
+  it.each([
+    ['no record', () => []],
+    ['an older head only', () => gateComments({ rev: '2'.repeat(40) })],
+    ['a result without a gate record', () => gateComments().slice(0, 1)],
+    ['a gate record without a result', () => gateComments().slice(1)],
+    ['card-queued only', () => gateComments({ outcome: GATE_OUTCOMES.CARD_QUEUED })],
+    ['an untrusted pass record', () => gateComments().map(c => ({ ...c, user: { login: 'mallory' } }))],
+  ])('keeps red-team-undecided for clear labels with %s', async (_name, comments) => {
+    const { kept, held } = await gateReadyItems(items(), report, {
+      gh: gate({ headRefOid: head, labels: [] }, comments()), log: () => {},
+    });
+    expect(held).toEqual([]);
+    expect(kept).toHaveLength(2);
+    expect(expectUndecided(kept)).toEqual({ ...items()[0], head, kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(kept.find(i => i.pr === 9)).toEqual(items()[1]);
+  });
 
   it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
     const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
@@ -332,16 +399,20 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(kept.map((i) => i.pr)).toEqual([9]);
     expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)']));
   });
-  it('keeps a ready item whose live PR is clean, and never judges needs-your-merge rows', async () => {
-    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, []);
+  it('keeps needs-you all gates pass only with a result and no-send-back record on the live head, and never judges needs-your-merge rows', async () => {
+    const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, gateComments());
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
     expect(held).toEqual([]);
+    expect(kept[0]).toEqual({ ...items()[0], head });
+    expect(kept[0].reason).toContain('all gates pass');
+    expect(kept[1]).toEqual(items()[1]);
   });
-  it('keeps the item (never suppresses an alert) when the live PR cannot be read, and logs it', async () => {
+  it('keeps red-team-undecided when the live PR cannot be read, and logs it', async () => {
     const logs = [];
     const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(expectUndecided(kept)).toEqual({ ...items()[0], kind: 'red-team-undecided', reason: expect.any(String) });
     expect(logs.join()).toMatch(/live gate unreadable, keeping: rate limited/);
   });
   it('runOnce applies the gate by default and logs what it held back', async () => {
@@ -356,34 +427,61 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
     const stale = [{ repo, number: 5768, head: 'stale' }];
     const r2 = { ready: stale };
-    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    const { kept } = await gateReadyItems(itemsFromReport(r2), r2, { gh: gate({ headRefOid: head, labels: [] }, gateComments()), log: () => {} });
     expect(kept[0].head).toBe(head);
   });
   it('the real fix-claim lease overrides the comment heuristic (expired lease = not claimed; live lease = claimed)', async () => {
     const created_at = new Date(Date.now() - 600000).toISOString();
     const body = '🔒 conveyor fix-begin — fix claim held';
-    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }]]) : JSON.stringify({ headRefOid: head, labels: [] }));
+    const gh = async (_f, args) => (args[0] === 'api' ? JSON.stringify([[{ user: { login: 'plateau-worker[bot]' }, body, created_at }, ...gateComments()]]) : JSON.stringify({ headRefOid: head, labels: [] }));
     const live = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => true });
     expect(live.held[0].reasons).toEqual(['a fix claim is open']);
     const expired = await gateReadyItems(items(), report, { gh, log: () => {}, fixClaimLive: () => false });
     expect(expired.held).toEqual([]);
+    expect(expired.kept[0]).toEqual({ ...items()[0], head });
   });
-  it('a pass-wide deadline keeps (never drops) the items it could not judge in time', async () => {
+  it('a pass-wide deadline keeps red-team-undecided for items it could not judge in time', async () => {
     const logs = [];
-    const gh = async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+    const gh = vi.fn(async () => JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] }));
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: (l) => logs.push(l), deadlineMs: -1 });
     expect(held).toEqual([]);
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
+    expect(expectUndecided(kept)).toEqual({ ...items()[0], kind: 'red-team-undecided', reason: expect.any(String) });
+    expect(gh).not.toHaveBeenCalled();
     expect(logs.join()).toMatch(/gate deadline/);
+  });
+  it('still holds a blocked PR when the deadline expires during the live read (evidence already arrived)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(at));
+    const logs = [];
+    const gh = async (_f, args) => {
+      if (args[0] !== 'api') return JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
+      vi.setSystemTime(new Date(Date.parse(at) + 1000));
+      return JSON.stringify([gateComments()]);
+    };
+    const { kept, held } = await gateReadyItems(items(), report, { gh, deadlineMs: 1000, log: l => logs.push(l) });
+    expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head']));
+    expect(kept.filter(i => i.pr === items()[0].pr)).toEqual([]);
   });
   it('keeps the incomplete flag the diff uses', async () => {
     const withFlag = Object.assign(items(), { incomplete: true });
-    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, []), log: () => {} });
+    const { kept } = await gateReadyItems(withFlag, report, { gh: gate({ headRefOid: head, labels: [] }, gateComments()), log: () => {} });
     expect(kept.incomplete).toBe(true);
   });
 });
 
 describe('stall sweep coexistence', () => {
+  it('an open stalled item does not suppress a new gate verdict (red-team-undecided) for the same head', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const gh = async (_f, args) => (args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head, labels: [] }));
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo, number: 5, head }] }), gh, settings,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' }, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.lines).toHaveLength(1);
+    expect(replay({ path })[0]).toMatchObject({ pr: 5, kind: 'red-team-undecided' });
+  });
   it.each([
     { WE_PR_STALL_SWEEP_MODE: 'off' },
     { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },
