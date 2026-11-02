@@ -22,7 +22,9 @@ const OLD_PUSH_TIME = '2026-10-30T12:00:00Z';
 // GitHub's own record of the newest push to a ref (GET /repos/{repo}/activity): server time, not the writer's clock.
 const push = (after, overrides = {}) => ({ activity_type: 'push', after, timestamp: OLD_PUSH_TIME, ...overrides });
 const run = (head_sha = otherSha, overrides = {}) => ({
-  head_sha, conclusion: 'success', created_at: RUN_CREATED, ...overrides,
+  head_sha, conclusion: 'success', created_at: RUN_CREATED, run_attempt: 1,
+  run_started_at: overrides.created_at ?? RUN_CREATED,
+  updated_at: overrides.created_at ?? RUN_CREATED, ...overrides,
 });
 // A quarantine entry that passes validateQuarantineList (scripts/lib/red-main-quarantine.mjs).
 const entry = (overrides = {}) => ({
@@ -120,6 +122,23 @@ const siblingCalls = [
 ];
 
 describe('queue-tested CLI adapter', () => {
+  it('keeps full CI for an older equal-tree success followed by a failure on the push SHA', () => {
+    const result = runCli({ runs: JSON.stringify({ workflow_runs: [
+      run(otherSha), run(sha, { conclusion: 'failure', created_at: '2026-10-31T12:10:00Z' }),
+    ] }) });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('did not succeed');
+  });
+
+  it('keeps full CI when an older run fails on a later attempt after another success', () => {
+    const result = runCli({ runs: JSON.stringify({ workflow_runs: [
+      run(sha), run(sha, { conclusion: 'failure', created_at: '2026-10-30T12:00:00Z',
+        run_attempt: 2, run_started_at: '2026-10-31T12:10:00Z', updated_at: '2026-10-31T12:20:00Z' }),
+    ] }) });
+    expect(result.stdout).toBe('queue_tested=false\n');
+    expect(result.stderr).toContain('did not succeed');
+  });
+
   it('keeps full CI after the default branch switched away and back to main for an older unpinned queue run', () => {
     const current = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
     const previous = structuredClone(current);
@@ -438,6 +457,60 @@ describe.each([
 });
 
 describe('decideQueueTestedSkip (pure function, no CLI or main export required)', () => {
+  it.each(['failure', 'cancelled', 'timed_out', null])('vetoes a newer equal-tree %j on a different SHA', async (conclusion) => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([
+      run(sha), run(otherSha, { conclusion, created_at: '2026-10-31T12:10:00Z' }),
+    ]), getCommitTree: vi.fn().mockResolvedValue(pushTree.toUpperCase()) });
+    const result = await decideQueueTestedSkip(args);
+    expectClosed(result);
+    expect(result.reason).toContain('did not succeed');
+    expect(args.getCommitTree).toHaveBeenCalledWith(otherSha);
+  });
+
+  it.each([undefined, 'invalid'])('orders a failed rerun by updated_at when run_started_at is %j', async (run_started_at) => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([
+      run(sha), run(sha, { conclusion: 'failure', created_at: '2026-10-30T12:00:00Z',
+        run_attempt: 2, run_started_at, updated_at: '2026-10-31T12:10:00Z' }),
+    ]) });
+    const result = await decideQueueTestedSkip(args);
+    expectClosed(result);
+    expect(result.reason).toContain('did not succeed');
+  });
+
+  it('uses the newest successful attempt, even if its run was created before a failure', async () => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([
+      run(sha, { created_at: '2026-10-31T11:00:00Z', run_attempt: 2,
+        run_started_at: '2026-10-31T12:20:00Z' }),
+      run(otherSha, { created_at: '2026-10-31T12:15:00Z' }),
+      run(sha, { conclusion: 'failure', created_at: '2026-10-31T12:10:00Z',
+        updated_at: '2026-10-31T12:25:00Z' }),
+    ]), getCommitTree: vi.fn().mockResolvedValue(pushTree) });
+    expect(await decideQueueTestedSkip(args)).toMatchObject({ skip: true, matchedSha: sha });
+  });
+
+  it('allows a newer failure on a different tree', async () => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([
+      run(sha), run(otherSha, { conclusion: 'failure', created_at: '2026-10-31T12:10:00Z' }),
+    ]) });
+    expect(await decideQueueTestedSkip(args)).toMatchObject({ skip: true, matchedSha: sha });
+    expect(args.getCommitTree).toHaveBeenCalledWith(otherSha);
+  });
+
+  it.each(['throw', 'invalid'])('fails closed when a newer failed run tree is unreadable (%s)', async (mode) => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([
+      run(sha), run(otherSha, { conclusion: 'failure', created_at: '2026-10-31T12:10:00Z' }),
+    ]), getCommitTree: mode === 'throw' ? vi.fn().mockRejectedValue(new Error('unavailable'))
+      : vi.fn().mockResolvedValue('bad') });
+    expectClosed(await decideQueueTestedSkip(args));
+  });
+
+  it('fails closed when a failure has no readable latest attempt time', async () => {
+    const args = input({ listMergeGroupRuns: vi.fn().mockResolvedValue([
+      run(sha), run(sha, { conclusion: 'failure', run_started_at: undefined, updated_at: 'bad' }),
+    ]) });
+    expectClosed(await decideQueueTestedSkip(args));
+  });
+
   it('exports the decision function and fixes the lookup bound at 20', () => {
     expect(decideQueueTestedSkip).toBeTypeOf('function');
     expect(MAX_RUNS_CHECKED).toBe(20);

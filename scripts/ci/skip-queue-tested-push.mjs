@@ -17,6 +17,13 @@ export const SIBLING_BRANCH = 'main';
 const CALL_TIMEOUT_MS = 30_000;
 const isSha = (value) => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})(?![\s\S])/i.test(value);
 const full = (reason) => ({ skip: false, reason: `${reason}; running full CI` });
+// The workflow-runs listing describes the latest run_attempt, including its conclusion.
+// created_at belongs to the original run and must not order later reruns.
+const attemptTime = (run) => {
+  const started = typeof run?.run_started_at === 'string' ? Date.parse(run.run_started_at) : NaN;
+  return Number.isFinite(started) ? started
+    : typeof run?.updated_at === 'string' ? Date.parse(run.updated_at) : NaN;
+};
 
 /**
  * The queue run read `name` at some point after its creation; the push run would read it now.
@@ -90,18 +97,44 @@ export async function decideQueueTestedSkip({
   }
   if (!Array.isArray(runs)) return full('merge-group run listing is not an array');
   const candidates = runs.filter((run) => run?.conclusion === 'success' && isSha(run.head_sha)
-    && typeof run.created_at === 'string' && Number.isFinite(Date.parse(run.created_at)))
-    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+    && typeof run.created_at === 'string' && Number.isFinite(Date.parse(run.created_at))
+    && Number.isFinite(attemptTime(run)))
+    .sort((a, b) => attemptTime(b) - attemptTime(a))
     .slice(0, MAX_RUNS_CHECKED);
   if (!candidates.length) return full('no valid successful merge-group runs');
 
-  // A newer non-success run on the same head SHA (a re-run that failed) overrides an older success.
-  const newerNonSuccess = (run) => runs.some((r) => r && r !== run && isSha(r.head_sha)
-    && r.head_sha.toLowerCase() === run.head_sha.toLowerCase()
-    && r.conclusion !== 'success' && typeof r.created_at === 'string'
-    && Date.parse(r.created_at) > Date.parse(run.created_at));
+  // Success and failure use the same tree identity. Cache immutable commit trees across both
+  // checks; the push head's tree is already known and needs no API lookup.
+  const trees = new Map([[sha.toLowerCase(), { tree: pushTree.toLowerCase() }]]);
+  const treeOf = async (head) => {
+    if (!isSha(head)) return { reason: 'invalid merge-group commit SHA' };
+    const key = head.toLowerCase();
+    if (!trees.has(key)) {
+      let tree;
+      try {
+        tree = await getCommitTree(head);
+      } catch {
+        return { reason: 'merge-group commit tree lookup failed' };
+      }
+      if (!isSha(tree)) return { reason: 'invalid merge-group commit tree' };
+      trees.set(key, { tree: tree.toLowerCase() });
+    }
+    return trees.get(key);
+  };
   const accept = async (run, reason) => {
-    if (newerNonSuccess(run)) return full('a newer merge-group run on the same SHA did not succeed');
+    // Candidates are newest-attempt-first, so this is the newest success for the push tree.
+    // Inspect every non-success in the bounded API listing, not just the 20 success candidates.
+    for (const failed of runs) {
+      if (failed?.conclusion === 'success') continue;
+      const failedAt = attemptTime(failed);
+      if (!Number.isFinite(failedAt)) return full('merge-group attempt time unreadable');
+      if (failedAt <= attemptTime(run)) continue;
+      const evidence = await treeOf(failed.head_sha);
+      if (evidence.reason) return full(evidence.reason);
+      if (evidence.tree === pushTree.toLowerCase()) {
+        return full('a newer merge-group run on the same tree did not succeed');
+      }
+    }
     const unproven = await queueRunUnproven({ readQuarantineState, readSiblingState }, run, now);
     return unproven ? full(unproven) : { skip: true, matchedSha: run.head_sha, reason };
   };
@@ -109,14 +142,9 @@ export async function decideQueueTestedSkip({
     if (run.head_sha.toLowerCase() === sha.toLowerCase()) {
       return accept(run, 'push head already passed merge-group CI');
     }
-    let tree;
-    try {
-      tree = await getCommitTree(run.head_sha);
-    } catch {
-      return full('merge-group commit tree lookup failed');
-    }
-    if (!isSha(tree)) return full('invalid merge-group commit tree');
-    if (tree.toLowerCase() === pushTree.toLowerCase()) {
+    const evidence = await treeOf(run.head_sha);
+    if (evidence.reason) return full(evidence.reason);
+    if (evidence.tree === pushTree.toLowerCase()) {
       return accept(run, 'push tree already passed merge-group CI');
     }
   }
