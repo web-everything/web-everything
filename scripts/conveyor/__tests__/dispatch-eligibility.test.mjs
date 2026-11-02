@@ -93,7 +93,7 @@ describe('dispatch-eligibility: holds', () => {
     expect(eligibility(pr({ isDraft: true }), withFact('red-team-send-back', 'redTeam', older))).toEqual({ hold: REASONS.DRAFT });
     expect(eligibility(pr({ isDraft: true }), clean('red-team-send-back'))).toEqual({ hold: REASONS.DRAFT });
   });
-  it.each(except('block-ruled-referral'))('%s: pending referral -> hold:referral', population => {
+  it.each(ALL)('%s: pending referral -> hold:referral', population => {
     for (const state of ['pending', 'human-parked', 'auto-resolve-stays']) {
       expect(eligibility(pr(), withFact(population, 'referral', known({ state })))).toEqual({ hold: REASONS.REFERRAL });
     }
@@ -101,8 +101,24 @@ describe('dispatch-eligibility: holds', () => {
   it.each(ALL)('%s: auto-resolve that resumes does not hold', population => {
     expect(eligibility(pr(), withFact(population, 'referral', known({ state: 'auto-resolve-resumes' })))).toMatchObject({ dispatch: true });
   });
-  it('block-ruled-referral exists to answer the referral and is exempt from it', () => {
-    expect(eligibility(pr(), withFact('block-ruled-referral', 'referral', known({ state: 'pending' })))).toMatchObject({ dispatch: true });
+  it('block-ruled-referral is NOT exempt: a pending referral still holds (never looser than today)', () => {
+    expect(eligibility(pr(), withFact('block-ruled-referral', 'referral', known({ state: 'pending' })))).toEqual({ hold: REASONS.REFERRAL });
+  });
+  it.each(ALL)('%s: a draft-withdrawn PR holds even where drafts are allowed', population => {
+    expect(eligibility(pr({ isDraft: true, labels: ['review-status:draft-withdrawn'] }), clean(population))).toEqual({ hold: REASONS.DRAFT });
+  });
+  it.each([undefined, 0, -1, 1.5, '7'])('a missing or invalid PR number %s -> unknown:pr', number => {
+    expect(eligibility(pr({ number }), clean())).toEqual({ unknown: 'pr' });
+  });
+  it.each([undefined, '', 'abc', 'a'.repeat(39)])('a missing or invalid head %s -> unknown:pr', headRefOid => {
+    expect(eligibility(pr({ headRefOid }), clean())).toEqual({ unknown: 'pr' });
+  });
+  it('unreadable labels -> unknown:pr', () => {
+    expect(eligibility(pr({ labels: undefined }), clean())).toEqual({ unknown: 'pr' });
+  });
+  it('empty-string result ids never authorise a draft send-back', () => {
+    const empty = known({ state: 'send-back', resultId: '', sendBackResultId: '' });
+    expect(eligibility(pr({ isDraft: true }), withFact('red-team-send-back', 'redTeam', empty))).toEqual({ unknown: 'redTeam' });
   });
   it.each(ALL)('%s: already landed -> hold:already-landed', population => {
     expect(eligibility(pr(), withFact(population, 'alreadyLanded', known('landed')))).toEqual({ hold: REASONS.ALREADY_LANDED });
@@ -168,7 +184,6 @@ describe('dispatch-eligibility: monotonicity', () => {
     pause: known({ paused: true }), sameHead: known({ spent: true }), rounds: known({ attempts: 5, cap: 3 }),
   };
   it.each(ALL.flatMap(p => Object.keys(blockers).map(k => [p, k])))('%s: a hold in %s survives any combination of other facts', (population, name) => {
-    if (population === 'block-ruled-referral' && name === 'referral') return;
     const names = Object.keys(blockers).filter(k => k !== name);
     for (let mask = 0; mask < 2 ** names.length; mask++) {
       const facts = { ...clean(population), [name]: blockers[name] };

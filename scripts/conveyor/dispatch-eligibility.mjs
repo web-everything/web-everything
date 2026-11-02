@@ -49,7 +49,7 @@ function isRecord(value) {
 
 /** @param {*} value @returns {boolean} Whether an optional result ID has a valid shape. */
 function isResultId(value) {
-  return value === null || typeof value === 'string';
+  return value === null || (typeof value === 'string' && value.length > 0);
 }
 
 /** @param {string} name @param {*} value @returns {boolean} Whether evidence is well formed. */
@@ -84,6 +84,8 @@ function validFact(name, value) {
  */
 export function eligibility(prState, facts) {
   if (prState?.commentsComplete !== true) return { unknown: 'thread' };
+  if (!Number.isInteger(prState.number) || prState.number <= 0) return { unknown: 'pr' };
+  if (!/^[0-9a-f]{40}$/i.test(String(prState.headRefOid ?? ''))) return { unknown: 'pr' };
   for (const name of REQUIRED_FACTS) {
     const fact = facts?.[name];
     if (!isRecord(fact) || fact.status !== 'known' || !validFact(name, fact.value)) {
@@ -97,13 +99,15 @@ export function eligibility(prState, facts) {
     && redTeam.sendBackResultId === redTeam.resultId;
 
   if (prState.state !== 'OPEN') return { hold: REASONS.NOT_OPEN };
+  if (prState.isDraft !== false && Array.isArray(prState.labels)
+    && prState.labels.includes('review-status:draft-withdrawn')) return { hold: REASONS.DRAFT };
+  if (!Array.isArray(prState.labels)) return { unknown: 'pr' };
   if (prState.isDraft !== false
     && population !== 'promote-draft' && population !== 'main-fix-green'
     && !(population === 'red-team-send-back' && boundSendBack)) {
     return { hold: REASONS.DRAFT };
   }
-  if (population !== 'block-ruled-referral'
-    && ['pending', 'human-parked', 'auto-resolve-stays'].includes(facts.referral.value.state)) {
+  if (['pending', 'human-parked', 'auto-resolve-stays'].includes(facts.referral.value.state)) {
     return { hold: REASONS.REFERRAL };
   }
   if (facts.alreadyLanded.value === 'landed') return { hold: REASONS.ALREADY_LANDED };
