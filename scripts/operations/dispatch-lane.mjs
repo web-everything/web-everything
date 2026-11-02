@@ -423,7 +423,13 @@ export function normalizeBriefScope(raw) {
     // a piece with no `repo:` prefix inherits the nearest earlier prefix of the SAME entry, so `we:a.mjs b.mjs`
     // is `we:a.mjs,we:b.mjs` and the lease overlap check sees both paths in the repo they belong to.
     let inherited = '';
-    for (const raw0 of String(entry ?? '').split(/[\s,]+/).filter(Boolean)) {
+    const parts = String(entry ?? '').split(/[\s,]+/).filter(Boolean);
+    // a glob inside a multi-path entry is refused: the lease matcher does not judge glob-vs-glob overlap, and the
+    // planner (loader) leaves such an entry unsplit, so accepting it here would dispatch what was never arbitrated.
+    if (parts.length > 1 && parts.some((part) => /[*?]/.test(part))) {
+      throw new Error(`dispatch-lane: unsafe scope entry ${JSON.stringify(String(entry))} — a glob inside a multi-path scope entry is refused for {{SCOPE}}; give the glob its own entry.`);
+    }
+    for (const raw0 of parts) {
       const own = /^[A-Za-z][\w-]*:/.exec(raw0)?.[0] ?? '';
       if (own) inherited = own;
       const piece = own ? raw0 : inherited + raw0;
