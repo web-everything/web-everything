@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
-import { eligibility } from '../dispatch-eligibility.mjs';
+import { eligibility, POPULATIONS, REASONS } from '../dispatch-eligibility.mjs';
+import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
 import { buildEligibilityFacts, redTeamFact } from '../dispatch-eligibility-facts.mjs';
 import { enrichPrsWithAlreadyLandedFacts } from '../reconcile-pass.mjs';
 
@@ -73,6 +74,32 @@ describe('buildEligibilityFacts', () => {
 });
 
 const gateFor = (comments, rev, outcome, who = bot) => who(`${redTeamGateMarker(pr, rev, outcome, liveResultGateState(comments, pr, rev).resultId)}\ngate`);
+describe('red-team label producer and eligibility contract', () => {
+  it.each(['sent-back', 'round-cap', 'operator-block'])('%s labels preserve the gate result in every population', outcome => {
+    const comments = [result(head)];
+    comments.push(gateFor(comments, head, outcome));
+    const plan = planRedTeamStatusLabels({ repo: 'o/n', pr, head, comments, labels: [], env: {} });
+    expect(plan.add).toBe('red-team:blocked');
+    for (const population of POPULATIONS) {
+      for (const isDraft of [false, true]) {
+        for (const labels of [[plan.add], [{ name: plan.add }]]) {
+          const state = { ...prState, isDraft, labels, commentsComplete: true };
+          const facts = buildEligibilityFacts({ pr: state, comments, commentsComplete: true, population, locals: goodLocals() });
+          const out = eligibility(state, facts);
+          const promotion = ['promote-draft', 'main-fix-green'].includes(population);
+          if (isDraft && (promotion || population !== 'red-team-send-back' || outcome !== 'sent-back')) {
+            expect(out).toEqual({ hold: REASONS.DRAFT });
+          } else if (outcome === 'sent-back') {
+            expect(out).toMatchObject({ dispatch: true, population });
+          } else {
+            expect(out).toEqual({ hold: `${REASONS.RED_TEAM_PREFIX}${outcome === 'round-cap' ? 'held' : 'blocked'}` });
+          }
+        }
+      }
+    }
+  });
+});
+
 describe('redTeamFact (gate store only; everything unmapped is unread)', () => {
   const unreadFact = { status: 'unread' };
   it('a no-send-back record is unread: the producer never writes it and it is not a digest-bound clearance', () => {
@@ -172,6 +199,26 @@ describe('reconcile-pass shadow fact', () => {
       fetchRef: noop, readMergeBase: () => 'c'.repeat(40), readChanges: () => [], onShadowFact: (n, f) => seen.push([n, f]) });
     expect(out[0]).toBe(labelled);
     expect(seen).toEqual([[pr, { alreadyLanded: { status: 'unread' } }]]);
+  });
+  it.each(['merge-base', 'diff'])('a throwing onShadowFact after a failed %s read leaves every PR unchanged', failedRead => {
+    const next = { ...labelled, number: pr + 1 };
+    const prs = [labelled, next];
+    const snapshot = structuredClone(prs);
+    const seen = [];
+    const out = enrichPrsWithAlreadyLandedFacts(prs, {
+      fetchRef: noop,
+      readMergeBase: () => failedRead === 'merge-base' ? null : 'c'.repeat(40),
+      readChanges: () => [],
+      onShadowFact: (n, f) => {
+        seen.push([n, f]);
+        throw new Error('shadow ledger unavailable');
+      },
+    });
+    expect(seen).toEqual([pr, pr + 1].map(n => [n, { alreadyLanded: { status: 'unread' } }]));
+    expect(out).toEqual(snapshot);
+    expect(prs).toEqual(snapshot);
+    expect(out[0]).toBe(labelled);
+    expect(out[1]).toBe(next);
   });
   it('without the callback behaviour is identical (snapshot of the unchanged return)', () => {
     expect(enrichPrsWithAlreadyLandedFacts([labelled], { fetchRef: noop, readMergeBase: () => null })).toEqual([labelled]);
