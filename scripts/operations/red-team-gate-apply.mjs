@@ -33,6 +33,7 @@ import { signalFixDispatch } from '../lib/fix-handoff.mjs';
  */
 import { readDrainQueueSafety, dequeueSentBack, sendBackReason } from '../lib/drain-queue-safety.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -265,7 +266,7 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       try {
         const path = join(dir, 'body.md');
         writeFileSync(path, body, 'utf8');
-        const r = spawnSync(process.execPath, [join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
+        const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), ...buildSendBackArgv({ repo, pr, bodyPath: path })],
           { cwd: root, encoding: 'utf8', timeout: 180_000, env: { ...env, [ACTOR_ENV]: `red-team-gate-${randomUUID()}` } });
         if (r.status === 0) return { ok: true };
         return { ok: false, error: String(r.stderr || r.stdout || `exit ${r.status}`).trim().split('\n').pop() };

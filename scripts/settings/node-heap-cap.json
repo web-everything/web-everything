@@ -1,0 +1,9 @@
+{
+  "description": "V8 old-space caps for review child processes: twice measured peak RSS, with a 1024 MB floor. Daemons are intentionally excluded: their measured runtime is 2.3–2.7 GB and their host plist is outside this repository.",
+  "floorMb": 1024,
+  "caps": {
+    "review-job": 2400,
+    "review-set-label": 1024,
+    "review-extra-seats": 1536
+  }
+}
