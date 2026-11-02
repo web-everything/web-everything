@@ -471,6 +471,8 @@ describe('hung recovery stand-down survives cancelled rerun', () => {
   const hung = overrides => ({ author: { login: 'web-everything' },
     body: buildHungCiComment({ headSha: sha, jobName: 'smoke', ...overrides }) });
   it.each([
+    ['lone failed cancel', [hung({ ok: false, action: 'cancel-failed' })]],
+    ['lone successful attempt', [hung({})]],
     ['per-head budget', [hung({}), hung({ ok: false })]],
     ['cap escalation', [hung({ kind: 'hung-cap-escalate' })]],
     ['repeat hang', [hung({ kind: 'repeat-hang' })]],
@@ -491,12 +493,12 @@ describe('hung recovery stand-down survives cancelled rerun', () => {
     ] });
     expectNoMutation(f);
   });
-  it.each(['old-head', 'untrusted', 'quoted', 'one-attempt'])('allows rerun with %s evidence', mode => {
+  it.each(['old-head', 'untrusted', 'quoted'])('allows rerun with %s evidence', mode => {
     const f = fixture();
     const c = hung(mode === 'old-head' ? { headSha: nextSha, kind: 'repeat-hang' } : {});
     if (mode === 'untrusted') c.author.login = 'stranger';
     if (mode === 'quoted') c.body = 'quoted\n' + c.body;
-    f.options.readComments.mockReturnValue(mode === 'one-attempt' ? [c] : [c, c]);
+    f.options.readComments.mockReturnValue([c, c]);
     expect(f.tick().applied).toContainEqual(expect.objectContaining({ ok: true }));
   });
 });

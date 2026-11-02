@@ -74,7 +74,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
-import { sweepPrCancelledRerun, formatPrCancelledReport, safeRequiredBase } from './pr-cancelled-rerun.mjs';
+import { sweepPrCancelledRerun, formatPrCancelledReport, safeRequiredBase, HUNG_CI_COMMENT_MARKER } from './pr-cancelled-rerun.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -587,7 +587,7 @@ export function formatExhaustedRetryReport({ dispatch = [], refusals = [], appli
  *  one job name per {@link countHungCiCommentsByJob}) so the two attempt caps never cross-count. Posted on
  *  EVERY attempt now — success or failure (see `sweepHungCiRecovery`'s own docblock for why a failed cancel
  *  must still count) — so the body always states the real outcome, never implying a rerun that never happened. */
-export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
+export { HUNG_CI_COMMENT_MARKER };
 
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#buildHungCiComment — the durable comment body posted after

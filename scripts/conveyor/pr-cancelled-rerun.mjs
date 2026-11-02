@@ -4,23 +4,17 @@ import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { latestCheckNamed, isFailedCheckRow, requiredCheckReadNeeded } from '../lib/rollup-collapse.mjs';
 import { isTrustedMarkerAuthor, countTrustedLeadingMarker } from '../lib/marker-authorship.mjs';
-import { DEFAULT_MAX_HUNG_RETRIES_PER_SHA } from './main-red-recovery.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 
-/** Preserve the hung pass's durable stop decision when another pass sees its cancellation. */
+// Shared with the hung-recovery writer; keep readers and writer on one marker identity.
+export const HUNG_CI_COMMENT_MARKER = '⏱️ conveyor CI-hung-recovery';
+
+/** Any trusted hung recovery owns this head; leave further recovery to that pass or the operator. */
 function hungRecoveryStopped(comments, headSha) {
   if (!Array.isArray(comments)) return true;
-  const countForHead = rows => countTrustedLeadingMarker(rows.filter(c =>
+  return countTrustedLeadingMarker(comments.filter(c =>
     typeof c?.body === 'string' && c.body.split('\n').includes(`sha: ${headSha}`)),
-    '⏱️ conveyor CI-hung-recovery');
-  if (countForHead(comments) >= DEFAULT_MAX_HUNG_RETRIES_PER_SHA) return true;
-  return comments.some(comment => {
-    if (!countForHead([comment])) return false;
-    const body = typeof comment === 'string' ? comment : comment.body;
-    // Builders predating structured kind fields recorded the decision in the outcome prose.
-    return /\b(?:hung-cap-escalate|hung-cap-exhausted|repeat-hang|cancelled-no-rerun)\b/.test(body) ||
-      body.includes('and did NOT re-run it');
-  });
+    HUNG_CI_COMMENT_MARKER) > 0;
 }
 
 export const safeRequiredBase = name => typeof name === 'string' && name.length <= 255 &&

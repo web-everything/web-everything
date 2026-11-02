@@ -1069,6 +1069,7 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
 
 
 describe('R372 accepted same-head CI rerun release', () => {
+  const requiredChecks = { source: 'live', checks: ['check-0', 'check-1', 'check-2'] };
   const marker = h => `<!-- pr-ci-cancelled-rerun: ${repo}#3481@${h} -->`;
   function accepted() {
     const r = run();
@@ -1084,42 +1085,71 @@ describe('R372 accepted same-head CI rerun release', () => {
   ] });
   it('re-arms an all-green accepted head once after a newer trusted rerun marker and no later review', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).toBeNull();
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).toBeNull();
     expect(decideSameHeadHold(p, [accepted(), { ...accepted(), startedAt: at + 2, completedAt: at + 3 }],
-      { repo, now: at + 4 })).not.toBeNull();
+      { repo, requiredChecks, now: at + 4 })).not.toBeNull();
+  });
+  it('keeps a green subset held when a required name is missing', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup.pop();
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
+  });
+  it.each([
+    undefined, null, { source: 'live', checks: [] }, { source: 'cache', checks: ['check-0', null] },
+    ...['stale-cache', 'fallback', 'declared', 'unavailable'].map(source => ({ source, checks: ['check-0'] })),
+  ])('keeps the hold for unavailable or untrusted required sets (%j)', requiredChecks => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
+  });
+  it('keeps the hold when the required-set reader throws', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2,
+      readRequiredChecks: () => { throw Error('denied'); } })).not.toBeNull();
+  });
+  it('enriches using a trusted default-branch required set, never the stacked base', () => {
+    const p = { ...acceptedPr([comment(marker(head), at + 1)]), baseRefName: 'lane/stack' };
+    const readRequiredChecks = vi.fn(() => ({ ...requiredChecks, source: 'cache' }));
+    expect(enrichPrsWithReferralHolds([p], { repo, now: at + 2, readRuns: () => [accepted()],
+      readRequiredChecks })[0].referralHold).toBeNull();
+    expect(readRequiredChecks).toHaveBeenCalledWith({ repo, branch: 'main' });
+  });
+  it('uses the latest required row when an older attempt failed', () => {
+    const p = acceptedPr([comment(marker(head), at + 1)]);
+    p.statusCheckRollup.unshift({ name: 'check-0', status: 'COMPLETED', conclusion: 'FAILURE' });
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).toBeNull();
   });
   it.each(['QUEUED', 'IN_PROGRESS'])('keeps the hold while the rerun is %s', status => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
-    p.statusCheckRollup.push({ name: 'rerun', status, conclusion: 'SUCCESS' });
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+    p.statusCheckRollup.push({ name: 'check-0', status, conclusion: 'SUCCESS' });
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
   });
   it.each(['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', undefined])('keeps the hold for a non-green rerun (%s)', conclusion => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
-    p.statusCheckRollup.push({ name: 'rerun', status: 'COMPLETED', conclusion });
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+    p.statusCheckRollup.push({ name: 'check-0', status: 'COMPLETED', conclusion });
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
   });
   it.each([undefined, null, [], {}, [null]])('keeps the hold when rollup evidence is absent or unreadable (%j)', rollup => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     if (rollup === undefined) delete p.statusCheckRollup;
     else p.statusCheckRollup = rollup;
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
   });
   it.each([100, 101])('keeps the hold for a potentially truncated green rollup (%s rows)', length => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     p.statusCheckRollup = Array.from({ length }, (_, i) => ({
       name: 'check-' + i, status: 'COMPLETED', conclusion: 'SUCCESS',
     }));
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
   });
   it('keeps the hold when the required-check read failed despite a green rollup', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     p.requiredCheckReadError = 'denied';
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).not.toBeNull();
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
   });
   it('releases a stacked accept without a reviewed-sha stamp', () => {
     const p = acceptedPr([comment(marker(head), at + 1)]);
     p.comments.shift();
-    expect(decideSameHeadHold(p, [accepted()], { repo, now: at + 2 })).toBeNull();
+    expect(decideSameHeadHold(p, [accepted()], { repo, requiredChecks, now: at + 2 })).toBeNull();
   });
   it.each(['missing', 'foreign-head', 'untrusted', 'old', 'not-accepted', 'pending', 'no-verdict'])('keeps the hold when accepted + same head + CI-only gap is unproven (%s)', mode => {
     const c = comment(marker(mode === 'foreign-head' ? 'b'.repeat(40) : head), mode === 'old' ? at - 1 : at + 1,
@@ -1129,6 +1159,6 @@ describe('R372 accepted same-head CI rerun release', () => {
     if (mode === 'not-accepted') row = evidence();
     if (mode === 'pending') row = { ...row, pending: ['unknown-gap'] };
     if (mode === 'no-verdict') row = { ...row, verdict: undefined };
-    expect(decideSameHeadHold(p, [row], { repo, now: at + 2 })).not.toBeNull();
+    expect(decideSameHeadHold(p, [row], { repo, requiredChecks, now: at + 2 })).not.toBeNull();
   });
 });
