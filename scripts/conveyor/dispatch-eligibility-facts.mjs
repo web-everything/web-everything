@@ -54,7 +54,11 @@ export function redTeamFact(comments, prNumber, head) {
   const live = head.toLowerCase();
   const malformed = comments.some(comment => {
     if (!isTrustedMarkerAuthor(comment)) return false;
-    const body = String(typeof comment === 'string' ? comment : comment?.body ?? '').replace(/\r\n/g, '\n').trimStart();
+    const raw = String(typeof comment === 'string' ? comment : comment?.body ?? '').replace(/\r\n/g, '\n');
+    // A carried verdict embeds the advisory result after wrapper lines, so read from the marker onward.
+    const at = raw.indexOf('<!-- we:red-team-advisory');
+    if (at < 0) return false;
+    const body = raw.slice(at);
     const parsed = parseRedTeamComment(body);
     if (!parsed || parsed.pr !== Number(prNumber) || parsed.rev !== live) return false;
     return body.split('\n').filter(line => /^\d+\. \[/.test(line)).length !== parsed.findings.length;

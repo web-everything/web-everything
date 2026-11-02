@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
+import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
 import { eligibility } from '../dispatch-eligibility.mjs';
 import { buildEligibilityFacts, redTeamFact } from '../dispatch-eligibility-facts.mjs';
 import { enrichPrsWithAlreadyLandedFacts } from '../reconcile-pass.mjs';
@@ -139,5 +140,12 @@ describe('redTeamFact audit closures', () => {
     const good = result(head, false);
     const bad = bot(`${good.body}\n1. [**confirmed**] malformed finding line without a category`);
     expect(redTeamFact([bad], pr, head)).toEqual({ status: 'unread' });
+  });
+  it('a carried verdict with a malformed finding line is unread, not clear', () => {
+    const base = result(oldHead, false);
+    const carried = bot([buildVerdictCarriedMarker({ fromSha: oldHead, toSha: head, patchId: 'c'.repeat(40) }),
+      'Review verdict carried across an identical contribution.',
+      base.body.replace(oldHead, head), '1. [**confirmed**] malformed finding line without a category'].join('\n'));
+    expect(redTeamFact([base, carried], pr, head)).toEqual({ status: 'unread' });
   });
 });
