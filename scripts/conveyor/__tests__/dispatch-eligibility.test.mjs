@@ -86,6 +86,14 @@ describe('dispatch-eligibility: holds', () => {
   it.each(['promote-draft', 'main-fix-green'])('%s: draft exception dispatches', population => {
     expect(eligibility(pr({ isDraft: true }), clean(population))).toMatchObject({ dispatch: true });
   });
+  it.each(['red-team:blocked', 'red-team:pending'])('a draft labelled %s is never exempt, in any draft population', label => {
+    const bound = known({ state: 'send-back', resultId: 'r1', sendBackResultId: 'r1' });
+    for (const population of ['promote-draft', 'main-fix-green', 'red-team-send-back']) {
+      const out = eligibility(pr({ isDraft: true, labels: [label] }), withFact(population, 'redTeam', bound));
+      expect(out.dispatch).toBeUndefined();
+      expect(out.hold).toBeTruthy();
+    }
+  });
   it('red-team-send-back: draft allowed ONLY for a send-back bound to the live result', () => {
     const bound = known({ state: 'send-back', resultId: 'r1', sendBackResultId: 'r1' });
     expect(eligibility(pr({ isDraft: true }), withFact('red-team-send-back', 'redTeam', bound))).toMatchObject({ dispatch: true });

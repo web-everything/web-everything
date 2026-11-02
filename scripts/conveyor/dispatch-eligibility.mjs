@@ -102,6 +102,10 @@ export function eligibility(prState, facts) {
   if (!Array.isArray(prState.labels) || typeof prState.isDraft !== 'boolean') return { unknown: 'pr' };
   const labelNames = prState.labels.map(l => (typeof l === 'string' ? l : l?.name));
   if (prState.isDraft && labelNames.includes('review-status:draft-withdrawn')) return { hold: REASONS.DRAFT };
+  // Every draft exemption sits below this hold (reconcile-core: a draft held by red team is never promoted).
+  if (prState.isDraft && labelNames.some(n => n === 'red-team:blocked' || n === 'red-team:pending')) {
+    return { hold: REASONS.DRAFT };
+  }
   if (prState.isDraft !== false
     && population !== 'promote-draft' && population !== 'main-fix-green'
     && !(population === 'red-team-send-back' && boundSendBack)) {
