@@ -188,7 +188,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'warn' }, platform: platform.prefs.prototypeLoad, tool });
+  // Audit mode is a scalar: normalize before the cascade can flatten an invalid object into no leaves.
+  const auditModeLayer = (layer) => layer?.canonicalAuditMode === undefined ? layer
+    : { ...layer, canonicalAuditMode: layer.canonicalAuditMode === 'warn' ? 'warn' : 'refuse' };
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, canonicalAuditMode: 'warn' },
+    platform: auditModeLayer(platform.prefs.prototypeLoad), tool: auditModeLayer(tool) });
   const config = policy.value;
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
