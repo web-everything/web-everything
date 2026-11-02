@@ -1,3 +1,5 @@
+import { sameRepoUrl, ensureLaneAlternates } from './lane-alternates.mjs';
+import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './git-bounded.mjs';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -51,10 +53,14 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     return ['-c', 'remote.origin.uploadpack=git-upload-pack', '-c', 'remote.origin.receivepack=git-receive-pack',
       '-c', 'remote.origin.pushurl=', '-c', 'push.gpgSign=false', '-c', 'gpg.ssh.defaultKeyCommand=', command, ...args];
   };
-  const git = (dir, args, timeout = 120_000) => runGit('git', args, {
-    cwd: dir, env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+  // `bounded` runs the command under git-bounded.mjs so a timeout kills the whole process group (index-pack, ssh).
+  const git = (dir, args, timeout = 120_000, bounded = false) => {
+    const cmd = bounded ? boundedGitCommand(args, timeout) : { file: 'git', args };
+    return runGit(cmd.file, cmd.args, {
+      cwd: dir, env, encoding: 'utf8', timeout: bounded ? timeout + BOUNDED_GIT_GRACE_MS : timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  };
   const checkTransportConfig = dir => {
     // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
     // every effective rewrite (including includes and global config) before transport.
@@ -104,7 +110,7 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
       // dot because a remote subsection can itself contain dots or line separators.
       const remoteName = /^remote\./i.test(key) ? key.slice(7, key.lastIndexOf('.')) : null;
       const unsafeRemote = remoteName !== null && (remoteName !== 'origin'
-        || (origin && normalizeRemoteName(remoteName) === normalizeRemoteName(origin)));
+        || (origin && (normalizeRemoteName(remoteName) === normalizeRemoteName(origin) || sameRepoUrl(remoteName, origin))));
       if (['local', 'worktree'].includes(scope)
         && (unsafeRemote || /^(?:credential\.|https?\.|protocol\.|fetch\.bundleuri$|core\.(?:askpass|gitproxy|sshcommand)$|ssh\.|gpg\.|push\.gpgsign$|user\.signingkey$|commit\.gpgsign$|remote\.[\s\S]*\.(?:proxy|proxyauthmethod|vcs|uploadpack|receivepack|pushurl)$)/i.test(key))) {
         throw new Error('lane-controlled transport configuration; inspect the lane manually and remove it before retrying');
@@ -122,20 +128,29 @@ export function realSalvageIo({ repo, preflightLaneDir, backupRoot = process.env
     const transportArgs = transport(command, ...args);
     if (preflightError) throw preflightError;
     checkTransportConfig(dir);
-    return git(dir, transportArgs);
+    // A fetch into a lane without alternates re-downloads the repository; repair them first (best effort, add-only).
+    if (command === 'fetch' && repo.alternatesReferencePath) {
+      try { ensureLaneAlternates({ laneDir: dir, referencePath: repo.alternatesReferencePath, laneOrigin: origin, referenceOrigin: origin }); } catch { /* never blocks the salvage */ }
+    }
+    return git(dir, transportArgs, 120_000, true);
   };
   return {
     aheadShas: dir => git(dir, ['rev-list', `origin/${repo.branch}..HEAD`]).split('\n').filter(Boolean),
     unmatchedShas: (dir, ahead) => {
       // All branch tips are needed for exact-SHA reachability, but only the integration branch
       // participates in patch equivalence. Explicit refspecs also make pruning independent of lane config.
-      transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*');
+      transportGit(dir, 'fetch', '--recurse-submodules=no', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*',
+        // ops/* carries the verdict ledger (huge history, never lane work): the lane's diet config excludes it, and this explicit
+        // refspec would otherwise pull ~117k objects on every release (lane-68, 2026-11-01).
+        '^refs/heads/ops/*');
       const matched = new Set();
       for (const line of git(dir, ['cherry', `origin/${repo.branch}`, 'HEAD']).split('\n')) {
         if (line.startsWith('- ')) matched.add(line.slice(2).trim());
       }
       return ahead.filter(sha => !matched.has(sha)
-        && !git(dir, ['for-each-ref', '--contains', sha, 'refs/remotes/origin', '--count=1']));
+        && !git(dir, ['for-each-ref', '--exclude=refs/remotes/origin/ops/*', '--contains', sha, '--format=%(refname)\t%(symref)', 'refs/remotes/origin'])
+          // A symbolic ref (origin/HEAD, or one aimed at the unrefreshed ops namespace) is never reachability evidence.
+          .split('\n').some(line => line && !line.split('\t')[1]));
     },
     push: (dir, ref, sha) => {
       transportGit(dir, 'push', '--recurse-submodules=no', origin, `${sha}:refs/heads/${ref}`);
