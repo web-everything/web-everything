@@ -450,19 +450,18 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(gh).not.toHaveBeenCalled();
     expect(logs.join()).toMatch(/gate deadline/);
   });
-  it('keeps red-team-undecided with the checked head when the deadline expires during the live read', async () => {
+  it('still holds a blocked PR when the deadline expires during the live read (evidence already arrived)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(at));
     const logs = [];
     const gh = async (_f, args) => {
-      if (args[0] !== 'api') return JSON.stringify({ headRefOid: head, labels: [] });
+      if (args[0] !== 'api') return JSON.stringify({ headRefOid: head, labels: [{ name: 'red-team:blocked' }] });
       vi.setSystemTime(new Date(Date.parse(at) + 1000));
       return JSON.stringify([gateComments()]);
     };
     const { kept, held } = await gateReadyItems(items(), report, { gh, deadlineMs: 1000, log: l => logs.push(l) });
-    expect(held).toEqual([]);
-    expect(expectUndecided(kept)).toEqual({ ...items()[0], head, kind: 'red-team-undecided', reason: expect.any(String) });
-    expect(logs.join()).toMatch(/gate deadline/);
+    expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head']));
+    expect(kept.filter(i => i.pr === items()[0].pr)).toEqual([]);
   });
   it('keeps the incomplete flag the diff uses', async () => {
     const withFlag = Object.assign(items(), { incomplete: true });
@@ -472,6 +471,17 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
 });
 
 describe('stall sweep coexistence', () => {
+  it('an open stalled item does not suppress a new gate verdict (red-team-undecided) for the same head', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl');
+    const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [`${repo}#5@${head}:stalled`] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const gh = async (_f, args) => (args[0] === 'api' ? '[[]]' : JSON.stringify({ headRefOid: head, labels: [] }));
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo, number: 5, head }] }), gh, settings,
+      env: { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'true' }, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.lines).toHaveLength(1);
+    expect(replay({ path })[0]).toMatchObject({ pr: 5, kind: 'red-team-undecided' });
+  });
   it.each([
     { WE_PR_STALL_SWEEP_MODE: 'off' },
     { WE_PR_STALL_SWEEP_MODE: 'shadow', WE_PR_STALL_SWEEP_DIGEST: 'false' },

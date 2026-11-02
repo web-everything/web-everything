@@ -70,6 +70,8 @@ const sectionReasons = {
 // Event-only escalations such as review-no-verdict and disk-space remain until acknowledged;
 // a successful queue read supplies no evidence that their independently owned condition resolved.
 export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down', 'confirmed-break-owed-send-back', 'red-team-undecided']);
+// Gate verdicts are new evidence about a head, never a repeat of the stall question: they are not suppressed by it.
+const GATE_KINDS = new Set(['confirmed-break-owed-send-back', 'red-team-undecided']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
@@ -212,7 +214,6 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const view = await readLivePr(item, { gh, cwd });
       // Publish the head actually checked, not a stale report head or a later lookup.
       checked = { ...item, head: view.headRefOid };
-      if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = undecided(checked); return; }
       const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       if (reasons.length) { held.push({ item, reasons }); return; }
@@ -307,7 +308,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
     // published twice (one already open stays, so it is never cleared by this filter).
     const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
-    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const asked = i => !GATE_KINDS.has(i.kind) && !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
