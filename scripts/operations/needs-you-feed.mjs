@@ -217,12 +217,14 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       // The red-team gate only sends back BROKEN, so a clear label can hide a confirmed break of any severity. Read the
       // gate's own live result for exactly this head (trusted author only, carried results included); a break is owed a send-back, not a human review.
       const breaks = (liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo).result?.findings ?? []).filter(f => f.confirmed);
-      // Fail closed: the parser drops a confirmed line it cannot read (e.g. no impact). A trusted advisory for this exact
-      // head that shows more confirmed lines than were parsed still owes a send-back; the unreadable ones are named so.
+      // Fail closed: the parser drops a finding line it cannot read (no impact, garbled), and a carried advisory hides
+      // its marker behind other lines. Count numbered finding lines in the WHOLE trusted advisory for this exact head;
+      // any beyond the parsed ones is an unreadable line and counts as a break.
+      const parsedCount = liveResultGateState(view.comments, item.pr, view.headRefOid, item.repo).result?.findings?.length ?? 0;
       const marker = redTeamMarker(item.pr, view.headRefOid).toLowerCase();
-      const shown = Math.max(0, ...(view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && String(c.body).trimStart().toLowerCase().startsWith(marker))
-        .map(c => (String(c.body).match(/^\d+\. \[\*\*confirmed\*\*\]/gm) ?? []).length));
-      for (let n = breaks.length; n < shown; n++) breaks.push({ index: '?', impact: 'unreadable', file: null, line: null, confirmed: true });
+      const shown = Math.max(0, ...(view.comments ?? []).filter(c => isTrustedMarkerAuthor(c) && String(c.body).replace(/\r\n/g, '\n').toLowerCase().split('\n').includes(marker))
+        .map(c => (String(c.body).match(/^\d+\. \[/gm) ?? []).length));
+      for (let n = parsedCount; n < shown; n++) breaks.push({ index: '?', impact: 'unreadable', file: null, line: null, confirmed: true });
       if (breaks.length) {
         const named = breaks.map(f => `#${f.index} ${f.impact ?? 'impact?'}${f.file ? ` ${f.file}${f.line != null ? `:${f.line}` : ''}` : ''}`).join('; ');
         out[index] = { ...item, kind: 'confirmed-break-owed-send-back', head: view.headRefOid,
@@ -316,7 +318,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     // The PR stall sweep's open `stalled` item already asks about this PR head: a NEW queue item for it is not
     // published twice (one already open stays, so it is never cleared by this filter).
     const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
-    const asked = i => !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
+    const asked = i => i.kind !== 'confirmed-break-owed-send-back' && !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
