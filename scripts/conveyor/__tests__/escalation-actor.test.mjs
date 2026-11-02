@@ -292,6 +292,29 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
       takeover: { rung: expected.rung, route: expected.route, n: expected.n, budget: expected.budget } });
   });
 
+  it('audit: a failed escalation at 5/5 preserves the shared round-cap output and parkToHuman note', () => {
+    const options = { durableCounts: { 6023: 5 }, roundCapAction: 'person' };
+    const ordinary = plan({}, { ...options, escalationStreaks: undefined });
+    expect(ordinary.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 5, cap: 5 }));
+    expect(ordinary.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+    const escalated = plan({}, options);
+    expect(escalated.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+    expect(escalated).toEqual(ordinary);
+  });
+
+  it('audit: an escalation refused before ordinary rounds are spent still surfaces the shared human-park note', () => {
+    const result = plan({}, { roundCapAction: 'person' });
+    expect(takeovers(result)).toEqual([]);
+    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+  });
+
+  it('audit: an exhausted escalation cap uses the shared human-park handler without granting a takeover', () => {
+    const result = plan({}, { escalationTakeoverCapPerHead: 0 });
+    expect(takeovers(result)).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+  });
+
   it('omitting escalationStreaks preserves the ordinary fix pass', () => {
     // An ordinary fix requires a real finding; an empty thread is correctly refused as no-findings.
     const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-11-02T10:00:00Z',

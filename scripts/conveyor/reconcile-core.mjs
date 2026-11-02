@@ -148,6 +148,7 @@ import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { gateOutcomesForHead, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
 import { sessionSlugFor } from '../operations/dispatch-lane.mjs';
@@ -2777,7 +2778,8 @@ export function planReconcile({
       const redTeamRound = redTeamHold && phase === 'bounced' && currentRound(pr.comments, pr.headRefOid, { strict: true });
       const redTeamSendBack = redTeamHold && phase === 'bounced' && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN'
         && /^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') && redTeamRound?.head && sameHeadSha(redTeamRound.head, pr.headRefOid)
-        && openDefects(pr.comments, pr.headRefOid)?.count >= 1;
+        && openDefects(pr.comments, pr.headRefOid)?.count >= 1
+        && gateOutcomesForHead(pr.comments, prNumber, pr.headRefOid).has(GATE_OUTCOMES.SENT_BACK);
       if (redTeamHold && !redTeamSendBack) {
         refuse('draft', { ...withPhase, why: `${redTeamHold} — a draft held by red team is never promoted` });
         continue;
@@ -3894,22 +3896,25 @@ export function planReconcile({
     const defectRound = escalation && currentRound(pr.comments, pr.headRefOid, { strict: true });
     const defects = defectRound?.head && sameHeadSha(defectRound.head, pr.headRefOid)
       ? openDefects(pr.comments, pr.headRefOid) : null;
-    if (!isCardBatch && !(attempts >= effectiveRoundCap && sendBackRound)
+    // At the ordinary cap, fall through to its shared handler unchanged (including review grants and human parking).
+    if (!isCardBatch && attempts < effectiveRoundCap
       && escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN' && defects?.count >= 1) {
       const used = takeoverMarkers(pr.comments).filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
-      if (Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used) {
-        const takeover = planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch });
-        if (takeover.ok) {
-          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: defects.count,
-            takeover: { attempts, cap: effectiveRoundCap, rung: takeover.rung, route: takeover.route,
-              n: takeover.n, budget: takeover.budget, ...(takeover.previous ? { previous: takeover.previous } : {}) },
-            why: `repeated escalation (${escalation.cause}, ${escalation.streak} sweeps) owes an actor — automatic takeover ${takeover.n} of ${takeover.budget}` });
-        } else {
-          refuse('cap-exhausted', { ...withPhase, takeover: takeover.reason,
-            why: `escalation takeover refused: ${takeover.reason}; a person must resolve the escalation` });
-        }
-        continue;
+      const capAllows = Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used;
+      const takeover = capAllows ? planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch }) : null;
+      if (takeover?.ok) {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: defects.count,
+          takeover: { attempts, cap: effectiveRoundCap, rung: takeover.rung, route: takeover.route,
+            n: takeover.n, budget: takeover.budget, ...(takeover.previous ? { previous: takeover.previous } : {}) },
+          why: `repeated escalation (${escalation.cause}, ${escalation.streak} sweeps) owes an actor — automatic takeover ${takeover.n} of ${takeover.budget}` });
+      } else {
+        refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: capAllows
+            ? `escalation takeover refused: ${takeover.reason}; a person must resolve the escalation`
+            : 'the per-head escalation takeover cap is exhausted or invalid; a person must resolve the escalation',
+        }, { allowTakeover: capAllows });
       }
+      continue;
     }
 
     // ── REFUSAL 3 — the cap, from the PR and ONLY from the PR. `durableCounts` is what the shell read back off
