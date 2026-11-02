@@ -3810,3 +3810,11 @@ polling sleep, then adoption and cleanup; immediate adoption alone does not exer
 For new operation refusal branches, use table-driven cases for every bad-input detail and invalid numeric
 shape, and assert the operator-facing fallback text. Pair state producers with a consumer integration test;
 test failed persistence warnings explicitly so callers cannot promise an event that was never tracked.
+
+## UID scanner idle proofs
+
+An absent UID does not guarantee an idle result from a shared host's `/proc`: repeated process
+churn or unreadable credentials deliberately retain reservations. In `forge-exec-run-reap.test.mjs`,
+keep the live host busy probe, but pin the idle probe's PID listing to the test process and read
+its real status file. Inject process churn, unreadable entries, and settled scans separately to
+verify the production scanner's fail-closed behavior without relying on host quiescence.
