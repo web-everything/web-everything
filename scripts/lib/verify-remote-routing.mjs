@@ -1,5 +1,6 @@
 import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { cpus, loadavg } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
 import { defaultPoolRoot } from './lane-pool-paths.mjs';
@@ -82,8 +83,10 @@ function wrappedChain(command) {
   return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
 }
 
+// Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
+export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
-  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && /^node (?:scripts\/lib\/|'[^'\r\n]*\/)verify-shard-run\.mjs'?(?=\s|$)/.test(command)) {
+  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node '${SHARD_RUN_SCRIPT}' `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
   }
   if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
