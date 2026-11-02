@@ -56,12 +56,17 @@ export function resolveEscalationActorSettings({ env = process.env, readSettings
         : typeof raw === 'string' && raw.trim() ? Number(raw) : undefined) : raw;
       const valid = key === 'enabled' ? typeof parsed === 'boolean'
         : Number.isSafeInteger(parsed) && parsed >= (key === 'threshold' ? 1 : 0);
-      layers[source][key] = valid ? parsed : defaults[key];
-      invalid[key] = valid ? null : `${source}-invalid (standard default)`;
+      layers[source][key] = valid ? parsed : key === 'enabled' ? false : 0;
+      invalid[key] = valid ? null : `${source}-invalid (actor disabled)`;
     }
   }
   const resolved = resolveCascade({ standard: defaults, platform: layers.platform, tool: layers.tool, envValues: layers.env });
   for (const [key, source] of Object.entries(invalid)) if (source) resolved.sources[key] = source;
+  const invalidSources = Object.entries(invalid).filter(([, source]) => source);
+  if (invalidSources.length) {
+    resolved.value.enabled = false;
+    resolved.sources.enabled = `disabled by ${invalidSources.map(([key, source]) => `${key}: ${source}`).join('; ')}`;
+  }
   for (const key of Object.keys(defaults)) log(`escalation.actor.${key}=${resolved.value[key]} source=${resolved.sources[key]}`);
   return { ...resolved.value, sources: resolved.sources };
 }

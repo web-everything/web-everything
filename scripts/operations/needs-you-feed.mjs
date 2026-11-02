@@ -228,19 +228,25 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
  * - "still suppresses when emitEvent %s" (including rejects).
  */
 export async function gateRulingItems(items, { gh = execFileSyncThrottled, cwd, log = console.error,
-  deadlineMs = 120000, concurrency = 4, lookup = rulingNeeded, emitEvent = appendDaemonEvent } = {}) {
+  deadlineMs = 120000, concurrency = 4, lookup = rulingNeeded, emitEvent = appendDaemonEvent,
+  confirmEscalations = false } = {}) {
   const deadline = Date.now() + deadlineMs, out = new Array(items.length);
+  const confirmed = new Map(); // Item identity -> positively checked head; keeping an alert alone grants nothing.
   const judge = async (index) => {
     const item = items[index];
     out[index] = item;
-    if (item.kind !== 'ruling-needed') return;
+    // Stood-down and ready alerts belong to their existing human flow. Unchecked items never enter confirmed.
+    if (item.kind !== 'ruling-needed' && (!confirmEscalations || !['at-round-limit', 'escalated'].includes(item.kind))) return;
     // Report prose can outlive the head it describes; only live ledger evidence authorizes suppression.
     if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate deadline reached, keeping`); return; }
     try {
       const pr = await readLivePr(item, { gh, cwd }, 'labels,headRefOid,body,createdAt');
       if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid) || !Array.isArray(pr.labels) || typeof pr.body !== 'string'
         || !Number.isFinite(Date.parse(pr.createdAt))) throw new Error('incomplete live PR');
-      if (await lookup(pr) !== null) return;
+      if (item.kind !== 'ruling-needed' || await lookup(pr) !== null) {
+        confirmed.set(item, pr.headRefOid);
+        return;
+      }
     } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate unreadable, keeping: ${error.message}`); return; }
     out[index] = undefined;
     const detail = 'all confirmed findings already ruled';
@@ -252,12 +258,13 @@ export async function gateRulingItems(items, { gh = execFileSyncThrottled, cwd, 
   await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
   const kept = out.filter(Boolean);
   kept.incomplete = items.incomplete;
-  return { kept };
+  return { kept, confirmed };
 }
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
   env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
   loadStreaks = loadEscalationLedger, saveStreaks = saveEscalationLedger, streakPath = escalationLedgerPath,
   loadActorSettings = resolveEscalationActorSettings,
+  rulingLookup = rulingNeeded,
   liveGate = true } = {}) {
   const actorLines = [];
   loadActorSettings({ env, readSettings: () => readSettings(checkoutRoot), log: line => actorLines.push(line) });
@@ -276,7 +283,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   if (failedRead) report.incomplete = true;
   const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
   for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
-  const items = !liveGate ? gated.kept : (await gateRulingItems(gated.kept, { gh, cwd: checkoutRoot, log })).kept;
+  const rulingGate = !liveGate ? { kept: gated.kept, confirmed: new Map() }
+    : await gateRulingItems(gated.kept, { gh, cwd: checkoutRoot, log, lookup: rulingLookup, confirmEscalations: true });
+  const items = rulingGate.kept;
   // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
   for (const item of items) if (!item.head) {
     try {
@@ -315,9 +324,9 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
       const rows = ['rulingNeeded', 'stoodDown', 'needsPerson'].flatMap(key => report[key] ?? []);
       for (const repo of repos) {
         ledgers[repo] = recordSweep({ ledger: previous[repo], sweepId: new Date(now).toISOString(),
-          items: items.filter(item => item.repo === repo && item.kind !== 'needs-you').map(item => {
+          items: items.filter(item => item.repo === repo && item.kind !== 'needs-you' && rulingGate.confirmed.has(item)).map(item => {
             const row = rows.find(row => row.repo === repo && (row.number ?? row.pr) === item.pr);
-            return { pr: item.pr, head: item.head, cause: row?.kind || item.kind };
+            return { pr: item.pr, head: rulingGate.confirmed.get(item), cause: row?.kind || item.kind };
           }) });
       }
     }

@@ -133,20 +133,44 @@ describe('resolveEscalationActorSettings', () => {
     ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', '-1'],
     ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', '1.5'],
     ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', 'Infinity'],
-  ])('invalid env %s=%s (%s) falls back to the default and names the invalid source', (key, variable, value) => {
+  ])('invalid env %s=%s (%s) disables the actor and names the invalid source', (key, variable, value) => {
     const result = resolve({ [variable]: value }, { enabled: false, threshold: 8, takeoverCapPerHead: 8 });
-    expect(result[key]).toBe(defaults[key]);
+    expect(result.enabled).toBe(false);
+    if (key !== 'enabled') expect(result[key]).toBe(0);
     expect(String(result.sources[key])).toMatch(/invalid/i);
     expect(String(result.sources[key])).toMatch(/env|WE_ESCALATION_ACTOR/i);
   });
 
   it.each([['enabled', 'perhaps'], ['threshold', 0], ['threshold', 1.5], ['takeoverCapPerHead', -1], ['takeoverCapPerHead', Infinity]])
-    ('invalid settings %s=%j falls back to the default with provenance', (key, value) => {
+    ('invalid settings %s=%j disables the actor with provenance', (key, value) => {
       const result = resolve({}, { [key]: value });
-      expect(result[key]).toBe(defaults[key]);
+      expect(result.enabled).toBe(false);
+      if (key !== 'enabled') expect(result[key]).toBe(0);
       expect(String(result.sources[key])).toMatch(/invalid/i);
       expect(String(result.sources[key])).toMatch(/settings|tool/i);
     });
+
+  it.each([
+    ['enabled', 'WE_ESCALATION_ACTOR_ENABLED', 'perhaps'],
+    ['threshold', 'WE_ESCALATION_ACTOR_THRESHOLD', 'bad'],
+    ['takeoverCapPerHead', 'WE_ESCALATION_ACTOR_TAKEOVER_CAP', '-1'],
+  ])('audit: invalid higher-layer %s cannot grant an actor over a valid lower layer', (key, variable, value) => {
+    for (const enabled of [false, true]) {
+      const result = resolve({ [variable]: value }, { enabled, threshold: 3, takeoverCapPerHead: 2 });
+      expect(result.enabled).toBe(false);
+      expect(result.sources[key]).toMatch(/env.*invalid/);
+      expect(result.sources.enabled).toMatch(/invalid/);
+    }
+  });
+
+  it('audit: invalid tool threshold disables a valid platform actor even when env explicitly enables it', () => {
+    const result = resolveEscalationActorSettings({ env: { WE_ESCALATION_ACTOR_ENABLED: 'true' },
+      readPlatform: () => ({ enabled: true, threshold: 3, takeoverCapPerHead: 2 }),
+      readSettings: () => ({ escalation: { actor: { threshold: 'bad' } } }) });
+    expect(result.enabled).toBe(false);
+    expect(result.sources.threshold).toMatch(/tool.*invalid/);
+    expect(result.sources.enabled).toMatch(/tool.*invalid/);
+  });
 });
 
 describe('planReconcile escalation takeovers (R392(1))', () => {
@@ -155,9 +179,11 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
     { id: 'stronger-model', at: 2, action: 'dispatch', provider: 'claude', taskType: 'ruling-escalation-stronger' },
   ] }, routes: { resend: { provider: 'claude', model: 'sonnet' },
     'stronger-model': { provider: 'claude', model: 'opus', effort: 'high' } } };
+  const finding = (head = HEAD) => ({ author: { login: 'web-everything' }, createdAt: '2026-11-02T10:00:00Z',
+    body: `🔁 review — changes requested\n\nRecorded by auto-policy\n\nruled \`block\` for head \`${head}\`.\n\n### Findings\n\n**correctness/logic** (1)\n- \`src/a.mjs:1\` — repair the open defect` });
   const pr = (over = {}) => ({ number: 6023, state: 'OPEN', isDraft: false, baseRefName: 'main',
     headRefName: 'lane/6023-repair', headRefOid: HEAD, mergeStateStatus: 'CLEAN',
-    labels: [{ name: 'review:changes' }], comments: [],
+    labels: [{ name: 'review:changes' }], comments: [finding()],
     statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: HEAD }], ...over });
   const plan = (over = {}, options = {}) => planReconcile({ repo: 'we', prs: [pr(over)], agents: [],
     now: Date.parse('2026-11-02T12:00:00Z'), requiredChecks: ['gate'], roundCap: 5, durableCounts: {},
@@ -174,6 +200,7 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
     const result = plan({}, { escalationStreaks: [item({ streak: 2 }), item({ streak: 2 })] });
     expect(result.dispatch).toHaveLength(1);
     expect(result.dispatch[0]).toMatchObject({ prNumber: 6023, kind: 'fix', mode: 'takeover',
+      findings: 1,
       takeover: { rung: expected.rung, route: expected.route, n: expected.n, budget: expected.budget } });
   });
 
@@ -187,15 +214,40 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
   });
 
   it('a trusted same-head marker consumes the cap and prevents another takeover', () => {
-    const comments = [marker()];
+    const comments = [finding(), marker()];
     expect(takeoverMarkers(comments)).toHaveLength(1);
     expect(takeovers(plan({ comments }))).toEqual([]);
   });
 
   it('a forged same-head marker does not consume the trusted takeover allowance', () => {
-    const comments = [marker(HEAD, { login: 'mallory' })];
+    const comments = [finding(), marker(HEAD, { login: 'mallory' })];
     expect(takeoverMarkers(comments)).toEqual([]);
     expect(takeovers(plan({ comments }))).toHaveLength(1);
+  });
+
+  it('audit: an empty-thread review:human escalation falls through to the ordinary review flow', () => {
+    const over = { labels: [{ name: 'review:human' }], comments: [] };
+    const result = plan(over);
+    expect(takeovers(result)).toEqual([]);
+    expect(result).toEqual(plan(over, { escalationStreaks: undefined }));
+  });
+
+  it.each(['review:accepted', 'ready-to-merge'])('audit: %s with historical defects is never owed an escalation takeover', label => {
+    const over = { labels: [{ name: label }] };
+    const result = plan(over);
+    expect(takeovers(result)).toEqual([]);
+    expect(result.dispatch).toEqual([]);
+    expect(result).toEqual(plan(over, { escalationStreaks: undefined }));
+  });
+
+  it('audit: an empty bounced thread cannot manufacture an escalation finding', () => {
+    const result = plan({ comments: [] });
+    expect(takeovers(result)).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings', findings: 0 }));
+  });
+
+  it('audit: a defect on an older head cannot authorize a current-head escalation takeover', () => {
+    expect(takeovers(plan({ comments: [finding(NEXT)] }))).toEqual([]);
   });
 
   it('ignores an escalation for a stale head', () => {

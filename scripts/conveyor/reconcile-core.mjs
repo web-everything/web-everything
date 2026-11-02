@@ -110,7 +110,7 @@ import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-s
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, currentRound, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { decideReviewChurn } from './review-churn.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
@@ -2808,32 +2808,6 @@ export function planReconcile({
       continue;
     }
 
-    // R392(1): a repeatedly surfaced escalation gets a bounded actor before ordinary fix rounds are spent.
-    // Keep all the ordinary author/liveness holds above and all planTakeover guards below.
-    const escalation = Array.isArray(escalationStreaks) && escalationStreaks.find(row =>
-      row?.pr === prNumber && /^[a-f0-9]{40}$/i.test(row.head ?? '') && row.head === pr.headRefOid
-      && Number.isSafeInteger(row.streak) && row.streak > 0 && typeof row.cause === 'string' && row.cause.trim());
-    if (escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN') {
-      if (!Array.isArray(pr.comments)) {
-        refuse('thread-truncated', { ...withPhase, why: 'escalation takeover needs readable, complete comments; a person must inspect the thread' });
-        continue;
-      }
-      const used = takeoverMarkers(pr.comments).filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
-      if (Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used) {
-        const takeover = planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch });
-        if (takeover.ok) {
-          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: Math.max(1, openDefects(pr.comments, pr.headRefOid)?.count ?? 0),
-            takeover: { attempts: roundAttempts(), cap: effectiveRoundCap, rung: takeover.rung, route: takeover.route,
-              n: takeover.n, budget: takeover.budget, ...(takeover.previous ? { previous: takeover.previous } : {}) },
-            why: `repeated escalation (${escalation.cause}, ${escalation.streak} sweeps) owes an actor — automatic takeover ${takeover.n} of ${takeover.budget}` });
-        } else {
-          refuse('cap-exhausted', { ...withPhase, takeover: takeover.reason,
-            why: `escalation takeover refused: ${takeover.reason}; a person must resolve the escalation` });
-        }
-        continue;
-      }
-    }
-
     // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —
     // an OPEN, GREEN, non-draft `lane/*` PR carrying NO `review:*` label (and no `ready-to-merge` landing-gate
     // label either) is in limbo forever: `classifyPr` reads phase `open` ("no hold recorded"), the generic table
@@ -3849,7 +3823,9 @@ export function planReconcile({
     if (findings === 0) {
       refuse('no-findings', {
         ...withPhase, findings: 0, comments: Array.isArray(pr?.comments) ? pr.comments.length : 0,
-        why: 'no reviewer finding on this PR — a fix agent would invent work. A review, not a fix, is what an unreviewed PR is owed.',
+        why: !Array.isArray(pr?.comments)
+          ? 'comments are unreadable — no finding can authorize a fix; a person must inspect the thread'
+          : 'no reviewer finding on this PR — a fix agent would invent work. A review, not a fix, is what an unreviewed PR is owed.',
       });
       continue;
     }
@@ -3901,6 +3877,31 @@ export function planReconcile({
             : ''),
       });
       continue;
+    }
+
+    // R392(1): only the ordinary fix population reaches here, after phase, findings and mechanical-route guards.
+    // openDefects has a historical fallback; require a round explicitly naming this head before using its tally.
+    const escalation = Array.isArray(escalationStreaks) && escalationStreaks.find(row =>
+      row?.pr === prNumber && /^[a-f0-9]{40}$/i.test(row.head ?? '') && row.head === pr.headRefOid
+      && Number.isSafeInteger(row.streak) && row.streak > 0 && typeof row.cause === 'string' && row.cause.trim());
+    const defectRound = escalation && currentRound(pr.comments, pr.headRefOid, { strict: true });
+    const defects = defectRound?.head && sameHeadSha(defectRound.head, pr.headRefOid)
+      ? openDefects(pr.comments, pr.headRefOid) : null;
+    if (escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN' && defects?.count >= 1) {
+      const used = takeoverMarkers(pr.comments).filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
+      if (Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used) {
+        const takeover = planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch });
+        if (takeover.ok) {
+          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: defects.count,
+            takeover: { attempts, cap: effectiveRoundCap, rung: takeover.rung, route: takeover.route,
+              n: takeover.n, budget: takeover.budget, ...(takeover.previous ? { previous: takeover.previous } : {}) },
+            why: `repeated escalation (${escalation.cause}, ${escalation.streak} sweeps) owes an actor — automatic takeover ${takeover.n} of ${takeover.budget}` });
+        } else {
+          refuse('cap-exhausted', { ...withPhase, takeover: takeover.reason,
+            why: `escalation takeover refused: ${takeover.reason}; a person must resolve the escalation` });
+        }
+        continue;
+      }
     }
 
     // ── REFUSAL 3 — the cap, from the PR and ONLY from the PR. `durableCounts` is what the shell read back off
