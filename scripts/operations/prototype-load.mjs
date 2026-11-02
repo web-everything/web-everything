@@ -5,7 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH } from './codex-audit.mjs';
+import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
 export const safeRegistrationRef = (ref) => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
@@ -20,12 +20,14 @@ export function readyEvidence(records, input) {
   const record = records.find((r) => r?.ref === input.branch && r.sha === input.sha && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   return record ? { source: 'ready-record', record } : null;
 }
-/** Latest canonical audit for this head, across bases; later appended records break ties. */
+/** Latest canonical audit for this head, across bases. Empty-diff audits (base===head) never count, and each
+ * base is validated by findAudit (contradictory findings rejected); later appended records break ties. */
 export function canonicalAuditEvidence(records, sha) {
   let latest = null;
-  for (const record of records) {
-    if (record?.head !== sha || record.questionHash !== QUESTION_HASH || !Number.isFinite(Date.parse(record.at))) continue;
-    if (!latest || Date.parse(record.at) >= Date.parse(latest.at)) latest = record;
+  const bases = new Set(records.filter((r) => r?.head === sha && r.base !== sha).map((r) => r.base));
+  for (const base of bases) {
+    const record = findAudit(records, { head: sha, base, questionHash: QUESTION_HASH });
+    if (record && (!latest || Date.parse(record.at) >= Date.parse(latest.at))) latest = record;
   }
   if (latest?.verdict === 'NOT WEAKENED') return { ok: true, record: latest };
   return { ok: false, reason: latest?.verdict === 'WEAKENED' ? 'weakened' : 'no-record' };
