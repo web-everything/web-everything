@@ -36,6 +36,10 @@ function validateSettings(settings) {
       throw new Error('incomplete path policy');
     }
   }
+  const records = settings.rulingRecordPaths;
+  if (!Array.isArray(records) || !records.length || records.length > 1000
+    || records.some(path => !validPath(path) || /[*?\[\]]/.test(path))
+    || new Set(records).size !== records.length) throw new Error('invalid ruling record paths');
   return settings;
 }
 
@@ -117,8 +121,9 @@ function decisionState(text) {
 
 async function directionPaths(paths, settings, metadata, head, base, deps) {
   const matches = [], unreadable = [];
+  let touchesDecision = false;
   for (const path of paths) {
-    if (isRulingPath(path) || settings.directionPaths.some(glob => matchesGlob(path, glob))) matches.push(path);
+    if (settings.rulingRecordPaths.includes(path) || isRulingPath(path) || settings.directionPaths.some(glob => matchesGlob(path, glob))) matches.push(path);
     if (/^backlog\/[^/]+\.md$/.test(path)) {
       try {
         const current = decisionState(await deps.readHeadFile(head, path));
@@ -126,16 +131,54 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
         const historicalText = await deps.readBaseFile(base, path);
         const historical = historicalText === null ? null : decisionState(historicalText);
         // Any net-diff touch can reverse a ruling, even with a resolved status at both ends.
-        if (current.decision || historical?.decision) matches.push(path);
+        if (current.decision || historical?.decision) {
+          touchesDecision = true;
+          matches.push(path);
+        }
       } catch { unreadable.push(path); }
     }
   }
   const hits = [...new Set(matches)];
-  const recording = hits.length && hits.every(path => isRulingPath(path)
-    && !settings.directionPaths.some(glob => matchesGlob(path, glob))) && RULING.test(`${metadata.title}\n${metadata.body}`)
+  const recording = hits.length && !touchesDecision
+    && paths.every(path => settings.rulingRecordPaths.includes(path))
+    && RULING.test(`${metadata.title}\n${metadata.body}`)
     && /(?:^\s*>|\bverbatim\b)/im.test(metadata.body);
   if (hits.length && !recording) return result(3, 'Sets no direction', 'FAIL', hits.map(path => `direction path: ${path}`));
   if (unreadable.length) return unknown(3, 'Sets no direction', `unreadable decision evidence: ${unreadable.join(', ')}`);
+  if (recording) {
+    let rows;
+    try {
+      const text = await deps.readRulingNumstat(base, head, hits);
+      if (typeof text !== 'string' || Buffer.byteLength(text) > 8 * 1024 * 1024
+        || !text.endsWith('\0')) throw new Error('missing or oversized numstat');
+      rows = text.slice(0, -1).split('\0').map(row => {
+        const match = /^(\d+)\t(\d+)\t([\s\S]+)$/.exec(row);
+        if (!match || !hits.includes(match[3]) || !Number.isSafeInteger(Number(match[1]))
+          || !Number.isSafeInteger(Number(match[2]))) throw new Error('invalid numstat');
+        return { added: Number(match[1]), deleted: Number(match[2]), path: match[3] };
+      });
+      if (rows.length !== hits.length || new Set(rows.map(row => row.path)).size !== hits.length) {
+        throw new Error('incomplete numstat');
+      }
+    } catch { return unknown(3, 'Sets no direction', 'ruling numstat unavailable, invalid or oversized'); }
+    if (rows.some(row => row.deleted !== 0 || row.added === 0)) {
+      return result(3, 'Sets no direction', 'FAIL', hits.map(path => `direction path (not append-only): ${path}`));
+    }
+    // Counts alone admit prepends and interior insertions. Preserve the entire
+    // base blob as a prefix of the head blob to prove additions occur only at EOF.
+    for (const path of hits) {
+      let before, after;
+      try {
+        before = await deps.readRulingFile(base, path);
+        after = await deps.readRulingFile(head, path);
+        if ([before, after].some(text => typeof text !== 'string'
+          || Buffer.byteLength(text) > 8 * 1024 * 1024)) throw new Error('invalid ruling blob');
+      } catch { return unknown(3, 'Sets no direction', `ruling EOF evidence unavailable, invalid or oversized: ${path}`); }
+      if (after.length <= before.length || !after.startsWith(before)) {
+        return result(3, 'Sets no direction', 'FAIL', [`direction path (not EOF-only append): ${path}`]);
+      }
+    }
+  }
   return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', ...hits] : ['no direction paths or touched decision cards']);
 }
 

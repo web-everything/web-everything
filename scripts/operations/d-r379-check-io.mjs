@@ -111,6 +111,26 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       if (paths.length > 10_000) throw new Error('diff bound exceeded; human review required');
       return {paths, base};
     },
+    readRulingNumstat(base, head, paths) {
+      checkSha(base);
+      checkSha(head);
+      if (!Array.isArray(paths) || !paths.length || paths.length > 1000
+        || paths.some(path => typeof path !== 'string' || !path || path.length > 4096
+          || path.startsWith('/') || path.includes('\\') || path.includes('\0')
+          || path.split('/').some(part => !part || part === '.' || part === '..'))) {
+        throw new Error('invalid ruling paths; human review required');
+      }
+      return run('git', ['--literal-pathspecs', 'diff', '--numstat', '-z', base, head, '--', ...paths]);
+    },
+    readRulingFile(sha, path) {
+      checkSha(sha);
+      if (typeof path !== 'string' || !path || path.length > 4096
+        || path.startsWith('/') || path.includes('\\') || path.includes('\0')
+        || path.split('/').some(part => !part || part === '.' || part === '..')) {
+        throw new Error('invalid ruling path; human review required');
+      }
+      return run('git', ['show', `${sha}:${path}`]);
+    },
     readHeadFile(head, path) {
       checkSha(head);
       if (typeof path !== 'string' || !/^backlog\/[^/]+\.md$/.test(path) || path.includes('\0')) throw new Error('invalid card path');

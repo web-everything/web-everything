@@ -7,7 +7,15 @@
     "src/_data/**",
     "src/_includes/*-descriptions/**"
   ],
+  "rulingRecordPaths": ["docs/agent/platform-decisions.md"],
   "protectedPaths": [
+    "tests/**",
+    "**/*.spec.*",
+    "**/*.test.*",
+    "**/__tests__/**",
+    "**/playwright*.config.*",
+    "tests/a11y/**",
+    "blocks/__tests__/e2e/**",
     "scripts/**/*gate*",
     "scripts/**/*guard*",
     "scripts/**/*verdict*",

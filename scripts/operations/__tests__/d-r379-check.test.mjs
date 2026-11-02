@@ -20,6 +20,8 @@ function deps(f = fixture(6223), overrides = {}) {
   return { readPr: async () => f, readLabels: async () => f.labels,
     fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
     readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
+    readRulingFile: async (sha) => sha === base ? 'Original rule.\n' : 'Original rule.\n> Appended ruling.\n',
+    readRulingNumstat: async (_base, _head, paths) => paths.map(path => `3\t0\t${path}\0`).join(''),
     readBaseFile: async () => '---\ntype: story\nstatus: open\n---\n',
     readSettings: async () => settings, readHeadFile: async () => '---\ntype: story\nstatus: open\n---\n',
     stdout: () => {}, stderr: () => {}, ...overrides };
@@ -83,7 +85,7 @@ describe('fail-closed evidence', () => {
 });
 describe('direction paths and R391', () => {
   it.each(['> Operator ruling text','Recorded verbatim'])('allows ruling-record with %s', async body => {
-    const f = {...fixture(6223),title:'R391 record',body,netDiffPaths:['.operations/rulings.md']};
+    const f = {...fixture(6223),title:'R391 record',body,netDiffPaths:['docs/agent/platform-decisions.md']};
     expect(condition(await checkPr(1,deps(f)),3)).toMatchObject({status:'PASS',evidence:expect.arrayContaining(['R391 ruling-record'])});
   });
   it.each([
@@ -460,10 +462,10 @@ describe('merge-base decision ratification regressions', () => {
     const r = await check({readHeadFile:()=>card('resolved','kind','story'),readBaseFile:()=>card('resolved')});
     expect(condition(r,3).status).toBe('FAIL');
   });
-  it('preserves the R391 exception for a pure decision ruling-record', async () => {
+  it('refuses the R391 exception for a resolved decision named rulings', async () => {
     const f = {...fixture(6223),title:'R391 record',body:'> Operator ruling',netDiffPaths:['backlog/123-rulings.md']};
     const r = await checkPr(6223,deps(f,{readHeadFile:()=>card('resolved'),readBaseFile:()=>card('resolved')}));
-    expect(condition(r,3)).toMatchObject({status:'PASS',evidence:expect.arrayContaining(['R391 ruling-record'])});
+    expect(condition(r,3).status).toBe('FAIL');
   });
   it('refuses R391 when a non-record decision body is also touched', async () => {
     const f = {...fixture(6223),title:'R391 record',body:'> Operator ruling',netDiffPaths:['rulings.md',path]};
@@ -552,5 +554,159 @@ describe('protected test, coverage and CI execution controls', () => {
   ])('refuses eligibility for %s', async path => {
     const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
     expect(condition(r,4).status).toBe('FAIL'); expect(r.eligible).toBe(false);
+  });
+});
+
+
+describe('round 4 wholesale test protection', () => {
+  it.each(['tests/helper.js', 'src/widget.spec.ts', 'widget.test.js',
+    'lib/__tests__/assertions.mjs', 'playwright.mobile.config.ts',
+    'config/playwright.config.js', 'tests/a11y/helper.ts', 'blocks/__tests__/e2e/helper.js'])
+  ('requires operator review for any edit or assertion removal in %s', async path => {
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    expect(condition(r,4)).toMatchObject({status:'FAIL',evidence:[`protected path: ${path}`]});
+    expect(r.eligible).toBe(false);
+  });
+});
+
+describe('round 4 append-only R391 evidence', () => {
+  const path = 'docs/agent/platform-decisions.md';
+  const f = {...fixture(6223),title:'R391 record',body:'> Operator ruling',netDiffPaths:[path]};
+  it('passes an append-only listed ruling record with R-id and blockquote', async () => {
+    const calls = [];
+    const r = await checkPr(6223,deps(f,{readRulingNumstat:(...args)=>{
+      calls.push(args); return `4\t0\t${path}\0`;
+    }}));
+    expect(calls).toEqual([[base,f.headRefOid,[path]]]);
+    expect(condition(r,3)).toMatchObject({status:'PASS',evidence:expect.arrayContaining(['R391 ruling-record'])});
+  });
+  it.each(['backlog/123-rulings.md', '.operations/rulings.md'])('rejects reversal of resolved text through unlisted %s', async record => {
+    const card = '---\ntype: decision\nstatus: resolved\n---\n';
+    const r = await checkPr(6223,deps({...f,netDiffPaths:[record]}, {
+      readHeadFile:()=>`${card}Reversed ruling.`,readBaseFile:()=>`${card}Original ruling.`,
+    }));
+    expect(condition(r,3).status).toBe('FAIL');
+  });
+  it.each(['1\t1', '0\t1', '0\t0'])('rejects non-append numstat %s in a listed record', async counts => {
+    const r = await checkPr(6223,deps(f,{readRulingNumstat:()=>`${counts}\t${path}\0`}));
+    expect(condition(r,3).status).toBe('FAIL');
+  });
+  it('rejects a decision card even if explicitly listed as a record', async () => {
+    const record = 'backlog/123-rulings.md';
+    const card = '---\ntype: decision\nstatus: resolved\n---\n';
+    const r = await checkPr(6223,deps({...f,netDiffPaths:[record]}, {
+      readSettings:()=>({...settings,rulingRecordPaths:[record]}),readHeadFile:()=>card,readBaseFile:()=>card,
+    }));
+    expect(condition(r,3).status).toBe('FAIL');
+  });
+  it('rejects a ruling append mixed with unrelated implementation changes', async () => {
+    const r = await checkPr(6223,deps({...f,netDiffPaths:[path,'scripts/example.mjs']}));
+    expect(condition(r,3).status).toBe('FAIL');
+  });
+  it.each(['throw','empty','binary','truncated','wrong path','duplicate','oversized'])
+  ('keeps %s numstat UNKNOWN with human fallback', async kind => {
+    const r = await checkPr(6223,deps(f,{readRulingNumstat:()=>{
+      if (kind === 'throw') throw Error('unreadable');
+      return {empty:'',binary:`-\t-\t${path}\0`,truncated:`1\t0\t${path}`,
+        'wrong path':'1\t0\tother.md\0',duplicate:`1\t0\t${path}\0`.repeat(2),
+        oversized:'x'.repeat(8*1024*1024+1)}[kind];
+    }}));
+    expect(condition(r,3).status).toBe('UNKNOWN');
+    expect(condition(r,3).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+  it.each([undefined,[],['**/rulings.md'],['../rulings.md'],Array(1001).fill(path)].map(rulingRecordPaths => ({rulingRecordPaths})))
+  ('keeps invalid exact ruling-record policy closed (%j)', async ({rulingRecordPaths}) => {
+    const r = await checkPr(6223,deps(f,{readSettings:()=>({...settings,rulingRecordPaths})}));
+    expect(condition(r,3).status).toBe('UNKNOWN');
+  });
+  it.each([{title:'story 391'}, {body:'paraphrase'}])('rejects missing R-id or quotation on listed records: %j', async extra => {
+    expect(condition(await checkPr(6223,deps({...f,...extra})),3).status).toBe('FAIL');
+  });
+  it('fixture 6223 retains condition 4 PASS without test-file exemptions', async () => {
+    const original = fixture(6223);
+    expect(original.netDiffPaths).toHaveLength(7);
+    expect(original.netDiffPaths.every(path => !settings.protectedPaths.some(glob => matchesGlob(path,glob)))).toBe(true);
+    expect(condition(await checkPr(6223,deps(original)),4).status).toBe('PASS');
+  });
+  it('keeps missing numstat rows for a second listed record UNKNOWN', async () => {
+    const second = 'docs/agent/another-record.md';
+    const r = await checkPr(6223,deps({...f,netDiffPaths:[path,second]}, {
+      readSettings:()=>({...settings,rulingRecordPaths:[path,second]}),
+      readRulingNumstat:()=>`1\t0\t${path}\0`,
+    }));
+    expect(condition(r,3).status).toBe('UNKNOWN');
+  });
+  it.each(['command failure','oversized output'])('keeps adapter %s UNKNOWN', async kind => {
+    const adapter = createCheckDeps({exec:()=>{
+      if (kind === 'command failure') throw Error('git failed');
+      return 'x'.repeat(8*1024*1024+1);
+    }});
+    const r = await checkPr(6223,deps(f,{readRulingNumstat:adapter.readRulingNumstat}));
+    expect(condition(r,3).status).toBe('UNKNOWN');
+    expect(condition(r,3).evidence.join(' ')).toContain('human review');
+  });
+  it('adapter requests bounded literal-path numstat for the classified range', async () => {
+    const calls = [];
+    const adapter = createCheckDeps({exec:(bin,args,options)=>{
+      calls.push([bin,args]); expect(options.maxBuffer).toBe(8*1024*1024);
+      return `4\t0\t${path}\0`;
+    }});
+    expect(await adapter.readRulingNumstat(base,f.headRefOid,[path])).toBe(`4\t0\t${path}\0`);
+    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--numstat','-z',base,f.headRefOid,'--',path]]]);
+  });
+});
+
+
+describe('R391 EOF-only ruling records', () => {
+  const path = 'docs/agent/platform-decisions.md';
+  const f = {...fixture(6223),title:'R391 record',body:'> Operator ruling',netDiffPaths:[path]};
+  const original = 'First rule.\nSecond rule.\n';
+  it.each([
+    ['insertion into existing ruling text', 'First rule.\n> Exception to first rule.\nSecond rule.\n'],
+    ['prepend to existing ruling text', '> Overriding ruling.\nFirst rule.\nSecond rule.\n'],
+    ['unchanged ruling text', original],
+  ])('rejects %s despite zero-deletion numstat', async (_name, changed) => {
+    const r = await checkPr(6223,deps(f,{
+      readRulingFile:async sha => sha === base ? original : changed,
+    }));
+    expect(condition(r,3).status).toBe('FAIL');
+    expect(r.eligible).toBe(false);
+  });
+  it('passes only an EOF append preserving the entire original ruling record', async () => {
+    const calls = [];
+    const r = await checkPr(6223,deps(f,{readRulingFile:async (sha, file)=>{
+      calls.push([sha,file]);
+      return sha === base ? original : `${original}> Appended ruling.\n`;
+    }}));
+    expect(calls).toEqual([[base,path],[f.headRefOid,path]]);
+    expect(condition(r,3).status).toBe('PASS');
+  });
+  it.each(['base unreadable','head unreadable','missing text','oversized base','oversized head'])
+  ('keeps %s UNKNOWN with a human fallback', async kind => {
+    const r = await checkPr(6223,deps(f,{readRulingFile:async sha=>{
+      if ((kind === 'base unreadable' && sha === base)
+        || (kind === 'head unreadable' && sha !== base)) throw Error('unreadable');
+      if (kind === 'missing text') return undefined;
+      if ((kind === 'oversized base' && sha === base)
+        || (kind === 'oversized head' && sha !== base)) return 'x'.repeat(8*1024*1024+1);
+      return sha === base ? original : `${original}> Appended ruling.\n`;
+    }}));
+    expect(condition(r,3).status).toBe('UNKNOWN');
+    expect(condition(r,3).evidence.join(' ')).toContain('human review');
+    expect(r.eligible).toBe(false);
+  });
+  it('reads exact base and head blobs through bounded injected Git IO', async () => {
+    const calls = [];
+    const adapter = createCheckDeps({exec:(bin,args,options)=>{
+      calls.push([bin,args]);
+      expect(options.maxBuffer).toBe(8*1024*1024);
+      return args[1] === `${base}:${path}` ? original : `${original}> Appended ruling.\n`;
+    }});
+    const r = await checkPr(6223,deps(f,{readRulingFile:adapter.readRulingFile}));
+    expect(condition(r,3).status).toBe('PASS');
+    expect(calls).toEqual([
+      ['git',['show',`${base}:${path}`]], ['git',['show',`${f.headRefOid}:${path}`]],
+    ]);
   });
 });
