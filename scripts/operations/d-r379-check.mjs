@@ -112,16 +112,22 @@ function decisionState(text) {
   if (!match) throw new Error('missing frontmatter');
   const data = yaml.safeLoad(match[1]);
   if (!data || typeof (data.kind ?? data.type) !== 'string' || typeof data.status !== 'string') throw new Error('incomplete frontmatter');
-  return (data.kind ?? data.type) === 'decision' && !['resolved', 'ratified'].includes(data.status);
+  return { decision: data.kind === 'decision' || data.type === 'decision',
+    ratified: ['resolved', 'ratified'].includes(data.status) };
 }
 
-async function directionPaths(paths, settings, metadata, head, deps) {
+async function directionPaths(paths, settings, metadata, head, base, deps) {
   const matches = [], unreadable = [];
   for (const path of paths) {
     if (isRulingPath(path) || settings.directionPaths.some(glob => matchesGlob(path, glob))) matches.push(path);
     if (/^backlog\/[^/]+\.md$/.test(path)) {
       try {
-        if (decisionState(await deps.readHeadFile(head, path))) matches.push(path);
+        const current = decisionState(await deps.readHeadFile(head, path));
+        // null is verified absence; every other unreadable historical value is UNKNOWN.
+        const historicalText = await deps.readBaseFile(base, path);
+        const historical = historicalText === null ? null : decisionState(historicalText);
+        if ((current.decision || historical?.decision)
+          && !(current.decision && current.ratified && historical?.decision && historical.ratified)) matches.push(path);
       } catch { unreadable.push(path); }
     }
   }
@@ -168,7 +174,7 @@ export async function checkPr(pr, deps) {
   if (failure) {
     conditions.push(unknown(3, 'Sets no direction', failure), unknown(4, 'Not guard-loosening / hard to undo', failure));
   } else {
-    conditions.push(await directionPaths(netDiffPaths, settings, metadata, head, deps), protectedPaths(netDiffPaths, settings));
+    conditions.push(await directionPaths(netDiffPaths, settings, metadata, head, base, deps), protectedPaths(netDiffPaths, settings));
   }
   const seats = { sat: null, earned: null };
   conditions.push(result(5, 'Seats sat vs earned', 'UNKNOWN', ['not determinable: labels and canonical audit do not establish seats sat or earned']));

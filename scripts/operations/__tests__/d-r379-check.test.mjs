@@ -20,6 +20,7 @@ function deps(f = fixture(6223), overrides = {}) {
   return { readPr: async () => f, readLabels: async () => f.labels,
     fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
     readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
+    readBaseFile: async () => '---\ntype: story\nstatus: open\n---\n',
     readSettings: async () => settings, readHeadFile: async () => '---\ntype: story\nstatus: open\n---\n',
     stdout: () => {}, stderr: () => {}, ...overrides };
 }
@@ -97,8 +98,9 @@ describe('direction paths and R391', () => {
     const d = deps({...fixture(6223),netDiffPaths:['backlog/123-test.md']},{readHeadFile:()=>`---\nkind: decision\nstatus: ${status}\n---\n`});
     expect(condition(await checkPr(1,d),3).status).toBe('FAIL');
   });
-  it.each(['resolved','ratified'])('ratified decision %s passes', async status => {
-    const d = deps({...fixture(6223),netDiffPaths:['backlog/123-test.md']},{readHeadFile:()=>`---\nkind: decision\nstatus: ${status}\n---\n`});
+  it.each(['resolved','ratified'])('previously ratified decision %s passes', async status => {
+    const card = `---\nkind: decision\nstatus: ${status}\n---\n`;
+    const d = deps({...fixture(6223),netDiffPaths:['backlog/123-test.md']},{readHeadFile:()=>card,readBaseFile:()=>card});
     expect(condition(await checkPr(1,d),3).status).toBe('PASS');
   });
   it('unreadable decision stays UNKNOWN', async () => {
@@ -412,5 +414,113 @@ describe('protected implementation and test regressions', () => {
   });
   it('keeps ordinary documentation outside protected paths', () => {
     expect(settings.protectedPaths.some(glob=>matchesGlob('docs/harmless.md',glob))).toBe(false);
+  });
+});
+
+
+describe('merge-base decision ratification regressions', () => {
+  const path = 'backlog/123-test.md';
+  const card = (status, key = 'kind', kind = 'decision') => `---\n${key}: ${kind}\nstatus: ${status}\n---\n`;
+  const check = overrides => checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]},overrides));
+  it.each([['kind','resolved'],['type','resolved'],['kind','ratified'],['type','ratified']])('rejects a new %s: decision with status %s', async (key,status) => {
+    const r = await check({readHeadFile:()=>card(status,key),readBaseFile:()=>null});
+    expect(condition(r,3).status).toBe('FAIL'); expect(r.eligible).toBe(false);
+  });
+  it.each([['open','resolved'],['draft','resolved'],['open','ratified'],['draft','ratified']])('rejects rewriting a %s decision as %s', async (before,after) => {
+    const r = await check({readHeadFile:()=>card(after),readBaseFile:()=>card(before)});
+    expect(condition(r,3).status).toBe('FAIL'); expect(r.eligible).toBe(false);
+  });
+  it('cannot hide a base decision by rewriting its head kind', async () => {
+    const r = await check({readHeadFile:()=>card('resolved','kind','story'),readBaseFile:()=>card('open')});
+    expect(condition(r,3).status).toBe('FAIL');
+  });
+  it('binds the historical read to the net diff base and permits resolved to ratified', async () => {
+    const calls = [], diffBase = 'b'.repeat(40);
+    const r = await check({fetchNetDiff:()=>({paths:[path],base:diffBase}),
+      readHeadFile:()=>card('ratified','type'),readBaseFile:(sha,p)=>{calls.push([sha,p]);return card('resolved','type');}});
+    expect(calls).toEqual([[diffBase,path]]); expect(condition(r,3).status).toBe('PASS');
+  });
+  it.each(['error','malformed','oversized','undefined'])('keeps %s base evidence UNKNOWN with a human fallback', async kind => {
+    const r = await check({readHeadFile:()=>card('resolved'),readBaseFile:()=>{
+      if(kind === 'error') throw Error('unreadable');
+      return kind === 'malformed' ? 'broken' : kind === 'oversized' ? 'x'.repeat(1024*1024+1) : undefined;
+    }});
+    expect(condition(r,3).status).toBe('UNKNOWN');
+    expect(condition(r,3).evidence.join(' ')).toContain('human review'); expect(r.eligible).toBe(false);
+  });
+  it('rejects reopening a previously resolved decision', async () => {
+    expect(condition(await check({readHeadFile:()=>card('open'),readBaseFile:()=>card('resolved')}),3).status).toBe('FAIL');
+  });
+});
+
+describe('merge-base card reader', () => {
+  const path = 'backlog/123-test.md';
+  it('reads historical bytes with git show base:path', async () => {
+    const calls = [];
+    const d = createCheckDeps({exec:(bin,args)=>{calls.push([bin,...args]);return 'historical card';}});
+    expect(await d.readBaseFile(base,path)).toBe('historical card');
+    expect(calls).toEqual([['git','show',`${base}:${path}`]]);
+  });
+  it('returns null only for a verified absent base path', async () => {
+    const calls = [];
+    const d = createCheckDeps({exec:(_bin,args)=>{calls.push(args);if(args[0]==='show')throw Error('missing');return '';}});
+    expect(await d.readBaseFile(base,path)).toBeNull();
+    expect(calls).toEqual([['show',`${base}:${path}`],['ls-tree','-z',base,'--',path]]);
+  });
+  it.each(['present','unreadable','oversized'])('refuses to mistake %s tree evidence for a new card', async kind => {
+    const d = createCheckDeps({exec:(_bin,args)=>{
+      if(args[0]==='show' || kind==='unreadable')throw Error('read failed');
+      return kind==='oversized' ? 'x'.repeat(8*1024*1024+1) : '100644 blob hash\tbacklog/123-test.md\0';
+    }});
+    await expect(d.readBaseFile(base,path)).rejects.toThrow();
+  });
+  it('validates base and card path before issuing commands', async () => {
+    const d = createCheckDeps({exec:()=>{throw Error('must not execute');}});
+    await expect(d.readBaseFile('HEAD',path)).rejects.toThrow('invalid commit');
+    await expect(d.readBaseFile(base,'../card.md')).rejects.toThrow('invalid card path');
+  });
+});
+
+describe('protected test, coverage and CI execution controls', () => {
+  it.each([
+    'package.json',
+    'package-lock.json',
+    'vitest.config.ts',
+    'vitest.integration.config.ts',
+    'vitest.live.config.ts',
+    'vitest.soak.config.ts',
+    'vitest.maas-conformance.config.ts',
+    'vitest.shared.ts',
+    'vitest.setup.ts',
+    'vitest.globalSetup.mjs',
+    'playwright.config.ts',
+    'bun-test.preload.ts',
+    '.github/workflows/ci.yml',
+    '.github/workflows/update-visual-baselines.yml',
+    'scripts/merge-coverage.mjs',
+    'scripts/ci-card-only.mjs',
+    'scripts/ci/quarantine-skip.mjs',
+    'scripts/ci/coverage-reach.mjs',
+    'scripts/ci/shard-runner-compare.mjs',
+    'scripts/ci/test-timings.json',
+    'scripts/conveyor/soak/run-shard.mjs',
+    'scripts/dev/regression.mjs',
+    'scripts/hermetic-tests.settings.json',
+    'scripts/hermetic-test-baseline.json',
+    'scripts/lib/hermetic-tests.mjs',
+    'scripts/lib/hermetic-tests-vitest.mjs',
+    'scripts/lib/hermetic-git-overlay.mjs',
+    'scripts/lib/trust-chain-tier.mjs',
+    'scripts/lib/test-result-cache.mjs',
+    'scripts/lib/test-cache-trace.mjs',
+    'scripts/lib/test-result-store.mjs',
+    'scripts/lib/related-test-selection.mjs',
+    'scripts/test-cache/shadow-reporter.mjs',
+    'scripts/test-cache/trace-setup.mjs',
+    'scripts/lib/workflow-invariants.cjs',
+    'scripts/readiness/heavy-admission.mjs'
+  ])('refuses eligibility for %s', async path => {
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    expect(condition(r,4).status).toBe('FAIL'); expect(r.eligible).toBe(false);
   });
 });

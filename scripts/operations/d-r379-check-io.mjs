@@ -116,6 +116,18 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       if (typeof path !== 'string' || !/^backlog\/[^/]+\.md$/.test(path) || path.includes('\0')) throw new Error('invalid card path');
       return run('git', ['show', `${head}:${path}`]);
     },
+    async readBaseFile(base, path) {
+      checkSha(base);
+      if (typeof path !== 'string' || !/^backlog\/[^/]+\.md$/.test(path) || path.includes('\0')) throw new Error('invalid card path');
+      try { return await run('git', ['show', `${base}:${path}`]); }
+      catch (error) {
+        // A failed show alone cannot distinguish a new card from corrupt/missing Git
+        // evidence. Only a successful, empty exact-path tree lookup proves absence.
+        const entry = await run('git', ['ls-tree', '-z', base, '--', path]);
+        if (entry === '') return null;
+        throw error;
+      }
+    },
     readSettings() {
       return configuredPolicy('d-r379-protected-paths', JSON.parse(read(POLICY)));
     },
