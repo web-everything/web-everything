@@ -3,7 +3,7 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
-import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
+import { resolveCascade, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const positive = value => Number.isSafeInteger(value) && value > 0;
@@ -39,14 +39,29 @@ const defaults = { enabled: true, threshold: 2, takeoverCapPerHead: 1 };
 const variables = { enabled: 'WE_ESCALATION_ACTOR_ENABLED', threshold: 'WE_ESCALATION_ACTOR_THRESHOLD', takeoverCapPerHead: 'WE_ESCALATION_ACTOR_TAKEOVER_CAP' };
 function defaultReadSettings() {
   try { return JSON.parse(readFileSync(fileURLToPath(new URL('../settings/needs-you-feed.json', import.meta.url)), 'utf8')); }
-  catch { return {}; }
+  catch (error) { if (error?.code === 'ENOENT') return {}; throw error; }
+}
+
+function defaultReadPlatform(env) {
+  const { prefs, errors } = readPlatformPreferences({ env });
+  if (errors.length) throw new Error('platform preferences unreadable');
+  return prefs.escalation?.actor;
 }
 
 export function resolveEscalationActorSettings({ env = process.env, readSettings = defaultReadSettings,
-  readPlatform = () => platformPreference('escalation', { env })?.actor, log = () => {} } = {}) {
+  readPlatform = () => defaultReadPlatform(env), log = () => {} } = {}) {
   let tool, platform;
-  try { tool = readSettings()?.escalation?.actor; } catch { tool = {}; }
-  try { platform = readPlatform(); } catch { platform = {}; }
+  const readFailures = [];
+  try {
+    const file = readSettings();
+    if (!object(file) || (file.escalation !== undefined && !object(file.escalation))) throw new Error('tool settings unreadable');
+    tool = file.escalation?.actor;
+    if (tool !== undefined && !object(tool)) throw new Error('tool actor settings unreadable');
+  } catch { tool = {}; readFailures.push('tool-read-failed (actor disabled)'); }
+  try {
+    platform = readPlatform();
+    if (platform !== undefined && !object(platform)) throw new Error('platform actor settings unreadable');
+  } catch { platform = {}; readFailures.push('platform-read-failed (actor disabled)'); }
   const layers = { platform: {}, tool: {}, env: {} }, invalid = {};
   for (const key of Object.keys(defaults)) {
     for (const [source, raw] of [['platform', platform?.[key]], ['tool', tool?.[key]], ['env', env[variables[key]]]]) {
@@ -63,9 +78,9 @@ export function resolveEscalationActorSettings({ env = process.env, readSettings
   const resolved = resolveCascade({ standard: defaults, platform: layers.platform, tool: layers.tool, envValues: layers.env });
   for (const [key, source] of Object.entries(invalid)) if (source) resolved.sources[key] = source;
   const invalidSources = Object.entries(invalid).filter(([, source]) => source);
-  if (invalidSources.length) {
+  if (invalidSources.length || readFailures.length) {
     resolved.value.enabled = false;
-    resolved.sources.enabled = `disabled by ${invalidSources.map(([key, source]) => `${key}: ${source}`).join('; ')}`;
+    resolved.sources.enabled = `disabled by ${[...readFailures, ...invalidSources.map(([key, source]) => `${key}: ${source}`)].join('; ')}`;
   }
   for (const key of Object.keys(defaults)) log(`escalation.actor.${key}=${resolved.value[key]} source=${resolved.sources[key]}`);
   return { ...resolved.value, sources: resolved.sources };

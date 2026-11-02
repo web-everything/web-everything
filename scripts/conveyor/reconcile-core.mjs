@@ -3879,6 +3879,10 @@ export function planReconcile({
       continue;
     }
 
+    // Shared with the final dispatch: an extraction route must never become an in-place escalation fix.
+    const isCardBatch = cardBatchExtract && !(attempts >= effectiveRoundCap && sendBackRound)
+      && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
+
     // R392(1): only the ordinary fix population reaches here, after phase, findings and mechanical-route guards.
     // openDefects has a historical fallback; require a round explicitly naming this head before using its tally.
     const escalation = Array.isArray(escalationStreaks) && escalationStreaks.find(row =>
@@ -3887,7 +3891,8 @@ export function planReconcile({
     const defectRound = escalation && currentRound(pr.comments, pr.headRefOid, { strict: true });
     const defects = defectRound?.head && sameHeadSha(defectRound.head, pr.headRefOid)
       ? openDefects(pr.comments, pr.headRefOid) : null;
-    if (escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN' && defects?.count >= 1) {
+    if (!isCardBatch && !(attempts >= effectiveRoundCap && sendBackRound)
+      && escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN' && defects?.count >= 1) {
       const used = takeoverMarkers(pr.comments).filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
       if (Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used) {
         const takeover = planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch });
@@ -3932,8 +3937,6 @@ export function planReconcile({
     // A rejected card batch (`lane/card-batch-*`, #4703) is not repaired in place: the one rejected card is extracted
     // into its own PR (`we:scripts/operations/card-batch-extract.mjs`) and the rest are re-sealed. Only this plain
     // bounce routes there; conflict/advisory/ruling fixes above keep their own `fix` kind.
-    const isCardBatch = cardBatchExtract && !(attempts >= effectiveRoundCap && sendBackRound)
-      && String(pr?.headRefName ?? '').startsWith('lane/card-batch-');
     dispatch.push({
       ...base, ...withPhase, kind: isCardBatch ? 'card-batch-extract' : 'fix', findings, attempts,
       ...(attempts >= effectiveRoundCap ? sendBackRoundFields : {}),

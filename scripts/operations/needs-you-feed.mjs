@@ -71,13 +71,15 @@ const sectionReasons = {
 // a successful queue read supplies no evidence that their independently owned condition resolved.
 export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-limit', 'escalated', 'stood-down']);
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
+const rulingKind = clues => /round-cap|at-round-limit|ci-heal-exhausted/.test(clues) ? 'at-round-limit'
+  : /escalat|dispute/.test(clues) ? 'escalated' : 'ruling-needed';
 export function itemsFromReport(report) {
   const items = [];
   // needsYourMergePending is diagnostic evidence, never an actionable feed item.
   for (const [field, baseKind] of [['ready', 'needs-you'], ['needsYourMerge', 'needs-you'], ['rulingNeeded', 'ruling-needed'], ['stoodDown', 'stood-down'], ['needsPerson', 'ruling-needed']]) {
     for (const row of report[field] ?? []) {
       const clues = [row.kind, row.reason, ...(row.findings ?? []).map(f => f.reason)].filter(Boolean).join(' ');
-      const kind = baseKind !== 'ruling-needed' ? baseKind : /round-cap|at-round-limit|ci-heal-exhausted/.test(clues) ? 'at-round-limit' : /escalat|dispute/.test(clues) ? 'escalated' : baseKind;
+      const kind = baseKind !== 'ruling-needed' ? baseKind : rulingKind(clues);
       const reason = row.redTeam && field === 'rulingNeeded'
         ? `${sectionReasons[field]}: ${(row.findings ?? []).map(f => f.summary).join('; ')}`
         : row.reason || row.detail || row.headline || sectionReasons[field];
@@ -243,7 +245,21 @@ export async function gateRulingItems(items, { gh = execFileSyncThrottled, cwd, 
       const pr = await readLivePr(item, { gh, cwd }, 'labels,headRefOid,body,createdAt');
       if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid) || !Array.isArray(pr.labels) || typeof pr.body !== 'string'
         || !Number.isFinite(Date.parse(pr.createdAt))) throw new Error('incomplete live PR');
-      if (item.kind !== 'ruling-needed' || await lookup(pr) !== null) {
+      if (item.kind !== 'ruling-needed' && item.head !== pr.headRefOid) {
+        log(`needs-you-feed ${item.repo}#${item.pr} escalation head mismatch, keeping alert without a streak`);
+        return;
+      }
+      const need = await lookup(pr);
+      if (item.kind !== 'ruling-needed') {
+        // A readable PR alone proves neither a repair cap nor a dispute. The live ledger must confirm the cause
+        // on that exact head. Unsupported causes remain operator alerts, never automatic takeover allowances.
+        const reasons = Array.isArray(need?.findings) ? need.findings.map(finding => finding?.reason).filter(reason => typeof reason === 'string') : [];
+        if (need?.head !== pr.headRefOid || !reasons.length || rulingKind(reasons.join(' ')) !== item.kind) {
+          log(`needs-you-feed ${item.repo}#${item.pr} escalation cause unverified, keeping alert without a streak`);
+          return;
+        }
+      }
+      if (need !== null) {
         confirmed.set(item, pr.headRefOid);
         return;
       }

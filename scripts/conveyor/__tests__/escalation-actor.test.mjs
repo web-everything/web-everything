@@ -171,6 +171,24 @@ describe('resolveEscalationActorSettings', () => {
     expect(result.sources.threshold).toMatch(/tool.*invalid/);
     expect(result.sources.enabled).toMatch(/tool.*invalid/);
   });
+
+  it.each([
+    ['both readers', true, true], ['tool reader', true, false], ['platform reader', false, true],
+  ])('audit: %s throwing disables the actor despite valid settings elsewhere', (_name, toolFails, platformFails) => {
+    const actor = { enabled: true, threshold: 2, takeoverCapPerHead: 1 };
+    const result = resolveEscalationActorSettings({ env: { WE_ESCALATION_ACTOR_ENABLED: 'true' },
+      readSettings: () => { if (toolFails) throw new Error('tool unreadable'); return { escalation: { actor } }; },
+      readPlatform: () => { if (platformFails) throw new Error('platform unreadable'); return actor; } });
+    expect(result.enabled).toBe(false);
+    if (toolFails) expect(result.sources.enabled).toMatch(/tool.*read.*fail/);
+    if (platformFails) expect(result.sources.enabled).toMatch(/platform.*read.*fail/);
+  });
+
+  it.each([null, [], 'unreadable', 42])('audit: unreadable tool settings %j cannot enable the actor', value => {
+    const result = resolveEscalationActorSettings({ env: {}, readSettings: () => value, readPlatform: () => undefined });
+    expect(result.enabled).toBe(false);
+    expect(result.sources.enabled).toMatch(/tool.*read.*fail/);
+  });
 });
 
 describe('planReconcile escalation takeovers (R392(1))', () => {
@@ -244,6 +262,14 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
     const result = plan({ comments: [] });
     expect(takeovers(result)).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings', findings: 0 }));
+  });
+
+  it('audit: an escalated card batch still routes to extraction rather than an in-place takeover', () => {
+    const over = { headRefName: 'lane/card-batch-prevention-4-r1' };
+    const result = plan(over, { cardBatchExtract: true });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'card-batch-extract', prNumber: 6023 })]);
+    expect(takeovers(result)).toEqual([]);
+    expect(result).toEqual(plan(over, { cardBatchExtract: true, escalationStreaks: undefined }));
   });
 
   it('audit: a defect on an older head cannot authorize a current-head escalation takeover', () => {
