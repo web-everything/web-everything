@@ -30,6 +30,8 @@ export const DEFAULT_ENV_LOAD_RETRY_MAX_MS = 60 * 60_000;
 export const LOAD_CONTENTION_SIGNATURES = Object.freeze([
   /\(lock contention\)/,
   /gave up waiting for the shared acquirability-scan lock/,
+  // Our own shared gh semaphore refusing: another caller's slot, never the tree under test.
+  /gh-throttle: throttled — no gh slot within [\d.]+s/,
 ]);
 
 export function loadDifferentialEnabled(env) {
