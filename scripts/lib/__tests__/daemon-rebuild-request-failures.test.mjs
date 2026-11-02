@@ -196,6 +196,44 @@ describe('rebuild request failure budget and retention', () => {
   });
 });
 
+describe('failure evidence publication safeguards', () => {
+  it('failure ledger publication is atomic and failed publication leaves the request pending', async () => {
+    maxFailures('1'); const req = publish();
+    const original = fs.renameSync;
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === failureFile()) {
+        expect(String(from)).toContain(`${failureFile()}.tmp-`);
+        expect(pending()).toMatchObject({ id: req.id }); // old evidence stays visible until rename
+        throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      }
+      return original(from, to);
+    });
+    await owner(refused()).synced.tickOnce();
+    expect(pending()).toMatchObject({ id: req.id });
+    expect(fs.existsSync(failureFile())).toBe(false);
+    rename.mockRestore();
+    await owner(refused()).synced.tickOnce(); expect(pending()).toBeNull();
+  });
+  it('a corrupt request with unknown generation cannot be acknowledged or abandoned against a later publication', async () => {
+    maxFailures('1'); publish();
+    const requestFile = join(base(), 'rebuild-request.json');
+    const stat = fs.statSync, read = fs.readFileSync;
+    vi.spyOn(fs, 'statSync').mockImplementation((path, ...args) => {
+      if (path === requestFile) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return stat(path, ...args);
+    });
+    vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...args) => {
+      if (path === requestFile) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return read(path, ...args);
+    });
+    const w = owner(vi.fn(async () => ({ moved: false, reason: 'up-to-date' })));
+    await w.synced.tickOnce(); await owner(refused()).synced.tickOnce();
+    expect(pending()).toEqual({ corrupt: true, id: 'corrupt:unknown' });
+    expect(fs.existsSync(join(base(), 'rebuild-request-ack.json'))).toBe(false);
+    expect(fs.existsSync(failureFile())).toBe(false);
+  });
+});
+
 describe('hard writer claims are retired; original soft fairness remains', () => {
   const options = () => ({ lockRoot, probe: alive, leaseMinutes: 1e9, writerClaimTtlMs: 1e12,
     writerPriorityAfter: 1, readerPriorityAfter: 3, writerPriorityMaxSkips: 0 });

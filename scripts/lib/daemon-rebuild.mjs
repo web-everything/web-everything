@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/lib/daemon-rebuild.mjs
- * Public rebuild entry preserves caller-selected lock policy; hard writer claims are opt-in.
+ * Public rebuild entry is a plain re-export; ownership and request retries are coordinated by self-sync.
  * @description Module C (card 4044/xgomze7, "the heart") of the daemon-clone rebuild
  *   (docs/agent/platform-decisions.md#resident-daemon-reload-lifecycle clauses 2-5) — REBUILDS a daemon clone
  *   fresh from `origin/main` plus its registered overlay list (`daemon-overlays.mjs`, Module B) every tick,

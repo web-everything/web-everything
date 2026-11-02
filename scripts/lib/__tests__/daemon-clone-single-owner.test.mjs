@@ -92,18 +92,23 @@ describe('durable rebuild request', () => {
     lock.clearRebuildRequest(root, { lockRoot });
     expect(readRequest()).toBeNull();
   });
-  it('expires at the explicit TTL and defaults to thirty minutes', () => {
-    request();
-    expect(readRequest({ nowMs: T + 99, ttlMs: 100 })).not.toBeNull();
-    expect(readRequest({ nowMs: T + 101, ttlMs: 100 })).toBeNull();
-    request();
-    expect(readRequest({ nowMs: T + 30 * 60_000 - 1 })).not.toBeNull();
-    expect(readRequest({ nowMs: T + 30 * 60_000 + 1 })).toBeNull();
+  it('marks requests stale at the explicit TTL or default thirty minutes without discarding work', () => {
+    request(); const onStale = vi.fn();
+    expect(readRequest({ nowMs: T + 99, ttlMs: 100, onStale })).not.toBeNull();
+    expect(onStale).not.toHaveBeenCalled();
+    expect(readRequest({ nowMs: T + 100, ttlMs: 100, onStale })).not.toBeNull();
+    expect(onStale).toHaveBeenCalledOnce();
+    request(); onStale.mockClear();
+    expect(readRequest({ nowMs: T + 30 * 60_000 - 1, onStale })).not.toBeNull();
+    expect(onStale).not.toHaveBeenCalled();
+    expect(readRequest({ nowMs: T + 30 * 60_000, onStale })).not.toBeNull();
+    expect(onStale).toHaveBeenCalledOnce();
   });
-  it('honours the environment TTL', () => {
+  it('honours the environment TTL as a stale retry threshold', () => {
     vi.stubEnv('WE_DAEMON_REBUILD_REQUEST_TTL_MS', '100');
-    request();
-    expect(readRequest({ nowMs: T + 101 })).toBeNull();
+    request(); const onStale = vi.fn();
+    expect(readRequest({ nowMs: T + 101, onStale })).not.toBeNull();
+    expect(onStale).toHaveBeenCalledOnce();
   });
   it.each(['{broken', '{}', 'null', '{"at":0}'])('corrupt or incomplete request %s remains synthetically pending', (contents) => {
     request();
@@ -160,14 +165,14 @@ describe('withSelfSync single owner', () => {
     await expect(w.synced.tickOnce()).resolves.toBe('ticked');
     expect(w.rebuild.mock.calls).toEqual([[]]);
   });
-  it('corrupt requests get hard priority, one alert, and acknowledgement by synthetic ID', async () => {
+  it('corrupt requests rebuild normally, alert once, and acknowledge their synthetic ID', async () => {
     request(); writeFileSync(onlyFile(), '{broken');
     const pending = readRequest();
     const alert = vi.fn();
     const log = { error: vi.fn() };
     const w = wrapper('review-daemon.mjs', { log, tickProgress: { alert, markTickDone: vi.fn() } });
     await w.synced.tickOnce();
-    expect(w.rebuild).toHaveBeenCalledWith({ lockOpts: { hardClaim: true } });
+    expect(w.rebuild.mock.calls).toEqual([[]]);
     expect(readRequest()).toBeNull();
     const ack = JSON.parse(readFileSync(join(lock.cloneLockDirs(root, lockRoot).base, 'rebuild-request-ack.json'), 'utf8'));
     expect(ack.id).toBe(pending.id);
@@ -185,7 +190,7 @@ describe('withSelfSync single owner', () => {
     expect(pending).toEqual({ corrupt: true, id: `corrupt:${fs.statSync(file).mtimeMs}` });
     const w = wrapper('review-daemon.mjs');
     await w.synced.tickOnce();
-    expect(w.rebuild).toHaveBeenCalledWith({ lockOpts: { hardClaim: true } });
+    expect(w.rebuild.mock.calls).toEqual([[]]);
     expect(readRequest()).toBeNull();
   });
   it('refused rebuild retains a corrupt request and deduplicates its alert across retries', async () => {
@@ -196,10 +201,10 @@ describe('withSelfSync single owner', () => {
     const w = wrapper('review-daemon.mjs', { rebuild, tickProgress: { alert, markTickDone: vi.fn() } });
     await w.synced.tickOnce(); await w.synced.tickOnce();
     expect(readRequest()).toEqual(pending);
-    expect(rebuild.mock.calls).toEqual([[{ lockOpts: { hardClaim: true } }], [{ lockOpts: { hardClaim: true } }]]);
+    expect(rebuild.mock.calls).toEqual([[], []]);
     expect(alert).toHaveBeenCalledTimes(1);
   });
-  it('expired request is dropped without hard priority and alerts once across ticks', async () => {
+  it('stale request alerts once and is consumed by a successful retry', async () => {
     request(T - 30 * 60_000 - 1);
     const alert = vi.fn();
     const log = { error: vi.fn() };
@@ -208,30 +213,30 @@ describe('withSelfSync single owner', () => {
     expect(readRequest()).toBeNull();
     expect(w.rebuild.mock.calls).toEqual([[], []]);
     expect(alert).toHaveBeenCalledTimes(1);
-    expect(alert).toHaveBeenCalledWith('rebuild-request-expired', expect.any(Object), T);
-    expect(log.error.mock.calls.filter(([line]) => line.includes('ALERT rebuild-request-expired'))).toHaveLength(1);
+    expect(alert).toHaveBeenCalledWith('rebuild-request-stale', expect.any(Object), T);
+    expect(log.error.mock.calls.filter(([line]) => line.includes('ALERT rebuild-request-stale'))).toHaveLength(1);
   });
-  it('owner requests a hard claim for a live request only until it is consumed', async () => {
+  it('owner consumes a live request through ordinary rebuild discovery', async () => {
     request();
     const w = wrapper('review-daemon.mjs');
     await w.synced.tickOnce();
     expect(readRequest()).toBeNull();
     await w.synced.tickOnce();
-    expect(w.rebuild.mock.calls).toEqual([[{ lockOpts: { hardClaim: true } }], []]);
+    expect(w.rebuild.mock.calls).toEqual([[], []]);
   });
-  it('expired rebuild requests do not enable hard claims', async () => {
+  it('stale rebuild requests retry through ordinary discovery', async () => {
     request(T - 30 * 60_000 - 1);
     const w = wrapper('review-daemon.mjs');
     await w.synced.tickOnce();
     expect(w.rebuild.mock.calls).toEqual([[]]);
   });
-  it('owner requests a hard claim for a ready smoke-passed candidate on the current HEAD', async () => {
+  it('owner discovers a ready smoke-passed candidate on the current HEAD without changing lock policy', async () => {
     const ready = { prevHead: 'boot', adopt: { finalSha: 'next' }, passedAt: 'smoke-passed' };
     const w = wrapper('review-daemon.mjs', { readReady: () => ready });
     await w.synced.tickOnce();
-    expect(w.rebuild).toHaveBeenCalledWith({ lockOpts: { hardClaim: true } });
+    expect(w.rebuild.mock.calls).toEqual([[]]);
   });
-  it('a ready candidate for another HEAD does not enable a hard claim', async () => {
+  it('a ready candidate for another HEAD preserves ordinary discovery', async () => {
     const ready = { prevHead: 'other', adopt: { finalSha: 'next' }, passedAt: 'smoke-passed' };
     const w = wrapper('review-daemon.mjs', { readReady: () => ready });
     await w.synced.tickOnce();

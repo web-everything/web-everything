@@ -1,10 +1,10 @@
 /**
  * @file scripts/lib/daemon-self-sync.mjs
  * Shared clones elect a heartbeat-backed rebuild owner; siblings keep read-locked ticks and HEAD restarts.
- * Overlay rebuild requests survive refusals/failures; concluded rebuilds acknowledge their observed ID
- * without deleting newer publications. Owners request hard claims only for live requests or ready adoption;
- * all siblings keep adoption-yield accounting, and stale-owner fallback alerts are bounded to 15 minutes.
- * Corrupt requests stay pending with hard priority; request corruption/expiry produce deduplicated alerts.
+ * Overlay requests persist counted retries; success or bounded failure acknowledges their observed ID
+ * without deleting newer publications. All siblings keep adoption-yield accounting and ordinary lock fairness.
+ * Stale requests retry with alerts bounded to 15 minutes; corrupt requests and unreadable ledgers stay pending.
+ * Success or the persisted failure budget concludes requests, with an operator-visible abandonment alert.
  * @description xv6fciw (narrow slice of decision #3681) — keep a daemon's DEDICATED clone on `origin/main`
  *   without a human re-syncing it, and restart the daemon onto new code between ticks.
  *
@@ -127,7 +127,7 @@ import { resolveVersionedContext, isInsideVersions, currentVersion } from './dae
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
 import {
   acquireRead as acquireReadLock, releaseRead as releaseReadLock, resolveReaderPriorityAfter,
-  resolveCloneOwnership, touchOwnerHeartbeat, readRebuildRequest, clearRebuildRequest,
+  resolveCloneOwnership, touchOwnerHeartbeat, readRebuildRequest, recordRebuildRequestResult,
 } from './daemon-clone-lock.mjs';
 import { basename, dirname, join } from 'node:path';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -712,36 +712,39 @@ export function withSelfSync(effects, {
     root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
   let tickOwnership = null;
-  let pendingRebuildRequest = null;
   let lastOwnershipReason = null;
   let lastOwnerStaleAlertAt = -Infinity;
-  const lastRequestAlertIds = new Map(); // at most one ID for each of the two alert kinds
+  const lastRequestAlerts = new Map(); // one ID/timestamp per alert kind, bounded across publications
   const alertRequest = (kind, request) => {
-    if (lastRequestAlertIds.get(kind) === request.id) return;
-    lastRequestAlertIds.set(kind, request.id);
-    log.error?.(`daemon-self-sync: ALERT ${kind} — ${kind === 'rebuild-request-expired'
-      ? 'request TTL elapsed; republish the request if rebuilding is still needed'
-      : 'corrupt request stays pending; requesting hard priority until a rebuild concludes'}`);
+    const previous = lastRequestAlerts.get(kind);
+    if (previous?.id === request.id && (kind !== 'rebuild-request-stale' || now() - previous.at < 15 * 60_000)) return;
+    lastRequestAlerts.set(kind, { id: request.id, at: now() });
+    const detail = kind === 'rebuild-request-abandoned' ? 'failure budget exhausted; republish after resolving the rebuild failure'
+      : kind === 'rebuild-request-stale' ? 'request is stale; owner continues retrying within the failure budget'
+      : kind === 'rebuild-request-corrupt' ? 'corrupt request stays pending until its rebuild concludes'
+      : 'failure ledger unavailable; request remains pending until its evidence is repaired';
+    log.error?.(`daemon-self-sync: ALERT ${kind} — ${detail}`);
     try { progress?.alert?.(kind, { id: request.id, clone: basename(root) }, now()); } catch { /* best-effort alert */ }
   };
-  const readOwnerRequest = () => readRebuildRequest(root, { ...cloneLockOpts(), env, nowMs: now(),
-    onExpired: (request) => alertRequest('rebuild-request-expired', request),
-    onCorrupt: (request) => alertRequest('rebuild-request-corrupt', request) });
+  const requestCallbacks = () => ({
+    onStale: (request) => alertRequest('rebuild-request-stale', request),
+    onAbandoned: (request) => alertRequest('rebuild-request-abandoned', request),
+    onCorrupt: (request) => alertRequest('rebuild-request-corrupt', request),
+    onUnreadable: (request) => alertRequest('rebuild-request-failures-unreadable', request),
+  });
+  const readOwnerRequest = () => readRebuildRequest(root, { ...cloneLockOpts(), env, nowMs: now(), ...requestCallbacks() });
   const rebuild = async (...args) => {
     if (tickOwnership && !tickOwnership.owner) return { moved: false, reason: 'clone-non-owner' };
-    // Pending work opts into priority explicitly. Ordinary discovery keeps legacy soft-writer fairness.
-    const liveRequest = readOwnerRequest();
-    if (liveRequest) pendingRebuildRequest = liveRequest;
-    const candidate = readReady(root, env);
-    const readyToAdopt = candidate?.adopt?.finalSha && candidate.prevHead
-      && readHead(syncOpts()) === candidate.prevHead;
-    const result = liveRequest || readyToAdopt
-      ? await rebuildImpl({ ...args[0], lockOpts: { ...args[0]?.lockOpts, hardClaim: true } }, ...args.slice(1))
-      : await rebuildImpl(...args);
-    if (pendingRebuildRequest && (result?.moved || result?.reason === 'up-to-date')) {
-      clearRebuildRequest(root, { ...cloneLockOpts(), id: pendingRebuildRequest.id });
-      pendingRebuildRequest = null;
-    }
+    const request = readOwnerRequest();
+    const record = (success) => {
+      if (!request) return;
+      recordRebuildRequestResult(root, { ...cloneLockOpts(), env, nowMs: now(), id: request.id,
+        success, ...requestCallbacks() });
+    };
+    let result;
+    try { result = await rebuildImpl(...args); }
+    catch (error) { record(false); throw error; }
+    record(!!result?.moved || result?.reason === 'up-to-date');
     return result;
   };
   const bg = background === undefined
@@ -957,8 +960,7 @@ export function withSelfSync(effects, {
         try { touchOwnerHeartbeat(root, { ...cloneLockOpts(), nowMs: now() }); }
         catch (error) { log.error?.(`daemon-self-sync: owner heartbeat unavailable; siblings may use owner-stale-fallback (${error.code ?? 'write-failed'})`); }
       }
-      pendingRebuildRequest = tickOwnership.owner
-        ? readOwnerRequest() : null;
+      if (tickOwnership.owner) readOwnerRequest();
       if (resolvedPocBranch && tickOwnership.owner) {
         const r = syncPoc({ root, base, pocBranch: resolvedPocBranch, ...(timeoutMs != null ? { timeoutMs } : {}) });
         if (r.merged) {
