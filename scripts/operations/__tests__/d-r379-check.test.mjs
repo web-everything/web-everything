@@ -47,11 +47,32 @@ describe('fail-closed evidence', () => {
     const f = { ...fixture(6223), files: [{path:'AGENTS.md'}] };
     expect((await checkPr(1,deps(f))).eligible).toBe(true);
   });
-  it.each(['red-team:held','red-team:pending','red-team:blocked','red-team:future-hold','review:changes','review:blocked','review:held-mechanical'])('rejects %s', async label => {
+  it.each(['red-team:held','red-team:pending','red-team:blocked','red-team:future-hold','review:changes','review:blocked','review:held-mechanical','advisory:ruling-needed','advisory:needs-human','advisory:changes'])('rejects %s', async label => {
     expect(condition(await checkPr(1,deps({...fixture(6223),labels:[...fixture(6223).labels,label]})),2).status).toBe('FAIL');
   });
-  it('review:human alongside acceptance fails', async () => {
-    expect((await checkPr(1,deps({...fixture(6223),labels:[...fixture(6223).labels,'review:human']}))).eligible).toBe(false);
+  it.each(['review:pending', 'review:human'])('%s coexists with accepted label and current-head ledger acceptance', async label => {
+    expect((await checkPr(1,deps({...fixture(6223),labels:[...fixture(6223).labels,label]}))).eligible).toBe(true);
+  });
+  it.each(['review:pending', 'review:human'])('%s needs ledger acceptance even without accepted label', async label => {
+    const f = {...fixture(6223),labels:['red-team:clear',label]};
+    expect((await checkPr(1,deps(f))).eligible).toBe(true);
+  });
+  it.each(['review:pending', 'review:human'])('%s without current-head acceptance fails explicitly', async label => {
+    const f = {...fixture(6223),labels:['red-team:clear',label]};
+    for (const rows of [[], [verdict(1,'f'.repeat(40))]]) {
+      const r = await checkPr(1,deps(f,{readReviewLedger:()=>rows}));
+      expect(r.eligible).toBe(false);
+      expect(condition(r,2)).toMatchObject({status:'FAIL',evidence:expect.arrayContaining(['acceptance not in ledger'])});
+    }
+  });
+  it.each(['review:pending', 'review:human'])('%s cannot bypass a later ledger hold or changes', async label => {
+    const f = {...fixture(6223),labels:[...fixture(6223).labels,label]};
+    for (const held of ['human','changes']) {
+      const r = await checkPr(1,deps(f,{readReviewLedger:()=>[verdict(1,f.headRefOid),
+        verdict(1,f.headRefOid,{verdict:held,at:'2026-11-02T11:00:00Z'})]}));
+      expect(r.eligible).toBe(false);
+      expect(condition(r,2).status).toBe('FAIL');
+    }
   });
   it('label read failure is UNKNOWN', async () => {
     expect(condition(await checkPr(1,deps(undefined,{readLabels:()=>{throw Error();}})),2).status).toBe('UNKNOWN');
@@ -348,13 +369,73 @@ describe('current-head ledger acceptance regressions', () => {
     expect(condition(r,2).evidence.join(' ')).toContain('human review');
     expect(r.eligible).toBe(false);
   });
-  it('reads configured ledger store through the shared reader', async () => {
+  it('reads raw configured ledger evidence before schema normalization', async () => {
     const calls = [], rows = [verdict(6223,fixture(6223).headRefOid)];
     const adapter = createCheckDeps({env:{FIXTURE:'yes'},readLedger:async (repo,opts)=>{
-      calls.push([repo,opts.env]); return {status:'ok',rows};
+      calls.push([repo,opts.env]); return {status:'ok',text:rows.map(row=>JSON.stringify(row)).join('\n')};
     }});
-    expect(await adapter.readReviewLedger(6223)).toEqual(rows);
+    expect(await adapter.readReviewLedger(6223)).toEqual(rows.map(row=>({...row,type:'verdict'})));
     expect(calls).toEqual([[CONSTELLATION_REPOS.we.slug,{FIXTURE:'yes'}]]);
+  });
+
+  it.each([
+    ['schema-invalid human hold', JSON.stringify({pr:6223,repo:CONSTELLATION_REPOS.we.slug,verdict:'human'})],
+    ['unparseable hold', '{"pr":6223,"verdict":"human"'],
+    ['unknown PR', JSON.stringify({verdict:'human'})],
+    ['invalid PR', JSON.stringify({pr:'6223',verdict:'human'})],
+  ])('raw ledger fails closed after valid acceptance: %s', async (_kind, bad) => {
+    const text = `${JSON.stringify(verdict(6223,fixture(6223).headRefOid))}\n${bad}\n`;
+    const adapter = createCheckDeps({readLedger:async()=>({status:'ok',text})});
+    const r = await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}));
+    expect(r.eligible).toBe(false);
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
+  });
+  it('schema-invalid evidence attributed to another PR does not block this PR', async () => {
+    const text = [verdict(6223,fixture(6223).headRefOid), {pr:99,verdict:'human'}].map(row=>JSON.stringify(row)).join('\n');
+    const adapter = createCheckDeps({readLedger:async()=>({status:'ok',text})});
+    expect((await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}))).eligible).toBe(true);
+  });
+  it.each(['missing raw text', 'oversized raw text', 'oversized raw row count'])('refuses %s with human fallback', async kind => {
+    const adapter = createCheckDeps({readLedger:async()=>({status:'ok',rows:[],
+      ...(kind === 'oversized raw text' ? {text:'x'.repeat(8*1024*1024+1)}
+        : kind === 'oversized raw row count' ? {text:'{"pr":99}\n'.repeat(100001)} : {})})});
+    const r = await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}));
+    expect(r.eligible).toBe(false);
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(condition(r,2).evidence.join(' ')).toContain('human review');
+  });
+  it('configured git path validates raw text rather than filtered records', async () => {
+    const head = fixture(6223).headRefOid;
+    const adapter = createCheckDeps({
+      env:{WE_VERDICT_LEDGER_READ_STORE:'git',WE_VERDICT_LEDGER_BOARD:'fixture-board'},
+      readGitLedger:async opts => {
+        expect(opts.board).toBe('fixture-board');
+        expect(opts.repo).toBe(CONSTELLATION_REPOS.we.slug);
+        return {status:'ok',records:[verdict(6223,head)],
+          text:[verdict(6223,head),{pr:6223,verdict:'human'}].map(row=>JSON.stringify(row)).join('\n')};
+      },
+    });
+    const r = await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}));
+    expect(condition(r,2).status).toBe('UNKNOWN');
+    expect(r.eligible).toBe(false);
+  });
+  it('configured home path validates raw lines and closes the descriptor', async () => {
+    const content = Buffer.from([verdict(6223,fixture(6223).headRefOid),
+      {pr:6223,verdict:'human'}].map(row=>JSON.stringify(row)).join('\n'));
+    let position = 0, closed = false;
+    const adapter = createCheckDeps({env:{WE_VERDICT_LEDGER_READ_STORE:'home',WE_VERDICT_LEDGER_DIR:'fixture-ledger'},
+      fs:{constants:{O_RDONLY:0,O_NONBLOCK:2048},
+        openSync:path=>{expect(String(path)).toMatch(/^fixture-ledger[\\/]/);return 73;},
+        fstatSync:()=>({size:content.length,isFile:()=>true}),
+        readSync:(_fd,buffer,offset,length)=>{
+          const count = Math.min(length,content.length-position);
+          content.copy(buffer,offset,position,position+count);position+=count;return count;
+        },
+        closeSync:()=>{closed=true;},
+      }});
+    await expect(adapter.readReviewLedger(6223)).rejects.toThrow(/invalid ledger/);
+    expect(closed).toBe(true);
   });
   it('shared store unreadability remains UNKNOWN', async () => {
     const adapter = createCheckDeps({readLedger:async()=>({status:'unreadable',reason:'ledger-exceeds-read-cap'})});

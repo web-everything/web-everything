@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import yaml from 'js-yaml';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
-import { derivePrState } from '../lib/pr-state.mjs';
+import { ledgerView, derivePrState } from '../lib/pr-state.mjs';
 import { REVIEW_LABELS } from '../lib/review-labels.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { globToRegExp } from '../lib/standards-sections.mjs';
@@ -76,8 +76,12 @@ async function reviewed(pr, head, base, deps) {
   try { labels = labelNames(await deps.readLabels(pr, head)); }
   catch { return unknown(2, name, 'labels unavailable'); }
   const blocked = labels.filter(l => (l.startsWith('red-team:') && l !== 'red-team:clear')
-    || [REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, 'review:blocked'].includes(l));
-  const missing = ['review:accepted', 'red-team:clear'].filter(l => !labels.includes(l));
+    || [REVIEW_LABELS.changes, REVIEW_LABELS.heldMechanical, 'review:blocked',
+      'advisory:ruling-needed', 'advisory:needs-human', 'advisory:changes'].includes(l));
+  const missing = ['red-team:clear'].filter(l => !labels.includes(l));
+  if (![REVIEW_LABELS.accepted, 'review:pending', REVIEW_LABELS.human].some(l => labels.includes(l))) {
+    missing.push(REVIEW_LABELS.accepted);
+  }
   if (blocked.length || missing.length) return result(2, name, 'FAIL', [
     ...blocked.map(l => `blocking label: ${l}`), ...missing.map(l => `missing label: ${l}`),
   ]);
@@ -87,17 +91,22 @@ async function reviewed(pr, head, base, deps) {
   if (audit.verdict !== 'NOT WEAKENED') return result(2, name, 'FAIL', [`latest audit: ${audit.verdict}`]);
   if (!base) return unknown(2, name, 'net diff merge-base unavailable');
   if (audit.base === head || audit.base !== base) return result(2, name, 'FAIL', ['audit base does not match the classified net diff merge-base']);
-  let state;
+  let state, current;
   try {
     const events = await deps.readReviewLedger(pr);
     if (!Array.isArray(events) || events.length > MAX_AUDITS) throw new Error('invalid or oversized verdict ledger');
     // The shared derive owns validation, stale acceptance, human holds and open findings.
     // These ledger-only facts need no unrelated live agents/checks/comment probes.
-    state = derivePrState(events, { repo: CONSTELLATION_REPOS.we.slug, pr,
-      head: { sha: head }, now: new Date().toISOString() });
+    const facts = { repo: CONSTELLATION_REPOS.we.slug, pr,
+      head: { sha: head }, now: new Date().toISOString() };
+    current = ledgerView(events, facts).folded?.current;
+    state = derivePrState(events, facts);
   } catch { return unknown(2, name, 'verdict ledger unavailable or oversized'); }
   if (state.holds.some(h => ['ledger-unreadable', 'scope-unknown', 'derive-crashed'].includes(h.code)
     || h.code.startsWith('rule-crashed:'))) return unknown(2, name, 'verdict ledger could not be derived');
+  if (!current?.clears || current.coverage?.headSha?.toLowerCase() !== head.toLowerCase()) {
+    return result(2, name, 'FAIL', ['acceptance not in ledger']);
+  }
   if (!state.clears || state.reviewExempt || !state.verdict) return result(2, name, 'FAIL',
     ['verdict ledger does not accept the current head', ...state.holds.map(h => `${h.code}: ${h.reason}`)]);
   return result(2, name, 'PASS', [REVIEW_LABELS.accepted, 'red-team:clear',

@@ -5,7 +5,10 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
-import { readLedgerEventsFromStore } from '../lib/verdict-ledger.mjs';
+import { resolveLedgerReadStore, resolveLedgerBoard, validateLedgerEvent, verdictLedgerPath,
+  defaultVerdictLedgerDir } from '../lib/verdict-ledger.mjs';
+import { readLedgerFromGit } from '../lib/verdict-ledger-io.mjs';
+import { ledgerGitPath } from '../lib/verdict-ledger-path.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 const POLICY = new URL('../settings/d-r379-protected-paths.json', import.meta.url);
@@ -25,7 +28,7 @@ async function realExec(bin, args, options) {
 
 /** exec(bin, argv, options), fs, home, env, cwd and output streams are hermetically replaceable. */
 export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = process.env,
-  fs = realFs, exec = realExec, readLedger = readLedgerEventsFromStore, stdout = text => process.stdout.write(text),
+  fs = realFs, exec = realExec, readLedger, readGitLedger = readLedgerFromGit, stdout = text => process.stdout.write(text),
   stderr = text => process.stderr.write(text) } = {}) {
   const options = { cwd, env, encoding: 'utf8', timeout: 60_000, maxBuffer: MAX_BYTES, stdio: ['ignore', 'pipe', 'pipe'] };
   // Name-only rename output otherwise omits the protected source of a move. Disable
@@ -89,11 +92,43 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
     },
     async readReviewLedger(pr) {
       checkPrNumber(pr);
-      const result = await readLedger(CONSTELLATION_REPOS.we.slug, {
-        env, log: text => stderr(`${safeLog(text)}\n`),
-      });
-      if (result?.status !== 'ok') throw new Error('verdict ledger unavailable; human review required');
-      return result.rows;
+      const repo = CONSTELLATION_REPOS.we.slug;
+      const ledgerOptions = { env, log: text => stderr(`${safeLog(text)}\n`) };
+      let result;
+      if (readLedger) result = await readLedger(repo, ledgerOptions);
+      else {
+        // The shared rows-only reader drops invalid lines. Inspect the raw snapshot
+        // from the same configured store instead; never downgrade to another store.
+        const store = resolveLedgerReadStore(undefined, env);
+        const explicit = env.WE_VERDICT_LEDGER_READ_STORE?.trim().toLowerCase();
+        if (explicit && !['home', 'git'].includes(explicit)) throw new Error('unsupported strict ledger store');
+        if (store === 'git') {
+          const board = resolveLedgerBoard(repo, {}, env);
+          if (!board) throw new Error('verdict ledger board unavailable');
+          result = await readGitLedger({ ...ledgerOptions, board, repo });
+        } else if (store === 'home') {
+          const path = env === process.env ? verdictLedgerPath(repo)
+            : join(env.WE_VERDICT_LEDGER_DIR?.trim() || defaultVerdictLedgerDir(home), ledgerGitPath(repo).split('/').at(-1));
+          result = { status: 'ok', text: read(path) };
+        } else throw new Error('unsupported strict ledger store');
+      }
+      if (result?.status !== 'ok' || typeof result.text !== 'string') {
+        throw new Error('raw verdict ledger unavailable; human review required');
+      }
+      if (Buffer.byteLength(result.text) > MAX_BYTES) throw new Error('ledger bound exceeded; human review required');
+      const lines = result.text.split(/\r?\n/).filter(line => line.trim());
+      if (lines.length > 100_000) throw new Error('ledger row bound exceeded; human review required');
+      const rows = [];
+      for (const line of lines) {
+        // An unparseable line has unknown scope and cannot be safely discarded.
+        const raw = JSON.parse(line);
+        if (!Number.isSafeInteger(raw?.pr) || raw.pr < 1) throw new Error('unknown ledger PR; human review required');
+        if (raw.pr !== pr) continue;
+        const { valid, record } = validateLedgerEvent(raw);
+        if (!valid) throw new Error('invalid ledger event; human review required');
+        if (record.repo.toLowerCase() === repo.toLowerCase()) rows.push(record);
+      }
+      return rows;
     },
     async fetchNetDiff(pr, head) {
       checkPrNumber(pr);
