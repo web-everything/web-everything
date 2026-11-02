@@ -29,9 +29,9 @@ export function matchesGlob(path, glob) {
 }
 
 function validateSettings(settings) {
-  for (const key of ['directionPaths', 'protectedPaths']) {
-    const patterns = settings?.[key];
-    if (!Array.isArray(patterns) || !patterns.length || patterns.length > 1000
+  for (const key of ['directionPaths', 'protectedPaths', 'enforcementTrees', 'reviewedSafePaths']) {
+    const patterns = key === 'reviewedSafePaths' && settings?.[key] === undefined ? [] : settings?.[key];
+    if (!Array.isArray(patterns) || (key !== 'reviewedSafePaths' && !patterns.length) || patterns.length > 1000
       || patterns.some(p => typeof p !== 'string' || !p.trim() || p.length > 4096)) {
       throw new Error('incomplete path policy');
     }
@@ -40,7 +40,7 @@ function validateSettings(settings) {
   if (!Array.isArray(records) || !records.length || records.length > 1000
     || records.some(path => !validPath(path) || /[*?\[\]]/.test(path))
     || new Set(records).size !== records.length) throw new Error('invalid ruling record paths');
-  return settings;
+  return { ...settings, reviewedSafePaths: settings.reviewedSafePaths ?? [] };
 }
 
 function labelNames(labels) {
@@ -128,6 +128,54 @@ function decisionState(text) {
   return { decision: data.kind === 'decision' || data.type === 'decision' };
 }
 
+/** Zero-context, append-only patch; counts and exact appended bytes prove completeness. */
+function rulingAddedLines(patch, appended, expectedCount) {
+  if (typeof patch !== 'string' || Buffer.byteLength(patch) > 8 * 1024 * 1024
+    || !patch.endsWith('\n')) throw new Error('missing or oversized ruling diff');
+  const added = [];
+  let remaining = 0, hunks = 0, files = 0, noNewline = false;
+  for (const line of patch.slice(0, -1).split('\n')) {
+    if (remaining) {
+      if (!line.startsWith('+')) throw new Error('incomplete append hunk');
+      added.push(line.slice(1));
+      remaining--;
+    } else if (line.startsWith('diff --git ')) {
+      files++;
+    } else if (line.startsWith('@@')) {
+      const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+      if (!hunk || Number(hunk[1] ?? 1) !== 0) throw new Error('not an append hunk');
+      remaining = Number(hunk[2] ?? 1);
+      if (!Number.isSafeInteger(remaining) || remaining < 1 || noNewline) throw new Error('invalid hunk');
+      hunks++;
+    } else if (line === '\\ No newline at end of file' && hunks && !noNewline) {
+      noNewline = true;
+    } else if (hunks) {
+      throw new Error('unexpected append diff line');
+    }
+  }
+  if (files !== 1 || !hunks || remaining || added.length !== expectedCount
+    || added.join('\n') + (noNewline ? '' : '\n') !== appended) throw new Error('incomplete ruling additions');
+  return added;
+}
+
+function isCitedRulingEntry(lines, metadata) {
+  const cited = new Set([...`${metadata.title}\n${metadata.body}`.matchAll(/\b(?:D-)?R(\d+)\b/gi)]
+    .map(match => match[1]));
+  let inEntry = false, entries = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const entry = /^- \*\*(?:D-)?R(\d+)\*\*(?:[ \t]|$)/.exec(line);
+    if (entry) {
+      if (!cited.has(entry[1])) return false;
+      inEntry = true;
+      entries++;
+    } else if (!inEntry || !/^(?: {2,}|\t)/.test(line)) {
+      return false;
+    }
+  }
+  return entries > 0;
+}
+
 async function directionPaths(paths, settings, metadata, head, base, deps) {
   const matches = [], unreadable = [];
   let touchesDecision = false;
@@ -186,15 +234,32 @@ async function directionPaths(paths, settings, metadata, head, base, deps) {
       if (after.length <= before.length || !after.startsWith(before)) {
         return result(3, 'Sets no direction', 'FAIL', [`direction path (not EOF-only append): ${path}`]);
       }
+      let added;
+      try {
+        added = rulingAddedLines(await deps.readRulingDiff(base, head, [path]),
+          after.slice(before.length), rows.find(row => row.path === path).added);
+      } catch { return unknown(3, 'Sets no direction', `ruling added-line evidence unavailable, invalid or oversized: ${path}`); }
+      if ((before && !before.endsWith('\n')) || !isCitedRulingEntry(added, metadata)) {
+        return result(3, 'Sets no direction', 'FAIL', [`direction path (not a cited ruling entry): ${path}`,
+          'provenance claimed by PR, not verified']);
+      }
     }
   }
-  return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', ...hits] : ['no direction paths or touched decision cards']);
+  return result(3, 'Sets no direction', 'PASS', recording ? ['R391 ruling-record', 'provenance claimed by PR, not verified', ...hits] : ['no direction paths or touched decision cards']);
 }
 
 function protectedPaths(paths, settings) {
   const hits = paths.filter(path => settings.protectedPaths.some(glob => matchesGlob(path, glob)));
-  return result(4, 'Not guard-loosening / hard to undo', hits.length ? 'FAIL' : 'PASS',
-    hits.length ? hits.map(path => `protected path: ${path}`) : ['no protected paths']);
+  if (hits.length) return result(4, 'Not guard-loosening / hard to undo', 'FAIL',
+    hits.map(path => `protected path: ${path}`));
+  const unclassified = paths.filter(path => {
+    const rootContent = !path.includes('/') && /^(?:README|LICENSE|CHANGELOG)/.test(path);
+    return settings.enforcementTrees.some(glob => !(rootContent && glob === '*') && matchesGlob(path, glob))
+      && !settings.reviewedSafePaths.some(glob => matchesGlob(path, glob));
+  });
+  return result(4, 'Not guard-loosening / hard to undo', unclassified.length ? 'UNKNOWN' : 'PASS',
+    unclassified.length ? unclassified.map(path => `unclassified enforcement-tree path: ${path}; operator review`)
+      : ['no protected or unclassified enforcement-tree paths']);
 }
 
 /** Return all five conditions; seats are informational and never authorize approval. */

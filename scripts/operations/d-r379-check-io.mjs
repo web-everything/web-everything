@@ -157,6 +157,17 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       }
       return run('git', ['--literal-pathspecs', 'diff', '--numstat', '-z', base, head, '--', ...paths]);
     },
+    readRulingDiff(base, head, paths) {
+      checkSha(base);
+      checkSha(head);
+      if (!Array.isArray(paths) || !paths.length || paths.length > 1000
+        || paths.some(path => typeof path !== 'string' || !path || path.length > 4096
+          || path.startsWith('/') || path.includes('\\') || path.includes('\0')
+          || path.split('/').some(part => !part || part === '.' || part === '..'))) {
+        throw new Error('invalid ruling paths; human review required');
+      }
+      return run('git', ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--unified=0', base, head, '--', ...paths]);
+    },
     readRulingFile(sha, path) {
       checkSha(sha);
       if (typeof path !== 'string' || !path || path.length > 4096
@@ -184,7 +195,7 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
       }
     },
     readSettings() {
-      return configuredPolicy('d-r379-protected-paths', JSON.parse(read(POLICY)));
+      return configuredPolicy('d-r379-protected-paths', JSON.parse(read(POLICY)), { reviewedSafePaths: [] });
     },
     readAudits() {
       let tool;

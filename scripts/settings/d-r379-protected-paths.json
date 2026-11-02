@@ -8,6 +8,21 @@
     "src/_includes/*-descriptions/**"
   ],
   "rulingRecordPaths": ["docs/agent/platform-decisions.md"],
+  "enforcementTrees": [
+    "scripts/**",
+    ".github/**",
+    ".claude/**",
+    "docs/agent/**",
+    "*",
+    "**/*.rs",
+    "**/*.sh",
+    "**/*.bash",
+    "**/*.zsh",
+    "**/*.ksh",
+    "**/*.csh",
+    "**/*.fish"
+  ],
+  "reviewedSafePaths": [],
   "protectedPaths": [
     "tests/**",
     "**/*.spec.*",

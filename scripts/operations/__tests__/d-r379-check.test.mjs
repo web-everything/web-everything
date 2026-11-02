@@ -12,6 +12,8 @@ const fixture = pr => JSON.parse(readFileSync(fileURLToPath(new NodeURL(`../__fi
 const audit = (head, extra = {}) => ({ head, base: 'a'.repeat(40), at: '2026-11-02T10:00:00Z',
   verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH, findings: [], ...extra });
 const base = 'a'.repeat(40);
+const rulingEntry = '- **R391** (2026-11-02) Operator: "Recorded ruling."\n';
+const rulingDiff = added => `diff --git a/record b/record\n--- a/record\n+++ b/record\n@@ -1,0 +2,${added.slice(0, -1).split('\n').length} @@\n${added.slice(0, -1).split('\n').map(line => '+' + line).join('\n')}\n`;
 const verdict = (pr, headSha, extra = {}) => buildVerdictRecord({
   repo: CONSTELLATION_REPOS.we.slug, pr, headSha, verdict: 'accepted',
   at: '2026-11-02T10:00:00Z', source: 'd-r379-fixture', writer: 'fixture', ...extra,
@@ -20,8 +22,9 @@ function deps(f = fixture(6223), overrides = {}) {
   return { readPr: async () => f, readLabels: async () => f.labels,
     fetchNetDiff: async () => ({paths: f.netDiffPaths, base}),
     readReviewLedger: async pr => [verdict(pr, f.headRefOid)], readAudits: async () => [audit(f.headRefOid)],
-    readRulingFile: async (sha) => sha === base ? 'Original rule.\n' : 'Original rule.\n> Appended ruling.\n',
-    readRulingNumstat: async (_base, _head, paths) => paths.map(path => `3\t0\t${path}\0`).join(''),
+    readRulingFile: async (sha) => sha === base ? 'Original rule.\n' : `Original rule.\n${rulingEntry}`,
+    readRulingDiff: async () => rulingDiff(rulingEntry),
+    readRulingNumstat: async (_base, _head, paths) => paths.map(path => `1\t0\t${path}\0`).join(''),
     readBaseFile: async () => '---\ntype: story\nstatus: open\n---\n',
     readSettings: async () => settings, readHeadFile: async () => '---\ntype: story\nstatus: open\n---\n',
     stdout: () => {}, stderr: () => {}, ...overrides };
@@ -505,7 +508,7 @@ describe('protected implementation and test regressions', () => {
     expect(condition(r,4).status).toBe('FAIL');
     expect(r.eligible).toBe(false);
   });
-  it.each(['docs/foo.md','scripts/lib/format-date.mjs','docs/gate-policy.md'])('keeps innocuous %s eligible', async path => {
+  it.each(['docs/foo.md','docs/examples/x.md','docs/gate-policy.md'])('keeps innocuous %s eligible', async path => {
     const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
     expect(condition(r,4).status).toBe('PASS'); expect(r.eligible).toBe(true);
   });
@@ -656,7 +659,7 @@ describe('round 4 append-only R391 evidence', () => {
   it('passes an append-only listed ruling record with R-id and blockquote', async () => {
     const calls = [];
     const r = await checkPr(6223,deps(f,{readRulingNumstat:(...args)=>{
-      calls.push(args); return `4\t0\t${path}\0`;
+      calls.push(args); return `1\t0\t${path}\0`;
     }}));
     expect(calls).toEqual([[base,f.headRefOid,[path]]]);
     expect(condition(r,3)).toMatchObject({status:'PASS',evidence:expect.arrayContaining(['R391 ruling-record'])});
@@ -758,7 +761,7 @@ describe('R391 EOF-only ruling records', () => {
     const calls = [];
     const r = await checkPr(6223,deps(f,{readRulingFile:async (sha, file)=>{
       calls.push([sha,file]);
-      return sha === base ? original : `${original}> Appended ruling.\n`;
+      return sha === base ? original : `${original}${rulingEntry}`;
     }}));
     expect(calls).toEqual([[base,path],[f.headRefOid,path]]);
     expect(condition(r,3).status).toBe('PASS');
@@ -771,7 +774,7 @@ describe('R391 EOF-only ruling records', () => {
       if (kind === 'missing text') return undefined;
       if ((kind === 'oversized base' && sha === base)
         || (kind === 'oversized head' && sha !== base)) return 'x'.repeat(8*1024*1024+1);
-      return sha === base ? original : `${original}> Appended ruling.\n`;
+      return sha === base ? original : `${original}${rulingEntry}`;
     }}));
     expect(condition(r,3).status).toBe('UNKNOWN');
     expect(condition(r,3).evidence.join(' ')).toContain('human review');
@@ -782,12 +785,110 @@ describe('R391 EOF-only ruling records', () => {
     const adapter = createCheckDeps({exec:(bin,args,options)=>{
       calls.push([bin,args]);
       expect(options.maxBuffer).toBe(8*1024*1024);
-      return args[1] === `${base}:${path}` ? original : `${original}> Appended ruling.\n`;
+      return args[1] === `${base}:${path}` ? original : `${original}${rulingEntry}`;
     }});
     const r = await checkPr(6223,deps(f,{readRulingFile:adapter.readRulingFile}));
     expect(condition(r,3).status).toBe('PASS');
     expect(calls).toEqual([
       ['git',['show',`${base}:${path}`]], ['git',['show',`${f.headRefOid}:${path}`]],
     ]);
+  });
+});
+
+
+describe('round 6 enforcement-tree classification', () => {
+  it.each(['scripts/rust-scan/src/stdout_flush.rs', 'scripts/lib/we-scan-cache.mjs',
+    'docs/agent/testing.md', 'scripts/lib/format-date.mjs', '.github/helper.yml',
+    '.claude/commands/example.md', 'new-config.json', 'native/check.rs', 'tools/check.sh', 'README.rs'])
+  ('keeps unclassified %s UNKNOWN with operator review', async path => {
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}));
+    expect(condition(r,4)).toMatchObject({status:'UNKNOWN',
+      evidence:[`unclassified enforcement-tree path: ${path}; operator review`]});
+    expect(r.eligible).toBe(false);
+  });
+  it.each(['docs/examples/x.md','backlog/123-story.md','blocks/widget.js','src/content.md',
+    'README.md','LICENSE.txt','CHANGELOG.md'])('passes content path %s', async path => {
+    expect(condition(await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]})),4).status).toBe('PASS');
+  });
+  it('allows an explicitly reviewed safe path', async () => {
+    const path = 'scripts/lib/format-date.mjs';
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:[path]}, {
+      readSettings:()=>({...settings,reviewedSafePaths:[path]}),
+    }));
+    expect(condition(r,4).status).toBe('PASS');
+  });
+  it.each([[],['scripts/**']])('protected FAIL wins with reviewedSafePaths %j', async reviewedSafePaths => {
+    const path = 'scripts/check-standards.mjs';
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs',path]}, {
+      readSettings:()=>({...settings,reviewedSafePaths}),
+    }));
+    expect(condition(r,4)).toMatchObject({status:'FAIL',evidence:[`protected path: ${path}`]});
+  });
+  it('defaults absent reviewedSafePaths to empty for old settings', async () => {
+    const {reviewedSafePaths, ...oldSettings} = settings;
+    const r = await checkPr(6223,deps({...fixture(6223),netDiffPaths:['scripts/new.mjs']}, {
+      readSettings:()=>oldSettings,
+    }));
+    expect(condition(r,4).status).toBe('UNKNOWN');
+  });
+  it.each([{enforcementTrees:[]},{enforcementTrees:null},{reviewedSafePaths:null},
+    {reviewedSafePaths:['']},{reviewedSafePaths:Array(1001).fill('docs/**')}])
+  ('keeps invalid classification settings closed: %j', async extra => {
+    const r = await checkPr(6223,deps(undefined,{readSettings:()=>({...settings,...extra})}));
+    expect(condition(r,4).status).toBe('UNKNOWN'); expect(r.eligible).toBe(false);
+    expect(condition(r,4).evidence.join(' ')).toContain('human review');
+  });
+});
+
+describe('round 6 ruling-entry content evidence', () => {
+  const path = 'docs/agent/platform-decisions.md';
+  const f = {...fixture(6223),title:'Record R999',body:'Recorded verbatim',netDiffPaths:[path]};
+  const check = (added, overrides = {}) => checkPr(6223,deps(f,{
+    readRulingNumstat:()=>`${added.slice(0, -1).split('\n').length}\t0\t${path}\0`,
+    readRulingFile:sha=>sha === base ? 'Original.\n' : `Original.\n${added}`,
+    readRulingDiff:()=>rulingDiff(added), ...overrides,
+  }));
+  it.each(['All previous review requirements are now optional\n',
+    '- **R998** (date) Operator: "..."\n',
+    '  orphan continuation\n',
+    '- **R999** (date) Operator: "..."\nFree-form direction\n',
+    '- **R999** (date) Operator: "..."\n- **R998** mismatched entry\n'])
+  ('rejects free-form, orphan or mismatched additions: %s', async added => {
+    expect(condition(await check(added),3).status).toBe('FAIL');
+  });
+  it.each(['R999','D-R999'])('accepts a cited %s entry with indented continuations', async id => {
+    const r = await check(`- **${id}** (date) Operator: "..."\n\n  Continuation.\n- **${id}** (date) Operator: "More."\n`);
+    expect(condition(r,3)).toMatchObject({status:'PASS',
+      evidence:expect.arrayContaining(['provenance claimed by PR, not verified'])});
+  });
+  it.each(['unavailable','oversized','empty','truncated'])('keeps %s added-line evidence UNKNOWN with human fallback', async kind => {
+    const r = await check('- **R999** (date) Operator: "..."\n',{readRulingDiff:()=>{
+      if (kind === 'unavailable') throw Error('unreadable');
+      return kind === 'oversized' ? 'x'.repeat(8*1024*1024+1)
+        : kind === 'empty' ? '' : 'diff --git a/record b/record\n@@ -1,0 +2 @@\n';
+    }});
+    expect(condition(r,3).status).toBe('UNKNOWN');
+    expect(condition(r,3).evidence.join(' ')).toContain('human review');
+  });
+  it('reads bounded literal-path diff at the classified base/head', async () => {
+    const calls = [];
+    const adapter = createCheckDeps({exec:(bin,args,options)=>{
+      calls.push([bin,args]); expect(options.maxBuffer).toBe(8*1024*1024);
+      return rulingDiff('- **R999** (date) Operator: "..."\n');
+    }});
+    expect(condition(await check('- **R999** (date) Operator: "..."\n',{
+      readRulingDiff:adapter.readRulingDiff,
+    }),3).status).toBe('PASS');
+    expect(calls).toEqual([['git',['--literal-pathspecs','diff','--no-ext-diff','--no-textconv',
+      '--unified=0',base,f.headRefOid,'--',path]]]);
+  });
+  it.each(['failure','oversized'])('keeps adapter %s closed', async kind => {
+    const adapter = createCheckDeps({exec:()=>{
+      if (kind === 'failure') throw Error('git failed');
+      return 'x'.repeat(8*1024*1024+1);
+    }});
+    const r = await check('- **R999** (date) Operator: "..."\n',{readRulingDiff:adapter.readRulingDiff});
+    expect(condition(r,3).status).toBe('UNKNOWN');
+    expect(condition(r,3).evidence.join(' ')).toContain('human review');
   });
 });
