@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { checkPr, main, matchesGlob } from '../d-r379-check.mjs';
@@ -477,6 +477,54 @@ describe('current-head ledger acceptance regressions', () => {
     expect(condition(r,2).status).toBe('UNKNOWN');
     expect(r.eligible).toBe(false);
   });
+  it.each(['unreadable result', 'rejected read'])
+    ('does not fall back to home when configured Git ledger is unreadable: %s', async failure => {
+      // Home has an older acceptance but cannot establish the configured store's current state.
+      const content = Buffer.from(`${JSON.stringify(verdict(6223,fixture(6223).headRefOid))}\n`);
+      let position = 0;
+      const fs = {
+        constants:{O_RDONLY:0,O_NONBLOCK:2048},
+        openSync:vi.fn(path=>{
+          expect(String(path)).toMatch(/^fixture-ledger[\\/]/);
+          position = 0;
+          return 73;
+        }),
+        fstatSync:vi.fn(()=>({size:content.length,isFile:()=>true})),
+        readSync:vi.fn((_fd,buffer,offset,length)=>{
+          const count = Math.min(length,content.length-position);
+          content.copy(buffer,offset,position,position+count);position+=count;return count;
+        }),
+        closeSync:vi.fn(),
+      };
+      const env = {WE_VERDICT_LEDGER_READ_STORE:'git',WE_VERDICT_LEDGER_BOARD:'fixture-board',
+        WE_VERDICT_LEDGER_DIR:'fixture-ledger'};
+      const readGitLedger = vi.fn(async ()=>{
+        if (failure === 'rejected read') throw Error('configured Git ledger unavailable');
+        return {status:'unreadable',reason:'fetch-failed'};
+      });
+      const adapter = createCheckDeps({env,fs,readGitLedger,stderr:()=>{}});
+      const r = await checkPr(6223,deps(undefined,{readReviewLedger:adapter.readReviewLedger}));
+      expect(readGitLedger).toHaveBeenCalledTimes(1);
+      expect(readGitLedger).toHaveBeenCalledWith(expect.objectContaining({
+        board:'fixture-board',repo:CONSTELLATION_REPOS.we.slug,env,
+      }));
+      expect(fs.openSync).not.toHaveBeenCalled();
+      expect(fs.readSync).not.toHaveBeenCalled();
+      expect(condition(r,2).status).toBe('UNKNOWN');
+      expect(condition(r,2).evidence.join(' ')).toContain('human review');
+      expect(r.eligible).toBe(false);
+      expect(r.conditions.filter(c=>[1,3,4].includes(c.id)).map(c=>c.status)).toEqual(['PASS','PASS','PASS']);
+
+      // Prove the home fixture really is readable and would otherwise authorize this head.
+      const home = createCheckDeps({env:{...env,WE_VERDICT_LEDGER_READ_STORE:'home'},fs,readGitLedger,stderr:()=>{}});
+      const control = await checkPr(6223,deps(undefined,{readReviewLedger:home.readReviewLedger}));
+      expect(condition(control,2).status).toBe('PASS');
+      expect(control.eligible).toBe(true);
+      expect(fs.openSync).toHaveBeenCalledTimes(1);
+      expect(fs.readSync).toHaveBeenCalled();
+      expect(fs.closeSync).toHaveBeenCalledWith(73);
+      expect(readGitLedger).toHaveBeenCalledTimes(1);
+    });
   it('configured home path validates raw lines and closes the descriptor', async () => {
     const content = Buffer.from([verdict(6223,fixture(6223).headRefOid),
       {pr:6223,verdict:'human'}].map(row=>JSON.stringify(row)).join('\n'));
