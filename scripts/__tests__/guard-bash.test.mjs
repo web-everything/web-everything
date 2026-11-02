@@ -3683,7 +3683,8 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   it.each([
     `GIT_DIR=${CLONE}/.git git log && git commit -m x`,
     `env GIT_WORK_TREE=${CLONE} git log; git reset --hard`,
-    `echo GIT_DIR=${CLONE}/.git; git add .`,
+    // Name the staged file so the independent enumeration guard does not mask environment scoping.
+    `echo GIT_DIR=${CLONE}/.git; git add notes.md`,
     `git reset --hard; printf '%s\\n' GIT_DIR=${CLONE}/.git`,
     `git reset --hard; export GIT_WORK_TREE=${CLONE}`,
     `git reset --hard; GIT_DIR=${CLONE}/.git`,
@@ -3697,6 +3698,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
 
   it.each([
     `export GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `export GIT_DIR=${CLONE}/.git; git add notes.md`,
     `GIT_WORK_TREE=${CLONE}; git clean -fd`,
     `command env GIT_DIR=${CLONE}/.git git reset --hard`,
     `export GIT_DIR=${CLONE}/.git; bash -c 'git reset --hard'`,
