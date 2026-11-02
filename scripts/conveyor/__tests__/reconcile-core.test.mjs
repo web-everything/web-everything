@@ -3956,6 +3956,11 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     const plan = planReconcile({ prs: [open()], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 1563, label: 'review:pending' })]);
   });
+  it('fails closed: an unlabelled green bot PR on ci/refresh-test-timings is owed review:pending (PR #6254)', () => {
+    const pr = open({ number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', author: { login: 'github-actions[bot]', __typename: 'Bot' } });
+    const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 6254, label: 'review:pending' })]);
+  });
   it('waits out the grace so a label-on-green producer can label ready-to-merge first', () => {
     const fresh = open({ statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 60_000).toISOString() })) });
     expect(planReconcile({ prs: [fresh], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
@@ -3972,11 +3977,14 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
       expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
     }
   });
-  it('never for a labelled, draft, red/pending, ready-to-merge or non-lane PR', () => {
+  it('an unlabelled green non-lane human PR is owed review:pending', () => {
+    const plan = planReconcile({ prs: [open({ headRefName: 'feature/human' })], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
+  it('never for a labelled, draft, red/pending or ready-to-merge PR', () => {
     for (const p of [
       open({ labels: lbl('review:accepted') }), open({ labels: lbl('review:pending') }), open({ labels: lbl('ready-to-merge') }),
       open({ isDraft: true }), open({ statusCheckRollup: pendingRollup }), open({ statusCheckRollup: redRollup }),
-      open({ headRefName: 'feature/human' }),
     ]) {
       expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
     }

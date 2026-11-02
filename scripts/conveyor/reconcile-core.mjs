@@ -2801,7 +2801,7 @@ export function planReconcile({
     }
 
     // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —
-    // an OPEN, GREEN, non-draft `lane/*` PR carrying NO `review:*` label (and no `ready-to-merge` landing-gate
+    // an OPEN, GREEN, non-draft PR carrying NO `review:*` label (and no `ready-to-merge` landing-gate
     // label either) is in limbo forever: `classifyPr` reads phase `open` ("no hold recorded"), the generic table
     // answers `nothing-owed`, and no daemon ever owns it. The producer (`pr-land --label-on-green`) exits
     // WITHOUT any label when its green-wait ends red/timeout/behind, and the fix daemon later heals the red —
@@ -2816,12 +2816,11 @@ export function planReconcile({
     // {@link reviewChecksAllow}, exactly as for a labelled stacked PR.
     const stackedLanePr = typeof pr?.baseRefName === 'string' && pr.baseRefName.startsWith('lane/') && pr.baseRefName !== defaultBranch;
     if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red'))
-        && String(pr?.headRefName ?? '').startsWith('lane/')
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
         && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
-        why: 'open lane PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
+        why: 'open PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
           + 'nothing would ever own it; apply review:pending so the ordinary review path picks it up',
       });
       continue;
