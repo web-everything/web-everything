@@ -113,9 +113,9 @@ function fromKey(key) {
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
   return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
 }
-export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null } = {}) {
+export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null, retainKeys = [] } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));
-  const retained = new Set([...prev].filter(key => incomplete || (clearKinds && !clearKinds.has(fromKey(key).was))));
+  const retained = new Set([...prev].filter(key => incomplete || retainKeys.includes(key) || (clearKinds && !clearKinds.has(fromKey(key).was))));
   const lines = [];
   for (const [key, item] of current) if (!prev.has(key)) {
     const event = { at, ...item };
@@ -310,7 +310,10 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const stalled = honorStalled ? prev.openKeys.filter(k => k.endsWith(':stalled')).map(k => k.slice(0, -':stalled'.length)) : [];
     const asked = i => !GATE_KINDS.has(i.kind) && !!i.head && stalled.includes(`${i.repo}#${i.pr}@${i.head}`); // only a resolved, matching head
     const fresh = items.filter(i => !asked(i) || prev.openKeys.includes(keyOf(i)));
-    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
+    // Unreadable or missing evidence (red-team-undecided) never clears an open confirmed-break alert on that head.
+    const undecided = new Set(fresh.filter(i => i.kind === 'red-team-undecided').map(i => `${i.repo}#${i.pr}@${i.head}`));
+    const retainKeys = prev.openKeys.filter(k => k.endsWith(':confirmed-break-owed-send-back') && undecided.has(k.slice(0, -':confirmed-break-owed-send-back'.length)));
+    const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete, retainKeys });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
     return result;

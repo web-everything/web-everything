@@ -424,6 +424,16 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(result.openKeys).toEqual([]);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('r#5768 held back from your review: the red team blocked the live head'));
   });
+  it('unreadable live evidence keeps an open confirmed-break alert open instead of clearing it', async () => {
+    const path = join(temp(), 'needs-you-events.jsonl'), key = `r#5768@${head}:confirmed-break-owed-send-back`;
+    writeFileSync(sidecarsOf(path).state, JSON.stringify({ openKeys: [key] }));
+    const settings = { enabled: { value: true }, intervalMinutes: { value: 2 }, path: { value: path }, allowPrimary: { value: true } };
+    const gh = async () => { throw new Error('rate limited'); };
+    const result = await runOnce({ exec: async () => JSON.stringify({ ready: [{ repo: 'r', number: 5768, head, title: 't' }] }), gh, settings,
+      env: {}, now: at, log: () => {}, checkoutRoot: join(temp(), 'workspace/.lanes/we/lane-1') });
+    expect(result.openKeys).toContain(key);
+    expect(result.lines.join('\n')).not.toContain('NEEDS-YOU-CLEARED');
+  });
   it('publishes the head it CHECKED, not a stale one from the report or a later lookup', async () => {
     const stale = [{ repo, number: 5768, head: 'stale' }];
     const r2 = { ready: stale };
