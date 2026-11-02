@@ -160,7 +160,8 @@ export function readFromFreshOrigin({ repo, checkCoverage, root = rootDir(), exe
   } finally {
     try { git(['worktree', 'remove', '--force', tree]); } catch { /* directory deleted, then registration pruned, below */ }
     rmSync(tmp, { recursive: true, force: true });
-    try { git(['worktree', 'prune']); } catch { /* best effort */ }
+    // A registration that cannot be pruned is a refusal, not a silent leak.
+    try { git(['worktree', 'prune']); } catch (error) { throw new Error(`worktree cleanup failed: ${String(error?.message ?? error).slice(0, 200)}`); }
   }
 }
 

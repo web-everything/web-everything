@@ -669,3 +669,15 @@ it('prunes the registration even when git cannot remove the worktree', () => {
     expect(calls.filter(Boolean)).toEqual(['add', 'remove', 'prune']);
   } finally { rmSync(f.tmp, { recursive: true, force: true }); }
 });
+
+it('fails closed when neither remove nor prune can clear the worktree registration', () => {
+  const f = gitFixture();
+  try {
+    f.advance(); git(f.clone, 'fetch', '-q', 'origin', 'main');
+    const broken = (bin, args, opts) => {
+      if (bin === 'git' && (args.includes('remove') || args.includes('prune'))) throw new Error('git refused');
+      return execFileSync(bin, args, opts);
+    };
+    expect(() => readFromFreshOrigin({ repo, root: f.clone, exec: broken })).toThrow(/worktree cleanup failed/);
+  } finally { rmSync(f.tmp, { recursive: true, force: true }); }
+});
