@@ -84,7 +84,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { join, basename, resolve, dirname, sep } from 'node:path';
 import { resolveReal } from './guard-lane.mjs';
-import { readGit } from './lib/proc-read.mjs';
+import { readGit, execRead } from './lib/proc-read.mjs';
+import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './lib/git-bounded.mjs';
+import { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
 // unattributed, GraphQL-backed `execFileSync`, run on EVERY `acquire` and EVERY `list --acquirable` scan
 // across every session in every pool — measured as the top unattributed slice of the app's GraphQL bucket
@@ -161,6 +163,7 @@ import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict
 // the acquire-time twin of `cleanLaneLitter`'s release-time cleanup — same allowlist, same verdict, never a
 // second hand-rolled classifier.
 import { cleanLaneLitter, planLitterCleanup } from './lib/lane-litter.mjs';
+import { salvageLaneCards } from './lib/lane-card-salvage.mjs';
 import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // #3383 gap 2 (auto-reclaim) — the SAME preservation primitives `lane-whois.mjs` itself uses to prove a lane's
 // uncommitted/ahead content is provably preserved (identical blob in origin, or a pushed/patch-equivalent
@@ -272,10 +275,21 @@ const scanTimeoutOpt = () => (scanDeadlineMs === null ? {} : { timeout: Math.max
 // Shared with `resolveLaneAcquireTimeoutMs`, so an outer wrapper around `acquire` is never tighter than this.
 const NETWORK_GIT_TIMEOUT_MS = SHARED_NETWORK_GIT_TIMEOUT_MS;
 const defaultGitTimeoutOpt = () => ({ timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
-const git = (args, cwd, opts = {}) =>
-  readGit(laneTransportArgs(args), { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts }).trim(); // #74d: throws on failure/oversize
-const gitQuiet = (args, cwd, opts = {}) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: LANE_GIT_ENV, ...opts });
+// A network git call (fetch/clone/ls-remote) spawns grandchildren (`index-pack`, ssh) that a plain child-kill timeout
+// orphans. Those run under `git-bounded.mjs`, which owns a process group and kills the whole group on timeout.
+const BOUNDED_NETWORK_GIT = new Set(['fetch', 'clone', 'ls-remote']);
+const git = (args, cwd, opts = {}) => {
+  const full = laneTransportArgs(args);
+  const options = { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(args), ...scanTimeoutOpt(), ...opts };
+  if (!BOUNDED_NETWORK_GIT.has(args[0])) return readGit(full, options).trim(); // #74d: throws on failure/oversize
+  const bounded = boundedGitCommand(full, options.timeout);
+  return execRead(bounded.file, bounded.args, { ...options, timeout: options.timeout + BOUNDED_GIT_GRACE_MS }).trim();
+};
+const gitQuiet = (args, cwd, opts = {}) => {
+  const options = { cwd, encoding: 'utf8', stdio: ['ignore', 'ignore', 'inherit'], timeout: NETWORK_GIT_TIMEOUT_MS, killSignal: 'SIGKILL', env: LANE_GIT_ENV, ...opts };
+  const bounded = BOUNDED_NETWORK_GIT.has(args[0]) ? boundedGitCommand(args, options.timeout) : null;
+  return execFileSync(bounded ? bounded.file : 'git', bounded ? bounded.args : args, bounded ? { ...options, timeout: options.timeout + BOUNDED_GIT_GRACE_MS } : options);
+};
 const tryGit = (args, cwd, opts = {}) => {
   try {
     return git(args, cwd, opts);
@@ -371,6 +385,8 @@ function resolveRepo(repoFlags = flags) {
   // GC and release can maintain leases without a trusted origin, but recovery must never forward a lane remote.
   let canonicalOrigin = true;
   let smokeOrigin = null;
+  let discoveredPrimaryPath = null;
+  let referenceValidated = false; // true only when the ownership scan above proved the reference is not a lane
   let originBase = topLevel;
   if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
@@ -412,8 +428,19 @@ function resolveRepo(repoFlags = flags) {
           }
         } catch { /* Missing or unreadable ownership evidence keeps the existing refusal. */ }
       }
+      // Run from inside a lane (a release/gc cwd): the lane's own remote is no anchor, but the pool's primary checkout
+      // is found by name in the workspace, never from lane-controlled paths.
+      if (!smokeOrigin && !unreadableOwner && (cmd === 'release' || cmd === 'gc')) {
+        const primary = findPrimaryForPool({
+          workspaceDir: dirname(resolve(POOL_ROOT)), poolName: originSourcePaths.map(poolNameFromLanePath).find(Boolean),
+          readOrigin: (dir) => tryGit(['remote', 'get-url', 'origin'], dir, gitOptions),
+        });
+        if (primary) { smokeOrigin = primary.origin; originBase = primary.path; discoveredPrimaryPath = primary.path; }
+      }
       canonicalOrigin = !!smokeOrigin;
       if (!canonicalOrigin && needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
+    } else {
+      referenceValidated = true;
     }
   }
   const rawOrigin = repoFlags.origin || smokeOrigin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
@@ -446,7 +473,8 @@ function resolveRepo(repoFlags = flags) {
   // Only discover a default when --branch is absent; explicit-branch acquire must not pay for an unused probe.
   const head = repoFlags.branch ? null : tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], topLevel, gitOptions);
   const branch = repoFlags.branch || (head ? head.replace(/^origin\//, '') : 'main');
-  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, branch, poolDir: join(POOL_ROOT, name) };
+  // alternatesReferencePath: the object store lanes may borrow. A primary found by name replaces the invoking lane.
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath: discoveredPrimaryPath || (referenceValidated ? topLevel : null), branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -963,8 +991,21 @@ function cloneLane(repo, n) {
     fail(`could not determine an origin URL for pool "${repo.name}" — --pool selects an existing pool for read/release only; to clone/acquire a lane pass --repo=<checkout> or --origin=<url>`);
   }
   const ref = cloneReferenceArgs(repo.referencePath);
-  log(`  clone lane-${n} ← ${repo.originUrl} ${ref.length ? `(--reference ${repo.referencePath})` : '(no --reference: shallow)'} …`);
-  gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
+  if (ref.length) {
+    log(`  clone lane-${n} ← ${repo.originUrl} (--reference ${repo.referencePath}) …`);
+    gitQuiet(['clone', '--quiet', '-c', 'gc.auto=0', ...ref, repo.originUrl, dest]);
+  } else {
+    // `git clone --reference` is fatal for a shallow primary, but borrowing its objects through alternates is not:
+    // init, point alternates at the primary's store, then fetch (transfers only what the primary lacks).
+    log(`  clone lane-${n} ← ${repo.originUrl} (alternates → ${repo.referencePath}, primary is shallow) …`);
+    mkdirSync(dest, { recursive: true });
+    gitQuiet(['init', '--quiet'], dest);
+    gitQuiet(['remote', 'add', 'origin', repo.originUrl], dest);
+    ensureAlternatesFor(repo, n);
+    gitQuiet(['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/*:refs/remotes/origin/*'], dest);
+    tryGit(['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${repo.branch}`], dest); // local only: no network outside git-bounded
+  }
+  ensureAlternatesFor(repo, n);
   gitQuiet(['config', '--local', 'gc.auto', '0'], dest);
   // lane-git-diet — `git clone` ignores a negative refspec on its initial fetch, so the fresh clone still carries
   // `origin/ops/*`. Apply the diet config and drop those tracking refs now (readers fetch them by name on demand).
@@ -995,8 +1036,27 @@ function healSharedStoreFor(repo, err) {
     return false;
   }
 }
+// A lane without alternates re-downloads the whole repository on every fetch. Add them (never remove anything) before
+// any lane fetch; best effort, a failure here never blocks the fetch itself.
+function ensureAlternatesFor(repo, n) {
+  const dir = laneDir(repo, n);
+  if (!repo.alternatesReferencePath) return { status: 'skipped', reason: 'no ownership-validated reference' }; // an explicit/inherited origin never validated the reference
+  try {
+    const result = ensureLaneAlternates({
+      laneDir: dir, referencePath: repo.alternatesReferencePath, laneOrigin: tryGit(['remote', 'get-url', 'origin'], dir), referenceOrigin: repo.originUrl,
+    });
+    if (result.status === 'added') log(`  lane-${n}: repaired missing alternates → ${repo.referencePath}`);
+    else if (result.status === 'skipped') log(`  ⚠ lane-${n}: alternates not set (${result.reason})`);
+    return result;
+  } catch (e) {
+    log(`  ⚠ lane-${n}: alternates repair failed (${String(e && e.message ? e.message : e).split('\n')[0]})`);
+    return { status: 'skipped', reason: 'error' };
+  }
+}
 function fetchOriginHealing(repo, n, { allowReclone = false, dietConfig } = {}) {
   const dir = laneDir(repo, n);
+  // Only a caller that holds the lane's lease (or finds none) may touch it; a refresh of someone else's live lane may not.
+  if (allowReclone) ensureAlternatesFor(repo, n);
   try {
     return fetchOriginPruneWithRetry(dir, dietConfig);
   } catch (e) {
@@ -2295,6 +2355,9 @@ async function cmdAcquire(repo) {
       }
       fail(`lane-${n} is ${describeLease(lease) || 'held'} — pick another lane`);
     }
+    // The lane is claimed. Repair missing alternates NOW, before any dirty/ahead refusal below: it only adds a file, so it is
+    // safe on a dirty lane, and a lane that is refused for its work still stops re-downloading the repository.
+    ensureAlternatesFor(repo, n);
     // #3390 — the explicit-lane path is the ONLY claim route that reaches the destructive reset below with no
     // #2267 dirty/ahead check at all: auto-pick's own candidate source (`isLaneAcquirable`, via the cached
     // scan) never selects a dirty/ahead candidate to begin with, and `refreshLane` calls `laneDirtyOrAhead`
@@ -3003,6 +3066,16 @@ async function cmdRelease(repo) {
         unpushed: Number.isFinite(beforeLitter.unpushedCommits) ? beforeLitter.unpushedCommits > 0 : undefined,
       });
     }
+    // R310 — a lane dirty ONLY with leftover backlog card files is saved, then cleaned; never handed back dirty.
+    if (!sameLease(readLease(dir), lease)) { log(`  lane-${n}: lease changed since it was read — not releasing; re-run if lane-${n} still looks wrong`); continue; }
+    const cards = salvageLaneCards({ dir, lane: n, pool: basename(repo.poolDir), reason: `release of lane-${n} (${lease.purpose || 'no purpose'})`,
+      isLeaseCurrent: () => sameLease(readLease(dir), lease) });
+    if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); releasing without cleaning — inspect the lane before reuse`);
+    if (cards.status === 'failed') { log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`); continue; }
+    if (cards.status === 'salvaged') {
+      log(`  lane-${n}: saved ${cards.removed.length} leftover card file(s) to ${cards.outDir} and cleaned them`);
+      journalLaneEvent(dir, { action: 'card-salvage', before: beforeLitter, removed: cards.removed, salvagedTo: cards.outDir, reason: 'release saved and cleaned leftover backlog card files' });
+    }
     // #x96v5hl — was an unconditional `rmSync` right after the ownership/contested decision above, which was
     // made against `lease` as read at the TOP of this loop iteration — `cleanLaneLitter` and every check since
     // ran real fs/git calls in between, real wall-clock time during which the ACTUAL holder could legitimately
@@ -3061,11 +3134,9 @@ function printStatus(repo) {
   // consumes leased rows, e.g. conveyor-state.mjs / scope-lease-collect.mjs). A leased lane's row is byte-for-
   // byte identical to a full `status` call; an unleased lane's row just omits the git-derived fields.
   const leasedOnly = !!flags['leased-only'];
-  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 0 = always probe
-  // fresh, today's behaviour) lets a display-only reader reuse a recent, signature-matched probe.
+  // Host churn cut (2026-10-04): `--max-age-ms=N` / env WE_LANE_STATUS_MAX_AGE_MS (default 45000; 0 = always probe fresh) lets a display-only reader reuse a recent, signature-matched probe.
   const maxAgeMs = resolveStatusMaxAgeMs(flags['max-age-ms']);
-  // Only an opted-in call reads OR writes the cache: a default `status` stays strictly read-only (stale-state and
-  // other readers pin "writes no state"), so the cache is shared among the opted-in display readers only.
+  // perf #3 — shared by every status reader (wip, health-watch, review); `--max-age-ms=0` neither reads nor writes it.
   const statusCache = maxAgeMs > 0 ? { maxAgeMs, cache: readStatusCache(repo.poolDir), updates: {} } : null;
   // Filter before probing: a single-lane reader must never spawn git in another lane.
   const lanes = existingLanes(repo).filter((n) => flags.lane === undefined || n === Number(flags.lane));

@@ -7,19 +7,18 @@
  *   constellation pool, every read), the three pool health-watches, conveyor-state, the dispatch daemons. That
  *   made it the single largest `git` caller on the host (`fs_usage`: git 560k fs events / 10 s).
  *
- *   A caller that opts in (`--max-age-ms=N`, or env `WE_LANE_STATUS_MAX_AGE_MS`) RECORDS its per-lane probes here
- *   and may REUSE a row instead of re-probing, but only when BOTH hold (a default call neither reads nor writes
- *   the file — plain `status` stays strictly read-only):
+ *   (perf #3: reuse is now ON by default, 45 s; `--max-age-ms=0` or env `=0` probes fresh and a lane's own acquire/release/reset drops its row.)
+ *   A caller with a positive max age (`--max-age-ms=N`, or env `WE_LANE_STATUS_MAX_AGE_MS`) RECORDS its per-lane probes here
+ *   and may REUSE a row instead of re-probing, but only when BOTH hold (`--max-age-ms=0` neither reads nor writes
+ *   the file):
  *     1. the row is younger than the caller's max age, and
  *     2. the lane's cheap git SIGNATURE is unchanged — `.git/HEAD`'s content plus the stat (mtime/size/inode)
  *        of `.git/index`, the checked-out branch ref, `refs/remotes/origin/<branch>`, and `packed-refs`. Any
  *        commit, checkout, reset, fetch, `add`, or stash rewrites one of those, so every git-level change
  *        invalidates the row at once regardless of age.
  *   The one thing the signature cannot see is an edit to a working-tree file that was never staged — so a
- *   reused `clean` can lag such an edit by at most the caller's max age. That is why the DEFAULT max age is 0
- *   (today's behaviour: always probe fresh), and only display-only readers (`live-state`, which just COUNTS
- *   free/leased/dirty for a dashboard) opt in. Anything that acts on `clean` (trim, reclaim, health-watch reap)
- *   keeps the default and always probes fresh. The lease marker is never cached — `laneStatus` reads it fresh
+ *   reused `clean` can lag such an edit by at most the caller's max age. Nothing that acts destructively on `clean` trusts it (acquire, trim, reclaim and litter-reap re-check fresh),
+ *   and the evidence reader `stale-state` passes `--max-age-ms=0`. The lease marker is never cached — `laneStatus` reads it fresh
  *   on every call.
  */
 import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
@@ -27,8 +26,12 @@ import { join } from 'node:path';
 
 export const LANE_STATUS_CACHE_FILE = '.lane-status-cache.json';
 export const LANE_STATUS_MAX_AGE_ENV = 'WE_LANE_STATUS_MAX_AGE_MS';
-/** Today's behaviour: never reuse a cached row unless a caller explicitly opts in. */
-export const DEFAULT_LANE_STATUS_MAX_AGE_MS = 0;
+/**
+ * perf #3 (R318/R320/R322) — ON by default with a short TTL: ~3 independent scanners (wip-publish, health-watch,
+ * review daemons) each re-ran 4 git calls x 90 lanes every 1-2 min. `--max-age-ms=0` / env `=0` restores
+ * always-fresh. Every lane mutation (journalLaneEvent: acquire/reset/release/refresh) drops that lane's row.
+ */
+export const DEFAULT_LANE_STATUS_MAX_AGE_MS = 45_000;
 
 /** `--max-age-ms` flag wins, then the env knob, then the default (0 = always probe fresh). */
 export function resolveStatusMaxAgeMs(flagValue, env = process.env) {
@@ -112,6 +115,22 @@ export function writeStatusCache(poolDir, updates, { nowMs = Date.now() } = {}) 
     for (const k of keys) cur.lanes[k] = { ...updates[k], ts: updates[k].ts ?? nowMs };
     mkdirSync(poolDir, { recursive: true });
     const file = join(poolDir, LANE_STATUS_CACHE_FILE);
+    const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ v: 1, lanes: cur.lanes }));
+    renameSync(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Drop one lane's cached row (called on that lane's own acquire/release/reset). Best-effort — never throws. */
+export function dropLaneStatusCacheRow(poolDir, n) {
+  try {
+    const file = join(poolDir, LANE_STATUS_CACHE_FILE);
+    const cur = JSON.parse(readFileSync(file, 'utf8'));
+    if (!cur || !cur.lanes || !(String(n) in cur.lanes)) return false;
+    delete cur.lanes[String(n)];
     const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     writeFileSync(tmp, JSON.stringify({ v: 1, lanes: cur.lanes }));
     renameSync(tmp, file);

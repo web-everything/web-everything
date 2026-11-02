@@ -140,11 +140,14 @@ import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs'
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, spawnSync } from 'node:child_process';
+import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
-import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { createLabelEnsurer, isLabelNotFoundError } from './lib/label-memo.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from './lib/couple-cascade.mjs';
@@ -1160,18 +1163,92 @@ export function resolveUnknownMergeabilityRetry(env = {}, layers = {}) {
   return n <= 3 ? { ...setting, retries: n } : setting;
 }
 
+async function notifyPersistentUnknown(payload, { onPersistentUnknown, nudge }) {
+  // Recovery is advisory: failed hooks cannot turn a refusal into admission or abort the drain.
+  try { await onPersistentUnknown?.(payload); } catch { /* best effort */ }
+  try { await nudge?.(payload); } catch { /* best effort */ }
+}
+
 /**
  * `revalidateForMerge` over a fresh read, re-reading while the ONLY refusal is a transient UNKNOWN mergeability.
  * Fails closed exactly as before: an UNKNOWN that never resolves within the bound returns that same refusal.
  * IO is injected (`read` → the fresh PR or null; `sleep(ms)`), so the bound is testable without GitHub.
  */
-export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
+export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep, repo, num, onPersistentUnknown, nudge }) {
   let verdict = revalidateForMerge(await read(), opts);
   for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
     await sleep(setting.delayMs);
     verdict = revalidateForMerge(await read(), opts);
   }
+  if (isTransientUnknownMergeability(verdict)) {
+    await notifyPersistentUnknown({ repo, num, verdict }, { onPersistentUnknown, nudge });
+  }
   return verdict;
+}
+
+export function markStuckUnknown(marks, { repo, num, now }) {
+  const next = new Map(marks);
+  const key = `${repo}#${num}`;
+  if (!next.has(key) || next.get(key).resolved) next.set(key, { repo, num, since: now });
+  return next;
+}
+
+export function pruneStuckUnknown(marks, { prs, listedRepos = [], now = Date.now() }) {
+  const next = new Map(marks);
+  // Absence is evidence only for a successful, complete live candidate listing.
+  const complete = new Set(listedRepos);
+  const present = new Set(prs.map(pr => `${pr.repo}#${pr.num}`));
+  for (const [key, mark] of next) if (complete.has(mark.repo) && !present.has(key)) next.delete(key);
+  for (const pr of prs) {
+    const key = `${pr.repo}#${pr.num}`;
+    if (['CLOSED', 'MERGED'].includes(pr.state)) {
+      next.delete(key);
+    } else if (next.has(key) && ['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable)) {
+      // Resolution silences the alert, but must not reintroduce ready-not-reached
+      // starvation on this or a subsequent drain invocation.
+      next.set(key, { ...next.get(key), resolved: true });
+    } else if (next.get(key)?.resolved && pr.mergeable === 'UNKNOWN') {
+      // A new UNKNOWN episode must age even if another hold prevents revalidation.
+      next.set(key, { repo: pr.repo, num: pr.num, since: now });
+    }
+  }
+  return next;
+}
+
+export function orderStuckUnknownFirst(prs, marks, { priorityOf = () => 0 } = {}) {
+  const marked = pr => marks.has(`${pr.repo}#${pr.num}`);
+  return [...prs].sort((a, b) => priorityOf(a) - priorityOf(b) || Number(marked(b)) - Number(marked(a)));
+}
+
+export function nudgeMergeability({ repo, num, read }) {
+  return read({ repo, num, fields: ['mergeable'] });
+}
+
+export function decideStuckUnknownAlert(marks, { now, afterMinutes = 30 }) {
+  const bound = Number.isFinite(afterMinutes) && afterMinutes > 0 ? afterMinutes : 30;
+  return [...marks.values()].filter(mark => !mark.resolved && now - mark.since > bound * 60_000)
+    .map(mark => ({ kind: 'stuck-unknown-mergeability', ...mark, ageMinutes: (now - mark.since) / 60_000,
+      reason: 'mergeability remains UNKNOWN; inspect the PR on GitHub and retry the drain; merge remains refused' }));
+}
+
+function loadStuckUnknown(path) {
+  try {
+    const rows = JSON.parse(readFileSync(path, 'utf8'));
+    if (!Array.isArray(rows)) return new Map();
+    return new Map(rows.filter(row => typeof row?.repo === 'string' && Number.isInteger(row.num) && row.num > 0
+      && Number.isFinite(row.since)).map(row => [`${row.repo}#${row.num}`, { repo: row.repo, num: row.num, since: row.since,
+        ...(row.resolved === true ? { resolved: true } : {}) }]));
+  } catch { return new Map(); }
+}
+
+function saveStuckUnknown(path, marks) {
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(temporary, JSON.stringify([...marks.values()]) + '\n', { mode: 0o600 });
+    renameSync(temporary, path);
+  } catch { /* best-effort state never affects admission */ }
+  finally { try { unlinkSync(temporary); } catch { /* absent or unwritable */ } }
 }
 
 /** The pass's ordering: UNKNOWN listings are re-polled BEFORE the head-bound open-PR context is collected. */
@@ -1185,19 +1262,31 @@ export async function repollThenCollectContext({ repoll, collect }) {
  * `writeLabelWithHandoff`, so a `ci:failed` written here wakes the fix daemon right after the write lands.
  * Best effort: a failed write is skipped (the next pass retries). Returns whether every write landed.
  */
-export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch }) {
+export function applyCiLifecycleLabelPlan({ plan, pr, repo = null, slug = repo, exec = execFileSync, signal = signalFixDispatch, onLabelNotFound = null }) {
   const flag = repo ? ['--repo', repo] : [];
   let ok = true;
   for (const rm of plan.toRemove) { try { exec('gh', ['pr', 'edit', String(pr), ...flag, '--remove-label', rm], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { ok = false; } }
+  const writeOnce = (add) => {
+    const write = () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { return write(); }
+    catch (err) { if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(add)) throw err; return write(); }
+  };
   for (const add of plan.toAdd) {
-    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => exec('gh', ['pr', 'edit', String(pr), ...flag, '--add-label', add], { stdio: ['ignore', 'ignore', 'pipe'] }) }, signal); } catch { ok = false; }
+    try { writeLabelWithHandoff({ repo: slug, pr, label: add, write: () => writeOnce(add) }, signal); } catch { ok = false; }
   }
   return ok;
 }
 
 /** Refresh UNKNOWN listing facts before reading head-bound manifests/commits or classifying the pass. */
-export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4 }) {
-  const unknown = pr => String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+export async function repollUnknownListings({ prsByRepo, read, sleep, setting = UNKNOWN_MERGEABILITY_RETRY, concurrency = 4, marks = new Map(), onPersistentUnknown, nudge }) {
+  const unknown = pr => !['CLOSED', 'MERGED'].includes(String(pr.state ?? '').toUpperCase())
+    && String(pr.mergeable ?? '').toUpperCase() === 'UNKNOWN';
+  const marked = [...prsByRepo].flatMap(([repo, prs]) => prs
+    .filter(pr => marks.has(`${repo}#${pr.number}`)).map(pr => ({ repo, pr })));
+  await mapWithConcurrency(marked, concurrency, async ({ repo, pr }) => {
+    const fresh = await read(repo, pr.number);
+    if (fresh?.number === pr.number) Object.assign(pr, fresh);
+  });
   let pending = [...prsByRepo].flatMap(([repo, prs]) => prs.filter(unknown).map(pr => ({ repo, pr })));
   for (let attempt = 0; pending.length && attempt < Math.min(3, setting.retries); attempt++) {
     await sleep(setting.delayMs);
@@ -1209,6 +1298,10 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, setting = 
     });
     pending = unresolved.filter(Boolean);
   }
+  // Listing UNKNOWNs never reach pre-merge revalidation. They need the same
+  // bounded recovery path, including when retries are configured to zero.
+  await mapWithConcurrency(pending, concurrency, ({ repo, pr }) =>
+    notifyPersistentUnknown({ repo, num: pr.number }, { onPersistentUnknown, nudge }));
 }
 
 /**
@@ -2701,13 +2794,13 @@ const ET_CLOCK = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York'
  * PURE (the IO arrives through `infoOf`). Order the ready set: `card-number` = the legacy order (card NNN, a hash or
  * no card last, then PR #); `ready-age` = delivery-priority class first when `priority.mode === 'enforce'` (shadow
  * only reports it), then the ready-label time (oldest first; unknown last), then PR #. Stable; the input is untouched.
- * The merge-queue class (main-fix first) is applied after this by `prioritizeMainFix`, and blockedBy/stack order is
+ * The optional `prioritize` applies the merge-queue class before reasons are built, and blockedBy/stack order is
  * realized across passes, as before.
  * @param {Array} ready
  * @param {{order:string, priority:object, now:number, infoOf:(c:object)=>({readyAtMs:number|null, facts:object})}} ctx
  * @returns {{ordered:Array, reasons:Array<{num:number, repo:(string|null), class:string, readyAtMs:(number|null), reason:string}>}}
  */
-export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }) } = {}) {
+export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }), stuckUnknownMarks = new Map(), prioritize = rows => rows } = {}) {
   const list = Array.isArray(ready) ? ready : [];
   const settings = resolvePrioritySettings(priority);
   const infos = list.map((c) => { try { return infoOf(c) ?? {}; } catch { return {}; } });
@@ -2718,14 +2811,20 @@ export function orderReadyCandidates(ready, { order = 'ready-age', priority, now
   const cls = (r) => PRIORITY_CLASSES.indexOf(r.p.class);
   const age = (r) => (r.readyAtMs == null ? Infinity : r.readyAtMs);
   if (order === 'ready-age') rows.sort((a, b) => (enforce ? cls(a) - cls(b) : 0) || (age(a) - age(b)) || (a.c.num - b.c.num) || (a.i - b.i));
-  const reasons = rows.map((r) => {
+  const byCandidate = new Map(rows.map(r => [r.c, r]));
+  const ordered = prioritize(orderStuckUnknownFirst(rows.map(r => r.c), stuckUnknownMarks, {
+    priorityOf: c => enforce ? cls(byCandidate.get(c)) : 0,
+  }));
+  const reasons = ordered.map(c => {
+    const r = byCandidate.get(c);
     const when = r.readyAtMs == null ? 'ready time unknown'
       : `ready ${ET_CLOCK.format(new Date(r.readyAtMs))} ET, waited ${Math.max(0, Math.floor((now - r.readyAtMs) / 60_000))} min`;
     const why = r.p.reasons.join('; ');
     const head = order === 'card-number' ? `card ${r.c.item ?? 'none'} · ${r.p.class}` : (enforce ? `${r.p.class} (${why})` : r.p.class);
-    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}` };
+    const recovery = stuckUnknownMarks.has(`${c.repo}#${c.num}`) ? ' · persistent UNKNOWN recovery priority' : '';
+    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: (enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}`) + recovery };
   });
-  return { ordered: rows.map((r) => r.c), reasons };
+  return { ordered, reasons };
 }
 
 /** PURE. The pass's order log: a header line, then one line per ready PR with its reason. */
@@ -4415,15 +4514,21 @@ export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, a
  * Apply the park label before releasing a de-escalated human hold, recording the verdict before any add.
  * @returns {{added: boolean, removed: string[]}} Successful label writes only; dry runs never write.
  */
-export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAdd }, { exec = execFileSync } = {}) {
+export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAdd, onLabelNotFound }, { exec = execFileSync } = {}) {
   let added = false;
   if (dryRun || !gate.applyLabel) return { added, removed: [] };
   let applyOk = true; // already present => nothing to add
   if (shouldApplyReviewLabel(gate.applyLabel, labels)) {
     onBeforeAdd?.();
+    const addOnce = () => exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
     try {
-      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
-        { stdio: ['ignore', 'ignore', 'pipe'] });
+      try { addOnce(); }
+      catch (err) {
+        // A memoised label deleted on GitHub: heal (forget + re-mint) and retry once, so no PR goes unlabelled.
+        if (!onLabelNotFound || !isLabelNotFoundError(err) || !onLabelNotFound(gate.applyLabel)) throw err;
+        addOnce();
+      }
       added = true;
     } catch { applyOk = false; /* label best-effort */ }
   }
@@ -4586,6 +4691,34 @@ async function runCli() {
   // lease so a differently-scoped launch can tell whether the holder actually covers its repos.
   const leaseScope = [...new Set(REPOS.map((r) => r || localSlug).filter(Boolean))].sort();
   const repoFlag = (repo) => (repo ? ['--repo', repo] : []);      // a slug → scope the gh call; null → cwd repo
+  // Provisioning receives the memo identity as --repo. Match implicit PR edits: honour GH_REPO, then
+  // let gh resolve its default remote (which may differ from origin). Resolve once, only when needed;
+  // use the URL so a remote on another GitHub host keeps its identity too. Never guess on a failed read.
+  let implicitLabelRepo;
+  const memoRepo = (repo) => {
+    if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
+    if (!implicitLabelRepo) {
+      implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
+      if (!implicitLabelRepo) throw new Error('Cannot resolve implicit label repository');
+    }
+    return implicitLabelRepo;
+  };
+  const KNOWN_LABEL_META = { ...REVIEW_LABEL_META, ...CI_LIFECYCLE_LABEL_META };
+  // Not-found on a label write: drop the stale memo entries, re-mint, report whether a retry is worthwhile.
+  const healLabelNotFoundIn = (repo) => (name) => {
+    const meta = KNOWN_LABEL_META[name];
+    if (!meta) return false;
+    labelEnsurer.forget(memoRepo(repo), name);
+    ensuredLabels.delete(`${repo || 'cwd'}::${name}`);
+    labelEnsurer.ensure(memoRepo(repo), name, meta);
+    return true;
+  };
+  const addPrLabel = (repo, num, label) => {
+    const add = () => execFileSync('gh', ['pr', 'edit', String(num), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] });
+    try { add(); }
+    catch (err) { if (!isLabelNotFoundError(err) || !healLabelNotFoundIn(repo)(label)) throw err; add(); }
+  };
   // #gh-graphql-budget — the merge-candidate list's `--limit`: sized off the shared snapshot's real open count
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
@@ -4597,6 +4730,13 @@ async function runCli() {
   // pairs this process has already ensured exist so a long-lived watch doesn't `gh label create` the same
   // review:* labels every single pass (wasted round-trips on an idempotent one-time mint).
   const ensuredLabels = new Set();
+  // perf item 6 — the in-process memo above dies with each drain process; persist it (keyed by repo, with a TTL)
+  // so a restarted or one-shot drain does not re-mint labels every pass. A not-found on a label write forgets the
+  // entry and re-mints it (`healLabelNotFoundIn`), so a label deleted on GitHub is created again exactly when needed.
+  const labelEnsurer = createLabelEnsurer({
+    path: process.env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
+    run: (args, repo) => execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }),
+  });
 
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
@@ -4730,13 +4870,17 @@ async function runCli() {
     });
   };
   const resolveListedChecks = (repo, prs) => mapWithConcurrency(prs, resolvedMergePolicy.policy.concurrency.gateReads, (pr) => resolveChecks(repo, pr));
-  const fetchFreshPrForRevalidation = async (repo, num) => {
+  const fetchFreshPrForRevalidation = async (repo, num, fields = null) => {
     try {
-      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json',
-        'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'],
+      const { stdout: raw } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo),
+        ...(fields ? ['--json', fields.join(',')] : ['--json', 'number,title,body,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels,commits'])],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
-      if (!data || data.number == null) return null;
+      if (!data || (!fields && data.number !== num)) return null;
+      // The nudge's partial response has no identity-bound evidence for state updates.
+      if (fields) return data;
+      const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
+      updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
     } catch { return null; }
@@ -4744,6 +4888,46 @@ async function runCli() {
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
   const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const stuckUnknownPath = join(dirname(refreshedStatePath()), 'stuck-unknown-mergeability.json');
+  let stuckUnknownMarks = loadStuckUnknown(stuckUnknownPath);
+  const updateStuckUnknown = next => {
+    const changed = next.size !== stuckUnknownMarks.size || [...next].some(([key, mark]) => mark.resolved !== stuckUnknownMarks.get(key)?.resolved);
+    if (!changed) return;
+    stuckUnknownMarks = next;
+    if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+    for (const [key] of stuckUnknownAlerts) if (!next.has(key) || next.get(key).resolved) stuckUnknownAlerts.delete(key);
+  };
+  const clearLandedStuckUnknown = c => updateStuckUnknown(pruneStuckUnknown(stuckUnknownMarks, {
+    prs: [{ repo: c.repo || localSlug, num: c.num, state: 'MERGED' }],
+  }));
+  // Persist canonical slugs; adapt keys to the pass's null-for-local convention without changing candidates.
+  const passStuckUnknownMarks = () => new Map([...stuckUnknownMarks.values()].flatMap(mark =>
+    [mark.repo, ...REPOS.filter(repo => (repo || localSlug) === mark.repo)]
+      .map(repo => [`${repo}#${mark.num}`, mark])));
+  let stuckUnknownTool;
+  try { stuckUnknownTool = readDeclaredDrainSettings()?.drain?.stuckUnknownMergeability; } catch { /* standard */ }
+  const stuckUnknownSetting = cascadePolicy('drain.stuckUnknownMergeability', stuckUnknownTool, {
+    standard: { afterMinutes: 30 }, env: process.env,
+    valid: { afterMinutes: v => Number.isFinite(v) && v > 0 },
+  });
+  process.stderr.write(`merge-ai-prs: stuckUnknownMergeability.afterMinutes=${stuckUnknownSetting.value.afterMinutes} (${stuckUnknownSetting.sources.afterMinutes})\n`);
+  const stuckUnknownAlerts = new Map();
+  const emitStuckUnknownAlerts = () => {
+    for (const alert of decideStuckUnknownAlert(stuckUnknownMarks, { now: Date.now(), ...stuckUnknownSetting.value })) {
+      const key = `${alert.repo}#${alert.num}`;
+      if (!stuckUnknownAlerts.has(key)) process.stderr.write(`merge-ai-prs · alert: ${JSON.stringify(alert)}\n`);
+      stuckUnknownAlerts.set(key, alert);
+    }
+  };
+  const unknownRecovery = {
+    onPersistentUnknown: ({ repo, num }) => {
+      stuckUnknownMarks = markStuckUnknown(stuckUnknownMarks, { repo: repo || localSlug, num, now: Date.now() });
+      if (!DRY_RUN) saveStuckUnknown(stuckUnknownPath, stuckUnknownMarks);
+      emitStuckUnknownAlerts();
+    },
+    nudge: ({ repo, num }) => nudgeMergeability({ repo, num,
+      read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) }),
+  };
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
@@ -4968,8 +5152,10 @@ async function runCli() {
       for (const [name, meta] of Object.entries(CI_LIFECYCLE_LABEL_META)) {
         const ensureKey = `${repo || 'cwd'}::${name}`;
         if (ensuredLabels.has(ensureKey)) continue;
-        ensuredLabels.add(ensureKey);
-        try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+        try {
+          labelEnsurer.ensure(memoRepo(repo), name, meta);
+          ensuredLabels.add(ensureKey);
+        } catch { /* Repository resolution is best effort too; a later pass retries. */ }
       }
     }
     const reconciled = [];
@@ -4996,7 +5182,7 @@ async function runCli() {
       if (greenVerdict.label) {
         if (DRY_RUN) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would label "${label}" (required check green, was unlabelled)\n`); }
         else {
-          try { execFileSync('gh', ['pr', 'edit', String(p.number), ...repoFlag(repo), '--add-label', label], { stdio: ['ignore', 'ignore', 'pipe'] }); touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} labelled "${label}" (post-CI reconcile — required check went green after a label-on-green timeout)\n`); }
+          try { addPrLabel(repo, p.number, label); touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} labelled "${label}" (post-CI reconcile — required check went green after a label-on-green timeout)\n`); }
           catch { /* a label race/permission miss is non-fatal — the next pass retries */ }
         }
       } else if (greenVerdict.reason === 'held') {
@@ -5043,7 +5229,7 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} would reconcile ci-lifecycle → "${desired}"${plan.toRemove.length ? ` (drop ${plan.toRemove.join(', ')})` : ''}\n`);
           } else {
             // Best effort — a label race/permission miss is non-fatal; the next pass retries.
-            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug });
+            const ok = applyCiLifecycleLabelPlan({ plan, pr: p.number, repo, slug: repo || localSlug, onLabelNotFound: healLabelNotFoundIn(repo) });
             if (ok) { touched = true; if (!AS_JSON) process.stderr.write(`  🏷 ${repoTag(repo)}${p.number} ci-lifecycle → "${desired}" (reconcile)\n`); }
           }
         }
@@ -5265,7 +5451,7 @@ async function runCli() {
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
       // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', readLiveRows: listLive };
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5295,6 +5481,15 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
+  // Do not prune against failed, truncated or round-snapshot listings, nor the
+  // later --pr narrowing: none proves that another marked PR left the queue.
+  for (const listing of listings) {
+    if (!listing.complete) continue;
+    const repo = listing.repo || localSlug;
+    updateStuckUnknown(pruneStuckUnknown(stuckUnknownMarks, {
+      prs: listing.prs.map(pr => ({ repo, num: pr.number })), listedRepos: [repo],
+    }));
+  }
   // #4108 — reuse only this pass's live listings; round snapshot rows never serve context.
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
@@ -5310,7 +5505,7 @@ async function runCli() {
   // fails closed (a coupled impl defers rather than orphan-landing past a carrier the gate cannot see).
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos: REPOS, isLocalRepo });
   const openPrContext = await repollThenCollectContext({
-    repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
+    repoll: async () => { await repollUnknownListings({ ...unknownRecovery, marks: passStuckUnknownMarks(), prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }); emitStuckUnknownAlerts(); },
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
   // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
@@ -5525,6 +5720,7 @@ async function runCli() {
   };
   // Keep this wrapper in the sweep's scope so every fresh read uses its approval-proof helper and setting.
   const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    ...unknownRecovery, repo: repo || localSlug, num,
     read: async () => {
       const pr = await fetchFreshPrForRevalidation(repo, num);
       return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
@@ -5759,8 +5955,10 @@ async function runCli() {
         for (const [name, meta] of Object.entries(REVIEW_LABEL_META)) {
           const ensureKey = `${repo || 'cwd'}::${name}`;
           if (ensuredLabels.has(ensureKey)) continue;
-          ensuredLabels.add(ensureKey);
-          try { execFileSync('gh', ['label', 'create', name, '--color', meta.color, '--description', meta.description, ...repoFlag(repo)], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* already exists — fine */ }
+          try {
+            labelEnsurer.ensure(memoRepo(repo), name, meta);
+            ensuredLabels.add(ensureKey);
+          } catch { /* Repository resolution is best effort too; a later pass retries. */ }
         }
       }
     }
@@ -5915,7 +6113,7 @@ async function runCli() {
             // is reported and never changes the label write below.
             const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
@@ -5924,7 +6122,7 @@ async function runCli() {
           // diff either; carry review:awaiting-advisory alongside it so "not yet advised" stays a label even on
           // a re-park, not just a fresh park (review-pr.mjs's `advise` step clears it once it posts, #xlw02hw).
           if (shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #2832 / #984 F2 — this park CREATES a hold (review:human) on a PR that, being in the
           // `--label ready-to-merge` candidate set, carries the go-ahead. Strip it in the same operation, through
@@ -6036,7 +6234,7 @@ async function runCli() {
               const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
               if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
             }
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, parkDecision.addLabel); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
@@ -6046,7 +6244,7 @@ async function runCli() {
           // mechanical park: the advisory runs for `review:human` PRs only, so the label would never be cleared; the
           // carry sweep adds it if it hands the hold to the operator (`review-set-label.mjs --to=restamp`).
           if (!mechanicalPark && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #2832 / #984 F2 — same as the manifest-tamper park above: this site CREATES a review hold on
           // a go-ahead-carrying candidate and `continue`s, so it must strip through the shared seam here.
@@ -6140,7 +6338,7 @@ async function runCli() {
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
         if (gate.applyLabel && !candidateDryRun) {
-          applyDrainParkLabel({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, onBeforeAdd: () => {
+          applyDrainParkLabel({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, onLabelNotFound: healLabelNotFoundIn(v.repo), onBeforeAdd: () => {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
             // final), so a `gh` failure below must not un-form it — only the durable record of it. Fail-soft:
@@ -6152,7 +6350,7 @@ async function runCli() {
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { addPrLabel(v.repo, v.num, REVIEW_LABELS.awaitingAdvisory); } catch { /* label best-effort */ }
           }
           // #xmnl36p — A CLEARANCE REVOCATION IS NEVER SILENT, and this is the ONE path that guarantees it.
           // It sits AHEAD of `shouldPostParkReasonComment` (which returns false for every human park, routing
@@ -6366,6 +6564,13 @@ async function runCli() {
   const drainPriority = { ...readDeliveryPrioritySettings(), mode: drainOrder.priorityMode };
   delete drainPriority.invalid;
   const drainMainFix = (() => { try { return readMainFixPriority(); } catch { return null; } })();
+  const MERGE_QUEUE = loadMergeQueueSettings();
+  const mainFixPriority = MERGE_QUEUE.queue.enabled ? drainMainFix : null;
+  const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
+  const prioritizeQueue = rows => prioritizeMainFix(rows, {
+    mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue,
+    isCoupleHalf: x => isImplHalf(x) || isCoupleCarrier(x), repoKeyOf: repoKeyOfVerdict,
+  });
   // The open PRs of c's repo: the context listing (has `files`) when collected, plus this pass's own listed verdicts
   // (always present; a dry-run / non-reconcile pass has no context listing), deduped by PR number.
   const openPrsOf = (c) => {
@@ -6410,7 +6615,7 @@ async function runCli() {
     const repoKey = isLocalRepo(c.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(c.repo);
     return { readyAtMs: info.readyAtMs, facts: drainPriorityFacts(c, { ...info, mainFix: drainMainFix, repoKey }) };
   };
-  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf });
+  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf, stuckUnknownMarks: passStuckUnknownMarks(), prioritize: prioritizeQueue });
   let lastDrainOrderLog = null;
   const logDrainOrder = (plan) => {
     if (AS_JSON || !Array.isArray(plan?.readyOrder) || !plan.readyOrder.length) return;
@@ -6529,11 +6734,9 @@ async function runCli() {
   const requiredWorkflowsRefusals = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
-  const MERGE_QUEUE = loadMergeQueueSettings();
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
-  const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
    * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per pass, through
@@ -6608,7 +6811,6 @@ async function runCli() {
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
   const coupleSplit = [];
-  const repoKeyOfVerdict = (v) => (isLocalRepo(v.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(v.repo));
   const repoKeyOfSlug = (slug) => (isLocalRepo(slug) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(slug));
   // All non-CI gates and the couple/dependency plan have now run. Provisional pending candidates
   // leave the real cascade here: preparation NEVER authorizes an enqueue (or a direct merge).
@@ -6720,9 +6922,7 @@ async function runCli() {
       let progressed = false;
       // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
       // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
-      coupleStep.ordered = prioritizeMainFix(coupleStep.ordered, {
-        mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue, isCoupleHalf: (x) => isImplHalf(x) || isCoupleCarrier(x), repoKeyOf: repoKeyOfVerdict,
-      });
+      coupleStep.ordered = prioritizeQueue(coupleStep.ordered);
       await runEnqueueCandidates(coupleStep.ordered, {
         concurrency: resolvedMergePolicy.policy.concurrency.enqueue,
         canParallel: (c) => canParallelEnqueue(c, {
@@ -6831,6 +7031,7 @@ async function runCli() {
         // revalidation). Recorded into `merged` so its numbering / resolve-on-land / derived regen runs this pass —
         // those steps are idempotent, and once merged a PR drops off every later pass's open-PR listing.
         const recordAlreadyMerged = () => {
+          clearLandedStuckUnknown(c);
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null });
           progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c));
@@ -7011,6 +7212,7 @@ async function runCli() {
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
+          clearLandedStuckUnknown(c);
           await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed merge writes the clearing facts
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
@@ -7391,7 +7593,11 @@ async function runCli() {
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)}; ${formatConcurrencySources(resolvedMergePolicy.policy)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
-  const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  const alerts = [...stuckUnknownAlerts.values()].filter(alert => {
+    const mark = stuckUnknownMarks.get(`${alert.repo}#${alert.num}`);
+    return mark && !mark.resolved;
+  });
+  const result = { alerts, ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };

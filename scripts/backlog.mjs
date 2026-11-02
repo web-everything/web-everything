@@ -81,6 +81,7 @@ import { createMemoryRunStore, newRunId } from './operations/run-store.mjs';
 import { claimOperation } from './operations/claim.mjs';
 import { createClaimReader, createClaimSinks } from './operations/claim-io.mjs';
 import { cardIndex, closedBlockersFor, closedDuplicatesBySurvivor } from './operations/close-items.mjs';
+import { fetchFresh } from './lib/git-fetch-fresh.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // #3445 — `--backlog-dir=<path>` points this CLI's own file reads (and, via `WE_BACKLOG_DIR`, the
@@ -205,8 +206,8 @@ function missingItemMessage(padded) {
     // Bounded + non-interactive: a stalled remote or a credential prompt must not hang the death path
     // (this also runs unattended in the drain). timeout → SIGTERM → the catch below returns `plain`.
     const gitEnv = { cwd: ROOT, timeout: 5000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } };
-    execFileSync('git', ['fetch', '--quiet', 'origin', 'main'], { ...gitEnv, stdio: 'ignore' });
-    const onOrigin = execFileSync('git', ['ls-tree', '--name-only', 'FETCH_HEAD', 'backlog/'], { ...gitEnv, encoding: 'utf8' })
+    fetchFresh({ cwd: ROOT, branches: ['main'], maxAgeMs: 0, run: (args) => execFileSync('git', args, { ...gitEnv, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }) });
+    const onOrigin = execFileSync('git', ['ls-tree', '--name-only', 'origin/main', 'backlog/'], { ...gitEnv, encoding: 'utf8' })
       .split('\n')
       .some((p) => p.startsWith(`backlog/${padded}-`));
     if (!onOrigin) return plain;

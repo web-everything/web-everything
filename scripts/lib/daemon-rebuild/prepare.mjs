@@ -6,13 +6,14 @@ import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } fr
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
-import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
+  overlayGraduated, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import {
@@ -26,7 +27,7 @@ import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
-import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
+import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
 import { recoverQuickSoak, launchQuickSoak, reportQuickSoakNeedsYou } from './quick-soak-job.mjs';
 import { rollbackToSha } from '../daemon-live-smoke.mjs';
 import { resolveQuick } from './quick.mjs';
@@ -34,20 +35,41 @@ import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
 
+/** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
+export function readOverlayEventLog(root, env) {
+  try {
+    const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
+  } catch { return []; }
+}
+
+/** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
+ * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
+export function contentContainedInBuild(git, sha, build) {
+  // Custom merge drivers can discard overlay changes while reporting an unchanged tree: refuse (fail closed).
+  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
+  const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+  const t = String(m.stdout ?? '').split('\n')[0].trim();
+  return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
+}
+
 /**
  * Phase 1 (LOCKED, fast — no smoke, no `reset --hard`): recovery, safety, fetch, `planRebuild`, overlay-list
  * edits, and the up-to-date/still-rejected/untracked-collision short-circuits — everything the old single-phase
  * `doRebuild` did in its Steps 0-4.5. Returns EITHER `{terminal:true, result, alerts}` (a final `rebuildClone`
  * result — the caller returns it as-is) or `{terminal:false, plan, prevHead, alerts}` (proceed to build +
- * smoke a candidate — see {@link rebuildClone}).
+ * smoke a candidate — see {@link rebuildClone}). In readyOnly mode recovery may update bookkeeping,
+ * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, launchSoak = launchQuickSoak,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, launchSoak = launchQuickSoak, readyOnly = false,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
   }
+  // Status must not refresh the live index while an excluded spawner may still be reading it.
+  if (readyOnly) env = { ...env, GIT_OPTIONAL_LOCKS: '0' };
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
@@ -71,6 +93,11 @@ export async function prepareRebuild({
     if (stale) alert('clone-held-stale', stale);
     return { terminal: true, result, alerts: alertsList };
   };
+
+  const mutationDue = (mutation) => terminal({
+    moved: false, reason: 'readonly-job-mutation-due', mutation,
+    detail: 'Deferred to the next daemon tick holding the normal clone write lock.',
+  });
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
@@ -98,12 +125,15 @@ export async function prepareRebuild({
     const st = statSync(indexLockPath);
     const staleMs = Number(env?.WE_DAEMON_INDEX_LOCK_STALE_MS) || 120_000;
     if (nowMs() - st.mtimeMs > staleMs) {
+      if (readyOnly) return mutationDue('index-lock-recovery');
       unlinkSync(indexLockPath);
       alert('index-lock-recovered', { ageMs: nowMs() - st.mtimeMs });
     } else {
       return terminal({ moved: false, reason: 'index-locked' });
     }
-  } catch { /* no index.lock present — nothing to recover */ }
+  } catch (error) {
+    if (readyOnly && error?.code !== 'ENOENT') return mutationDue('index-lock-unverified');
+  }
 
   if (state.inProgress) {
     const staleMs = Number(env?.WE_DAEMON_REBUILD_STALE_MS) || 30 * 60_000;
@@ -123,6 +153,7 @@ export async function prepareRebuild({
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
+        if (readyOnly) return mutationDue('in-progress-rollback');
         const rolled = ip.quick ? rollbackQuick(ip.prevHead).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
         if (ip.quick) {
           const detail = { sha: ip.target, lastGood: ip.prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: rolled } };
@@ -185,6 +216,7 @@ export async function prepareRebuild({
   if (state.unverified) {
     const uv = state.unverified;
     if (verifyRev(git, 'HEAD') === uv.head && uv.head !== uv.prevHead) {
+      if (readyOnly) return mutationDue('unverified-rollback');
       if (!rollbackUnverified({ git, prevHead: uv.prevHead })) {
         alert('rebuild-interrupted-unrecoverable', { unverified: uv });
         return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
@@ -217,6 +249,7 @@ export async function prepareRebuild({
     const untracked = collectUntrackedPaths(git);
     const clean = status.status === 0 && !String(status.stdout ?? '').trim() && untracked !== null
       && !untracked.some((p) => git(['cat-file', '-e', `${qHead}:${p}`]).status === 0);
+    if (clean && readyOnly) return mutationDue('quarantine-reset');
     const reset = clean ? git(['reset', '--hard', state.quarantine.prevHead]) : { status: 1 };
     if (clean && reset.status === 0) {
       state.quarantine = null;
@@ -234,6 +267,7 @@ export async function prepareRebuild({
   if (!onMain) {
     // A store writer that checked its branch out in THIS clone (live 2026-10-09) is healed back to main when the
     // branch is allowlisted and only store files changed; anything else still refuses (wrong-branch-heal.mjs).
+    if (readyOnly) return mutationDue('wrong-branch-heal');
     const heal = healWrongBranch({ git, now: nowMs });
     alert(heal.healed ? 'wrong-branch-healed' : 'wrong-branch-heal-refused', heal);
     if (heal.healed) {
@@ -246,9 +280,27 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'not-on-main' });
   }
 
-  const unsafe = ensureSafeToMove({
-    git, root, env, stEnv, alert, knownInputs: knownInputsOf(state),
-  });
+  if (readyOnly) {
+    // repairCloneRefs can prune refs, heal commit graphs, or replace the whole clone. Use only
+    // read probes here; even an incomplete diagnosis defers to the normal tick, never to repair.
+    try {
+      const refs = probeBrokenRefs(root);
+      if (refs.probeFailed !== false || !Array.isArray(refs.broken)) return mutationDue('clone-ref-repair');
+      // repairCloneRefs prunes only dangling remote-tracking refs other than HEAD's; any other dangling ref is
+      // merely reported, so it must not defer every ready-only job.
+      const head = refs.broken.length ? String(git(['symbolic-ref', '-q', 'HEAD']).stdout ?? '').trim() : '';
+      if (refs.broken.some((b) => String(b?.ref).startsWith('refs/remotes/') && b.ref !== head)) return mutationDue('clone-ref-repair');
+      const diagnosis = diagnoseLane(root);
+      // repairCloneRefs ignores the "ref(s) point at missing objects" problem too (handled above).
+      const problems = Array.isArray(diagnosis.problems) ? diagnosis.problems.filter((p) => !/ref\(s\) point at missing objects/.test(p)) : null;
+      if (!problems || problems.length || (diagnosis.ok !== true && !refs.broken.length)) return mutationDue('clone-reclone');
+      if (git(['commit-graph', 'verify']).status !== 0) return mutationDue('clone-commit-graph-repair');
+    } catch { return mutationDue('clone-repair-unverified'); }
+  }
+  const safetyArgs = { git, root, env, stEnv, alert, knownInputs: knownInputsOf(state) };
+  // The recovery helper restores tracked claim stamps and migrates tracked runtime stores.
+  const unsafe = readyOnly ? findUnsafeLocalState(safetyArgs) : ensureSafeToMove(safetyArgs);
+  if (readyOnly && unsafe.reason === 'dirty') return mutationDue('dirty-tree-recovery');
   if (!unsafe.safe) {
     alert(unsafe.reason, unsafe.detail);
     return terminal({ moved: false, reason: unsafe.reason });
@@ -275,7 +327,7 @@ export async function prepareRebuild({
   // repairCloneRefs re-checks that lock itself and refuses without it.
   // The write lock was taken under `env`'s lock root (rebuild.mjs), so the proof must be read from that same root.
   const lockRoot = env?.WE_DAEMON_CLONE_LOCK_ROOT;
-  const cloneRepair = repairCloneRefs(root, {
+  const cloneRepair = readyOnly ? { ok: true, pruned: [], reportedNew: [] } : repairCloneRefs(root, {
     log: (m) => log?.error?.(m), allowReclone: true, holdsWriteLock: (d) => holdsCloneWriteLock(d, lockRoot ? { lockRoot } : {}),
   });
   if (cloneRepair.pruned.length || cloneRepair.reportedNew.length || cloneRepair.quarantinedTo || !cloneRepair.ok) {
@@ -301,7 +353,10 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
-  pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
+  const prunedSidecars = pruneLandedBacklogSidecars({
+    git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert, dryRun: readyOnly,
+  });
+  if (readyOnly && prunedSidecars.length) return mutationDue('backlog-sidecar-prune');
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
     alert('status-failed', 'Post-cleanup ls-files --others failed');
@@ -474,6 +529,7 @@ export async function prepareRebuild({
   {
     const ready = readReadyCandidate(root, stEnv);
     if (ready) {
+      if (readyOnly) return mutationDue('ready-candidate-adopt');
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
       const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
@@ -483,6 +539,13 @@ export async function prepareRebuild({
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
       }
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
+      let overlayEvents;
+      const readOverlayEvents = () => {
+        if (overlayEvents === undefined) {
+          overlayEvents = readOverlayEventLog(root, env);
+        }
+        return overlayEvents;
+      };
       const m = matchReadyCandidate({
         ready,
         plan,
@@ -503,14 +566,27 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
-        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        leftForMain: (a, build) => overlayGraduated({
+          readyAt: ready.at ?? ready.passedAt,
+          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
+        }),
+        contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
+        removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       if (ready.quick && !resolveQuick(env).quick) {
         clearReadyCandidate(root, stEnv);
         alert('ready-candidate-discarded', { target: ready.adopt.finalSha, note: 'quick mode disabled — full smoke required' });
       } else if (!m.adopt) {
         clearReadyCandidate(root, stEnv);
-        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });
+        reportDiscardedCandidate({
+          ready, match: m, alert,
+          needsYou: ({ kind, ...detail }) => {
+            try {
+              appendOverlayEvent(root, { kind: 'needs-you', need: kind, ...detail }, { env });
+            } catch { /* the alert remains visible when the event log is unwritable */ }
+            alert('ready-candidate-discarded-needs-you', detail);
+          },
+        });
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {
@@ -521,6 +597,7 @@ export async function prepareRebuild({
         alert('ready-candidate-adopted', {
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({
@@ -600,6 +677,7 @@ export async function prepareRebuild({
     const changedFiles = diff.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null;
     const d = skipCheck(changedFiles);
     if (d?.skip) {
+      if (readyOnly) return mutationDue('skip-unrelated-adopt');
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
         root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },

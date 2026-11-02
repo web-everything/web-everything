@@ -1,4 +1,4 @@
-import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
  * every open PR, and return what to dispatch plus every refusal and the fact each turned on.
@@ -112,6 +112,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
+import { decideReviewChurn } from './review-churn.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
@@ -1479,15 +1480,23 @@ function refuseHumanClearedHead({ pr, refuse, withPhase, extra = {} }) {
   return true;
 }
 
+/** Optional diagnostics only; callers retain their existing refusal and dispatch decisions. */
+function earlyStartShadowFields(pr, requiredChecks) {
+  return pr?.reviewTiming?.earlyStartShadow === true ? { earlyStartShadow: earlyStartShadow({
+    headSha: pr.headRefOid, checks: pr.statusCheckRollup, requiredChecks, verifyGreen: pr.verifyGreen,
+    care: pr.careLevel, lines: pr.diffLines, files: pr.diffFiles, kinds: pr.kinds, policy: pr.reviewTiming,
+  }) } : {};
+}
+
 /**
  * The pre-review gates a review emission that does NOT go through {@link dispatchReviewRow} must still honour: a draft
  * PR, a scope-bloated diff and a human-cleared head are never reviewed. The direct
  * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
  * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
  */
-function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
+function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   if (pr?.isDraft) {
-    refuse('draft', { ...withPhase, ...extra, why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
+    refuse('draft', { ...withPhase, ...extra, ...earlyStartShadowFields(pr, requiredChecks), why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
     return true;
   }
   if (pr?.scopeBloat) {
@@ -1539,7 +1548,7 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
   const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
   if (!allowed) refuse('review-ci', {
-    ...withPhase, ...extra, ci,
+    ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
   });
   return allowed;
@@ -1694,6 +1703,16 @@ function dispatchReviewRow({
       return;
     }
   }
+  // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
+  // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
+  // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
+  // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
+  const churnRaw = decideReviewChurn(pr);
+  const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
+  if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
+  // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
+  // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
+  if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
@@ -2376,7 +2395,7 @@ export function planReconcile({
       const grant = allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') ? pastCapGrant(extra) : null;
       if (grant?.action === 'review') {
         if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
-        if (refuseUnreviewable({ pr, refuse: refuseFn, withPhase: extra })) return;
+        if (refuseUnreviewable({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
         if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
         dispatch.push({ ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), ...grant.row, why: grant.why });
         return;
@@ -3603,7 +3622,7 @@ export function planReconcile({
           if (advisoryIsStale) {
             if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
             if (refuseReferralHold({ pr, refuse, withPhase })) continue;
-            if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+            if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -3662,7 +3681,7 @@ export function planReconcile({
       const advisoryFindingsHere = countFindings(pr?.comments);
       if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
-      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -3681,7 +3700,7 @@ export function planReconcile({
       ? staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) : null;
     if (staleBase) {
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
-      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
       const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
         currentRef: defaultBranch, currentSha: mainSha,
       });
@@ -3944,6 +3963,11 @@ export function planReconcile({
         attempts: entry.reviewFixAttempts ?? entry.attempts,
         joinedInputs: { head: pr.headRefOid, ciFailures: facts.ciFailures, reviewFindings: facts.findings.map(c => c.body) } });
     } else timedDispatch.push(entry);
+  }
+  for (const d of timedDispatch) {
+    if (d.kind !== 'review' || !d.churnCap || notes.some(n => n.kind === 'review-churn' && n.prNumber === d.prNumber)) continue;
+    notes.push({ kind: 'review-churn', prNumber: d.prNumber, loops: d.churnCap.loops, cap: d.churnCap.cap,
+      text: `PR #${d.prNumber}: ${d.churnCap.loops} reviews of distinct heads (review.reviewChurn.maxLoopsPerPr=${d.churnCap.cap}) — the fix/review loop is not converging; the new head is still reviewed, and a person should look at the PR` });
   }
   return { dispatch: timedDispatch, refusals, notes };
 }

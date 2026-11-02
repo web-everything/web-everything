@@ -252,9 +252,14 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
         result.verdictHistory = parseAdvisories(trusted).map(a => commentVerdict(trusted[a.index], a));
         const latest = result.verdictHistory[0];
         const current = mine.filter(r => r.type === 'verdict').at(-1);
-        result.latestVerdict = latest && advisoryCoversHead({ head: latest.headSha }, headSha) ? latest
-          : current?.coverage?.headSha === headSha ? { accepted: verdictClears(current.verdict), findings: null, lensVerdicts: null, evidence: 'ledger-only' } : null;
-        if (result.latestVerdict?.evidence === 'ledger-only') evidenceErrors.push('verdict details unavailable');
+        result.latestVerdict = latest && advisoryCoversHead({ head: latest.headSha }, headSha) ? latest : null;
+        // No published advisory for this head: the ledger row at this head is the verdict. Any doubt fails closed.
+        if (!result.latestVerdict && current?.coverage?.headSha === headSha) {
+          if (typeof current.verdict === 'string' && current.verdict && Number.isFinite(Date.parse(current.at))) {
+            result.latestVerdict = { accepted: verdictClears(current.verdict), findings: null, lensVerdicts: null,
+              at: new Date(current.at).toISOString(), headSha, evidence: 'ledger' };
+          } else evidenceErrors.push('verdict ledger row malformed');
+        }
         if (!result.latestVerdict && labels.some(l => ['advisory:accepted', 'review:accepted'].includes(l))) evidenceErrors.push('accepted label lacks live verdict evidence');
         if (result.latestVerdict && current?.coverage?.headSha === headSha && Date.parse(current.at) >= Date.parse(result.latestVerdict.at)
           && !verdictClears(current.verdict)) result.latestVerdict = { ...result.latestVerdict, accepted: false };

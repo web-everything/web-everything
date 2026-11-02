@@ -7,6 +7,7 @@ import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
+import { resolveFinalHeadSeats, decideFinalHeadSeats } from '../lib/review-final-head-seats.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 import { readRun, writeRun } from './run-store.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
@@ -594,6 +595,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    // R365 fix 5 — `review.finalHeadSeats` (see `../lib/review-final-head-seats.mjs`) and the PR's live head.
+    finalHeadSeatsSetting: () => resolveFinalHeadSeats({ env }),
+    liveHead: ({ pr, repo }) => {
+      try { return JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })).headRefOid ?? null; } catch { return null; }
+    },
     // Read the existing quota and queue signals; never invent a second outage detector.
     reviewInfraBlock: () => {
       const now = Date.now();
@@ -860,7 +866,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   if (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function') {
     let extraSeats;
     try {
-      extraSeats = io.runExtraSeats(seatsBox.input);
+      let gate;
+      try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
+      extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
     } catch (e) {
       extraSeats = { status: 'error', reason: tail(e?.message ?? e, 300) };
     }
@@ -1020,6 +1028,25 @@ export function prepareReviewArc(input, io) {
   } catch (e) {
     throw Error(`review lane setup failed: ${tail(e?.message ?? e, 300)}; inspect the PR head and retry`);
   }
+}
+
+/** R365 fix 5 — gate the added seats on the final head. Fail-open: any lookup problem runs the seats. */
+function finalHeadSeatsGate(input, io) {
+  let setting;
+  try { setting = io.finalHeadSeatsSetting?.(); } catch { setting = null; }
+  if (!setting) return { run: true, skip: false, reason: 'no final-head setting' };
+  let d = decideFinalHeadSeats({ loopPayload: input.loopPayload, setting });
+  // Only a potential final head needs supersession evidence. Off, definitive changes
+  // (including shadow), and missing verdicts already have a decision without a lookup.
+  if (d.reason === 'final head') {
+    let liveHead = null;
+    try { liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo }) ?? null; } catch { liveHead = null; }
+    d = decideFinalHeadSeats({ loopPayload: input.loopPayload, liveHead, setting });
+  }
+  if (d.reason !== 'final head' && d.reason !== 'final-head seats off') {
+    io.log(`review-job: final-head seats (${setting.mode}): ${d.skip ? 'SKIP' : 'would skip (shadow, running)'} — ${d.reason}`);
+  }
+  return d;
 }
 
 function runReviewArc({

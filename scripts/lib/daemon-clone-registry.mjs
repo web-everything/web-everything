@@ -133,6 +133,7 @@ function readRecords(env) {
   try { entries = readdirSync(dir); } catch { return out; }
   for (const name of entries) {
     if (!name.endsWith('.json')) continue; // skips the sibling `.events.jsonl` audit trail too
+    if (name.includes('.json.')) continue; // sidecars such as `<key>.json.main-sync.json` are not overlay records
     try {
       const file = path.join(dir, name);
       out.push({ file, record: JSON.parse(readFileSync(file, 'utf8')) });

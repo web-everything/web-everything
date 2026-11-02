@@ -6,7 +6,7 @@ import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {basename,join} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {classifyManifestPath,manifestEntry,manifestWire,digestManifest,parseGitTree,validateTestNames,isTestFile,bytePath,pathParts,decodeManifest} from './forge-exec-manifest.mjs';
+import {classifyManifestPath,credentialContentFinding,manifestEntry,manifestWire,digestManifest,parseGitTree,validateTestNames,isTestFile,bytePath,pathParts,decodeManifest} from './forge-exec-manifest.mjs';
 import {baseGuard,copyLeaves,createBasePin,prewarmDirectory,prewarmEntry,baseDirectory,baseFile,readBase,readyBases,pruneBases,PUBLIC_REPOSITORY,anonymousGitEnv} from './forge-exec-bases.mjs';
 import {createRunner,verifyManifest,digestLock} from './forge-exec-run.mjs';
 const URL=PUBLIC_REPOSITORY;
@@ -223,6 +223,8 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
         // Git object identity plus a fresh manifest hash bind exported bytes.
         const oid=createHash(entry.oid.length===64?'sha256':'sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
         if(oid!==entry.oid)throw new Error('Public blob changed');
+        // R321: a name-flagged public file with secret-like content stays out of the base.
+        if(policy.credentialSource&&credentialContentFinding(entry.path,content)){excluded.push(entry.path);continue;}
         let dest=Buffer.from(tree);const parts=pathParts(entry.path);
         for(const [i,part] of parts.entries()){dest=bytePath(dest,part);if(i<parts.length-1)await fs.mkdir(dest,{recursive:true,mode:0o755});else await fs.writeFile(dest,content,{flag:'wx',mode:entry.executable?0o755:0o644});}
         entries.push(manifestEntry(entry.path,content,entry.executable,true));

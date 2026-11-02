@@ -2,7 +2,7 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
@@ -156,8 +156,8 @@ describe('remote admission policy', () => {
     {env:{},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['node','scripts/check-standards.mjs','--local','--files=a.mjs'],expected:['npm','run','check:standards','--','--local','--files=a.mjs']},
-    // Only verify-lane's handoff drops the trailing gate-only options, and only from the remote argv.
-    {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','a.test.mjs','--reporter=dot','--passWithNoTests','--testTimeout=15000','--hookTimeout=30000'],expected:['npm','run','test:unit','--','a.test.mjs','--reporter=dot']},
+    // Forge accepts the gate options (R314): the remote argv carries them unchanged.
+    {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','a.test.mjs','--reporter=dot','--passWithNoTests','--testTimeout=15000','--hookTimeout=30000'],expected:['npm','run','test:unit','--','a.test.mjs','--reporter=dot','--passWithNoTests','--testTimeout=15000','--hookTimeout=30000']},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','a.test.mjs','--testTimeout=15000','--testTimeout=15000'],expected:['npm','run','test:unit','--','a.test.mjs','--testTimeout=15000','--testTimeout=15000']},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['vitest','run','--config','vitest.integration.config.ts','a.test.mjs','--passWithNoTests'],expected:['npm','run','test:integration:vitest','--','a.test.mjs','--passWithNoTests']},
     {env:{},command:['vitest','run','a.test.mjs','--passWithNoTests'],expected:['npm','run','test:unit','--','a.test.mjs','--passWithNoTests']},
@@ -666,7 +666,8 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     const remoteRoot = join(f.lockRoot, '..', 'remote');
     mkdirSync(remoteRoot, { recursive: true });
     const marker = join(remoteRoot, 'slot-0.unconfirmed');
-    writeFileSync(marker, 'remote termination unconfirmed\n');
+    // A structured marker owned by this live process must keep its slot quarantined.
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: Date.now() }) + '\n');
     const base = Date.now();
     let t = base;
     f.clock = () => (t += 10_000);
@@ -682,6 +683,87 @@ describe('host overload routes to Forge instead of deferring (7579)', () => {
     expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0, remoteResult: { mode: 'remote', code: 0 } });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('waiting for a remote slot instead of deferring locally');
+  });
+
+  it('records the Forge run id into the execution marker once the client reports it', async () => {
+    const f = await overloadFixture({ overloaded: false, freeAtMs: null });
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    rmSync(join(remoteRoot, 'slot-0.unconfirmed'));
+    let seen;
+    f.remoteExec = vi.fn(async options => {
+      options.onRun('r-' + 'a'.repeat(32));
+      seen = JSON.parse(readFileSync(join(remoteRoot, 'slot-0.unconfirmed.run'), 'utf8'));
+      return { mode: 'remote', code: 0 };
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(seen.run).toBe('r-' + 'a'.repeat(32));
+    expect(seen.owner).toBeTruthy();
+  });
+
+  it('reaps a dead client\'s stale marker and runs on the idle Forge instead of remote-full (perf10)', async () => {
+    const f = await overloadFixture({ overloaded: false, freeAtMs: null });
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1 }) + '\n');
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    // An earlier client already saw this exact marker's owner dead long ago (the persisted stamp).
+    const st = statSync(marker);
+    writeFileSync(marker + '.dead', JSON.stringify({ key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000 }));
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('reaped stale remote slot marker');
+  });
+
+  it('never reaps a live client\'s marker while Forge is idle', async () => {
+    const f = await overloadFixture({ overloaded: false, freeAtMs: null });
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    writeFileSync(marker, JSON.stringify({ v: 1, host: 'forge', owner: 'live', pid: process.pid, at: 1 }) + '\n');
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(existsSync(marker)).toBe(true);
+    expect(f.remoteExec).not.toHaveBeenCalled();
+  });
+  it.each(['legacy', 97, 254])('does not dispatch into a quarantined slot after %s leaves remote work unconfirmed', async failure => {
+    const f = await overloadFixture({overloaded: false, freeAtMs: null});
+    const marker = join(f.lockRoot, '..', 'remote', 'slot-0.unconfirmed');
+    const run = 'r-' + 'a'.repeat(32);
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    expect(child.status).toBe(0);
+    writeFileSync(marker, failure === 'legacy' ? 'remote termination unconfirmed\n'
+      : JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1, run}));
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    const st = statSync(marker);
+    writeFileSync(marker + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000}));
+    const health = f.readTelemetry;
+    f.readTelemetry = async () => {
+      const telemetry = await health();
+      return {...telemetry, activeRuns: 1, recent: [{runId: run, startedAtET: telemetry.sampledAtET,
+        stageMs: {install: 0, run: 0}, code: failure === 'legacy' ? null : failure}]};
+    };
+    expect(await runWithRemoteDecision(f)).toEqual({handled: false});
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(existsSync(marker)).toBe(true);
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('remote-full (30s wait exhausted)');
+  });
+  it('reaps stale markers before acquiring an available slot', async () => {
+    const f = await overloadFixture({overloaded: false, freeAtMs: null, remote: {mode: 'always', maxConcurrent: 2}});
+    const root = join(f.lockRoot, '..', 'remote'), marker = join(root, 'slot-0.unconfirmed');
+    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    expect(child.status).toBe(0);
+    writeFileSync(marker, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: 1}));
+    const old = (Date.now() - 3_600_000) / 1000; utimesSync(marker, old, old);
+    const st = statSync(marker);
+    writeFileSync(marker + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: Date.now() - 600_000}));
+    // Retain the next execution's marker, so cleanup after completion cannot hide the acquisition order.
+    f.remoteExec.mockResolvedValue({mode: 'unconfirmed', reason: 'ambiguous-result'});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 124});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.sleep).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.map(c => c[0]).join('')).toContain('reaped stale remote slot marker(s) slot-0.unconfirmed');
+    const replacement = JSON.parse(readFileSync(marker, 'utf8'));
+    expect(replacement.owner).not.toBe('dead');
+    expect(replacement.pid).toBe(process.pid);
+    expect(existsSync(join(root, 'slot-1.unconfirmed'))).toBe(false);
   });
 
   it('keeps the 30s remote-full fallback when the host is not overloaded', async () => {

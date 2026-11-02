@@ -21,7 +21,7 @@ function fixture({ leases = [], claims = {}, runs = {}, probe = () => false, ahe
       if (ahead instanceof Error) throw ahead;
       return ahead;
     }
-    expect(argv).toEqual(['/fixture/scripts/lane-pool.mjs', 'status', '--json']);
+    expect(argv).toEqual(['/fixture/scripts/lane-pool.mjs', 'status', '--json', '--max-age-ms=0']);
     return JSON.stringify({ lanes: leases });
   });
   const read = createStaleStateReader({
