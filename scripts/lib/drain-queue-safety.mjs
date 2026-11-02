@@ -1,6 +1,7 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
@@ -23,7 +24,10 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
     const testedHead = event.beforeCommit?.parents?.nodes?.[1]?.oid;
     if (typeof testedHead !== 'string' || !/^[a-f0-9]{40}$/i.test(testedHead))
       return hold('no commit binding for merge-queue removal; inspect timeline before retrying');
-    if (testedHead === head) return hold(safe(reason) || 'unknown removal reason');
+    if (testedHead === head) {
+      // Preserve the public enumerable decision shape for existing callers/serializers.
+      return Object.defineProperty(hold(safe(reason) || 'unknown removal reason'), 'removal', { value: true });
+    }
   }
   return { hold: false, line: null };
 }
@@ -57,9 +61,72 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
   }
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSync, log = () => {} } = {}) {
+/** Append-only spent-head ledger: no expiry, since old heads must never be retried.
+ * Persistence is best-effort; an unavailable file retains deduplication for this process.
+ */
+export function createMqSameHeadRefreshStore({ read, write, log = () => {} }) {
+  let keys;
+  const load = () => {
+    if (keys) return;
+    keys = new Set();
+    try {
+      const saved = JSON.parse(read());
+      if (!Array.isArray(saved) || saved.some(key => typeof key !== 'string')) throw new Error('invalid ledger');
+      keys = new Set(saved);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') log('mq-same-head-refresh: state unreadable; using in-memory deduplication');
+    }
+  };
+  return {
+    has(key) { load(); return keys.has(key); },
+    add(key) {
+      load(); keys.add(key);
+      try { write(JSON.stringify([...keys]) + '\n'); }
+      catch { log('mq-same-head-refresh: state write failed; using in-memory deduplication'); }
+    },
+  };
+}
+
+/** Owns recovery of a confirmed removal; the admission hold remains until the head changes. */
+export function mqSameHeadRefresh({ repo, pr, head, decision, exec = execFileSyncThrottled,
+  log = () => {}, store } = {}) {
+  if (!decision?.hold || !decision.removal || !store) return;
+  const key = `${repo}#${pr}@${head}`;
+  if (store.has(key)) return;
+  const opts = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
+  let live;
+  try {
+    live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
+      '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
+  } catch { return; }
+  if (live?.headRefOid !== head) return;
+  const checks = live.statusCheckRollup;
+  const green = Array.isArray(checks) && checks.length > 0 && checks.every(check => {
+    if (!check || (check.status != null && check.status !== 'COMPLETED')) return false;
+    return ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state);
+  });
+  if (live.mergeStateStatus !== 'CLEAN' && !green) return;
+  // Spend before IO: even a refused request (including a head race/422) is never repeated.
+  store.add(key);
+  const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+  const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — update-branch`;
+  try {
+    exec('gh', ['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`,
+      '-f', `expected_head_sha=${head}`], opts);
+    log(`${prefix} requested`);
+  } catch (error) {
+    const message = safe(String(error?.stderr || error?.message || error).split('\n')[0]).slice(0, 240);
+    log(`${prefix} refused (${message}); not retrying at this head`);
+  }
+}
+
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, refresh } = {}) {
   const decision = decideMqSameHead({ pr, head, timeline: readMqTimeline({ repo, pr, exec }) });
-  if (decision.hold) log(decision.line);
+  if (decision.hold) {
+    log(decision.line);
+    if (refresh) mqSameHeadRefresh({ repo, pr, head, decision, exec, log, store: refresh.store });
+  }
   return decision;
 }
 

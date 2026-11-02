@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard } from '../drain-queue-safety.mjs';
+import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, mqSameHeadRefresh, createMqSameHeadRefreshStore } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -29,6 +29,144 @@ describe('merge-queue same-head failure admission', () => {
   const response = evidence => JSON.stringify({ data: { repository: { pullRequest: {
     timelineItems: { nodes: evidence.nodes, pageInfo: { hasPreviousPage: evidence.hasPreviousPage } },
   } } } });
+
+  describe('same-head refresh owner', () => {
+    const green = { headRefOid: head, mergeStateStatus: 'BLOCKED', statusCheckRollup: [
+      { status: 'COMPLETED', conclusion: 'SUCCESS' }, { state: 'SUCCESS' },
+      { conclusion: 'SKIPPED' }, { conclusion: 'NEUTRAL' },
+    ] };
+    function fixture(view = green, { evidence = timeline(removed()), putError } = {}) {
+      const store = new Set(), log = vi.fn();
+      const exec = vi.fn((_cmd, args) => {
+        if (args[1] === 'graphql') return response(evidence);
+        if (args[0] === 'pr') return JSON.stringify(view);
+        expect(store.has(`${repo}#${pr}@${head}`)).toBe(true);
+        if (putError) throw putError;
+        return '{}';
+      });
+      const pass = () => mqSameHeadGuard({ repo, pr, head, exec, log, refresh: { store } });
+      const puts = () => exec.mock.calls.filter(([, args]) => args.includes('PUT'));
+      return { store, log, exec, pass, puts };
+    }
+    it('held + green requests exactly one PUT pinned to the head, including across passes', () => {
+      const f = fixture();
+      expect(f.pass().hold).toBe(true);
+      expect(f.puts()).toHaveLength(1);
+      expect(f.exec).toHaveBeenCalledWith('gh', ['pr', 'view', String(pr), '--repo', repo,
+        '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], expect.any(Object));
+      expect(f.puts()[0][2]).toMatchObject({ throttle: { maxAttempts: 1 } });
+      expect(f.puts()[0].slice(0, 2)).toEqual(['gh', ['api', '-X', 'PUT',
+        `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
+      expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
+      f.pass();
+      expect(f.puts()).toHaveLength(1);
+      expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'pr')).toHaveLength(1);
+    });
+    it('CLEAN permits refresh without a rollup', () => {
+      const f = fixture({ headRefOid: head, mergeStateStatus: 'CLEAN' });
+      f.pass(); expect(f.puts()).toHaveLength(1);
+    });
+    it.each([
+      ['red', [{ conclusion: 'FAILURE' }]],
+      ['pending', [{ status: 'IN_PROGRESS', conclusion: null }]],
+      ['pending with stale success', [{ status: 'IN_PROGRESS', conclusion: 'SUCCESS' }]],
+      ['unknown', [{}]], ['missing', undefined], ['empty', []],
+    ])('held + %s checks does not refresh', (_name, statusCheckRollup) => {
+      const f = fixture({ ...green, statusCheckRollup });
+      f.pass(); expect(f.puts()).toHaveLength(0); expect(f.store.size).toBe(0);
+    });
+    it('422 is logged without throwing and never retried on the next pass', () => {
+      const f = fixture(green, { putError: new Error('HTTP 422: head moved') });
+      expect(f.pass).not.toThrow();
+      expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch refused (HTTP 422: head moved); not retrying at this head`);
+      f.pass(); expect(f.puts()).toHaveLength(1);
+    });
+    it.each([
+      ['unreadable', { error: 'offline' }],
+      ['incomplete', { ...timeline(removed()), hasPreviousPage: true }],
+      ['unbound', timeline({ ...removed(), beforeCommit: null })],
+      ['manual', timeline(removed('manual'))], ['merged', timeline(removed('merged'))],
+    ])('%s timeline never attempts a refresh read or request', (_name, evidence) => {
+      const f = fixture(green, { evidence });
+      f.pass(); expect(f.exec).toHaveBeenCalledTimes(1);
+    });
+    it('head moved never refreshes', () => {
+      const f = fixture({ ...green, headRefOid: prior });
+      f.pass(); expect(f.puts()).toHaveLength(0);
+    });
+    it('unreadable PR evidence never refreshes', () => {
+      const exec = vi.fn(() => { throw new Error('offline'); });
+      expect(() => mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())),
+        exec, store: new Set() })).not.toThrow();
+      expect(exec).toHaveBeenCalledTimes(1);
+    });
+    it.each(['{', 'null', '{}'])('malformed or incomplete PR response %s never refreshes', reply => {
+      const store = new Set(), exec = vi.fn(() => reply);
+      mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store });
+      expect(exec).toHaveBeenCalledTimes(1); expect(store.size).toBe(0);
+    });
+    it('missing head hold cannot refresh', () => {
+      const exec = vi.fn();
+      mqSameHeadRefresh({ repo, pr, head: '', decision: decideMqSameHead({ pr, head: '',
+        timeline: timeline(removed()) }), exec, store: new Set() });
+      expect(exec).not.toHaveBeenCalled();
+    });
+    it('a different PR or head has its own request allowance', () => {
+      const store = new Set();
+      for (const [number, sha] of [[pr, head], [pr + 1, head], [pr, prior]]) {
+        const exec = vi.fn((_cmd, args) => args[0] === 'pr'
+          ? JSON.stringify({ headRefOid: sha, mergeStateStatus: 'CLEAN' }) : '{}');
+        mqSameHeadRefresh({ repo, pr: number, head: sha, decision: { hold: true, removal: true }, exec, store });
+        expect(exec).toHaveBeenCalledTimes(2);
+      }
+      expect(store.size).toBe(3);
+    });
+    it('guard without refresh never reads PR checks or requests update', () => {
+      const f = fixture();
+      mqSameHeadGuard({ repo, pr, head, exec: f.exec });
+      expect(f.exec).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('refresh spent-head persistence', () => {
+    it('persists before the request and suppresses it after a simulated restart', () => {
+      let disk = '[]';
+      const write = vi.fn(data => { disk = data; });
+      const makeStore = () => createMqSameHeadRefreshStore({ read: () => disk, write });
+      const exec = vi.fn((_cmd, args) => {
+        if (args[0] === 'pr') return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
+        expect(JSON.parse(disk)).toContain(`${repo}#${pr}@${head}`);
+        return '{}';
+      });
+      const run = store => mqSameHeadRefresh({ repo, pr, head, decision: decide(timeline(removed())), exec, store });
+      run(makeStore()); run(makeStore());
+      expect(exec).toHaveBeenCalledTimes(2); expect(write).toHaveBeenCalledTimes(1);
+    });
+    it.each(['unreadable', 'bad JSON', 'wrong schema', 'bad key'])('%s file falls back to memory', kind => {
+      const log = vi.fn();
+      const read = () => {
+        if (kind === 'unreadable') throw new Error('EACCES');
+        return kind === 'bad JSON' ? '{' : kind === 'bad key' ? '[null]' : '{}';
+      };
+      const store = createMqSameHeadRefreshStore({ read, write: vi.fn(), log });
+      expect(store.has('key')).toBe(false);
+      store.add('key'); expect(store.has('key')).toBe(true);
+      expect(log).toHaveBeenCalledWith('mq-same-head-refresh: state unreadable; using in-memory deduplication');
+    });
+    it('failed writes retain the spent head in memory and warn the operator', () => {
+      const log = vi.fn(), write = vi.fn(() => { throw new Error('EACCES'); });
+      const store = createMqSameHeadRefreshStore({ read: () => '[]', write, log });
+      store.add('key'); expect(store.has('key')).toBe(true);
+      expect(log).toHaveBeenCalledWith('mq-same-head-refresh: state write failed; using in-memory deduplication');
+    });
+    it('a missing file starts fresh without an unreadable warning', () => {
+      const log = vi.fn();
+      const store = createMqSameHeadRefreshStore({
+        read: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, write: vi.fn(), log,
+      });
+      expect(store.has('key')).toBe(false); expect(log).not.toHaveBeenCalled();
+    });
+  });
 
   it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
     expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });

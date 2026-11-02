@@ -2,7 +2,7 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { mqSameHeadGuard } from './lib/drain-queue-safety.mjs';
+import { mqSameHeadGuard, createMqSameHeadRefreshStore } from './lib/drain-queue-safety.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -251,6 +251,16 @@ function recordEnqueue(outcomes, repo, outcome) {
 }
 
 const REVIEW_BASELINE_STATE_PATH = resolve(process.cwd(), '.claude/skills/drain/review-baseline-state.json');
+const MQ_SAME_HEAD_REFRESH_STATE_PATH = resolve(dirname(REVIEW_BASELINE_STATE_PATH), 'mq-same-head-refresh-state.json');
+// Module lifetime spans watch passes; persisted spent keys also survive drain restarts.
+const mqSameHeadRefreshStore = createMqSameHeadRefreshStore({
+  read: () => readFileSync(MQ_SAME_HEAD_REFRESH_STATE_PATH, 'utf8'),
+  write: data => {
+    mkdirSync(dirname(MQ_SAME_HEAD_REFRESH_STATE_PATH), { recursive: true });
+    writeFileSync(MQ_SAME_HEAD_REFRESH_STATE_PATH, data, { mode: 0o600 });
+  },
+  log: line => process.stderr.write(`${line}\n`),
+});
 
 const argv = process.argv.slice(2);
 const flags = parseArgvFlags(argv); // #2859 — single source: scripts/lib/reconcile-predicate.mjs
@@ -4821,6 +4831,7 @@ async function runCli() {
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options) {
     const guard = mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      refresh: DRY_RUN ? undefined : { store: mqSameHeadRefreshStore },
       log: line => process.stderr.write(`${line}\n`) });
     if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: guard.line };
     return mergeStrategy.enqueue(c, sha, options);
