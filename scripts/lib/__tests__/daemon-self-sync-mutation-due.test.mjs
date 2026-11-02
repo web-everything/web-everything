@@ -202,3 +202,108 @@ describe('owner handoff of readonly rebuild-job mutations', () => {
     expect(w.alert).not.toHaveBeenCalled();
   });
 });
+
+
+describe('deferred mutation handoff audit regressions', () => {
+  it('only the owner performs adopt-only mutation and completes it before queuing a new job', async () => {
+    touchOwnerHeartbeat(root, { lockRoot, nowMs: T });
+    const job = due('audit-owner-order');
+    const started = Promise.withResolvers(), release = Promise.withResolvers(), queued = Promise.withResolvers();
+    const events = [];
+    const rebuild = vi.fn(async (options) => {
+      if (options?.adoptOnly) {
+        events.push('mutation-started'); started.resolve('mutation-started');
+        await release.promise; events.push('mutation-completed');
+        return { moved: false, reason: 'needs-build' };
+      }
+      events.push('job-queued'); queued.resolve('job-queued'); return normalResult();
+    });
+    const owner = fixture({ rebuild, readLatestRebuildJobResult: vi.fn(() => job) });
+    const nonOwner = fixture({ entries: ['pass-daemon.mjs'], readLatestRebuildJobResult: vi.fn(() => job) });
+    const executing = owner.synced.tickOnce();
+    try {
+      expect(await Promise.race([started.promise, queued.promise])).toBe('mutation-started');
+      await expect(nonOwner.synced.tickOnce()).resolves.toBe('ticked');
+      expect(nonOwner.latest).not.toHaveBeenCalled();
+      expect(nonOwner.rebuild).not.toHaveBeenCalled();
+      expect(nonOwner.alert).not.toHaveBeenCalled();
+      expect(rebuild.mock.calls).toEqual([[MUTATION]]);
+      expect(events).toEqual(['mutation-started']);
+      release.resolve(); await expect(executing).resolves.toBe('ticked');
+      expect(rebuild.mock.calls).toEqual([[MUTATION], []]);
+      expect(events).toEqual(['mutation-started', 'mutation-completed', 'job-queued']);
+    } finally { release.resolve(); await executing; }
+  });
+
+  it('persisted handled IDs suppress mutation across wrapper recreation without a previous in-memory attempt', async () => {
+    const job = due('audit-persisted-before-process-attempt');
+    // This ID has never entered the module's process guard: only the persisted evidence can suppress it.
+    fs.writeFileSync(marker(), JSON.stringify({ handledJobIds: [job.id] }));
+    const original = fixture({ readLatestRebuildJobResult: vi.fn(() => job) });
+    await expect(original.synced.tickOnce()).resolves.toBe('ticked');
+    const recreated = fixture({ readLatestRebuildJobResult: vi.fn(() => job) });
+    await expect(recreated.synced.tickOnce()).resolves.toBe('ticked');
+    expect(original.latest).toHaveBeenCalled(); expect(recreated.latest).toHaveBeenCalled();
+    expect(original.rebuild.mock.calls).toEqual([[]]);
+    expect(recreated.rebuild.mock.calls).toEqual([[]]);
+    expect(original.alert).not.toHaveBeenCalled(); expect(recreated.alert).not.toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(marker(), 'utf8'))).toEqual({ handledJobIds: [job.id] });
+  });
+
+  it.each(['read-EACCES', 'rename-EACCES', 'read-and-rename-EACCES'])(
+    'concurrent wrappers attempt one mutation and await its completion with marker %s', async (failure) => {
+      const job = due(`audit-concurrent-${failure}`);
+      const originalRead = fs.readFileSync, originalRename = fs.renameSync;
+      const faults = { reads: 0, writes: 0 };
+      vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...args) => {
+        if (String(path) === marker() && failure !== 'rename-EACCES') {
+          faults.reads += 1; throw Object.assign(new Error('marker read denied'), { code: 'EACCES' });
+        }
+        return originalRead(path, ...args);
+      });
+      vi.spyOn(fs, 'renameSync').mockImplementation((from, to, ...args) => {
+        if (String(to) === marker() && failure !== 'read-EACCES') {
+          faults.writes += 1; throw Object.assign(new Error('marker write denied'), { code: 'EACCES' });
+        }
+        return originalRename(from, to, ...args);
+      });
+      syncBuiltinESMExports();
+      const started = Promise.withResolvers(), release = Promise.withResolvers(), queued = Promise.withResolvers();
+      const secondRead = Promise.withResolvers();
+      const events = [];
+      const rebuild = vi.fn(async (options) => {
+        if (options?.adoptOnly) {
+          events.push('mutation-started'); started.resolve('mutation-started');
+          await release.promise; events.push('mutation-completed');
+          return { moved: false, reason: 'needs-build' };
+        }
+        events.push('job-queued'); queued.resolve('job-queued'); return normalResult();
+      });
+      const first = fixture({ rebuild, readLatestRebuildJobResult: vi.fn(() => job) });
+      const second = fixture({ rebuild, readLatestRebuildJobResult: vi.fn(() => { secondRead.resolve(); return job; }) });
+      const firstTick = first.synced.tickOnce();
+      let secondTick = Promise.resolve();
+      try {
+        expect(await Promise.race([started.promise, queued.promise])).toBe('mutation-started');
+        secondTick = second.synced.tickOnce(); await secondRead.promise;
+        // Both wrappers have observed this job while the first mutation is deliberately held open.
+        expect(rebuild.mock.calls).toEqual([[MUTATION]]);
+        expect(events).toEqual(['mutation-started']);
+        release.resolve();
+        await expect(Promise.all([firstTick, secondTick])).resolves.toEqual(['ticked', 'ticked']);
+        expect(rebuild.mock.calls).toEqual([[MUTATION], [], []]);
+        expect(events).toEqual(['mutation-started', 'mutation-completed', 'job-queued', 'job-queued']);
+        if (failure !== 'rename-EACCES') expect(faults.reads).toBeGreaterThan(0);
+        if (failure !== 'read-EACCES') {
+          expect(faults.writes).toBe(1);
+          expect(fs.existsSync(marker())).toBe(false); // persistence failed; retry suppression must be in-process
+        }
+        const recreated = fixture({ rebuild, readLatestRebuildJobResult: vi.fn(() => job) });
+        await expect(recreated.synced.tickOnce()).resolves.toBe('ticked');
+        expect(rebuild.mock.calls).toEqual([[MUTATION], [], [], []]);
+        expect(mutationCalls(rebuild)).toHaveLength(1);
+        expect(first.alert).not.toHaveBeenCalled(); expect(second.alert).not.toHaveBeenCalled();
+      } finally { release.resolve(); await Promise.allSettled([firstTick, secondTick]); }
+    },
+  );
+});

@@ -5,6 +5,8 @@
  * without deleting newer publications. All siblings keep adoption-yield accounting and ordinary lock fairness.
  * Stale requests retry with alerts bounded to 15 minutes; corrupt requests and unreadable ledgers stay pending.
  * Success or the persisted failure budget concludes requests, with an operator-visible abandonment alert.
+ * Finished readonly jobs hand deferred mutations to one owner adopt-only pass before new work is queued.
+ * Atomic handled IDs survive restarts; a process-wide attempt guard bounds retries when state is unreadable.
  * @description xv6fciw (narrow slice of decision #3681) — keep a daemon's DEDICATED clone on `origin/main`
  *   without a human re-syncing it, and restart the daemon onto new code between ticks.
  *
@@ -130,14 +132,16 @@ import {
   resolveCloneOwnership, touchOwnerHeartbeat, readRebuildRequest, recordRebuildRequestResult,
 } from './daemon-clone-lock.mjs';
 import { basename, dirname, join } from 'node:path';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
   BUILT_IN_BACKGROUND_BUILD_SETTINGS, makeTickProgressStore, readCloneIdentity,
 } from './daemon-background-build.mjs';
-import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-rebuild/rebuild-job.mjs';
+import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND, RESULT_SUFFIX } from './daemon-rebuild/rebuild-job.mjs';
 import { createJobStore } from './daemon-jobs-runtime.mjs';
+import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 import { maybeMaintainClone, cloneHasRebuildJob } from './clone-maintenance.mjs';
@@ -578,6 +582,47 @@ export function listRebuildJobIds(root, env = process.env, { store = createJobSt
   ].filter((id) => typeof id === 'string' && id);
 }
 
+/** Latest finished job's full .result, not the lossy finishedJobs summary returned after job queuing.
+ * Unknown history or unreadable latest evidence never falls back to an older mutation result. */
+export function readLatestRebuildJobResult(root, env = process.env, { store = createJobStore(rebuildJobsDir(root, env)) } = {}) {
+  try {
+    const { records, corrupt } = store.list();
+    if (corrupt?.length) return null;
+    const finished = records.filter((r) => r?.job?.kind === REBUILD_JOB_KIND.kind && TERMINAL_JOB_STATUSES.includes(r.job.status));
+    if (finished.some((r) => !Number.isFinite(Date.parse(r.job.finishedAt)))) return null;
+    finished.sort((a, b) => Date.parse(b.job.finishedAt) - Date.parse(a.job.finishedAt));
+    const latest = finished[0];
+    if (!latest || typeof latest.id !== 'string' || !latest.id || basename(latest.id) !== latest.id
+      || latest.id === '.' || latest.id === '..' || latest.id.includes('\\')) return null;
+    const result = JSON.parse(fs.readFileSync(join(store.dir, `${latest.id}${RESULT_SUFFIX}`), 'utf8'));
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+    return { id: latest.id, status: latest.job.status, finishedAt: latest.job.finishedAt, result };
+  } catch { return null; }
+}
+
+// Kept across withSelfSync wrappers: even an unwritable marker cannot repeat one attempt per process.
+// The promise also makes a concurrent tick wait for the attempt before it can queue its next job.
+const mutationDueAttempts = new Map();
+function mutationDuePath(root, env) { return join(daemonStateDir(env), `${cloneKey(root)}.mutation-due.json`); }
+function readHandledMutations(path) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(path, 'utf8'));
+    if (!Array.isArray(saved?.handledJobIds) || saved.handledJobIds.some((id) => typeof id !== 'string' || !id)) return new Set();
+    return new Set(saved.handledJobIds);
+  } catch { return new Set(); } // unreadable evidence is unhandled, never permission to suppress a repair
+}
+function writeHandledMutations(path, ids) {
+  // Merge again after the async repair so another completed job in this process is not forgotten.
+  const handledJobIds = [...new Set([...readHandledMutations(path), ...ids])];
+  fs.mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify({ handledJobIds })}\n`, 'utf8');
+    fs.renameSync(tmp, path);
+  } finally { fs.rmSync(tmp, { force: true }); }
+}
+const mutationLogValue = (value) => String(value).replace(/[\u0000-\u001f\u007f]/g, '');
+
 /**
  * A rebuild JOB that ended `failed` because its rebuild child crashed after it started ("rebuild child exited N with
  * no JSON result"). It RAN on the checkout, so — parity with the retired builder, whose record counted a rebuild that
@@ -695,7 +740,9 @@ export function withSelfSync(effects, {
   // `recloneMarker` are IO (injectable); they default to the real files only when `rebuild` is the real one, so a
   // test never writes real daemon state.
   // `rebuildJobIds`: the clone's shared rebuild job ids (see listRebuildJobIds) — IO, real only when `realIo`.
+  // `readLatestRebuildJobResult`: injectable full result reader for the owner-only deferred-mutation handoff.
   background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, rebuildJobIds,
+  readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
   maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
@@ -755,6 +802,47 @@ export function withSelfSync(effects, {
   const progress = tickProgress ?? (realIo ? makeTickProgressStore({ root, entry: entries?.[0], env }) : null);
   const marker = recloneMarker ?? (realIo ? makeRecloneMarkerStore({ root, env, log }) : memoryRecloneMarkerStore());
   const listJobIds = rebuildJobIds ?? (realIo ? () => listRebuildJobIds(root, env) : () => []);
+  // Injected rebuilds opt into job IO explicitly, keeping existing hermetic callers off real stores.
+  const readLatestJob = readLatestJobOpt ?? (realIo ? readLatestRebuildJobResult : () => null);
+  const handleMutationDue = async () => {
+    if (!tickOwnership?.owner || !rebuildAsJob) return;
+    let job;
+    try { job = await readLatestJob(root, env); } catch { return; }
+    if (!job || typeof job.id !== 'string' || !job.id.trim() || !TERMINAL_JOB_STATUSES.includes(job.status)
+      || !Number.isFinite(Date.parse(job.finishedAt)) || job.result?.reason !== 'readonly-job-mutation-due'
+      || typeof job.result.mutation !== 'string' || !job.result.mutation.trim()) return;
+    const key = JSON.stringify([cloneKey(root), job.id]);
+    const previous = mutationDueAttempts.get(key);
+    if (previous) { await previous; return; }
+    let complete;
+    const pending = new Promise((resolve) => { complete = resolve; });
+    mutationDueAttempts.set(key, pending); // claim before awaiting the repair, including refused/thrown attempts
+    try {
+      const path = mutationDuePath(root, env);
+      const handled = readHandledMutations(path);
+      if (handled.has(job.id)) return;
+      const id = mutationLogValue(job.id), mutation = mutationLogValue(job.result.mutation);
+      log.error?.(`daemon-self-sync: readonly job ${id} deferred mutation ${mutation}; running it on the owning tick`);
+      try {
+        const result = await rebuild({ asJob: false, adoptOnly: true });
+        if (resultReportsReclone(result)) noteReclone('clone-recloned');
+        if (!result?.moved && !['up-to-date', 'needs-build', 'clone-recloned', 'ready-adopted'].includes(result?.reason)) {
+          throw new Error(`refused: ${result?.reason ?? 'no-result'}`);
+        }
+      } catch (error) {
+        const detail = mutationLogValue(error?.message ?? error);
+        log.error?.(`daemon-self-sync: readonly job ${id} deferred mutation ${mutation} failed: ${detail}; continuing normal discovery`);
+        try { progress?.alert?.('readonly-job-mutation-failed', { id: job.id, mutation: job.result.mutation, error: detail }, now()); }
+        catch { /* alert delivery cannot create a second mutation attempt */ }
+      } finally {
+        handled.add(job.id);
+        try { writeHandledMutations(path, handled); }
+        catch (error) {
+          log.error?.(`daemon-self-sync: readonly job ${id} handled state unavailable (${error.code ?? 'write-failed'}); this process will not retry it`);
+        }
+      }
+    } finally { complete(); }
+  };
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
   const syncOpts = () => ({ root, ...(timeoutMs != null ? { timeoutMs } : {}) });
@@ -989,6 +1077,9 @@ export function withSelfSync(effects, {
       if (vctx) return versionedTick(args);
 
       // ---- DEFAULT (non-POC) path — full clone rebuild (#4044 Module E, see file header) ----
+
+      // A readonly job cannot repair its clone; hand that work to the owner before queuing another job.
+      await handleMutationDue();
 
       // Only count candidates already smoke-passed at tick entry, still based on this clone's HEAD.
       // This is a tick-boundary policy: it never interrupts a running tick or changes the clone lock.
