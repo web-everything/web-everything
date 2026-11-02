@@ -266,11 +266,26 @@ const failureLine = (e) => {
   return err && err !== lines[0] ? `${lines[0]} — ${err.trim()}` : lines[0];
 };
 
+const DIAG_LINES = 10;
+const DIAG_LINE_CHARS = 300;
+const DIAG_TOTAL_CHARS = 2400;
+// A gh-throttle slot refusal is the cause of a child's exit 1, but lives only in stderr; the classifier reads detail.
+const GH_THROTTLE_REFUSAL = /^(?:✗ reconcile pass could not read state: (?:open-PR list unreadable for [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+: (?:page page [1-9]\d*|hydrate PR #[1-9]\d*) failed: )?)?(gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[^)]*\))(?:; retry next tick)?$/;
+// Only the LAST stderr line may be a refusal, bare or echoed by reconcile-pass's CLI catch,
+// including PrListUnreadableError's page/hydration context. Unknown wrappers or later failures stay code.
+const throttleCause = (e) => {
+  // A signal/crash exit, a non-1 exit code, or any Error/crash line anywhere in stderr is a code failure.
+  if (e?.signal || e?.status !== 1) return undefined;
+  if (/\b[A-Za-z]*Error\b[:\s]|Cannot find module|\bat \S+ \(|\bSIG[A-Z]+\b/.test(String(e?.stderr ?? ''))) return undefined;
+  const last = String(e?.stderr ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).pop() ?? '';
+  return GH_THROTTLE_REFUSAL.exec(last)?.[1];
+};
+
 // Diagnostic stderr is separate from detail: classifiers must see only the original summary.
 const childFailureDiagnostics = (e) => {
   const tail = String(e?.stderr ?? '').split(/\r?\n/)
-    .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean).slice(-6)
-    .map((line) => redactDetail(line).slice(0, 300)).join(' | ').slice(-1200);
+    .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean).slice(-DIAG_LINES)
+    .map((line) => redactDetail(line).slice(0, DIAG_LINE_CHARS)).join(' | ').slice(-DIAG_TOTAL_CHARS);
   return tail ? { stderrTail: tail } : {};
 };
 
@@ -498,13 +513,15 @@ async function checkGhPrList({ ghChildEnv, budgets, runChild }) {
 async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
   const failures = [];
   const stderrTails = [];
+  const causes = [];
   for (const slug of repos) {
     try {
       // x5wbsbc — `env` too (like every lane-pool check, #4139): a candidate smoke's env carries the LIVE
       // clone's pool root / dispatch root (`daemon-rebuild.mjs#candidateSmokeEnv`), never the candidate path's.
       await runChild('node', ['scripts/conveyor/reconcile-pass.mjs', `--repo=${slug}`, '--json'], { cwd: root, timeoutMs: budgets.reconcileMs, env });
     } catch (e) {
-      failures.push(`${slug}: ${firstLine(e)}`);
+      causes.push(throttleCause(e));
+      failures.push(`${slug}: ${firstLine(e).replaceAll('smoke-env-cause', 'smoke-env-cause\u200b')}`);
       const { stderrTail } = childFailureDiagnostics(e);
       if (stderrTail) stderrTails.push(`${slug}: ${stderrTail}`);
     }
@@ -513,6 +530,10 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
   const kills = failures.map((f) => /^([^:]+): (timed out after \d+ms \(process group killed\))$/.exec(f));
   if (failures.length && kills.every(Boolean)) {
     return { ok: false, detail: `reconcile-pass dry-run (${failures.length}/${repos.length} repo(s) — ${kills.map((m) => m[1]).join(', ')}) failed: ${kills[0][2]}` };
+  }
+  // Name the throttle only when EVERY failing repo was throttled: one real code failure among them keeps the row 'code'.
+  if (failures.length && causes.every(Boolean)) {
+    return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.map((f, i) => `${f} — smoke-env-cause: ${causes[i]}`).join('; ')}`, ...(stderrTails.length ? { stderrTail: stderrTails.join('; ') } : {}) };
   }
   if (failures.length) {
     return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.join('; ')}`, ...(stderrTails.length ? { stderrTail: stderrTails.join('; ') } : {}) };
@@ -1214,6 +1235,9 @@ export const ENV_TIMEOUT_PATTERNS = Object.freeze([
   /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
   /scan exceeded its \d+ms budget/,
   /gave up waiting for the shared acquirability-scan lock/,
+  // gh-throttle refused the child a gh slot (`slot_throttled`, gh-throttle.mjs#slotTimeoutMessage): the pool was
+  // full, a host fact. Live 2026-11-01 20:28Z: reconcile-pass exited 1 with this line, plain last-good failed the same.
+  / — smoke-env-cause: gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s/,
 ]);
 export const SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV = 'WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS';
 export const DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS = 30_000;
@@ -1260,6 +1284,14 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
   // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
   const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
   if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  // Background gh slots normally give up after 8s. Only markers emitted after throttleCause's exit/stderr
+  // checks qualify; check elapsed time against their own wait, as for a bounded kill. With several failed
+  // repos use the longest wait, so one short refusal cannot excuse a longer one that failed too quickly.
+  const slotWaits = [...detail.matchAll(/ — smoke-env-cause: gh-throttle: throttled — no gh slot within (\d+(?:\.\d+)?)s \(class=[^)]*\)/g)]
+    .map(match => Number(match[1]) * 1000);
+  if (slotWaits.length && slotWaits.every(ms => Number.isFinite(ms) && ms >= MIN_OWN_CAP_MS)) {
+    return Number(row.ms) >= Math.min(minElapsedMs, Math.max(...slotWaits) * 0.9);
+  }
   return Number(row.ms) >= minElapsedMs;
 }
 

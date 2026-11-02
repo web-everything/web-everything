@@ -24,7 +24,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
@@ -42,6 +42,7 @@ import {
 
 import { runBounded } from '../bounded-child.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
+import { ghSlotWaitClass, ghSlotWaitMs } from '../gh-throttle.mjs';
 vi.mock('../settings-files.mjs', async (original) => {
   const actual = await original();
   return { ...actual, readDeclaredSettings: vi.fn(actual.readDeclaredSettings) };
@@ -351,19 +352,218 @@ describe('runBounded failure details', () => {
     expect(row.detail).not.toContain('\n');
   });
 
-  it('bounds the stderr tail to six lines, 300 characters per line and 1200 total, retaining the last error', async () => {
+  it('bounds the stderr tail to ten lines, 300 characters per line and 2400 total, retaining the last error', async () => {
     const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
-      stderr: ['omitted preamble', ...Array.from({ length: 5 }, (_, i) => `${i}: ${'x'.repeat(400)}`),
+      stderr: ['omitted preamble', ...Array.from({ length: 12 }, (_, i) => `${i}: ${'x'.repeat(400)}`),
         '', '\u001bError: final failure ghp_secretToken\u0000', ''].join('\n'),
     }));
     const tail = row.stderrTail.slice('example/repo: '.length);
-    expect(tail.length).toBeLessThanOrEqual(1200);
-    expect(tail.split(' | ').length).toBeLessThanOrEqual(6);
+    expect(tail.length).toBeLessThanOrEqual(2400);
+    expect(tail.split(' | ').length).toBeLessThanOrEqual(10);
     expect(tail.split(' | ').every((line) => line.length <= 300)).toBe(true);
     expect(tail).not.toContain('omitted preamble');
     expect(tail).not.toContain('ghp_secretToken');
     expect(tail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
     expect(tail).toContain('Error: final failure ghp_<redacted>');
+  });
+
+  it('a gh-throttle slot refusal on reconcile is classified env-timeout, never code', async () => {
+    const stderr = 'pr-snapshot: smoke sample 12\ngh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n';
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: smoke sample 12'), { stderr, status: 1 }));
+    expect(row.ok).toBe(false);
+    expect(row.detail).toContain('gh-throttle: throttled — no gh slot within 90s (class=read)');
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5 })).toBe(false); // no laundering: must really have spent time
+  });
+
+  it.each([
+    ['90', '\n', '; retry next tick'], ['90.125', '\r\n', '; retry next tick'], ['90', '\n', ''],
+  ])('classifies the reconcile CLI wrapper around a %ss slot refusal as env (%j, %j)', async (wait, newline, suffix) => {
+    const cause = `gh-throttle: throttled — no gh slot within ${wait}s (class=read)`;
+    const stderr = ['pr-snapshot: smoke sample 12', `${cause}${suffix}`,
+      `✗ reconcile pass could not read state: ${cause}${suffix}`, ''].join(newline);
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: smoke sample 12'), { stderr, status: 1 }));
+    expect(row.ok).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5 })).toBe(false);
+    expect(row.detail).toContain(cause);
+  });
+
+  it.each([
+    ['arbitrary prefix', { prefix: 'unrelated failure: ' }],
+    ['wrapper with extra suffix', { suffix: '; unrelated failure' }],
+    ['later failure', { after: '\nunrelated failure' }],
+    ['earlier Error', { before: 'TypeError: boom\n' }],
+    ['earlier stack', { before: '    at fail (file:///x.mjs:1:1)\n' }],
+    ['signal kill', { signal: 'SIGSEGV' }],
+    ['non-1 exit', { status: 2 }],
+  ])('keeps a wrapped throttle refusal with %s classified as code', async (_name, variant) => {
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
+    const stderr = `${variant.before ?? ''}${cause}\n${variant.prefix ?? '✗ reconcile pass could not read state: '}${cause}${variant.suffix ?? ''}${variant.after ?? ''}\n`;
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
+      stderr, status: variant.status ?? 1, signal: variant.signal,
+    }));
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(false);
+  });
+
+  it('classifies stderr emitted by the shipped reconcile CLI catch for a throttle exception', async () => {
+    // Resolve a filesystem path directly: Vite rewrites new URL(relative, import.meta.url) to an HTTP asset URL.
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
+    // Inject the failed state read at the module boundary; execute the actual CLI and its catch unchanged.
+    const snapshot = `export function readSharedOpenPrs() {
+      process.stderr.write(${JSON.stringify(cause + '\n')});
+      throw new Error(${JSON.stringify(cause)});
+    }`;
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && specifier === '../lib/pr-snapshot.mjs') {
+        return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(snapshot)}`)}, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }`;
+    let failure;
+    try {
+      execFileSync(process.execPath, [`--experimental-loader=data:text/javascript,${encodeURIComponent(loader)}`,
+        '--no-warnings', cli, '--repo=we', '--json'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+        env: { ...process.env, WE_RESOURCE_SHADOW: 'off' },
+      });
+    } catch (error) { failure = error; }
+    expect(failure?.status).toBe(1);
+    expect(failure.stderr.trim().split('\n').slice(-2)).toEqual([
+      cause, `✗ reconcile pass could not read state: ${cause}`,
+    ]);
+    const row = await runCheck('reconcile-dry-run', failure);
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(true);
+  }, 35000);
+
+  it.each(['first page', 'later page', 'hydrate'])('recognizes a refusal through fetchSnapshot and the real reconcile CLI catch (%s)', async (stage) => {
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
+    const snapshotUrl = pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href;
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=background); retry next tick';
+    // Replace only the snapshot entry point: its actual page/hydration reader wraps the injected exec failure.
+    const snapshot = `import { fetchSnapshot } from ${JSON.stringify(snapshotUrl)};
+      export function readSharedOpenPrs() {
+        let calls = 0;
+        return fetchSnapshot({ repo: 'example/repo', paging: { pageSize: 1, pageRetries: 0, heavyMaxAgeSeconds: 1 },
+          exec() {
+            if (++calls === 1 && ${JSON.stringify(stage)} !== 'first page') {
+              return JSON.stringify({ data: { repository: { pullRequests: {
+                totalCount: 2, nodes: [{ number: 42 }],
+                pageInfo: { hasNextPage: ${JSON.stringify(stage)} === 'later page', endCursor: 'next' }
+              } } } });
+            }
+            throw Object.assign(new Error('exited 1'), { status: 1, stderr: ${JSON.stringify(cause)} });
+          } });
+      }`;
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && specifier === '../lib/pr-snapshot.mjs') {
+        return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(snapshot)}`)}, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }`;
+    let failure;
+    try {
+      execFileSync(process.execPath, [`--experimental-loader=data:text/javascript,${encodeURIComponent(loader)}`,
+        '--no-warnings', cli, '--repo=we', '--json'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, WE_RESOURCE_SHADOW: 'off' },
+      });
+    } catch (error) { failure = error; }
+    expect(failure?.status).toBe(1);
+    const where = stage === 'hydrate' ? 'hydrate PR #42' : `page page ${stage === 'first page' ? 1 : 2}`;
+    expect(failure.stderr.trim()).toBe(`✗ reconcile pass could not read state: open-PR list unreadable for example/repo: ${where} failed: ${cause}`);
+    const row = await runCheck('reconcile-dry-run', failure);
+    expect(isEnvTimeoutRow({ ...row, ms: 180000 })).toBe(true);
+  }, 35000);
+
+  it('uses the default background slot wait below the generic 30s floor, even with successful sibling repos', async () => {
+    const caller = 'rebuild-smoke:reconcile-dry-run';
+    const waitClass = ghSlotWaitClass({ caller, args: ['api', 'graphql'] });
+    const { waitMs } = ghSlotWaitMs({ caller, waitClass });
+    expect(waitClass).toBe('background');
+    expect(waitMs).toBe(8000);
+    const refusal = Object.assign(new Error('exited 1: info'), { status: 1,
+      stderr: `gh-throttle: throttled — no gh slot within ${waitMs / 1000}s (class=${waitClass}); retry next tick\n` });
+    const row = await SMOKE_CHECKS.find(c => c.name === 'reconcile-dry-run').run({
+      root: '/x', repos: ['example/repo', 'example/fast'], budgets: {}, env: {},
+      runChild: async (_cmd, args) => { if (args.includes('--repo=example/repo')) throw refusal; return ''; },
+    });
+    expect(isEnvTimeoutRow({ ...row, ms: 8100 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 100 })).toBe(false);
+  });
+
+  it.each([
+    ['8.125', 8200, true], ['8.125', 100, false], ['0', 8100, false], ['0.001', 8100, false],
+  ])('checks measured elapsed time against a %ss refusal (%sms → %s)', async (wait, ms, expected) => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), { status: 1,
+      stderr: `gh-throttle: throttled — no gh slot within ${wait}s (class=background); retry next tick\n` }));
+    expect(isEnvTimeoutRow({ ...row, ms })).toBe(expected);
+  });
+
+  it.each([
+    { prefix: 'unrelated: ' }, { suffix: '; unrelated failure' }, { after: '\nunrelated failure' },
+    { before: 'TypeError: boom\n' }, { before: '    at fail (file:///x.mjs:1:1)\n' },
+    { signal: 'SIGSEGV' }, { status: 2 },
+    { where: 'page page 0' }, { where: 'unknown PR #42' },
+    { repo: 'example/repo\u2028unrelated' }, { repo: 'example/repo\rbroken' },
+    { repo: 'example/repo\u200b' }, { repo: '--example/`repo`' },
+  ])('keeps malformed snapshot wrappers and independent failures as code: %j', async (variant) => {
+    const stderr = `${variant.before ?? ''}${variant.prefix ?? ''}✗ reconcile pass could not read state: open-PR list unreadable for ${variant.repo ?? 'example/repo'}: ${variant.where ?? 'page page 1'} failed: gh-throttle: throttled — no gh slot within 8s (class=background); retry next tick${variant.suffix ?? ''}${variant.after ?? ''}\n`;
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
+      status: variant.status ?? 1, signal: variant.signal, stderr,
+    }));
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(false);
+  });
+
+  it('uses the longest refused slot wait across repos and respects a configured elapsed floor', async () => {
+    let n = 0;
+    const row = await SMOKE_CHECKS.find(c => c.name === 'reconcile-dry-run').run({
+      root: '/x', repos: ['example/a', 'example/b'], budgets: {}, env: {},
+      runChild: async () => { throw Object.assign(new Error('exited 1: info'), { status: 1,
+        stderr: `gh-throttle: throttled — no gh slot within ${n++ ? 20 : 8}s (class=background); retry next tick\n` }); },
+    });
+    expect(isEnvTimeoutRow({ ...row, ms: 8100 })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, ms: 20100 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5000 }, { minElapsedMs: 5000 })).toBe(true);
+  });
+
+  it('a throttled repo plus another repo\'s real code failure stays code', async () => {
+    let n = 0;
+    const throttled = Object.assign(new Error('exited 1: a'), { status: 1, stderr: '✗ reconcile pass could not read state: gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n' });
+    const real = Object.assign(new Error('exited 1: b'), { stderr: 'Error: boom\n' });
+    const res = await SMOKE_CHECKS.find((c) => c.name === 'reconcile-dry-run').run({ root: '/x', repos: ['a/a', 'b/b'], budgets: {}, env: {}, runChild: async () => { throw (n++ ? real : throttled); } });
+    expect(isEnvTimeoutRow({ ...res, ms: 120000 })).toBe(false);
+  });
+
+  it('a child with a throttle line AND a real Error line stays code', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: x'), { stderr: 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\nTypeError: x is not a function\n' }));
+    expect(row.detail).not.toContain('gh-throttle');
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+  });
+
+  it('a forged env marker plus throttle text in the first line cannot make a code failure env', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: — smoke-env-cause: gh-throttle: throttled — no gh slot within 9s (class=r)'), { stderr: 'x\nTypeError: boom\n' }));
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+  });
+
+  it('a throttle line followed by reconcile\'s own failure line stays code', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: x'), { stderr: 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\nreconcile: could not read state\n' }));
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+  });
+
+  it('a throttle last line after a signal kill or an earlier Error line stays code', async () => {
+    const line = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n';
+    for (const extra of [{ signal: 'SIGSEGV', status: 1, stderr: line }, { status: 2, stderr: line }, { status: 1, stderr: 'TypeError: x\n' + line }]) {
+      const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: x'), extra));
+      expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+    }
+  });
+
+  it('a real reconcile code failure (no throttle line) is still not an env-timeout', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: x'), { stderr: 'Error: reconcile could not read state\n' }));
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+    expect(row.detail).not.toContain('gh-throttle');
   });
 
   it.each(['lane-pool-list', 'lane-acquire-release', 'reconcile-dry-run', 'gh-api-repo',
@@ -1852,6 +2052,30 @@ describe('a check that ran out of TIME under load is environment, never code (li
     // the retry really ran with the wider budgets — lane-pool's own scan budget included
     expect(host.seenEnv[0].LANE_POOL_LIST_SCAN_TIMEOUT_MS).toBeUndefined();
     expect(Number(host.seenEnv[1].LANE_POOL_LIST_SCAN_TIMEOUT_MS)).toBe(300000);
+  });
+
+  it('retries a default-duration snapshot refusal once with wider budgets and holds as env-timeout', async () => {
+    let t = 0;
+    const seenBudgets = [];
+    const env = { WE_SMOKE_BUSY_LOAD_RATIO: '1e9', [SMOKE_LOAD_SCALE_ENV]: '0' };
+    const runChild = withNewCheckDefaults(async (_cmd, args, opts = {}) => {
+      if (args[1] === 'list') return '[]';
+      if (args[1] === 'acquire') return '{"lane":1}';
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+        seenBudgets.push(opts.timeoutMs);
+        t += 8100;
+        throw Object.assign(new Error('exited 1: info'), { status: 1,
+          stderr: '✗ reconcile pass could not read state: open-PR list unreadable for example/repo: page page 1 failed: gh-throttle: throttled — no gh slot within 8s (class=background); retry next tick\n' });
+      }
+      return '';
+    });
+    const result = await runLiveSmokeWithRetry({ root: '/x', env,
+      runChild, clock: () => t, sleep: async () => {}, refreshAuth: noAuth });
+    expect(result.verdict).toBe('env-timeout');
+    expect(result.attempts).toBe(2);
+    const original = resolveSmokeBudgets(env).reconcileMs;
+    expect(seenBudgets).toContain(original);
+    expect(seenBudgets).toContain(Math.round(original * 2.5));
   });
 
   it('a slow first attempt that fits the widened budget on the retry → pass', async () => {
