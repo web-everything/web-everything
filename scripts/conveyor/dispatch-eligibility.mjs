@@ -99,9 +99,9 @@ export function eligibility(prState, facts) {
     && redTeam.sendBackResultId === redTeam.resultId;
 
   if (prState.state !== 'OPEN') return { hold: REASONS.NOT_OPEN };
-  if (prState.isDraft !== false && Array.isArray(prState.labels)
-    && prState.labels.includes('review-status:draft-withdrawn')) return { hold: REASONS.DRAFT };
-  if (!Array.isArray(prState.labels)) return { unknown: 'pr' };
+  if (!Array.isArray(prState.labels) || typeof prState.isDraft !== 'boolean') return { unknown: 'pr' };
+  const labelNames = prState.labels.map(l => (typeof l === 'string' ? l : l?.name));
+  if (prState.isDraft && labelNames.includes('review-status:draft-withdrawn')) return { hold: REASONS.DRAFT };
   if (prState.isDraft !== false
     && population !== 'promote-draft' && population !== 'main-fix-green'
     && !(population === 'red-team-send-back' && boundSendBack)) {

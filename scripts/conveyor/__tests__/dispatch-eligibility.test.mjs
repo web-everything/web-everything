@@ -81,7 +81,7 @@ describe('dispatch-eligibility: holds', () => {
     expect(eligibility(pr({ isDraft: true }), clean(population))).toEqual({ hold: REASONS.DRAFT });
   });
   it('a non-boolean isDraft is not treated as ready', () => {
-    expect(eligibility(pr({ isDraft: undefined }), clean('fix'))).toEqual({ hold: REASONS.DRAFT });
+    expect(eligibility(pr({ isDraft: undefined }), clean('fix'))).toEqual({ unknown: 'pr' });
   });
   it.each(['promote-draft', 'main-fix-green'])('%s: draft exception dispatches', population => {
     expect(eligibility(pr({ isDraft: true }), clean(population))).toMatchObject({ dispatch: true });
@@ -112,6 +112,12 @@ describe('dispatch-eligibility: holds', () => {
   });
   it.each([undefined, '', 'abc', 'a'.repeat(39)])('a missing or invalid head %s -> unknown:pr', headRefOid => {
     expect(eligibility(pr({ headRefOid }), clean())).toEqual({ unknown: 'pr' });
+  });
+  it.each(ALL)('%s: an object-shaped withdrawn label holds too', population => {
+    expect(eligibility(pr({ isDraft: true, labels: [{ name: 'review-status:draft-withdrawn' }] }), clean(population))).toEqual({ hold: REASONS.DRAFT });
+  });
+  it.each(ALL)('%s: missing isDraft evidence -> unknown:pr, even for draft-exempt populations', population => {
+    expect(eligibility(pr({ isDraft: undefined }), clean(population))).toEqual({ unknown: 'pr' });
   });
   it('unreadable labels -> unknown:pr', () => {
     expect(eligibility(pr({ labels: undefined }), clean())).toEqual({ unknown: 'pr' });
