@@ -117,8 +117,16 @@ export function createCheckDeps({ cwd = process.cwd(), home = homedir(), env = p
     },
     async readHeadPushedAt(pr, head) {
       checkPrNumber(pr); checkSha(head);
-      // The head commit's committer date is never later than its push, so the window since it is a safe superset.
-      return (await run('gh', ['api', `repos/${CONSTELLATION_REPOS.we.slug}/commits/${head}`, '--jq', '.commit.committer.date'])).trim();
+      const repo = CONSTELLATION_REPOS.we.slug;
+      const view = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefName,headRefOid']));
+      if (view.headRefOid !== head || typeof view.headRefName !== 'string' || !view.headRefName) throw new Error('PR head moved; retry');
+      // Server-recorded push time (never the author-controlled commit date); one bounded page, newest first.
+      const rows = JSON.parse(await run('gh', ['api',
+        `repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${view.headRefName}`)}&activity_type=push&per_page=100`]));
+      if (!Array.isArray(rows) || rows.length > 100) throw new Error('invalid push activity');
+      const hit = rows.find(row => row?.after === head);
+      if (!hit || typeof hit.timestamp !== 'string') throw new Error('head push time not found; human review required');
+      return hit.timestamp;
     },
     async readReviewLedger(pr) {
       checkPrNumber(pr);

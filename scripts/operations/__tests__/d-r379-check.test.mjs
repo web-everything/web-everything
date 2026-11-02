@@ -976,12 +976,19 @@ describe('round 7 live hold chronology', () => {
     expect(condition(r,2).status).toBe('UNKNOWN');
     expect(condition(r,2).evidence.join(' ')).toContain('human review');
   });
-  it('reads the head commit date through the pinned API path and rejects a bad sha', async () => {
-    const calls = [];
-    const adapter = createCheckDeps({exec:(...a)=>{ calls.push(a); return '2026-11-02T09:30:00Z\n'; }});
-    expect(await adapter.readHeadPushedAt(6223,'b'.repeat(40))).toBe('2026-11-02T09:30:00Z');
-    expect(JSON.stringify(calls)).toContain(`commits/${'b'.repeat(40)}`);
-    await expect(adapter.readHeadPushedAt(6223,'main; rm')).rejects.toThrow();
+  it('reads the server push time for the head, not the commit date', async () => {
+    const head = 'b'.repeat(40), calls = [];
+    const exec = (...a) => { calls.push(a); return a[1][0] === 'pr' ? JSON.stringify({headRefName:'lane/x',headRefOid:head})
+      : JSON.stringify([{after:'c'.repeat(40),timestamp:'2030-01-01T00:00:00Z'},{after:head,timestamp:'2026-11-02T09:30:00Z'}]); };
+    expect(await createCheckDeps({exec}).readHeadPushedAt(6223,head)).toBe('2026-11-02T09:30:00Z');
+    expect(JSON.stringify(calls)).toContain('activity_type=push');
+    await expect(createCheckDeps({exec}).readHeadPushedAt(6223,'main; rm')).rejects.toThrow();
+  });
+  it.each(['no matching push','head moved','oversized page'])('refuses head push time on %s', async kind => {
+    const head = 'b'.repeat(40);
+    const exec = (...a) => a[1][0] === 'pr' ? JSON.stringify({headRefName:'lane/x',headRefOid: kind === 'head moved' ? 'c'.repeat(40) : head})
+      : JSON.stringify(kind === 'oversized page' ? Array(101).fill({after:head,timestamp:'2026-11-02T09:30:00Z'}) : [{after:'c'.repeat(40),timestamp:'2026-11-02T09:30:00Z'}]);
+    await expect(createCheckDeps({exec}).readHeadPushedAt(6223,head)).rejects.toThrow();
   });
   it('paginates explicit-repo issue events and filters hold label events', async () => {
     const calls = [];
