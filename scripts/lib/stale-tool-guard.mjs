@@ -135,11 +135,15 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
       return result.stdout;
     };
     git(['fetch', '--upload-pack=git-upload-pack', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-    const count = git(['rev-list', '--count', 'HEAD..origin/main']).trim();
+    // Resolve the exact fetched ref once: local branches/tags can shadow origin/main,
+    // and a concurrent fetch must not change the target between checking and reexec.
+    const upstream = git(['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}']).trim();
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(upstream)) throw new Error('Invalid upstream commit ID');
+    const count = git(['rev-list', '--count', `HEAD..${upstream}`]).trim();
     const behind = /^\d+$/.test(count) ? Number(count) : NaN;
     if (!nonnegative(behind)) throw new Error('Unknown or oversized upstream commit count');
     // NUL avoids Git's quoted filename output and preserves whitespace in real paths.
-    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', 'HEAD', 'origin/main', '--']);
+    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', 'HEAD', upstream, '--']);
     const changedPaths = diff.includes('\0') ? diff.split('\0').filter(Boolean) : diff.split('\n').filter(Boolean);
     let depPaths;
     try { depPaths = await importClosure(entry, { root }); } catch (error) {
@@ -160,7 +164,7 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     const worktree = join(scratch, 'checkout');
     let added = false;
     try {
-      git(['worktree', 'add', '--detach', worktree, 'origin/main']);
+      git(['worktree', 'add', '--detach', worktree, upstream]);
       added = true;
       symlinkSync(join(root, 'node_modules'), join(worktree, 'node_modules'), 'junction');
       const child = exec(process.execPath, [join(worktree, name), ...process.argv.slice(2)], {

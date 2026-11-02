@@ -3,6 +3,8 @@ import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -31,6 +33,7 @@ function put(root, path, text) {
 
 const success = (stdout = '') => ({ status: 0, stdout, stderr: '' });
 const failure = () => ({ status: 1, stdout: '', stderr: 'fixture git failure' });
+const UPSTREAM_COMMIT = 'a'.repeat(40);
 
 describe('evaluateStaleness', () => {
   it.each([
@@ -107,7 +110,7 @@ describe('importClosure', () => {
 });
 
 /** exec is injectable spawnSync(command, argv, options), returning { status, stdout, stderr, error? }. */
-function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', fail, throws = false, childStatus = 0 } = {}) {
+function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', upstream = `${UPSTREAM_COMMIT}\n`, fail, throws = false, childStatus = 0 } = {}) {
   const root = scratch();
   // The injected exec and explicit root need no on-disk Git metadata.
   mkdirSync(join(root, 'node_modules'));
@@ -121,21 +124,25 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', fail, thro
       return { status: childStatus, stdout: '', stderr: '' };
     }
     expect(command).toBe('git');
-    expect(options.cwd).toBe(args.includes('rev-parse') ? process.cwd() : root);
-    if (args.includes('rev-parse')) return failure(); // Model a non-Git invocation cwd.
-    const operation = ['fetch', 'rev-list', 'diff', 'worktree'].find((name) => args.includes(name));
+    expect(options.cwd).toBe(args.includes('--show-toplevel') ? process.cwd() : root);
+    if (args.includes('--show-toplevel')) return failure(); // Model a non-Git invocation cwd.
+    const operation = ['fetch', 'rev-parse', 'rev-list', 'diff', 'worktree'].find((name) => args.includes(name));
     const stage = operation === 'worktree' ? `worktree-${args[args.indexOf('worktree') + 1]}` : operation;
     if (stage === fail) {
       if (throws) throw new Error('fixture exec failure');
       return failure();
     }
     if (operation === 'fetch') return success();
+    if (operation === 'rev-parse') {
+      expect(args.slice(args.indexOf('rev-parse'))).toEqual(['rev-parse', '--verify', 'refs/remotes/origin/main^{commit}']);
+      return success(upstream);
+    }
     if (operation === 'rev-list') return success(behind);
     if (operation === 'diff') return success(changed);
     if (stage === 'worktree-add') {
       expect(args).toContain('--detach');
-      expect(args).toContain('origin/main');
-      worktree = args.slice(args.indexOf('add') + 1).find((arg) => !arg.startsWith('-') && arg !== 'origin/main');
+      expect(args.at(-1)).toBe(upstream.trim());
+      worktree = args[args.indexOf('--detach') + 1];
       expect(worktree).toBeTruthy();
       garbage.push(worktree);
       put(worktree, 'scripts/tool.mjs', 'process.exit(0);');
@@ -293,7 +300,7 @@ describe('review regressions', () => {
     const h = harness();
     const cwdRoot = scratch();
     const runner = h.exec.getMockImplementation();
-    h.exec.mockImplementation((command, args, options) => args.includes('rev-parse')
+    h.exec.mockImplementation((command, args, options) => args.includes('--show-toplevel')
       ? success(`${cwdRoot}\n`) : runner(command, args, options));
     await guardToolCheckout({ ...h, settings: { mode: 'reexec' } });
     expect(nodeCalls(h)[0][2].env).toMatchObject({
@@ -355,16 +362,16 @@ describe('guardToolCheckout', () => {
     }
   });
 
-  it.each(['fetch', 'rev-list', 'diff'])('fails closed on a nonzero %s exit even in reexec mode', async (fail) => {
+  it.each(['fetch', 'rev-parse', 'rev-list', 'diff'])('fails closed on a nonzero %s exit even in reexec mode', async (fail) => {
     const { guardToolCheckout } = await load();
     const h = harness({ fail });
-    await expect(async () => guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow();
+    await expect(async () => guardToolCheckout({ ...h, settings: { mode: 'reexec' } })).rejects.toThrow(`Git ${fail}`);
     expect(nodeCalls(h)).toHaveLength(0);
   });
 
-  it.each(['fetch', 'rev-list', 'diff'])('fails closed when %s throws', async (fail) => {
+  it.each(['fetch', 'rev-parse', 'rev-list', 'diff'])('fails closed when %s throws', async (fail) => {
     const { guardToolCheckout } = await load();
-    await expect(async () => guardToolCheckout(harness({ fail, throws: true }))).rejects.toThrow();
+    await expect(async () => guardToolCheckout(harness({ fail, throws: true }))).rejects.toThrow('fixture exec failure');
   });
 
   it.each(['', 'garbage\n', '-1\n', '1.5\n', '9007199254740992\n', '6junk\n'])
@@ -373,6 +380,34 @@ describe('guardToolCheckout', () => {
       await expect(async () => guardToolCheckout(harness({ behind, changed: 'docs/unrelated.md\n' })))
         .rejects.toThrow();
     });
+
+  it.each(['', 'origin/main\n', '--help\n', `${UPSTREAM_COMMIT}\n${UPSTREAM_COMMIT}\n`, 'a'.repeat(39), 'a'.repeat(65)])(
+    'refuses malformed upstream commit %j before counting or reexec', async (upstream) => {
+      const { guardToolCheckout } = await load();
+      const h = harness({ upstream });
+      await expect(guardToolCheckout({ ...h, settings: { mode: 'reexec' } }))
+        .rejects.toThrow('Invalid upstream commit ID');
+      expect(h.exec.mock.calls.some(([, args]) => args.includes('rev-list'))).toBe(false);
+      expect(nodeCalls(h)).toHaveLength(0);
+    },
+  );
+
+  it.each([40, 64])('pins count, diff and reexec to one resolved %s-character commit even if the ref moves', async (length) => {
+    const { guardToolCheckout } = await load();
+    const upstream = 'b'.repeat(length);
+    const h = harness({ upstream: `${upstream}\n` });
+    const runner = h.exec.getMockImplementation();
+    let resolutions = 0;
+    h.exec.mockImplementation((command, args, options) => {
+      if (args.includes('--verify') && resolutions++ > 0) return success(`${'c'.repeat(length)}\n`);
+      return runner(command, args, options);
+    });
+    await guardToolCheckout({ ...h, settings: { mode: 'reexec' } });
+    expect(resolutions).toBe(1);
+    expect(h.exec.mock.calls.find(([, args]) => args.includes('rev-list'))[1]).toContain(`HEAD..${upstream}`);
+    expect(h.exec.mock.calls.find(([, args]) => args.includes('diff'))[1]).toContain(upstream);
+    expect(h.exec.mock.calls.find(([, args]) => args.includes('add'))[1].at(-1)).toBe(upstream);
+  });
 
   it('refuses an unreadable dependency instead of assuming unrelated changes are safe', async () => {
     const { guardToolCheckout } = await load();
@@ -434,42 +469,53 @@ describe('guardToolCheckout', () => {
 });
 
 describe('real local Git fixture (no network)', () => {
-  it.each(['scripts/lib/dep.mjs', 'docs/unrelated.md'])('six upstream commits touching %s use real ancestry and diff evidence', async (changedPath) => {
+  it.each([
+    ['scripts/lib/dep.mjs', null], ['docs/unrelated.md', null],
+    ['scripts/lib/dep.mjs', 'refs/heads/origin/main'],
+    ['scripts/lib/dep.mjs', 'refs/tags/origin/main'],
+    ['scripts/lib/dep.mjs', 'refs/tags/refs/remotes/origin/main'],
+  ])('six upstream commits touching %s with shadow %s use real ancestry and diff evidence', async (changedPath, shadow) => {
     const { guardToolCheckout } = await load();
-    const base = scratch();
-    const writer = join(base, 'writer');
-    const origin = join(base, 'origin.git');
-    const checkout = join(base, 'checkout');
-    mkdirSync(writer);
-    function git(cwd, ...args) {
-      if (args.includes('fetch') || args.includes('push')) throw new Error('Fixture forbids fetch/push');
-      const result = spawnSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', ...args], {
-        cwd, encoding: 'utf8', maxBuffer: 1024 * 1024,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-      });
-      if (result.error || result.status !== 0) throw new Error(result.stderr || String(result.error));
-      return result;
+    const checkout = scratch();
+    // Assemble a bare object store as files: all Git commands below are read-only,
+    // and neither setup nor the simulated fetch needs a .git directory or network.
+    function object(type, contents) {
+      const body = Buffer.from(contents);
+      const bytes = Buffer.concat([Buffer.from(`${type} ${body.length}\0`), body]);
+      const oid = createHash('sha1').update(bytes).digest('hex');
+      put(checkout, `objects/${oid.slice(0, 2)}/${oid.slice(2)}`, deflateSync(bytes));
+      return oid;
     }
-    git(writer, 'init', '-b', 'main');
-    put(writer, 'scripts/tool.mjs', "import './lib/dep.mjs';");
-    put(writer, 'scripts/lib/dep.mjs', 'export const version = 0;');
-    git(writer, 'add', '.');
-    git(writer, 'commit', '-m', 'base');
-    // Shared local object stores and update-ref model upstream publication without fetch/push.
-    git(base, 'clone', '--bare', '--shared', writer, origin);
-    git(base, 'clone', '--shared', origin, checkout);
-    for (let version = 1; version <= 6; version++) {
-      put(writer, changedPath, `// version ${version}\n`);
-      git(writer, 'add', '.');
-      git(writer, 'commit', '-m', `upstream ${version}`);
+    let tip;
+    let head;
+    for (let version = 0; version <= 6; version++) {
+      let oid = object('blob', `// version ${version}\n`);
+      let mode = '100644';
+      for (const name of changedPath.split('/').reverse()) {
+        oid = object('tree', Buffer.concat([Buffer.from(`${mode} ${name}\0`), Buffer.from(oid, 'hex')]));
+        mode = '40000';
+      }
+      tip = object('commit', `tree ${oid}\n${tip ? `parent ${tip}\n` : ''}`
+        + 'author Fixture <fixture@example.invalid> 1700000000 +0000\n'
+        + `committer Fixture <fixture@example.invalid> 1700000000 +0000\n\nversion ${version}\n`);
+      if (version === 0) head = tip;
     }
-    const tip = git(writer, 'rev-parse', 'HEAD').stdout.trim();
-    git(origin, 'update-ref', 'refs/heads/main', tip);
+    put(checkout, 'config', '[core]\n bare = true\n');
+    put(checkout, 'HEAD', 'ref: refs/heads/main\n');
+    put(checkout, 'refs/heads/main', `${head}\n`);
+    put(checkout, 'refs/remotes/origin/main', `${head}\n`);
+    if (shadow) put(checkout, shadow, `${head}\n`);
+    put(checkout, 'scripts/tool.mjs', "import './lib/dep.mjs';");
+    put(checkout, 'scripts/lib/dep.mjs', 'export const version = 0;');
     const exec = vi.fn((command, args, options) => {
       expect(command).toBe('git');
       expect(options.cwd).toBe(checkout);
-      if (args.includes('fetch')) return git(checkout, 'update-ref', 'refs/remotes/origin/main', tip);
-      return git(options.cwd, ...args);
+      if (args.includes('fetch')) {
+        put(checkout, 'refs/remotes/origin/main', `${tip}\n`);
+        return success();
+      }
+      expect(args.some(arg => ['rev-parse', 'rev-list', 'diff'].includes(arg))).toBe(true);
+      return spawnSync(command, args, options);
     });
     const run = () => guardToolCheckout({ root: checkout, entry: join(checkout, 'scripts/tool.mjs'), exec, env: {} });
     if (changedPath === 'scripts/lib/dep.mjs') {
