@@ -83,6 +83,20 @@ describe('squash-graduated overlays in superseded ready candidates', () => {
     expect(match.omitted).toEqual(liveApplied.map(({ ref }) => ref));
     expect(match.reason).toBe(`superseded-omits-live-overlay: ${match.omitted.join(', ')}`);
   });
+
+  it('only exempts the overlay with complete graduation evidence', () => {
+    const evidence = graduation();
+    evidence.events = evidence.events.filter(({ ref }) => ref === liveApplied[0].ref);
+    const { match } = matchWith(evidence);
+    expect(match.adopt).toBeNull();
+    expect(match.omitted).toEqual([liveApplied[1].ref]);
+  });
+
+  it.each([undefined, null, 'unknown', {}])('refuses unknown graduation proof (%j)', (proof) => {
+    const match = adoption.matchReadyCandidate({ ...fixture(), leftForMain: () => proof });
+    expect(match.adopt).toBeNull();
+    expect(match.omitted).toEqual(liveApplied.map(({ ref }) => ref));
+  });
 });
 
 describe('overlayGraduated evidence', () => {

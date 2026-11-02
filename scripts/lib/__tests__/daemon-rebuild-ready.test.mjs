@@ -654,20 +654,20 @@ describe('matchReadyCandidate — pure', () => {
     const live = (...refs) => refs.map((r) => ({ ref: r, sha: `${r}-sha` }));
     const o = (extra) => args({ liveApplied: live('lane/m'), carries: () => false, ...extra });
     it('adopts when the omitted overlay left for main AND its content is in the candidate build', () => {
-      const m = matchReadyCandidate(o({ leftForMain: () => true, contentInBuild: () => true }));
+      const m = matchReadyCandidate(o({ removedForMain: () => true, contentInBuild: () => true }));
       expect(m.match).toBe('superseded');
       expect(m.retired).toEqual(['lane/m']);
     });
     it('still discards an omitted overlay that is unmerged (not left for main)', () => {
-      const m = matchReadyCandidate(o({ leftForMain: () => false, contentInBuild: () => true }));
+      const m = matchReadyCandidate(o({ removedForMain: () => false, contentInBuild: () => true }));
       expect(m.reason).toMatch(/^superseded-omits-live-overlay: lane\/m/);
     });
     it('still discards when it left for main but its content is NOT in the build', () => {
-      expect(matchReadyCandidate(o({ leftForMain: () => true, contentInBuild: () => false })).adopt).toBeNull();
+      expect(matchReadyCandidate(o({ removedForMain: () => true, contentInBuild: () => false })).adopt).toBeNull();
     });
     it('mixed: one in-main, one unmerged -> discards naming only the unmerged', () => {
       const m = matchReadyCandidate(o({
-        liveApplied: live('lane/m', 'lane/u'), leftForMain: (r) => r === 'lane/m', contentInBuild: () => true,
+        liveApplied: live('lane/m', 'lane/u'), removedForMain: (r) => r === 'lane/m', contentInBuild: () => true,
       }));
       expect(m.adopt).toBeNull();
       expect(m.omitted).toEqual(['lane/u']);

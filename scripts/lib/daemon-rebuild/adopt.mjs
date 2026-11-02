@@ -36,13 +36,16 @@ import { lockClosureScopeMode } from './closure-scope-settings.mjs';
  * @param {{ready:object|null, plan:object, prevHead:string, treeOf:(sha:string)=>string|null,
  *   stillWanted:(ref:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
  *   overlayTip?:(ref:string)=>string|null, registered?:(ref:string)=>boolean, allowFallback?:boolean,
+ *   leftForMain?:(applied:object, build:string)=>boolean, removedForMain?:(ref:string)=>boolean,
+ *   contentInBuild?:(sha:string, build:string)=>boolean,
  *   rejected?:object|null, nowMs:number, maxAgeMs:number}} o — `registered`: still on the overlay list after this
  *   tick's own edits (defaults to `stillWanted`); `allowFallback: false` (a mainOnly rebuild) refuses any fallback.
  */
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
-  liveApplied, carries = () => false, leftForMain = () => false, contentInBuild = () => false,
+  liveApplied, carries = () => false, leftForMain = () => false,
+  removedForMain = () => false, contentInBuild = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   const passedMs = Date.parse(ready.passedAt || '');
@@ -83,17 +86,15 @@ export function matchReadyCandidate({
   if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
-  // No exemption for "landed on main": the CURRENT main having it says nothing about the record's (possibly older)
-  // main — the record itself must contain it (Codex round 2). A squash-landed overlay just refuses superseded (fail closed).
-  // The ONE exemption (live 2026-10-31 ET, perf5/perf-fetch overlays): an omitted overlay that this tick's plan itself
-  // auto-removed as `pr-merged`/`in-main` (`leftForMain`) AND whose applied sha is provably contained in THE RECORD'S
-  // OWN BUILD by content (`contentInBuild`: merging it onto that build changes nothing) is not lost — the candidate
-  // already has it. Its registration is already removed by the plan. Any other omission refuses.
+  // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
+  // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
+  // with independent content proof. Current main containing an overlay alone never satisfies either path.
   const retired = [];
   const omitted = liveApplied.filter((a) => {
     if (!a?.ref) return false;
     if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
-    if (a.sha && leftForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
+    if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
     return true;
   });
   if (omitted.length > 0) {

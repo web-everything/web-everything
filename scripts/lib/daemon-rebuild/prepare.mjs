@@ -778,8 +778,12 @@ export async function prepareRebuild({
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+        leftForMain: (applied, build) => overlayGraduated({
+          ...applied, build, git, events: readOverlayEvents(),
+          registered: (ref) => overlaysBefore.some((o) => o?.ref === ref) || registeredRefs.has(ref),
+        }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
-        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
       // A saved candidate predates this tick's archives (auto-retirement may have run since it passed).
       // Hold it to the same rule as a fresh plan: every registered carrier's archived sources must be in

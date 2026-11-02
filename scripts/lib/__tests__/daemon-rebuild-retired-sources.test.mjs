@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
-import { addOverlay, migrateRegistrationIds, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity,
+import { addOverlay, appendOverlayEvent, migrateRegistrationIds, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity,
   reinstateOverlaySources, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { readReadyCandidate, writeReadyCandidate, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
@@ -391,6 +391,39 @@ describe('archived sources remain represented in preparation', () => {
 });
 
 describe('a saved ready candidate is held to the archived-source rule (PR #6033 red team)', () => {
+  it.each(['graduated', 'missing-event', 'invalid-event', 'registered-unrefreshed'])(
+    'wires persisted graduation proof into the ready matcher (%s)', async (mode) => {
+      const f = fixture();
+      f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
+      model.upToDate = false;
+      model.missing = mode === 'registered-unrefreshed';
+      if (model.missing) writeOverlays(root, [
+        { ref: 'lower', pr: 1, tipSha: '2'.repeat(40) }, { ref: 'top', pr: 2 },
+      ], { env: f.env }); // Known harmless tip avoids the unrelated unavailable-pin hold.
+      const applied = { ref: model.missing ? 'lower' : 'graduated', sha: '8'.repeat(40) };
+      const target = '7'.repeat(40);
+      const merged = '1'.repeat(40);
+      if (mode !== 'missing-event') appendOverlayEvent(root, {
+        kind: 'removed', ref: applied.ref,
+        reason: mode === 'invalid-event' ? 'operator removed' : `graduated #6011 (merged ${merged})`,
+      }, { env: f.env });
+      writeReadyCandidate(root, { kind: 'candidate', prevHead: merged, passedAt: new Date().toISOString(),
+        adopt: { finalSha: target, mainSha: merged, applied: [] } }, f.env);
+      // Probe the production evidence hook; matcher decisions are covered by daemon-rebuild-graduated.
+      model.readyMatch = vi.fn((args) => {
+        expect(args.leftForMain(applied, args.ready.adopt.finalSha)).toBe(mode === 'graduated');
+        expect(args.removedForMain(applied.ref)).toBe(false);
+        return { adopt: null, reason: 'graduation-proof-probed' };
+      });
+      await f.prepare({ run: (args) => {
+        if (args[0] === 'merge-base' && args[1] === '--is-ancestor'
+          && args[2] === merged && args[3] === target) return { status: 0, stdout: '' };
+        return f.git(args);
+      } });
+      expect(model.readyMatch).toHaveBeenCalledTimes(1);
+    },
+  );
+
   // Saved before auto-retirement archived lower into top; matchReadyCandidate accepts it as fallback-main-moved.
   async function readyTick({ target, gitError = false }) {
     const f = fixture();
