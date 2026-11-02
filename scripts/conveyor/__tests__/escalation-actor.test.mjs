@@ -178,7 +178,10 @@ describe('planReconcile escalation takeovers (R392(1))', () => {
   });
 
   it('omitting escalationStreaks preserves the ordinary fix pass', () => {
-    const result = plan({}, { escalationStreaks: undefined });
+    // An ordinary fix requires a real finding; an empty thread is correctly refused as no-findings.
+    const comments = [{ author: { login: 'web-everything' }, createdAt: '2026-11-02T10:00:00Z',
+      body: `🔁 review — changes requested\n\nRecorded by auto-policy\n\nruled \`block\` on head \`${HEAD}\`.\n\n### Findings\n\n**correctness/logic** (1)\n- \`src/a.mjs:1\` — repair the open defect` }];
+    const result = plan({ comments }, { escalationStreaks: undefined });
     expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 6023, kind: 'fix' })]);
     expect(takeovers(result)).toEqual([]);
   });

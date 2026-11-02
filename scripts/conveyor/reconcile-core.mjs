@@ -2111,6 +2111,7 @@ export function planReconcile({
   // `takeover` (a takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting and the
   // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
   roundCapAction = 'person', takeoverBudget = 1,
+  escalationStreaks = [], escalationTakeoverCapPerHead = 1,
   owedCiRerun = { rerun: 'on', maxRerunsPerHead: 1 },
   // `fix.staleCiRerun` (`off` | `once-per-head`): a red required check on a head that main's green CI did NOT cause
   // (no red window explains it) still gets ONE mechanical re-run of the failed jobs per head, never a heal first.
@@ -2335,7 +2336,7 @@ export function planReconcile({
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
     // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
     if (threadMayBeTruncated(pr)) {
-      refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
+      refuse('thread-truncated', { why: `the comment thread has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be truncated, so the markers after it cannot be counted; nothing is decided on this view` });
       continue;
     }
     // xilx617 (epic #4075/#3383) — EVERY `cap-exhausted` refusal EXCEPT the `ci-red` one above (which already
@@ -2715,6 +2716,10 @@ export function planReconcile({
     }
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
+    if (pr?.isDraft && !Array.isArray(pr.labels)) {
+      refuse('draft', { why: 'draft labels are unreadable — no fix or promotion is authorized; a person must check the labels' });
+      continue;
+    }
     const phase = classifyPr({
       state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
@@ -2764,23 +2769,26 @@ export function planReconcile({
     // one) keeps a review from firing for either of those two cases.
     // xu1nixv — the red-main fix PR is promoted at once (it must not sit as a draft while main is red).
     if (pr?.isDraft && (withPhase.check === 'green' || reviewHoldOnlyRed(pr.statusCheckRollup, requiredChecks) || mainFixPriority)) {
-      if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
-        refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
+      if (!Array.isArray(pr.labels) || labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
+        refuse('draft', { ...withPhase, why: 'draft PR is withdrawn or its labels are unreadable — explicit release is required before promotion' });
         continue;
       }
       const redTeamHold = labelNames(pr.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
-      if (redTeamHold) {
+      const redTeamSendBack = redTeamHold && labelNames(pr.labels).includes('review:changes');
+      if (redTeamHold && !redTeamSendBack) {
         refuse('draft', { ...withPhase, why: `${redTeamHold} — a draft held by red team is never promoted` });
         continue;
       }
-      dispatch.push({
-        ...base, ...withPhase, kind: 'promote-draft',
-        why: withPhase.check !== 'green' && mainFixPriority
-          ? 'draft PR that owns the fix for red main — promoted at once: every other PR is waiting for it (card xu1nixv)'
-          : 'draft PR — required checks are green or held only for review; promote it to ready for review (draft-first PRs, '
-          + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
-      });
-      continue;
+      if (!redTeamSendBack) {
+        dispatch.push({
+          ...base, ...withPhase, kind: 'promote-draft',
+          why: withPhase.check !== 'green' && mainFixPriority
+            ? 'draft PR that owns the fix for red main — promoted at once: every other PR is waiting for it (card xu1nixv)'
+            : 'draft PR — required checks are green or held only for review; promote it to ready for review (draft-first PRs, '
+            + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
+        });
+        continue;
+      }
     }
 
     // An earlier operator request survives later mechanical bounces and advisory accepts. Keep the existing
@@ -2798,6 +2806,32 @@ export function planReconcile({
           why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'operator send-back not yet addressed after a fixer had its chance' });
       }
       continue;
+    }
+
+    // R392(1): a repeatedly surfaced escalation gets a bounded actor before ordinary fix rounds are spent.
+    // Keep all the ordinary author/liveness holds above and all planTakeover guards below.
+    const escalation = Array.isArray(escalationStreaks) && escalationStreaks.find(row =>
+      row?.pr === prNumber && /^[a-f0-9]{40}$/i.test(row.head ?? '') && row.head === pr.headRefOid
+      && Number.isSafeInteger(row.streak) && row.streak > 0 && typeof row.cause === 'string' && row.cause.trim());
+    if (escalation && String(pr.state ?? 'OPEN').toUpperCase() === 'OPEN') {
+      if (!Array.isArray(pr.comments)) {
+        refuse('thread-truncated', { ...withPhase, why: 'escalation takeover needs readable, complete comments; a person must inspect the thread' });
+        continue;
+      }
+      const used = takeoverMarkers(pr.comments).filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
+      if (Number.isSafeInteger(escalationTakeoverCapPerHead) && escalationTakeoverCapPerHead > used) {
+        const takeover = planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch });
+        if (takeover.ok) {
+          dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: Math.max(1, openDefects(pr.comments, pr.headRefOid)?.count ?? 0),
+            takeover: { attempts: roundAttempts(), cap: effectiveRoundCap, rung: takeover.rung, route: takeover.route,
+              n: takeover.n, budget: takeover.budget, ...(takeover.previous ? { previous: takeover.previous } : {}) },
+            why: `repeated escalation (${escalation.cause}, ${escalation.streak} sweeps) owes an actor — automatic takeover ${takeover.n} of ${takeover.budget}` });
+        } else {
+          refuse('cap-exhausted', { ...withPhase, takeover: takeover.reason,
+            why: `escalation takeover refused: ${takeover.reason}; a person must resolve the escalation` });
+        }
+        continue;
+      }
     }
 
     // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —

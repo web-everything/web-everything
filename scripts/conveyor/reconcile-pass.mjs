@@ -125,6 +125,9 @@ import { enrichPrsWithReviewChurn } from './review-churn.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { resolveFixSettings } from './fix-takeover.mjs';
+import { takeoverMarkers, sameHeadSha } from './fix-takeover.mjs';
+import { owedTakeovers, escalationLedgerPath, loadEscalationLedger, resolveEscalationActorSettings } from './escalation-actor.mjs';
+import { feedPath as needsYouFeedPath } from '../operations/needs-you-feed.mjs';
 import { resolveTakeoverBudget, PLATFORM_PREFERENCES_PATH, REPO_FIX_SETTINGS_PATH } from './takeover-budget.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
 import { loadPrOwnershipSettings } from './pr-ownership-settings.mjs';
@@ -1487,6 +1490,9 @@ export function runReconcilePass({
   loadStaleCiRerunSetting = resolveStaleCiRerunSetting,
   // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
   loadTakeoverBudget = resolveTakeoverBudget,
+  loadEscalationActorSettings = resolveEscalationActorSettings,
+  loadEscalationStreaks = loadEscalationLedger,
+  resolveNeedsYouFeedPath = needsYouFeedPath,
   // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
   loadOperatorRulingRounds = loadOperatorRulingExtraRounds,
   loadRoundExtensionAnchorSetting = loadRoundExtensionAnchor,
@@ -1579,7 +1585,19 @@ export function runReconcilePass({
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
   const prs = enrichVerifyGreen(rulingPrs, { policy: timing.review, env });
+  const actor = loadEscalationActorSettings({ env, log: line => console.error(line) });
+  const ledger = loadEscalationStreaks(escalationLedgerPath(resolveNeedsYouFeedPath({ env })));
+  const takeoverCountsByHead = {};
+  for (const pr of prs) {
+    // Unknown threads are rejected again in the pure core; never infer an unused allowance from them.
+    if (!Array.isArray(pr.comments)) continue;
+    takeoverCountsByHead[`${pr.number}@${pr.headRefOid}`] = takeoverMarkers(pr.comments)
+      .filter(marker => sameHeadSha(marker.head, pr.headRefOid)).length;
+  }
+  const escalationStreaks = actor.enabled ? owedTakeovers({ ledger: ledger[CONSTELLATION_REPOS[repoKey].slug],
+    threshold: actor.threshold, cap: actor.takeoverCapPerHead, takeoverCountsByHead }) : [];
   const plan = planReconcile({
+    escalationStreaks, escalationTakeoverCapPerHead: actor.takeoverCapPerHead,
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
     owedCiRerun: owedCiRerunSetting.value,

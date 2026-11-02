@@ -16,6 +16,7 @@ import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-reg
 import { resolveStallSweepSettings } from '../conveyor/pr-stall-sweep.mjs';
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+import { recordSweep, escalationLedgerPath, loadEscalationLedger, saveEscalationLedger, resolveEscalationActorSettings } from '../conveyor/escalation-actor.mjs';
 
 export const CHECKOUT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 function readOptional(path, fallback) {
@@ -255,8 +256,13 @@ export async function gateRulingItems(items, { gh = execFileSyncThrottled, cwd, 
 }
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
   env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
+  loadStreaks = loadEscalationLedger, saveStreaks = saveEscalationLedger, streakPath = escalationLedgerPath,
+  loadActorSettings = resolveEscalationActorSettings,
   liveGate = true } = {}) {
-  logSettings(settings, log);
+  const actorLines = [];
+  loadActorSettings({ env, readSettings: () => readSettings(checkoutRoot), log: line => actorLines.push(line) });
+  logSettings(settings, line => log(line.startsWith('needs-you-feed enabled=')
+    ? `${line}; ${actorLines.join('; ')}` : line));
   assertProducerCheckout(checkoutRoot, { env, settings });
   let stdout, failedRead = false;
   try { stdout = await exec(process.execPath, [join(checkoutRoot, 'scripts/operations/operator-queue.mjs'), '--json'],
@@ -300,6 +306,22 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
     const result = diffFeed(prev.openKeys, fresh, now, { clearKinds: REPORT_KINDS, incomplete: items.incomplete });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { openKeys: result.openKeys, lastRunAt: new Date(now).toISOString() });
+    const ledgerPath = streakPath(path);
+    const previous = loadStreaks(ledgerPath);
+    const ledgers = {};
+    // A partial read cannot establish consecutiveness. Reset rather than inventing evidence of a second sweep.
+    if (!items.incomplete) {
+      const repos = new Set(items.map(item => item.repo).filter(repo => typeof repo === 'string' && repo));
+      const rows = ['rulingNeeded', 'stoodDown', 'needsPerson'].flatMap(key => report[key] ?? []);
+      for (const repo of repos) {
+        ledgers[repo] = recordSweep({ ledger: previous[repo], sweepId: new Date(now).toISOString(),
+          items: items.filter(item => item.repo === repo && item.kind !== 'needs-you').map(item => {
+            const row = rows.find(row => row.repo === repo && (row.number ?? row.pr) === item.pr);
+            return { pr: item.pr, head: item.head, cause: row?.kind || item.kind };
+          }) });
+      }
+    }
+    saveStreaks(ledgerPath, ledgers);
     return result;
   });
 }
