@@ -35,7 +35,7 @@ export const FAILURE_REASONS = new Set([
   'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
-  'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
+  'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
   'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
   'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
@@ -123,6 +123,9 @@ async function rebuildCloneInternal({
   } else if (waitMs > baseWaitMs) log.error?.(`daemon-rebuild: starved for ${starvedCount} consecutive attempt(s) — waiting up to ${Math.round(waitMs / 1000)}s for in-flight ticks this time`);
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
+    // Only the ready-only job has prepare guards that make excluding its spawner safe.
+    ...(readyOnly ? { ignoreOwners: (env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS || '')
+      .split(',').map((owner) => owner.trim()).filter(Boolean) } : {}),
     now,
     waitMs,
     onBlocked: ({ blockers, waitMs: w }) => log.error?.(
@@ -148,7 +151,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {
