@@ -106,11 +106,11 @@ const siblingCalls = [
 ];
 
 describe('queue-tested CLI adapter', () => {
-  it('CLI queries only successful merge_group runs from ci.yml and emits the matching-tree decision', () => {
+  it('CLI queries all merge_group runs (a newer failure must stay visible) from ci.yml and emits the matching-tree decision', () => {
     const result = runCli();
     expect(result.calls).toEqual([
       ['git', 'rev-parse', `${sha}^{tree}`],
-      ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
+      ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&per_page=100'],
       ['gh', 'api', `repos/example/project/git/commits/${otherSha}`, '--jq', '.tree.sha'],
       ...quarantineCalls(),
       ...siblingCalls,
@@ -140,7 +140,7 @@ describe('queue-tested CLI adapter', () => {
   it('uses the supplied repository for every WE endpoint', () => {
     const result = runCli({ args: { repo: 'another-owner/another-repo' } });
     expect(result.calls.slice(1)).toEqual([
-      ['gh', 'api', 'repos/another-owner/another-repo/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
+      ['gh', 'api', 'repos/another-owner/another-repo/actions/workflows/ci.yml/runs?event=merge_group&per_page=100'],
       ['gh', 'api', `repos/another-owner/another-repo/git/commits/${otherSha}`, '--jq', '.tree.sha'],
       ...quarantineCalls('another-owner/another-repo'),
       ...siblingCalls,
@@ -153,7 +153,7 @@ describe('queue-tested CLI adapter', () => {
     expect(result.stdout).toBe('queue_tested=true\n');
     expect(result.calls).toEqual([
       ['git', 'rev-parse', `${sha}^{tree}`],
-      ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100'],
+      ['gh', 'api', 'repos/example/project/actions/workflows/ci.yml/runs?event=merge_group&per_page=100'],
       ...quarantineCalls(),
       ...siblingCalls,
     ]);

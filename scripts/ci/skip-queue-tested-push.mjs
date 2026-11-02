@@ -172,7 +172,7 @@ async function main() {
       ...values,
       pushTree: exec('git', ['rev-parse', `${values.sha}^{tree}`]),
       listMergeGroupRuns: () => JSON.parse(exec('gh', ['api',
-        `repos/${values.repo}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100`,
+        `repos/${values.repo}/actions/workflows/ci.yml/runs?event=merge_group&per_page=100`,
       ])).workflow_runs,
       getCommitTree: (sha) => exec('gh', ['api', `repos/${values.repo}/git/commits/${sha}`, '--jq', '.tree.sha']),
       readQuarantineState: () => readQuarantineAt(exec, values.repo),
