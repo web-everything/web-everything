@@ -39,6 +39,7 @@ import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
 import { createRegistry, op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
+import { createAuditDeps } from './codex-audit-io.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -482,10 +483,15 @@ export const OPERATIONS = Object.freeze({
       } }),
     }),
     sinks: { 'codex-audit.run': async ({ base, head }) => {
-      const code = await codexAuditMain([`--base=${base}`, `--head=${head}`]);
-      return { ok: code === 0, code };
+      let stdout = '', stderr = '';
+      const code = await codexAuditMain([`--base=${base}`, `--head=${head}`], {
+        ...createAuditDeps(),
+        stdout: text => { stdout += text; }, stderr: text => { stderr += text; },
+      });
+      return { ok: code === 0, code, stdout, stderr };
     } },
-    finish: ({ run, code, lines }) => ({ code: run?.verdict?.code ?? code, lines }),
+    finish: ({ run, code, lines, json }) => ({ code: run?.verdict?.code ?? code,
+      lines: json ? lines : [...[run?.verdict?.stdout, run?.verdict?.stderr].filter(Boolean).map(text => text.trimEnd()), ...lines] }),
   }),
   [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
     sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },
