@@ -1,3 +1,4 @@
+// @vitest-environment node
 /** R375: red-first contract for the standalone, read-only human-hold shadow. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -110,7 +111,12 @@ describe('decideStaleReferralHumanHold: stale referral must be the ONLY cause', 
   it('head moved past referral but live head has another pending referral -> no', async () => {
     const { pr, record, options } = clean();
     pr.headRefOid = movedHead;
-    pr.comments = [referralComment(record), referralComment({ ...record, head: movedHead })];
+    const liveRecord = structuredClone(record);
+    liveRecord.head = movedHead;
+    // Re-check metadata is pinned to its record head; preserve that invariant when moving the fixture.
+    for (const f of liveRecord.referrals) if (f.recheck) f.recheck.head = movedHead;
+    for (const recheck of liveRecord.rechecks ?? []) recheck.head = movedHead;
+    pr.comments = [referralComment(record), referralComment(liveRecord)];
     expect((await decideStaleReferralHumanHold(pr, options)).wouldClear).toBe(false);
   });
 
@@ -233,6 +239,20 @@ describe('shadow setting', () => {
     expect(resolveStaleReferralHumanShadow({ env: {}, tool: {} }).value.enabled).toBe(true);
   });
 
+  it('explicit tool enabled=false disables readers and events independently of the enabled default', async () => {
+    const { pr, options } = clean();
+    const settings = resolveStaleReferralHumanShadow({ env: {},
+      tool: { staleReferralHumanShadow: { enabled: false } } });
+    expect(settings).toMatchObject({ value: { enabled: false }, sources: { enabled: 'tool' } });
+    const decision = await decideStaleReferralHumanHold(pr, { ...options, settings });
+    expect(decision.wouldClear).toBe(false);
+    expect(options.readHoldEvidence).not.toHaveBeenCalled();
+    expect(options.readRequiredChecks).not.toHaveBeenCalled();
+    expect(options.readReferralState).not.toHaveBeenCalled();
+    await emitShadowEvent({ wouldClear: true }, pr, { repo, settings, env: {} });
+    expect(appendDaemonEvent).not.toHaveBeenCalled();
+  });
+
   it.each([['0', true, false], ['1', false, true], ['invalid', false, false], ['true', true, true]])(
     'environment %s over tool enabled=%s resolves to %s', (value, toolEnabled, expected) => {
       const result = resolveStaleReferralHumanShadow({ env: { WE_STALE_REFERRAL_HUMAN_SHADOW: value },
@@ -325,6 +345,55 @@ describe('emitShadowEvent', () => {
     const nextRepo = field === 'repo' ? 'another/repo' : repo;
     await emitShadowEvent(next, { ...nextPr, repo: nextRepo }, { repo: nextRepo, settings: enabled, env: process.env });
     expect(rows()).toHaveLength(2);
+  });
+});
+
+// Each row starts with the same positive referral-only fixture and changes only one
+// independent cause. Keep this list aligned with the complete checked-cause contract.
+const independentCauses = [
+  { cause: 'round-cap', present: ({ evidence }) => { evidence.round = NEGOTIATION_ROUND_CAP; }, field: 'round' },
+  { cause: 'block-ruling', present: ({ pr, record }) => { pr.comments = [referralComment(record), ruling(record, 'block')]; }, reader: 'readReferralState' },
+  { cause: 'requested-changes', present: ({ pr }) => { pr.reviews = [{ state: 'CHANGES_REQUESTED' }]; }, prField: 'reviews' },
+  { cause: 'red-team-blocked', present: ({ pr }) => { pr.labels.push({ name: 'red-team:blocked' }); }, prField: 'labels' },
+  { cause: 'draft', present: ({ pr }) => { pr.isDraft = true; }, prField: 'isDraft' },
+  { cause: 'merge-conflict', present: ({ pr }) => { pr.mergeable = 'CONFLICTING'; }, prField: 'mergeable' },
+  { cause: 'required-checks', present: ({ pr }) => { pr.statusCheckRollup[0].conclusion = 'FAILURE'; }, reader: 'readRequiredChecks' },
+  { cause: 'escalation', present: ({ pr, evidence }) => { evidence.escalations = [{ head: pr.headRefOid }]; }, field: 'escalations' },
+  { cause: 'needs-you', present: ({ evidence }) => { evidence.needsYou = true; }, field: 'needsYou' },
+  { cause: 'operator-ruling-needed', present: ({ evidence }) => { evidence.operatorRulingNeeded = true; }, field: 'operatorRulingNeeded' },
+  { cause: 'no-verdict', present: ({ evidence }) => { evidence.noVerdict = true; }, field: 'noVerdict' },
+  { cause: 'same-head-hold', present: ({ evidence }) => { evidence.sameHeadHold = true; }, field: 'sameHeadHold' },
+  { cause: 'security-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, lens: 'security' }]; }, field: 'findings' },
+  { cause: 'mandatory-referral-finding', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, mandatoryReferral: true }]; }, field: 'findings' },
+  { cause: 'advisory-push', present: ({ pr, evidence }) => { evidence.findings = [{ head: pr.headRefOid, advisory: true, requiresPush: true }]; }, field: 'findings' },
+];
+
+describe('referral-only safety predicate: every independent cause fails closed', () => {
+  it('positive referral-only fixture checks every cause absent and proposes clearance', async () => {
+    const { pr, options } = clean();
+    const decision = await decideStaleReferralHumanHold(pr, options);
+    expect(decision.wouldClear).toBe(true);
+    for (const cause of causes) expect(decision.checked).toContainEqual(
+      expect.objectContaining({ cause, status: 'absent', detail: expect.any(String) }));
+    expect(independentCauses.map(row => row.cause).sort()).toEqual([...causes].sort());
+  });
+
+  it.each(independentCauses)('$cause present independently prevents referral-only clearance', async row => {
+    const context = clean();
+    row.present(context);
+    checked(await decideStaleReferralHumanHold(context.pr, context.options), row.cause, 'present');
+    expect(appendDaemonEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(independentCauses)('$cause unreadable independently prevents referral-only clearance', async row => {
+    const { pr, evidence, options } = clean();
+    if (row.reader) options[row.reader] = () => { throw new Error(`${row.cause} evidence unavailable`); };
+    else if (row.prField) delete pr[row.prField];
+    else delete evidence[row.field];
+    const decision = await decideStaleReferralHumanHold(pr, options);
+    checked(decision, row.cause, 'unknown');
+    await emitShadowEvent(decision, pr, { repo, settings: enabled, env: {} });
+    expect(appendDaemonEvent).not.toHaveBeenCalled();
   });
 });
 
