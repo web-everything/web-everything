@@ -121,7 +121,8 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', fail, thro
       return { status: childStatus, stdout: '', stderr: '' };
     }
     expect(command).toBe('git');
-    expect(options.cwd).toBe(root);
+    expect(options.cwd).toBe(args.includes('rev-parse') ? process.cwd() : root);
+    if (args.includes('rev-parse')) return failure(); // Model a non-Git invocation cwd.
     const operation = ['fetch', 'rev-list', 'diff', 'worktree'].find((name) => args.includes(name));
     const stage = operation === 'worktree' ? `worktree-${args[args.indexOf('worktree') + 1]}` : operation;
     if (stage === fail) {
@@ -152,6 +153,121 @@ function harness({ behind = '6\n', changed = 'scripts/lib/dep.mjs\n', fail, thro
 
 const nodeCalls = (h) => h.exec.mock.calls.filter(([cmd]) => cmd === process.execPath || cmd === 'node');
 const removals = (h) => h.exec.mock.calls.filter(([, args]) => args.includes('worktree') && args.includes('remove'));
+
+describe('review regressions', () => {
+  it('scrubs inherited Git context and pins every Git call to the tool checkout', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    const env = {
+      GIT_DIR: '/untrusted/repository', GIT_WORK_TREE: '/untrusted/worktree',
+      GIT_COMMON_DIR: '/untrusted/common', GIT_INDEX_FILE: '/untrusted/index',
+      GIT_OBJECT_DIRECTORY: '/untrusted/objects', GIT_ALTERNATE_OBJECT_DIRECTORIES: '/untrusted/alternate',
+      GIT_CONFIG: '/untrusted/config', GIT_CONFIG_GLOBAL: '/untrusted/global', GIT_CONFIG_SYSTEM: '/untrusted/system',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always',
+      GIT_CONFIG_PARAMETERS: "'protocol.ext.allow=always'", GIT_EXEC_PATH: '/untrusted/bin',
+      GIT_CONFIG_KEY_orphan: 'protocol.ext.allow', GIT_CONFIG_VALUE_orphan: 'always',
+      GIT_ALLOW_PROTOCOL: 'ext:file', GIT_SSH_COMMAND: 'untrusted-command',
+      GIT_EXTERNAL_DIFF: 'untrusted-diff', GIT_ASKPASS: 'untrusted-askpass', FIXTURE_TOKEN: 'keep',
+    };
+    await guardToolCheckout({ ...h, env, settings: { mode: 'reexec' } });
+    for (const [, args, options] of h.exec.mock.calls.filter(([cmd]) => cmd === 'git')) {
+      expect(args.slice(0, 2)).toEqual(['-C', options.cwd]);
+      for (const key of Object.keys(env).filter(key => key.startsWith('GIT_'))) {
+        expect(options.env[key], key).toBe(key === 'GIT_ALLOW_PROTOCOL' ? 'https' : undefined);
+      }
+      expect(options.env.FIXTURE_TOKEN).toBe('keep');
+      for (const setting of ['protocol.ext.allow=never', 'protocol.allow=never',
+        'protocol.https.allow=always', 'protocol.file.allow=never']) expect(args).toContain(setting);
+    }
+    const childEnv = nodeCalls(h)[0][2].env;
+    for (const key of Object.keys(env).filter(key => key.startsWith('GIT_'))) expect(childEnv[key], key).toBeUndefined();
+    expect(env.GIT_DIR).toBe('/untrusted/repository');
+  });
+
+  it('refuses an ext origin with GIT_DIR set without executing its transport command', async () => {
+    const { guardToolCheckout } = await load();
+    const root = scratch();
+    const marker = join(root, 'transport-executed');
+    // A minimal bare repository, assembled as files: no .git writes or Git setup commands.
+    mkdirSync(join(root, 'objects'));
+    mkdirSync(join(root, 'refs'));
+    put(root, 'HEAD', 'ref: refs/heads/main\n');
+    put(root, 'config', `[core]\n bare = true\n[remote "origin"]\n url = ext::sh -c >${marker}\n[protocol "ext"]\n allow = always\n`);
+    const exec = vi.fn(spawnSync);
+    await expect(guardToolCheckout({ entry: join(root, 'scripts/tool.mjs'), root,
+      exec, env: { ...process.env, GIT_DIR: root }, log: () => {},
+    })).rejects.toThrow('Git fetch');
+    expect(existsSync(marker)).toBe(false);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.results[0].value.stderr).toContain("transport 'ext' not allowed");
+  });
+
+  it.each([undefined, 'relative-pool', '~/private-pool'])(
+    'reexec preserves original checkout and pool from a non-git cwd with override %s', async (pool) => {
+      const { guardToolCheckout } = await load();
+      const { defaultPoolRoot } = await import('../lane-pool-paths.mjs');
+      const h = harness();
+      const task = scratch();
+      const cwd = scratch();
+      const env = { ...process.env, TMPDIR: task, WE_TOOL_STALE_MODE: 'reexec' };
+      delete env.LANE_POOL_ROOT;
+      delete env.VITEST;
+      delete env.WE_UNDER_TEST;
+      if (pool) env.LANE_POOL_ROOT = pool;
+      const runner = h.exec.getMockImplementation();
+      const source = readFileSync(join(ROOT, 'scripts/lane-pool.mjs'), 'utf8');
+      const bootstrap = source.slice(source.indexOf('const CWD_TOP_LEVEL ='),
+        source.indexOf('// #3383 — `guardedPoolRoot`'));
+      expect(bootstrap).toContain('const CHECKOUT_ROOT =');
+      let child;
+      h.exec.mockImplementation((command, args, options) => {
+        if (command === process.execPath) {
+          put(h.worktree, 'scripts/tool.mjs', `
+            import { checkoutRootFor, defaultPoolRoot } from ${JSON.stringify(join(ROOT, 'scripts/lib/lane-pool-paths.mjs'))};
+            import { dirname, resolve } from 'node:path';
+            import { fileURLToPath } from 'node:url';
+            const tryGit = () => null;
+            const LOCAL_GIT_TIMEOUT_MS = 1000;
+            ${bootstrap}
+            console.log(JSON.stringify({ checkout: CHECKOUT_ROOT, pool: defaultPoolRoot(CHECKOUT_ROOT), cwd: process.cwd() }));
+          `);
+          child = spawnSync(command, args, { ...options, cwd, stdio: 'pipe', encoding: 'utf8', timeout: 10_000 });
+          return child;
+        }
+        return runner(command, args, options);
+      });
+      expect(await guardToolCheckout({ ...h, env })).toBe(0);
+      expect(child.stderr).toBe('');
+      expect(JSON.parse(child.stdout)).toEqual({
+        checkout: h.root, pool: defaultPoolRoot(h.root, env), cwd,
+      });
+      expect(existsSync(h.worktree)).toBe(false);
+    },
+  );
+
+  it('preserves a Git cwd repository instead of the tool checkout for the child', async () => {
+    const { guardToolCheckout } = await load();
+    const { defaultPoolRoot } = await import('../lane-pool-paths.mjs');
+    const h = harness();
+    const cwdRoot = scratch();
+    const runner = h.exec.getMockImplementation();
+    h.exec.mockImplementation((command, args, options) => args.includes('rev-parse')
+      ? success(`${cwdRoot}\n`) : runner(command, args, options));
+    await guardToolCheckout({ ...h, settings: { mode: 'reexec' } });
+    expect(nodeCalls(h)[0][2].env).toMatchObject({
+      WE_TOOL_ORIGINAL_CHECKOUT: cwdRoot, LANE_POOL_ROOT: defaultPoolRoot(cwdRoot, {}),
+    });
+  });
+
+  it('keeps the test real-pool refusal before creating a fresh worktree', async () => {
+    const { guardToolCheckout } = await load();
+    const h = harness();
+    await expect(guardToolCheckout({ ...h, env: { VITEST: 'true' }, settings: { mode: 'reexec' } }))
+      .rejects.toThrow('refusing to resolve the REAL lane-pool root');
+    expect(h.worktree).toBeUndefined();
+    expect(nodeCalls(h)).toHaveLength(0);
+  });
+});
 
 describe('guardToolCheckout', () => {
   it.each([
@@ -326,6 +442,12 @@ describe('real local Git fixture (no network)', () => {
 });
 
 describe('lane-pool entry wiring', () => {
+  it('uses the original checkout fallback only in the fresh reexec child', () => {
+    const source = readFileSync(join(ROOT, 'scripts/lane-pool.mjs'), 'utf8');
+    expect(source).toContain("process.env.WE_TOOL_FRESH_REEXEC === '1' && process.env.WE_TOOL_ORIGINAL_CHECKOUT");
+    expect(source).toContain('? process.env.WE_TOOL_ORIGINAL_CHECKOUT : resolve(dirname(fileURLToPath(import.meta.url))');
+  });
+
   it('imports the separate guard side-effect entry before every other import', () => {
     const source = readFileSync(join(ROOT, 'scripts/lane-pool.mjs'), 'utf8');
     const imports = source.split(/\r?\n/).filter((line) => /^\s*import\b/.test(line));

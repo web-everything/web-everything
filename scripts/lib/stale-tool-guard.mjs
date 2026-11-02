@@ -5,6 +5,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { laneGitConfigArgs } from './lane-git-hardening.mjs';
+import { checkoutRootFor, guardedPoolRoot } from './lane-pool-paths.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
@@ -117,20 +119,26 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     root = resolve(root ?? checkoutRoot(entry));
     const name = within(root, entry);
     const policy = resolveStaleToolSettings({ env, settings, log });
-    const git = args => {
-      const result = exec('git', args, { cwd: root, env: { ...env, GIT_TERMINAL_PROMPT: '0' },
+    // No inherited Git repository, executable, config or transport context may redirect this guard.
+    const cleanEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+    const gitEnv = { ...cleanEnv, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: 'https' };
+    const git = (args, cwd = root) => {
+      const result = exec('git', ['-C', cwd, ...laneGitConfigArgs(),
+        '-c', 'protocol.ext.allow=never', '-c', 'protocol.allow=never',
+        '-c', 'protocol.https.allow=always', '-c', 'protocol.file.allow=never',
+        ...args], { cwd, env: gitEnv,
         encoding: 'utf8', timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, shell: false });
       if (result?.error || result?.status !== 0 || typeof result.stdout !== 'string') {
         throw new Error(`Git ${args[0]} failed or exceeded its ${GIT_TIMEOUT_MS}ms / ${MAX_BUFFER}-byte bound`);
       }
       return result.stdout;
     };
-    git(['fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+    git(['fetch', '--upload-pack=git-upload-pack', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
     const count = git(['rev-list', '--count', 'HEAD..origin/main']).trim();
     const behind = /^\d+$/.test(count) ? Number(count) : NaN;
     if (!nonnegative(behind)) throw new Error('Unknown or oversized upstream commit count');
     // NUL avoids Git's quoted filename output and preserves whitespace in real paths.
-    const diff = git(['diff', '--name-only', '--no-renames', '-z', 'HEAD', 'origin/main', '--']);
+    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', 'HEAD', 'origin/main', '--']);
     const changedPaths = diff.includes('\0') ? diff.split('\0').filter(Boolean) : diff.split('\n').filter(Boolean);
     let depPaths;
     try { depPaths = await importClosure(entry, { root }); } catch (error) {
@@ -140,6 +148,12 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
     }
     if (evaluateStaleness({ behind, threshold: policy.threshold, changedPaths, depPaths }).action === 'ok') return;
     if (policy.mode === 'refuse') throw new Error(`stale tool checkout (${behind} behind)`);
+    // Resolve both roots while the script still lives in the original checkout. A non-Git cwd
+    // falls back to that checkout, just as lane-pool's normal bootstrap does.
+    let cwdTopLevel;
+    try { cwdTopLevel = git(['rev-parse', '--show-toplevel'], process.cwd()).trim(); } catch { /* non-Git cwd */ }
+    const originalCheckout = checkoutRootFor({ cwdTopLevel, scriptCheckout: root, cwd: process.cwd() });
+    const poolRoot = guardedPoolRoot(originalCheckout, env);
     if (!env.TMPDIR && !process.env.TMPDIR) throw new Error('Reexec requires a task-local TMPDIR');
     const scratch = mkdtempSync(join(env.TMPDIR || process.env.TMPDIR, 'fresh-tool-'));
     const worktree = join(scratch, 'checkout');
@@ -149,7 +163,9 @@ export async function guardToolCheckout({ entry, root, exec = spawnSync, env = p
       added = true;
       symlinkSync(join(root, 'node_modules'), join(worktree, 'node_modules'), 'junction');
       const child = exec(process.execPath, [join(worktree, name), ...process.argv.slice(2)], {
-        cwd: process.cwd(), env: { ...env, WE_TOOL_FRESH_REEXEC: '1' }, stdio: 'inherit', shell: false,
+        cwd: process.cwd(), env: { ...cleanEnv,
+          WE_TOOL_FRESH_REEXEC: '1', WE_TOOL_ORIGINAL_CHECKOUT: originalCheckout,
+          LANE_POOL_ROOT: poolRoot }, stdio: 'inherit', shell: false,
       });
       if (child?.error || !Number.isInteger(child?.status) || child.status < 0 || child.status > 255) {
         throw new Error('Fresh tool failed to launch or terminated without an exit status');

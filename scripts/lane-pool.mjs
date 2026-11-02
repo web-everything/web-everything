@@ -350,7 +350,8 @@ const LOCAL_GIT_TIMEOUT_MS = Math.min(resolveChildTimeoutMs(), 15_000);
 // and every prepare failed with `could not determine an origin URL`. Outside any git work tree, the checkout this
 // script lives in is the honest answer (it IS `<WE_ROOT>`), for both the pool root and the repo to acquire from.
 const CWD_TOP_LEVEL = tryGit(['rev-parse', '--show-toplevel'], process.cwd(), { timeout: LOCAL_GIT_TIMEOUT_MS });
-const SCRIPT_CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const SCRIPT_CHECKOUT = process.env.WE_TOOL_FRESH_REEXEC === '1' && process.env.WE_TOOL_ORIGINAL_CHECKOUT
+  ? process.env.WE_TOOL_ORIGINAL_CHECKOUT : resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CHECKOUT_ROOT = checkoutRootFor({ cwdTopLevel: CWD_TOP_LEVEL, scriptCheckout: SCRIPT_CHECKOUT, cwd: process.cwd() });
 // #3383 — `guardedPoolRoot` (not the bare `defaultPoolRoot`) so a vitest run that spawns this CLI for real with
 // no pool-root override fails LOUDLY and immediately, instead of quietly hammering the shared real pool (see
