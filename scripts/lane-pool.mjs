@@ -313,15 +313,21 @@ export function ignoredBuildOutputDirs(dir) {
     const config = readFileSync(join(dir, '.eleventy.js'), 'utf8')
       .replace(/("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g,
         (match, quoted) => quoted ?? match.replace(/[^\r\n]/g, ' '));
-    const dirConfig = config.match(/\bdir\s*:\s*\{([^{}]*)\}/)?.[1];
-    const output = dirConfig?.match(/\boutput\s*:\s*(["'])([^"'\r\n]*)\1/);
-    if (output) add(output[2]);
+    // Only standalone opening/closing lines delimit a supported dir block.
+    for (const block of config.matchAll(/^[\t ]*dir[\t ]*:[\t ]*\{[\t ]*\r?\n([^{}]*?)^[\t ]*\}[\t ]*,?[\t ]*\r?$/gm)) {
+      for (const line of block[1].split(/\r?\n/)) {
+        const output = line.match(/^\s*output\s*:\s*(["'])([A-Za-z0-9_-][A-Za-z0-9_.-]*)\1\s*,?\s*$/);
+        if (output) add(output[2]);
+      }
+    }
   } catch { /* Unreadable config: no Eleventy output is eligible. */ }
   try {
     const config = readFileSync(join(dir, 'playwright.config.ts'), 'utf8');
     for (const line of config.split(/\r?\n/)) {
-      if (/^(?:\/\/|\*|\/\*)/.test(line.trimStart()) || !line.includes('@11ty/eleventy')) continue;
-      for (const match of line.matchAll(/@11ty\/eleventy\b[^`"'\n]*?--output=([^\s"'`]+)/g)) add(match[1]);
+      // Validate the whole command property before extracting any output tokens.
+      // Flag values may include template interpolations such as ${VISUAL_FIXTURE_PORT}.
+      if (line.includes('//') || !/^\s*command\s*:\s*`npx @11ty\/eleventy\b(?:\s+--[A-Za-z-]+(?:=[^\s`;&|#]+)?)*`\s*,?\s*$/.test(line)) continue;
+      for (const match of line.matchAll(/\s--output=([A-Za-z0-9_-][A-Za-z0-9_.-]*)(?=\s|`)/g)) add(match[1]);
     }
   } catch { /* Unreadable config: no Playwright outputs are eligible. */ }
   return [...dirs].filter((name) => {
