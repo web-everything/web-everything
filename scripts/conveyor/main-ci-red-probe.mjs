@@ -60,6 +60,7 @@ export function readRunJobs(runId, { exec = execFileSyncThrottled, repoSlug = DE
   return {
     complete,
     count: jobs.length,
+    names: jobs.map((j) => String(j.name)),
     failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: j.name })),
     passed: jobs.filter((j) => String(j.conclusion) === 'success').map((j) => String(j.name)),
   };
@@ -68,12 +69,17 @@ export function readRunJobs(runId, { exec = execFileSyncThrottled, repoSlug = DE
 /**
  * Tag the jobs read with `gatingFailed`: the failed jobs named in the required set. The full `failed` list stays (it names
  * root causes such as a failing shard); only `gatingFailed` decides whether the run is a code failure of main. With no
- * required set every failed job gates (fail closed). PURE.
+ * required set every failed job gates (fail closed). When narrowing hides a failed job, positive proof is demanded: every
+ * required job in the run must have SUCCEEDED, so a failed shard under a cancelled `test` summary stays gating. PURE.
  */
 export function onlyGatingFailures(jobs, requiredChecks) {
   if (!jobs) return jobs;
   const gating = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
-  return { ...jobs, gatingFailed: gating ? jobs.failed.filter((j) => gating.has(j.name)) : jobs.failed };
+  if (!gating) return { ...jobs, gatingFailed: jobs.failed };
+  const gatingFailed = jobs.failed.filter((j) => gating.has(j.name));
+  const hidden = jobs.failed.length > gatingFailed.length;
+  const unproven = hidden && (jobs.names ?? []).some((n) => gating.has(n) && !(jobs.passed ?? []).includes(n));
+  return { ...jobs, gatingFailed: unproven ? jobs.failed : gatingFailed };
 }
 
 /** Failing test titles from one job's check-run annotations (CI output — untrusted text, quoted later). */
@@ -133,7 +139,12 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
   // test-selection-measure) is not a code failure of main. Real failures surface in the required `test` / `daemon-soak`
   // summary jobs. An unreadable or empty required set filters nothing (fail closed: every failed job stays gating).
   let requiredChecks = null;
-  try { const c = readRequired({ repo: repoSlug })?.checks; requiredChecks = Array.isArray(c) && c.length ? c : null; } catch { requiredChecks = null; }
+  // Only a LIVE or fresh-cache read is trusted policy; a fallback / stale-cache / declared list may omit a newly required check.
+  try {
+    const got = readRequired({ repo: repoSlug });
+    const trusted = got?.source === undefined || ['live', 'cache'].includes(got.source);
+    requiredChecks = trusted && Array.isArray(got?.checks) && got.checks.length ? got.checks : null;
+  } catch { requiredChecks = null; }
   // One job read per run, however many passes below look at it. `null` = unreadable (stays red: never promoted on a blind read).
   const jobsRead = new Map();
   const jobsOf = (r) => {

@@ -10,7 +10,7 @@ const run = { databaseId: 41701873905, headSha: SHA, status: 'completed', conclu
   createdAt: '2026-11-03T19:17:00Z', updatedAt: '2026-11-03T20:00:00Z', attempt: 1 };
 const job = (id, name, conclusion) => ({ id, name, conclusion, status: 'completed' });
 
-function probe(jobs, { required = REQUIRED, runs = [run] } = {}) {
+function probe(jobs, { required = REQUIRED, runs = [run], source } = {}) {
   const exec = (bin, argv) => {
     const url = argv.join(' ');
     if (argv[0] === 'run' && argv[1] === 'list') return JSON.stringify(runs);
@@ -21,7 +21,7 @@ function probe(jobs, { required = REQUIRED, runs = [run] } = {}) {
     if (/check-runs/.test(url)) return JSON.stringify({ total_count: 0, check_runs: [] });
     return 'null';
   };
-  return probeMainCiRuns({ exec, readRequired: () => ({ checks: required }) });
+  return probeMainCiRuns({ exec, readRequired: () => ({ checks: required, ...(source ? { source } : {}) }) });
 }
 
 describe('main-red judges required checks only (R516)', () => {
@@ -43,5 +43,15 @@ describe('main-red judges required checks only (R516)', () => {
   it('fails closed: an unreadable required set keeps every failed job gating', () => {
     const p = probe([job(1, 'test', 'success'), job(3, 'test-selection-measure', 'timed_out')], { required: [] });
     expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
+  });
+  it('a failed shard under a cancelled required summary stays red (positive proof needed)', () => {
+    const p = probe([job(1, 'test', 'cancelled'), job(2, 'smoke', 'success'), job(3, 'test-shard (3)', 'failure')]);
+    expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
+  });
+  it('an untrusted required list (fallback / stale-cache) filters nothing', () => {
+    for (const source of ['fallback', 'stale-cache']) {
+      const p = probe([job(1, 'test', 'success'), job(3, 'test-selection-measure', 'timed_out')], { source });
+      expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
+    }
   });
 });
