@@ -394,9 +394,34 @@ describe('report runner', () => {
   expect(Object.values(JSON.parse(files.get('state/bottleneck-slices.json')).entries)[0])
    .toMatchObject({final:false,cachedAt:now+1000});
  });
+ it('scrubs a planted token from every persisted artefact',async()=>{
+  const {deps,files}=setup();const token='ghp_'+'a'.repeat(36);
+  deps.analyzePr=async pr=>[{...slice(pr,'ci:queued',1),reason:`clone https://x:${token}@github.com/a/b failed`}];
+  await runBottleneckReport({dir:'state',now,deps});
+  for(const f of ['bottleneck-slices.json','bottleneck-report.json','bottleneck-report.md','bottleneck-history.jsonl'])
+   expect(files.get('state/'+f)||'').not.toContain(token);
+ });
+ it('fails closed and persists nothing when the scrubber is unavailable',async()=>{
+  const {deps,files}=setup();deps.scrub=null;
+  const out=await runBottleneckReport({dir:'state',now,deps});
+  expect(out.error).toMatch(/scrubber unavailable/);
+  expect([...files.keys()].filter(k=>/bottleneck-(report|slices|history)/.test(k))).toEqual([]);
+ });
+ it('invalidates a final cache entry on reopen/reclose and marks the run truncated',async()=>{
+  const {deps,files}=setup();let updatedAt='2026-11-02T20:00:00Z', end=now;
+  deps.listPrs=async()=>[{number:1,repo:'a/b',updatedAt,state:'closed'}];
+  deps.analyzePr=vi.fn(async pr=>[{pr,bucket:'idle/unowned',causeKey:'unknown:idle',reason:'idle/unowned',start:now-3*hour,end}]);
+  await runBottleneckReport({dir:'state',now,deps});
+  updatedAt='2026-11-02T22:00:00Z';
+  await runBottleneckReport({dir:'state',now:now+1000,deps,force:true});
+  expect(deps.analyzePr).toHaveBeenCalledTimes(2);
+  const r=JSON.parse(files.get('state/bottleneck-report.json'));
+  expect(r.truncated).toBe(true);
+  expect(r.gapsFlagged.some(g=>/invalidated/.test(g.why))).toBe(true);
+ });
  it('invalidates updated open PRs, retains final PRs across updates, and prunes entries after 72 hours',async()=>{
   const {deps,files}=setup();let updatedAt='2026-11-02T20:00:00Z';
-  deps.listPrs=async()=>[{number:1,repo:'a/b',updatedAt,state:'open'}, {number:2,repo:'a/b',updatedAt,state:'closed'}];
+  deps.listPrs=async()=>[{number:1,repo:'a/b',updatedAt,state:'open'}, {number:2,repo:'a/b',updatedAt:'2026-11-02T20:00:00Z',state:'closed'}];
   deps.analyzePr=vi.fn(async pr=>[slice(pr,'ci:queued',1)]);
   await runBottleneckReport({dir:'state',now,deps});
   updatedAt='2026-11-03T00:30:00Z';deps.analyzePr.mockClear();
@@ -515,7 +540,7 @@ describe('report runner', () => {
   expect(deps.runGhSync.mock.calls.every(([args])=>/\/pulls\/\d+$/.test(args[1]))).toBe(true);
  });
  it('retains reduced CI precision warnings when cached final slices are reused',async()=>{
-  const {deps,files}=setup();deps.listPrs=async()=>[{number:1,repo:'a/b',state:'closed'}];
+  const {deps,files}=setup();deps.listPrs=async()=>[{number:1,repo:'a/b',updatedAt:'2026-11-02T20:00:00Z',state:'closed'}];
   deps.analyzePr=async(pr,{cache})=>{cache.gaps.push({source:'PR 1 CI',why:'completed workflow timing used'});return [slice(pr,'ci:queued',1)];};
   await runBottleneckReport({dir:'state',now,deps});
   deps.analyzePr=vi.fn(()=>{throw Error('must reuse final slices');});
@@ -525,7 +550,7 @@ describe('report runner', () => {
    gapsFlagged:expect.arrayContaining([{source:'PR 1 CI',why:'completed workflow timing used'}])});
  });
  it('a final-cache run with only precision warnings respects the hourly cadence',async()=>{
-  const {deps,files}=setup();deps.listPrs=vi.fn(async()=>[{number:1,repo:'a/b',state:'closed'}]);
+  const {deps,files}=setup();deps.listPrs=vi.fn(async()=>[{number:1,repo:'a/b',updatedAt:'2026-11-02T20:00:00Z',state:'closed'}]);
   deps.analyzePr=vi.fn(async(pr,{cache})=>{cache.gaps.push({source:'CI',why:'completed workflow timing used; individual job/idle detail unavailable'});return [slice(pr,'ci:queued',1)];});
   await runBottleneckReport({dir:'state',now,deps});
   expect(JSON.parse(files.get('state/bottleneck-report.json'))).toMatchObject({truncated:true,deferredWork:false});

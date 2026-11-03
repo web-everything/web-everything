@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { runGhSync, isGhDeferred } from '../lib/gh-throttle.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { analyzePr } from './pr-time-core.mjs';
+import { scrubDeep } from './health-watch-core.mjs';
 const HOUR = 3600000;
 const ms = t => typeof t === 'number' ? t : Date.parse(t);
 const unknown = key => /^(unknown:|other:|fix:agent-unattributed)/.test(key);
@@ -219,7 +220,12 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
    // Open lifecycle slices end at analysis time, so metadata equality is only fresh within this interval.
    // Short-term reuse lets partial passes resume without repeatedly analysing the same newest PRs.
    // A cached final lifecycle can reopen; only current closed-state evidence permits immutable reuse.
-   if(current && (current.final ? pr.state==='closed' : (pr.state!=='closed' && updatedAt && current.updatedAt===updatedAt && at>=current.cachedAt && at-current.cachedAt<everyMs)))continue;
+   // A final entry is reusable only when the PR is closed NOW and its lifecycle version (updatedAt) is unchanged;
+   // a reopen/reclose changes updatedAt, so the entry is invalidated and the run is marked truncated.
+   if(current?.final && !(pr.state==='closed' && updatedAt && current.updatedAt===updatedAt)) {
+    for(const [key,e] of Object.entries(entries))if(e.repo===repo && e.number===number)delete entries[key];
+    record(`PR ${number}`,'lifecycle changed or unverifiable (reopen/reclose); cached final slices invalidated',false);
+   } else if(current && (current.final || (pr.state!=='closed' && updatedAt && current.updatedAt===updatedAt && at>=current.cachedAt && at-current.cachedAt<everyMs)))continue;
    if(clock()>=deadline || attempts>=cache.maxPrs || cache.calls>=cache.maxCalls){record('analysis budget','remaining PRs deferred to a later run',true);break;}
    attempts++;
    try {
@@ -248,11 +254,16 @@ export async function runBottleneckReport({dir, now = Date.now(), deps = {}, bud
  report.cycleAt=cadence.cycleAt;report.earlyRetries=cadence.earlyRetries;
  const line=summary(report), publish=limiter(clock()+writeGraceMs);
  try {
+  // Every persisted artefact passes the shared credential scrubber; fail closed when it is unavailable.
+  const scrub=deps.scrub===undefined?scrubDeep:deps.scrub;
+  if(typeof scrub!=='function')throw Error('credential scrubber unavailable; nothing persisted');
+  const safeReport=scrub(report), safeMd=scrub(renderMarkdown(report));
+  const safeCache=cacheLoaded?scrub({version:8,entries,ciReads:Object.fromEntries([...cache.ciReads].slice(-256))}):null;
   await publish(()=>io.mkdir(dir,{recursive:true}));
-  if(cacheLoaded)await publish(()=>io.writeFile(join(dir,'bottleneck-slices.json'),JSON.stringify({version:8,entries,ciReads:Object.fromEntries([...cache.ciReads].slice(-256))})+'\n'));
-  await publish(()=>io.writeFile(join(dir,'bottleneck-report.md'),renderMarkdown(report)));
-  await publish(()=>io.appendFile(join(dir,'bottleneck-history.jsonl'),JSON.stringify(report)+'\n'));
-  await publish(()=>io.writeFile(join(dir,'bottleneck-report.json'),JSON.stringify(report,null,2)+'\n'));
+  if(safeCache)await publish(()=>io.writeFile(join(dir,'bottleneck-slices.json'),JSON.stringify(safeCache)+'\n'));
+  await publish(()=>io.writeFile(join(dir,'bottleneck-report.md'),safeMd));
+  await publish(()=>io.appendFile(join(dir,'bottleneck-history.jsonl'),JSON.stringify(safeReport)+'\n'));
+  await publish(()=>io.writeFile(join(dir,'bottleneck-report.json'),JSON.stringify(safeReport,null,2)+'\n'));
   return {at,completedAt:clock(),summary:line,truncated:report.truncated,deferredWork:report.deferredWork,cycleAt:report.cycleAt,earlyRetries:report.earlyRetries,...(truncated?{error:gaps.map(g=>g.why).join('; ')}:{})};
  } catch(e) {return {at,error:String(e?.message || e),summary:'Bottleneck report: incomplete (report IO failed)',truncated:true};}
 }
