@@ -3898,6 +3898,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ['a = default expansion', (k) => `: "\${${k}=${CLONE}/.git}"`],
       ['printf -v into element 0', (k) => `printf -v ${k}[0] %s ${CLONE}/.git`],
       ['a quoted builtin word', (k) => `"read" ${k} <<< ${CLONE}/.git`],
+      ['arithmetic outside a child shell', (k) => `echo $((${k}=1))`],
     ];
     const KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'XDG_CONFIG_HOME'];
     it.each(WRITERS.flatMap(([name, writer]) => KEYS.map((key) => ({ name, writer, key }))))(
@@ -3926,7 +3927,9 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     it('quoted message text neither triggers the check nor counts toward the name cap', () => {
       const words = Array.from({ length: 600 }, (_, i) => `w${i}`).join(' ');
       for (const command of [`gh pr comment 6262 --body "Fixed for ${words}"; git push origin HEAD:lane/x`,
-        `git commit -m "read ${words}" && git push origin HEAD:lane/x`]) {
+        `git commit -m "read ${words}" && git push origin HEAD:lane/x`,
+        // A command substitution body (the heredoc commit-message shape) runs in a child shell.
+        `git commit -m "$(cat <<'EOF'\nfor x=[1] ${words}\nEOF\n)" && git push origin HEAD:lane/x`]) {
         expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
       }
     });

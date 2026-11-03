@@ -3441,6 +3441,26 @@ function maskQuotedKeepingExpansions(s) {
   return out;
 }
 
+// `s` with every `$(…)` and backtick body blanked to spaces (same length); `$((…))` arithmetic is kept. An
+// unbalanced body is left as is, so its text still counts (the conservative direction). Linear.
+function blankCommandSubstitutions(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    let end = -1;
+    if (s[i] === '`') end = s.indexOf('`', i + 1) + 1 || -1;
+    else if (s[i] === '$' && s[i + 1] === '(' && s[i + 2] !== '(') {
+      for (let j = i + 2, depth = 1; j < s.length; j++) {
+        if (s[j] === '(') depth++;
+        else if (s[j] === ')' && --depth === 0) { end = j + 1; break; }
+      }
+    }
+    if (end < 0) { out += s[i]; continue; }
+    out += ' '.repeat(end - i);
+    i = end - 1;
+  }
+  return out;
+}
+
 // `name`'s value after one statement runs: `value` unchanged, the newly assigned text, or null (unknown).
 // `home` expands a `~`/`$HOME` in the assigned word (null = expand nothing).
 function valueAfter(stmt, name, value, home) {
@@ -5689,7 +5709,9 @@ export function decide(command, ctx = {}) {
       const unreadScript = ['source', '.'].includes(programWord(seg)) || (programWord(seg) === 'eval' && !modelled);
       // Quoted message text is data: it neither triggers the check nor counts toward the name cap. Expansions
       // inside double quotes are kept (`"${GIT_DIR:=x}"` assigns), and a quoted whole word still names a variable.
-      const masked = maskQuotedKeepingExpansions(seg);
+      // Command substitution bodies run in a child shell and cannot rebind this one (a heredoc commit message
+      // lives there), so they are blanked too; `$((…))` arithmetic runs here and is kept.
+      const masked = blankCommandSubstitutions(maskQuotedKeepingExpansions(seg));
       const quotedWords = shellWords(seg).map(unquoted).filter((w) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(w));
       // A statement with no rebinding builtin, arithmetic, subscript, descriptor or assignment rebinds nothing.
       // `quotedWords` also catches an escaped or quoted builtin word (`r\ead`, `"read"`).
