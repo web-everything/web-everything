@@ -11,6 +11,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, prepareDrainFreeze, resolveDrainFreezeSettings, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit,
 } from '../red-main-freeze-shared.mjs';
@@ -871,7 +872,10 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     let calls = 0; const waits = []; const errors = [];
     const git = timedGit(500, { exec: (_bin, _args, opts) => {
       calls++;
-      return execFileSync(process.execPath, ['-e', "process.stderr.write('Warning: SSH connection notice\\n'); setInterval(() => {}, 1000);"], opts);
+      return execFileSync(process.execPath, ['-e', keepAliveScript({
+        prelude: "process.stderr.write('Warning: SSH connection notice\\n');",
+        maxLifetimeMs: 10_000,
+      })], opts);
     } });
     const { s } = await run(() => {
       const r = readSharedFreeze({ board: dirname(m.file), branch: BRANCH, run: git }); errors.push(r); return r;
