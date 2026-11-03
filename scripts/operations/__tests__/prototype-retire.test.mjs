@@ -328,7 +328,7 @@ describe('planFetchFailed (registration whose branch could not be fetched)', () 
   const OFF = 'f'.repeat(40);
   const ZERO = '0'.repeat(40);
   const T = (n) => `2026-11-02T10:0${n}:00Z`;
-  const event = (activity_type, before, after, n) => ({ activity_type, before, after, timestamp: T(n) });
+  const event = (activity_type, before, after, n, ref = 'refs/heads/lane/gone') => ({ ref, activity_type, before, after, timestamp: T(n) });
   const merged = (head, extra = {}) => ({ number: 7, state: 'MERGED', headRefName: 'lane/gone', headRefOid: head,
     headRepository: { nameWithOwner: REPO }, isCrossRepository: false, mergeCommit: { oid: head }, ...extra });
   /** gh stub: `prs` answers `pr list`, `activity` answers the ref activity log (newest first, as GitHub returns it). */
@@ -355,7 +355,7 @@ describe('planFetchFailed (registration whose branch could not be fetched)', () 
       evidence: { refGone: true, prState: 'MERGED', mergeCommit: sha, prVia: 'head-ref', deletedTip: sha } });
     // the activity read names the exact ref and the PR read covers every state
     const api = s.calls.find((c) => c[0] === 'api');
-    expect(api[1]).toBe(`repos/${REPO}/activity?ref=refs%2Fheads%2Flane%2Fgone&per_page=10`);
+    expect(api[1]).toBe(`repos/${REPO}/activity?ref=refs%2Fheads%2Flane%2Fgone&direction=desc&per_page=10`);
     expect(s.calls.find((c) => c[0] === 'pr')[s.calls.find((c) => c[0] === 'pr').indexOf('--state') + 1]).toBe('all');
   });
   it('retires when the recorded PR number matches', () => {
@@ -384,6 +384,14 @@ describe('planFetchFailed (registration whose branch could not be fetched)', () 
     expect(run(r, stub([merged(sha)], [{ ...event('branch_deletion', sha, ZERO, 5), timestamp: 'never' }]))).toMatchObject(KEEP);
     expect(run(r, stub([merged(sha)], [event('branch_deletion', sha, ZERO, 5), event('push', OFF, sha, 5)]))).toMatchObject(KEEP);
     expect(run(r, stub([merged(sha)], [event('branch_deletion', 'short', ZERO, 5)]))).toMatchObject(KEEP);
+  });
+  it('keeps when any activity event is for another ref (a loosened server filter)', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    const foreign = event('branch_deletion', sha, ZERO, 9, 'refs/heads/lane/sibling');
+    expect(run(r, stub([merged(sha)], [foreign, ...deletedAt(OFF)]))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], [event('branch_deletion', sha, ZERO, 9, undefined), ...deletedAt(sha)].map((e, i) => (i ? e : { ...e, ref: undefined }))))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], [event('branch_deletion', sha, ZERO, 9, 'refs/heads/Lane/Gone')]))).toMatchObject(KEEP);
   });
   it('keeps when the deleted tip is not the merged PR head', () => {
     const r = withMain();

@@ -203,12 +203,15 @@ const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.t
  * The deleted branch's authoritative last tip, from GitHub's ref activity log: the NEWEST event for the ref must be
  * a `branch_deletion`, and its `before` is the tip the branch had when it was deleted. A historical PR head alone
  * proves nothing, because a registration tracks a mutable name that may have been reused (and deleted again)
- * after the PR merged. Unreadable, empty, malformed, full-page or tied-newest answers return null.
+ * after the PR merged. The request pins newest-first order, so the newest event is always in the page; unreadable,
+ * empty, malformed, foreign-ref or tied-newest answers return null.
  */
 function deletedBranchTip({ gh, repo, ref }) {
   const limit = 10;
-  const res = ghJson(gh, ['api', `repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${ref}`)}&per_page=${limit}`]);
+  const res = ghJson(gh, ['api', `repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${ref}`)}&direction=desc&per_page=${limit}`]);
   if (!res.ok || !Array.isArray(res.value) || !res.value.length) return null;
+  // Every event must be for this exact ref: a loosened or case-folded server filter could surface another branch's deletion.
+  if (res.value.some((e) => e?.ref !== `refs/heads/${ref}`)) return null;
   const events = res.value.map((e) => ({ type: e?.activity_type, before: e?.before, after: e?.after, at: Date.parse(e?.timestamp) }));
   if (events.some((e) => typeof e.type !== 'string' || !SHA.test(e.before || '') || !SHA.test(e.after || '') || !Number.isFinite(e.at))) return null;
   events.sort((a, b) => b.at - a.at);

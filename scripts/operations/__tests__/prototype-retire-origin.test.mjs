@@ -19,9 +19,9 @@ const merged = (extra = {}) => ({ number: 7, state: 'MERGED', headRefName: REF, 
   mergeCommit: { oid: MERGE }, headRepository: { nameWithOwner: REPO }, isCrossRepository: false, ...extra });
 /** The ref's activity log (newest first): created, pushed to `tip`, then deleted at `tip`. */
 const deletedAt = (tip) => [
-  { activity_type: 'branch_deletion', before: tip, after: ZERO, timestamp: '2026-11-02T11:00:00Z' },
-  { activity_type: 'push', before: OTHER, after: tip, timestamp: '2026-11-02T10:00:00Z' },
-  { activity_type: 'branch_creation', before: ZERO, after: OTHER, timestamp: '2026-11-02T09:00:00Z' },
+  { ref: `refs/heads/${REF}`, activity_type: 'branch_deletion', before: tip, after: ZERO, timestamp: '2026-11-02T11:00:00Z' },
+  { ref: `refs/heads/${REF}`, activity_type: 'push', before: OTHER, after: tip, timestamp: '2026-11-02T10:00:00Z' },
+  { ref: `refs/heads/${REF}`, activity_type: 'branch_creation', before: ZERO, after: OTHER, timestamp: '2026-11-02T09:00:00Z' },
 ];
 
 function proof(prs, row = { ref: REF }, activity = deletedAt(TIP)) {
@@ -73,7 +73,7 @@ describe.each(paths)('deleted branch with an authoritative last tip: %s', (_name
   });
 
   it('keeps when the newest ref event is not a deletion (the name was recreated)', () => {
-    const recreated = [{ activity_type: 'branch_creation', before: ZERO, after: OTHER, timestamp: '2026-11-02T12:00:00Z' }, ...deletedAt(TIP)];
+    const recreated = [{ ref: `refs/heads/${REF}`, activity_type: 'branch_creation', before: ZERO, after: OTHER, timestamp: '2026-11-02T12:00:00Z' }, ...deletedAt(TIP)];
     expect(decide(proof([merged()], { ref: REF }, recreated))).toMatchObject(KEEP);
   });
 

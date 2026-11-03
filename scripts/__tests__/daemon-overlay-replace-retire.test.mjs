@@ -283,8 +283,8 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
   const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip,
     headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false, mergeCommit: { oid: mergeOid } });
   /** The ref activity GitHub reports for a branch last deleted at `tip`. */
-  const deletedAt = (tip) => [{ activity_type: 'branch_deletion', before: tip, after: '0'.repeat(40), timestamp: '2026-11-02T11:00:00Z' },
-    { activity_type: 'push', before: '1'.repeat(40), after: tip, timestamp: '2026-11-02T10:00:00Z' }];
+  const deletedAt = (tip) => [{ ref: 'refs/heads/lane/sq', activity_type: 'branch_deletion', before: tip, after: '0'.repeat(40), timestamp: '2026-11-02T11:00:00Z' },
+    { ref: 'refs/heads/lane/sq', activity_type: 'push', before: '1'.repeat(40), after: tip, timestamp: '2026-11-02T10:00:00Z' }];
   const setup = () => {
     const f = fixture();
     const tip = f.push('lane/sq', 'a.txt', 'squashed\n');
