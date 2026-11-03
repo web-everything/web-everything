@@ -184,12 +184,12 @@ describe('renderOpenForBrief', () => {
 
   it('returns an empty string for an empty ledger or only test-pinned entries', () => {
     expect(renderOpenForBrief(emptyLedger())).toBe('');
-    expect(renderOpenForBrief(pinned())).toBe('');
+    expect(renderOpenForBrief(pinned(), { pinStillHolds: () => true })).toBe('');
   });
 
   it('omits pinned entries while retaining open ones', () => {
     const other = finding({ file: 'policy/other.md', summary: 'missing validation allows unsafe input' });
-    const brief = renderOpenForBrief(record(pinned(), [other], 'audit', H2));
+    const brief = renderOpenForBrief(record(pinned(), [other], 'audit', H2), { pinStillHolds: () => true });
     expect(brief).toContain(findingKey(other));
     expect(brief).not.toContain(findingKey(finding()));
     expect(brief).not.toContain(SUMMARY);

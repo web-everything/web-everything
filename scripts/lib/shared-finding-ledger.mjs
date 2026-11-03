@@ -15,11 +15,12 @@ export function emptyLedger() {
   return { entries: [] };
 }
 
-function matches(entry, finding) {
+function matches(entry, finding, { strict = false } = {}) {
   const identity = normalizeFindingIdentity(finding);
   const original = normalizeFindingIdentity(entry.finding);
-  return sameFindingIdentity(original, identity, { ignoreLens: true })
-    || Boolean(original?.path && identity?.path && sameFinding(
+  if (sameFindingIdentity(original, identity, { ignoreLens: true })) return true;
+  // Fuzzy similarity may MERGE reports into one entry, but never decides a suppression (a near claim is not the same defect).
+  return !strict && Boolean(original?.path && identity?.path && sameFinding(
       { ...entry.finding, file: original.path }, { ...finding, file: identity.path }));
 }
 
@@ -58,7 +59,7 @@ export function pinFinding(ledger, key, pinningTest) {
 export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
   const kept = [], dropped = [];
   for (const finding of findings) {
-    const entry = ledger.entries.find(candidate => matches(candidate, finding));
+    const entry = ledger.entries.find(candidate => matches(candidate, finding, { strict: true }));
     let proven = false;
     if (entry?.status === 'test-pinned' && entry.pinningTest && typeof pinStillHolds === 'function') {
       try { proven = pinStillHolds(structuredClone(entry)) === true; } catch { /* Retain on unknown evidence. */ }
@@ -68,8 +69,13 @@ export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
   return { kept, dropped };
 }
 
-export function renderOpenForBrief(ledger) {
-  const entries = ledger.entries.filter(entry => entry.status !== 'test-pinned');
+/** Lists open, fixed-unpinned and test-pinned entries whose pin is not currently proven (a stale pin must not hide a finding). */
+export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
+  const holds = (entry) => {
+    if (entry.status !== 'test-pinned' || typeof pinStillHolds !== 'function') return false;
+    try { return pinStillHolds(structuredClone(entry)) === true; } catch { return false; }
+  };
+  const entries = ledger.entries.filter(entry => !holds(entry));
   if (!entries.length) return '';
   const body = entries.map(entry => `key=${entry.key} sources=${entry.sources.join(',')} status=${entry.status}\n`
     + `${entry.finding.file ?? ''}:${entry.finding.line ?? ''} ${entry.finding.summary}`).join('\n\n');
@@ -79,4 +85,10 @@ export function renderOpenForBrief(ledger) {
 /** Default off; callers resolve settings and decide whether to supply ledger context. */
 export function sharedLedgerEnabled(settings, env = process.env) {
   return env.WE_SHARED_FINDING_LEDGER === 'on' || settings?.review?.sharedFindingLedger?.enabled === true;
+}
+
+/** Wrap ledger text as fenced untrusted DATA unless it already is, so a supplied brief cannot carry instructions. */
+export function fenceLedgerBrief(text) {
+  if (typeof text !== 'string' || !text.trim()) return '';
+  return text.includes('<findings>') ? text : `${FENCED_DATA_RULE}\n\n${fenceUntrusted('findings', text)}`;
 }

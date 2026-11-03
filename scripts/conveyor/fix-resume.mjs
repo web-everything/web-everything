@@ -34,6 +34,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { isLeaseStale, LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { isForeignCompletionSessionId, tryReadCompletion } from '../operations/completion-store.mjs';
+import { fenceLedgerBrief } from '../lib/shared-finding-ledger.mjs';
 
 /** Completion files are keyed by slug; a newer session's record cannot speak for this row. */
 export function priorPermissionBlock(prior, readCompletion = tryReadCompletion) {
@@ -195,7 +196,7 @@ export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, 
     'then steps 2 to 9 (step 1 is the lane above). Answer every finding below, especially any marked as raised again.',
     '',
     history || '(no round history could be read for this PR — read the newest review comments on the PR first)',
-    ...(typeof ledgerBrief === 'string' && ledgerBrief.trim() ? ['', ledgerBrief] : []),
+    ...(typeof ledgerBrief === 'string' && ledgerBrief.trim() ? ['', fenceLedgerBrief(ledgerBrief)] : []),
   ].join('\n');
 }
 
