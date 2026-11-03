@@ -10,6 +10,8 @@ import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
+import { readForceAdopt, clearForceAdopt, recordForcedAdoption } from '../daemon-force-adopt.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
@@ -659,6 +661,21 @@ export async function smokeAndAdopt({
   }
 
   const failedA = failedRows(a.smokeResult);
+  // R508 operator force-adopt: the smoke above STILL ran; its failure is recorded alongside the force, never skipped.
+  const forceReq = readForceAdopt(root, stEnv);
+  if (forceReq) {
+    const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
+    alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });
+    const lastGoodState = readRebuildState(root, stEnv).adopted;
+    const forced = await finalize(plan, undefined, undefined, a.smokeResult);
+    if (forced.moved === true || forced.readyRecorded === true) {
+      await recordForcedAdoption({
+        root, env: stEnv, request: forceReq, sha: plan.finalSha, lastGood: lastGoodState ?? { head: prevHead },
+        smoke: forceSmoke, emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
+      });
+    } else clearForceAdopt(root, stEnv);
+    return forced;
+  }
   if (a.reused) {
     await hold('smoke-reused-env-failed', failedA);
     return { moved: false, reason: 'smoke-reused-env-failed', plan, alerts: [...prepAlerts, ...alertsList] };

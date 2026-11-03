@@ -1892,6 +1892,18 @@ describe('prototype-load', () => {
       expect([...f.registrations.keys()]).toEqual(['lane/live']);
       expect(mutations(f, 'add')).toEqual([]);
     });
+    it('force-adopt (R508) is refused without a ruling id + quote and never registers or adopts anything', async () => {
+      const f = fixture({ list: [], ready: '' });
+      const r = await f.run({ forceAdopt: true });
+      expect(r).toMatchObject({ ok: false, stopReason: 'force-adopt-refused', forceAdopt: { requested: false, refused: 'no-ruling' } });
+      const r2 = await f.run({ forceAdopt: true, ruling: 'R508', quote: 'this quote is not in any ruling' });
+      expect(r2).toMatchObject({ ok: false, forceAdopt: { requested: false } });
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('declares the force-adopt operation inputs', () => {
+      const op = prototypeLoadOperation();
+      expect(Object.keys(op.input)).toEqual(expect.arrayContaining(['force-adopt', 'ruling', 'quote']));
+    });
     it('replace swaps a contained old top in one loader command, with no retained-registration stop', async () => {
       const f = fixture({ list: ['lane/old'], contained: ['lane/old'] });
       const r = await f.run({ replace: 'lane/old' });

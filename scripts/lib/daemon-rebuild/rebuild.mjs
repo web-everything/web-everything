@@ -11,13 +11,15 @@ import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { runForceWatchTick } from '../daemon-force-adopt.mjs';
+import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState } from './state.mjs';
+import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
@@ -90,6 +92,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  * @returns {Promise<object>}
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
+  const startedAtMs = Date.now();
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
@@ -112,7 +115,48 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
+  await forceWatch(options, emitEvent, startedAtMs);
   return result;
+}
+
+/** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
+ *  clone to the last-good build on a failed check or a crash loop. Never throws; the job process (readyOnly) skips it. */
+async function forceWatch(options, emitEvent, startedAtMs) {
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false } = options;
+  if (!root || readyOnly) return;
+  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  try {
+    await runForceWatchTick({
+      root, env: stEnv, notBefore: startedAtMs, emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
+      probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
+      rollback: async (lastGood) => {
+        if (!lastGood?.head) return { ok: false };
+        const git = makeGit({ run, cwd: root, env });
+        const head = verifyRev(git, 'HEAD');
+        clearReadyCandidate(root, stEnv);
+        if (head === lastGood.head) return { ok: true };
+        const fin = await withWriteLock(root, () => finalizeRebuild({
+          root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
+          plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
+        }), { now });
+        return { ok: fin.ok === true && fin.value?.adopted === true };
+      },
+    });
+  } catch { /* a watch failure never changes the rebuild outcome */ }
+}
+
+/** Default health probe: the clone's tracked tree is intact and its entry module still loads. A crash-loop signal
+ *  comes from the daemon's own restart count when the caller supplies `forceWatchProbe`. */
+function defaultForceWatchProbe(run, env) {
+  return async (root) => {
+    const status = run(['status', '--porcelain', '--untracked-files=no'], { cwd: root, env });
+    const dirty = String(status?.stdout ?? '').trim();
+    if (status?.status !== 0 || dirty) return { healthy: false };
+    try {
+      execFileSync(process.execPath, ['--input-type=module', '-e', "await import('./scripts/lib/daemon-rebuild.mjs')"], { cwd: root, timeout: 60_000, stdio: 'ignore' });
+      return { healthy: true };
+    } catch { return { healthy: false }; }
+  };
 }
 
 async function rebuildCloneInternal({
