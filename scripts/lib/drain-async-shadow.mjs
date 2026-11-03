@@ -27,6 +27,7 @@ export function summarize(lines) {
   };
 }
 
+/** WE_ASYNC_DRAIN=off|shadow defaults to off (R425); shadow collection requires explicit opt-in. */
 export function createAsyncShadow({
   env = process.env,
   mode = env.WE_ASYNC_DRAIN || 'off',
@@ -102,10 +103,13 @@ export function createAsyncShadow({
     return summary;
   };
   return {
-    observePass({ candidates, enqueuedKeys = new Set(), countMissed = true }) {
+    // null means a complete census; entries scope absence to a repo or one PR, across its heads.
+    observePass({ candidates, enqueuedKeys = new Set(), countMissed = true, scope = null }) {
       pass++;
       const seenAt = now();
       const candidateKeys = new Set(candidates.map(keyOf));
+      const scopedRepos = new Set((scope ?? []).filter(c => c.num == null).map(c => c.repo));
+      const scopedPrs = new Set((scope ?? []).filter(c => c.num != null).map(c => `${c.repo}#${c.num}`));
       for (const [key, row] of records) {
         // Freeze superseded, closed/merged, absent and expired heads BEFORE counting this pass.
         if (row.retired) {
@@ -113,12 +117,13 @@ export function createAsyncShadow({
           continue;
         }
         if (row.actualEnqueueAt != null) continue;
-        if (!candidateKeys.has(key) || seenAt - row.wouldEnqueueAt >= retentionMs) {
+        const inScope = scope == null || scopedRepos.has(row.repo) || scopedPrs.has(`${row.repo}#${row.num}`);
+        if ((inScope && !candidateKeys.has(key)) || seenAt - row.wouldEnqueueAt >= retentionMs) {
           row.retired = true;
           row.retiredAt = seenAt;
           continue;
         }
-        if (countMissed && !enqueuedKeys.has(key)) row.readyNotReached++;
+        if (countMissed && candidateKeys.has(key) && !enqueuedKeys.has(key)) row.readyNotReached++;
       }
       for (const candidate of candidates) {
         const key = keyOf(candidate);

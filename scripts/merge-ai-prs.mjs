@@ -5430,7 +5430,7 @@ async function runCli() {
         prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
         // Eligibility was just checked live. No label reads are added for telemetry.
         try {
-          asyncShadow?.observePass({ candidates: [prestageShadowCandidate] });
+          asyncShadow?.observePass({ candidates: [prestageShadowCandidate], scope: [prestageShadowCandidate] });
           shadowObserved = true;
         } catch { /* Timing only. */ }
         return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: entry.baseRefName });
@@ -6769,9 +6769,14 @@ async function runCli() {
     try {
       // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
       // A failed prestage attempt can fall through within this same sweep, not a later missed pass.
-      asyncShadow?.observePass({ countMissed: !shadowObserved, candidates: toMerge.map(c => ({
+      // Only an unfiltered, complete listing is a repo census. Other passes observe the selected PRs;
+      // absence outside those PRs (including failed/truncated listings) is not retirement evidence.
+      const shadowScope = listings.flatMap(l => l.complete && onlyPr == null && !base && !label
+        ? [{ repo: l.repo || localSlug }]
+        : (prsByRepo.get(l.repo) || []).map(p => ({ repo: l.repo || localSlug, num: p.number })));
+      asyncShadow?.observePass({ scope: shadowScope, countMissed: !shadowObserved, candidates: toMerge.map(c => ({
         repo: c.repo || localSlug, num: c.num, headSha: c.headSha,
-        readyAtMs: readyInfoMemo.has(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`) ? readyInfoOf(c).readyAtMs : null,
+        readyAtMs: readyInfoMemo.get(`${c.repo || localSlug}#${c.num}@${c.listedHeadSha || c.headSha || null}`)?.readyAtMs ?? null,
       })) });
     } catch { /* Timing observations never affect enqueue decisions. */ }
   }

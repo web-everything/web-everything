@@ -13,6 +13,41 @@ const key = c => `${c.repo}#${c.num}@${c.headSha}`;
 afterEach(() => { for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('async drain shadow measurement', () => {
+  it('scoped observations preserve unrelated pending PRs and repositories across invocations', () => {
+    const dir = temp();
+    const other = { ...candidate, num: 8 };
+    const otherRepo = { ...candidate, repo: 'owner/other' };
+    createAsyncShadow({ mode: 'shadow', dir, now: () => 100 })
+      .observePass({ candidates: [candidate, other, otherRepo] });
+    const scoped = createAsyncShadow({ mode: 'shadow', dir, now: () => 200 });
+    scoped.observePass({ candidates: [], scope: [candidate] });
+    const resumed = createAsyncShadow({ mode: 'shadow', dir, now: () => 300 });
+    resumed.recordActual(other);
+    resumed.recordActual(otherRepo);
+    expect(lines(join(dir, 'shadow.jsonl')).map(row => key(row))).toEqual([key(other), key(otherRepo)]);
+    const rows = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records;
+    expect(rows.find(row => key(row) === key(candidate)).retired).toBe(true);
+    expect(rows.find(row => key(row) === key(other)).readyNotReached).toBe(0);
+  });
+
+  it('a scoped replacement retires the old head while a repo census retires only that repo', () => {
+    const dir = temp();
+    const other = { ...candidate, repo: 'owner/other' };
+    const sameRepo = { ...candidate, num: 9 };
+    const shadow = createAsyncShadow({ mode: 'shadow', dir, now: () => 100 });
+    shadow.observePass({ candidates: [candidate, other, sameRepo] });
+    const next = { ...candidate, headSha: 'head-b' };
+    shadow.observePass({ candidates: [next], scope: [next] });
+    shadow.recordActual(candidate);
+    shadow.recordActual(next);
+    shadow.observePass({ candidates: [], scope: [{ repo: candidate.repo }] });
+    shadow.recordActual(sameRepo);
+    shadow.recordActual(other);
+    expect(lines(join(dir, 'shadow.jsonl')).map(row => key(row))).toEqual([key(next), key(other)]);
+    const rows = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records;
+    expect(rows.find(row => row.num === 9)).toMatchObject({ retired: true, readyNotReached: 0 });
+  });
+
   it('retires superseded and absent heads so two empty passes freeze head A after head B enqueues', () => {
     const dir = temp();
     const shadow = createAsyncShadow({ mode: 'shadow', dir, now: () => 100 });

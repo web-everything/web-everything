@@ -12,6 +12,7 @@ import { fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { createPrestageCache, resolvePrestageSettings, enqueuePrestage } from '../lib/drain-prestage.mjs';
 import { buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
+import { createAsyncShadow } from '../lib/drain-async-shadow.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
@@ -103,6 +104,49 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
 }
 
 describe('real drain pre-stage path', () => {
+  it.each([false, true])('scoped green-event observation preserves unrelated pending heads (prestage: %s)', green => world(({pr,run,coord,slug}) => {
+    if (green) expect(run().stderr).toContain('eligible=true');
+    const dir = join(coord, 'drain-async-shadow');
+    const target = { repo: slug, num: 42, headSha: sha };
+    const other = { ...target, num: 43 };
+    const firstAt = Date.now() - 1000;
+    createAsyncShadow({ mode: 'shadow', dir, now: () => firstAt }).observePass({ candidates: [target, other] });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { shadowMode:'shadow' });
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+    expect(next.report.prestaged === true).toBe(green);
+    const pending = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).records.find(row => row.num === 43);
+    expect(pending.retired).not.toBe(true);
+    expect(pending.readyNotReached).toBe(0);
+    createAsyncShadow({ mode: 'shadow', dir }).recordActual(other);
+    const rows = readFileSync(join(dir, 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows.map(row => row.num)).toEqual([42, 43]);
+    expect(rows.every(row => row.wouldEnqueueAt === firstAt)).toBe(true);
+  }));
+
+  it('shadow adds zero gh calls for a dependency-held candidate absent from ready ordering', async () => {
+    const traces = [];
+    for (const shadowMode of ['off', 'shadow']) {
+      await world(({pr,run,coord}) => {
+        pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+        pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({ item:'xabc123', repos:[{repo:'we',ref:pr.headRefName}], blockedBy:['xdef456'],stackParents:[] }) + '\n```\n<!-- lane-manifest:end -->';
+        const next = run(false, { shadowMode });
+        expect(next.report.toMerge).toMatchObject([{num:42}]);
+        expect(next.report.deferred).toMatchObject([{num:42,waitOn:['xdef456']}]);
+        expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+        const ghCalls = next.calls.filter(a => a[0] !== 'git');
+        expect(ghCalls.some(a => a.some(x => /issues\/42\/events/.test(x)))).toBe(false);
+        // Independent reads run concurrently; compare the exact call multiset, including duplicates.
+        traces.push(ghCalls.map(a => JSON.stringify(a)).sort());
+        if (shadowMode === 'shadow') {
+          const rows = JSON.parse(readFileSync(join(coord, 'drain-async-shadow', 'state.json'), 'utf8')).records;
+          expect(rows).toMatchObject([{num:42,actualEnqueueAt:null}]);
+        }
+      });
+    }
+    expect(traces[1]).toEqual(traces[0]);
+  });
+
   it('a drain run with json=true and WE_ASYNC_DRAIN=shadow writes rows with unchanged stdout', () => world(({pr,run,coord}) => {
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = run(false, { shadowMode:'shadow' });
