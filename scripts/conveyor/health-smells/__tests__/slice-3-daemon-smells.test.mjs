@@ -295,7 +295,7 @@ describe('probeDrainHistory', () => {
     expect(out.length).toBeGreaterThan(0);
     // trimmed to the window, plus at most ONE older pass (the last pass, which `drain-landed-nothing` needs after a stoppage)
     expect(out.filter((p) => p.at < NOW - 7 * HOUR).length).toBeLessThanOrEqual(1);
-    expect(Object.keys(out[out.length - 1]).sort()).toEqual(['at', 'considered', 'deferred', 'deferredDetail', 'exit', 'failed', 'merged', 'ms', 'skippedPrs', 'valid']);
+    expect(Object.keys(out[out.length - 1]).sort()).toEqual(['at', 'clean', 'considered', 'deferred', 'deferredDetail', 'exit', 'failed', 'failedRepos', 'merged', 'ms', 'skippedPrs', 'valid']);
   });
 
   it('no file → null (no drain on this host), not an empty history', () => {

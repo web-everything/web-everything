@@ -114,4 +114,9 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     const h = [{ at: now - 45 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 0, merged: 0, exit: 0, failed: 0, failedRepos: 1 }];
     expect(smell.evaluate({ drainHistory: h }, { now })[0].breach).toBe(true);
   });
+  it('a pass the probe marked not clean (unreadable failure counters) is not recovery', () => {
+    const now = T0 + 60 * MIN;
+    const h = [{ at: now - 45 * MIN, considered: 4, merged: 0 }, { at: now - 1 * MIN, considered: 0, merged: 0, exit: 0, failed: 0, clean: false }];
+    expect(smell.evaluate({ drainHistory: h }, { now })[0].breach).toBe(true);
+  });
 });

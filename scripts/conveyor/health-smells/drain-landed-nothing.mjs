@@ -12,7 +12,7 @@ const MIN = 60 * 1000;
 
 /** PURE: the stall over the last `windowMs`, or null when the drain landed something / had nothing queued / is not covered. */
 /** A pass that proves the drain recovered: it merged something, or it cleanly (exit 0, nothing failed) found nothing queued. */
-const isRecovery = (p) => (Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && p.exit === 0 && !(Number(p.failed) > 0) && !(Number(p.failedRepos) > 0));
+const isRecovery = (p) => (Number(p.merged) || 0) > 0 || ((Number(p.considered) || 0) === 0 && (p.clean ?? (p.exit === 0 && !(Number(p.failed) > 0) && !(Number(p.failedRepos) > 0))) === true); // `clean` (the probe's strict read) wins: unreadable failure counters are never clean
 /** A pass that had queued PRs and landed none. Failed zero-count passes are neither this nor recovery: they are ignored. */
 const isStalled = (p) => (Number(p.considered) || 0) > 0 && (Number(p.merged) || 0) === 0;
 
