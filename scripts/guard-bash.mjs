@@ -4996,7 +4996,7 @@ export function decide(command, ctx = {}) {
     // comments rather than assume a later assignment or unset ran. File-descriptor redirections
     // (`2>&1`, `&>`) are not control flow.
     const controlText = whole.replace(/\d*[<>]&\d*-?|&>>?/g, ' ');
-    const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case|select|function)\b|(?:^|[\s;])[{}!#]|\(\s*\)/.test(controlText);
+    const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case|select|function|enable)\b|(?:^|[\s;])[{}!#]|\(\s*\)/.test(controlText);
     const setAssignment = (key, value, readonly = false, conditional = false) => {
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
       if (conditional || !canUnset || maybeReadonly.has(key)) {
@@ -5069,6 +5069,15 @@ export function decide(command, ctx = {}) {
       }
       const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
       const canonicalWords = shellTokens(canonicalCommand(seg)).filter((t) => !t.op).map((t) => t.text);
+      // A failed redirection skips the builtin, and an unknown option makes it refuse: either way its
+      // assignment or unset may not run, so it only adds a possible value.
+      const redirected = shellTokens(seg).some((t) => t.op && /[<>]/.test(t.text));
+      const knownOptions = { export: /^-[fnp]+$/, readonly: /^-[aAfp]+$/, declare: /^[-+][aAfFgilnrtuxIp]+$/,
+        typeset: /^[-+][aAfFgilnrtuxIp]+$/ }[canonicalWords[0]];
+      const optionEnd = canonicalWords.indexOf('--');
+      const badOption = !!knownOptions && canonicalWords.slice(1, optionEnd < 0 ? undefined : optionEnd)
+        .some((t) => /^[-+]./.test(t) && !knownOptions.test(t));
+      const uncertain = redirected || badOption;
       if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
         let variables = true;
         let options = true;
@@ -5082,7 +5091,7 @@ export function decide(command, ctx = {}) {
           names.push(word);
         }
         if (variables) for (const name of names) {
-          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) setAssignment(name, undefined);
+          if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) setAssignment(name, undefined, false, uncertain);
         }
       }
       const directive = !seg.trim().startsWith('(')
@@ -5093,9 +5102,9 @@ export function decide(command, ctx = {}) {
         const assignments = directive ? [...gitLeadingAssignments(seg).map((m) => m[0]), ...canonicalWords] : words;
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
-          if (m) setAssignment(m[1], m[2], readonly);
+          if (m) setAssignment(m[1], m[2], readonly, uncertain);
           else if (readonly && word !== canonicalWords[0] && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) {
-            setAssignment(word, gitConfigEnv[word], true);
+            setAssignment(word, gitConfigEnv[word], true, uncertain);
           }
         }
       }

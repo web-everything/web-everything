@@ -3780,7 +3780,16 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       // Quote-split keywords hide the condition from the calling scope; the eval script still sees it.
       `eval "i""f true\nth""en\nreadonly GIT_DIR=${CLONE}/.git\nf""i"\nexport GIT_DIR=${LANE}/.git\ngit reset --hard`,
       `eval "i""f true\nth""en\nreadonly GIT_DIR=${CLONE}/.git\nf""i"\nunset GIT_DIR\ngit reset --hard`,
+      // A failed redirection skips the builtin; an unknown option makes it refuse; `enable -n` disables it.
+      `export GIT_DIR=${CLONE}/.git; export GIT_DIR=${LANE}/.git >/nonexistent/d/f; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; unset GIT_DIR 2>/nonexistent/d/f; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; export -Q GIT_DIR=${LANE}/.git; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; declare -Qx GIT_DIR=${LANE}/.git; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; readonly -Q GIT_DIR=${LANE}/.git; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; enable -n export; export GIT_DIR=${LANE}/.git; git reset --hard`,
     ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+    // Known options and no redirection still replace the earlier value.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
   });
 
   it('ALLOWS an unconditional reassignment after a file-descriptor redirection', () => {
