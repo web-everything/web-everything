@@ -49,6 +49,8 @@ export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 export const PUBLISH_ATTEMPTS = 4;
 /** Per-git-call ceiling: a hung fetch/push FAILS (writer: reported + exit 1; reader: `{error}`, fail closed). */
 export const GIT_TIMEOUT_MS = 20_000;
+/** A timed-out freeze READ is retried once with this many times the bound. */
+const READ_RETRY_FACTOR = 4;
 /** Captured git output cap: the freeze doc is a few hundred bytes; anything near this is not our file (fail). */
 const GIT_MAX_BUFFER = 4 * 1024 * 1024;
 
@@ -223,11 +225,16 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
  * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
  */
-export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = timedGit() } = {}) {
+export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run, runFor = (ms) => timedGit(ms) } = {}) {
   const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
+  const isTimeout = (e) => e?.code === 'ETIMEDOUT' || /ETIMEDOUT|timed out/i.test(String(e?.message || ''));
+  const attempt = (r) => readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run: r })[SHARED_FREEZE_FILE];
   let text;
-  try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
-  catch (e) { return { source, error: flatText(`branch unreadable: ${String(e?.stderr || e?.message || e).trim()}`) }; }
+  try {
+    // A loaded host (EMERGENCY-1: load ~25) can push a plain fetch past the per-call bound: retry ONCE with a longer bound before failing closed.
+    try { text = attempt(run ?? runFor(GIT_TIMEOUT_MS)); }
+    catch (e) { if (!isTimeout(e)) throw e; text = attempt(run ?? runFor(GIT_TIMEOUT_MS * READ_RETRY_FACTOR)); }
+  } catch (e) { return { source, error: flatText(`branch unreadable: ${String(e?.stderr || e?.message || e).trim()}`) }; }
   if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   let doc;
   try { doc = JSON.parse(text); } catch { return { source, error: flatText(`${SHARED_FREEZE_FILE} is not JSON`) }; }
@@ -295,6 +302,8 @@ export function drainFreezeSignal({ state, mainRedState, priority, now, holdOn =
   const signal = redMainSignal({ mainRedState: holdOn ? mainRedState : null, priority: holdOn ? priority : null, manualFreeze: state.manual || stopAll ? { reason: state.reason } : null, now });
   if (state.auto && holdOn && !stopAll) { signal.red = true; signal.sources.push('local-auto'); }
   if (stopAll) signal.fixPrs = [];
+  // An unreadable freeze is NOT a manual freeze and NOT a red main: it gets its own source so the hold reason says so (and alerts).
+  if (state.error && !state.manual && state.local == null && signal.sources.includes('manual')) signal.sources = signal.sources.map(x => (x === 'manual' ? 'freeze-unreadable' : x));
   return signal;
 }
 
