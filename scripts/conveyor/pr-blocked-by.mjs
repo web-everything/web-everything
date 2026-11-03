@@ -1,7 +1,7 @@
 /** R437: report-only PR dependency edges. All text is untrusted Markdown; no IO. */
 import MarkdownIt from 'markdown-it';
 const markdown = new MarkdownIt();
-export function parseBlockedBy(text) {
+function dependencyText(text) {
   // Block tokens account for indentation, nesting and lazy blockquote continuation;
   // a line-prefix filter cannot tell quoted example text from an active dependency.
   const paragraphs = [];
@@ -25,8 +25,20 @@ export function parseBlockedBy(text) {
     cursor = run.index + run[0].length;
   }
   if (delimiter === null) clean += plain.slice(cursor);
-  return [...new Set([...clean.matchAll(/\b(?:blocked[ \t]+by|depends[ \t]+on|waits[ \t]+on|waiting[ \t]+on)[ \t]+#([1-9]\d*)\b/gi)]
+  return clean;
+}
+export function parseBlockedBy(text) {
+  return [...new Set([...dependencyText(text).matchAll(/\b(?:blocked[ \t]+by|depends[ \t]+on|waits[ \t]+on|waiting[ \t]+on)[ \t]+#([1-9]\d*)\b/gi)]
     .map(m => Number(m[1])).filter(Number.isSafeInteger))];
+}
+/** Explicit reverse declarations belong to the PR body, never comments or daemon logs. */
+export function parseUnblocks(text) {
+  const refs = [];
+  for (const line of dependencyText(text).split('\n')) {
+    const list = line.match(/^[ \t]*unblocks(?:[ \t]*:[ \t]*|[ \t]+)(#[1-9]\d*(?:[ \t,]+#[1-9]\d*)*)\b/i)?.[1];
+    if (list) refs.push(...[...list.matchAll(/#([1-9]\d*)/g)].map(m => Number(m[1])).filter(Number.isSafeInteger));
+  }
+  return [...new Set(refs)];
 }
 /** Inputs are the current open-PR listing for ONE repository (state may be omitted).
  * Textual references alone never confirm a live blocker; closed, merged and absent targets do not block.
@@ -42,6 +54,13 @@ export function buildBlockedMap(prs) {
     const refs = [...new Set(texts.flatMap(parseBlockedBy))].filter(n => n !== number && openNumbers.has(n));
     blockedBy.set(number, refs);
     for (const n of refs) unblocks.set(n, [...new Set([...(unblocks.get(n) ?? []), number])]);
+  }
+  for (const pr of openPrs) {
+    const number = Number(pr.number ?? pr.pr);
+    for (const target of parseUnblocks(pr.body).filter(n => n !== number && openNumbers.has(n))) {
+      blockedBy.set(target, [...new Set([...blockedBy.get(target), number])]);
+      unblocks.set(number, [...new Set([...(unblocks.get(number) ?? []), target])]);
+    }
   }
   return { blockedBy, unblocks };
 }

@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest';
-import { parseBlockedBy, buildBlockedMap, sortUnblockersFirst } from '../pr-blocked-by.mjs';
+import { parseBlockedBy, parseUnblocks, buildBlockedMap, sortUnblockersFirst } from '../pr-blocked-by.mjs';
 it('parses all four dependency phrases, case-insensitively and deduplicates', () => {
   expect(parseBlockedBy('Blocked by #6244; DEPENDS ON #2; waits on #3; waiting on #4; blocked by #2')).toEqual([6244, 2, 3, 4]);
 });
@@ -44,4 +44,24 @@ it('R437 ignores lazy blockquote continuation lines throughout the quoted paragr
 });
 it('R437 resumes dependency parsing after a blockquote paragraph ends', () => {
   expect(parseBlockedBy('> example\n\nblocked by #6244')).toEqual([6244]);
+});
+
+it('parses line-based Unblocks lists, deduplicates and rejects unsafe PR numbers', () => {
+  expect(parseUnblocks('Unblocks: #6193, #7 #8\nUNBLOCKS #7\nprose Unblocks #9\nUnblocks: #0 #9007199254740992')).toEqual([6193, 7, 8]);
+});
+it('excludes quoted, fenced, indented and inline Unblocks examples including lazy continuations', () => {
+  expect(parseUnblocks('> example\nUnblocks #1\n\n```md\nUnblocks #2\n```\n\n    Unblocks #3\n\n`Unblocks #4`\nUnblocks `#5`\nUnblocks: #6')).toEqual([6]);
+  expect(parseUnblocks('`example\nUnblocks #7')).toEqual([]);
+});
+it('builds body-only Unblocks edges for open targets, merges both directions and sorts the unblocker first', () => {
+  const prs = [{ number: 6193, body: 'blocked by #6244' },
+    { number: 6244, body: 'Unblocks: #6193, #7 #6244 #8 #9', comments: [{ body: 'Unblocks #10' }], refusalReason: 'Unblocks #10' },
+    { number: 7 }, { number: 8, state: 'CLOSED' }, { number: 10 }];
+  const map = buildBlockedMap(prs);
+  expect(map.blockedBy.get(6193)).toEqual([6244]);
+  expect(map.blockedBy.get(7)).toEqual([6244]);
+  expect(map.blockedBy.get(6244)).toEqual([]);
+  expect(map.blockedBy.get(10)).toEqual([]);
+  expect(map.unblocks.get(6244)).toEqual([6193, 7]);
+  expect(sortUnblockersFirst(prs.map(p => ({ ...p, unblocks: map.unblocks.get(p.number) } )))[0].number).toBe(6244);
 });

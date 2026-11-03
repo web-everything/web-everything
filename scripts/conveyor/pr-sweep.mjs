@@ -28,7 +28,7 @@ const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
 const command = async (bin, args, env) => (await exec(bin, args, { env, encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })).stdout;
-const DEFAULTS = { alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
+const DEFAULTS = { toolingDeadlineMinutes: 240, alertBackoffMinutes: [30, 60, 120, 240], deadlineMinutes: DEADLINE_MINUTES, enabled: true, intervalMinutes: 30, idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90, sessionActiveWithinMinutes: 30, dispatchDiagnosis: false, repos: [CONSTELLATION_REPOS.we.slug, CONSTELLATION_REPOS['plateau-app'].slug] };
 export function resolvePrSweepSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
   const errors = []; let tool = {};
   try { tool = JSON.parse(read(join(ROOT, 'scripts/settings/pr-sweep.json'), 'utf8')).prSweep; } catch (e) { errors.push(`settings: ${e.message}`); }
@@ -184,7 +184,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     const key = prKey(p), fingerprint = stateFingerprint(p), old = previous?.invariantClocks?.[key];
     const since = stateSince(p, old?.fingerprint === fingerprint ? old.since : now, now);
     clocks[key] = { fingerprint, since };
-    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, ...dependencies.get(key) }) };
+    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, ...dependencies.get(key), daemons: signals?.[key]?.daemons ?? [] }) };
   }));
   const annotate = item => {
     const decision = decisions.find(p => p.repo === item.repo && p.number === item.pr);

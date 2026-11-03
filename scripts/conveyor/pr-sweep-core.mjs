@@ -82,8 +82,32 @@ export function repeatDue(record, now, backoff) {
   return Array.isArray(backoff) && backoff.length > 0 && Number.isFinite(record?.lastAlertAt)
     && now - record.lastAlertAt >= backoff[Math.min(Math.max(0, (record.alertCount ?? 1) - 1), backoff.length - 1)] * 60000;
 }
+/** Compare full reasons before shortening for display: different long failures stay distinct. */
+function repeatedToolingRefusal(daemons) {
+  const counts = new Map();
+  for (const entry of daemons) {
+    if (entry.kind !== 'refusal' || !['fix-dispatch-daemon', 'reconcile-fix-dispatch-daemon'].includes(entry.name)
+      || typeof entry.reason !== 'string') continue;
+    const reason = entry.reason
+      .replace(/\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?\b/g, '')
+      .replace(/^.*?\brefused\b[^\n]*?\s[—–]\s/, '')
+      .replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|“[^”]*”|‘[^’]*’|`[^`]*`/g, '')
+      .replace(/\d+/g, '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!/[a-z]/i.test(reason)) continue;
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+    if (counts.get(reason) >= 2) return reason.length > 80 ? `${reason.slice(0, 79)}…` : reason;
+  }
+  return null;
+}
 /** PURE: one owner, action, deadline and violation for every open PR. */
-export function evaluateInvariant(pr, owner = {}, { now, since = now, settings = {}, blockedBy = [] } = {}) {
+export function evaluateInvariant(pr, owner = {}, { now, since = now, settings = {}, blockedBy = [], daemons = [] } = {}) {
+  const toolingReason = !blockedBy.length && pr.changedFiles !== 0 ? repeatedToolingRefusal(daemons) : null;
+  if (toolingReason) {
+    const state = `blocked-by-tooling (${toolingReason})`;
+    return { owner: 'tooling', state, violation: state, nextAction: `fix tooling: ${toolingReason}`,
+      deadline: new Date(stateSince(pr, since, now) + (settings.toolingDeadlineMinutes ?? 240) * 60000).toISOString() };
+  }
   const labels = labelNames(pr);
   const unreadable = !labels || labels.some(l => typeof l !== 'string');
   let nextAction = unreadable ? 'inspect unreadable labels' : !labels.length ? 'label'

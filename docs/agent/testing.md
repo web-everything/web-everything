@@ -3862,3 +3862,12 @@ With independent PR/detector reads succeeding, the disabled producers allow comp
 passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
 The tests also require the detector digest to remain enabled, excluding disable-time
 clearing as a false-positive proof of detector completeness.
+
+R437 follow-up: `Unblocks: #N` (or `Unblocks #A, #B`) creates reverse dependencies
+only from PR bodies, using the same Markdown exclusions and confirmed-open targets.
+Two matching fix-dispatch refusal entries produce `blocked-by-tooling`, with a tooling
+owner and repair action. Compare full reasons after removing quoted values, timestamps
+and digits; truncate only the displayed reason to 80 characters. Explicit blockers and
+empty-diff closure keep precedence. `prSweep.toolingDeadlineMinutes` defaults to 240
+through the existing policy cascade and provenance logger. The added soak replay retains
+the original four incident cases and exercises body-only reverse edges and tooling precedence.

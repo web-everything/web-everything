@@ -31,6 +31,23 @@ export default {
     if (rows[0]?.number !== 6244 || !rows[0]?.unblocks?.includes(6193)) violations.push('blocker does not sort first / lacks unblocks #6193');
     if (!rows.find(p => p.number === 6193)?.nextAction?.includes('blocked-by #6244')) violations.push('blocked-by #6244 missing');
     if (rows.find(p => p.number === 6268)?.nextAction !== 'close into card') violations.push('empty diff not closed into card');
+    // Additional replay: body-only reverse dependency and repeated fix-tool refusal.
+    const refusal = value => ({ name: 'fix-dispatch-daemon', kind: 'refusal', at: now,
+      reason: `dispatch-lane: the value for {{SCOPE}} ("${value}") has characters the brief cannot carry safely. Refusing.` });
+    const added = await runPrSweep({ now, dryRun: true, env: {}, config: {},
+      settings: { value: { repos: [repo], idleMinutes: 45, stuckAlertMinutes: 90, toolingDeadlineMinutes: 240 }, sources: {} },
+      detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }),
+      readPrs: () => [{ ...base, number: 6193, labels: ['status:fixing'] },
+        { ...base, number: 6244, body: 'Unblocks: #6193', labels: ['review:pending'] },
+        { ...base, number: 6270, labels: ['status:fixing'] }],
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => ({}),
+      readSignals: () => Object.fromEntries([6193, 6270].map(n => [`${repo}#${n}`, { daemons: [refusal('a1'), refusal('b2')] }])) });
+    if (added.decisions[0]?.number !== 6244 || !added.decisions[0]?.unblocks.includes(6193)) violations.push('body Unblocks missing');
+    if (added.decisions.find(p => p.number === 6193)?.violation !== 'waiting-on-blocked') violations.push('explicit blocker must win over tooling');
+    const tooling = added.decisions.find(p => p.number === 6270);
+    if (tooling?.owner !== 'tooling' || !tooling?.violation?.startsWith('blocked-by-tooling (')
+      || tooling?.state !== tooling?.violation || !tooling?.nextAction?.startsWith('fix tooling: ')
+      || tooling?.deadline !== new Date(now + 240 * 60000).toISOString()) violations.push('repeated tooling refusal missing');
     return { violations };
   },
   judge(report) { return report.violations; },

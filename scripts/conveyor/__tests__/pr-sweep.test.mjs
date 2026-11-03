@@ -544,3 +544,81 @@ describe('R437 sanctioned dependency comment discovery', () => {
     expect(calls).toBe(1);
   });
 });
+
+const refusalLine = (value, digit = 1) => `reconcile-fix-dispatch-daemon: refused dispatch-failed ${pr.repo} PR #12 — dispatch-lane: the value for {{SCOPE}} ("${value}") has characters the brief cannot carry safely ${digit} Refusing.`;
+const toolingSweep = (daemons, rows = [pr], extra = {}) => runPrSweep({ now, dryRun: true, env: {}, config: {},
+  settings: { value: { ...settings, toolingDeadlineMinutes: 240 }, sources: {} }, readPrs: () => rows,
+  readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => ({}),
+  readSignals: () => ({ [`${pr.repo}#12`]: { daemons } }),
+  detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }), ...extra });
+const fixRefusal = (reason, extra = {}) => ({ name: 'fix-dispatch-daemon', kind: 'refusal', at: now, reason, ...extra });
+it('classifies two matching fix refusals as tooling after stripping quoted values, digits and timestamps', async () => {
+  const logs = [1, 2].map(n => `${new Date(now - n * 60000).toISOString()} ${refusalLine(`scope-${n}`, n)}`).join('\n');
+  const out = await toolingSweep([], [pr], { readSignals: args => collectOwnerSignals({ ...args, readAgents: () => [],
+    cloneRoots: () => [join(tmpdir(), 'fix-clone')], listLogs: () => ['fix-dispatch-daemon.log'], readTail: () => logs, readHealth: () => ({}) }) });
+  expect(out.errors).toEqual([]);
+  const row = out.decisions[0];
+  expect(row.owner).toBe('tooling');
+  expect(row.violation).toMatch(/^blocked-by-tooling \(.+\)$/);
+  expect(row.state).toBe(row.violation);
+  const reason = row.violation.slice('blocked-by-tooling ('.length, -1);
+  expect(reason.length).toBeLessThanOrEqual(80);
+  expect(reason).toContain('dispatch-lane');
+  expect(reason).not.toContain('scope-');
+  expect(row.nextAction).toBe(`fix tooling: ${reason}`);
+  expect(row.deadline).toBe(new Date(now + 240 * 60000).toISOString());
+});
+it.each([
+  ['single', [fixRefusal(refusalLine('a'))]],
+  ['different', [fixRefusal('first failure'), fixRefusal('second failure')]],
+  ['review daemon', [fixRefusal('failure', { name: 'review-daemon' }), fixRefusal('failure', { name: 'review-daemon' })]],
+  ['diagnostic', [fixRefusal('failure', { kind: 'diagnostic' }), fixRefusal('failure')]],
+  ['missing reason', [fixRefusal(undefined), fixRefusal(undefined)]],
+  ['empty normalisation', [fixRefusal('"a" 123'), fixRefusal('"b" 456')]],
+])('does not infer tooling from %s evidence', async (_name, daemons) => {
+  expect((await toolingSweep(daemons)).decisions[0].owner).not.toBe('tooling');
+});
+it('bounds oversized refusal reasons and gives an operator-visible tooling action', async () => {
+  const out = await toolingSweep([fixRefusal('failure ' + 'x'.repeat(5000)), fixRefusal('failure ' + 'x'.repeat(5000))]);
+  expect(out.decisions[0].nextAction).toMatch(/^fix tooling: /);
+  expect(out.decisions[0].nextAction.length).toBeLessThanOrEqual(93);
+});
+it('keeps long refusal reasons distinct when their first 80 normalized characters match', async () => {
+  const prefix = 'failure ' + 'x'.repeat(80);
+  const out = await toolingSweep([fixRefusal(`${prefix} alpha`), fixRefusal(`${prefix} beta`)]);
+  expect(out.errors).toEqual([]);
+  const row = out.decisions[0];
+  expect(row.owner).not.toBe('tooling');
+  expect(row.violation ?? '').not.toContain('blocked-by-tooling');
+  expect(row.nextAction).toBe('fix');
+});
+it('keeps empty-diff closure ahead of tooling with two matching fix refusals', async () => {
+  const out = await toolingSweep([fixRefusal('failure'), fixRefusal('failure')], [{ ...pr, changedFiles: 0 }]);
+  expect(out.errors).toEqual([]);
+  expect(out.decisions[0]).toMatchObject({
+    violation: 'empty-diff', nextAction: 'close into card',
+    deadline: new Date(now + 45 * 60000).toISOString(),
+  });
+  expect(out.decisions[0].owner).not.toBe('tooling');
+});
+it('body Unblocks makes the explicit blocker win over repeated tooling refusals', async () => {
+  const out = await toolingSweep([fixRefusal('failure'), fixRefusal('failure')], [pr, { ...pr, number: 6244, body: 'Unblocks: #12' }]);
+  expect(out.decisions[0]).toMatchObject({ number: 6244, unblocks: [12] });
+  expect(out.decisions[1]).toMatchObject({ blockedBy: [6244], violation: 'waiting-on-blocked', nextAction: 'blocked-by #6244' });
+  expect(out.decisions[1].owner).not.toBe('tooling');
+});
+it('tooling deadline resolves and logs cascade provenance and rejects invalid overrides', async () => {
+  const { resolvePrSweepSettings } = await import('../pr-sweep.mjs');
+  const lines = [];
+  const tool = resolvePrSweepSettings({ env: {}, log: line => lines.push(line) });
+  expect(tool.value.toolingDeadlineMinutes).toBe(240);
+  expect(tool.sources.toolingDeadlineMinutes).toBe('tool');
+  expect(lines.join(' ')).toContain('toolingDeadlineMinutes');
+  const env = resolvePrSweepSettings({ env: { WE_PR_SWEEP_TOOLING_DEADLINE_MINUTES: '137' }, log: () => {} });
+  expect(env.value.toolingDeadlineMinutes).toBe(137);
+  expect(env.sources.toolingDeadlineMinutes).toBe('env');
+  const out = await toolingSweep([fixRefusal('failure'), fixRefusal('failure')], [pr], { settings: env });
+  expect(out.decisions[0].deadline).toBe(new Date(now + 137 * 60000).toISOString());
+  const invalid = resolvePrSweepSettings({ env: { WE_PR_SWEEP_TOOLING_DEADLINE_MINUTES: '0' }, log: () => {} });
+  expect(invalid.errors.join(' ')).toContain('toolingDeadlineMinutes');
+});
