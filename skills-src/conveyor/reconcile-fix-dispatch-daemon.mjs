@@ -69,7 +69,7 @@ import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projectio
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
 import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
-import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
@@ -756,15 +756,15 @@ export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThr
  * Default live probe for claims and sessions: `claim:<repo>:<pr>` for every live fix/ci-heal claim, and
  * `agent:<id>` for every live agent session (the planner's liveness gate reads these).
  */
-export function readPlanClaims({ readAgents = () => defaultReadAgents() } = {}) {
+export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()) } = {}) {
   const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
   const agents = readAgents();
   if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
-  // Identity, working directory (the lane binding) and, for lane-bound or non-interactive sessions, activity state:
+  // Identity, working directory (the lane binding) and, for lane-bound or non-interactive sessions, activity state and lane HEAD (what the planner binds sessions to PRs by):
   // any of those changing means the planner's liveness reading would differ.
   for (const a of agents) {
     const laneBound = a?.kind !== 'interactive' || /[\\/]\.lanes[\\/]/.test(String(a?.cwd ?? ''));
-    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${a?.cwd ?? ''}${laneBound ? `:${a?.status ?? ''}` : ''}`);
+    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${a?.cwd ?? ''}${laneBound ? `:${a?.status ?? ''}:${a?.laneHeadOid ?? ''}` : ''}`);
   }
   return out;
 }

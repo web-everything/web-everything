@@ -1928,6 +1928,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const lane = (status, cwd = '/w/.lanes/web-everything/lane-1') => ({ sessionId: 's1', kind: 'background', cwd, status });
     expect(probe([lane('idle')])).not.toEqual(probe([lane('busy')]));
     expect(probe([lane('idle')])).not.toEqual(probe([lane('idle', '/w/.lanes/web-everything/lane-2')]));
+    expect(probe([{ ...lane('busy'), laneHeadOid: 'a' }])).not.toEqual(probe([{ ...lane('busy'), laneHeadOid: 'b' }]));
     const chat = (status) => ({ sessionId: 's2', kind: 'interactive', cwd: '/w/main', status });
     expect(probe([chat('idle')])).toEqual(probe([chat('busy')]));
     expect(() => readPlanClaims({ readAgents: () => null })).toThrow(/unreadable/);
