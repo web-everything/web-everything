@@ -64,7 +64,7 @@ import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mj
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
-import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -921,8 +921,8 @@ try {
       // The isolated run keeps the gate's OWN scaled timeouts: without them vitest falls back to its 5 s default and a
       // load-slow file that passed the main run's 15 s budget times out again alone (ci-heal-4017: still-red at load 25).
       const timeoutFlags = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? 1).split(' ').filter(Boolean);
-      result = await timedRunGate('vitestMs', 'npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
-        ...timeoutFlags, ...retriedFailures.map(f => `./${f.file}`)]);
+      const retryArgv = isolatedRetryArgv(retriedFailures.map(f => f.file), timeoutFlags);
+      result = await timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1));
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }

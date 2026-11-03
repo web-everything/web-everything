@@ -15,6 +15,10 @@ const positive = n => Number.isSafeInteger(n) && n > 0;
 const booleans = new Set(['--passWithNoTests', '--run', '--watch', '--coverage', '--silent', '--globals', '--isolate', '--no-isolate', '--no-file-parallelism', '--fileParallelism']);
 const HEAVY_ADMISSION_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'heavy-admission.mjs');
 
+export function shardRunArgv(files, flags) {
+  return ['npx', 'vitest', 'run', ...files, ...flags, '--reporter=json'];
+}
+
 export function splitVitestArgs(argv, count) {
   if (!positive(count) || argv.slice(0, 3).join(' ') !== 'npx vitest run') throw Error('expected npx vitest run and a positive shard count');
   const files = [], flags = [];
@@ -188,7 +192,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           // Preserve the npx command class through admission. JSON travels on
           // stdout through the existing SSH stream; no remote file is left behind
           // for finish() to delete before the inventory can be retrieved.
-          const args = ['npx', 'vitest', 'run', ...files, ...flags, '--reporter=json'];
+          const args = shardRunArgv(files, flags);
           const result = await execute({ command: local ? 'npx' : 'node',
             args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
             files, report, remoteReport, cwd, env: local ? { ...childEnv, [ADMISSION_HELD_ENV]: '1' } : childEnv,

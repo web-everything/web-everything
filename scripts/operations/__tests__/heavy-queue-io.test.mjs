@@ -6,10 +6,10 @@
  *   git ancestry against this actual checkout).
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { tryAcquireSlot, markWaiting, admissionStatus } from '../../readiness/heavy-admission.mjs';
+import { tryAcquireSlot, markWaiting, admissionStatus, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { collectHeavyQueue, repoFromOwner } from '../heavy-queue-io.mjs';
 import { assessHeavyQueue } from '../heavy-queue.mjs';
 
@@ -119,5 +119,25 @@ describe('collectHeavyQueue — against a REAL (temp) admission lock root, real 
     } finally {
       rmSync(lockRoot, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('remote fallback summary', () => {
+  it('carries last-24h counts from the log into the JSON verdict, ignoring malformed and future rows', () => {
+    const root = mkdtempSync(join(process.env.TMPDIR,'fallback-summary-'));
+    try {
+      const env = {WE_UNDER_TEST:'1',LANE_POOL_ROOT:root};
+      const lockRoot = admissionLockRoot(root,env), nowMs = Date.now();
+      mkdirSync(lockRoot,{recursive:true});
+      const row = (age,reason) => JSON.stringify({ts:new Date(nowMs-age).toISOString(),reason});
+      writeFileSync(join(lockRoot,'remote-fallbacks.jsonl'), [row(1,'ignored-test-file'),row(2,'ignored-test-file'),
+        row(3600000,'copy-failed'),row(86400001,'expired'),row(-1,'future'),'broken',JSON.stringify({reason:'no-ts'})].join('\n')+'\n');
+      const collect = () => collectHeavyQueue({repo:root,env,now:()=>nowMs,readBaseline:null,
+        readAdmission:()=>({cap:1,heldCount:0,freeCount:1,held:[],waiting:[]})});
+      expect(assessHeavyQueue(collect()).remoteFallbacks).toEqual({total:3,byReason:{'ignored-test-file':2,'copy-failed':1}});
+      rmSync(join(lockRoot,'remote-fallbacks.jsonl'));
+      expect(assessHeavyQueue(collect()).remoteFallbacks).toEqual({total:0,byReason:{}});
+    } finally {rmSync(root,{recursive:true,force:true});}
   });
 });
