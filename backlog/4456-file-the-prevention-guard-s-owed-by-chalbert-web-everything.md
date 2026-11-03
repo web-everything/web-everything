@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-retired-fields.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs", "we:backlog/1683-implement-the-js-first-token-runtime-webinjectors-resolves-t.md"]
 dateOpened: "2026-09-28"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "7a8f51570435bc14cb2e13114cb1c7484119daf4"
+preparedDate: "2026-11-02"
+preparedAgainstSha: "2734d57956b5a6db7c035d75e2d5a7ae3bfdc0fc"
 tags: []
 ---
 
@@ -64,3 +64,5 @@ Save red/green output for A1–A5 using the added tests first with the pre-build
 - Epic sizing is outside this item under the recorded ruling; do not file speculative sizing cleanup as a condition of completion.
 - Broader retired-field policy, scoped-linter parity, and repair of the old migration utility are separate work. This implementation uses a one-line corpus edit and does not depend on that utility.
 - Report any newly discovered corpus occurrences for explicit scope adjustment; do not silently migrate unrelated cards or choose their classifications.
+
+revalidated: The supplied diff only extends template badge and kind-filter checks; it does not alter the preparation’s frontmatter validation, backlog readers, corpus repair, or test/proof premises.
