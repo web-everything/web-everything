@@ -53,23 +53,6 @@ function inventoryPath(name, cwd, receiptId) {
   return resolve(cwd, remote && remote[1] === receiptId ? remote[2] : name);
 }
 
-function collectExecutedAssertions(text, inventory, cwd, { receiptId }) {
-  try {
-    const report = JSON.parse(text);
-    if (!Array.isArray(report?.testResults)) return;
-    for (const suite of report.testResults) {
-      if (!Array.isArray(suite?.assertionResults)) continue;
-      const file = inventoryPath(suite.name, cwd, receiptId);
-      for (const assertion of suite.assertionResults) {
-        if (['passed', 'failed'].includes(assertion?.status)) {
-          const key = JSON.stringify([file, assertion.fullName ?? assertion.title]);
-          inventory.set(key, (inventory.get(key) ?? 0) + 1);
-        }
-      }
-    }
-  } catch { /* Unreadable reports cannot establish additional executed assertions. */ }
-}
-
 export function inventoryVerdict(text, files, cwd = process.cwd(), { receiptId } = {}) {
   try {
     const report = JSON.parse(text);
@@ -205,7 +188,6 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
         let lastResult = null, observedFailure = false, unexplainedExit = false;
-        const initialAssertions = new Map(), retriedAssertions = new Map();
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -229,13 +211,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           try {
             reportText = Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8');
             const location = local ? {} : phaseRunLocation(readRemoteReport(attemptRemoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
-            collectExecutedAssertions(reportText, retry ? retriedAssertions : initialAssertions, cwd, location);
             inventory = inventoryVerdict(reportText, attemptFiles, cwd, location);
-            // Split retries must finish every reported assertion, including in
-            // extra files. Keep the first-attempt inventory policy unchanged.
-            if (retry && inventory === 'PASS' && JSON.parse(reportText).testResults.some(r =>
-              !Array.isArray(r?.assertionResults) || !r.assertionResults.length
-              || r.assertionResults.some(a => a?.status !== 'passed'))) inventory = 'INVENTORY-INCOMPLETE';
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') {
@@ -289,19 +265,14 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             const middle = Math.ceil(files.length / 2);
             const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
             const retried = [];
-            // One split level only. Each half must prove its own complete inventory.
+            // One split level only, to surface failures; passing halves cannot settle the shard.
             for (const [half, selected] of halves.entries()) {
               const verdict = await attempt(false, selected, `retry-${half + 1}.`);
               retried.push(verdict);
               if (infraExit || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
             }
-            status = ['TIMEOUT', 'NOT-RUN', 'FAIL'].find(failure => retried.includes(failure))
-              ?? (retried.every(r => r === 'PASS') ? 'PASS' : 'UNSETTLED');
-            if (observedFailure && ['PASS', 'UNSETTLED'].includes(status)) status = 'FAIL';
-            else if (status === 'PASS' && [...initialAssertions].some(([assertion, count]) => (retriedAssertions.get(assertion) ?? 0) < count)) {
-              log(`verify-shard ${index + 1}/${shards.length}: retry inventory omitted previously executed assertions; rerun the affected selection\n`);
-              status = 'UNSETTLED';
-            }
+            status = observedFailure || retried.some(r => ['FAIL', 'TIMEOUT', 'NOT-RUN'].includes(r))
+              ? 'FAIL' : 'UNSETTLED';
           }
           if (unexplainedExit && status === 'PASS') status = 'UNSETTLED';
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
