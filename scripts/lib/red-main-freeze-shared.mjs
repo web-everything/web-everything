@@ -34,13 +34,13 @@
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { RED_MAIN_HOLD_SETTINGS_FILE, redMainSignal } from './red-main-hold.mjs';
 import { execFileSync } from 'node:child_process';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stageOnTransportBranch, readFromTransportBranch } from './git-transport-branch.mjs';
 import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
@@ -369,17 +369,29 @@ function trustedLkgDirectory(file, create = false) {
   if (create) mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stat = lstatSync(dir);
   if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o022) !== 0) throw new Error('untrusted cache directory');
-  return uid;
+  // A private leaf is replaceable if any ancestor is controlled by another user.
+  // Resolve aliases (e.g. macOS /var) once, validate that hierarchy, and use ONLY
+  // this canonical path for IO so a changed ancestor symlink cannot redirect it.
+  const canonicalDir = realpathSync(dir);
+  for (let ancestor = canonicalDir; ; ancestor = dirname(ancestor)) {
+    const parent = lstatSync(ancestor);
+    const trustedOwner = parent.uid === uid || parent.uid === 0;
+    // Sticky system temp directories protect an owned child from other users.
+    const replaceable = (parent.mode & 0o022) !== 0 && (parent.mode & 0o1000) === 0;
+    if (!parent.isDirectory() || !trustedOwner || replaceable) throw new Error('untrusted cache ancestor');
+    if (dirname(ancestor) === ancestor) break;
+  }
+  return { uid, file: resolve(canonicalDir, basename(file)) };
 }
 
 function readLkgDisk(file) {
   let fd;
   try {
-    const uid = trustedLkgDirectory(file);
+    const trusted = trustedLkgDirectory(file);
     // Validate the opened inode, not a path checked before open. NONBLOCK also prevents a planted FIFO hanging the drain.
-    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    fd = openSync(trusted.file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o022) !== 0 || stat.nlink !== 1 || stat.size > 64 * 1024) return null;
+    if (!stat.isFile() || stat.uid !== trusted.uid || (stat.mode & 0o022) !== 0 || stat.nlink !== 1 || stat.size > 64 * 1024) return null;
     // A cache is only a small freeze doc; bound even a file that grows after fstat.
     const buf = Buffer.alloc(64 * 1024 + 1);
     const size = readSync(fd, buf, 0, buf.length, 0);
@@ -392,7 +404,8 @@ function readLkgDisk(file) {
 function writeLkgDisk(file, rec) {
   let tmp;
   try {
-    trustedLkgDirectory(file, true);
+    const trusted = trustedLkgDirectory(file, true);
+    file = trusted.file;
     const candidate = `${file}.${process.pid}.${randomUUID()}.tmp`;
     writeFileSync(candidate, JSON.stringify(rec), { mode: 0o600, flag: 'wx' });
     tmp = candidate; // Only unlink files created by this invocation.

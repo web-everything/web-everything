@@ -13,8 +13,9 @@ import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import {
-  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, prepareDrainFreeze, resolveDrainFreezeSettings, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit,
+  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, prepareDrainFreeze, resolveDrainFreezeSettings, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit, drainFreezeSignal,
 } from '../red-main-freeze-shared.mjs';
+import { decideRedMainHold } from '../red-main-hold.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { applyFreezeRecheck, combineRedMain, formatRedMainFreeze, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
@@ -897,13 +898,54 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     expect(readFileSync(target, 'utf8')).toBe('untouched');
     expect(statSync(m.file).mode & 0o077).toBe(0);
   });
+  it.each(['direct ancestor', 'symlink ancestor'])(
+    'rejects a private cache beneath a replaceable %s, including writes', async variant => {
+      const root = mkdtempSync(join(tmpdir(), 'lkg-ancestor-'));
+      const parent = join(root, 'replaceable');
+      const dir = join(parent, 'private');
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const file = join(dir, 'lkg.json');
+      let cache = file;
+      try {
+        if (variant === 'symlink ancestor') {
+          const link = join(root, 'alias'); symlinkSync(parent, link);
+          cache = join(link, 'private', 'lkg.json');
+        }
+        chmodSync(parent, 0o777);
+        const forged = JSON.stringify({ key: 'ancestor', at: 1500, result: CLEAR });
+        writeFileSync(file, forged, { mode: 0o600 });
+        // No memory record: an untrusted ancestor cannot supply a restart fallback.
+        const before = await run(() => T, { file: cache, t: 2000 }, { key: 'ancestor' });
+        expect(before.s.frozen).toBe(true);
+        // A verified live freeze must stay in memory without persisting through this path.
+        await run(() => FROZEN, { file: cache, t: 1000 }, { key: 'ancestor' });
+        expect(readFileSync(file, 'utf8')).toBe(forged);
+        const { s, log } = await run(() => T, { file: cache, t: 2000 }, { key: 'ancestor' });
+        expect(s.frozen).toBe(true); expect(s.shared.lastKnownGood).toBeUndefined();
+        expect(log).not.toContain('using last-known-good');
+        expect(decideRedMainHold({ num: 7, signal: drainFreezeSignal({ state: s, now: 1 }) }).hold).toBe(true);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+  it('accepts a trusted restart cache through a stable alias beneath a sticky ancestor', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lkg-sticky-'));
+    try {
+      const parent = join(root, 'sticky'); const dir = join(parent, 'private');
+      mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(parent, 0o1777);
+      const alias = join(root, 'alias'); symlinkSync(parent, alias);
+      const file = join(dir, 'lkg.json');
+      writeFileSync(file, JSON.stringify({ key: 'sticky', at: 1000, result: CLEAR }), { mode: 0o600 });
+      const { s } = await run(() => T, { file: join(alias, 'private', 'lkg.json'), t: 2000 }, { key: 'sticky' });
+      expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('rejects an oversized disk cache without a memory record', async () => {
     const m = mk();
     writeFileSync(m.file, JSON.stringify({ key: 'large', at: m.t, result: CLEAR, padding: 'x'.repeat(64 * 1024) }), { mode: 0o600 });
     const { s } = await run(() => T, m, { key: 'large' });
     expect(s.frozen).toBe(true); expect(s.shared.lastKnownGood).toBeUndefined();
   });
-  it('rejects a foreign-owned disk inode after a sticky-directory write failure, preserving the hold', () => {
+  it.each(['disk inode', 'ancestor'])('rejects a foreign-owned %s after a sticky-directory write failure, preserving the hold', variant => {
     const m = mk();
     try {
       const script = `
@@ -911,10 +953,17 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
         import { syncBuiltinESMExports } from 'node:module';
         import { prepareDrainFreeze, resolveDrainFreezeSettings, drainFreezeSignal } from ${JSON.stringify(resolve(HERE, '../red-main-freeze-shared.mjs'))};
         import { decideRedMainHold } from ${JSON.stringify(resolve(HERE, '../red-main-hold.mjs'))};
+        import { dirname } from 'node:path';
         const file = process.env.FREEZE_CACHE_TEST_FILE;
         fs.writeFileSync(file, JSON.stringify({ key: 'foreign', at: 1500, result: { frozen: false } }), { mode: 0o600 });
-        const stat = fs.fstatSync;
-        fs.fstatSync = fd => Object.assign(stat(fd), { uid: process.getuid() + 1 });
+        if (${JSON.stringify(variant)} === 'disk inode') {
+          const stat = fs.fstatSync;
+          fs.fstatSync = fd => Object.assign(stat(fd), { uid: process.getuid() + 1 });
+        } else {
+          const ancestor = dirname(fs.realpathSync(dirname(file)));
+          const stat = fs.lstatSync;
+          fs.lstatSync = path => path === ancestor ? Object.assign(stat(path), { uid: process.getuid() + 1 }) : stat(path);
+        }
         fs.renameSync = () => { throw Object.assign(new Error('sticky directory refuses replacement'), { code: 'EPERM' }); };
         syncBuiltinESMExports();
         const opts = { env: {}, settings: resolveDrainFreezeSettings({ env: {}, tool: {} }), logSettings: false, stderr: () => {}, lkg: { file, key: 'foreign', now: () => 1000, sleepSync: () => {} } };
