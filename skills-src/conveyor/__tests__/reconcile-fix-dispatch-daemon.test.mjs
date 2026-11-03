@@ -30,6 +30,17 @@ import * as prStack from '../../../scripts/conveyor/pr-stack.mjs';
 import * as reconcilePass from '../../../scripts/conveyor/reconcile-pass.mjs';
 import { execFileSyncThrottled } from '../../../scripts/lib/gh-throttle.mjs';
 import { resolveFixDispatchSettings } from '../../../scripts/conveyor/fix-takeover.mjs';
+import * as ghThrottle from '../../../scripts/lib/gh-throttle.mjs';
+import * as prSnapshot from '../../../scripts/lib/pr-snapshot.mjs';
+import * as ciHealDispatch from '../../../scripts/operations/ci-heal-pr-dispatch.mjs';
+import * as promoteDispatch from '../../../scripts/operations/promote-draft-pr-dispatch.mjs';
+import * as fixFacts from '../../../scripts/lib/fix-facts.mjs';
+import * as awaitVerifyLoop from '../../../scripts/conveyor/await-verify-loop.mjs';
+import * as stuckReclaim from '../../../scripts/conveyor/fixer-stuck-reclaim.mjs';
+import * as supersedeWatch from '../../../scripts/conveyor/supersede-watch.mjs';
+import * as heavyAdmission from '../../../scripts/readiness/heavy-admission.mjs';
+import * as resourceGate from '../../../scripts/lib/resource-gate.mjs';
+import * as unsupportedRepo from '../../../scripts/conveyor/unsupported-repo.mjs';
 
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
   it.each([
@@ -1787,6 +1798,145 @@ describe('fix daemon pass timing', () => {
 describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
   afterEach(() => vi.restoreAllMocks());
   const planOf = (extra = {}) => ({ dispatch: [], notes: [], refusals: [], prs: 1, agents: 0, ...extra });
+  it.each([[true, undefined], [undefined, true], [true, false]])(
+    'never shares an auto-proceed=%s plan with an auto-proceed=%s caller', (first, second) => {
+      const reconcile = vi.fn(input => planOf(input.allowStandDownAutoProceed === true
+        ? { dispatch: [{ kind: 'ci-heal', prNumber: 7 }] }
+        : { refusals: [{ kind: 'stand-down', prNumber: 7 }] }));
+      const cache = createReconcilePlanCache({ reconcile,
+        readFingerprints: () => new Map([[7, 'a']]), readClaims: () => new Set() });
+      const input = flag => ({ repo: 'repo-a', ...(flag === undefined ? {} : { allowStandDownAutoProceed: flag }) });
+      cache.reconcile(input(first));
+      const result = cache.reconcile(input(second));
+      expect(reconcile).toHaveBeenCalledTimes(2);
+      expect(result.dispatch).toHaveLength(second === true ? 1 : 0);
+      expect(result.refusals).toHaveLength(second === true ? 0 : 1);
+      cache.reconcile(input(second));
+      expect(reconcile).toHaveBeenCalledTimes(2);
+    });
+  it('treats omitted and explicit false auto-proceed permission as the same read-only input', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map(), readClaims: () => new Set() });
+    cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    cache.reconcile({ repo: 'repo-a' });
+    expect(cache.notes('repo-a')).not.toBeNull();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it('notes never reuse a writer-enabled plan, including when fix is the only phase that planned', () => {
+    const reconcile = vi.fn(() => planOf({ notes: [{ prNumber: 7 }] }));
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map(), readClaims: () => new Set() });
+    cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true });
+    expect(cache.notes('repo-a')).toBeNull();
+    cache.reconcile({ repo: 'repo-a' });
+    expect(cache.notes('repo-a').notes).toEqual([{ prNumber: 7 }]);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+  });
+
+  it('other planner overrides bypass reuse and cannot leave an earlier plan available to notes', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map(), readClaims: () => new Set() });
+    cache.reconcile({ repo: 'repo-a' });
+    const input = { repo: 'repo-a', readAgents: () => [] };
+    cache.reconcile(input);
+    expect(cache.notes('repo-a')).toBeNull();
+    cache.reconcile(input);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    expect(reconcile.mock.calls[1][0].readAgents).toBe(input.readAgents);
+  });
+
+  it('input changes and a failed recompute retain touched-PR exclusions and discard the old notes view', () => {
+    const reconcile = vi.fn(() => planOf({ dispatch: [{ kind: 'ci-heal', prNumber: 7 }] }));
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map([[7, 'a']]), readClaims: () => new Set() });
+    cache.reconcile({ repo: 'repo-a' });
+    cache.markTouched({ dispatched: [{ repo: 'repo-a', pr: 7 }] });
+    reconcile.mockImplementationOnce(() => { throw new Error('planner failed'); });
+    expect(() => cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true })).toThrow('planner failed');
+    expect(cache.notes('repo-a')).toBeNull();
+    expect(cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true }).dispatch).toEqual([]);
+  });
+
+  it('planner bypasses poisoned discovery and shared snapshots, reading directly after the baseline', () => {
+    const order = [];
+    const discovery = vi.fn(() => [{ number: 7, comments: ['stale'] }]);
+    const shared = vi.spyOn(prSnapshot, 'readSharedOpenPrs').mockImplementation(() => {
+      throw new Error('poisoned shared snapshot must never be consulted');
+    });
+    const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation(() => {
+      order.push('direct-read'); return '[]';
+    });
+    const reader = vi.spyOn(reconcilePass, 'defaultReadPrs');
+    const cache = createReconcilePlanCache({
+      readFingerprints: () => { order.push('baseline'); return new Map(); },
+      readClaims: () => { order.push('claims'); return new Set(); },
+      reconcile: input => {
+        order.push('planner');
+        expect(input.readPrs({ repo: 'web-everything/web-everything' })).toEqual([]);
+        return planOf();
+      },
+    });
+    cache.reconcile({ repo: 'we', readPrs: discovery });
+    expect(order).toEqual(['baseline', 'claims', 'planner', 'direct-read']);
+    expect(discovery).not.toHaveBeenCalled();
+    expect(shared).not.toHaveBeenCalled();
+    expect(reader.mock.calls[0][0].exec).not.toBe(execFileSyncThrottled);
+    expect(reader.mock.calls[0][0].attributionRepo).toBe('web-everything/web-everything');
+    expect(exec.mock.calls[0][0]).toBe('gh');
+    expect(exec.mock.calls[0][1]).toEqual(expect.arrayContaining(['pr', 'list', '--repo', 'web-everything/web-everything']));
+  });
+
+  it.each(['plan', 'captured PRs'])('clone failure in %s recomputes in full without exposing a partial cache entry', target => {
+    const bad = () => {};
+    vi.spyOn(reconcilePass, 'defaultReadPrs').mockReturnValue([{ number: 7, ...(target === 'captured PRs' ? { bad } : {}) }]);
+    const reconcile = vi.fn(input => {
+      input.readPrs();
+      return planOf(target === 'plan' ? { bad } : {});
+    });
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map(), readClaims: () => new Set() });
+    expect(() => cache.reconcile({ repo: 'repo-a' })).not.toThrow();
+    expect(cache.notes('repo-a')).toBeNull();
+    cache.reconcile({ repo: 'repo-a' });
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(cache.notes('repo-a')).toBeNull();
+  });
+
+  it('a clone failure during reuse falls back to a fresh full plan', () => {
+    const reconcile = vi.fn(() => planOf());
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map(), readClaims: () => new Set() });
+    cache.reconcile({ repo: 'repo-a' });
+    vi.spyOn(globalThis, 'structuredClone').mockImplementationOnce(() => { throw new Error('clone failed'); });
+    expect(cache.reconcile({ repo: 'repo-a' })).toEqual(planOf());
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(cache.notes('repo-a')).not.toBeNull();
+  });
+
+  it('nested plan and captured-PR mutations cannot affect later readers', () => {
+    vi.spyOn(reconcilePass, 'defaultReadPrs').mockReturnValue([{ number: 7, comments: [{ body: 'original' }] }]);
+    const reconcile = vi.fn(input => {
+      input.readPrs();
+      return planOf({ dispatch: [{ prNumber: 7, nested: { scope: ['original'] } }],
+        notes: [{ prNumber: 7, nested: { text: 'original' } }] });
+    });
+    const cache = createReconcilePlanCache({ reconcile,
+      readFingerprints: () => new Map([[7, 'a']]), readClaims: () => new Set() });
+    cache.reconcile({ repo: 'repo-a' }).dispatch[0].nested.scope[0] = 'first caller';
+    const second = cache.reconcile({ repo: 'repo-a' });
+    expect(second.dispatch[0].nested.scope).toEqual(['original']);
+    second.dispatch[0].nested.scope.push('second caller');
+    second.notes[0].nested.text = 'second caller';
+    cache.notes('repo-a').prsByNumber.get(7).comments[0].body = 'notes caller';
+    const third = cache.reconcile({ repo: 'repo-a' });
+    expect(third.dispatch[0].nested.scope).toEqual(['original']);
+    expect(third.notes[0].nested.text).toBe('original');
+    expect(cache.notes('repo-a').prsByNumber.get(7).comments[0].body).toBe('original');
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
   const phases = (calls, extra = {}) => {
     const use = name => (opts) => { calls.push(`${name}:${opts.repo}`); opts.reconcile({ repo: opts.repo }); return null; };
     return {
@@ -1809,6 +1959,111 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     await runTickAllRepos({ ...base, ...phases(calls) });
     expect(calls.filter(c => c.endsWith(':repo-a'))).toHaveLength(4);
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  // Keep all runTickAllRepos phase defaults. Decorate the real dispatch handlers only to supply hermetic IO;
+  // injecting *Tick options would turn off the production default whose activation this fixture must defend.
+  const productionFixture = () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(netScope, 'applyNetScopeToReconcile').mockImplementation(value => value);
+    vi.spyOn(prStack, 'readStacksForPass').mockReturnValue({ pairs: [] });
+    vi.spyOn(fixFacts, 'warmFixFacts').mockResolvedValue({});
+    vi.spyOn(awaitVerifyLoop, 'runTickAwaitVerify').mockResolvedValue({ rows: [] });
+    vi.spyOn(stuckReclaim, 'runFixerStuckReclaimPass').mockResolvedValue({ rows: [] });
+    vi.spyOn(supersedeWatch, 'runSupersedeWatch').mockReturnValue({ holds: [], applied: [] });
+    vi.spyOn(recovery, 'sweepHungCiRecovery').mockImplementation(noopHungCiTick);
+    vi.spyOn(recovery, 'sweepCiRedRecovery').mockImplementation(noopMainRedRebaseTick);
+    vi.spyOn(recovery, 'sweepMissingRunRecovery').mockImplementation(noopMissingRunTick);
+    vi.spyOn(heavyAdmission, 'resolveLiveQueueBaseline').mockReturnValue({ bypassed: 'fixture' });
+    vi.spyOn(resourceGate, 'createResourceFixThrottle').mockReturnValue({ tryAdmit: () => ({ admit: true }) });
+    vi.spyOn(unsupportedRepo, 'readUnsupported').mockReturnValue([]);
+    vi.spyOn(unsupportedRepo, 'recordUnsupported').mockImplementation(() => {});
+    const dispatch = vi.fn(() => { throw new Error('unexpected external dispatch'); });
+    const promote = vi.fn(() => { throw new Error('unexpected promotion'); });
+    const live = { invalid: false, stale: false };
+    const checkStaleness = vi.fn(() => live.stale
+      ? { action: 'warn', reason: 'diverged', behind: 1, ahead: 1, dirty: false }
+      : { fresh: true, behind: 0 });
+    const profile = () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' });
+    const realFix = fixDispatch.runReconcileFixDispatch;
+    vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockImplementation(options => {
+      const result = realFix({ ...options, root: '/fixture', checkStaleness, resolveProfile: profile,
+        listFixClaims: () => [], listBuildClaims: () => [], loadItems: () => [],
+        priorityShadow: null, pickFreeLanes: () => [], writeStacks: null, dispatch });
+      live.invalid = true; // changed after planning; the later phase's own live gate must see it
+      return result;
+    });
+    const realCiHeal = ciHealDispatch.runReconcileCiHealDispatch;
+    const timeoutHold = vi.fn(() => live.invalid ? { reason: 'new live timeout hold' } : null);
+    vi.spyOn(ciHealDispatch, 'runReconcileCiHealDispatch').mockImplementation(options => realCiHeal({
+      ...options, root: '/fixture', checkStaleness, resolveProfile: profile, pickFreeLanes: () => [],
+      pollAttempts: () => [], flushOwed: () => ({ kept: [] }), flushTimeouts: async () => [],
+      timeoutHold, currentBuild: () => null, dispatch,
+    }));
+    const realPromote = promoteDispatch.runReconcilePromoteDraftDispatch;
+    const readHeadCheckState = vi.fn(() => ({ state: live.invalid ? 'red' : 'green', why: 'live check' }));
+    vi.spyOn(promoteDispatch, 'runReconcilePromoteDraftDispatch').mockImplementation(options => realPromote({
+      ...options, root: '/fixture', checkStaleness, readHeadCheckState,
+      readPrLabels: () => [], provider: { ready: promote },
+    }));
+    let elapsed = 0;
+    const planner = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => {
+      elapsed += 1000;
+      return planOf({ dispatch: [{ kind: 'ci-heal', prNumber: 7, headRefOid: 'abc' },
+        { kind: 'promote-draft', prNumber: 8, headRefOid: 'def', baseRefName: 'main' }] });
+    });
+    return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,
+      options: { repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
+        authGateOverride: () => ({ paused: false, reason: null }), notesDryRun: true,
+        now: () => elapsed,
+        readPlanFingerprint: () => { elapsed += 20; return new Map([[7, 'a'], [8, 'a']]); },
+        readPlanClaimSet: () => { elapsed += 5; return new Set(); } },
+    };
+  };
+
+  it.each([false, true])('production defaults enable compatible plan reuse and retain phase live gates (auto-proceed=%s)', async flag => {
+    const f = productionFixture();
+    const result = await realRunTickAllRepos({ ...f.options,
+      fixSettings: { ...f.options.fixSettings, standDownAutoProceed: flag } });
+    expect(f.planner).toHaveBeenCalledTimes(flag ? 2 : 1);
+    expect(f.planner.mock.calls.map(([input]) => input.allowStandDownAutoProceed)).toEqual(flag ? [true, undefined] : [false]);
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ pr: 7, kind: 'ci-timeout-rerun' }),
+      expect.objectContaining({ pr: 8, kind: 'stale-check-refused' }),
+    ]));
+    expect(result.refusals.some(row => row.kind.includes('tick-failed'))).toBe(false);
+    expect(f.timeoutHold).toHaveBeenCalledTimes(1);
+    expect(f.readHeadCheckState).toHaveBeenCalledWith(expect.objectContaining({ sha: 'def' }));
+    expect(f.checkStaleness).toHaveBeenCalledTimes(3);
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.promote).not.toHaveBeenCalled();
+    // The fix phase must still refuse stale daemon code before consulting even an otherwise reusable plan.
+    f.live.stale = true;
+    const stale = await realRunTickAllRepos(f.options);
+    expect(stale.refusals.filter(row => row.kind.includes('tick-failed'))).toHaveLength(3);
+  });
+
+  it('separate production passes recompute independently', async () => {
+    const f = productionFixture();
+    await realRunTickAllRepos(f.options);
+    await realRunTickAllRepos(f.options);
+    expect(f.planner).toHaveBeenCalledTimes(2);
+  });
+
+  it('baseline-versus-cache pass cost includes live probes and differing production permissions', async () => {
+    const f = productionFixture();
+    const options = { ...f.options, fixSettings: { ...f.options.fixSettings, standDownAutoProceed: true } };
+    const baseline = await realRunTickAllRepos({ ...options, reuseReconcilePlan: false });
+    expect(f.planner).toHaveBeenCalledTimes(4);
+    f.planner.mockClear();
+    const cached = await realRunTickAllRepos(options);
+    expect(f.planner).toHaveBeenCalledTimes(2);
+    // Deterministic injected IO costs: 1000 ms/planner and 25 ms/live probe (PR/main + claims/sessions).
+    // This measures scheduling overhead in a fixture; live GitHub acceptance requires an external timing run.
+    expect(baseline.passMs).toBe(4000);
+    expect(cached.passMs).toBe(2100);
+    expect(cached.passMs).toBeLessThan(baseline.passMs);
   });
 
   it('hands each phase its own copy, so one phase mutating the plan cannot change another', async () => {
