@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { checkBodyFileLocation } from '../open-pr-body-location.mjs';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 const defaults = { cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false };
@@ -53,7 +54,7 @@ describe('checkBodyFileLocation', () => {
   });
 
   it('accepts the codex-worker body path from a real mkdtempSync directory', () => {
-    const caller = readFileSync(new URL('../../operations/codex-worker.mjs', import.meta.url), 'utf8');
+    const caller = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../operations/codex-worker.mjs'), 'utf8');
     expect(caller).toContain("makeScratchDir = () => mkdtempSync(join(tmpdir(), 'codex-worker-'))");
     expect(caller).toContain("const bodyFile = join(scratchDir, 'pr-body.md')");
     const scratch = mkdtempSync(join(tmpdir(), 'codex-worker-'));
@@ -62,7 +63,7 @@ describe('checkBodyFileLocation', () => {
   });
 
   it('accepts card-batch-extract UUID body files directly in the system temp directory', () => {
-    const caller = readFileSync(new URL('../../operations/card-batch-extract.mjs', import.meta.url), 'utf8');
+    const caller = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../operations/card-batch-extract.mjs'), 'utf8');
     expect(caller).toContain('join(tmpdir(), `card-batch-extract-${randomUUID()}.md`)');
     // A fixed temp root prevents another random ancestor from masking this exemption.
     expect(check('/tmp/card-batch-extract-12345678-1234-1234-1234-123456789abc.md')).toEqual({ ok: true });

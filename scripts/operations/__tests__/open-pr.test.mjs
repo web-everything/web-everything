@@ -703,7 +703,7 @@ describe('PR body location admission', () => {
   });
 
   it('admits card-batch-seal bodies beside the default automation state', () => {
-    const caller = readFileSync(new URL('../card-batch-seal-io.mjs', import.meta.url), 'utf8');
+    const caller = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../card-batch-seal-io.mjs'), 'utf8');
     expect(caller).toContain('bodyPath = `${statePath}.${lease.token}.body.md`');
     const statePath = join(cardBatchStateDir({}), 'org-repo-prevention.json');
     expect(location(`${statePath}.12345678-1234-1234-1234-123456789abc.body.md`)).toEqual({ ok: true });
