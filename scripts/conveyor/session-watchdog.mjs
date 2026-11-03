@@ -113,12 +113,16 @@ export const DEFAULT_SESSION_WATCHDOG = Object.freeze({
   finishedIdleMinutes: 10,
   ghostHours: 24,
   prHeadMaxAgeMinutes: 30,
+  // R502 item 3 (`stale-claim-or-binding` smell): a fix claim older than this, whose holder has been silent for
+  // `staleClaimIdleMinutes`, on a PR whose head has not moved. DETECTION ONLY (auto-release is PR #6346).
+  staleClaimMinutes: 90,
+  staleClaimIdleMinutes: 20,
   tailLines: 200,
   tailMaxBytes: 1_500_000,
   act: true,
 });
 const SCALAR_KEYS = ['intervalMinutes', 'standardFactor', 'minSamples', 'waitLoopRepeats', 'waitLoopWindowCalls', 'waitLoopMinMinutes',
-  'stalledIdleMinutes', 'stalledBlockedMinutes', 'finishedIdleMinutes', 'ghostHours', 'prHeadMaxAgeMinutes',
+  'stalledIdleMinutes', 'stalledBlockedMinutes', 'finishedIdleMinutes', 'ghostHours', 'prHeadMaxAgeMinutes', 'staleClaimMinutes', 'staleClaimIdleMinutes',
   'tailLines', 'tailMaxBytes'];
 const KIND_MAP_KEYS = ['floorMinutes', 'fallbackMinutes'];
 
@@ -336,7 +340,7 @@ export function escalationKey({ repo, pr, sessionId, name, classification, headS
  * @param {{rows:Array<object>, claims:Array<object>, prHeadFor:(repo:string, pr:number)=>string|null,
  *   standardFor:(kind:string)=>{ms:number, minutes:number}, nowMs:number}} o
  */
-export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor, nowMs }) {
+export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor, nowMs, cfg = DEFAULT_SESSION_WATCHDOG }) {
   const findings = [];
   const actions = [];
   const events = [];
@@ -379,6 +383,14 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
     const head = prHeadFor(m.repo, m.pr);
     if (claimAgeMs != null && claimAgeMs >= standard.ms && head && m.headSha && head === m.headSha) {
       findings.push({ type: 'fix-claim-held-no-progress', ...base, prHead: head, holderClass: holder?.class ?? 'not-listed' });
+    }
+    // R502 item 3 — stale claim: old, holder silent (or not listed at all), head unmoved. Unknown head or unknown idle
+    // never breach (fail closed: no alarm on missing evidence). Detection only; release is a separate path (#6346).
+    const holderIdle = holder ? holder.evidence?.idleMinutes : null;
+    const holderSilent = holder ? Number.isFinite(holderIdle) && holderIdle >= cfg.staleClaimIdleMinutes : true;
+    if (claimAgeMs != null && claimAgeMs >= cfg.staleClaimMinutes * MINUTE && head && m.headSha && head === m.headSha && holderSilent) {
+      findings.push({ type: 'stale-claim', ...base, prHead: head, holderClass: holder?.class ?? 'not-listed', holderIdleMinutes: Number.isFinite(holderIdle) ? holderIdle : null,
+        thresholdMinutes: cfg.staleClaimMinutes, idleThresholdMinutes: cfg.staleClaimIdleMinutes });
     }
     if (holder && confirmedDead(holder) && (m.sessionId || !nameShared(holder))) {
       actions.push({ type: 'release-fix-claim', repo: m.repo, pr: m.pr, who: m.who, sessionId: m.sessionId ?? null, session: holder.name });
@@ -536,7 +548,7 @@ export function runSessionWatchdogPass({
 
   let claims = [];
   try { claims = listClaims() || []; } catch { claims = []; }
-  const plan = planWatchdog({ rows, claims, prHeadFor, standardFor, nowMs });
+  const plan = planWatchdog({ rows, claims, prHeadFor, standardFor, nowMs, cfg: config });
 
   // Escalation events: write each key once; report which ones a consumer acknowledged.
   let ledger = { emitted: new Set(), acked: new Set() };
