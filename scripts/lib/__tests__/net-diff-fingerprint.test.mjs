@@ -24,6 +24,8 @@ beforeAll(() => {
   // code change: one character differs
   git('checkout', '-q', '-b', 'changed', 'rebased'); S.changed = commit('a.mjs', 'one\ntwo\nthree\nfouR\n', 'tweak');
   // mechanical path only: the root lane manifest is excluded
+  git('checkout', '-q', '-b', 'fe', 'rebased'); S.fe = commit('b.txt', Buffer.from([0x61, 0xfe, 0x0a]), 'fe');
+  git('checkout', '-q', '-b', 'ff', 'rebased'); S.ff = commit('b.txt', Buffer.from([0x61, 0xff, 0x0a]), 'ff');
   git('checkout', '-q', '-b', 'manifest', 'rebased'); S.manifest = commit('.lane-manifest.json', '{"a":1}\n', 'manifest');
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -41,6 +43,16 @@ describe('netDiffFingerprint / carriesAcross', () => {
   });
   it('excludes only the root lane manifest', () => {
     expect(carriesAcross(netDiffFingerprint(dir, 'main', S.rebased), netDiffFingerprint(dir, 'main', S.manifest))).toBe(true);
+  });
+  it('distinct invalid UTF-8 bytes do not collapse into one fingerprint', () => {
+    const fe = netDiffFingerprint(dir, 'main', S.fe), ff = netDiffFingerprint(dir, 'main', S.ff);
+    expect(fe).toMatch(/^[0-9a-f]{64}$/); expect(carriesAcross(fe, ff)).toBe(false);
+  });
+  it('asks git for a diff no text converter or submodule setting can hide', () => {
+    const calls = []; const exec = (c, a, o) => { calls.push(a); return execFileSync(c, a, o); };
+    netDiffFingerprint(dir, 'main', S.A, { exec });
+    const diff = calls.find((a) => a.includes('diff'));
+    expect(diff).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--ignore-submodules=none']));
   });
   it('unreadable fingerprints never carry', () => {
     const ok = netDiffFingerprint(dir, 'main', S.A);
