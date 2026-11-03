@@ -25,9 +25,9 @@ export function isRunningSession(a) {
 /**
  * 'yes' when running, alive and active within the window (a recent start counts);
  * 'unknown' when running and alive but its activity could not be read; else 'no'.
- * Timestamps beyond the five-minute clock-skew tolerance are not evidence. Unknown lasts only `unknownForMinutes` after the start.
+ * Timestamps beyond the one-minute clock-skew tolerance are not evidence. Unknown lasts only `unknownForMinutes` after the start.
  */
-const OWNER_CLOCK_SKEW_MS = 5 * 60000;
+const OWNER_CLOCK_SKEW_MS = 60000;
 export function sessionActivity(a, now, activeWithinMinutes = 30, unknownForMinutes = 90) {
   if (!isRunningSession(a)) return 'no';
   const valid = (v) => { const t = ms(v); return Number.isFinite(t) && t <= now + OWNER_CLOCK_SKEW_MS ? t : NaN; };

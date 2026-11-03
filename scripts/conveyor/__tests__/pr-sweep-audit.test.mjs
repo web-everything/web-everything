@@ -204,7 +204,7 @@ it('review-label restoration preserves configured label budgets and escalates ov
 });
 
 
-it.each([5 * minute + 1, 24 * 60 * minute])('ignores daemon progress beyond five-minute skew: %s ms', offset => {
+it.each([minute + 1, 4 * minute, 24 * 60 * minute])('ignores daemon progress beyond one-minute skew: %s ms', offset => {
   const future = { name: 'review', kind: 'progress', at: now + offset };
   expect(resolveOwner(pr, { now, daemons: [future] })).toMatchObject({ state: 'none', owner: null, ownerLastSeenAt: null });
   const past = { name: 'fix-dispatch-daemon', kind: 'progress', at: now - 100 * minute };
@@ -213,7 +213,7 @@ it.each([5 * minute + 1, 24 * 60 * minute])('ignores daemon progress beyond five
   expect(evaluateInvariant(pr, { state: 'active', owner: 'daemon:review', ownerLastSeenAt: new Date(future.at).toISOString() }, { now, since: now }))
     .toMatchObject({ violation: 'owner-stale' });
 });
-it.each([-minute, 0, 5 * minute])('retains ordinary progress and tolerated clock skew: %s ms', offset => {
+it.each([-minute, 0, minute])('retains ordinary progress and tolerated clock skew: %s ms', offset => {
   const at = now + offset;
   const owner = resolveOwner(pr, { now, daemons: [{ name: 'review', at }] });
   expect(owner).toMatchObject({ state: 'active', owner: 'daemon:review' });
