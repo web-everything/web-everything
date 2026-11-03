@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { checkApprovalTier, classifyFindings as classify, createApprovalDeps, main } from '../approval-tier-check.mjs';
+import { checkApprovalTier, createApprovalDeps, main } from '../approval-tier-check.mjs';
 import { createCheckDeps } from '../d-r379-check-io.mjs';
 import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
@@ -10,7 +10,6 @@ const repo = 'web-everything/web-everything', head = '6'.repeat(40), base = 'a'.
 const load = name => JSON.parse(readFileSync(fileURLToPath(new NodeURL(`../../settings/${name}.json`, import.meta.url)), 'utf8'));
 const policy = load('approval-tiers'), pathsPolicy = load('d-r379-protected-paths');
 const clear = { head, base, at: '2026-11-02T10:00:00Z', verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH, findings: [] };
-const classifyFindings = (findings, paths) => classify(findings, paths, policy.preExistingException?.requiredPhrases);
 const oldFinding = 'blocks/old.ts:12 pre-existing on main; unrelated to this change; tracked in backlog #123';
 function deps({ paths = ['docs/examples/example.md'], humanRequired = false, settings = policy, audit = clear, ...extra } = {}) {
   return {
@@ -20,12 +19,13 @@ function deps({ paths = ['docs/examples/example.md'], humanRequired = false, set
     readReviewLedger: async pr => [buildVerdictRecord({ repo, pr, headSha: head, verdict: 'accepted',
       at: clear.at, source: 'synthetic-fixture', writer: 'fixture' })],
     readAudits: async () => audit ? [audit] : [], readApprovalSettings: async () => structuredClone(settings),
-    readRedTeam: async () => ({ head, result: 'clear' }), cardExists: async () => true,
+    readRedTeam: async () => ({ head, result: 'clear' }),
     readShape: async () => ({ humanRequired }), readExplicitAsk: async () => null,
     readEmergency: async () => null, readAuthorModelFamily: async () => 'author',
     readJudgeModelFamily: async () => 'judge', stdout: vi.fn(), stderr: vi.fn(), ...extra,
   };
 }
+// Historical persisted policy cannot re-enable the removed exception.
 const exceptionPolicy = () => {
   const settings = structuredClone(policy);
   settings.tiers.standard.allowPreExistingCardedWeakened = true;
@@ -36,11 +36,35 @@ const weakened = findings => ({ ...clear, verdict: 'WEAKENED', findings });
 const ask = { quote: 'Please implement this direction.', timestamp: clear.at, rulingId: 'R456' };
 
 describe('approval tiers (synthetic, in-memory evidence)', () => {
+  it.each([false, true])('R455 is deferred even with a persisted enabled setting (humanRequired=%s)', async humanRequired => {
+    const r = await check(deps({ humanRequired, settings: exceptionPolicy(), audit: weakened([oldFinding]) }));
+    expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    expect(r.reasons.join(' ')).toContain('R455 exception deferred until the audit emits structured findings');
+  });
+  it.each([
+    'scripts/settings/approval-tiers.json',
+    'scripts/settings/d-r379-protected-paths.json',
+    'scripts/operations/approval-tier-check.mjs',
+    'scripts/operations/approval-tier-check-io.mjs',
+    'scripts/operations/d-r379-check.mjs',
+    'scripts/operations/d-r379-check-io.mjs',
+    'scripts/operations/__tests__/approval-tier-check.test.mjs',
+    'scripts/operations/__tests__/d-r379-check.test.mjs',
+    'docs/agent/decision-rights.md',
+    'docs/agent/decision-rights-extra.md',
+  ])('approval-policy path %s requires the operator with all evidence clear', async path => {
+    for (const humanRequired of [false, true]) {
+      const r = await check(deps({ paths: [path], humanRequired, readExplicitAsk: async () => ask }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator', emergencyEligible: false });
+      expect(r.reasons.join(' ')).toContain(`always-human paths: ${path}`);
+    }
+  });
   it('R455 never passes punctuation-containing net paths mentioned beside an outside path', async () => {
     const path = 'docs/examples/my(file).md';
     const findings = [`${path}:3 and blocks/old.ts pre-existing; backlog #123`];
-    expect(classifyFindings(findings, [path]).status).not.toBe('PASS');
-    expect((await check(deps({ paths: [path], audit: weakened(findings) }))).approvableBy).toBe('operator');
+    const r = await check(deps({ paths: [path], audit: weakened(findings) }));
+    expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    expect(r.reasons.join(' ')).toContain('R455 exception deferred');
   });
   it.each([false, true])('red-team:clear label cannot replace current-head evidence (elevated=%s)', async humanRequired => {
     for (const [evidence, tier] of [[null, 'unknown'], [{ head: base, result: 'clear' }, 'human'],
@@ -53,11 +77,12 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
       expect(await main(['--pr=6244', `--repo=${repo}`], deps({ humanRequired, readRedTeam }))).toBe(2);
     }
   });
-  it('R455 requires an existing card', async () => {
-    const cardExists = vi.fn(async () => false);
-    expect((await check(deps({ settings: exceptionPolicy(), audit: weakened([oldFinding]), cardExists }))).tier).toBe('human');
-    expect(cardExists).toHaveBeenCalledWith('123');
-    expect((await check(deps({ settings: exceptionPolicy(), audit: weakened([oldFinding]), cardExists: async () => { throw Error('unreadable cards'); } }))).tier).toBe('unknown');
+  it('R455 never reads cards to establish delegation', async () => {
+    const cardExists = vi.fn(() => { throw Error('unreadable cards'); });
+    const r = await check(deps({ settings: exceptionPolicy(), audit: weakened([oldFinding]), cardExists }));
+    expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    expect(r.reasons.join(' ')).toContain('R455 exception deferred');
+    expect(cardExists).not.toHaveBeenCalled();
   });
   it.each([
     ['secrets-access', 'SECRET access', 'title'],
@@ -87,31 +112,30 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
       ['docs/my file.md', 'a/docs/my file.md'],
       ['docs/my file.md', './docs/my file.md'],
       ['docs/my file.md', '`docs/my file.md`'],
-      ['docs/my directory/file.md', 'docs/my directory/file.md'],
-      ['docs/my\tfile.md', 'docs/my\tfile.md'],
+      ['docs/examples/my directory/file.md', 'docs/examples/my directory/file.md'],
     ]) {
       const findings = [`${citedPath}:3 pre-existing on main; backlog #123`];
-      expect(classifyFindings(findings, [path]).status, citedPath).toBe('UNKNOWN');
-      expect(await check(deps({ paths: [path], audit: weakened(findings) })))
-        .toMatchObject({ tier: 'unknown', approvableBy: 'operator', emergencyEligible: false });
+      const r = await check(deps({ paths: [path], audit: weakened(findings) }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator', emergencyEligible: false });
+      expect(r.reasons.join(' ')).toContain('R455 exception deferred');
     }
   });
   it.each(['a/docs/examples/example.md', 'b/docs/examples/example.md',
     './docs/examples/example.md', './a/docs/examples/example.md', './b/docs/examples/example.md'])
     ('R455 regression: in-diff path alias %s cannot produce standard approval', async path => {
       const findings = [`${path}:3 pre-existing on main; backlog #123`];
-      expect(classifyFindings(findings, ['docs/examples/example.md']).status).toBe('FAIL');
-      expect(await check(deps({ audit: weakened(findings) })))
-        .toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      const r = await check(deps({ audit: weakened(findings) }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      expect(r.reasons.join(' ')).toContain('R455 exception deferred');
     });
   it.each(['../docs/examples/example.md', 'docs/../docs/examples/example.md',
     '/docs/examples/example.md', 'docs//examples/example.md', 'docs\\examples\\example.md',
     'a/./docs/examples/example.md', '%2e%2e/docs/examples/example.md'])
     ('R455 regression: ambiguous path %s fails closed even beside a carded finding', async path => {
       const findings = [oldFinding, `${path}:3 pre-existing on main; backlog #123`];
-      expect(classifyFindings(findings, ['docs/examples/example.md']).status).toBe('UNKNOWN');
-      expect(await check(deps({ audit: weakened(findings) })))
-        .toMatchObject({ tier: 'unknown', approvableBy: 'operator' });
+      const r = await check(deps({ audit: weakened(findings) }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      expect(r.reasons.join(' ')).toContain('R455 exception deferred');
     });
   it.each([
     [false, clear, 'standard'], [true, clear, 'elevated'],
@@ -121,6 +145,7 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
   ])('R454/R455 humanRequired=%s audit=%j => %s', async (humanRequired, audit, tier) => {
     const r = await check(deps({ humanRequired, audit }));
     expect(r.tier).toBe(tier);
+    if (audit.verdict === 'WEAKENED') expect(r.reasons.join(' ')).toContain('R455 exception deferred');
     expect(r.approvableBy).toBe(tier === 'standard' ? 'orchestrator' : tier === 'elevated' ? 'elevated-judge' : 'operator');
   });
   it('mutation guard: changing only humanRequired removes orchestrator authority', async () => {
@@ -180,24 +205,15 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     'pre-existing on main; this patch builds on it', 'pre-existing on main; needed for this change'])
     ('R455 refuses incomplete independence evidence: %s', async prose => {
       const finding = `blocks/old.ts:12 ${prose}; backlog #123`;
-      expect(classifyFindings([finding], ['docs/examples/example.md']).status).toBe('FAIL');
-      expect(classifyFindings([oldFinding, finding], ['docs/examples/example.md']).status).toBe('FAIL');
-      expect((await check(deps({ audit: weakened([oldFinding, finding]) }))).tier).toBe('human');
+      const r = await check(deps({ audit: weakened([oldFinding, finding]) }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      expect(r.reasons.join(' ')).toContain('R455 exception deferred');
     });
-  it('R455 uses every configured required phrase when explicitly enabled', async () => {
-    const settings = exceptionPolicy();
-    settings.preExistingException = { requiredPhrases: ['pre-existing on main', 'unrelated to this change', 'independently confirmed'] };
-    expect((await check(deps({ settings, audit: weakened([oldFinding]) }))).tier).toBe('human');
-    expect((await check(deps({ settings, audit: weakened([`${oldFinding}; independently confirmed`]) }))).tier).toBe('standard');
+  it('R455 exception settings are removed and the deferral is documented', () => {
+    expect(policy.tiers.standard).not.toHaveProperty('allowPreExistingCardedWeakened');
+    expect(policy).not.toHaveProperty('preExistingException');
+    expect(policy._doc).toContain('R455 exception deferred until the audit emits structured findings');
   });
-  it.each([undefined, {}, { requiredPhrases: [] }, { requiredPhrases: [''] },
-    { requiredPhrases: Array(1001).fill('phrase') }, { requiredPhrases: ['x'.repeat(4097)] }])
-    ('R455 invalid or oversized phrase settings require operator repair (case %#)', async preExistingException => {
-      const settings = { ...policy, preExistingException };
-      const d = deps({ settings });
-      expect(await main(['--pr=6244', `--repo=${repo}`, '--json'], d)).toBe(2);
-      expect(JSON.parse(d.stdout.mock.calls[0][0]).reasons.join(' ')).toContain('operator');
-    });
   it('elevates a guard path with head-bound red-team acceptance', async () => {
     expect((await check(deps({ paths: ['scripts/example-guard.mjs'] }))).tier).toBe('elevated');
     expect((await check(deps({ paths: ['scripts/example-guard.mjs'], readLabels: async () => ['review:accepted'] }))).tier).toBe('human');
@@ -250,9 +266,9 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     ['stale audit', { audit: { ...clear, head: 'f'.repeat(40) } }],
     ['wrong base', { audit: { ...clear, base: 'b'.repeat(40) } }],
     ['no audit', { audit: null }],
-    ['unclassifiable finding', { audit: weakened(['unclear']) }],
     ['labels unreadable', { readLabels: async () => { throw Error(); } }],
     ['emergency throws', { audit: weakened(['docs/examples/example.md:1 assertion removed']), readEmergency: async () => { throw Error(); } }],
+    ['control character in diff path', { paths: ['docs/my\tfile.md'] }],
     ['oversized diff; operator reviews full diff', { paths: Array(10001).fill('x') }],
   ])('fail closed: %s', async (_name, overrides) => {
     const d = deps(overrides);
@@ -281,15 +297,16 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
       { ...clear, head: 'f'.repeat(40), verdict: 'WEAKENED', findings: ['bad'], at: '2026-11-03T00:00:00Z' }] }))).tier).toBe('standard');
   });
   it.each([false, true])('default setting never passes WEAKENED (humanRequired=%s)', async humanRequired => {
-    expect(policy.tiers.standard.allowPreExistingCardedWeakened).toBe(false);
-    expect(await check(deps({ humanRequired, audit: weakened([oldFinding]) })))
-      .toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    const r = await check(deps({ humanRequired, audit: weakened([oldFinding]) }));
+    expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    expect(r.reasons.join(' ')).toContain('R455 exception deferred');
   });
-  it.each(['NOT', 'never', 'no', "isn't", 'isn’t'])('enabled R455 rejects negation %s near required phrases', async negation => {
-    for (const phrase of policy.preExistingException.requiredPhrases) {
+  it.each(['NOT', 'never', 'no', "isn't", 'isn’t'])('deferred R455 refuses delegation with negation %s near required phrases', async negation => {
+    for (const phrase of ['pre-existing on main', 'unrelated to this change']) {
       const finding = oldFinding.replace(phrase, `${negation} ${phrase}`);
-      expect(await check(deps({ settings: exceptionPolicy(), audit: weakened([finding]) })))
-        .toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      const r = await check(deps({ settings: exceptionPolicy(), audit: weakened([finding]) }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      expect(r.reasons.join(' ')).toContain('R455 exception deferred');
     }
   });
   it('security findings outside the diff also exclude emergency approval', async () => {
@@ -297,10 +314,10 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
       readEmergency: async () => ({ blocking: true, repeatedRefusals: 3 }) })))
       .toMatchObject({ emergencyEligible: false });
   });
-  it('settings can disable the R455 exception', async () => {
-    const settings = structuredClone(policy);
-    settings.tiers.standard.allowPreExistingCardedWeakened = false;
-    expect((await check(deps({ settings, audit: weakened([oldFinding]) }))).tier).toBe('human');
+  it('unclassifiable WEAKENED prose still requires the operator', async () => {
+    const r = await check(deps({ audit: weakened(['unclear']) }));
+    expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator', emergencyEligible: false });
+    expect(r.reasons.join(' ')).toContain('R455 exception deferred');
   });
   it('uses configured emergency counts and kinds', async () => {
     const settings = structuredClone(policy);
@@ -313,25 +330,7 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
   });
 });
 
-describe('finding classification and default shape IO', () => {
-  it.each(['a/blocks/old.ts', 'b/blocks/old.ts', './blocks/old.ts'])
-    ('R455 accepts supported outside-diff path form %s', path => {
-      expect(classifyFindings([`${path}:12 pre-existing on main; unrelated to this change; backlog #123`],
-        ['docs/examples/example.md']).status).toBe('PASS');
-    });
-  it('R455 retains real a/ and b/ directories when checking Git-prefix ambiguity', () => {
-    for (const path of ['a/blocks/old.ts', 'b/blocks/old.ts']) {
-      expect(classifyFindings([`${path}:12 pre-existing on main; unrelated to this change; backlog #123`], [path]).status).toBe('FAIL');
-    }
-  });
-  it.each([
-    [[oldFinding], 'PASS'], [[oldFinding, 'unclassifiable'], 'UNKNOWN'],
-    [['blocks/old.ts:1 pre-existing but uncarded'], 'FAIL'],
-    [['blocks/old.ts:1 pre-existing; backlog pending'], 'FAIL'],
-    [['docs/examples/example.md:1 pre-existing #123'], 'FAIL'], [[], 'UNKNOWN'],
-  ])('classifies every finding: %j', (findings, status) => {
-    expect(classifyFindings(findings, ['docs/examples/example.md']).status).toBe(status);
-  });
+describe('default approval IO', () => {
   it.each([createApprovalDeps, createCheckDeps])('reads the newest trusted current-head red-team verdict through bounded gh api argv (%#)', async createDeps => {
     const record = (rev, verdict, created_at, login = 'chalbert') => ({ user: { login }, created_at,
       body: `<!-- we:red-team-advisory pr=6244 rev=${rev} -->\n### Post-accept red team\nAdvisory only: this comment changes no label itself; Head \`${rev.slice(0, 12)}\` · recorded verdict \`${verdict}\`.` });
@@ -360,16 +359,6 @@ describe('finding classification and default shape IO', () => {
     const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, () => ({ body: '' }))));
     expect(() => createApprovalDeps({ exec }).readRedTeam(6244, head)).toThrow(/page cap/);
     expect(exec).toHaveBeenCalledTimes(10);
-  });
-  it('default cardExists checks a real matching backlog file in the selected checkout', () => {
-    const entry = (name, file = true) => ({ name, isFile: () => file });
-    const readdirSync = vi.fn(() => [entry('123-old.md'), entry('456-directory.md', false), entry('789-other.txt')]);
-    const d = createApprovalDeps({ cwd: 'fixture-checkout', fs: { readdirSync } });
-    expect(d.cardExists('123')).toBe(true);
-    for (const id of ['12', '456', '789', '999']) expect(d.cardExists(id)).toBe(false);
-    expect(readdirSync).toHaveBeenCalledWith('fixture-checkout/backlog', { withFileTypes: true });
-    expect(() => d.cardExists('../123')).toThrow();
-    expect(() => createApprovalDeps({ fs: { readdirSync: () => { throw Error('unreadable'); } } }).cardExists('123')).toThrow('unreadable');
   });
   it('uses bounded argv-only shape invocation through injectable IO', async () => {
     const exec = vi.fn(async () => JSON.stringify({ humanRequired: true }));

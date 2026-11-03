@@ -2,7 +2,6 @@
 /** Read-only approval authority. Unknown evidence always escalates to the operator. */
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
@@ -23,13 +22,13 @@ export function validateSettings(s) {
     && elevated?.approvableBy === 'elevated-judge' && s?.tiers?.human?.approvableBy === 'operator'
     && standard.requireHumanRequiredFalse === true && standard.auditMustBe === 'NOT WEAKENED'
     && text(standard.rule), 'invalid tier settings');
-  for (const value of [standard.allowPreExistingCardedWeakened, elevated.killSwitch,
+  for (const value of [elevated.killSwitch,
     elevated.judge?.requireDifferentModelFamilyFromAuthor, elevated.securityCriticalRequiresRedTeamClearOnHead,
     ...['requireVerbatimQuote', 'requireTimestamp', 'requireRulingId'].map(k => elevated.explicitlyAsked?.[k])]) {
     requireFact(typeof value === 'boolean', 'invalid approval setting boolean');
   }
   for (const list of [s.alwaysHuman?.pathGlobs, s.alwaysHuman?.categories, s.securityCriticalGlobs,
-    s.preExistingException?.requiredPhrases, elevated.rules, emergency?.knownWontSelfResolveKinds, emergency?.neverEmergencyApprovable, emergency?.securityFindingWords]) {
+    elevated.rules, emergency?.knownWontSelfResolveKinds, emergency?.neverEmergencyApprovable, emergency?.securityFindingWords]) {
     requireFact(Array.isArray(list) && list.length > 0 && list.length <= 1000
       && list.every(v => text(v) && v.length <= 4096), 'invalid or oversized approval setting list');
   }
@@ -51,52 +50,6 @@ export function validateSettings(s) {
   requireFact(emergency.neverEmergencyApprovable.every(v =>
     ['security-finding-in-diff', 'secrets-access', 'irreversible-action'].includes(v)), 'unknown emergency exclusion');
   return s;
-}
-
-// Accept repository-relative and Git a/ or b/ paths, optionally prefixed by ./.
-// Retain both interpretations of a/ and b/: those can also be real directories.
-function findingPaths(token) {
-  const relative = token.replace(/^(?:\.\/)+/, '');
-  if (!relative || relative.endsWith('.') || relative.split('/').some(part =>
-    !part || part === '.' || part === '..' || !/^[\w@.-]+$/.test(part))) return null;
-  const unprefixed = relative.replace(/^[ab]\//, '');
-  return [relative, unprefixed];
-}
-
-function findingCards(line) {
-  return [...line.matchAll(/#(\d+)\b|\b(?:card|backlog)[\s/#:-]+((?=[a-z\d-]*\d)[a-z\d][\w-]*)\b|\bbacklog\/(\d+)[\w-]*\.md\b/gi)]
-    .map(m => m[1] ?? m[2] ?? m[3]);
-}
-
-/** Conservative R455 classifier: every named file must be outside the net diff. */
-export function classifyFindings(findings, netDiffPaths, requiredPhrases) {
-  // This prose tokenizer cannot preserve whitespace inside filenames. If the
-  // diff contains one, split fragments cannot prove a finding is outside it;
-  // refuse the R455 exception and require operator review instead.
-  if (!Array.isArray(requiredPhrases) || !requiredPhrases.length || requiredPhrases.length > 1000
-    || requiredPhrases.some(phrase => !text(phrase) || phrase.length > 4096)
-    || !Array.isArray(findings) || !findings.length || findings.some(line => !text(line))
-    || netDiffPaths.some(path => /\s/.test(path))) {
-    return { status: 'UNKNOWN', securityInDiff: false };
-  }
-  let status = 'PASS', securityInDiff = false;
-  for (const line of findings) {
-    // Capture whole path-like tokens, including unsupported forms. Never salvage
-    // a valid-looking suffix from traversal, absolute or otherwise ambiguous paths.
-    const tokens = (line.match(/[^\s`'"(),;:]+/g) ?? []).filter(token =>
-      /[/\\]/.test(token) || /^[\w@-]+\.[\w.-]+$/.test(token));
-    const parsed = tokens.map(findingPaths);
-    const paths = parsed.filter(Boolean).flat();
-    const inDiff = netDiffPaths.some(path => line.includes(path))
-      || paths.some(path => netDiffPaths.includes(path));
-    securityInDiff ||= inDiff && /security|secret|credential/i.test(line);
-    if (!paths.length || parsed.includes(null) || /[\x00-\x1f\x7f-\x9f]/.test(line)) status = 'UNKNOWN';
-    else if (status !== 'UNKNOWN' && (inDiff
-      || /\b(?:not|never|no|isn['’]t)\b/i.test(line)
-      || !requiredPhrases.every(phrase => line.toLowerCase().includes(phrase.toLowerCase()))
-      || !findingCards(line).length)) status = 'FAIL';
-  }
-  return { status, securityInDiff };
 }
 
 /** Extra evidence has no inferred provenance: absent operator/emergency records are null. */
@@ -126,11 +79,6 @@ export function createApprovalDeps(options = {}) {
       deps.stderr(`${clean(formatCascadeSourcesLine('approval-tiers', resolved))}\n`);
       return validateSettings(resolved.value);
     },
-    cardExists(id) {
-      requireFact(typeof id === 'string' && /^[a-z\d][\w-]*$/i.test(id), 'invalid backlog card id');
-      return io.readdirSync(join(cwd, 'backlog'), { withFileTypes: true })
-        .some(entry => entry.isFile() && entry.name.startsWith(`${id}-`) && entry.name.endsWith('.md'));
-    },
     readRedTeam: (pr, head) => readRedTeam(pr, head, { cwd, env, exec }),
     async readShape(files) {
       requireFact(files.every(path => !path.includes(',') && path === path.trim()), 'lossy shape paths; operator review required');
@@ -140,7 +88,7 @@ export function createApprovalDeps(options = {}) {
         'invalid or oversized shape output; operator review required');
       return JSON.parse(String(output));
     },
-    classifyFindings, readExplicitAsk: async () => null, readEmergency: async () => null,
+    readExplicitAsk: async () => null, readEmergency: async () => null,
   };
 }
 
@@ -181,35 +129,18 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     requireFact(audit && audit.base === base && audit.base !== head, 'no audit bound to head and net-diff base');
     const shape = await deps.readShape(facts.netDiffPaths);
     requireFact(typeof shape?.humanRequired === 'boolean', 'shape humanRequired unknown');
-    const classification = audit.verdict === 'WEAKENED'
-      ? await (deps.classifyFindings ?? classifyFindings)(audit.findings, facts.netDiffPaths, settings.preExistingException.requiredPhrases)
-      : { status: 'PASS', securityInDiff: false };
-    requireFact(['PASS', 'FAIL'].includes(classification?.status)
-      && typeof classification.securityInDiff === 'boolean', 'audit findings unclassifiable');
-    let cardsVerified = classification.status === 'PASS';
-    if (settings.tiers.standard.allowPreExistingCardedWeakened && audit.verdict === 'WEAKENED' && cardsVerified) {
-      for (const line of audit.findings) {
-        let exists = false;
-        for (const id of findingCards(line)) {
-          requireFact(typeof deps.cardExists === 'function', 'card existence reader unavailable');
-          if (await deps.cardExists(id) === true) exists = true;
-        }
-        cardsVerified &&= exists;
-      }
-    }
-    const auditPassing = audit.verdict === settings.tiers.standard.auditMustBe
-      || (settings.tiers.standard.allowPreExistingCardedWeakened && classification.status === 'PASS' && cardsVerified);
+    const auditPassing = audit.verdict === settings.tiers.standard.auditMustBe;
     const reasons = [];
     if (!redTeamClear) reasons.push('red-team not clear on current head');
     if (alwaysHuman.length) reasons.push(`always-human paths: ${alwaysHuman.join(', ')}`);
     if (acceptance.status !== 'PASS') reasons.push(`acceptance/red-team failed: ${acceptance.evidence.join('; ')}`);
-    if (!auditPassing) reasons.push('audit failing: WEAKENED findings are not all explicitly pre-existing on main, unrelated to this change, outside the net diff and carded');
+    if (!auditPassing) reasons.push('audit failing: WEAKENED; R455 exception deferred until the audit emits structured findings');
     for (const c of conditions) if (c.status === 'FAIL') reasons.push(`condition ${c.id} failed: ${c.evidence.join('; ')}`);
     if (shape.humanRequired) reasons.push('shape humanRequired=true (R454)');
     const securityFinding = audit.verdict === 'WEAKENED' && audit.findings.some(line =>
       settings.emergency1.securityFindingWords.some(word => line.toLowerCase().includes(word.toLowerCase())));
     let emergencyEligible = false;
-    if (!alwaysHuman.length && redTeamClear && acceptance.status === 'PASS' && !securityFinding && !classification.securityInDiff
+    if (!alwaysHuman.length && redTeamClear && acceptance.status === 'PASS' && !securityFinding
       && ((audit.verdict === 'WEAKENED' && audit.findings.length > 0)
         || (!auditPassing && !shape.humanRequired && conditions.every(c => c.status === 'PASS')))) {
       const emergency = await deps.readEmergency(pr);
