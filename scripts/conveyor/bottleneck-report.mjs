@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { runGhSync, isGhDeferred } from '../lib/gh-throttle.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { analyzePr } from './pr-time-core.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { scrubDeep } from './health-watch-core.mjs';
 const HOUR = 3600000;
 const ms = t => typeof t === 'number' ? t : Date.parse(t);
@@ -80,7 +81,7 @@ const grepLog = (pattern,path,options) => new Promise((resolve,reject)=>{
  });
 });
 function defaultReaders({now, deadline, cache, gaps, runGh = runGhSync, searchLog = grepLog}) {
- const repo = 'web-everything/web-everything';
+ const repo = ghRepoSlug('we');
  const workspace = join(homedir(),'workspace');
  const paths = {fix:join(workspace,'wev-fix-daemon','.conveyor','fix-dispatch-daemon.log'),review:join(workspace,'wev-review-daemon','.conveyor','review-daemon.log'),drain:join(workspace,'plateau-app','.drain-daemon','daemon.log'),build:join(resolveCoordinationRoot(),'build-dispatch-daemon.log')};
  const logCache = new Map();
