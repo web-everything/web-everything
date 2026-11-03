@@ -21,14 +21,41 @@ import { GH_ARGV, assertCompletePrComments } from '../lib/review-label-provider.
 export const LIST_COMMENTS_PAGE_SIZE = 100;
 
 /** Complete, paginated read, proved by count, unique node ids, string bodies and author logins; throws on missing proof. */
-export function readCompletePrComments(number, { repo = null, exec = execRead } = {}) {
+export function readCompletePrComments(number, { repo = null, exec = execRead, gh, maxPages = 10 } = {}) {
   const countArgv = GH_ARGV.readCommentsTotalCount(repo, number);
-  const comments = defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts) });
-  const response = JSON.parse(exec('gh', countArgv, {
+  const rows = defaultListPrComments({ number, repo, exec: (file, args, opts) => exec(file, args, opts), gh, maxPages });
+  // REST ids are numeric; the completeness proof and listed GraphQL page use node ids.
+  const comments = gh ? rows.map(c => ({ ...c, id: c.node_id ?? c.id })) : rows;
+  const response = gh ? gh(countArgv) : JSON.parse(exec('gh', countArgv, {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
   }));
   assertCompletePrComments(comments, response);
   return comments;
+}
+
+/** One tick's open-PR discovery. Short threads stay in the list call; capped threads
+ * use the complete reader. All repositories, pages and count proofs share a budget.
+ * Exhaustion or unreadable evidence throws, allowing the caller to retain prior alerts.
+ */
+export function createOpenPrCommentReader({ exec = execRead, env = process.env, maxCalls = 128, maxPages = 10 } = {}) {
+  if (!Number.isSafeInteger(maxCalls) || maxCalls < 1 || !Number.isSafeInteger(maxPages) || maxPages < 1) throw Error('invalid comment discovery bounds');
+  let calls = 0;
+  const gh = args => {
+    if (calls >= maxCalls) throw Error('comment discovery request budget exceeded; operator must inspect full threads before resolving alerts');
+    calls++;
+    return JSON.parse(exec('gh', args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024 }));
+  };
+  return repo => {
+    const prs = gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,title,labels,isDraft,updatedAt,headRefOid,changedFiles,additions,body,comments']);
+    if (!Array.isArray(prs) || prs.length >= 1000 || prs.some(pr => !Array.isArray(pr?.comments) || pr.comments.some(c => typeof c?.body !== 'string'))) {
+      throw Error('incomplete PR/comment listing; operator must inspect discovery before resolving alerts');
+    }
+    return enrichPrsWithCompleteComments(prs, {
+      repo, annotate: pr => pr,
+      readComments: number => readCompletePrComments(number, { repo, gh, maxPages }),
+      onError: (pr, error) => { throw Error(`PR #${pr.number}: ${error.message}; operator must inspect full thread before resolving alerts`); },
+    });
+  };
 }
 
 /** Complete edit history metadata: REST updated_at cannot prove a comment was never edited. Throws on any

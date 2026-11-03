@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { classifyIdlePrs, resolveOwner, planSweep } from '../pr-sweep-core.mjs';
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
+import * as completeComments from '../pr-comments-complete.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const now = Date.parse('2026-10-14T16:00:00Z');
@@ -316,5 +317,230 @@ describe('only an actively running session owns a PR', () => {
     expect(errors).toEqual([]); expect(signals[`${pr.repo}#12`].unreadSessions).toEqual(['fix-12']);
     expect(resolveOwner(pr, { now, ...signals[`${pr.repo}#12`] }).state).toBe('active');
     expect(resolveOwner(pr, { now, ...signals[`${pr.repo}#12`], sessions: [] }).state).toBe('unknown');
+  });
+});
+
+// R437: the running shell, not just the pure evaluator, must cover fresh updatedAt.
+it('R437 evaluates every open PR, records state clocks and audits dependency order', async () => {
+  const rows = [{ ...pr, headRefOid: 'a'.repeat(40), number: 6193, body: '> blocked by #1', comments: [{ body: 'depends on #6244' }], updatedAt: new Date(now).toISOString() },
+    { ...pr, headRefOid: 'a'.repeat(40), number: 6244, labels: ['red-team:pending'], stateSince: now - 420 * 60000, updatedAt: new Date(now).toISOString() }];
+  const lines = [];
+  const out = await runPrSweep({ now, settings: { value: settings, sources: {} }, config: {},
+    readPrs: () => rows, readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => ({}), readSignals: ({ prs }) => Object.fromEntries(prs.map(p => [`${p.repo}#${p.number}`, { daemons: [] }])),
+    append: line => lines.push(line), persist: () => {}, flush: () => {}, notify: () => ({ ok: true }),
+    stallSweep: () => ({ mode: 'shadow', dir: 'unused', items: [] }), stallDigest: pass => {
+      expect(pass.items.map(p => p.pr)).toEqual([6244, 6193]);
+      expect(pass.items[1].reason).toContain('blocked-by #6244');
+      return {};
+    } });
+  expect(out.errors).toEqual([]);
+  expect(out.decisions.map(p => p.number)).toEqual([6244, 6193]);
+  expect(out.decisions[0].violation).toBe('deadline-passed');
+  expect(out.decisions[1].violation).toBe('waiting-on-blocked');
+  expect(lines.join('')).toContain('unblocks #6193');
+  expect(lines.join('')).toContain('blocked-by #6244');
+  expect(lines.join('')).toMatch(/owner=.*next=.*deadline=/);
+});
+it('R437 pure invariant uses real state time, fails closed on unreadable labels and closes empty diffs', async () => {
+  const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
+  const deps = { now, since: now - 420 * 60000, settings };
+  expect(evaluateInvariant({ ...pr, labels: [] }, {}, deps).violation).toBe('no-labels');
+  expect(evaluateInvariant({ ...pr, labels: null }, {}, deps)).toMatchObject({ violation: 'owner-stale', nextAction: 'inspect unreadable labels' });
+  expect(evaluateInvariant({ ...pr, changedFiles: 0 }, {}, deps)).toMatchObject({ violation: 'empty-diff', nextAction: 'close into card' });
+  expect(evaluateInvariant({ ...pr, labels: ['red-team:pending'], stateSince: deps.since }, {}, { ...deps, since: now }).violation).toBe('deadline-passed');
+});
+it('R437 repeats after 30,60,120,240 minutes capped at four hours; updatedAt never resets state', () => {
+  const configured = { ...settings, alertBackoffMinutes: [30,60,120,240] };
+  let previous = plan({ settings: configured }).nextState;
+  for (const minute of [91,121,181,301,541,781]) {
+    const out = plan({ now: now + minute * 60000, settings: configured, prevState: previous,
+      idle: [{ ...pr, updatedAt: new Date(now + minute * 60000).toISOString() }] });
+    expect(out.alerts).toHaveLength(1);
+    previous = out.nextState;
+    expect(plan({ now: now + (minute + 1) * 60000, settings: configured, prevState: previous }).alerts).toEqual([]);
+  }
+  expect(plan({ now: now + 800 * 60000, settings: configured, prevState: previous, idle: [{ ...pr, labels: ['review:pending'] }] }).alerts).toEqual([]);
+});
+it('R437 shipped rollout stays shadow and backoff is explicit', async () => {
+  const { readFileSync } = await import('node:fs');
+  expect(JSON.parse(readFileSync('scripts/settings/pr-stall-sweep.json')).prStallSweep.mode).toBe('shadow');
+  expect(JSON.parse(readFileSync('scripts/settings/pr-sweep.json')).prSweep.alertBackoffMinutes).toEqual([30,60,120,240]);
+});
+
+it('R437 fresh updates retain the state clock, while a head or label-set change resets it', async () => {
+  let previous = {};
+  const sweep = async (minutes, overrides = {}) => {
+    const tick = now + minutes * 60000;
+    const out = await runPrSweep({ now: tick, dryRun: true, config: {}, settings: { value: settings, sources: {} },
+      readPrevious: () => previous, readPrs: () => [{ ...pr, labels: ['red-team:pending'], updatedAt: new Date(tick).toISOString(), ...overrides }],
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}) });
+    previous = out.nextState;
+    return out.decisions[0];
+  };
+  const first = await sweep(0);
+  expect((await sweep(61)).deadline).toBe(first.deadline);
+  expect((await sweep(62)).violation).toBe('deadline-passed');
+  expect((await sweep(63, { headRefOid: 'new' })).deadline).not.toBe(first.deadline);
+  const changed = await sweep(64, { headRefOid: 'new', labels: ['red-team:pending', 'review:accepted'] });
+  expect(Date.parse(changed.deadline)).toBe(now + 124 * 60000);
+});
+it('R437 migrates an old alerted episode to a repeat clock and retries a failed repeat', async () => {
+  const key = `${pr.repo}#12`, configured = { ...settings, alertBackoffMinutes: [30,60,120,240] };
+  const legacy = { episodes: { [key]: { head: pr.headRefOid, updatedAt: pr.updatedAt, firstUnownedAt: now - 120 * 60000, alerted: true } } };
+  const first = plan({ prevState: legacy, settings: configured });
+  expect(first.alerts).toEqual([]);
+  const due = plan({ prevState: first.nextState, settings: configured, now: now + 30 * 60000 });
+  expect(due.alerts).toHaveLength(1);
+  expect(plan({ prevState: due.nextState, settings: configured, now: now + 60 * 60000,
+    idle: [{ ...pr, updatedAt: new Date(now + 60 * 60000).toISOString() }] }).alerts).toEqual([]);
+  const out = await runPrSweep({ now: now + 30 * 60000, config: {}, settings: { value: configured, sources: {} },
+    readPrevious: () => first.nextState, readPrs: () => [pr], readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    notify: () => ({ ok: false, error: 'injected' }), persist: () => {}, append: () => {}, flush: () => {}, stallSweep: () => ({ mode: 'off' }) });
+  expect(plan({ prevState: out.nextState, settings: configured, now: now + 31 * 60000 }).alerts).toHaveLength(1);
+});
+it('R437 uses idleMinutes for stale owner evidence and keeps blocked ownership out of stall claims', async () => {
+  const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
+  expect(evaluateInvariant(pr, {}, { now, since: now, settings }).violation).toBeNull();
+  const owner = { state: 'active', owner: 'daemon:review', ownerLastSeenAt: now - 46 * 60000 };
+  expect(evaluateInvariant(pr, owner, { now, since: now, settings }).violation).toBe('owner-stale');
+  expect(evaluateInvariant(pr, owner, { now, since: now, settings, blockedBy: [6244] })).toMatchObject({ violation: 'waiting-on-blocked', nextAction: 'blocked-by #6244' });
+});
+
+it('R437 settings cascade names sources and rejects invalid backoff and deadlines', async () => {
+  const { resolvePrSweepSettings } = await import('../pr-sweep.mjs');
+  const resolved = resolvePrSweepSettings({ env: { WE_PR_SWEEP_ALERT_BACKOFF_MINUTES: '[30,60,120,240]', WE_PR_SWEEP_DEADLINE_MINUTES: '{"await-review":75}' }, log: () => {} });
+  expect(resolved.sources.alertBackoffMinutes).toBe('env');
+  expect(resolved.sources.deadlineMinutes).toBe('env');
+  expect(resolved.value.deadlineMinutes['await-review']).toBe(75);
+  const invalid = resolvePrSweepSettings({ env: { WE_PR_SWEEP_ALERT_BACKOFF_MINUTES: '[0]', WE_PR_SWEEP_DEADLINE_MINUTES: 'bad' }, log: () => {} });
+  expect(invalid.value.alertBackoffMinutes).toEqual([30,60,120,240]);
+  expect(invalid.errors.join(' ')).toMatch(/alertBackoffMinutes/);
+  expect(invalid.errors.join(' ')).toMatch(/deadlineMinutes/);
+});
+
+it('R437 removing the blocker from the open-PR listing restores dependent stall monitoring and alerts', async () => {
+  const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body: 'blocked by #6244' };
+  const blocker = { ...pr, number: 6244, headRefOid: 'b'.repeat(40) };
+  const key = `${pr.repo}#6193`;
+  let previous = {};
+  const sweep = async (minutes, rows) => {
+    const report = await runPrSweep({ now: now + minutes * 60000, dryRun: true, config: {},
+      settings: { value: settings, sources: {} }, readPrs: () => rows,
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}), readPrevious: () => previous,
+      detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }) });
+    expect(report.errors).toEqual([]);
+    previous = report.nextState;
+    return report;
+  };
+  const blocked = await sweep(0, [dependent, blocker]);
+  expect(blocked.decisions.find(p => p.number === 6193)).toMatchObject({ blockedBy: [6244], violation: 'waiting-on-blocked' });
+  expect(blocked.nextState.episodes[key]).toBeUndefined();
+  const released = await sweep(91, [dependent]);
+  expect(released.decisions[0].blockedBy).toEqual([]);
+  expect(released.decisions[0].violation).not.toBe('waiting-on-blocked');
+  expect(released.nextState.episodes[key].firstUnownedAt).toBe(now + 91 * 60000);
+  const stalled = await sweep(182, [dependent]);
+  expect(stalled.alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
+});
+
+it.each([
+  ['environment scalar', { env: { WE_PR_SWEEP_DEADLINE_MINUTES: '137' } }, 'env'],
+  ['tool scalar', { config: { prSweep: { deadlineMinutes: 137 } } }, 'tool'],
+  ['environment map', { env: { WE_PR_SWEEP_DEADLINE_MINUTES: '{"await-review":137}' } }, 'env'],
+  ['tool map', { config: { prSweep: { deadlineMinutes: { 'await-review': 137 } } } }, 'tool'],
+])('R437 settings-to-evaluator contract applies %s deadline overrides', async (_name, overrides, source) => {
+  const { resolvePrSweepSettings } = await import('../pr-sweep.mjs');
+  const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
+  const resolved = resolvePrSweepSettings({ env: {}, ...overrides, log: () => {} });
+  expect(resolved.errors).toEqual([]);
+  expect(resolved.sources.deadlineMinutes ?? resolved.sources['deadlineMinutes.await-review']).toBe(source);
+  const since = now - 100 * 60000;
+  const result = evaluateInvariant({ ...pr, labels: ['review:pending'] }, { state: 'active', owner: 'daemon:review', ownerLastSeenAt: now },
+    { now, since, settings: resolved.value });
+  expect(result.deadline).toBe(new Date(since + 137 * 60000).toISOString());
+  expect(result.violation).toBeNull();
+});
+
+it.each(['    blocked by #6244', '\tblocked by #6244', '> example\nblocked by #6244'])
+  ('R437 quoted or indented dependency example %j never suppresses a stall episode', async body => {
+    const dependent = { ...pr, number: 6193, headRefOid: 'a'.repeat(40), body };
+    const blocker = { ...pr, number: 6244, headRefOid: 'b'.repeat(40) };
+    const key = `${pr.repo}#6193`;
+    let previous = {};
+    const tick = async minutes => {
+      const report = await runPrSweep({ now: now + minutes * 60000, dryRun: true, config: {},
+        settings: { value: settings, sources: {} }, readPrs: () => [dependent, blocker],
+        readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}), readPrevious: () => previous,
+        detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }) });
+      expect(report.errors).toEqual([]);
+      previous = report.nextState;
+      return report;
+    };
+    const first = await tick(0);
+    const decision = first.decisions.find(p => p.number === 6193);
+    expect(decision.blockedBy).toEqual([]);
+    expect(decision.violation).not.toBe('waiting-on-blocked');
+    expect(first.nextState.episodes[key].firstUnownedAt).toBe(now);
+    expect((await tick(91)).alerts).toContainEqual(expect.objectContaining({ kind: 'pr-stuck', key }));
+  });
+it('R437 empty diff takes precedence over blockedBy in the invariant action, violation and deadline', async () => {
+  const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
+  expect(evaluateInvariant({ ...pr, changedFiles: 0 }, {}, { now, since: now, settings, blockedBy: [6244] }))
+    .toMatchObject({ nextAction: 'close into card', violation: 'empty-diff', deadline: new Date(now + 45 * 60000).toISOString() });
+});
+it('R437 empty diff with a live blocker keeps close-into-card precedence in sweep output and digest', async () => {
+  const empty = { ...pr, number: 6268, headRefOid: 'a'.repeat(40), changedFiles: 0, body: 'blocked by #6244' };
+  const blocker = { ...pr, number: 6244, headRefOid: 'b'.repeat(40), changedFiles: 5 };
+  const digests = [], logs = [];
+  const report = await runPrSweep({ now, env: {}, config: {}, settings: { value: settings, sources: {} },
+    readPrs: () => [empty, blocker], readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({}),
+    readPrevious: () => ({}), detector: async () => ({ enabled: false, items: [], errors: [], nextSeen: {} }),
+    notify: () => ({ ok: true }), flush: () => {}, persist: () => {}, append: line => logs.push(line),
+    stallSweep: async () => ({ mode: 'shadow', dir: 'unused', items: [], incomplete: false }),
+    stallDigest: pass => { digests.push(pass); return { lines: [], fresh: [], errors: [] }; } });
+  expect(report.errors).toEqual([]);
+  expect(report.decisions.find(p => p.number === 6268)).toMatchObject({ blockedBy: [6244], violation: 'empty-diff', nextAction: 'close into card' });
+  expect(report.idle.find(p => p.number === 6268)).toMatchObject({ state: 'empty-diff', why: 'close into card' });
+  expect(report.nextState.episodes[`${pr.repo}#6268`]).toBeDefined();
+  expect(digests[0].items.find(p => p.pr === 6268)).toMatchObject({ blockedBy: [6244], state: 'empty-diff', action: 'close into card', nextAction: 'close into card' });
+  expect(logs.join('')).toContain('next=close into card');
+});
+
+
+describe('R437 sanctioned dependency comment discovery', () => {
+  const comment = (i) => ({ id: `IC_${i}`, body: `note ${i}`, author: { login: 'operator' } });
+  it('uses one listing for short threads and completes long threads before dependency evaluation', () => {
+    const listed = Array.from({ length: 100 }, (_, i) => comment(i));
+    const last = { ...comment(100), body: 'blocked by #6244' };
+    const calls = [];
+    const read = completeComments.createOpenPrCommentReader({ exec: (_bin, args) => {
+      calls.push(args);
+      if (args[0] === 'pr') return JSON.stringify([{ ...pr, comments: listed }]);
+      if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 101 } } } } });
+      if (args[1].endsWith('page=1')) return JSON.stringify(listed.map((c, i) => ({ ...c, id: i, node_id: c.id })));
+      return JSON.stringify([{ ...last, id: 100, node_id: last.id }]);
+    } });
+    expect(read(pr.repo)[0]).toMatchObject({ commentsComplete: true, comments: [...listed.map((c, i) => ({ ...c, node_id: c.id, createdAt: undefined })), { ...last, node_id: last.id, createdAt: undefined }] });
+    expect(calls).toHaveLength(4);
+    const shortCalls = [];
+    const short = completeComments.createOpenPrCommentReader({ exec: (_bin, args) => { shortCalls.push(args); return JSON.stringify([{ ...pr, comments: [last] }]); } });
+    expect(short(pr.repo)[0].comments).toEqual([last]);
+    expect(shortCalls).toHaveLength(1);
+  });
+  it('fails closed on missing comment evidence instead of treating it as an empty thread', () => {
+    const read = completeComments.createOpenPrCommentReader({ exec: () => JSON.stringify([pr]) });
+    expect(() => read(pr.repo)).toThrow(/comment/);
+  });
+  it('fails closed on oversized threads with an operator-visible escalation', () => {
+    const rows = Array.from({ length: 100 }, (_, i) => comment(i));
+    const read = completeComments.createOpenPrCommentReader({ maxPages: 1, exec: (_bin, args) => JSON.stringify(args[0] === 'pr' ? [{ ...pr, comments: rows }] : rows) });
+    expect(() => read(pr.repo)).toThrow(/page cap.*operator/i);
+  });
+  it('shares a bounded request budget across repository listings', () => {
+    let calls = 0;
+    const read = completeComments.createOpenPrCommentReader({ maxCalls: 1, exec: () => { calls++; return '[]'; } });
+    expect(read(pr.repo)).toEqual([]);
+    expect(() => read(pr.repo)).toThrow(/budget.*operator/i);
+    expect(calls).toBe(1);
   });
 });

@@ -58,11 +58,13 @@ const ADDED_2026_10_17 = ['nightly-coroner-failed'];
 const ADDED_2026_10_27 = ['red-main-quarantined-test'];
 // Operator ruling R179 2026-10-28: a daemon build stale vs main must alert.
 const ADDED_2026_10_28 = ['daemon-build-stale'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, ...ADDED_2026_10_28, 'disk-space'])];
+// Operator order R437, 2026-11-02: PR movement and stage stalls notify in shadow.
+const ADDED_2026_11_02 = ['pr-no-movement', 'pr-stage-stall'];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, ...ADDED_2026_10_28, ...ADDED_2026_11_02, 'disk-space'])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 30 entries', () => {
-    expect(APPROVED).toHaveLength(30);
+  it('is exactly the union of the approved operator decisions — 32 entries', () => {
+    expect(APPROVED).toHaveLength(32);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 
