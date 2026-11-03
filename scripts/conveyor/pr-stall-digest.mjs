@@ -112,7 +112,7 @@ function diffEvidenceIncomplete(saved, unknownDiffs) {
     const key = feedKey(item), identity = saved.current?.[key];
     if (identity !== undefined) {
       if (typeof identity !== 'string') throw new Error('unreadable persisted stall identity');
-      return identity === 'empty-diff' || (identity.startsWith('[') && JSON.parse(identity)[0] === 'empty-diff');
+      return identity === 'empty-diff' || (identity.startsWith('[') && JSON.parse(identity).slice(0, 2).includes('empty-diff'));
     }
     return (saved.published ?? []).includes(`${item.repo}#${item.pr}@${item.head}:empty-diff`);
   });

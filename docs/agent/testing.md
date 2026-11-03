@@ -3978,3 +3978,11 @@ uses the same check; unreadable persisted identity evidence raises an operator-v
 error and conservatively marks the pass incomplete. `pr-stall-digest.test.mjs`
 covers unknown diff plus null labels, other-repo/head isolation, legacy listings,
 and same-head replacement attempts alongside new-head publication.
+
+
+Persisted stall identities store state and violation separately. Empty-diff proof
+is still required when either of those two fields is `empty-diff`, including a
+merged detector/sweep finding whose original state survives. Other identity fields
+such as the action do not establish an empty-diff finding. The named state,
+merged-violation and other-field tests in `pr-stall-digest.test.mjs` cover both the
+sweep preflight reader and persisted-feed publication.

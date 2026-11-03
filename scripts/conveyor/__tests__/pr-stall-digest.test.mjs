@@ -810,3 +810,36 @@ it('unreadable persisted diff identity fails closed with an operator-visible err
   expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
   expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
 });
+
+
+it.each([
+  ['state', 'empty-diff', 'owner-stale'],
+  ['merged violation', 'stalled-same-head', 'empty-diff'],
+])('unknown same-head diff evidence retains a persisted empty-diff %s', async (_slot, state, violation) => {
+  const { readDiffEvidenceIncomplete } = await import('../pr-stall-digest.mjs');
+  const ctx = setup(), { notify } = sent();
+  const finding = op(6254, state, { violation, nextAction: 'close into card' });
+  expect(run(ctx, [finding], { notify }).errors).toEqual([]);
+  const saved = JSON.parse(readFileSync(join(ctx.stateDir, 'digest-state.json'), 'utf8'));
+  expect(JSON.parse(saved.current[`${REPO}#6254@${H}:stalled`]).slice(0, 2)).toEqual([state, violation]);
+  const before = unacknowledged({ path: ctx.feedPath });
+  const unknownDiffs = [{ repo: REPO, pr: 6254, head: H }];
+  const result = run(ctx, [], { notify, now: NOW + 60000, pass: { incomplete: false, unknownDiffs } });
+  expect(result.errors).toEqual([]);
+  expect(result.lines).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(before);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
+  expect(readDiffEvidenceIncomplete(ctx.stateDir, unknownDiffs)).toBe(true);
+});
+
+it('empty-diff text in other identity fields does not count as an empty-diff state or violation', async () => {
+  const { readDiffEvidenceIncomplete } = await import('../pr-stall-digest.mjs');
+  const ctx = setup(), { notify } = sent();
+  expect(run(ctx, [op(6254, 'stalled-same-head', { violation: 'owner-stale', nextAction: 'empty-diff' })], { notify }).errors).toEqual([]);
+  const unknownDiffs = [{ repo: REPO, pr: 6254, head: H }];
+  expect(readDiffEvidenceIncomplete(ctx.stateDir, unknownDiffs)).toBe(false);
+  const result = run(ctx, [], { notify, now: NOW + 60000, pass: { incomplete: false, unknownDiffs } });
+  expect(result.errors).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
+});
