@@ -26,6 +26,23 @@ function fixture(findings, { stage = 'prerelease', first, recheck } = {}) {
 }
 
 describe('R473 classified audit prompt and records', () => {
+  it.each(['WEAKENED', 'WEAKENED\n\n  \t'])('refuses a weakened opening without findings %j and requests human review', async raw => {
+    const f = fixture([]);
+    f.deps.runCodex.mockResolvedValue(raw);
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.records).toEqual([]);
+    expect(f.output).toEqual([]);
+    expect(f.errors.join('')).toMatch(/incomplete.*human review/);
+    expect(f.deps.recheck).not.toHaveBeenCalled();
+  });
+
+  it.each(['E1', 'E2'])('preserves prerelease ship and card for parsed %s after a weakened opening', async cls => {
+    const f = fixture([finding({ class: cls })], { first: 'WEAKENED' });
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.result().ships).toContainEqual(expect.objectContaining({ class: cls }));
+    expect(f.result().cards).toContainEqual(expect.objectContaining({ class: cls }));
+  });
+
   it('changes the question hash and requests every structured evidence column', () => {
     expect(QUESTION_HASH).not.toBe(LEGACY_HASH);
     expect(QUESTION_HASH).toBe(createHash('sha256').update(CANONICAL_QUESTION).digest('hex'));
@@ -95,6 +112,29 @@ describe('R473 classified audit prompt and records', () => {
 });
 
 describe('R473 per-finding recheck, never 2-of-3 voting', () => {
+  it.each(['D3', 'E1', 'E2', 'X2'])('one recheck returning disputed %s stays unresolved', async cls => {
+    const f = fixture([finding({ class: 'D1', trigger: null })], {
+      recheck: vi.fn(async f => ({ ...f, class: cls, disputed: true, trigger: 'Evidence remains disputed' })),
+    });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.recheck).toHaveBeenCalledTimes(1);
+    expect(f.deps.runCodex).toHaveBeenCalledTimes(1);
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ id: 'f1', class: 'X2' }));
+    expect(f.result().ships).toEqual([]);
+    expect(f.result().cards).toEqual([]);
+    expect(f.records.some(r => r.verdict === 'NOT WEAKENED')).toBe(false);
+  });
+
+  it('one recheck returning X2 without a dispute flag stays unresolved', async () => {
+    const f = fixture([finding({ class: 'D1', trigger: null })], {
+      recheck: vi.fn(async f => ({ ...f, class: 'X2', trigger: 'Evidence is incomplete' })),
+    });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.recheck).toHaveBeenCalledTimes(1);
+    expect(f.result().recheck).toContainEqual(expect.objectContaining({ class: 'X2' }));
+    expect(f.records.some(r => r.verdict === 'NOT WEAKENED')).toBe(false);
+  });
+
   it('rechecks D1 once against the same commits then records advisory D3 with a card', async () => {
     const claim = finding({ class: 'D1', trigger: null });
     const f = fixture([claim]);

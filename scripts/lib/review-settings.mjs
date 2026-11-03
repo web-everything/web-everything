@@ -102,10 +102,11 @@ export function validateReviewSettings(raw) {
 
 export function loadReviewSettingsFile(path = defaultReviewSettingsPath()) {
   try { return validateReviewSettings(JSON.parse(readFileSync(path, 'utf8'))); }
-  catch { return validateReviewSettings(null); }
+  catch { return validateReviewSettings({ releaseStage: 'prod' }); }
 }
 
-const rawReviewSettings = () => { try { return JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8')); } catch { return null; } };
+// Failed reads are explicit conservative policy; an omitted key in a readable file keeps the product default.
+const rawReviewSettings = () => { try { return JSON.parse(readFileSync(defaultReviewSettingsPath(), 'utf8')); } catch { return { releaseStage: 'prod' }; } };
 const REFERRAL_SAFETY_KEYS = ['recheckCarriedReferrals', 'autoPolicyRespectsNotReal'];
 /** New referral safeguards use the shared standard → platform → tool → env cascade, with provenance. */
 export function resolveReferralSafetySettings({ fileConfig = rawReviewSettings(), platform, env = process.env, log } = {}) {

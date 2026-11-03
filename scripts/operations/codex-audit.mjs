@@ -40,6 +40,7 @@ export function parseAuditAnswer(answer) {
   const opening = lines.shift();
   if (opening !== 'NOT WEAKENED' && opening !== 'WEAKENED') throw new Error('invalid first verdict line');
   if (hasConflictingVerdict(opening, lines)) throw new Error('conflicting verdict lines');
+  if (opening === 'WEAKENED' && !lines.some(line => line.trim())) throw new Error('incomplete weakened verdict without findings');
   return lines.filter(line => line.trim()).map((line, index) => {
     let finding;
     if (line.startsWith('{')) finding = JSON.parse(line);
@@ -112,7 +113,7 @@ export async function main(argv, deps) {
           if (validFinding(checked) && checked.id === f.id && findingIdentity(checked) === findingIdentity(f)) {
             // A failed repro never disproves a safety finding. Retain the effective B class.
             const safety = classification.blocks.find(b => b.class?.startsWith('B'));
-            replacement = safety ? safety : checked;
+            replacement = safety ? safety : checked.disputed ? { ...checked, class: 'X2' } : checked;
           }
         } catch { /* Unavailable rechecks retain evidence for human adjudication. */ }
       }

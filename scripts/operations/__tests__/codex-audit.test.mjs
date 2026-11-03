@@ -123,8 +123,12 @@ describe('canonical audit', () => {
 
   it.each(conflictingAnswers)('findAudit ignores historical contradictory records: %j', async answer => {
     const verdict = answer.startsWith('WEAKENED') ? 'WEAKENED' : 'NOT WEAKENED';
-    const f = fixture(verdict);
-    await main(ARGS, f.deps);
+    const evidence = { id: 'guard', class: 'B3', file: 'scripts/gate.mjs', line: 12,
+      invariant: 'Unknown state refuses admission', trigger: 'Metadata unreadable',
+      consequence: 'Admission proceeds', relation: 'introduced' };
+    const f = fixture(verdict === 'WEAKENED' ? `${verdict}\n${JSON.stringify(evidence)}` : verdict);
+    expect(await main(ARGS, f.deps)).toBe(verdict === 'WEAKENED' ? 1 : 0);
+    expect(f.records[0]).toMatchObject({ verdict });
     const valid = { ...f.records[0], at: '2026-01-01T00:00:00.000Z' };
     const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
     for (const findings of [answer.slice(verdict.length).split(/\r?\n/), [answer]]) {
