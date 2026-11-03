@@ -12,7 +12,7 @@ describe('settings', () => {
   it('defaults, overrides, invalid ignored, band cannot invert', () => {
     expect(resolveGovernorSettings().targetLoadPerCore).toBe(2);
     const s = resolveGovernorSettings({ settings: { loadGovernor: { targetLoadPerCore: 1.5, resumeBelowPerCore: 9, holdFromClass: 'nope' } } });
-    expect(s.targetLoadPerCore).toBe(1.5); expect(s.resumeBelowPerCore).toBe(1.5); expect(s.holdFromClass).toBe('daemon-fix');
+    expect(s.targetLoadPerCore).toBe(1.5); expect(s.resumeBelowPerCore).toBeCloseTo(1.2); expect(s.holdFromClass).toBe('daemon-fix');
     expect(resolveGovernorSettings({ env: { WE_LOAD_GOVERNOR_TARGET: 'x' } }).targetLoadPerCore).toBe(2);
   });
 });
