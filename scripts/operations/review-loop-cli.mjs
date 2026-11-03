@@ -82,6 +82,7 @@ import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execFile } from 'node:child_process';
@@ -473,14 +474,13 @@ export function pathsWithRenameSources(files) {
   return out;
 }
 
-function defaultReadChangedFiles({ pr, repo }) {
+export function defaultReadChangedFiles({ pr, repo }) {
   // No repo, no REST path: throw, which `chooseSecuritySeat` answers with the full roster. 100 entries is one page and
   // is the cap above, so a list that long is never trusted to buy prose.
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo ?? ''))) throw new Error('no valid --repo: the file list with rename sources needs <owner>/<name>');
-  // `--jq` drops each file's `patch`, which would otherwise make a documentation-heavy PR overflow the read buffer.
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
-    '--jq', '[.[] | {filename, previous_filename}]'],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
+  // R492 S1: a conditional REST read (shared ETag cache, 304s are free); only the two path fields are kept.
+  const { json } = ghRestGetJson(`repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`, { caller: 'review-loop-cli' });
+  const out = (Array.isArray(json) ? json : []).map(({ filename, previous_filename }) => ({ filename, previous_filename }));
   return pathsWithRenameSources(out);
 }
 
@@ -515,9 +515,13 @@ export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) 
   };
 }
 
-function defaultReadResumePr({ repo, pr }) {
-  const { headRefOid, body, createdAt } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,body,createdAt'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+export function defaultReadResumePr({ repo, pr }) {
+  // R492 S1: with a repo, the REST pull (conditional, shared ETag cache); without one, the old `gh pr view`.
+  const { headRefOid, body, createdAt } = repo
+    ? (({ json: pull }) => ({ headRefOid: pull?.head?.sha, body: pull?.body, createdAt: pull?.created_at }))(
+      ghRestGetJson(`repos/${repo}/pulls/${Number(pr)}`, { caller: 'review-loop-cli' }))
+    : JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--json', 'headRefOid,body,createdAt'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
   // The complete, paginated thread: a ruling is the newest comment, which a 100-comment page can miss.
   return { headRefOid, body, createdAt, comments: readCompletePrComments(pr, { repo }) };
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { ghRestGetPaged } from '../lib/gh-rest-read.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
@@ -2069,7 +2070,8 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
       }
     },
     logTrial: (row) => logDelegationTrial(row, storePath ? { path: storePath } : {}),
-    listComments: ({ pr, repo }) => JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'comments']) || '{}').comments ?? [],
+    // R492 S1: conditional REST issue comments (shared ETag cache); REST `user.login` is read by isTrustedMarkerAuthor.
+    listComments: ({ pr, repo }) => ghRestGetPaged(`repos/${repo}/issues/${Number(pr)}/comments`, { maxItems: 5000, caller: 'review-extra-seats', env, execOpts: { env } }),
     postComment: ({ pr, repo, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
   };
 }

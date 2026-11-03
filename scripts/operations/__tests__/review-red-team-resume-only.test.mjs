@@ -100,12 +100,12 @@ describe('shared red-team recovery entry guards', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-large-comments-'));
     try {
       const comments = [{ author: { login: 'someone' }, body: 'x'.repeat(2 * 1024 * 1024 + 1024) }];
-      writeFileSync(join(dir, 'comments.json'), JSON.stringify({ comments }));
+      writeFileSync(join(dir, 'comments.json'), JSON.stringify(comments));
       writeFileSync(join(dir, 'gh'), `#!${process.execPath}
 const fs = require('node:fs');
 const path = require('node:path');
 const args = process.argv.slice(2);
-if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.includes('comments')) {
+if (args[0] === 'api' && args.some(a => /issues\/\d+\/comments/.test(a))) {
   fs.writeFileSync(1, fs.readFileSync(path.join(__dirname, 'comments.json')));
 } else if (args[0] === 'pr' && args[1] === 'comment' && args.includes('--body-file')) {
   fs.writeFileSync(path.join(__dirname, 'posted.txt'), fs.readFileSync(0));
@@ -138,7 +138,7 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
     const dir = mkdtempSync(join(tmpdir(), 'red-team-missing-gh-'));
     try {
       const io = createRedTeamIo({ env: { PATH: dir }, storePath: join(dir, 'scorecards.json') });
-      expect(() => io.listComments({ pr, repo })).toThrow(/gh pr view failed: .*ENOENT/);
+      expect(() => io.listComments({ pr, repo })).toThrow(/ENOENT/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('includes the comment failure reason in the resume summary', async () => {
