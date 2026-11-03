@@ -407,15 +407,14 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
       pagedHeavyCache.set(repo, paged.cache);
-      // A capped inventory is incomplete discovery — mark it so the planner does not treat the omitted PRs as absent.
-      if (paged.truncated) Object.defineProperty(paged.rows, 'discoveryIncomplete', { value: true });
+      // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
+      if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
       return paged.rows;
     }, { repo, op: 'reconcile-pr-list', ...retryOpts });
     if (!Array.isArray(listed)) return listed;
     const withAuthors = viaDirect ? listed : withRestAuthors(listed, { repo, readRest });
-    const enriched = enrich(withAuthors);
-    if (listed.discoveryIncomplete === true && enriched.discoveryIncomplete !== true) Object.defineProperty(enriched, 'discoveryIncomplete', { value: true });
-    return enriched;
+    if (listed.discoveryIncomplete === true && withAuthors !== listed) Object.defineProperty(withAuthors, 'discoveryIncomplete', { value: true }); // before enrich, so its completeness guard sees it
+    return enrich(withAuthors);
   }
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const rows = direct();

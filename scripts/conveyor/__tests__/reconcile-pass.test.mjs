@@ -1667,11 +1667,10 @@ describe('defaultReadPrs production list path is cheap and loud (504 incident 20
   });
 });
 
-it('a truncated paged fallback marks discovery incomplete instead of reading as complete', async () => {
+it('a truncated paged fallback is refused loudly, never planned as a complete inventory', async () => {
   const { defaultReadPrs } = await import('../reconcile-pass.mjs');
   const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
   const rows = [{ number: 1, labels: [], comments: [], statusCheckRollup: [], author: { login: 'x' } }];
-  const prs = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
-    listPaged: () => ({ rows, truncated: true, cache: {} }), readRest: () => ({ json: {} }) });
-  expect(prs.discoveryIncomplete).toBe(true);
+  expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+    listPaged: () => ({ rows, truncated: true, totalCount: 900, cache: {} }), readRest: () => ({ json: {} }) })).toThrow(/truncated/);
 });
