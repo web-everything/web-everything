@@ -19,12 +19,33 @@ Audit wrapper directory effects and environment scope through the existing token
 
 The advisory also owes deterministic coverage of earlier HOME assignments for global -C, --git-dir and --work-tree targets. First establish the supported shell semantics and the reason for the supplied `not-real` ruling. Pin those semantics with injected hook HOME distinct from shell-local HOME. If an authorized behavior change is needed, pass effective HOME consistently into target normalization and fetch-config reads; do not silently supersede the operator ruling.
 
+## Advisory obligation map
+
+The advisory's `codex-correctness` panel reports `prevention-outstanding`. Its HOME prevention request is filed here as A4; filing it does not assert that the disputed behavior is a confirmed defect. This card stays open until its executable acceptance criteria are delivered.
+
+| Advisory finding | Filed prevention |
+| --- | --- |
+| correctness/correctness — unclassified Git mutators | A1 command inventory and classification |
+| security/coverage — wrapper directory effects | A2 wrapper table |
+| security/coverage — compound environment changes | A3 scope and hook tests |
+| security/coverage — incomplete mutator denylist | A1 command inventory and classification |
+| codex-correctness/correctness — earlier HOME assignments | A4 deterministic HOME matrix and normalization consistency |
+| correctness/claim-accuracy — stale residual prose | [xp6262r](xp6262r-reverify-pr-residual-claims-against-final-diff.md) |
+
 ## Acceptance
 
 - [A1] Executable — a deterministic Git-command inventory test fails for an unclassified command, including a synthetic newly introduced command. Cover update-index, bisect, sparse-checkout, maintenance, replace, symbolic-ref writes, submodule update, reflog expire and filter-branch. Read controls remain allowed.
 - [A2] Executable — a parameterized wrapper table covers every wrapper peeled by canonicalCommand, including env -C / --chdir and sudo -D, proving its directory effect is carried or refused. Unknown path-taking options cannot establish a safe target.
 - [A3] Executable — named decision and hook tests cover an export inside a function body and a loop/if branch preceding a Git mutation, plus read controls and child-scope isolation.
 - [A4] Executable — a named parameterized regression, `DENIES tilde targets after an earlier HOME assignment`, covers -C, --git-dir and --work-tree where the supported semantics require denial. Include separated/equals spellings, earlier assignments/exports, quoted literal tilde, unset/unknown HOME, assignments after the command and read controls. Record the operator-ruling reconciliation before changing behavior.
+
+### A4 deterministic fixture and wiring
+
+Use distinct injected hook HOME, shell-local HOME, lane and protected-clone roots. Cross earlier bare assignments and exports with `-C <path>`, `--git-dir <path>`, `--git-dir=<path>`, `--work-tree <path>` and `--work-tree=<path>`; Git's `-C` takes a separate argument. Include quoted and concatenated assignment values, conditional assignments and child shells. Assert the effective target at the decision boundary and through hook JSON input, with a harmless read command as the control. Keep candidate mutation strings inert.
+
+Distinguish unquoted `~/...` expansion from a quoted literal tilde and from `$HOME` / `${HOME}` expansion. An assignment after the Git invocation cannot affect its target. Unset, relative or unresolved effective HOME must exercise the unknown-target path where expansion requires HOME. Give each case an explicit shell-semantics expectation rather than applying the advisory's denial expectation to literal paths. Fixtures must not depend on the developer's HOME or alter it without restoration.
+
+If the reconciled semantics require tracked HOME, carry the same effective value through global target options, GIT_DIR/GIT_WORK_TREE normalization and persisted fetch-config reads. Add a fetch-reader assertion so target protection and the configuration subprocess cannot resolve the same tilde spelling differently. Preserve possible earlier HOME values after conditional or refused assignments. Record the current `not-real` ruling alongside the test expectations; do not describe this prevention filing as a completed runtime fix.
 
 ## Non-goals
 
