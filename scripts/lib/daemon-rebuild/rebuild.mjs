@@ -127,7 +127,7 @@ async function forceWatch(options, emitEvent, startedAtMs) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({
-      root, env: stEnv, notBefore: startedAtMs, emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
+      root, env: stEnv, notBefore: startedAtMs, currentHead: verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') || null, emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
       probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
       rollback: async (lastGood) => {
         if (!lastGood?.head) return { ok: false };

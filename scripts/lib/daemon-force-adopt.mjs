@@ -109,11 +109,18 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
 }
 
 /** One tick of the post-force health watch. `probe(root)` -> { healthy, restarts? }; `rollback(lastGood)` -> { ok }. */
-export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null }) {
+export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
   const watch = readForceWatch(root, env);
   if (!watch) return { action: 'none' };
   // A watch opened by THIS tick's own forced adoption starts counting at the next tick.
   if (notBefore !== null && Date.parse(watch.startedAt) >= notBefore) return { action: 'none' };
+  // Ticks only count once the forced build is really the running head (a ready-only job adopts a tick or more later).
+  if (currentHead !== null && currentHead !== watch.sha) {
+    if (watch.adoptedSeen) { clearWatch(root, env); await emit?.({ kind: 'force-adopt-watch-superseded', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, head: currentHead } }); return { action: 'superseded' }; }
+    if (now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS) { clearWatch(root, env); return { action: 'expired' }; }
+    return { action: 'waiting' };
+  }
+  if (currentHead !== null && !watch.adoptedSeen) { watch.adoptedSeen = true; writeJson(watchPath(root, env), watch); }
   let health;
   try { health = await probe(root); } catch { health = { healthy: false }; }
   const verdict = evaluateForceWatch({ watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });

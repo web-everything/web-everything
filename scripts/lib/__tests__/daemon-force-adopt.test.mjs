@@ -115,6 +115,23 @@ describe('evaluateForceWatch (auto-rollback decision)', () => {
   });
 });
 
+describe('runForceWatchTick before/after the forced build is the running head', () => {
+  const rec = () => recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'b'.repeat(40),
+    lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => true, now: () => Date.now() });
+  const tick = (head, extra = {}) => runForceWatchTick({ root, env, currentHead: head, probe: async () => ({ healthy: true }), rollback: async () => ({ ok: true }), emit: async () => {}, ...extra });
+  it('does not count ticks while the old build still runs', async () => {
+    await rec();
+    for (let i = 0; i < 8; i++) expect((await tick('a'.repeat(40))).action).toBe('waiting');
+    expect(readForceWatch(root, env).ticksLeft).toBe(5);
+  });
+  it('counts once adopted, and clears the watch if a later build supersedes it', async () => {
+    await rec();
+    expect((await tick('b'.repeat(40))).action).toBe('continue');
+    expect((await tick('c'.repeat(40))).action).toBe('superseded');
+    expect(readForceWatch(root, env)).toBeNull();
+  });
+});
+
 describe('runForceWatchTick', () => {
   const setup = async () => {
     await recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'b'.repeat(40),

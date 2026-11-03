@@ -8,7 +8,7 @@ import {
 } from './smoke-classify/index.mjs';
 import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
-import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
+import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { readForceAdopt, clearForceAdopt, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
@@ -678,6 +678,7 @@ export async function smokeAndAdopt({
       return { moved: false, reason: 'force-adopt-refused', detail: opened.reason, plan, alerts: [...prepAlerts, ...alertsList] };
     }
     const forced = await finalize(plan, undefined, undefined, a.smokeResult);
+    if (forced.moved !== true && forced.readyRecorded !== true) clearReadyCandidate(root, stEnv); // never leave the failed build adoptable unwatched
     if (forced.moved !== true && forced.readyRecorded !== true) await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
     return forced;
   }
