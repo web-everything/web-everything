@@ -474,9 +474,29 @@ describe('the lane comes from the tick core or nowhere', () => {
     expect(grouped.scope).toEqual(['we:src/a*b.mjs', 'we:src/ab*.mjs']);
   });
 
+  it.each([' ', ',', ', ', '\t', '\n'])(
+    'accepts a file plus a test glob in one entry separated by %j (#4701 card shape)', (separator) => {
+      const scope = [`we:scripts/lib/daemon-rebuild/prepare.mjs${separator}we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs`];
+      const want = ['we:scripts/lib/daemon-rebuild/prepare.mjs', 'we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+      for (const launchKind of ['build', 'fix', 'ci-heal']) {
+        const read = tickRead({
+          launchKind,
+          launch: { num: '3037', lane: 8, pr: 6244, reason: 'red-ci' },
+          laneRef: 'lane/dispatch-scope-multi',
+          briefTemplate: 'scope: {{SCOPE}}',
+          repoTokens: briefTokensForRepo('we', { itemNum: '3037' }),
+        });
+        const shaped = shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' });
+        expect(shaped.dispatching).toBe(true);
+        expect(shaped.scope).toEqual(want);
+        expect(shaped.prompt).toContain(`scope: ${want.join(',')}`);
+      }
+    },
+  );
+
   it.each([' ', ',', ', ', '\t', '\n', '\r', '\u2028'])(
-    'refuses a glob combined with another path inside one entry separated by %j', (separator) => {
-      const scope = [`we:a*b.mjs${separator}we:docs/x.md`];
+    'refuses two globs inside one entry separated by %j (ambiguous overlap)', (separator) => {
+      const scope = [`we:src/a*b.mjs${separator}we:src/ab*.mjs`];
       for (const launchKind of ['build', 'fix', 'ci-heal']) {
         const read = tickRead({ launchKind });
         expect(() => shapeDispatchRead({ ...read, item: { ...read.item, scope } }, { num: '3037' }))
@@ -497,7 +517,7 @@ describe('the lane comes from the tick core or nowhere', () => {
 
   it('prepare-item ignores malformed item.scope and leases the card', () => {
     const read = tickRead({ launchKind: 'prepare-item' });
-    read.item.scope = ['we:../x', 'we:a;id', 'we:a*b.mjs we:docs/x.md'];
+    read.item.scope = ['we:../x', 'we:a;id', 'we:a*b.mjs we:c*d.mjs'];
     const shaped = shapeDispatchRead(read, { num: '3037' });
     expect(shaped.dispatching).toBe(true);
     expect(shaped.scope).toEqual([`we:${read.item.specPath}`]);

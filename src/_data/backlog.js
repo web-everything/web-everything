@@ -80,9 +80,10 @@ const normalizeScope = (v, defaultPrefix = 'we:') => {
     let repo = defaultPrefix; // bare paths are qualified only after the loader infers the item's locus
     const text = entry == null ? '' : String(entry).trim();
     const pieces = text.split(/[\s,]+/).filter(Boolean);
-    // A glob inside a multi-path entry stays UNSPLIT, so dispatch-lane refuses it (fail closed): the lease matcher
-    // does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
-    if (pieces.length > 1 && pieces.some((piece) => /[*?]/.test(piece))) { list.push(text); continue; }
+    // Two or more globs inside one multi-path entry stay UNSPLIT, so dispatch-lane refuses it (fail closed): the lease
+    // matcher does not judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list. A file
+    // plus one test glob splits normally (#4701). Keep in step with dispatch-lane's refuseMultiPathGlobs.
+    if (pieces.filter((piece) => /[*?]/.test(piece)).length > 1) { list.push(text); continue; }
     for (const piece of pieces) {
       // Match dispatch-lane's prefix grammar, including underscores. Keep path case unchanged.
       const own = /^[A-Za-z][\w-]*:/.exec(piece)?.[0] ?? '';

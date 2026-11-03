@@ -85,12 +85,19 @@ export default {
     }
     for (const separator of [' ', ',', '\t', '\n']) {
       for (const kind of ['build', 'fix', 'ci-heal']) {
-        try { read([`we:a*b.mjs${separator}we:docs/x.md`], kind); violations.push(`${kind} accepted a glob inside a multi-path entry`); } catch { /* fail closed */ }
+        try { read([`we:src/a*b.mjs${separator}we:src/ab*.mjs`], kind); violations.push(`${kind} accepted two globs inside a multi-path entry`); } catch { /* fail closed */ }
+        // A file plus a test glob in one entry is the ordinary card shape (#4701) and must dispatch.
+        const fileAndGlob = [`we:src/a.mjs${separator}we:src/__tests__/a*.test.mjs`];
+        const want = ['we:src/a.mjs', 'we:src/__tests__/a*.test.mjs'];
+        try {
+          const shaped = read(fileAndGlob, kind);
+          if (!shaped.dispatching || JSON.stringify(shaped.scope) !== JSON.stringify(want)) violations.push(`${kind} did not carry a file plus a test glob in one entry`);
+        } catch (e) { violations.push(`${kind} refused a file plus a test glob in one entry: ${String(e.message).slice(0, 120)}`); }
       }
     }
     // Preparation repairs the card itself, including malformed scope; it must remain dispatchable.
     for (const kind of ['prepare', 'prepare-item', 'prepare-decision', 'investigate']) {
-      for (const bad of ['we:../x', 'we:src/./a', 'we:src/a*b.mjs we:docs/x.md', 'we:a;id']) {
+      for (const bad of ['we:../x', 'we:src/./a', 'we:src/a*b.mjs we:src/ab*.mjs', 'we:a;id']) {
         try {
           const shaped = read(normalizeScope([bad]), kind);
           if (shaped.dispatching !== true || JSON.stringify(shaped.scope) !== JSON.stringify(['we:backlog/3037-x.md'])

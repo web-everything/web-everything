@@ -177,9 +177,15 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
       expect(normalizeBriefScope(normalizeScope(scope))).toEqual(leaseScope);
     },
   );
-  it('keeps a multi-path entry holding a glob UNSPLIT, so dispatch refuses it (fail closed)', () => {
-    expect(normalizeScope(['we:scripts/a*b.mjs we:docs/x.md'])).toEqual(['we:scripts/a*b.mjs we:docs/x.md']);
-    expect(() => normalizeBriefScope(normalizeScope(['we:scripts/a*b.mjs we:docs/x.md'])))
+  it('splits a file plus a test glob in one entry (#4701 card shape)', () => {
+    const entry = ['we:scripts/lib/daemon-rebuild/prepare.mjs we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+    const want = ['we:scripts/lib/daemon-rebuild/prepare.mjs', 'we:scripts/lib/daemon-rebuild/__tests__/prepare*.test.mjs'];
+    expect(normalizeScope(entry)).toEqual(want);
+    expect(normalizeBriefScope(normalizeScope(entry))).toEqual(want);
+  });
+  it('keeps a multi-path entry holding two globs UNSPLIT, so dispatch refuses it (fail closed)', () => {
+    expect(normalizeScope(['we:scripts/a*b.mjs we:scripts/ab*.mjs'])).toEqual(['we:scripts/a*b.mjs we:scripts/ab*.mjs']);
+    expect(() => normalizeBriefScope(normalizeScope(['we:scripts/a*b.mjs we:scripts/ab*.mjs'])))
       .toThrow(/unsafe scope.*glob/);
     expect(normalizeScope(['we:scripts/a*b.mjs'])).toEqual(['we:scripts/a*b.mjs']);
   });

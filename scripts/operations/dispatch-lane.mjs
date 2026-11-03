@@ -420,11 +420,12 @@ function canonicalScopePrefix(value) {
 }
 
 function refuseMultiPathGlobs(parts) {
-  // Only a single authored entry containing multiple paths is subject to this restriction.
-  // Separate file/glob entries remain supported (#4701), including across grouped cards.
+  // A file plus a test glob (`a.mjs __tests__/a*.test.mjs`) is the normal card shape (#4701) and is accepted, in one
+  // entry or as separate entries. Only ONE authored entry holding two or more globs is refused: the lease matcher
+  // cannot judge glob-vs-glob overlap, and flattening would hide that behind a clean-looking list.
   // Cross-entry glob-vs-glob overlap is pre-existing (R412), carded; the lease matcher does not judge it.
-  if (parts.length > 1 && parts.some((piece) => /[*?]/.test(piece))) {
-    throw new Error('dispatch-lane: unsafe scope entry — a glob in a multi-path scope entry is refused for {{SCOPE}}; use explicit paths or a directory scope.');
+  if (parts.filter((piece) => /[*?]/.test(piece)).length > 1) {
+    throw new Error('dispatch-lane: unsafe scope entry — more than one glob in a multi-path scope entry is refused for {{SCOPE}}; use explicit paths, one glob per entry, or a directory scope.');
   }
 }
 
