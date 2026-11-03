@@ -76,7 +76,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
 import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -401,6 +401,8 @@ export const lanePoolFailureLine = (e) => {
 export const SMOKE_LANE_HINT_TRIES = 3;
 /** Per-hint cap: one lane's reset is a single-lane git probe, never a pool scan. */
 export const SMOKE_LANE_HINT_TIMEOUT_MS = 60_000;
+/** Cap on the auto-pick's first try when hints exist; only a timeout past it falls back to the hints. */
+export const SMOKE_AUTOPICK_FIRST_MS = 120_000;
 /**
  * Lane numbers the smoke may try by explicit `--lane=N`, read straight from the health-watch's published free-lane
  * list (we:scripts/lib/free-lane-list.mjs). AGE IS DELIBERATELY IGNORED here: an explicit acquire re-verifies the
@@ -415,7 +417,10 @@ export function smokeLaneHints({ root, env = process.env, max = SMOKE_LANE_HINT_
   try {
     const poolDir = join(defaultPoolRoot(root, env), 'web-everything');
     const list = readFreeLaneList(resolveFreeLaneListPath({ repoName: 'web-everything', poolDir, env }));
-    return freeLaneCandidates(list).slice(0, max);
+    // Never target the caller's own checkout (auto-pick's own selfLane exclusion).
+    const self = resolve(root);
+    const rows = (list?.lanes ?? []).filter((l) => !l?.path || resolve(l.path) !== self);
+    return freeLaneCandidates({ ...list, lanes: rows }).slice(0, max);
   } catch { return []; }
 }
 
@@ -434,32 +439,51 @@ async function checkLaneAcquireRelease(ctx) {
     // killed mid-flight expires by itself.
     // #4139 — see {@link checkLanePoolList}'s own comment just above: `env` must reach every lane-pool child
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
-    const acquire = () => runChild('node', [
+    const hints = (ctx.laneHints ?? smokeLaneHints)({ root, env });
+    // With hints available the auto-pick gets a bounded first try (SMOKE_AUTOPICK_FIRST_MS): a healthy host still
+    // exercises the real auto-pick, and only a TIMED-OUT scan degrades to the explicit-lane proof below.
+    const acquire = (timeoutMs = acquireCapMs) => runChild('node', [
       'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
       `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
     ], {
-      cwd: root, timeoutMs: acquireCapMs, env,
+      cwd: root, timeoutMs, env,
     });
-    let out;
-    // Fast path: explicit `--lane=N` from the published free-lane hints — no pool-wide scan. Any failure falls
-    // through to the unchanged auto-pick below, so a real "no free lane" regression is still caught there.
-    for (const hint of (ctx.laneHints ?? smokeLaneHints)({ root, env })) {
-      try {
-        const hinted = await runChild('node', [
-          'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`, `--lane=${hint}`,
-          '--ttl-minutes=10', '--json',
-        ], { cwd: root, timeoutMs: Math.min(SMOKE_LANE_HINT_TIMEOUT_MS, acquireCapMs), env });
-        if (Number.isInteger(JSON.parse(hinted)?.lane)) { out = hinted; break; }
-      } catch {
-        try { await runChild('node', ['scripts/lane-pool.mjs', 'release', `--lane=${hint}`, `--session=${sessionSlug}`], { cwd: root, timeoutMs: budgets.laneReleaseMs, env }); } catch { /* 10-minute TTL covers it */ }
+    const releaseSession = () => runChild('node', ['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${sessionSlug}`], { cwd: root, timeoutMs: budgets.laneReleaseMs, env });
+    // Explicit `--lane=N` on a published free-lane hint: re-verifies ONE lane, no pool-wide scan.
+    const acquireHinted = async () => {
+      for (const hint of hints) {
+        try {
+          const hinted = await runChild('node', [
+            'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`, `--lane=${hint}`,
+            '--ttl-minutes=10', '--json',
+          ], { cwd: root, timeoutMs: Math.min(SMOKE_LANE_HINT_TIMEOUT_MS, acquireCapMs), env });
+          if (Number.isInteger(JSON.parse(hinted)?.lane)) return hinted;
+        } catch {
+          // A failed explicit acquire may still have written a lease: drop this session's leases (10-minute TTL backstops).
+          try { await releaseSession(); } catch { /* TTL covers it */ }
+        }
       }
-    }
+      return undefined;
+    };
+    const isTimeout = (e) => /timed out after \d+ms/.test(String(e?.message ?? e));
+    const acquireWithHintFallback = async () => {
+      try {
+        return await acquire(hints.length ? Math.min(acquireCapMs, SMOKE_AUTOPICK_FIRST_MS) : acquireCapMs);
+      } catch (e) {
+        if (!hints.length || !isTimeout(e)) throw e;
+        try { await releaseSession(); } catch { /* TTL covers it */ }
+        const hinted = await acquireHinted();
+        if (hinted === undefined) throw e;
+        return hinted;
+      }
+    };
+    let out;
     try {
-      if (out === undefined) out = await acquire();
+      out = await acquireWithHintFallback();
     } catch (e) {
       if (!isEnvOnlyAcquireExit(e)) throw e;
       try {
-        out = await acquire();
+        out = await acquireWithHintFallback();
       } catch (retryError) {
         // Structural, not textual: only lane-pool's own environmental-only exit (75) twice in a row is a skip.
         if (!isEnvOnlyAcquireExit(retryError)) {
