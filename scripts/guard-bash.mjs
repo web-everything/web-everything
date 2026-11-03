@@ -2358,14 +2358,21 @@ function daemonWrapperUncertain(segment) {
   // proven safe when it is a plain Git read (subcommand directly after `git`, literal args) or `command -v/-V`.
   let optionSeen = false;
   let probeOnly = false;
+  let gitEnvSeen = false;
+  let wrapperSeen = false;
   for (let i = 0; i < words.length;) {
     const word = words[i++];
-    if (/^[A-Za-z_]\w*=/.test(word)) continue;
+    if (/^[A-Za-z_]\w*=/.test(word)) {
+      // code-running Git env (GIT_EXTERNAL_DIFF, GIT_*_COMMAND, GIT_PAGER, config injection) makes even a "read" subcommand run code (`--ext-diff`).
+      if (/^GIT_(?:EXTERNAL_DIFF|\w*_COMMAND|PAGER|EDITOR|SEQUENCE_EDITOR|ASKPASS|SSH|CONFIG_COUNT|CONFIG_PARAMETERS|CONFIG_(?:KEY|VALUE)_\d+)=/.test(word)) gitEnvSeen = true;
+      continue;
+    }
     const base = word.replace(/^\\+/, '').replace(/^.*\//, '');
     if (base !== word && ['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'xargs', 'npx', 'bunx'].includes(base)) {
       return true; // canonicalCommand does not peel path-qualified wrappers; do not lose their Git child
     }
     if (word === 'env') {
+      wrapperSeen = true;
       // Only options that neither change directory nor split a string are modelled: -i/-0 and -u NAME.
       // -C/--chdir, -S/--split-string and unknown options stay uncertain.
       while (words[i]?.startsWith('-')) {
@@ -2414,8 +2421,9 @@ function daemonWrapperUncertain(segment) {
       }
       continue;
     }
+    if (gitEnvSeen && wrapperSeen && base === 'git') return true;
     if (!optionSeen || probeOnly) return false;
-    if (base === 'git') return !(DAEMON_GIT_READS.has(words[i] ?? '') && words.slice(i).every((w) => !/[$`]/.test(w) && !/^--out/.test(w)));
+    if (base === 'git') return gitEnvSeen || !(DAEMON_GIT_READS.has(words[i] ?? '') && !words.slice(i).includes('--ext-diff') && words.slice(i).every((w) => !/[$`]/.test(w) && !/^--out/.test(w)));
     return ['sh', 'bash', 'zsh', 'eval'].includes(base);
   }
   return false;
@@ -2431,7 +2439,10 @@ const PUSH_SAFE_EXPANSION = /(?:^|\s)(?:--push-option=|--push-option\s+|-o\s+)"\
  *  strip the one exact harmless spelling above, then any remaining `$`/backtick fails closed. */
 function pushHasUnresolvedTarget(command) {
   if (!/[$`]/.test(command)) return false;
-  return /[$`]/.test(String(command).replace(PUSH_SAFE_EXPANSION, ' '));
+  const rest = String(command).replace(PUSH_SAFE_EXPANSION, ' ');
+  // The allowance must not sit beside a redirect: bash opens/truncates the target before git runs.
+  if (rest !== command && /[<>]/.test(command)) return true;
+  return /[$`]/.test(rest);
 }
 
 // Separate from GIT_STATE_SUBCOMMANDS: new commands and aliases default to denied at protected targets.
