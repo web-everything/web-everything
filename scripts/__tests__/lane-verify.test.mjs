@@ -9,9 +9,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { classifyRedCause } from '../lib/red-cause.mjs';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   verifyServerVerdict,
   VERIFY_FILENAME,
@@ -643,10 +643,17 @@ describe('#3321 — every pr-land COMMAND STRING the tracked file set ships decl
   );
 
   /** Every tracked file that mentions pr-land.mjs — the harvest set, computed, never listed. */
-  const trackedMentioningPrLand = () =>
-    execFileSync('git', ['grep', '-lF', '--', 'pr-land.mjs'], { cwd: REPO, encoding: 'utf8' })
-      .split('\n')
-      .filter(Boolean);
+  // Hermetic: never depends on the host's git env or on a .git being present.
+  const trackedMentioningPrLand = () => {
+    const env = { ...process.env };
+    for (const k of ['GIT_INDEX_FILE', 'GIT_DIR', 'GIT_WORK_TREE']) delete env[k];
+    // A real checkout: the tracked set, exactly as before. A copy with NO .git (a container/exported tree): the
+    // same search over the work tree minus ignored files, with no repo needed (`--no-index --exclude-standard`).
+    // The one gap in that fallback is a file tracked despite an ignore rule; a real checkout never takes it.
+    const args = existsSync(join(REPO, '.git')) ? ['grep', '-lF', '--', 'pr-land.mjs'] : ['grep', '--no-index', '--exclude-standard', '-lF', '--', 'pr-land.mjs'];
+    return execFileSync('git', args, { cwd: REPO, env, encoding: 'utf8', maxBuffer: 1 << 26 }).split('\n').filter(Boolean);
+  };
+
 
   /**
    * Harvest one source TEXT's invocations WITH the line context the verify-arm needs. PURE over `(name, src)`,
