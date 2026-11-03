@@ -1860,14 +1860,15 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(cache.reconcile({ repo: 'repo-a', allowStandDownAutoProceed: true }).dispatch).toEqual([]);
   });
 
-  it('planner bypasses poisoned discovery and shared snapshots, reading directly after the baseline', () => {
+  it('planner bypasses poisoned discovery and shared snapshots, reading FRESH small pages after the baseline (never the heavy pr list)', () => {
     const order = [];
     const discovery = vi.fn(() => [{ number: 7, comments: ['stale'] }]);
     const shared = vi.spyOn(prSnapshot, 'readSharedOpenPrs').mockImplementation(() => {
       throw new Error('poisoned shared snapshot must never be consulted');
     });
     const exec = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation(() => {
-      order.push('direct-read'); return '[]';
+      order.push('direct-read');
+      return JSON.stringify({ data: { repository: { pullRequests: { nodes: [], totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null } } } } });
     });
     const reader = vi.spyOn(reconcilePass, 'defaultReadPrs');
     const cache = createReconcilePlanCache({
@@ -1883,10 +1884,12 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(order).toEqual(['baseline', 'claims', 'planner', 'direct-read']);
     expect(discovery).not.toHaveBeenCalled();
     expect(shared).not.toHaveBeenCalled();
-    expect(reader.mock.calls[0][0].exec).not.toBe(execFileSyncThrottled);
+    expect(reader.mock.calls[0][0].fresh).toBe(true);
+    expect(reader.mock.calls[0][0].exec).toBeUndefined(); // the REAL throttled exec: a wrapper knocked the read off the production path
     expect(reader.mock.calls[0][0].attributionRepo).toBe('web-everything/web-everything');
     expect(exec.mock.calls[0][0]).toBe('gh');
-    expect(exec.mock.calls[0][1]).toEqual(expect.arrayContaining(['pr', 'list', '--repo', 'web-everything/web-everything']));
+    expect(exec.mock.calls[0][1].slice(0, 3)).toEqual(['api', 'graphql', '-f']); // a small GraphQL page
+    expect(exec.mock.calls.some(c => c[1][0] === 'pr' && c[1][1] === 'list')).toBe(false); // never the heavy 200-row list
   });
 
   it.each(['plan', 'captured PRs'])('clone failure in %s recomputes in full without exposing a partial cache entry', target => {

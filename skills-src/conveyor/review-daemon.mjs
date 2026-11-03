@@ -484,6 +484,9 @@ export function runReviewTick({
     } else {
       plan = reconcile({ repo, defaultBranch });
     }
+    // A deferred PR read (gh low budget / slot throttle / author-lookup budget) planned NOTHING: that is "owed unknown",
+    // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
+    if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
