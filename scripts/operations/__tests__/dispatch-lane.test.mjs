@@ -512,6 +512,8 @@ describe('the lane comes from the tick core or nowhere', () => {
       ['WebEverything:src/a.mjs', 'we:src/a.mjs'],
       ['FrontierUI:src/a.mjs', 'fui:src/a.mjs'],
       ['PLATEAU-APP:src/a.mjs', 'plateau:src/a.mjs'],
+      ['pa:src/a.mjs', 'plateau:src/a.mjs'],
+      ['PA:src/a.mjs', 'plateau:src/a.mjs'],
       ['src/a.mjs', 'we:src/a.mjs'],
     ]) {
       const read = tickRead();
@@ -604,11 +606,11 @@ describe('the lane comes from the tick core or nowhere', () => {
   });
 
   it.each([
-    'plateau-app', 'frontierui', 'webeverything', 'FUI', 'WE', 'PLATEAU',
+    'plateau-app', 'pa', 'PA', 'frontierui', 'webeverything', 'FUI', 'WE', 'PLATEAU',
     'FrontierUI', 'WebEverything', 'Plateau-App', 'custom-repo', '',
   ])('accepts and canonicalizes legacy scope spelling %j for individual and grouped dispatches', (repo) => {
     const prefix = repo ? `${repo}:` : '';
-    const canonical = { 'plateau-app': 'plateau', frontierui: 'fui', webeverything: 'we' }[repo.toLowerCase()] ?? (repo.toLowerCase() || 'we');
+    const canonical = { 'plateau-app': 'plateau', pa: 'plateau', frontierui: 'fui', webeverything: 'we' }[repo.toLowerCase()] ?? (repo.toLowerCase() || 'we');
     const read = tickRead();
     for (const scope of [
       [`${prefix}src/a.mjs`],

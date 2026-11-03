@@ -13,6 +13,17 @@ const require = createRequire(import.meta.url);
 const { normalizeScope } = require('../backlog.js');
 const matter = require('gray-matter');
 
+// Historical malformed scopes restored by the PR #6244 operator cleanup. They must remain refused;
+// accepting every card would require unrelated backlog edits or weakening the dispatch boundary.
+const refusedCorpusEntries = new Map([
+  ['plateau:branding-proposals/loop/ (new fui-*.svg iteration files)', /unsafe scope.*glob/],
+  ['plateau:branding.html (regenerated, not hand-edited)', /characters the brief cannot carry/],
+  ['plateau-app:src/feature-tracker/read-model.ts (owned re-edit)', /characters the brief cannot carry/],
+  ['plateau-app:src/feature-tracker/read-model.test.ts (owned re-edit)', /characters the brief cannot carry/],
+  ...['wip-relay', 'worker', 'vitest.shared', 'bun-test.preload', 'vitest.setup', 'vitest.globalSetup']
+    .map((name): [string, RegExp] => [`we:./__tests__/${name}.test.mjs`, /unsafe scope entry.*path segments are refused/]),
+]);
+
 describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
   it.each([
     { name: 'FrontierUI tag with bare paths', tags: ['frontierui'], scope: ['src/a.mjs b.mjs,src/c.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs', 'fui:b.mjs', 'fui:src/c.mjs'] },
@@ -54,15 +65,28 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
     }
   });
 
-  it('accepts every open backlog card scope through the dispatcher', () => {
+  it.each([...refusedCorpusEntries])('refuses historical malformed scope %s before and after loading', (entry, reason) => {
+    const scope = ['we:src/safe.mjs', entry];
+    expect(() => normalizeBriefScope(scope)).toThrow(reason);
+    expect(() => normalizeBriefScope(normalizeScope(scope))).toThrow(reason);
+  });
+
+  it('accepts open backlog scopes except explicitly pinned malformed entries, which remain refused', () => {
     const dir = join(dirname(require.resolve('../backlog.js')), '../../backlog');
     const open = readdirSync(dir).filter((file) => file.endsWith('.md')).map((file) => ({
       file, data: matter(readFileSync(join(dir, file), 'utf8'), {}).data,
     })).filter(({ data }) => data.status === 'open');
     expect(open.length).toBeGreaterThan(0);
     for (const { file, data } of open) {
-      expect.soft(() => normalizeBriefScope(data.scope), file).not.toThrow();
-      expect.soft(() => normalizeBriefScope(normalizeScope(data.scope)), file).not.toThrow();
+      const malformed = Array.isArray(data.scope)
+        ? data.scope.find((entry: string) => refusedCorpusEntries.has(entry)) : undefined;
+      for (const scope of [data.scope, normalizeScope(data.scope)]) {
+        if (malformed) {
+          expect.soft(() => normalizeBriefScope(scope), file).toThrow(refusedCorpusEntries.get(malformed));
+        } else {
+          expect.soft(() => normalizeBriefScope(scope), file).not.toThrow();
+        }
+      }
     }
   });
 
@@ -96,6 +120,7 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
     for (const [input, canonical] of [
       ['WE:src/a.mjs', 'we:src/a.mjs'], ['webeverything:src/a.mjs', 'we:src/a.mjs'],
       ['FrontierUI:src/a.mjs', 'fui:src/a.mjs'], ['PLATEAU-APP:src/a.mjs', 'plateau:src/a.mjs'],
+      ['pa:src/a.mjs', 'plateau:src/a.mjs'], ['PA:src/a.mjs', 'plateau:src/a.mjs'],
       ['src/a.mjs', 'we:src/a.mjs'],
     ]) {
       const scope = normalizeScope([input]);
@@ -120,10 +145,10 @@ describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
   it('does not inherit a repository prefix across scope entries', () => {
     expect(normalizeScope(['fui:a.mjs b.mjs', 'c.mjs'])).toEqual(['fui:a.mjs', 'fui:b.mjs', 'we:c.mjs']);
   });
-  it.each(['we', 'fui', 'plateau', 'plateau-app', 'frontierui', 'webeverything', 'WE', 'FUI', 'custom-repo', 'custom_repo', 'repo2'])(
+  it.each(['we', 'fui', 'plateau', 'plateau-app', 'pa', 'PA', 'frontierui', 'webeverything', 'WE', 'FUI', 'custom-repo', 'custom_repo', 'repo2'])(
     'loader and dispatcher canonicalize %s identically for leases, including underscores', (prefix) => {
       const scope = [`${prefix}:a.mjs b.mjs`, 'c.mjs'];
-      const canonical = ({ 'plateau-app': 'plateau', frontierui: 'fui', webeverything: 'we' } as Record<string, string>)[prefix.toLowerCase()] ?? prefix.toLowerCase();
+      const canonical = ({ 'plateau-app': 'plateau', pa: 'plateau', frontierui: 'fui', webeverything: 'we' } as Record<string, string>)[prefix.toLowerCase()] ?? prefix.toLowerCase();
       const leaseScope = [`${canonical}:a.mjs`, `${canonical}:b.mjs`, 'we:c.mjs'];
       expect(normalizeScope(scope)).toEqual(leaseScope);
       expect(normalizeBriefScope(scope)).toEqual(leaseScope);
