@@ -1798,7 +1798,8 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     };
   };
   const base = { repos: ['repo-a', 'repo-b'], allowStandDownAutoProceed: false,
-    authGateOverride: () => ({ paused: false, reason: null }), reuseReconcilePlan: true };
+    authGateOverride: () => ({ paused: false, reason: null }), reuseReconcilePlan: true,
+    readPlanFingerprint: () => new Map([[7, 'a'], [8, 'a'], [9, 'a']]), readPlanClaimSet: () => new Set() };
 
   it('runs the reconcile planner once per repo and lets fix, ci-heal, promote-draft and notes reuse it', async () => {
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -1842,5 +1843,42 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     let t = 0;
     await runTickAllRepos({ ...base, repos: ['repo-a'], now: () => (t += 400_000), ...phases([]) });
     expect(spy.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  const rowsPlan = () => planOf({
+    dispatch: [{ kind: 'ci-heal', prNumber: 7 }, { kind: 'promote-draft', prNumber: 8 }],
+    notes: [{ prNumber: 7 }, { prNumber: 8 }], refusals: [{ prNumber: 7, kind: 'fix-claimed' }] });
+  const readBack = async (extra) => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(rowsPlan);
+    const seen = {};
+    await runTickAllRepos({ ...base, repos: ['repo-a'], ...extra, ...phases([], {
+      fixTick: vi.fn(opts => { opts.reconcile({ repo: opts.repo }); return { dispatched: [], refusals: [] }; }),
+      ciHealTick: vi.fn(async opts => { seen.plan = opts.reconcile({ repo: opts.repo }); return { dispatched: [], refusals: [] }; }),
+    }) });
+    return seen.plan;
+  };
+
+  it('re-probes live on every reuse: a PR that changed since the plan was made loses its dispatch and notes rows, refusals stay', async () => {
+    let reads = 0;
+    const plan = await readBack({ readPlanFingerprint: () => new Map([[7, reads++ < 1 ? 'a' : 'b'], [8, 'a']]) });
+    expect(plan.dispatch).toEqual([{ kind: 'promote-draft', prNumber: 8 }]);
+    expect(plan.notes).toEqual([{ prNumber: 8 }]);
+    expect(plan.refusals).toEqual([{ prNumber: 7, kind: 'fix-claimed' }]);
+  });
+
+  it('drops rows for a PR that gained a live fix claim after the plan was made', async () => {
+    let reads = 0;
+    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set() : new Set(['repo-a:8'])) });
+    expect(plan.dispatch).toEqual([{ kind: 'ci-heal', prNumber: 7 }]);
+  });
+
+  it('recomputes the plan in full when the live probe fails', async () => {
+    let calls = 0;
+    const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(rowsPlan);
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    await runTickAllRepos({ ...base, repos: ['repo-a'],
+      readPlanFingerprint: () => { if (calls++ > 0) throw new Error('gh down'); return new Map(); }, ...phases([]) });
+    expect(spy).toHaveBeenCalledTimes(4);
   });
 });

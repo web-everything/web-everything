@@ -732,40 +732,73 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
 /** How long (ms) a pass-local reconcile plan may be reused. Older than this, the next phase recomputes. */
 export const RECONCILE_PLAN_MAX_AGE_MS = 15 * 60 * 1000;
 
+/** Stable per-PR fingerprint of everything a phase's decision reads live: head, draft, labels, last activity. */
+function prFingerprint(pr) {
+  return JSON.stringify([pr.headRefOid, pr.isDraft, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), pr.updatedAt]);
+}
+
+/**
+ * Default live probe for plan reuse: one light open-PR list per repo (shared host snapshot when fresh).
+ * Throws when a row lacks `updatedAt`, so the cache fails closed to a full recompute.
+ */
+export function readPlanFingerprints(repo) {
+  const rows = defaultReadOpenPrs({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt'] });
+  if (!Array.isArray(rows) || rows.some((pr) => !pr || typeof pr.updatedAt !== 'string')) throw new Error('plan fingerprint unreadable');
+  return new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
+}
+
+/** Default live claim probe: the set of PRs holding a live fix/ci-heal claim right now. */
+export function readPlanClaims() {
+  return new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `${c.meta.repo}:${c.meta.pr}`));
+}
+
 /**
  * One reconcile plan per repo per pass, reused by fix, ci-heal, promote-draft and notes. A READ CACHE only: it lives
- * inside one `runTickAllRepos` call and dies with it. It never authorizes an action; every phase still re-checks its
- * own preconditions live (claims, fresh per-sha check read, stale-main guard). It fails closed: a plan older than
- * `maxAgeMs`, or one that cannot be cloned, is recomputed; every row about a PR an earlier phase already acted on
- * this pass is dropped from later readers; each reader gets its own deep copy.
- * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number}} [o]
+ * inside one `runTickAllRepos` call and dies with it. It never authorizes an action, and it fails closed:
+ *  - Every reuse re-probes the repo live (one light PR list plus the live claim set) and compares with the probe taken
+ *    just BEFORE the plan was computed. A PR whose head, draft state, labels or last activity (comments, stand-downs,
+ *    pushes) changed, or that gained a live claim, loses its dispatch/notes/owed rows from the reused plan; refusal
+ *    rows are kept (they only explain). Anything an earlier phase acted on is dropped the same way.
+ *  - A failed probe, a plan older than `maxAgeMs`, or one that cannot be cloned is recomputed in full.
+ *  - Each reader gets its own deep copy.
+ * Each phase still runs its own live gates (fix claim, fresh per-sha check read, stale-main guard) on top.
+ * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number, readFingerprints?:Function, readClaims?:Function}} [o]
  */
-export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now, maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS } = {}) {
+export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now,
+  maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims } = {}) {
   const entries = new Map();
   const touched = new Map();
-  const fresh = (repo) => {
-    const entry = entries.get(repo);
-    return entry && now() - entry.at <= maxAgeMs ? entry : null;
-  };
-  const withoutTouched = (repo, plan) => {
-    const prs = touched.get(repo);
-    if (!prs?.size) return plan;
-    const keep = (row) => !prs.has(row?.prNumber ?? row?.pr);
-    for (const key of ['dispatch', 'notes', 'refusals', 'owedTriggers']) if (Array.isArray(plan[key])) plan[key] = plan[key].filter(keep);
-    return plan;
+  const probe = (repo) => ({ prs: readFingerprints(repo), claims: readClaims() });
+  // PRs whose live state differs from what the plan saw (or that an earlier phase acted on).
+  const staleSet = (repo, baseline) => {
+    const live = probe(repo);
+    const stale = new Set(touched.get(repo) ?? []);
+    for (const [pr, fp] of baseline.prs) if (live.prs.get(pr) !== fp) stale.add(pr);
+    for (const [pr] of live.prs) if (!baseline.prs.has(pr)) stale.add(pr);
+    const claimPr = (key) => Number(String(key).split(':').pop());
+    for (const key of live.claims) if (!baseline.claims.has(key)) stale.add(claimPr(key));
+    return stale;
   };
   const read = (repo) => {
-    const entry = fresh(repo);
-    if (!entry) return null;
-    try { return { plan: withoutTouched(repo, structuredClone(entry.plan)), captured: structuredClone(entry.captured) }; }
-    catch { entries.delete(repo); return null; }
+    const entry = entries.get(repo);
+    if (!entry || now() - entry.at > maxAgeMs) return null;
+    try {
+      const stale = staleSet(repo, entry.baseline);
+      const plan = structuredClone(entry.plan);
+      const drop = (row) => !stale.has(row?.prNumber ?? row?.pr);
+      for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) plan[key] = plan[key].filter(drop);
+      const captured = structuredClone(entry.captured).filter((pr) => !stale.has(pr?.number));
+      return { plan, captured };
+    } catch { entries.delete(repo); return null; }
   };
   return {
-    /** Same shape as `runReconcilePass`. Computes once per repo, then serves copies. */
+    /** Same shape as `runReconcilePass`. Computes once per repo, then serves live-validated copies. */
     reconcile(input = {}) {
       const repo = input.repo ?? null;
       const hit = read(repo);
       if (hit) return hit.plan;
+      let baseline = null;
+      try { baseline = probe(repo); } catch { baseline = null; }
       let captured = [];
       const tap = (fn, fallback) => (...args) => { captured = (fn ?? fallback)(...args); return captured; };
       // The default reader is recognised by identity (attribution repo), so it is left untapped; the later stages
@@ -774,11 +807,11 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
         ...(input.readPrs ? { readPrs: tap(input.readPrs) } : {}),
         excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
         enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) });
-      try { entries.set(repo, { at: now(), plan: structuredClone(plan), captured: structuredClone(captured) }); }
+      try { if (baseline) entries.set(repo, { at: now(), baseline, plan: structuredClone(plan), captured: structuredClone(captured) }); }
       catch { entries.delete(repo); }
       return plan;
     },
-    /** The notes view of the cached plan, or null when there is none to reuse. */
+    /** The notes view of the live-validated cached plan, or null when there is none to reuse. */
     notes(repo) {
       const hit = read(repo);
       if (!hit) return null;
@@ -790,8 +823,8 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       for (const d of results?.dispatched ?? results?.dispatch ?? []) {
         const pr = d?.pr ?? d?.prNumber;
         if (pr == null) continue;
-        const repo = d.repo ?? null;
-        for (const key of repo == null ? [...entries.keys()] : [repo]) {
+        const repos = d.repo == null ? [...entries.keys()] : [d.repo];
+        for (const key of repos) {
           if (!touched.has(key)) touched.set(key, new Set());
           touched.get(key).add(pr);
         }
@@ -868,6 +901,8 @@ export async function runTickAllRepos({
   reuseReconcilePlan,
   // Injectable planner under the cache (tests count invocations).
   reconcilePass = (input) => runReconcilePass(input),
+  // Injectable live probes behind plan reuse (default: one light PR list per repo + the live claim set).
+  readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
 } = {}) {
@@ -875,7 +910,7 @@ export async function runTickAllRepos({
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
   const planCache = (reuseReconcilePlan ?? !anyTickInjected)
-    ? createReconcilePlanCache({ reconcile: reconcilePass, now }) : null;
+    ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
   const phaseMs = {};
   const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
   const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
