@@ -3738,17 +3738,15 @@ Only HTTP 200 with the requested SHA and an `api.github.com` JSON URL qualifies;
 rate limits and the ten-second deadline retain exclusion/refusal and local execution.
 `remote-exec.test.mjs` injects the request seam and checks credential isolation, rejected
 responses, cancellation, and the 64-distinct-OID/16-concurrent lookup bounds.
-Positive results persist by immutable OID in `.admission/remote/public-blobs.jsonl` under
-the shared lane pool, outside the repository. Validate the cache parent against the
-canonical repository path before every read/write, including existing ancestors of
-missing directories; external symlink aliases into the repository are never evidence
-and must not receive cache writes. The named symlink-parent regression proves a
-forged positive still requires a successful anonymous lookup. Atomic replacement of JSON-lines retains at most 4,096
-positives; negatives/errors never persist. Corrupt, unreadable or oversized (384 KiB)
-cache evidence is a miss: a fresh anonymous lookup must succeed or execution stays
-local. Eviction uses the same fallback. Cache write failure cannot invalidate a live
-positive. Named regressions cover zero-call reuse, harmless fixture content, 403/429,
-corruption/oversize/unreadability, eviction, and failed writes.
+Every credential-named file must first be tracked and byte-identical to its index and
+`origin/main` blob, including harmless fixtures with no content finding. Anonymous
+publication evidence relaxes only the content-finding exclusion for test fixtures.
+Positive and negative results live only in a per-`buildManifest` OID-to-boolean map.
+Concurrent duplicate OIDs share the lookup already in progress; each new build requires
+fresh evidence. At most 64 distinct OIDs are looked up per build, with excess OIDs
+retaining exclusion and local execution. No publication evidence is stored on disk.
+Named regressions cover harmless JSON identity, positive and negative reuse within
+one build, fresh lookups across builds, 403/429, malformed responses and deadlines.
 Its named native-transport tests intercept `https.get` while exercising the production
 request helper: assert no Authorization/token options, `agent:false`, and one request
 only when GitHub responds with a cross-host redirect.

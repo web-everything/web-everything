@@ -3,8 +3,8 @@ import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
 import https from 'node:https';
 import * as filesystem from 'node:fs/promises';
-import { constants, mkdirSync, lstatSync, realpathSync, openSync, fstatSync, readSync, closeSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
-import { join, resolve, relative, isAbsolute, win32, dirname, basename, sep } from 'node:path';
+import { constants, mkdirSync, lstatSync, realpathSync } from 'node:fs';
+import { join, resolve, relative, isAbsolute, win32, dirname, basename } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +12,6 @@ import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, diges
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
-import {defaultPoolRoot} from '../lib/lane-pool-paths.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -420,72 +419,7 @@ function anonymousBlobRequest({url, headers, signal}) {
   });
 }
 
-// Immutable public blob evidence is host state, never part of a shipped tree.
-// Concurrent processes may lose a cache addition; that only causes a new lookup.
-const PUBLIC_CACHE_ENTRIES=4096, PUBLIC_CACHE_BYTES=384*1024;
-const publicOidPattern=/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
-function outsideDirectory(root,path) {
-  const rel=relative(root,path);
-  return rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel);
-}
-// Resolve existing ancestors even when a fresh host has no cache directory yet.
-// Only ENOENT permits projection; unreadable/broken evidence disables the cache.
-function canonicalCacheParent(path) {
-  try {return realpathSync(path);} catch(error) {
-    const parent=dirname(path);
-    if(error.code!=='ENOENT'||parent===path)throw error;
-    return join(canonicalCacheParent(parent),basename(path));
-  }
-}
-function publicCachePath(file,cwd,create=false) {
-  try {
-    if(!outsideDirectory(resolve(cwd),file))return null;
-    const repo=realpathSync(cwd);
-    let parent=canonicalCacheParent(dirname(file));
-    if(!outsideDirectory(repo,parent))return null;
-    if(create)mkdirSync(parent,{recursive:true,mode:0o700});
-    // Validate again at each read/write, then use the canonical parent path so
-    // an external alias cannot redirect the operation into repository state.
-    parent=realpathSync(parent);
-    if(!outsideDirectory(repo,parent))return null;
-    return join(parent,basename(file));
-  } catch {return null;}
-}
-function readPublicCache(file,cwd) {
-  file=publicCachePath(file,cwd);
-  if(!file)return [];
-  let fd;
-  try {
-    fd=openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-    const st=fstatSync(fd);
-    if(!st.isFile()||st.size>PUBLIC_CACHE_BYTES)return [];
-    const bytes=Buffer.alloc(PUBLIC_CACHE_BYTES+1);
-    const size=readSync(fd,bytes,0,bytes.length,0);
-    if(size>PUBLIC_CACHE_BYTES)return [];
-    const text=bytes.subarray(0,size).toString('utf8');
-    if(!text.endsWith('\n'))return [];
-    const lines=text.slice(0,-1).split('\n');
-    if(lines.length>PUBLIC_CACHE_ENTRIES)return [];
-    const oids=lines.map(line=>JSON.parse(line)?.oid);
-    if(!oids.every(oid=>typeof oid==='string'&&publicOidPattern.test(oid)))return [];
-    return [...new Set(oids)];
-  } catch {return [];} finally {if(fd!==undefined)try{closeSync(fd);}catch{ /* cache miss remains safe */ }}
-}
-function cachePublicBlob(file,oid,cwd) {
-  let temp;
-  try {
-    file=publicCachePath(file,cwd,true);
-    if(!file)return;
-    const oids=readPublicCache(file,cwd).filter(value=>value!==oid);
-    oids.push(oid);
-    temp=`${file}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
-    writeFileSync(temp,oids.slice(-PUBLIC_CACHE_ENTRIES).map(oid=>JSON.stringify({oid})).join('\n')+'\n',{mode:0o600,flag:'wx'});
-    renameSync(temp,file);
-  } catch { /* Publication was independently proved; cache IO is best effort. */ }
-  finally {if(temp)try{unlinkSync(temp);}catch{ /* renamed or unwritable */ }}
-}
-
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, publicRequest=anonymousBlobRequest, publicCacheFile} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, publicRequest=anonymousBlobRequest} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
@@ -574,15 +508,18 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     await publicLoad;
     return publicBlobs.get(key);
   }
-  // Only positive anonymous evidence persists. Corruption, eviction and IO
-  // failures fall back to a fresh lookup, whose failure retains local execution.
-  // The leaf pool bounds concurrency to 16; cap new OID lookups at 64 per build.
-  const cacheFile=resolve(publicCacheFile??join(defaultPoolRoot(cwd,env),'.admission','remote','public-blobs.jsonl'));
+  // Positive and negative evidence lives only for this build. Concurrent duplicate
+  // OIDs await the lookups already started before reading their boolean result.
+  // The leaf pool bounds concurrency to 16; cap distinct OID lookups at 64.
   const publishedBlobs=new Map();
-  function githubPublished(oid) {
-    if(readPublicCache(cacheFile,cwd).includes(oid))return true;
-    if(publishedBlobs.has(oid))return publishedBlobs.get(oid);
+  let pendingPublications=Promise.resolve();
+  async function githubPublished(oid) {
+    if(publishedBlobs.has(oid)) {
+      await pendingPublications;
+      return publishedBlobs.get(oid);
+    }
     if(publishedBlobs.size>=64)return false;
+    publishedBlobs.set(oid,false);
     const lookup=(async()=>{
       let timer;
       const controller=new AbortController();
@@ -595,13 +532,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
         if(result?.status!==200||typeof result.body!=='string'||Buffer.byteLength(result.body)>LIMIT)return false;
         const body=JSON.parse(result.body);
         const url=new URL(body.url);
-        const published=body.sha===oid && url.protocol==='https:' && url.host==='api.github.com';
-        if(published)cachePublicBlob(cacheFile,oid,cwd);
-        return published;
+        return body.sha===oid && url.protocol==='https:' && url.host==='api.github.com';
       } catch {return false;} finally {clearTimeout(timer);controller.abort();}
     })();
-    publishedBlobs.set(oid,lookup);
-    return lookup;
+    const settled=lookup.then(published=>{publishedBlobs.set(oid,published);return published;});
+    pendingPublications=Promise.all([pendingPublications,settled]);
+    return settled;
   }
   const excludedSource = () => Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
   files.sort(Buffer.compare);
@@ -634,10 +570,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (credentialSource && !names.includes('node_modules')) {
       const key = path.toString('base64');
       const indexedOid = indexBlobs.get(key);
-      publicOid = testFixture ? indexedOid : await publicBlob(key);
+      publicOid = await publicBlob(key);
       if (!indexedOid || indexedOid !== publicOid) {
-        // Fixtures require tracked bytes; other credential paths retain the
-        // origin/main check. Missing evidence keeps the existing local fallback.
+        // Every credential-named file retains the origin/main identity proof.
+        // Anonymous publication only relaxes the content-finding exclusion.
         if (sourceExtension.test(names.at(-1))) throw excludedSource();
         publicOid = undefined;
       }
