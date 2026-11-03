@@ -270,7 +270,9 @@ else if (!args.includes('fetch') && !args.includes('diff')) process.exit(99);
     mkdirSync(join(h.root, 'refs'));
     put(h.root, 'HEAD', 'ref: refs/heads/main\n');
     put(h.root, 'config', `[core]\n bare = true\n sshCommand = untrusted-command\n[remote "origin"]\n url = ${origin}\n[protocol "ssh"]\n allow = never\n`);
-    put(h.root, 'bin/ssh', '#!/bin/sh\nprintf "0000"\n');
+    // Answer Git's SSH capability probe separately. Keep stdin open until Git
+    // finishes its request, otherwise protocol-v2 writes can race our exit (SIGPIPE).
+    put(h.root, 'bin/ssh', '#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = "-G" ]; then exit 0; fi\ndone\nprintf "0000"\ncat >/dev/null\n');
     chmodSync(join(h.root, 'bin/ssh'), 0o755);
     const runner = h.exec.getMockImplementation();
     let probe;
@@ -288,6 +290,8 @@ else if (!args.includes('fetch') && !args.includes('diff')) process.exit(99);
       PATH: `${join(h.root, 'bin')}:${process.env.PATH}`,
       GIT_ALLOW_PROTOCOL: 'ext', GIT_SSH_COMMAND: 'untrusted-command',
     }, log: () => {} }).then(() => 'continued', error => error.message);
+    expect(probe.error).toBeUndefined();
+    expect(probe.signal).toBeNull();
     expect(probe.stderr).toBe('');
     expect(probe.status).toBe(0);
     expect(outcome).toBe('continued');
@@ -369,6 +373,8 @@ else if (!args.includes('fetch') && !args.includes('diff')) process.exit(99);
     const { guardToolCheckout } = await load();
     const root = scratch();
     const marker = join(root, 'transport-executed');
+    // The realpath entry check must pass before this test can exercise transport refusal.
+    put(root, 'scripts/tool.mjs', '');
     // A minimal bare repository, assembled as files: no .git writes or Git setup commands.
     mkdirSync(join(root, 'objects'));
     mkdirSync(join(root, 'refs'));
