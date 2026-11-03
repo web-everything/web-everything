@@ -100,13 +100,19 @@ export function transcriptActivityMs(row, { resolve = resolveSessionTranscript, 
   let newest;
   try { newest = stat(file).mtimeMs; } catch { return null; }
   if (!Number.isFinite(newest)) return null;
-  try {
-    const subDir = joinPath(dirname(file), basename(file, '.jsonl'), 'subagents');
-    for (const f of list(subDir)) {
-      if (!f.endsWith('.jsonl')) continue;
-      try { newest = Math.max(newest, stat(joinPath(subDir, f)).mtimeMs); } catch { /* unreadable subagent: main stands */ }
+  const subDir = joinPath(dirname(file), basename(file, '.jsonl'), 'subagents');
+  let names;
+  try { names = list(subDir); } catch (e) {
+    if (e?.code === 'ENOENT' || e?.code === 'ENOTDIR') return newest; // no subagents were ever bound
+    return null; // unreadable child activity is unknown: fail closed
+  }
+  for (const f of names) {
+    if (!f.endsWith('.jsonl')) continue;
+    try { newest = Math.max(newest, stat(joinPath(subDir, f)).mtimeMs); } catch (e) {
+      if (e?.code === 'ENOENT') continue; // vanished between listing and stat
+      return null;
     }
-  } catch { /* no subagent dir */ }
+  }
   return newest;
 }
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
