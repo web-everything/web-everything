@@ -156,8 +156,133 @@ function extraction(root) {
   mkdirSync(ops, { recursive: true });
   writeFileSync(join(ops, 'coroner-extract.mjs'), '');
   return { input: { night: '2026-10-16', until: '2026-10-17T02:17:00.000Z', dir, sourceRoot: root },
-    io: { root, home, statusFeed: join(home, 'needs-you-events.jsonl'), acquire: vi.fn(async () => lane), release: vi.fn(async () => {}), sweep: vi.fn(async () => {}), run: vi.fn(async () => JSON.stringify({ changeRequests: { rounds: 2 } })) } };
+    io: { root, home, statusFeed: join(home, 'needs-you-events.jsonl'), acquire: vi.fn(async () => lane), release: vi.fn(async () => {}), sweep: vi.fn(async () => {}),
+      judge: vi.fn(async () => ({ value: { verdicts: [] } })), fileItem: vi.fn(async () => ({ id: 'test-card' })),
+      run: vi.fn(async () => JSON.stringify({ changeRequests: { rounds: 2 } })) } };
 }
+// These fixtures exercise the new default without permitting live judge/file-item IO.
+function judgedExtraction() {
+  const fixture = extraction(temp());
+  const metrics = { errorRates: { gateRuns: { causes: Object.fromEntries(Array.from({ length: 6 }, (_, n) =>
+    [`cause-${n}`, { count: n + 1, minutes: 60 - n, examples: [{ ref: `PR #${101 + n}`, at: fixture.input.until }] }])) } } };
+  fixture.io.run.mockResolvedValue(JSON.stringify(metrics));
+  fixture.io.judge.mockImplementation(async () => {
+    const { rankFrictions } = await import('../../operations/coroner-judge.mjs');
+    return { value: { verdicts: rankFrictions(metrics).map(({ key }, n) => n === 1
+      ? { key, verdict: 'COVERED-BY', coveredBy: 'PR #42' } : { key, verdict: 'NEW' }) } };
+  });
+  fixture.io.fileItem.mockImplementation(async () => ({ id: `card-${fixture.io.fileItem.mock.calls.length}` }));
+  return { ...fixture, metrics };
+}
+function seedUnjudgedReport({ input, io, metrics }) {
+  // Historical extraction receipt: no judge receipt exists, and the extractor must not be re-run.
+  mkdirSync(io.home, { recursive: true }); mkdirSync(input.dir, { recursive: true });
+  const window = { since: '2026-10-16T02:17:00.000Z', until: input.until };
+  writeFileSync(join(io.home, `coroner-${input.night}.md`), [
+    `# Nightly coroner — ${input.night}`, '',
+    'Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.', '',
+    '## Extraction (includes change-request rounds when available)', '', '```json', JSON.stringify(metrics, null, 2), '```', '',
+    '## False findings', '', 'Extractor not present.', '', `<!-- nightly-coroner ${JSON.stringify(window)} -->`, '',
+  ].join('\n'));
+  writeFileSync(join(input.dir, 'nightly-coroner-cursor.json'), JSON.stringify({ lastNight: input.night, lastEnd: input.until }));
+}
+it('judges after extraction publication by default, files only NEW with the default three-card cap, and updates report wording', async () => {
+  const { input, io } = judgedExtraction();
+  const judge = io.judge.getMockImplementation();
+  io.judge.mockImplementation(async (...args) => {
+    expect(existsSync(join(io.home, `coroner-${input.night}.md`))).toBe(true);
+    expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-ready');
+    return judge(...args);
+  });
+  const result = await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledOnce();
+  expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(JSON.stringify(io.fileItem.mock.calls)).toContain('PR #101');
+  expect(JSON.stringify(io.fileItem.mock.calls)).not.toContain('PR #102');
+  const report = readFileSync(join(io.home, result.report), 'utf8');
+  expect(report).not.toContain('no agent session was launched');
+  expect(report).not.toContain('Operator judgment is pending');
+  expect(io.release).toHaveBeenCalledOnce();
+});
+it('persists a completed judge receipt so re-entry with fresh IO neither judges nor files twice', async () => {
+  const { input, io } = judgedExtraction();
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+  const replay = { ...io, judge: vi.fn(), fileItem: vi.fn(), run: vi.fn(), acquire: vi.fn() };
+  await extractNightlyCoroner(input, replay);
+  expect(replay.judge).not.toHaveBeenCalled(); expect(replay.fileItem).not.toHaveBeenCalled();
+  expect(replay.run).not.toHaveBeenCalled(); expect(replay.acquire).not.toHaveBeenCalled();
+});
+it('resumes a historical published report without a judge receipt and never repeats extraction', async () => {
+  const fixture = judgedExtraction(); seedUnjudgedReport(fixture);
+  const { input, io } = fixture;
+  const result = await extractNightlyCoroner(input, io);
+  expect(io.run).not.toHaveBeenCalled(); expect(io.acquire).not.toHaveBeenCalled();
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(readFileSync(join(io.home, result.report), 'utf8')).not.toContain('no agent session was launched');
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+});
+it('honors judge.enabled=false without marking an unjudged report completed, then judges when enabled', async () => {
+  const { input, io } = judgedExtraction();
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: false } } }, io);
+  expect(io.judge).not.toHaveBeenCalled(); expect(io.fileItem).not.toHaveBeenCalled();
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: true } } }, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledTimes(3);
+  expect(io.run).toHaveBeenCalledOnce();
+});
+it('honors coroner.nightly.judge.maxCards even when more ranked causes are NEW', async () => {
+  const { input, io } = judgedExtraction();
+  await extractNightlyCoroner({ ...input, nightly: { judge: { enabled: true, maxCards: 1 } } }, io);
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).toHaveBeenCalledOnce();
+});
+it.each(['exception', 'invalid answer', 'filing exception'])('preserves extraction and publishes a judge-failed feed note on %s', async (failure) => {
+  const { input, io } = judgedExtraction();
+  if (failure === 'exception') io.judge.mockRejectedValue(new Error('judge unavailable'));
+  if (failure === 'invalid answer') io.judge.mockResolvedValue({ value: 'unparseable judge answer' });
+  if (failure === 'filing exception') io.fileItem.mockRejectedValue(new Error('file-item unavailable'));
+  const result = await extractNightlyCoroner(input, io);
+  expect(result.report).toBe(`coroner-${input.night}.md`);
+  expect(existsSync(join(io.home, result.report))).toBe(true);
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-cursor.json'), 'utf8')).lastEnd).toBe(input.until);
+  expect(io.judge).toHaveBeenCalledOnce();
+  if (failure !== 'filing exception') expect(io.fileItem).not.toHaveBeenCalled();
+  const feed = readFileSync(io.statusFeed, 'utf8');
+  expect(feed).toContain('coroner-ready');
+  expect(feed).toContain('coroner-judge-failed');
+  if (failure !== 'invalid answer') expect(feed).toContain(failure === 'exception' ? 'judge unavailable' : 'file-item unavailable');
+  expect(io.release).toHaveBeenCalledOnce();
+});
+it('honors an already aborted signal on report replay without launching the pending judge', async () => {
+  const fixture = judgedExtraction(); seedUnjudgedReport(fixture);
+  const controller = new AbortController(); controller.abort(new Error('stopped before judge'));
+  await expect(extractNightlyCoroner(fixture.input, { ...fixture.io, signal: controller.signal })).rejects.toThrow('stopped before judge');
+  expect(fixture.io.judge).not.toHaveBeenCalled(); expect(fixture.io.fileItem).not.toHaveBeenCalled();
+});
+it('checks abort after judgment before filing and leaves the published report eligible for judging on replay', async () => {
+  const { input, io } = judgedExtraction(); const controller = new AbortController();
+  const judge = io.judge.getMockImplementation();
+  io.judge.mockImplementation(async (...args) => {
+    const answer = await judge(...args); controller.abort(new Error('stopped during judge')); return answer;
+  });
+  await expect(extractNightlyCoroner(input, { ...io, signal: controller.signal })).rejects.toThrow('stopped during judge');
+  expect(io.judge).toHaveBeenCalledOnce(); expect(io.fileItem).not.toHaveBeenCalled();
+  io.judge.mockImplementation(judge);
+  await extractNightlyCoroner(input, io);
+  expect(io.run).toHaveBeenCalledOnce(); expect(io.judge).toHaveBeenCalledTimes(2);
+  expect(io.fileItem).toHaveBeenCalledTimes(3);
+});
+it('resolves and logs judge defaults and tool overrides through nightly settings', () => {
+  const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+  const defaults = resolveNightlyCoronerSettings({ read: missing, env: {}, log: vi.fn() });
+  expect(defaults.value.judge).toMatchObject({ enabled: true, maxCards: 3 });
+  const log = vi.fn();
+  const out = resolveNightlyCoronerSettings({ env: {}, log, read: (path) => path.endsWith('coroner.json')
+    ? JSON.stringify({ coroner: { nightly: { judge: { enabled: false, maxCards: 1 } } } }) : '{}' });
+  expect(out.value.judge).toMatchObject({ enabled: false, maxCards: 1 });
+  expect(JSON.stringify(out.sources)).toContain('tool');
+  expect(log.mock.calls.flat().join('\n')).toMatch(/judge/);
+});
 it.each(['lane-directory', 'script-file'])('executes both extractor CLIs through a symlinked %s path', async (kind) => {
   const root = temp(); const { input, io } = extraction(root);
   const lane = await io.acquire(); io.acquire.mockClear();
