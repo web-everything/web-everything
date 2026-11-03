@@ -124,7 +124,7 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
 import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
-import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
+import { collapseRollupToLatestPerName, rollupRowKind, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
@@ -2072,21 +2072,28 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
  *  `review:pending` that would hold an auto-landing PR for a review it does not need. */
 export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
-/** True when the newest completion/success status is at least the grace old (or, non-strictly, no timestamp is readable). */
-export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
-  // Use the same winning rows as CI truth; superseded statuses/runs cannot hold grace open.
-  const checks = collapseRollupToLatestPerName(rollup);
-  // An active latest run is not settled, even when non-strict grace permits missing timestamps.
-  // Otherwise a queued rerun erases the previous completion and bypasses the producer's wait.
-  if (checks.some(c => c?.status && String(c.status).toUpperCase() !== 'COMPLETED')) return false;
-  // gh and the paged mapper expose StatusContext.createdAt as startedAt: it dates the reported
-  // success, not a CheckRun's start. CheckRuns must still supply their own completion time.
-  // The paged mapper's zero-date sentinel parses successfully but is not completion evidence.
-  const times = checks.map((c) => Date.parse(c?.__typename === 'StatusContext' && c?.state === 'SUCCESS'
-    ? c.startedAt : c?.completedAt)).filter((time) => Number.isFinite(time) && time > 0);
-  if (strict && (times.length !== checks.length)) return false; // strict: ANY unreadable timing is NOT settled
-  if (!times.length || !Number.isFinite(now) || !now) return !strict; // strict: unknown timing is NOT settled
-  return now - Math.max(...times) >= graceMs;
+/** True only with complete timing evidence and every latest run completed at least the grace ago. */
+export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS) {
+  if (!Array.isArray(rollup) || !rollup.length || !Number.isFinite(now) || now <= 0) return false;
+  // Validate BEFORE collapsing: unreadable timing makes a name's latest run unknowable.
+  // gh exposes StatusContext.createdAt as startedAt; normalize it for the shared time ordering.
+  // CheckRuns must supply completedAt. Zero-date sentinels are not completion evidence.
+  const timed = rollup.map(c => ({ ...c,
+    completedAt: rollupRowKind(c) === 'StatusContext' ? c.startedAt : c?.completedAt,
+  }));
+  if (timed.some(c => !Number.isFinite(Date.parse(c.completedAt)) || Date.parse(c.completedAt) <= 0)) return false;
+  const checks = collapseRollupToLatestPerName(timed);
+  if (checks.some(c => rollupRowKind(c) === 'StatusContext'
+    ? String(c.state).toUpperCase() !== 'SUCCESS'
+    : String(c.status).toUpperCase() !== 'COMPLETED')) return false;
+  return checks.every(c => now - Date.parse(c.completedAt) >= graceMs);
+}
+
+/** Required-check hydration cannot erase incomplete or unsettled evidence from the original rollup. */
+function restoreReviewChecksSettled(pr, now) {
+  return pr?.rollupIncomplete !== true && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)
+    && (!Object.hasOwn(pr, 'preHydrationStatusCheckRollup')
+      || greenSettledForRestoreGrace(pr.preHydrationStatusCheckRollup, now));
 }
 
 /** #3902 — env switch for the review-label healer: `stuck` (default) | `green` | `off`. */
@@ -2833,7 +2840,7 @@ export function planReconcile({
         && ((laneHead && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red')))
           || (!laneHead && botAuthored && withPhase.check === 'green'))
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, { strict: !laneHead })) {
+        && restoreReviewChecksSettled(pr, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         why: 'open PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
@@ -2854,7 +2861,7 @@ export function planReconcile({
         && withPhase.labels.includes('ready-to-merge')
         && !withPhase.labels.some((l) => l.startsWith('review:'))
         && isAiGeneratedPr(pr)
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && restoreReviewChecksSettled(pr, now)) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'stuck',
         why: 'ready-to-merge lane PR with a red required check and no review:* label — the drain only scores '
@@ -2869,7 +2876,7 @@ export function planReconcile({
         && ['open', 'queued'].includes(phase) && String(pr?.headRefName ?? '').startsWith('lane/')
         && isAiGeneratedPr(pr) && !withPhase.labels.some(l => l.startsWith('review:'))
         && (withPhase.check === 'red' || withPhase.labels.some(l => ['status:ci-red', 'ci:failed'].includes(l)))
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && restoreReviewChecksSettled(pr, now)) {
       dispatch.push({ ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
         variant: 'stuck', rule: 'unlabeled-red',
         why: `agent PR reads ci-red but has no review:* label, so no daemon owns it (phase ${phase} answers nothing-owed); apply review:pending so the review path owns it; real red CI then routes to ci-heal` });

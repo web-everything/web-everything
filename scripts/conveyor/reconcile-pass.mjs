@@ -1431,6 +1431,10 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
     ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+      // REST check-runs can supply required CI, but omit legacy statuses and may drop unreadable duplicates.
+      // Restoration must also validate the original evidence, including an explicit unknown (null) rollup.
+      preHydrationStatusCheckRollup: Object.hasOwn(pr, 'preHydrationStatusCheckRollup')
+        ? pr.preHydrationStatusCheckRollup : pr.statusCheckRollup,
       ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };

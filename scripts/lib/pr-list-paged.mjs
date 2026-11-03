@@ -72,7 +72,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision author{login __typename} labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision author{login __typename} labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{workflowRun{workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
@@ -83,11 +83,15 @@ const mapCtx = c => c.__typename === 'CheckRun'
 
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape. */
 export function mapGraphqlPr(n) {
+  const contexts = n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts;
+  // A bounded or unreadable connection is unknown, never a complete green rollup.
+  // Preserve that through JSON snapshots using null; the next read can establish completeness.
+  const complete = contexts?.pageInfo?.hasNextPage === false && Array.isArray(contexts?.nodes);
   return { number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
     headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
-    statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx),
+    statusCheckRollup: complete ? contexts.nodes.map(mapCtx) : null,
     // GraphQL Bot logins need not carry gh's app/ prefix; preserve bot identity explicitly.
     author: n.author ? { login: n.author.login, is_bot: n.author.__typename === 'Bot' } : null };
 }

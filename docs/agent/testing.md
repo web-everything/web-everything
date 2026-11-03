@@ -1779,6 +1779,17 @@ so map `__typename` to `is_bot`. Keep human and missing-author controls in
 `pr-list-paged.test.mjs`, and cover refreshing a persisted snapshot without the field
 and preserving author data on cache hits in `pr-snapshot.test.mjs`.
 
+Review-label grace needs complete check evidence in every branch, including lane heads.
+Validate every run's completion timestamp before collapsing names: an unreadable duplicate
+must not disappear behind an older green run. Status contexts use their reported timestamp;
+check runs need a completion timestamp. Test both duplicate orders and the ten-minute boundary.
+Paged rollups require `contexts.pageInfo.hasNextPage === false`; truncated or unknown pages
+remain `null` through snapshot serialization and cannot satisfy grace. Keep complete-page
+fixtures explicit, including exactly 100 contexts, and replay these cases through the
+unlabelled-bot soak scenario as well as the mapper and reconcile tests. Required-check
+REST hydration must retain the original rollup for grace: its check-run-only response
+cannot establish completeness of legacy status contexts or erase unreadable duplicates.
+
 ### Explicit Claude spawn models
 
 Operator rule (2026-09-29): every fresh daemon-launched Claude session must pass an explicit

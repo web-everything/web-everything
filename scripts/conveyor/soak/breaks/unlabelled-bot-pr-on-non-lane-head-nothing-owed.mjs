@@ -25,7 +25,7 @@ export default {
       violations.push(`PR #6254 (open, green, bot, no review label) was not owed a label: ${JSON.stringify(plan.refusals.map((r) => r.kind))}`);
     }
     // PR #6296 red-team: the real paged mapper exposes StatusContext.createdAt as startedAt.
-    const mapped = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
+    const mapped = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [
       done('test'), { __typename: 'StatusContext', context: 'external-ci', state: 'SUCCESS', createdAt: '2026-11-02T15:20:00Z' },
     ] } } } }] } });
     for (const now of ['2026-11-02T16:20:00Z', '2026-11-03T16:20:00Z']) {
@@ -38,7 +38,7 @@ export default {
     // PR #6296 send-back: grace must use the same winning rows as CI truth and reject mapper zero dates.
     const cases = [
       { name: 'legacy failure superseded by CheckRun', nodes: [
-        { __typename: 'StatusContext', context: 'test', state: 'FAILURE' }, done('test'),
+        { __typename: 'StatusContext', context: 'test', state: 'FAILURE', createdAt: '2026-11-02T15:00:00Z' }, done('test'),
       ], owed: true },
       { name: 'optional queued run', nodes: [done('test'),
         { __typename: 'CheckRun', name: 'optional', status: 'QUEUED', conclusion: null, completedAt: null },
@@ -49,11 +49,32 @@ export default {
       { name: 'optional run completed and settled', nodes: [done('test'), done('optional')], owed: true },
     ];
     for (const { name, nodes, owed } of cases) {
-      const mappedCase = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes } } } }] } });
+      const mappedCase = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes, pageInfo: { hasNextPage: false } } } } }] } });
       const result = planReconcile({ prs: [{ ...pr, statusCheckRollup: mappedCase.statusCheckRollup }], agents: [],
         now: Date.parse('2026-11-02T16:00:00Z'), requiredChecks: ['test'] });
       if (result.dispatch.some((d) => d.kind === 'restore-review-label') !== owed) {
         violations.push(`${name}: expected restore-review-label=${owed}`);
+      }
+    }
+    // PR #6296 operator send-back: unknown timing cannot be hidden by collapse or pagination.
+    for (const completedAt of [undefined, 'unreadable', '0001-01-01T00:00:00Z']) {
+      const unknown = { ...done('test'), completedAt };
+      for (const nodes of [[unknown, done('test')], [done('test'), unknown]]) {
+        cases.push({ name: `unreadable duplicate ${completedAt}`, nodes, owed: false });
+      }
+    }
+    for (const { name, nodes, owed } of cases) {
+      for (const hasNextPage of [false, true, undefined]) {
+        const mappedCase = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: {
+          contexts: { nodes, pageInfo: { hasNextPage } },
+        } } }] } });
+        for (const headRefName of ['ci/refresh-test-timings', 'lane/child']) {
+          const result = planReconcile({ prs: [{ ...pr, headRefName, baseRefName: 'lane/parent', statusCheckRollup: mappedCase.statusCheckRollup }],
+            agents: [], now: Date.parse('2026-11-02T16:00:00Z'), requiredChecks: ['test'] });
+          if (result.dispatch.some(d => d.kind === 'restore-review-label') !== (owed && hasNextPage === false)) {
+            violations.push(`${name}, ${headRefName}, hasNextPage=${hasNextPage}: incomplete checks restored review or complete checks were held`);
+          }
+        }
       }
     }
     // A queued rerun must not turn a fresh completion into settled non-strict grace.

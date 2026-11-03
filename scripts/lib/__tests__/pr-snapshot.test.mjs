@@ -31,7 +31,7 @@ const PAGING = { pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600, source: 
 const pageCalls = calls => calls.filter(a => a[0] === 'api');
 const viewCalls = calls => calls.filter(a => a[0] === 'pr');
 
-function fakeExec(prs = PRS) {
+function fakeExec(prs = PRS, contextPageInfo = { hasNextPage: false }) {
   const calls = [];
   const exec = (file, argv) => {
     expect(file).toBe('gh');
@@ -45,6 +45,7 @@ function fakeExec(prs = PRS) {
       const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, author, ...p }) => ({
         ...p, author: author && { login: author.login, __typename: author.is_bot ? 'Bot' : 'User' },
         labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+          pageInfo: contextPageInfo,
           nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
             ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
@@ -100,6 +101,22 @@ describe('pure helpers', () => {
 });
 
 describe('readSharedOpenPrs — one fetch serves the fleet', () => {
+  it.each([{ hasNextPage: true }, {}, null])(
+    'preserves unknown check completeness through cache hits, then recovers on a complete refresh: %j', pageInfo => {
+      const { exec, calls } = fakeExec([PRS[0]], pageInfo);
+      const fields = 'number,statusCheckRollup';
+      const expected = [{ number: PRS[0].number, statusCheckRollup: null }];
+      expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(expected);
+      expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(expected);
+      expect(pageCalls(calls)).toHaveLength(1);
+      const saved = JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8'));
+      expect(saved.prs[0].statusCheckRollup).toBeNull();
+      clock += 80_000;
+      const complete = fakeExec([PRS[0]]);
+      expect(readSharedOpenPrs(opts({ fields, exec: complete.exec })))
+        .toEqual([{ number: PRS[0].number, statusCheckRollup: PRS[0].statusCheckRollup }]);
+      expect(pageCalls(complete.calls)).toHaveLength(1);
+    });
   it('refreshes an old field union and preserves bot identity through fresh and cached reads', () => {
     const author = { login: 'web-everything', is_bot: true };
     const { exec, calls } = fakeExec([{ ...PRS[0], author }]);

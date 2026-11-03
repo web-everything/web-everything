@@ -1040,6 +1040,27 @@ const xxOptions = () => ({ repo: 'we', readPrs: () => [xxPr()], readAgents: () =
   enrichAlreadyLanded: prs => prs, enrichBaseRef: prs => prs, enrichSystemFix: prs => prs,
   enrichFixClaims: prs => prs, resolveMainSha: () => null, enrichTimeouts: prs => prs });
 
+it.each(['truncated', 'missing-page-info', 'unreadable-duplicate', 'complete', 'fresh-hydration'])(
+  'review grace preserves original completeness and timing through REST hydration: %s', async shape => {
+    const { runReconcilePass } = await import('../reconcile-pass.mjs');
+    const { mapGraphqlPr } = await import('../../lib/pr-list-paged.mjs');
+    const now = Date.parse('2026-11-03T11:00:00Z');
+    const completedAt = '2026-11-03T10:00:00Z';
+    const nodes = Array.from({ length: 100 }, () => ({ __typename: 'CheckRun', name: 'test',
+      status: 'COMPLETED', conclusion: 'SUCCESS', completedAt }));
+    if (shape === 'unreadable-duplicate') nodes[0].completedAt = undefined;
+    const pageInfo = shape === 'missing-page-info' ? undefined : { hasNextPage: shape === 'truncated' };
+    const mapped = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes, pageInfo } } } }] } });
+    const pr = { ...xxPr(), state: 'OPEN', isDraft: false, headRefName: 'ci/refresh-test-timings', baseRefName: 'main',
+      author: { login: 'app/web-everything' }, statusCheckRollup: mapped.statusCheckRollup };
+    const readChecks = vi.fn(() => [{ id: 1, name: 'test', status: 'completed', conclusion: 'success',
+      completed_at: shape === 'fresh-hydration' ? '2026-11-03T10:59:00Z' : completedAt }]);
+    const plan = runReconcilePass({ ...xxOptions(), now, readPrs: () => [pr], readChecks,
+      readRequiredChecks: () => ({ checks: ['test'] }) });
+    expect(readChecks).toHaveBeenCalledOnce();
+    expect(plan.dispatch.some(d => d.kind === 'restore-review-label')).toBe(shape === 'complete');
+  });
+
 it('xxh4zw8 hydrates the crowded snapshot before planning same-tick recovery', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const readChecks = vi.fn(() => xxRuns());

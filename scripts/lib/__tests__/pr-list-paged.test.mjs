@@ -34,6 +34,7 @@ describe('query and gh row shape', () => {
     expect(q).toContain('repository(owner:"owner",name:"name")');
     expect(q).toContain('states:OPEN,first:20,orderBy:');
     expect(q).toContain('author{login __typename}');
+    expect(q).toContain('contexts(first:100){pageInfo{hasNextPage}');
     expect(q).not.toContain('after:');
     expect([...q].filter(c => c === '{')).toHaveLength([...q].filter(c => c === '}').length);
     const after = 'cursor"\\\n';
@@ -56,14 +57,14 @@ describe('query and gh row shape', () => {
       conclusion: null, startedAt: null, detailsUrl: 'https://example.com/check' };
     const status = { __typename: 'StatusContext', context: 'ci', createdAt: 'today', state: 'PENDING', targetUrl: null };
     const n = node(1, { labels: { nodes: [{ id: 'id', name: 'ready', description: '', color: 'abc123' }] },
-      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status] } } } }] } });
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status], pageInfo: { hasNextPage: false } } } } }] } });
     expect(mapGraphqlPr(n)).toEqual({ ...node(1), reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
       { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: '', detailsUrl: check.detailsUrl,
         name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '' },
       { __typename: 'StatusContext', context: 'ci', startedAt: 'today', state: 'PENDING', targetUrl: '' },
     ] });
     expect(Object.keys(row(1))).toEqual(PAGED_LIGHT_FIELDS);
-    expect(row(1)).toMatchObject({ labels: [], statusCheckRollup: [], reviewDecision: '' });
+    expect(row(1)).toMatchObject({ labels: [], statusCheckRollup: null, reviewDecision: '' });
     check.checkSuite = { workflowRun: { workflow: { name: 'build' } } };
     expect(mapGraphqlPr(n).statusCheckRollup[0].workflowName).toBe('build');
     expect(Object.isFrozen(HEAVY_FIELDS)).toBe(true);
@@ -75,6 +76,27 @@ describe('query and gh row shape', () => {
       JSON.stringify({ errors: [{ message: 'GraphQL: Something went wrong while executing your query' }], data: {} })]) {
       expect(() => parseOpenPrPage(text)).toThrow();
     }
+  });
+  it.each([true, undefined, null, 'false'])(
+    'does not publish a partial check rollup when hasNextPage is %s', hasNextPage => {
+      const nodes = Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: `check-${i}`,
+        status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-12T00:00:00Z' }));
+      for (const pageInfo of [{ hasNextPage }, undefined]) {
+        const n = node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes, pageInfo } } } }] } });
+        expect(mapGraphqlPr(n).statusCheckRollup).toBeNull();
+        expect(parseOpenPrPage(page([n])).rows[0].statusCheckRollup).toBeNull();
+      }
+    });
+  it('accepts a complete 100-context page and rejects unreadable context nodes', () => {
+    const nodes = Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: `check-${i}`,
+      status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-12T00:00:00Z' }));
+    const mapped = nodes => mapGraphqlPr(node(1, { commits: { nodes: [{ commit: {
+      statusCheckRollup: { contexts: { nodes, pageInfo: { hasNextPage: false } } },
+    } }] } })).statusCheckRollup;
+    expect(mapped(nodes)).toHaveLength(100);
+    expect(mapped([])).toEqual([]);
+    expect(mapped(null)).toBeNull();
+    expect(mapped(undefined)).toBeNull();
   });
   it('uses shared transient patterns', () => {
     for (const text of [timeout, 'HTTP 502', 'unexpected end of JSON input', "invalid character '<' looking for beginning of value"]) {

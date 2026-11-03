@@ -470,7 +470,7 @@ function handleOpenPrPage(store, rest) {
     const { labels, statusCheckRollup, author, ...light } = pickFields(view, PAGED_LIGHT_FIELDS.join(','));
     const bot = author?.is_bot === true || /^app\//.test(author?.login ?? '') || /\[bot\]$/.test(author?.login ?? '');
     return { ...light, author: author ? { login: author.login, __typename: bot ? 'Bot' : 'User' } : null,
-      labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup } } } }] } };
+      labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: statusCheckRollup, pageInfo: { hasNextPage: false } } } } }] } };
   });
   return jsonResult({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
     pageInfo: { hasNextPage: offset + nodes.length < prs.length, endCursor: nodes.length ? `fake-pr-page:${offset + nodes.length}` : null } } } } });
