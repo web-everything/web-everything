@@ -865,7 +865,7 @@ async function runCli() {
       return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
     }
     let rulingsText = '';
-    try { rulingsText = readFileSync(process.env.WE_RULINGS_PATH || join(homedir(), 'workspace/.operations/handoff/rulings.md'), 'utf8'); } catch { /* fail closed: no ruling ids resolve */ }
+    try { rulingsText = readFileSync(join(homedir(), 'workspace/.operations/handoff/rulings.md'), 'utf8'); } catch { /* fail closed: no ruling ids resolve */ }
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files, actor: currentActorId(), rulingsText });
   }
 
