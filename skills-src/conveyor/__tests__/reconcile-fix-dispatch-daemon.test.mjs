@@ -1932,6 +1932,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(probe([{ ...lane('busy'), pidAlive: true }])).not.toEqual(probe([{ ...lane('busy'), pidAlive: false }]));
     const chat = (status) => ({ sessionId: 's2', kind: 'interactive', cwd: '/w/main', status });
     expect(probe([chat('idle')])).toEqual(probe([chat('busy')]));
+    expect(probe([{ ...chat('idle'), laneHeadOid: 'a' }])).not.toEqual(probe([{ ...chat('idle'), laneHeadOid: 'b' }]));
     expect(() => readPlanClaims({ readAgents: () => null })).toThrow(/unreadable/);
   });
 });
