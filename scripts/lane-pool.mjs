@@ -2516,7 +2516,7 @@ async function cmdAcquire(repo) {
       let candidateDirs;
       let usingFreeList = false;
       if (!freeListExhausted) {
-        const freeCands = freeLaneCandidates(freeList, { exclude: excluded });
+        const freeCands = freeLaneCandidates(freeList, { exclude: excluded, nowMs: Date.now(), maxAgeMs: freeListMaxAgeMs() });
         if (freeCands.length) {
           candidateDirs = freeCands.map((n) => laneDir(repo, n));
           usingFreeList = true;

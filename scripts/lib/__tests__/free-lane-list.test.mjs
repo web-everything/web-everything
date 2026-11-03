@@ -172,3 +172,11 @@ describe('read/write IO shell', () => {
     expect(readFreeLaneList(path)).toBeNull();
   });
 });
+
+describe('freeLaneCandidates per-entry age', () => {
+  it('drops entries older than the limit even when the list itself is fresh', () => {
+    const list = { v: 1, writtenAt: 1_000_000, repo: 'r', poolDir: null, lanes: [{ lane: 1, at: 1_000_000 - 700_000 }, { lane: 2, at: 1_000_000 - 1000 }] };
+    expect(freeLaneCandidates(list, { nowMs: 1_000_000, maxAgeMs: 600_000 })).toEqual([2]);
+    expect(freeLaneCandidates(list)).toEqual([1, 2]);
+  });
+});
