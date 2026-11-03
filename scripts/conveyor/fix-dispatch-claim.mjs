@@ -86,20 +86,18 @@ import {
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
-import { resolveSessionTranscript } from '../operations/agent-usage-report.mjs';
 import { readdirSync, statSync } from 'node:fs';
 import { dirname, join as joinPath, basename } from 'node:path';
 
-/** Newest mtime (ms) of the holder's transcript and any bound subagent transcripts, or null when the main
- *  transcript cannot be read (callers fail closed: unknown activity means the holder is not idle). */
-export function transcriptActivityMs(row, { resolve = resolveSessionTranscript, stat = statSync, list = readdirSync } = {}) {
-  const sessionId = row?.sessionId, cwd = row?.cwd;
-  if (!sessionId) return null;
-  let file;
-  try { file = resolve({ session: String(sessionId), cwd: String(cwd ?? '') }); } catch { return null; }
-  let newest;
-  try { newest = stat(file).mtimeMs; } catch { return null; }
-  if (!Number.isFinite(newest)) return null;
+/** Newest activity (ms) of the holder: the SAME transcript-tail read the hung detector uses for the main transcript
+ *  (so a missing, unreadable or partly unparseable transcript is unknown, exactly as `readHungInfo` treats it), and the
+ *  newest mtime of any bound subagent transcript. Null = unknown; callers fail closed and keep the claim. */
+export function transcriptActivityMs(row, { tail = readTranscriptTailActivity, stat = statSync, list = readdirSync } = {}) {
+  let t;
+  try { t = tail(row, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 }); } catch { return null; }
+  if (!t || t.hadUnparseableLine || !Number.isFinite(t.lastActivityMs)) return null;
+  const file = t.file;
+  let newest = t.lastActivityMs;
   const subDir = joinPath(dirname(file), basename(file, '.jsonl'), 'subagents');
   let names;
   try { names = list(subDir); } catch (e) {
@@ -115,7 +113,7 @@ export function transcriptActivityMs(row, { resolve = resolveSessionTranscript, 
   }
   return newest;
 }
-import { readHungInfo, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER } from './hung-session.mjs';
+import { readHungInfo, readTranscriptTailActivity, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';

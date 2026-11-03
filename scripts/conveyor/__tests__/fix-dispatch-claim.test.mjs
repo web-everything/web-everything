@@ -834,15 +834,17 @@ describe('idle-claim auto-release (R201)', () => {
     expect(released).toBe(0);
   });
 
-  it('transcriptActivityMs takes the newest of the main and subagent transcripts, null when unreadable', () => {
-    const stat = (f) => { if (f.endsWith('main.jsonl')) return { mtimeMs: 100 }; if (f.endsWith('sub.jsonl')) return { mtimeMs: 500 }; throw new Error('x'); };
+  it('transcriptActivityMs: main tail activity, newest subagent mtime, unknown (null) on any doubt', () => {
     const row = { sessionId: 'main', cwd: '/c' };
-    expect(transcriptActivityMs(row, { resolve: () => '/p/main.jsonl', stat, list: () => ['sub.jsonl', 'junk.txt'] })).toBe(500);
-    expect(transcriptActivityMs(row, { resolve: () => '/p/main.jsonl', stat, list: () => { throw Object.assign(new Error('none'), { code: 'ENOENT' }); } })).toBe(100);
-    expect(transcriptActivityMs(row, { resolve: () => '/p/main.jsonl', stat, list: () => { throw Object.assign(new Error('perm'), { code: 'EACCES' }); } })).toBeNull();
-    expect(transcriptActivityMs(row, { resolve: () => '/p/main.jsonl', stat: (f) => { if (f.endsWith('sub.jsonl')) throw Object.assign(new Error('perm'), { code: 'EACCES' }); return { mtimeMs: 100 }; }, list: () => ['sub.jsonl'] })).toBeNull();
-    expect(transcriptActivityMs(row, { resolve: () => { throw new Error('no'); }, stat })).toBeNull();
-    expect(transcriptActivityMs(row, { resolve: () => '/p/other.jsonl', stat })).toBeNull();
+    const tail = (extra = {}) => () => ({ file: '/p/main.jsonl', lastActivityMs: 100, hadUnparseableLine: false, ...extra });
+    const stat = (f) => { if (f.endsWith('sub.jsonl')) return { mtimeMs: 500 }; throw new Error('x'); };
+    expect(transcriptActivityMs(row, { tail: tail(), stat, list: () => ['sub.jsonl', 'junk.txt'] })).toBe(500);
+    expect(transcriptActivityMs(row, { tail: tail(), stat, list: () => { throw Object.assign(new Error('none'), { code: 'ENOENT' }); } })).toBe(100);
+    expect(transcriptActivityMs(row, { tail: tail(), stat, list: () => { throw Object.assign(new Error('perm'), { code: 'EACCES' }); } })).toBeNull();
+    expect(transcriptActivityMs(row, { tail: tail(), stat: () => { throw Object.assign(new Error('perm'), { code: 'EACCES' }); }, list: () => ['sub.jsonl'] })).toBeNull();
+    expect(transcriptActivityMs(row, { tail: tail({ hadUnparseableLine: true }) })).toBeNull();
+    expect(transcriptActivityMs(row, { tail: () => null })).toBeNull();
+    expect(transcriptActivityMs(row, { tail: () => { throw new Error('boom'); } })).toBeNull();
   });
 
   it.each(['abc', '0'])('malformed WE_IDLE_CLAIM_RELEASE_MINUTES=%s falls back to the 30 min standard', (value) => {
