@@ -126,3 +126,13 @@ describe('observeRoundCap', () => {
     expect(readdirSync(dir).sort()).toEqual(['2026-10.jsonl']);
   });
 });
+
+describe('nonConverging setting', () => {
+  it('is off in the standard, on when the settings file turns it on, and ignores junk', () => {
+    expect(resolveRoundJudgeMode({ env: {}, path: '/nonexistent', platform: null }).nonConverging).toBe(false);
+    const d = tmp(); const p = join(d, 's.json'); writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow', nonConverging: true } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).nonConverging).toBe(true);
+    writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow', nonConverging: 'yes' } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).nonConverging).toBe(false);
+  });
+});
