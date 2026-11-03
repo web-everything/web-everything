@@ -4242,6 +4242,9 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     expect(repair()).toEqual({ missing: ['standards'] });
     expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
   });
+  it.each(['off', 'shadow', 'on'])('finds the missing job under startEarly=%s (early start must not hide it)', startEarly => {
+    expect(repair({ reviewTiming: { ...reviewTiming, startEarly } })).toEqual({ missing: ['standards'] });
+  });
   it.each([
     ['draft', { isDraft: true }], ['DIRTY', { mergeStateStatus: 'dirty' }],
     ['stacked base', { baseRefName: 'lane/other' }], ['empty rollup', { statusCheckRollup: [] }],
