@@ -107,7 +107,9 @@ export function parseRedTeamComment(body) {
     const counts = headline === '### Post-accept red team — no break found'
       ? [0, 0] : HEADLINE_RE.exec(headline ?? '')?.slice(1).map(Number);
     if (headlines.length !== 1 || !counts || !counts.every(Number.isSafeInteger)
-      || counts[0] !== findings.length || counts[1] !== findings.filter(f => f.confirmed).length) {
+      || counts[0] !== findings.length || counts[1] !== findings.filter(f => f.confirmed).length
+      // Finding indices key every ruling: they must be exactly 1..N, so a duplicate cannot ride one ruling.
+      || findings.some((f, i) => f.index !== i + 1)) {
       shapedLines.push(`unparsed headline counts: ${headlines.join(' | ') || 'missing headline'}`);
     }
   }

@@ -47,6 +47,13 @@ describe('readRedTeamDisposition: unparsed findings fail closed', () => {
   const headline = "### Post-accept red team — 2 possible break(s), 1 confirmed by Claude's re-check";
   const unconfirmed = '1. [not confirmed] (edge-case, broken) — maybe';
 
+  it('holds duplicate finding indices (one ruling must not release two breaks)', () => {
+    const one = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — first';
+    const dup = '1. [**confirmed**] (edge-case, broken) `scripts/y.mjs:2` — second';
+    const d = read(`${marker}\n### Post-accept red team — 2 possible break(s), 2 confirmed by Claude's re-check\n${one}\n${dup}`);
+    expect(d.held).toContainEqual(expect.objectContaining({ index: -1, synthetic: true }));
+  });
+
   it('holds the round-3 bracketless confirmed break beside a parsed unconfirmed finding', () => {
     const skipped = '2. **confirmed** (edge-case, broken) — missed break';
     const d = read(`${marker}\n${headline}\n${unconfirmed}\n${skipped}`);
