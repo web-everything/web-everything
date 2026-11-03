@@ -2183,6 +2183,21 @@ describe('the write arc and its #2964 ordering', () => {
     expect(order).toEqual(['setLabels', 'postComment']);
   });
 
+  it('guarded changes swap strips readiness and preserves unrelated status labels', () => {
+    const p = stubProvider({ labels: ['review:pending', 'ready-to-merge', 'status:awaiting-ci', 'status:red-team', 'status:at-round-limit', 'status:fixing'] });
+    const { exitCode } = run(p, ['1048', '--repo=o/n', '--to=changes', '--actor=op'], { verdictBody: 'Repair needed' });
+    expect(exitCode).toBe(0);
+    const spec = p.calls.find(c => c && typeof c === 'object' && 'add' in c);
+    expect(spec).toEqual({ add: 'review:changes', remove: ['review:pending', 'ready-to-merge'] });
+  });
+
+  it('first acceptance preserves group readiness without red-team clearance and all unrelated status labels', () => {
+    const p = stubProvider({ labels: ['review:pending', 'ready-to-merge', 'status:awaiting-ci', 'status:red-team', 'status:at-round-limit', 'status:fixing'] });
+    expect(run(p, ['1048', '--repo=o/n', '--to=accepted', '--actor=op']).exitCode).toBe(0);
+    const spec = p.calls.find(c => c && typeof c === 'object' && 'add' in c);
+    expect(spec).toEqual({ add: 'review:accepted', remove: ['review:pending'] });
+  });
+
   it('never hands the swap a label the PR does not carry', () => {
     const p = stubProvider({ labels: ['review:pending'] });
     run(p, ['1048', '--repo=o/n', '--to=accepted', '--actor=op']);

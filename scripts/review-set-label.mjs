@@ -1,3 +1,4 @@
+import { reduceLabelState } from './lib/pr-label-state.mjs';
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
@@ -2044,6 +2045,9 @@ export function runReviewLabelCli({
       }
     }
     try {
+      const reduced = reduceLabelState({ labels: preSwapLabels ?? currentLabels,
+        add: decision.addLabel ? [decision.addLabel] : [], remove: removals, enforceClearance: false, enforceSingleStatus: false });
+      removals = [...new Set([...removals, ...reduced.remove])];
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);

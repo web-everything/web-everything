@@ -224,8 +224,8 @@ describe('PR 5890 not-owed settlement', () => {
     { status: 'not-owed', reason: 'review verdict is needs-human, not accept' },
   ])('contradictory not-owed never clears and notifies once: %j', redTeam => {
     const f = fixture();
-    expect(f.settle(redTeam).outcome).toBe('non-policy');
-    expect(f.settle(redTeam).outcome).toBe('non-policy');
+    expect(f.settle(redTeam, { reviewVerdict: 'accept' }).outcome).toBe('non-policy');
+    expect(f.settle(redTeam, { reviewVerdict: 'accept' }).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
     expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).not.toBe('red-team:clear');
@@ -275,5 +275,23 @@ describe('stored-review not-owed settlement context', () => {
       accepted: true, storedReviewPolicyClear: true,
     }).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
+  });
+});
+
+describe('not-owed diagnostics use the current head review verdict', () => {
+  it.each(['changes', 'needs-human', undefined])('does not claim an accepted head for %s', reviewVerdict => {
+    const redTeam = { status: 'not-owed' };
+    const expected = `red team reported not-owed (review verdict: ${reviewVerdict ?? 'unknown'})`;
+    expect(classifyRedTeamSkip(redTeam, { reviewVerdict }).reason).toBe(expected);
+    const f = fixture();
+    f.settle(redTeam, { reviewVerdict });
+    expect(f.io.publishNeedsYou.mock.calls[0][0].reason).toBe(`red team skipped (${expected}); not cleared`);
+  });
+  it('still diagnoses not-owed on an accepted head when the live verdict is accept', () => {
+    const f = fixture();
+    const redTeam = { status: 'not-owed' };
+    expect(classifyRedTeamSkip(redTeam, { reviewVerdict: 'accept' }).reason).toBe('red team reported not-owed on an accepted head');
+    f.settle(redTeam, { reviewVerdict: 'accept' });
+    expect(f.io.publishNeedsYou.mock.calls[0][0].reason).toBe('red team skipped (red team reported not-owed on an accepted head); not cleared');
   });
 });

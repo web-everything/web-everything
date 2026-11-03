@@ -42,6 +42,12 @@ function fixture(redTeam = skipped) {
 }
 
 describe('review-job red-team skip settlement', () => {
+  it('passes the live review verdict into skip settlement', () => {
+    const f = fixture({ status: 'not-owed' });
+    runReviewJob({ repo, pr }, f.io);
+    expect(f.io.settleRedTeamSkip).toHaveBeenCalledWith(expect.objectContaining({ reviewVerdict: 'accept' }));
+  });
+
   it.each([
     [{ status: 'skipped', policy: 'card-only' }, { status: 'skipped', policy: 'card-only' }],
     [{ status: 'skipped', reason: 'quota exhausted' }, { status: 'skipped' }],

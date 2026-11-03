@@ -111,3 +111,23 @@ it('the real drain evidence reader exposes the finished status and its full resu
       .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+it('sync preserves accepted readiness without red-team clearance and all unrelated status labels', () => {
+  const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
+  syncRedTeamStatusLabels({ ...input, live: { headRefOid: head,
+    labels: ['ready-to-merge', 'review:accepted', 'status:awaiting-ci', 'status:red-team', 'status:at-round-limit', 'status:fixing'] },
+    comments: [], evidence: { scheduled: true, inFlight: true }, provider, standingRuling: null });
+  expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, {
+    add: 'red-team:pending', remove: [],
+  });
+});
+
+it('sync strips readiness on changes and preserves unrelated statuses along with its red-team update', () => {
+  const provider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
+  syncRedTeamStatusLabels({ ...input, live: { headRefOid: head,
+    labels: ['ready-to-merge', 'review:changes', 'red-team:clear', 'status:awaiting-ci', 'status:red-team', 'status:at-round-limit', 'status:fixing'] },
+    comments: [], evidence: { scheduled: true, inFlight: true }, provider, standingRuling: null });
+  expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, {
+    add: 'red-team:pending', remove: ['red-team:clear', 'ready-to-merge'],
+  });
+});

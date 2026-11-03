@@ -1,4 +1,5 @@
 /** The pusher hands its exact new head to CI immediately; the existing missing-run watch repairs missed triggers. */
+import { reduceLabelState } from '../lib/pr-label-state.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { recordFixPush } from './fix-push-state.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -65,6 +66,9 @@ export function markFixPushAwaitingCi({ repo, pr, head }, { run = defaultRun, re
   // A same-head retry (a re-arm owed by an earlier run) can arrive after CI finished: that verdict stands.
   const verdict = view.statusCheckRollup?.length ? headCiVerdict(view.statusCheckRollup, readRequired(repo)) : 'pending';
   const plan = fixPushLabelPlan(present, verdict);
+  const reduced = reduceLabelState({ labels: present,
+    add: plan.handOff ? ['checking', 'status:awaiting-ci'] : [], remove: plan.remove, enforceClearance: false, enforceSingleStatus: false });
+  plan.remove = [...new Set([...plan.remove, ...reduced.remove])];
   if (!plan.handOff) {
     if (plan.remove.length) run('gh', ['pr', 'edit', String(pr), ...repoArgs, ...plan.remove.flatMap(l => ['--remove-label', l])]);
     return false;

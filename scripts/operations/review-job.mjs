@@ -960,7 +960,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         const readHead = isRealHead(rev) ? rev : null;
         const head = readHead ?? seatsBox.laneHead;
         const settled = io.settleRedTeamSkip({ redTeam: settlementOutcome, repo: out.repo, pr: out.pr,
-          head, readHead, runId: out.runId });
+          head, readHead, runId: out.runId, reviewVerdict: seatsBox.input.loopPayload?.verdict?.verdict ?? null });
         out.redTeam = { ...out.redTeam, ...settled };
       } catch (error) {
         try { io.log(`review-job ${out.sessionSlug}: red-team skip settlement failed (${tail(error?.message ?? error, 300)})`); }
@@ -1242,7 +1242,7 @@ function runReviewArc({
         // this job still holds the lane/claim. It never enters queued model admission.
         const redTeam = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
         const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
-          redTeam, carry: { loopPayload, lanePath } });
+          redTeam, reviewVerdict: loopPayload?.verdict?.verdict ?? null, carry: { loopPayload, lanePath } });
         classified = { outcome: 'red-team-only' };
         return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }

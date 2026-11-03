@@ -1,4 +1,5 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
+import { reduceLabelState } from './pr-label-state.mjs';
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
@@ -36,6 +37,8 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     try { scope = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: head, comments: thread } }) ?? null; } catch { scope = null; }
   }
   const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope });
+  const reduced = reduceLabelState({ labels: state.labels, add: plan.add ? [plan.add] : [], remove: plan.remove, enforceClearance: false, enforceSingleStatus: false });
+  plan.remove = [...new Set([...plan.remove, ...reduced.remove])];
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
     provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });

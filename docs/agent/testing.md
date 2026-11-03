@@ -3868,3 +3868,22 @@ With independent PR/detector reads succeeding, the disabled producers allow comp
 passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
 The tests also require the detector digest to remain enabled, excluding disable-time
 clearing as a false-positive proof of detector completeness.
+
+## PR label-state regressions
+
+Label writers can post-process their computed add/remove plan through the pure
+`scripts/lib/pr-label-state.mjs` reducer after all existing admission guards.
+Pin conflicting labels (including the #6288 set), net deltas, status request order,
+and normalization idempotence in its unit tests; exercise each wired writer through
+its injected provider. The status fallback is lexical ascending order when no status
+is requested. Skip alerts must receive the current head review verdict explicitly;
+missing evidence must never produce the phrase “on an accepted head”. Keep historical
+pending notification records replayable: their stored reason and key remain authoritative.
+
+The reducer enforces both readiness clearances by default. The review-label, red-team-status,
+and fix-push writers pass `enforceClearance: false` to preserve card-group readiness while
+red-team is pending, and `enforceSingleStatus: false` to preserve status signals read by other
+daemons (including `status:at-round-limit` and `status:fixing`). Each writer still strips readiness
+on `review:changes` and unions reducer removals with its existing removal plan. Pin accepted
+readiness without clearance, changes removal, and unrelated status preservation at each wired
+site; retain reducer tests for single-status enforcement by default and its explicit opt-out.

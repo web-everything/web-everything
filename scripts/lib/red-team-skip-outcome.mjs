@@ -36,12 +36,13 @@ function itemKey(item) {
 }
 
 /** PURE. A reason string is never evidence of a policy exemption. */
-export function classifyRedTeamSkip(redTeam) {
+export function classifyRedTeamSkip(redTeam, { reviewVerdict } = {}) {
   const valid = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam);
   const deferred = valid && Boolean(redTeam.deferredByGuard || redTeam.deferredByCap);
-  // Settlement is reached only for an accepted head: a terminal not-owed contradicts that admission.
+  // Describe the current head verdict; not-owed alone is never evidence of acceptance.
   const reason = valid && redTeam.status === 'not-owed' && !deferred
-    ? 'red team reported not-owed on an accepted head'
+    ? reviewVerdict === 'accept' ? 'red team reported not-owed on an accepted head'
+      : `red team reported not-owed (review verdict: ${typeof reviewVerdict === 'string' && reviewVerdict ? reviewVerdict : 'unknown'})`
     : valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
       ? redTeam.reason : 'unknown red-team outcome';
   return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
@@ -133,7 +134,7 @@ export function settleRedTeamSkip(input = {}) {
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
     const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
-      : classifyRedTeamSkip(redTeam);
+      : classifyRedTeamSkip(redTeam, { reviewVerdict: input.reviewVerdict });
     let { reason } = classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();

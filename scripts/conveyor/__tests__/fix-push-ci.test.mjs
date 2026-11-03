@@ -124,3 +124,21 @@ it('ages missing CI from the push, preserving that time on a same-head retry', (
     expect(recordFixPush({ ...key, head: 'other' }, { dir, now: () => 60_000 }).pushedAt).toBe(new Date(60_000).toISOString());
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('CI handoff preserves accepted readiness without red-team clearance and unrelated statuses', () => {
+  const calls = [];
+  const run = (_cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc',
+    labels: ['ready-to-merge', 'review:accepted', 'status:red-team', 'status:at-round-limit'] }); };
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {} })).toBe(true);
+  expect(calls.at(-1)).toEqual(['pr', 'edit', '7', '--repo=o/r', '--add-label', 'checking',
+    '--add-label', 'status:awaiting-ci']);
+});
+
+it('CI handoff strips readiness on changes and preserves unrelated statuses', () => {
+  const calls = [];
+  const run = (_cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc',
+    labels: ['ready-to-merge', 'review:changes', 'status:red-team', 'status:at-round-limit'] }); };
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {} })).toBe(true);
+  expect(calls.at(-1)).toEqual(['pr', 'edit', '7', '--repo=o/r', '--add-label', 'checking',
+    '--add-label', 'status:awaiting-ci', '--remove-label', 'ready-to-merge']);
+});
