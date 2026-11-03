@@ -150,9 +150,9 @@ describe('shared head budget and additional restart ceiling', () => {
     const history = restarts.map(it => record({ ...it, ...(legacy ? { headCap: 2 } : {}) }));
     const next = item('restart-red-team', 'restart-3');
     const result = planStallActions([...ordinary, next], { now: NOW, limits, history });
-    expect(result.act).toEqual([]);
-    expect(result.held).toEqual([...ordinary.map(it => ({ ...it, held: 'per-PR-head cap' })),
-      { ...next, held: expect.stringMatching(/restart per-head cap.*operator/) }]);
+    // R452: legacy restart records neither spend the shared budget (both ordinary actions still fit under 2) nor bypass the restart cap.
+    expect(result.act).toEqual(ordinary);
+    expect(result.held).toEqual([{ ...next, held: expect.stringMatching(/restart per-head cap.*operator/) }]);
   });
 });
 

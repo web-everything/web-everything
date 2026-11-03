@@ -62,11 +62,11 @@ const reader = (gh, unreadable = false) => {
 describe('settings', () => {
   const file = (block) => (path) => { if (String(path).endsWith('pr-stall-sweep.json')) return JSON.stringify({ prStallSweep: block }); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
   const log = () => {};
-  it('repository shared ceiling resolves to two (R452) with tool provenance', () => {
+  it('repository shared ceiling resolves to one with tool provenance', () => {
     const log = vi.fn();
     const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log });
-    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 2 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
-    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=2 (tool)');
+    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 1 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=1 (tool)');
   });
   it.each([3, Number.MAX_SAFE_INTEGER])('shared ceiling validator accepts %s without changing its safe-integer bound', cap => {
     expect(resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: cap }), log }))
@@ -83,9 +83,9 @@ describe('settings', () => {
     const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
     expect(repo.prStallSweep.digest).toBe(true);
   });
-  it('R452: repository settings allow two actions per head (two red-team restarts, then needs-you)', () => {
+  it('R452: repository settings keep the shared ceiling at one and allow two red-team restarts per head, then needs-you', () => {
     const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
-    expect(repo.prStallSweep.maxActionsPerPrHead).toBe(2);
+    expect(repo.prStallSweep.maxActionsPerPrHead).toBe(1);
     expect(repo.prStallSweep.maxRedTeamRestartsPerHead).toBe(2);
   });
   it.each([['false', false], ['0', false], ['true', true], ['1', true]])('parses WE_PR_STALL_SWEEP_DIGEST=%s as %s', (raw, value) => {
@@ -478,33 +478,14 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) }]);
     expect(out.items[0].reason).toMatch(cap === 0 ? /disabled.*maxRedTeamRestartsPerHead=0.*operator/ : /exhausted.*operator/);
   });
-  it.each(['would-do', 'intent'])('shared cap yields one needs-you record per head after prior %s', async phase => {
-    for (const priorAction of ['ask-review-daemon', 'restart-red-team']) {
-      const dir = auditDir();
-      seed(dir, [restartRecord(120, { phase, action: priorAction })]);
-      const options = { dir, settings: shadow() };
-      const first = await sweep(options);
-      expect(first.out.act).toEqual([]);
-      expect(first.out.held).toMatchObject([{ action: 'restart-red-team', held: 'per-PR-head cap' }]);
-      const operator = first.out.records.filter(r => r.phase === 'operator');
-      expect(operator).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted',
-        reason: expect.stringMatching(new RegExp(`held by the per-head ceiling.*${priorAction === 'restart-red-team' ? 1 : 0} restarts so far.*pending age 180.*needs-you`)) }]);
-      const repeated = await sweep({ ...options, now: NOW + 60_000 });
-      expect(repeated.out.records.filter(r => r.phase === 'operator')).toEqual([]);
-      expect(lines(dir).filter(r => r.phase === 'operator')).toHaveLength(1);
-    }
-  });
-  it.each(['would-do', 'intent'])('logs a shared-ceiling-held restart as would-skip after prior %s', async phase => {
+  it.each(['would-do', 'intent'])('R452: a prior ordinary action at the shared ceiling does not hold the restart (prior %s)', async phase => {
     const dir = auditDir();
     seed(dir, [restartRecord(120, { phase, action: 'ask-review-daemon', key: `${prHead}:daemon` })]);
     const { out, calls } = await sweep({ dir, settings: shadow({ maxActionsPerPrHead: 1 }) });
     expect(out.incomplete).toBe(false);
-    expect(out.act).toEqual([]);
-    expect(out.held).toMatchObject([{ action: 'restart-red-team', held: 'per-PR-head cap' }]);
-    expect(lines(dir).filter(r => r.phase === 'would-skip')).toMatchObject([
-      { action: 'restart-red-team', held: 'per-PR-head cap' },
-    ]);
-    expect(lines(dir).filter(r => r.phase === 'would-do' && r.action === 'restart-red-team')).toEqual([]);
+    expect(out.held).toEqual([]);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(lines(dir).filter(r => r.phase === 'would-do' && r.action === 'restart-red-team')).toHaveLength(1);
     expectReadOnly(calls);
   });
   it('pending over 60 minutes with no live run or result logs would restart-red-team in shadow', async () => {
@@ -711,9 +692,9 @@ describe('watchdog restart budgets', () => {
     const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
     expect(planStallActions([restart(1)], { now: NOW, limits, history })).toEqual({ act: [restart(1)], held: [] });
   });
-  it.each(['would-do', 'intent'])('a second restart is held by the shared one-action head cap after a prior %s', phase => {
+  it.each(['would-do', 'intent'])('R452: a second restart is not held by the shared one-action head cap after a prior %s', phase => {
     expect(planStallActions([restart(2)], { now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 },
-      history: [record(restart(1), phase)] })).toEqual({ act: [], held: [{ ...restart(2), held: 'per-PR-head cap' }] });
+      history: [record(restart(1), phase)] })).toEqual({ act: [restart(2)], held: [] });
   });
   it('caps its own action bucket at two including actions planned in this pass', () => {
     const result = planStallActions([restart(1), restart(2), restart(3)], { now: NOW, limits });
@@ -746,7 +727,7 @@ describe('watchdog restart budgets', () => {
     expect(planStallActions([publish], { now: NOW, limits,
       history: [record(restart(1)), record(restart(2))] })).toEqual({ act: [publish], held: [] });
     expect(planStallActions([publish], { now: NOW, limits, history: [record(publish)] })).toEqual({ act: [], held: [] });
-    expect(planStallActions([publish], { now: NOW, limits,
+    expect(planStallActions([publish], { now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 },
       history: [record({ prHead, action: 'ask-review-daemon', key: 'nudge' }), record(restart(1)), record(restart(2))] }))
       .toEqual({ act: [], held: [{ ...publish, held: 'per-PR-head cap' }] });
   });
