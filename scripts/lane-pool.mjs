@@ -302,6 +302,7 @@ const tryGit = (args, cwd, opts = {}) => {
 /** Read literal output names without executing lane-owned configuration. Unknown configs add nothing. */
 export function ignoredBuildOutputDirs(dir) {
   const dirs = new Set();
+  const denied = new Set(['node_modules', '.git', '.claude', 'src', 'scripts', 'docs']);
   const add = (name) => {
     // Also exclude pathspec magic/globs and platform-specific separators: these must be literal children.
     if (/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(name) && !name.includes('..')) dirs.add(name);
@@ -316,10 +317,16 @@ export function ignoredBuildOutputDirs(dir) {
     const config = readFileSync(join(dir, 'playwright.config.ts'), 'utf8');
     for (const match of config.matchAll(/--output=([^\s"'`]+)/g)) add(match[1]);
   } catch { /* Unreadable config: no Playwright outputs are eligible. */ }
-  return [...dirs];
+  return [...dirs].filter((name) => {
+    if (denied.has(name)) return false;
+    // Unknown Git evidence fails closed, including when this is not a repository.
+    const path = `${name}/`;
+    return tryGit(['ls-files', '--', path], dir) === ''
+      && tryGit(['check-ignore', '-q', '--', path], dir) === '';
+  });
 }
 
-/** Best-effort removal of ignored build artifacts, scoped to real output directories in this lane. */
+/** Remove eligible ignored build directories; failure must prevent handing out a dirty lane. */
 export function cleanIgnoredBuildOutput(dir) {
   try {
     const dirs = ignoredBuildOutputDirs(dir).filter((name) => {
@@ -328,8 +335,10 @@ export function cleanIgnoredBuildOutput(dir) {
     // Never invoke clean with an empty pathspec (which would target the whole repository).
     if (dirs.length) git(['clean', '-fdX', '--quiet', '--', ...dirs.map((name) => `${name}/`)], dir);
   } catch (e) {
-    const message = String(e?.message || e).split('\n')[0].replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
-    log(`  ignored build output cleanup failed: ${message}`);
+    const message = msgOf(e).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+    throw Object.assign(new Error(`ignored build output cleanup failed: ${message}`, { cause: e }), {
+      ignoredBuildOutputCleanupFailure: true,
+    });
   }
 }
 
@@ -2263,7 +2272,8 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     try {
       reset = resetToBase();
     } catch (e) {
-      if (!looksLikeCorruption(msgOf(e))) throw e;
+      // Artifact removal failures must reach claim rollback, even if Git's error resembles corruption.
+      if (e.ignoredBuildOutputCleanupFailure || !looksLikeCorruption(msgOf(e))) throw e;
       healSharedStoreFor(repo, e);
       repairUnhealthyClone();
       reset = resetToBase();
