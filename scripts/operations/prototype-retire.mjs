@@ -23,6 +23,31 @@ import { parseSupersedes, isTrustedSupersedeAuthor, isBodyEditedAfterMergeByUntr
 const SHA = /^[a-f0-9]{40}$/;
 const lines = (text) => String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
+/** Bind evidence to origin's repository AND host, regardless of GH_REPO, GH_HOST or gh's defaults. */
+export function resolveOriginRepository({ git, gh }) {
+  const unknown = { repo: '', gh: () => ({ code: 1, stdout: '' }) };
+  try {
+    const origin = git(['remote', 'get-url', 'origin']);
+    const url = String(origin.stdout || '').trim();
+    if (origin.code !== 0 || !url || url.startsWith('-') || /[\r\n\0]/.test(url)) return unknown;
+    const result = ghJson(gh, ['repo', 'view', url, '--json', 'nameWithOwner,url']);
+    const repo = result.value?.nameWithOwner;
+    if (!result.ok || typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return unknown;
+    const page = new URL(result.value.url);
+    if (page.protocol !== 'https:' || page.username || page.password || page.search || page.hash
+      || page.pathname.toLowerCase() !== `/${repo}`.toLowerCase()) return unknown;
+    const boundGh = (args) => {
+      if (args[0] === 'api') return gh([...args, '--hostname', page.host]);
+      const index = args.indexOf('--repo');
+      if (index < 0) return { code: 1, stdout: '' };
+      const bound = [...args];
+      bound[index + 1] = `${page.host}/${repo}`;
+      return gh(bound);
+    };
+    return { repo, gh: boundGh };
+  } catch { return unknown; }
+}
+
 /** Use the same visible declaration target list as the conveyor; code and trailing prose confer no authority. */
 export function declaresSupersedes(body, pr) {
   if (!Number.isInteger(pr)) return false;
@@ -169,4 +194,67 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     }
     return keep('unique-commits-not-on-main', { tip, pr: prNumber, evidence });
   });
+}
+
+const ZERO_SHA = '0'.repeat(40);
+const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+
+/**
+ * The deleted branch's authoritative last tip, from GitHub's ref activity log: the NEWEST event for the ref must be
+ * a `branch_deletion`, and its `before` is the tip the branch had when it was deleted. A historical PR head alone
+ * proves nothing, because a registration tracks a mutable name that may have been reused (and deleted again)
+ * after the PR merged. The request pins newest-first order, so the newest event is always in the page; unreadable,
+ * empty, malformed, foreign-ref or tied-newest answers return null.
+ */
+function deletedBranchTip({ gh, repo, ref }) {
+  const limit = 10;
+  const res = ghJson(gh, ['api', `repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${ref}`)}&direction=desc&per_page=${limit}`]);
+  if (!res.ok || !Array.isArray(res.value) || !res.value.length) return null;
+  // Every event must be for this exact ref: a loosened or case-folded server filter could surface another branch's deletion.
+  if (res.value.some((e) => e?.ref !== `refs/heads/${ref}`)) return null;
+  const events = res.value.map((e) => ({ type: e?.activity_type, before: e?.before, after: e?.after, at: Date.parse(e?.timestamp) }));
+  if (events.some((e) => typeof e.type !== 'string' || !SHA.test(e.before || '') || !SHA.test(e.after || '') || !Number.isFinite(e.at))) return null;
+  events.sort((a, b) => b.at - a.at);
+  if (events.length > 1 && events[1].at === events[0].at) return null; // order of simultaneous events is unknown
+  const [newest] = events;
+  return newest.type === 'branch_deletion' && newest.after === ZERO_SHA && newest.before !== ZERO_SHA ? newest.before : null;
+}
+
+/**
+ * A registration whose branch could not be fetched. Retire it only when the deleted branch's LAST tip is proved
+ * to be the head of the one origin PR that merged it: exactly one PR ever headed the ref in origin, it is MERGED
+ * (matching any recorded PR number), its merge commit is an ancestor of `mainRef`, and GitHub's ref activity log
+ * shows the ref's newest event was a deletion at that PR's head commit. Anything unreadable, ambiguous or
+ * different (a reused name deleted at another tip, a full result page, a fork's same-named PR) keeps it.
+ * @returns {{ref:string, action:'retire'|'keep', reason:string, tip?:string, pr?:number, evidence?:object}}
+ */
+export function planFetchFailed({ row, git, gh, repo, mainRef = 'origin/main' }) {
+  const keep = () => ({ ref: row.ref, action: 'keep', reason: 'fetch-failed' });
+  try {
+    if (typeof git !== 'function' || typeof gh !== 'function') return keep();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo || '')) || row.edgeResolution) return keep();
+    const limit = 10;
+    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', row.ref, '--state', 'all', '--json',
+      'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', String(limit)]);
+    if (!list.ok || !Array.isArray(list.value) || list.value.length >= limit) return keep();
+    const named = list.value.filter((pr) => pr?.headRefName === row.ref);
+    // A PR whose head repository cannot be classified could be this branch's reuse: refuse rather than guess.
+    const origin = [];
+    for (const pr of named) {
+      const head = pr.headRepository?.nameWithOwner;
+      if (pr.isCrossRepository === false && sameRepo(head, repo)) origin.push(pr);
+      else if (!(pr.isCrossRepository === true && typeof head === 'string' && !sameRepo(head, repo))) return keep();
+    }
+    if (origin.length !== 1) return keep();
+    const [pr] = origin;
+    if (pr.state !== 'MERGED' || !Number.isInteger(pr.number)) return keep();
+    if (row.pr != null && row.pr !== pr.number) return keep();
+    const mergeCommit = pr.mergeCommit?.oid;
+    if (!SHA.test(pr.headRefOid || '') || !SHA.test(mergeCommit || '')) return keep();
+    if (git(['merge-base', '--is-ancestor', mergeCommit, mainRef]).code !== 0) return keep();
+    const deletedTip = deletedBranchTip({ gh, repo, ref: row.ref });
+    if (deletedTip !== pr.headRefOid) return keep();
+    return { ref: row.ref, action: 'retire', reason: 'pr-squash-merged', tip: deletedTip, pr: pr.number,
+      evidence: { refGone: true, prState: 'MERGED', mergeCommit, prVia: 'head-ref', deletedTip } };
+  } catch { return keep(); }
 }
