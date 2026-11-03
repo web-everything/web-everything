@@ -119,8 +119,10 @@ function sourceInMain({ git, ref, tip, carried, mainRef }) {
   if (parentsRes.code !== 0) return null;
   const parents = lines(parentsRes.stdout)[0]?.split(/\s+/).slice(1) || [];
   if (parents.length !== 2 || !parents.every((sha) => SHA.test(sha))) return null;
-  const source = parents[1];
-  return git(['merge-base', '--is-ancestor', source, mainRef]).code === 0 ? source : null;
+  // BOTH merged parents must be in main: a clean merge of two main-reachable commits adds no content of its own,
+  // so main's later edits (moved tests) have superseded it. The exact-tree compare cannot see that, hence this rule.
+  if (!parents.every((sha) => git(['merge-base', '--is-ancestor', sha, mainRef]).code === 0)) return null;
+  return parents[1];
 }
 
 /** The registration's PR: its recorded number, else a PR whose head is the ref, else (for `-m<N>`) its base branch. */

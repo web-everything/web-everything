@@ -109,6 +109,16 @@ describe('source-in-main retire evidence', () => {
     expect(run(git).action).toBe('keep');
   });
 
+  it('keeps when the main-side parent of the merge ref is not in main', () => {
+    const { r, source } = scenario();
+    landOn(r, source);
+    r.ok('checkout', '-q', '-b', 'side', 'origin/main');
+    const side = r.commit('side.txt', 's\n');
+    r.ok('checkout', '-q', 'main');
+    r.ok('update-ref', 'refs/remotes/origin/lane/x-m2', r.mergeRef(side, source));
+    expect(run(notNoop(r.git)).action).toBe('keep');
+  });
+
   it('keeps when git cannot answer the ancestry question', () => {
     const { r, source } = scenario();
     landOn(r, source);
