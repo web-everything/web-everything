@@ -1,6 +1,6 @@
 /** 2026-11-03: #6244/#6262 fix claims were heartbeated for hours by a LIVE but idle fixer session. Idle-head release
  *  read `state === 'idle'`, but real `claude agents` rows are `state:'working'` + `status:'idle'`, so it never fired. */
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -10,7 +10,8 @@ export default {
   title: 'a live fixer at status:idle with an unmoved PR head kept its fix claim for hours (idle release only read state:idle)',
   card: 'we:backlog (delivery fix 2026-11-03, #6244/#6262)',
   fixedBy: { sha: 'f432496da8', where: 'lane/claim-liveness-idle-pid-reuse', paths: ['scripts/conveyor/fix-dispatch-claim.mjs'] },
-  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/fix-dispatch-claim.mjs'), 'utf8').includes("a.status === 'idle'"); },
+  // The fix ships in the SAME change as this break, so the scenario is always required GREEN: reverting the fix turns it red.
+  fixPresent() { return true; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const m = await import(pathToFileURL(join(root, 'scripts/conveyor/fix-dispatch-claim.mjs')).href);
