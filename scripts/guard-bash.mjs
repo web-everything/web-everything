@@ -2209,9 +2209,18 @@ function gitConfigFileTargets(segment, dir, configEnv) {
     else if (t.startsWith('-f') && t.length > 2) targets.push(absoluteGitTarget(dir, t.slice(2), home));
   }
   const scopes = [['GIT_CONFIG', null], ['GIT_CONFIG_GLOBAL', '--global'], ['GIT_CONFIG_SYSTEM', '--system']];
+  const globalScope = args.some((a) => a.length >= 3 && '--global'.startsWith(a));
   for (const env of leadingAssignmentEnvs(configEnv, segment)) {
     for (const [key, flag] of scopes) {
       if (env[key] && (!flag || args.some((a) => a.length >= 3 && flag.startsWith(a)))) targets.push(absoluteGitTarget(dir, env[key], home));
+    }
+    if (globalScope && !env.GIT_CONFIG_GLOBAL) {
+      // Without GIT_CONFIG_GLOBAL, git writes its global file under the HOME (or XDG_CONFIG_HOME) the git
+      // process sees, a command-local prefix included. An unknown value leaves the target unknown.
+      const files = [[env.HOME, '.gitconfig'], env.XDG_CONFIG_HOME ? [env.XDG_CONFIG_HOME, 'git/config'] : [env.HOME, '.config/git/config']];
+      for (const [base, file] of files) {
+        targets.push(typeof base !== 'string' || !base || /[$`]/.test(base) ? null : resolve(dir || '.', base, file));
+      }
     }
   }
   return targets;
@@ -3250,7 +3259,7 @@ function homeCdTarget(cmd, { segments, pipedFrom }, home) {
 // target this resolver can't statically resolve (e.g. a command-substitution path) will be wrongly denied.
 // The fix is to invoke with a directly-resolvable `cd` (a literal absolute path, or `LANE=/abs; cd "$LANE"` —
 // the standard lane idiom every skill already teaches), not to reach for a removed override.
-export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null) {
+export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve, home = process.env.HOME ?? null, onUnresolvedHome = null) {
   // r3 audit — a heredoc BODY is data. A `cd /elsewhere` line (or an apostrophe that desyncs the quote
   // scanner) inside a PR-body heredoc must not steer, or break, the cwd resolution; `decide` already strips
   // them before it parses, and this must agree with it. An unparseable command keeps the REPORTED cwd, which
@@ -3279,6 +3288,10 @@ export function resolveEffectiveCwd(command, reportedCwd, resolvePath = resolve,
     const cd = stmt.trim().match(/^cd\s+(.+)$/);
     if (!cd) continue;
     let target = cd[1].trim().split(/\s+/)[0];                // first arg only (ignore trailing redirs/opts)
+    // An unquoted home target the resolver above could not expand although the starting HOME is usable
+    // (so the command rebinds HOME unreadably): the directory is unknown. Tell the caller, so git targets
+    // fail closed instead of trusting the literal `~` join below.
+    if (target.startsWith('~') && onUnresolvedHome && typeof home === 'string' && isAbsolute(home)) onUnresolvedHome();
     target = target.replace(/^(['"])(.*)\1$/, '$2');          // strip surrounding quotes
     const v = target.match(/^\$\{?([A-Za-z_]\w*)\}?$/);       // whole target is $VAR / ${VAR}
     if (v) target = vars[v[1]] ?? '';
@@ -5074,6 +5087,12 @@ export function decide(command, ctx = {}) {
           values.add(gitConfigEnv[key]);
           values.delete(value);
           alternates.set(key, values);
+          if (values.size > ALTERNATE_CHECK_CAP) {
+            // Too many possible values to track: the value is unknown, so every target reader fails closed.
+            // Collapsing also bounds the per-segment work that grows with each possible HOME.
+            alternates.delete(key);
+            value = `\${${key}}`;
+          }
         }
         gitConfigEnv[key] = value;
         if (readonly) maybeReadonly.add(key);
@@ -5104,6 +5123,7 @@ export function decide(command, ctx = {}) {
         childMaybeReadonly, childAttributes);
     };
     for (const seg of list) {
+      const homeBefore = gitConfigEnv.HOME;
       let attributeTargetUnknown = false;
       if (uncertainAttributes.size) {
         const named = new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []);
@@ -5221,11 +5241,14 @@ export function decide(command, ctx = {}) {
         const homesNow = () => [gitConfigEnv.HOME, ...(alternates.get('HOME') || [])];
         const statementHomes = homesNow();
         let homeAssigned = false;
-        for (const word of assignments) {
+        // A prefix assignment on a declaration builtin is temporary in Bash but kept in POSIX mode: it only
+        // adds a possible value and never replaces the earlier one.
+        const prefixCount = directive ? leadingWords.length : 0;
+        for (const [index, word] of assignments.entries()) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
           if (m) {
             const homes = !directive ? homesNow() : homeAssigned ? [...statementHomes, ...homesNow()] : statementHomes;
-            assignValue(m[1], m[2], homes, readonly, uncertain, attribute);
+            assignValue(m[1], m[2], homes, readonly && index >= prefixCount, uncertain || index < prefixCount, attribute);
             if (m[1] === 'HOME') homeAssigned = true;
           }
           else if (attribute && /^([A-Za-z_][A-Za-z0-9_]*)(?:\[|\+=)/.test(word)) {
@@ -5238,6 +5261,14 @@ export function decide(command, ctx = {}) {
           }
         }
       }
+      // HOME writers this tracker does not model (`HOME+=`, `read HOME`, `printf -v HOME`, a prefix a special
+      // builtin may keep) must not leave a stale HOME. The cd resolver's statement reader says what HOME can
+      // be after this statement; when it cannot tell, or disagrees, HOME becomes unknown and tilde targets fail closed.
+      let readerHome;
+      try {
+        readerHome = valueAfter(seg, 'HOME', homeBefore, typeof homeBefore === 'string' ? homeBefore : null);
+      } catch { readerHome = null; }
+      if (readerHome === null || readerHome !== gitConfigEnv.HOME) setAssignment('HOME', '${HOME}', false, true);
     }
     // Preserve the whole-command recovery used by withNestedCommands: a substitution/group containing
     // separators may not be reconstructible from an individual segment. Never use future assignments.
@@ -5360,6 +5391,7 @@ if (IS_CLI) {
   let dispatchKind = null;
   let agentSession = false;
   let effectiveCwd = null;
+  let cwdHomeUnknown = false; // a leading `cd ~…` whose HOME could not be followed
   let daemonRoots = [];
   let hookSessionId = null;
   let orchestratorSettings = {};
@@ -5397,7 +5429,7 @@ if (IS_CLI) {
     const rp = (p) => { try { return realpathSync(p); } catch { return p; } };
     // #2335 — the reported cwd resets to the primary between calls; honour a leading `cd <lane>` so a genuine
     // lane mutation isn't misread as a primary one (and the #2323 git call runs in the lane, not the primary).
-    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
+    const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd(), undefined, undefined, () => { cwdHomeUnknown = true; }));
     effectiveCwd = cwd;
     const weRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
     const workspace = dirname(weRoot);
@@ -5423,7 +5455,7 @@ if (IS_CLI) {
   }
   // --config-env can name any inherited variable, not just one of Git's own GIT_* variables.
   const gitConfigEnv = { ...process.env };
-  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, gitConfigEnv, daemonFetchConfigReader: readDaemonFetchConfig, fixPushes };
+  const guardCtx = { ...orchestratorSettings, primaryCwd, staleBehind, foreignLiveLease, markedLeaseSlug, contestedHolderSlug, runInBackground, dispatchKind, agentSession, cwd: effectiveCwd, daemonCloneRoots: daemonRoots, gitConfigEnv, gitTargetUnknown: cwdHomeUnknown, daemonFetchConfigReader: readDaemonFetchConfig, fixPushes };
   const r = decide(cmd, guardCtx);
   if (r) {
     // #3311 — the deny is ALL-OR-NOTHING, so name the state-producing steps it takes down with it. Computed

@@ -3715,11 +3715,38 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
       ['an unresolved HOME is unknown for a later assignment', 'HOME=$(x); export GIT_DIR=~/wev-review-daemon/.git; git reset --hard', HOOK_HOME, true],
       ['a user tilde is unknown', 'git -C ~nobody/wev-review-daemon reset --hard', HOOK_HOME, true],
       ['a quoted literal tilde stays conservative', 'HOME=/ws; git -C "~/wev-review-daemon" reset --hard', HOOK_HOME, true],
+      // HOME writers the assignment tracker does not model leave HOME unknown, never stale.
+      ['an append to HOME is unknown', 'HOME=/; HOME+=ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['read HOME is unknown', 'read HOME <<< /ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['printf -v HOME is unknown', 'printf -v HOME /ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a HOME prefix on export keeps the earlier HOME', 'HOME=/ws; HOME=/tmp export X=1; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a HOME prefix on a special builtin may persist', 'HOME=/ws :; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a GIT_DIR prefix on export keeps the earlier GIT_DIR', 'export GIT_DIR=/ws/wev-review-daemon/.git; GIT_DIR=/tmp export X=1; git reset --hard', HOOK_HOME, true],
+      ['readonly HOME refuses the reassignment', 'readonly HOME; HOME=/ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, false],
     ])('%s', (_name, command, home, denied) => {
       const out = decide(command, ctx(home));
       if (denied) expect(out).toMatch(/DAEMON CLONE/);
       else expect(out).toBeNull();
       expect(decide(command.replace(/reset --hard|clean -fd/, 'log'), ctx(home))).toBeNull();
+    });
+
+    it.each([
+      ['a command-local HOME prefix', 'HOME=/ws/wev-review-daemon git config --global x.y z'],
+      ['an earlier HOME assignment', 'HOME=/ws/wev-review-daemon; git config --global --unset x.y'],
+      ['an XDG_CONFIG_HOME prefix', 'XDG_CONFIG_HOME=/ws/wev-review-daemon git config --global x.y z'],
+      ['an unknown HOME', 'HOME=$(x) git config --global x.y z'],
+    ])('git config --global writes under the git process HOME: %s', (_name, command) => {
+      expect(decide(command, ctx())).toMatch(/DAEMON CLONE/);
+      expect(decide(command.replace(/ x\.y z$| --unset x\.y$/, ' --get x.y'), ctx())).toBeNull();
+      expect(decide('git config --global x.y z', ctx())).toBeNull();
+    });
+
+    it('bounds possible HOME values: past the cap HOME is unknown and stays fast', () => {
+      const command = `${'true && HOME=/h; '.repeat(2000)}${'A=~/x B=~/y C=i true; '.repeat(2000)}git -C ~/wev-review-daemon reset --hard`;
+      let n = 0;
+      const started = Date.now();
+      expect(decide(command.replace(/HOME=\/h/g, () => `HOME=/h${n++}`), ctx())).toMatch(/DAEMON CLONE/);
+      expect(Date.now() - started).toBeLessThan(6000);
     });
   });
 
@@ -4553,6 +4580,11 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
         [`export HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, hookHome, true],
         [`env HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git git log`, hookHome, false],
         [`git -C ~/workspace/wev-review-daemon reset --hard; HOME=${root}`, hookHome, false],
+        // A leading `cd ~` the cd resolver cannot follow leaves the target unknown, not the literal `~` join.
+        [`read HOME <<< ${root}; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
+        [`HOME=${root}; HOME=/tmp export X=1; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
+        [`read HOME <<< ${root}; cd ~/workspace/wev-review-daemon && git status`, hookHome, false],
+        [`cd ~ && git status`, hookHome, false],
       ])('applies Bash HOME timing at the hook: %s', (command, home, denied) => {
         const out = runHook(command, lane, home);
         if (denied) expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
