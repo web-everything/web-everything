@@ -3957,7 +3957,7 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 1563, label: 'review:pending' })]);
   });
   it('fails closed: an unlabelled green bot PR on ci/refresh-test-timings is owed review:pending (PR #6254)', () => {
-    const pr = open({ number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', author: { login: 'app/web-everything', is_bot: true },
+    const pr = open({ number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', author: { login: 'app/web-everything' },
       statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() })) });
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 6254, label: 'review:pending' })]);
