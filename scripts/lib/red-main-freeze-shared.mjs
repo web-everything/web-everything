@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { stageOnTransportBranch, readFromTransportBranch } from './git-transport-branch.mjs';
 import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
 import { readSettings } from './settings-files.mjs';
+import { instrumentGit } from './freeze-read-timing-log.mjs'; // R510 debug: log-only timing of the freeze read
 
 export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 /** How many times the CLI hook tries to land one publish before it reports failure. */
@@ -223,7 +224,7 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
  * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
  */
-export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = timedGit() } = {}) {
+export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = process.env.WE_FREEZE_READ_TIMING === '0' ? timedGit() : instrumentGit(timedGit()) } = {}) {
   const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
   let text;
   try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
