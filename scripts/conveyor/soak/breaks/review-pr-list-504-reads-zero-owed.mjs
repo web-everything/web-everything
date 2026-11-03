@@ -26,7 +26,7 @@ import { pathToFileURL } from 'node:url';
 
 const SPECIFIC = new Set([
   'transient-504-not-retried', 'persistent-504-read-as-list', 'persistent-504-no-event',
-  'persistent-504-not-bounded', 'declared-sample-read-as-truncated',
+  'persistent-504-not-bounded', 'heavy-list-issued', 'declared-sample-read-as-truncated',
 ]);
 
 const e504 = () => Object.assign(new Error('gh failed'), { stderr: 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)' });
