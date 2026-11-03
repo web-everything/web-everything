@@ -40,7 +40,7 @@ describe('withListRetry', () => {
     const read = vi.fn(() => { throw error; });
     expect(() => run(read, o, { env })).toThrow(error);
     expect(read).toHaveBeenCalledTimes(3);
-    expect(o.sleep.mock.calls).toEqual([[2000], [6000]]);
+    expect(o.sleep.mock.calls).toEqual(GH_LIST_BACKOFF_MS.map((ms) => [ms])); // the default schedule (synchronous in the daemon loop, so kept short)
   });
   it('lets an explicit backoff schedule override the environment and determine the default attempt count', () => {
     const o = mk();
