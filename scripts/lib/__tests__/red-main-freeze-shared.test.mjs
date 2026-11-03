@@ -874,7 +874,7 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
       return execFileSync(process.execPath, ['-e', "process.stderr.write('Warning: SSH connection notice\\n'); setInterval(() => {}, 1000);"], opts);
     } });
     const { s } = await run(() => {
-      const r = readSharedFreeze({ board: '/b', branch: BRANCH, run: git }); errors.push(r); return r;
+      const r = readSharedFreeze({ board: dirname(m.file), branch: BRANCH, run: git }); errors.push(r); return r;
     }, { ...m, t: m.t + 1000 }, { sleepSync: ms => waits.push(ms) });
     expect(calls).toBe(3); expect(waits).toEqual([1000, 2000]);
     for (const r of errors) {
