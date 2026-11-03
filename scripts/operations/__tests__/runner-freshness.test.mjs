@@ -210,6 +210,7 @@ describe('runner freshness policy', () => {
 
   describe('codex-audit --json', () => {
     const SHA = 'a'.repeat(40), HEAD = 'b'.repeat(40);
+    const WEAK = `WEAKENED\n${JSON.stringify({ id: 'f1', class: 'B2', file: 'run.mjs', line: 1, invariant: 'run guard', trigger: 'Skips guard', consequence: 'Fails open', relation: 'introduced' })}\n`;
     const deps = (answer, out = []) => ({ resolveSha: ref => (ref === HEAD ? HEAD : SHA), runCodex: () => answer,
       appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
     const run = async (answer, json) => {
@@ -235,16 +236,17 @@ describe('runner freshness policy', () => {
       expect(verdict.code).toBe(0);
     });
     it('json mode carries WEAKENED findings and a nonzero code', async () => {
-      const { written, records, out } = await run('WEAKENED\nrun.mjs:1 loosened\n', true);
+      const { written, records, out } = await run(WEAK, true);
       expect(out.code).toBe(1);
       expect(written).toEqual([]);
-      expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 1,
-        stdout: 'WEAKENED\nrun.mjs:1 loosened\n', stderr: '' });
-      expect(records).toEqual([[expect.objectContaining({ verdict: 'WEAKENED', findings: ['run.mjs:1 loosened'] })]]);
+      const v = JSON.parse(out.lines[0]).verdict;
+      expect(v).toMatchObject({ ok: false, code: 1, stderr: '' });
+      expect(v.stdout).toMatch(/^WEAKENED\n\{.*"id":"f1".*\}\n$/);
+      expect(records).toEqual([[expect.objectContaining({ verdict: 'WEAKENED', findings: [expect.objectContaining({ id: 'f1', class: 'B2' })] })]]);
     });
     it('plain mode is unchanged: verdict then findings lines, no JSON', async () => {
-      const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', false);
-      expect(out.lines.join('\n')).toBe('WEAKENED\nrun.mjs:1 loosened');
+      const { out } = await run(WEAK, false);
+      expect(out.lines.join('\n')).toMatch(/^WEAKENED\n\{.*"id":"f1".*\}$/);
     });
     it('an incomplete audit keeps its code and returns its diagnostic in the operations envelope', async () => {
       const { written, records, out } = await run(undefined, true);
@@ -257,7 +259,7 @@ describe('runner freshness policy', () => {
     });
     it.each([
       ['NOT WEAKENED', [], 0],
-      ['WEAKENED', ['run.mjs:1 loosened'], 1],
+      ['WEAKENED', [JSON.stringify({ id: 'f1', class: 'B2', file: 'run.mjs', line: 1, invariant: 'run guard', trigger: 'Skips guard', consequence: 'Fails open', relation: 'introduced' })], 1],
     ])('registered CLI --json emits only the %s envelope', async (verdict, findings, code) => {
       const written = [];
       const injectedDeps = { ...deps([verdict, ...findings].join('\n'), written),
@@ -274,11 +276,14 @@ describe('runner freshness policy', () => {
           store: createMemoryRunStore(), newRunId: () => 'audit-json-regression',
         });
         expect(auditDeps).toHaveBeenCalledOnce();
-        const captured = { ok: code === 0, code, stdout: `${[verdict, ...findings].join('\n')}\n`, stderr: '' };
+        // Classed findings are re-serialised with a derived hunkHash, so match structurally.
+        const captured = code === 0 ? { ok: true, code, stdout: `${verdict}\n`, stderr: '' }
+          : { ok: false, code, stdout: expect.stringMatching(/^WEAKENED\n\{.*"id":"f1".*\}\n$/), stderr: '' };
         expect(outcome.run.verdict).toEqual(captured);
         expect(injectedDeps.appendRecord).toHaveBeenCalledOnce();
         expect(injectedDeps.appendRecord).toHaveBeenCalledWith(expect.objectContaining({
-          verdict, findings, base: SHA, head: HEAD,
+          verdict, base: SHA, head: HEAD,
+          findings: findings.map(() => expect.objectContaining({ id: 'f1', class: 'B2' })),
         }));
         expect(written).toEqual([]);
         const output = binding.finish({ ...outcome, json: true });
