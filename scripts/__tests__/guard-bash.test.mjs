@@ -3778,6 +3778,43 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     },
   );
 
+  // Advisory r10 F1 — the main-push arm reads shell expansions by position, in EVERY cwd (it protects `main`,
+  // not a daemon clone, so it is deliberately independent of the clone registry). An expansion confined to a
+  // double-quoted refspec SOURCE with a literal lane destination cannot reach `main`; anything else can.
+  describe('git push with shell expansions — independent of daemon clones', () => {
+    const CONTEXTS = [{}, { cwd: '/ordinary/repo', daemonCloneRoots: [] }, { cwd: LANE, daemonCloneRoots: roots }];
+    it.each([
+      'git push --force origin "$C:refs/heads/lane/slug"', // the documented commit-tree → lane flow
+      'git push origin "$C:lane/slug"', 'git push origin "${C}:refs/heads/lane/slug"',
+      'git push origin "$(git rev-parse HEAD):refs/heads/lane/slug"', 'git push origin "HEAD$X:lane/slug"',
+      'git push origin -- "$C:refs/heads/lane/slug"', 'git push -u origin "+$C:refs/heads/lane/slug"',
+      `git push origin '$literal:lane/slug'`, 'git push origin \\$C:lane/slug',
+    ])('ALLOWS %s', (command) => {
+      for (const ctx of CONTEXTS) expect(decide(command, ctx), JSON.stringify(ctx)).toBeNull();
+    });
+    it.each([
+      // git splits a refspec at its LAST colon, so an expanded destination may hold `x:main`.
+      ['an expanded destination', 'git push origin "HEAD:lane/$SLUG"'],
+      ['an expanded destination prefix', 'git push origin "HEAD:${NS}lane/x"'],
+      ['an unquoted expansion word-splits into extra refspecs', 'git push origin $C:refs/heads/lane/x'],
+      ['an unquoted destination', 'git push origin HEAD:lane/$SLUG'],
+      ['a partly unquoted word', 'git push origin "HEAD"$C:lane/x'],
+      ['a whole expanded refspec', 'git push origin "$SPEC"'],
+      ['an expansion with no literal colon', 'git push origin "HEAD$X"'],
+      ['an expanded remote', 'git push "$R" HEAD:lane/x'],
+      ['an expanded word that may be an option', 'git push "$OPT" origin HEAD:lane/x'],
+      ['an expanded option value', 'git push --repo=$R HEAD:lane/x'],
+      ['an expanded separated option value', 'git push -o "$X" origin HEAD:lane/x'],
+      ['a literal lane ref beside an unknown one', 'git push origin HEAD:lane/x "$SPEC"'],
+      ['a backtick destination', 'git push origin "HEAD:`printf main`"'],
+      ['an ANSI-C quoted word', "git push origin $'HEAD:main'"],
+      ['a non-lane literal destination', 'git push origin "$C:refs/heads/main"'],
+    ])('DENIES %s', (_name, command) => {
+      for (const ctx of CONTEXTS) expect(decide(command, ctx), JSON.stringify(ctx)).toMatch(/push/);
+      expect(decide(`MAIN_PUSH_OK=1 ${command}`, {})).toBeNull();
+    });
+  });
+
   it.each(['-fz', '-zf', '-fu', '-zu'])(
     'DENIES uncertain short fetch bundles: %s', (flags) => {
       expect(decide(`git fetch ${flags} origin`, { cwd: CLONE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
@@ -3799,6 +3836,90 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
         expect(decide(command, { cwd, daemonCloneRoots: roots }), command).toBeNull();
       }
     }
+  });
+
+  // Advisory r10 F2 — common read-only invocations must stay allowed against a protected clone.
+  it.each(['git --version', 'git -v', 'git --version --build-options', 'git --help', 'git -h', 'git --help log',
+    'git version', 'git help log', 'git branch', 'git branch -a', 'git branch -vv', 'git branch --list "lane/*"',
+    'git branch --show-current', 'git branch --contains HEAD', 'git branch -r --merged origin/main',
+    'git grep -n needle', 'git grep -e x -- "*.mjs"', 'git blame scripts/x.mjs', 'git annotate x.mjs', 'git shortlog -sn',
+    'git ls-remote origin', 'git ls-remote --heads origin main', 'git tag', 'git tag -l', 'git tag --list "v*"',
+    'git tag --contains HEAD', 'git tag -n5 -l'])(
+    'SAFE-COMMAND REGRESSION: ALLOWS read-only diagnostic %s against a protected clone', (command) => {
+      for (const ctx of [{ cwd: CLONE, daemonCloneRoots: roots }, { cwd: LANE, daemonCloneRoots: roots }]) {
+        expect(decide(command, ctx), `${command} @ ${ctx.cwd}`).toBeNull();
+      }
+      const targeted = command.replace(/^git /, `git -C ${CLONE} `);
+      expect(decide(targeted, { cwd: LANE, daemonCloneRoots: roots }), targeted).toBeNull();
+    },
+  );
+
+  // …while the write forms of the same subcommands (and the command-running options) stay denied.
+  it.each(['git branch newname', 'git branch -D lane/x', 'git branch -m a b', 'git branch -f main HEAD',
+    'git branch -v newname', 'git branch --set-upstream-to=origin/main', 'git branch -u origin/main',
+    'git tag v1', 'git tag -d v1', 'git tag -a v1 -m x', 'git tag -f v1', 'git grep -O touch x',
+    'git grep --open-files-in-pager=touch x', 'git grep -nO x', 'git ls-remote --upload-pack=touch origin',
+    'git ls-remote -u touch origin', 'git ls-remote --upl=touch origin', 'git --version reset', 'git --help -w log',
+    'git --exec-path=/x reset --hard'])(
+    'DENIES the write or command-running form %s inside a protected clone', (command) => {
+      expect(decide(command, { cwd: CLONE, daemonCloneRoots: roots }), command).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  // Advisory r10 F3 — an `=`-spelled value-taking fetch option is checked like the separated spelling.
+  it.each(['$SPEC', '"$SPEC"', '${SPEC}', '`printf main:refs/heads/x`'])(
+    'DENIES expansion in an =-spelled fetch option value: %s', (operand) => {
+      for (const option of ['--upload-pack', '--server-option', '--depth', '--filter', '--negotiation-tip', '--repo', '-j']) {
+        const spelled = option.startsWith('--') ? `${option}=${operand}` : `${option}${operand}`;
+        expect(decide(`SPEC='x main:main'; git fetch ${spelled} origin`, {
+          cwd: CLONE, daemonCloneRoots: roots,
+        }), spelled).toMatch(/DAEMON CLONE/);
+      }
+    },
+  );
+
+  // Advisory r10 F4 — shell writers the assignment tracker does not model leave every Git target variable
+  // unknown, never stale (the HOME catch-all, generalized).
+  describe('DENIES a mutation after an unmodelled write of a Git target variable', () => {
+    const WRITERS = [
+      ['read', (k) => `read ${k} <<< ${CLONE}/.git`],
+      ['read -r', (k) => `read -r ${k} < /dev/null`],
+      ['printf -v', (k) => `printf -v ${k} %s ${CLONE}/.git`],
+      ['mapfile', (k) => `mapfile ${k} < /dev/null`],
+      ['readarray', (k) => `readarray ${k} < /dev/null`],
+      ['let', (k) => `let ${k}=1`],
+      ['getopts', (k) => `getopts a ${k}`],
+      ['a {NAME}> descriptor', (k) => `exec {${k}}>/dev/null`],
+      ['an eval of a read', (k) => `eval 'read ${k} <<< ${CLONE}/.git'`],
+      ['an eval of expanded text', () => 'eval "$SETUP"'],
+      ['a sourced file', () => 'source ./env.sh'],
+    ];
+    const KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'XDG_CONFIG_HOME'];
+    it.each(WRITERS.flatMap(([name, writer]) => KEYS.map((key) => ({ name, writer, key }))))(
+      '$name $key; export $key; git <mutation> from a lane', ({ writer, key }) => {
+        const git = { GIT_CONFIG: 'git config user.name x', GIT_CONFIG_GLOBAL: 'git config --global user.name x',
+          XDG_CONFIG_HOME: 'git config --global user.name x' }[key] ?? 'git reset --hard';
+        const ctx = { cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: '/hook-home' } };
+        // The same command without the unmodelled writer resolves to a safe target: the writer is the cause.
+        expect(decide(`true; export ${key}; ${git}`, ctx)).toBeNull();
+        expect(decide(`${writer(key)}; export ${key}; ${git}`, ctx)).toMatch(/DAEMON CLONE/);
+      });
+    it.each([
+      ['a --config-env target variable', `read TARGET <<< ${CLONE}; git --config-env=core.worktree=TARGET reset --hard`],
+      ['an escaped builtin name', `r\\ead GIT_DIR <<< ${CLONE}/.git; export GIT_DIR; git reset --hard`],
+      ['an expanded name', `read $V <<< ${CLONE}/.git; git reset --hard`],
+      ['an expanded printf -v name', `printf -v "$N" %s ${CLONE}; git --config-env=core.worktree=T reset --hard`],
+    ])('%s is unknown after an unmodelled write', (_name, command) => {
+      expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    });
+    it('an unrelated read leaves the Git targets resolved (no over-deny)', () => {
+      expect(decide('for f in a b; do git add $f; done', { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+      expect(decide('export PATH=/x:$PATH; git commit -m wip', { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+      const ctx = { cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: '/hook-home' } };
+      expect(decide('read ANSWER <<< yes; git reset --hard', ctx)).toBeNull();
+      expect(decide('printf -v OUT %s x; git commit -m wip', ctx)).toBeNull();
+      expect(decide('read -r ANSWER; git config --global user.name x', ctx)).toBeNull();
+    });
   });
 
   it('DENIES git reset/checkout/commit — cwd inside the clone, or via `-C <clone>` from elsewhere', () => {

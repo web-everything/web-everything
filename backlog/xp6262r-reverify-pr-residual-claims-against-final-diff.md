@@ -12,8 +12,8 @@ File the claim-accuracy prevention requested by the advisory on web-everything/w
 
 ## Acceptance
 
-- [A1] Observable — the reviewer checklist requires re-verifying every residual or known-limitation claim against the final diff and named tests at the last push, with stale claims corrected before hand-back.
-- [A2] Observable — apply the checklist to PR #6262: remove the obsolete claims about refspecs containing @, persisted fetch configuration, and config/remote mutations; describe any remaining limitations using the final head and current operator rulings.
+- [A1] Executable — a search for "residual" in `we:docs/agent/reviewer-expectations.md` prints a checklist line requiring every residual or known-limitation claim to be re-verified against the final diff and named tests at the last push, with stale claims corrected before hand-back. Planned check: a `check:standards` assertion that the line exists, so deleting it fails the gate.
+- [A2] Observable — `gh pr view 6262 --json body` shows no residual claim about refspecs containing @, persisted fetch configuration, or config/remote mutations. Each removed claim maps to its named test in `we:scripts/__tests__/guard-bash.test.mjs` (`DENIES unresolved refspec/ref operands: %s`, the persisted `remote.*.fetch` reader tests, `DENIES bundled config file selection: %s`). Any remaining limitation names the final head and the current operator rulings.
 
 ## Non-goals
 

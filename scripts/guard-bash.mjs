@@ -2137,6 +2137,9 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
     const t = toks[i];
     if (options && t === '--') { options = false; continue; }
     if (options) {
+      // An expansion inside an option word (`--upload-pack=$SPEC`, `-j$N`) can word-split into extra refspecs,
+      // exactly like the separated `--upload-pack $SPEC` spelling checked below.
+      if (t.startsWith('-') && /[$`]/.test(t)) return true;
       const flag = t.split('=')[0];
       // Git accepts unambiguous long-option abbreviations.
       if ((flag.length >= 10 && '--update-head-ok'.startsWith(flag)) || t === '-u' || /^-[A-Za-z0-9]*u[A-Za-z0-9]*$/.test(t)) return true;
@@ -2396,18 +2399,86 @@ function daemonWrapperUncertain(segment) {
   return false;
 }
 
+// Environment variables that choose where git reads or writes: `decide`'s tracker makes each unknown after a
+// statement that rebinds it in a form the tracker cannot read (the HOME catch-all, applied to every target).
+const GIT_TARGET_ENV_KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL',
+  'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME'];
+// How many distinct names one statement's unmodelled-rebinding check reads before it treats ANY name as rebound.
+const REBIND_NAME_CAP = 512;
+
 // Separate from GIT_STATE_SUBCOMMANDS: new commands and aliases default to denied at protected targets.
 const DAEMON_GIT_READS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'rev-list', 'ls-files',
   'ls-tree', 'cat-file', 'describe', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev',
   'diff-tree', 'diff-index', 'diff-files', 'count-objects', 'check-ref-format']);
 
+// Reads whose every option is harmless (`blame --contents <file>` and `-S <file>` only READ a file).
+const DAEMON_GIT_PLAIN_READS = new Set(['blame', 'annotate', 'shortlog', 'version']);
+
+/** The `--version`/`--help` (or `-v`/`-h`) global flag git turns into `git version`/`git help`: its index in
+ *  `toks` after the known global options, or -1. `gitSubcommandIndex` returns -1 there (unknown arity). */
+function gitInfoFlagIndex(toks) {
+  for (let i = 1; i < toks.length; i++) {
+    if (GIT_VALUE_FLAGS.has(toks[i])) { i += 1; continue; }
+    if (GIT_GLOBAL_FLAGS.has(toks[i]) || /^-(?:c|C).+/.test(toks[i])
+      || /^--(?:git-dir|work-tree|namespace|config-env)=/.test(toks[i])) continue;
+    return ['--version', '-v', '--help', '-h'].includes(toks[i]) ? i : -1;
+  }
+  return -1;
+}
+
+/** Long option `arg` (possibly an unambiguous abbreviation, `=value` allowed) spells one of `names`. */
+const spellsLongOption = (arg, names, min = 4) => {
+  const flag = arg.split('=')[0];
+  return flag.startsWith('--') && flag.length >= min && names.some((name) => name.startsWith(flag));
+};
+
+/** `git branch` / `git tag` in LIST mode only — never a create, delete, rename, move, upstream or annotate form.
+ *  Every option must be a known list option; a positional is a pattern only once list mode is explicit or
+ *  implied by a filter (`--list`, `--contains`, `--merged`, `--points-at`, …), else it names a ref to create. */
+function gitRefListRead(sub, args) {
+  const shortSafe = sub === 'branch' ? /^-[arvil]+$/ : /^-(?:l|i|n\d*)+$/;
+  const longSafe = ['--all', '--remotes', '--verbose', '--list', '--ignore-case', '--color', '--no-color',
+    '--column', '--no-column', '--show-current', '--omit-empty', '--abbrev', '--no-abbrev', '--sort', '--format',
+    '--contains', '--no-contains', '--merged', '--no-merged', '--points-at'];
+  const valueTaking = ['--sort', '--format', '--contains', '--no-contains', '--merged', '--no-merged', '--points-at'];
+  let list = false;
+  let positional = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') { positional ||= i + 1 < args.length; break; }
+    if (!a.startsWith('-')) { positional = true; continue; }
+    if (a === '--show-current' && sub === 'tag') return false;
+    if (shortSafe.test(a)) { list ||= /l/.test(a); continue; }
+    const flag = a.split('=')[0];
+    if (!longSafe.includes(flag)) return false; // abbreviations and every other option stay denied
+    if (['--list', '--contains', '--no-contains', '--merged', '--no-merged', '--points-at'].includes(flag)) list = true;
+    // A filter's optional commit operand is consumed only when attached or present; either way list mode holds.
+    if (!a.includes('=') && valueTaking.includes(flag) && i + 1 < args.length && !args[i + 1].startsWith('-')) i += 1;
+  }
+  return list || !positional;
+}
+
 function daemonGitRead(segment, sub) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const index = gitSubcommandIndex(toks);
-  if (index < 0) return false;
+  if (index < 0) {
+    // `git --version [--build-options]` / `git --help [<topic>]` print and exit; any other word is not a read.
+    const info = gitInfoFlagIndex(toks);
+    if (info < 0) return false;
+    const rest = toks.slice(info + 1);
+    return ['--version', '-v'].includes(toks[info])
+      ? rest.every((a) => a === '--build-options')
+      : rest.length <= 1 && rest.every((a) => /^[A-Za-z][\w-]*$/.test(a));
+  }
   const args = toks.slice(index + 1);
   if (args.some((a) => /[$`]/.test(a) || /^--out/.test(a))) return false;
-  if (DAEMON_GIT_READS.has(sub)) return true;
+  if (DAEMON_GIT_READS.has(sub) || DAEMON_GIT_PLAIN_READS.has(sub)) return true;
+  if (sub === 'help') return args.every((a) => !a.startsWith('-') || ['-a', '--all', '-g', '--guides'].includes(a));
+  if (sub === 'branch' || sub === 'tag') return gitRefListRead(sub, args);
+  // `grep -O`/`--open-files-in-pager` runs a program; any short bundle holding `O` is read as that option.
+  if (sub === 'grep') return !args.some((a) => /^-[^-]*O/.test(a) || spellsLongOption(a, ['--open-files-in-pager']));
+  // `ls-remote -u`/`--upload-pack` runs a program.
+  if (sub === 'ls-remote') return !args.some((a) => /^-[^-]*u/.test(a) || spellsLongOption(a, ['--upload-pack'], 3));
   if (sub === 'config' || sub === 'remote') return !gitConfigOrRemoteWrites(segment, sub);
   if (sub === 'symbolic-ref') {
     return args.filter((a) => !['-q', '--quiet', '--short', '--no-recurse'].includes(a)).length === 1
@@ -2955,6 +3026,110 @@ export function laneRootFromCwd(cwd) {
   if (!cwd) return null;
   const m = String(cwd).match(/^(.*\/\.lanes\/[^/]+\/lane-\d+)(?:\/.*)?$/);
   return m ? m[1] : null;
+}
+
+/** The end (exclusive) of the shell expansion starting at `text[i]` (`$NAME`, `${…}`, `$(…)`, `` `…` ``,
+ *  `$'…'`), or -1 when its body nests quotes or another expansion this reader does not follow. Pure. */
+function expansionEnd(text, i) {
+  if (text[i] === '`') {
+    const close = text.indexOf('`', i + 1);
+    return close < 0 || /[\\'"$]/.test(text.slice(i + 1, close)) ? -1 : close + 1;
+  }
+  const next = text[i + 1];
+  if (next === '{' || next === '(') {
+    const close = next === '{' ? '}' : ')';
+    for (let j = i + 2, depth = 1; j < text.length; j++) {
+      if (/[\\'"`$]/.test(text[j])) return -1;
+      if (text[j] === next) depth++;
+      else if (text[j] === close && --depth === 0) return j + 1;
+    }
+    return -1;
+  }
+  if (next === "'" || next === '"') return -1; // `$'…'` / `$"…"`: a quoted word this reader does not decode
+  if (/[A-Za-z_]/.test(next ?? '')) {
+    let j = i + 1;
+    while (j < text.length && /\w/.test(text[j])) j++;
+    return j;
+  }
+  return i + 2; // `$1`, `$@`, `$?`… — and a lone `$` counts as an expansion too (conservative)
+}
+
+/** The shell words of `text`, each character marked `exp` (part of an expansion) and `dq` (inside double
+ *  quotes), or null when the text has quoting this reader cannot follow. Pure. */
+function expansionWords(text) {
+  const words = [];
+  let cur = null;
+  let quote = null;
+  const add = (ch, exp) => { (cur ??= []).push({ ch, exp, dq: quote === '"' }); };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === "'") { if (c === "'") quote = null; else add(c, false); continue; }
+    if (c === '\\') {
+      if (i + 1 >= text.length) return null;
+      if (quote === '"' && !'$`"\\\n'.includes(text[i + 1])) { add(c, false); continue; }
+      add(text[++i], false);
+      continue;
+    }
+    if (quote === null && /\s/.test(c)) { if (cur) words.push(cur); cur = null; continue; }
+    if (c === '"') { quote = quote ? null : '"'; cur ??= []; continue; }
+    if (c === "'" && quote === null) { quote = "'"; cur ??= []; continue; }
+    if (c === '$' || c === '`') {
+      const end = expansionEnd(text, i);
+      if (end < 0) return null;
+      for (let j = i; j < end; j++) add(text[j], true);
+      i = end - 1;
+      continue;
+    }
+    add(c, false);
+  }
+  if (quote !== null) return null;
+  if (cur) words.push(cur);
+  return words;
+}
+
+/** git push options whose value is the NEXT word when not attached with `=` (long forms may be abbreviated). */
+// (`--signed` / `--force-with-lease` / `--recurse-submodules` take an ATTACHED optional value only.)
+const GIT_PUSH_VALUE_OPTIONS = ['--repo', '--receive-pack', '--exec', '--push-option'];
+
+/** Can no shell expansion in this canonical `git push …` change WHERE it pushes? Pure. True when there is no
+ *  expansion, or every expansion sits in the SOURCE of a positional refspec (never the repository operand)
+ *  that is double-quoted (so it cannot word-split into extra refspecs) and whose destination — the text after
+ *  the last literal colon, because git splits a refspec at its LAST colon — is a literal lane ref. An
+ *  expansion in an option word or option value, in the destination, or outside double quotes is refused.
+ *  A word that BEGINS with an expansion is accepted: under this guard's accidental-collision threat model
+ *  (the arm has the `MAIN_PUSH_OK=1` escape) a commit id expanding into an option is not a realistic slip. */
+export function pushExpansionsConfined(resolvedPush) {
+  if (!/[$`]/.test(resolvedPush)) return true;
+  const words = expansionWords(resolvedPush);
+  if (!words) return false;
+  let positional = 0;
+  let options = true;
+  for (let w = 2; w < words.length; w++) {             // words[0..1] are `git push`
+    const chars = words[w];
+    const text = chars.map((c) => c.ch).join('');
+    const expanded = chars.some((c) => c.exp);
+    if (options && !expanded && text === '--') { options = false; continue; }
+    if (options && chars.length && !chars[0].exp && chars[0].ch === '-') {
+      if (expanded) return false;                      // `--repo=$R`, `-o$X`
+      const flag = text.split('=')[0];
+      const valueNext = !text.includes('=') && (/^-[^-]*o$/.test(text)
+        || (flag.startsWith('--') && flag.length >= 4 && GIT_PUSH_VALUE_OPTIONS.some((o) => o.startsWith(flag))));
+      if (valueNext && w + 1 < words.length) {
+        if (words[w + 1].some((c) => c.exp)) return false;
+        w += 1;
+      }
+      continue;
+    }
+    positional += 1;
+    if (!expanded) continue;
+    if (positional === 1) return false;                // the repository operand
+    if (chars.some((c) => c.exp && !c.dq)) return false; // unquoted: word-splits into extra refspecs
+    let colon = -1;
+    chars.forEach((c, k) => { if (!c.exp && c.ch === ':') colon = k; });
+    if (colon < 0 || chars.slice(colon + 1).some((c) => c.exp)) return false;
+    if (!/^(?:refs\/heads\/)?lane\/[^\s:]+$/.test(text.slice(colon + 1))) return false;
+  }
+  return true;
 }
 
 /** Normalize the leading git invocation of a single command segment to a canonical `git <subcommand> …`
@@ -4531,10 +4706,15 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // `lane/*` ref → PR → CI gate; a direct `git push … main` (or a bare `git push` from a checkout on main)
   // skips CI entirely. Only an explicit `lane/*` destination is allowed. Sanctioned override: prefix
   // `MAIN_PUSH_OK=1` (e.g. pr-land --fallback-git, or an emergency the user directs).
+  // Shell expansions are read by POSITION (`pushExpansionsConfined`), in every cwd: this arm protects `main`, not
+  // a daemon clone, so it does not depend on the clone registry.
   const resolvedPush = canonicalGitOp(s);
-  if (/^git\s+push\b/.test(resolvedPush) && /[$`]/.test(resolvedPush)
+  if (/^git\s+push\b/.test(resolvedPush) && !pushExpansionsConfined(resolvedPush)
       && !/\bMAIN_PUSH_OK=1\b/.test(s))
-    return 'unresolved git push arguments may target a protected ref. Use explicit literal remote/refspec arguments and push to a lane/* ref.';
+    return 'unresolved git push arguments may target a protected ref. A shell expansion is allowed only inside a '
+      + 'double-quoted refspec SOURCE whose destination is a literal lane ref (`git push origin "$C:refs/heads/lane/<name>"`); '
+      + 'git splits a refspec at its LAST colon, so an expanded destination, remote, option or unquoted word may reach `main`. '
+      + 'Inline the value, or push to a literal lane/* ref.';
   if (atCommand(/^git\s+push\b/) && !/\bMAIN_PUSH_OK=1\b/.test(s)) {
     const pushHead = heads.find((h) => /^git\s+push\b/.test(h));
     const rest = pushHead.replace(/^git\s+push\b/, '');
@@ -5479,6 +5659,37 @@ export function decide(command, ctx = {}) {
         readerHome = valueAfter(seg, 'HOME', homeBefore, typeof homeBefore === 'string' ? homeBefore : null);
       } catch { readerHome = null; }
       if (readerHome === null || readerHome !== gitConfigEnv.HOME) setAssignment('HOME', '${HOME}', false, true);
+      // The same catch-all for every Git target variable (advisory r10 F4): `read GIT_DIR`, `printf -v`,
+      // `mapfile`, `let`, a `{GIT_DIR}>` descriptor… rebind it in a way the tracker above does not read, so it
+      // becomes unknown and every target reader fails closed. Plain assignments are already tracked above.
+      // Declarations, unset and bare assignment statements ARE modelled above, unless a name is itself expanded
+      // (`export $V=…`, `unset $V`); for them only an arithmetic rebinding inside a value is left to catch.
+      // An `eval` of literal text is modelled too: its script ran through checkNested above, persisting here.
+      const modelled = directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
+        || (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset')
+        || (programWord(seg) === 'eval' && !/[$`]/.test(seg));
+      const dynamicName = canonicalWords.slice(1).some((w) => w.startsWith('$'));
+      const rebinds = (key) => {
+        try {
+          const p = rebindingOf(key);
+          return modelled && !dynamicName ? rebindsInArithmetic(seg.trim(), p) : rebindsUnreadably(seg.trim(), key, p);
+        } catch { return true; }
+      };
+      // Every name the statement spells (a `--config-env=<key>=NAME` target may be any variable), bounded.
+      // `source`/`.`, or a rebinding through an expanded name (`read $V`) — a name that appears nowhere in the
+      // text still reads as rebound — may change ANY variable: every target is unknown from here on.
+      // A statement with no rebinding builtin, arithmetic, subscript, descriptor or assignment rebinds nothing.
+      const mayRebind = /\b(?:read|mapfile|readarray|printf|let|for|select|coproc|export|readonly|declare|typeset|local|getopts|unset|wait|eval|source)\b|\(\(|\[|\$\{|\}[<>]|[A-Za-z0-9_]=|^\s*\./.test(unquoted(seg)); // `r\ead` runs `read`
+      const spelled = mayRebind ? [...new Set(seg.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])] : [];
+      // Past the cap the names are not read one by one: ANY may be rebound (fail closed, the visible
+      // "unresolved git target" deny), never silently unchecked.
+      const anyName = ['source', '.'].includes(programWord(seg)) || spelled.length > REBIND_NAME_CAP
+        || (mayRebind && rebinds('__guard_bash_unspelled_name__'));
+      for (const key of new Set([...GIT_TARGET_ENV_KEYS, ...(anyName ? [] : spelled)])) {
+        if (anyName || (mayRebind && rebinds(key))) setAssignment(key, `\${${key}}`, false, true);
+      }
+      // A nameref-style marker: later targets read through any variable are unknown (`attributeTargetUnknown`).
+      if (anyName) setAssignment(GIT_TARGET_ENV_KEYS[0], `\${${GIT_TARGET_ENV_KEYS[0]}}`, false, true, 'indirect');
     }
     // Preserve the whole-command recovery used by withNestedCommands: a substitution/group containing
     // separators may not be reconstructible from an individual segment. Never use future assignments.
