@@ -25,7 +25,11 @@ function repo() {
   return { ok, commit, mergeRef, git: (args) => { const r = raw(args); return { code: r.status, stdout: r.stdout }; } };
 }
 const noPr = () => ({ code: 0, stdout: '[]' });
-/** Reproduce the live case: main moved tests between files, so `merge-tree main tip` is not main's tree. */
+/**
+ * Model the live compare answer: after main moved tests between files, `merge-tree main tip` is not main's tree.
+ * Only this one answer is stubbed (git itself cannot be coaxed into it from a tiny repo); history, ancestry,
+ * parents and clean-merge checks all run on real commits.
+ */
 const notNoop = (git) => (args) => (args[0] === 'merge-tree' && args.includes('origin/main')
   ? { code: 0, stdout: `${'f'.repeat(40)}\n` } : git(args));
 const run = (git, ref = 'lane/x-m2') => planRetirements({ rows: [{ ref }], git, gh: noPr, repo: 'o/r' })[0];
@@ -89,6 +93,13 @@ describe('source-in-main retire evidence', () => {
     r.ok('update-ref', 'refs/remotes/origin/lane/x-m2', evil);
     landOn(r, source);
     expect(run(notNoop(r.git)).action).toBe('keep');
+  });
+
+  it('keeps when the parent lookup of the merge ref fails', () => {
+    const { r, source } = scenario();
+    landOn(r, source);
+    const git = (args) => (args[0] === 'rev-list' && args.includes('--parents') ? { code: 128, stdout: '' } : notNoop(r.git)(args));
+    expect(run(git).action).toBe('keep');
   });
 
   it('keeps when git cannot answer the ancestry question', () => {

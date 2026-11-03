@@ -113,7 +113,9 @@ function sourceInMain({ git, ref, tip, carried, mainRef }) {
   if (!mergeRefBase(ref)) return null;
   if (carried.unique.length !== 0 || carried.cleanMerges !== true) return null;
   if (carried.merges.some((merge) => merge !== tip)) return null;
-  const parents = lines(git(['rev-list', '--parents', '-n', '1', tip]).stdout)[0]?.split(/\s+/).slice(1) || [];
+  const parentsRes = git(['rev-list', '--parents', '-n', '1', tip]);
+  if (parentsRes.code !== 0) return null;
+  const parents = lines(parentsRes.stdout)[0]?.split(/\s+/).slice(1) || [];
   if (parents.length !== 2 || !parents.every((sha) => SHA.test(sha))) return null;
   const source = parents[1];
   return git(['merge-base', '--is-ancestor', source, mainRef]).code === 0 ? source : null;
