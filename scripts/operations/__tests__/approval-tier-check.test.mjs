@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { checkApprovalTier, createApprovalDeps, main } from '../approval-tier-check.mjs';
 import { createCheckDeps } from '../d-r379-check-io.mjs';
+import { checkPr } from '../d-r379-check.mjs';
 import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 
@@ -331,6 +332,26 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
 });
 
 describe('default approval IO', () => {
+  it.each(['sent-back', 'operator-block', 'round-cap'].flatMap(outcome =>
+    ['approval-tier-check', 'D-R379 reviewed'].map(consumer => [outcome, consumer])))('advisory accept plus later %s is not clear in %s', async (outcome, consumer) => {
+    const rows = [{ user: { login: 'chalbert' }, created_at: '2026-11-01T00:00:00Z',
+      body: `<!-- we:red-team-advisory pr=6244 rev=${head} -->\n### Post-accept red team\nAdvisory only: this pass never blocks or unblocks the merge. Head \`${head.slice(0, 12)}\` · recorded verdict \`accept\`.\n\n1. [**confirmed**] (edge-case, degraded) \`scripts/example.mjs:1\` — Degraded behavior.` }];
+    const readRedTeam = createApprovalDeps({ env: {}, exec: () => JSON.stringify(rows) }).readRedTeam;
+    const d = deps({ readRedTeam });
+    expect((await check(d)).tier).toBe('standard');
+    expect((await checkPr(6244, d, repo)).conditions.find(c => c.id === 2).status).toBe('PASS');
+    rows.push({ user: { login: 'chalbert' }, created_at: '2026-11-02T00:00:00Z',
+      body: `<!-- we:red-team-gate pr=6244 rev=${head} outcome=${outcome} -->\n${outcome === 'round-cap'
+        ? '- 1 confirmed break(s) NOT sent back: cap (#1).'
+        : '- 1 confirmed break(s) sent back to the fixer (#1).'}` });
+    if (consumer === 'approval-tier-check') {
+      expect(await check(d)).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    } else {
+      const reviewed = (await checkPr(6244, d, repo)).conditions.find(c => c.id === 2);
+      expect(reviewed.status).toBe('FAIL');
+      expect(reviewed.evidence.join(' ')).toContain('red-team not clear');
+    }
+  });
   it.each([createApprovalDeps, createCheckDeps])('reads the newest trusted current-head red-team verdict through bounded gh api argv (%#)', async createDeps => {
     const record = (rev, verdict, created_at, login = 'chalbert') => ({ user: { login }, created_at,
       body: `<!-- we:red-team-advisory pr=6244 rev=${rev} -->\n### Post-accept red team\nAdvisory only: this comment changes no label itself; Head \`${rev.slice(0, 12)}\` · recorded verdict \`${verdict}\`.` });

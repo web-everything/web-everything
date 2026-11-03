@@ -1,6 +1,7 @@
 /** Bounded, injectable Git/GitHub/filesystem readers for D-R379. No shell evaluation. */
 import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import * as realFs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -55,7 +56,13 @@ export function readRedTeam(pr, head, { cwd = process.cwd(), env = process.env, 
     requireFact(Number.isFinite(at), 'red-team timestamp unknown; operator review required');
     if (!newest || at >= newest.at) newest = { at, head: marker[2], result: verdict === 'accept' ? 'clear' : (verdict ?? 'unknown') };
   }
-  return newest ? { head: newest.head, result: newest.result } : null;
+  if (!newest) return null;
+  const disposition = readRedTeamDisposition({ comments, pr, head, repo: CONSTELLATION_REPOS.we.slug, env });
+  // An advisory accept is necessary, but recorded send-backs and operator holds
+  // remain authoritative. Missing disposition evidence cannot grant clearance.
+  const result = disposition.sendBack.length || disposition.held.length ? 'blocked'
+    : !disposition.result ? 'unknown' : newest.result;
+  return { head: newest.head, result };
 }
 
 /** exec(bin, argv, options), fs, home, env, cwd and output streams are hermetically replaceable. */
