@@ -5,7 +5,7 @@
  *   a process cwd / a stash. Deletions are logged with size and reason; dry-run deletes nothing.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, symlinkSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -74,6 +74,18 @@ describe('pruneSnapshots', () => {
     const cmd = `node ${join(jobs, 'verify-daemon/.snapshots/code/ccc')}/scripts/x.mjs`;
     pruneSnapshots({ jobsDir: jobs, stateDir: state, keep: 2, dryRun: false, processCommands: [cmd], sizeOf, log() {} });
     expect(existsSync(join(jobs, 'verify-daemon/.snapshots/code/ccc'))).toBe(true);
+  });
+});
+
+describe('dependency store of a pinned code snapshot', () => {
+  it('is retained', () => {
+    for (const [i, k] of ['aaa', 'bbb', 'ccc'].entries()) snap('verify-daemon', 'code', k, i + 1);
+    for (const [i, k] of ['n1', 'n2', 'n3'].entries()) snap('verify-daemon', 'node-modules', k, i + 1);
+    mkdirSync(join(jobs, 'verify-daemon/.snapshots/node-modules/n3/node_modules'));
+    symlinkSync(join(jobs, 'verify-daemon/.snapshots/node-modules/n3/node_modules'), join(jobs, 'verify-daemon/.snapshots/code/ccc/node_modules'));
+    record('verify-daemon', 'job-1', 'running', { snapshotKeys: ['code:ccc'] });
+    pruneSnapshots({ jobsDir: jobs, stateDir: state, keep: 2, processCommands: [], sizeOf, log() {} });
+    expect(existsSync(join(jobs, 'verify-daemon/.snapshots/node-modules/n3'))).toBe(true);
   });
 });
 

@@ -9,8 +9,8 @@
  *   Every deletion is reported to `log` with its size and reason; `dryRun` deletes nothing. Side effects
  *   (sizes, pids, processes, lanes) are injected so every refusal is unit-testable.
  */
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { evictSnapshots, snapshotsRoot } from './daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
@@ -32,7 +32,9 @@ function readJson(file) { try { return JSON.parse(readFileSync(file, 'utf8')); }
 
 /** All job records in one daemon-jobs store dir; `bad` counts record files we could not read (pins then unknown). */
 function jobRecords(dir) {
-  const parsed = safeList(dir).filter((n) => n.endsWith('.json')).map((n) => readJson(join(dir, n)));
+  let names;
+  try { names = readdirSync(dir); } catch { return { records: [], bad: 1 }; }
+  const parsed = names.filter((n) => n.endsWith('.json')).map((n) => readJson(join(dir, n)));
   return { records: parsed.filter((r) => r && r.job), bad: parsed.filter((r) => !r || !r.job).length };
 }
 
@@ -42,7 +44,9 @@ function jobRecords(dir) {
  */
 function registrationText(stateDir) {
   let out = '';
-  for (const name of safeList(stateDir)) {
+  let names;
+  try { names = readdirSync(stateDir); } catch (e) { return e.code === 'ENOENT' ? '' : null; }
+  for (const name of names) {
     if (!name.endsWith('.json')) continue;
     try {
       const p = join(stateDir, name);
@@ -71,6 +75,11 @@ export function pruneSnapshots({ jobsDir, stateDir, keep = DISK_CLEANUP_DEFAULTS
       for (const key of safeList(join(snapshotsRoot(dir), sub))) {
         if (blob.includes(key)) referenced.add(`${sub === 'code' ? 'code' : 'node-modules'}:${key}`);
       }
+    }
+    // A pinned code snapshot also pins the dependency store its node_modules link points at.
+    for (const key of safeList(join(snapshotsRoot(dir), 'code'))) {
+      if (!referenced.has(`code:${key}`)) continue;
+      try { referenced.add(`node-modules:${basename(dirname(readlinkSync(join(snapshotsRoot(dir), 'code', key, 'node_modules'))))}`); } catch { /* no link */ }
     }
     const plan = evictSnapshots({ jobsDir: dir, referenced, keep, dryRun: true }).evicted;
     for (const ref of plan) {

@@ -36,18 +36,18 @@ const isPidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (
 const processCommands = () => { try { return sh('ps', ['-axo', 'command=']).split('\n'); } catch { return null; } };
 const freeGb = () => { const s = statfsSync(homedir()); return Number(s.bavail) * Number(s.bsize) / 1024 ** 3; };
 
-function liveCwds() {
+function liveCwds() { // read fresh for every inspection: a process may enter a lane after an earlier look
   try { return sh('lsof', ['-a', '-d', 'cwd', '-Fn']).split('\n').filter((l) => l.startsWith('n')).map((l) => l.slice(1)); } catch { return null; }
 }
 function git(dir, args) { try { return sh('git', ['-C', dir, ...args]); } catch { return null; }
 }
 /** Conservative: anything unreadable counts as NOT idle. */
 function makeInspect() {
-  const cwds = liveCwds();
   return (lane) => {
+    const cwds = liveCwds();
     const dir = lane.dir;
-    // Refresh remote-tracking refs first so a stale ref can never prove a commit is pushed; a failed fetch = not idle.
-    const fetched = git(dir, ['fetch', '--prune', '--quiet', 'origin']) !== null;
+    // Refresh every remote's tracking refs first so a stale ref can never prove a commit is pushed; a failed fetch = not idle.
+    const fetched = git(dir, ['fetch', '--all', '--prune', '--quiet']) !== null;
     const unpushedOut = git(dir, ['rev-list', '--count', 'HEAD', '--not', '--remotes']);
     const porcelain = git(dir, ['status', '--porcelain']);
     const stashOut = git(dir, ['stash', 'list']);
