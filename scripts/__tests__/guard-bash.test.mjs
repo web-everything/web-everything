@@ -3594,6 +3594,33 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   const LANE = '/ws/.lanes/web-everything/lane-53';
   const roots = [CLONE];
 
+  it.each([32, 96])('DENIES a clone mutation after %i substitution-bearing shells (R451 traversal budget)', (count) => {
+    const prefix = Array(count).fill("bash -c 'echo $(true)'").join('; ');
+    expect(decide(`${prefix}; bash -c 'git -C ${CLONE} reset --hard'`, {
+      cwd: LANE, daemonCloneRoots: roots,
+    })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('DENIES incomplete nested traversal with a visible fallback; preserves behavior without clone roots', () => {
+    const command = Array(96).fill("bash -c 'echo $(true)'").join('; ');
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE.*traversal.*(?:budget|limit)/s);
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: [] })).toBeNull();
+  });
+
+  it.each(['$SPEC', '"$SPEC"', '${SPEC}', '`printf main:refs/heads/x`'])(
+    'DENIES expansion in a value-taking fetch option operand: %s', (operand) => {
+      expect(decide(`git fetch --upload-pack ${operand} origin`, {
+        cwd: CLONE, daemonCloneRoots: roots,
+      })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['-zf', '-fz'])( 'DENIES bundled config file selection: %s', (flags) => {
+    expect(decide(`git config ${flags} ${CLONE}/.git/config user.name example`, {
+      cwd: LANE, daemonCloneRoots: roots,
+    })).toMatch(/DAEMON CLONE/);
+  });
+
   it('DENIES an Edit-equivalent shell write with cwd already inside the clone', () => {
     expect(daemonCloneWriteReason('echo hi > notes.md', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
     expect(daemonCloneWriteReason('sed -i s/a/b/ notes.md', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);

@@ -2144,7 +2144,10 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
         repositorySeen = true;
         continue;
       }
-      if (GIT_FETCH_VALUE_FLAGS.has(t)) { i += 1; continue; }
+      if (GIT_FETCH_VALUE_FLAGS.has(t)) {
+        if (/[$`]/.test(toks[++i] || '')) return true;
+        continue;
+      }
       if (/^-[^-].+/.test(t)) {
         // Parse the bundle individually. Value-taking/unknown letters leave its reading uncertain.
         if ([...t.slice(1)].some((flag) => !'aPfkpqvnt46'.includes(flag))) return true;
@@ -2214,7 +2217,17 @@ function gitConfigFileTargets(segment, dir, configEnv) {
     const t = args[i];
     if (t === '--file' || t === '--fil' || t === '-f') targets.push(absoluteGitTarget(dir, args[++i] || '', home));
     else if (/^--file?=/.test(t)) targets.push(absoluteGitTarget(dir, t.slice(t.indexOf('=') + 1), home));
-    else if (t.startsWith('-f') && t.length > 2) targets.push(absoluteGitTarget(dir, t.slice(2), home));
+    else if (/^-[^-]/.test(t)) {
+      // Read short bundles letter by letter. Retain the attached-value reading as well as
+      // the separate operand when the suffix could itself be flags: uncertainty never clears a target.
+      for (let j = 1; j < t.length; j++) {
+        if (t[j] !== 'f') continue;
+        const suffix = t.slice(j + 1);
+        if (suffix) targets.push(absoluteGitTarget(dir, suffix, home));
+        if (!suffix || /^[zl]+$/.test(suffix)) targets.push(absoluteGitTarget(dir, args[++i] || '', home));
+        break;
+      }
+    }
   }
   const scopes = [['GIT_CONFIG', null], ['GIT_CONFIG_GLOBAL', '--global'], ['GIT_CONFIG_SYSTEM', '--system']];
   const globalScope = args.some((a) => a.length >= 3 && '--global'.startsWith(a));
@@ -5138,6 +5151,7 @@ export function decide(command, ctx = {}) {
     // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
     // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
     const alternates = copyAlternates(inheritedAlternates);
+    const visitedNested = new Set();
     // Clearing evidence must be unconditional. This scanner does not evaluate shell control flow;
     // retain possible targets in conditional lists, loops, pipelines, groups, function bodies and after
     // comments rather than assume a later assignment or unset ran. File-descriptor redirections
@@ -5188,7 +5202,16 @@ export function decide(command, ctx = {}) {
     };
     const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates,
       childMaybeReadonly = maybeReadonly, childAttributes = uncertainAttributes) => {
-      if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
+      if (!String(text).trim()) return null;
+      if (depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) {
+        // Uninspected executable text can select any clone through shell state. Keep the
+        // historical behavior only when there are no daemon-clone targets to protect.
+        return ctx.daemonCloneRoots?.length
+          ? `DAEMON CLONE protection: nested-command traversal ${nestedBudget <= 0 ? 'budget' : 'depth limit'} exhausted; `
+            + 'split the command into smaller, shallower invocations so every target can be checked. '
+            + daemonCloneWriteMessage('unresolved target in uninspected nested command')
+          : null;
+      }
       nestedBudget -= 1;
       return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates,
         childMaybeReadonly, childAttributes);
@@ -5247,6 +5270,7 @@ export function decide(command, ctx = {}) {
       // and runners receive those assignments even behind wrappers such as `command env`.
       const substitutionCount = substitutionBodies(seg).length;
       for (const [index, text] of nestedCommandStrings(seg).entries()) {
+        visitedNested.add(text);
         const substitution = index < substitutionCount;
         const newProcess = !substitution && (SHELL_PROGRAMS.has(programWord(seg)) || runnerInvocation(canonicalCommand(seg))?.exec);
         // eval executes in this shell; explicit assignments in its script survive the invocation.
@@ -5346,6 +5370,7 @@ export function decide(command, ctx = {}) {
     // separators may not be reconstructible from an individual segment. Never use future assignments.
     const group = leadingGroupBody(whole);
     for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
+      if (visitedNested.has(text)) continue;
       const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates, inheritedMaybeReadonly,
         inheritedAttributes);
       if (r) return r;
