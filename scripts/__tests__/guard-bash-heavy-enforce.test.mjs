@@ -7,9 +7,14 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { decide } from '../guard-bash.mjs';
+import { decide, fullSuiteEscapeUsed } from '../guard-bash.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
+const execVitestRuns = [
+  'npm x vitest run', 'npm x -- vitest run',
+  'npm exec vitest run', 'npm exec -- vitest run',
+  'pnpm exec vitest run', 'yarn exec vitest run', 'bun exec vitest run',
+];
 const separateNodeOptions = [
   '--test-reporter spec.mjs',
   '--test-reporter-destination results.mjs',
@@ -39,6 +44,29 @@ const bypassRuns = [
 ];
 
 describe('heavy-enforce — every direct test run requires admission', () => {
+  it.each(execVitestRuns)('denies bare whole-suite `%s` both raw and admitted', (cmd) => {
+    for (const prefix of ['', queue]) {
+      expect(decide(prefix + cmd, {})).toBe(decide(prefix + 'npx vitest run', {}));
+      expect(decide(prefix + cmd, {})).toContain('bare FULL-SUITE');
+      expect(fullSuiteEscapeUsed(prefix + cmd)).toBe(false);
+    }
+  });
+
+  it.each(execVitestRuns)('allows an admitted file target for `%s` and still queues raw runs', (cmd) => {
+    expect(decide(queue + cmd + ' a.test.mjs', {})).toBeNull();
+    expect(decide(cmd + ' a.test.mjs', {})).toContain('heavy-enforce');
+    expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=1 ' + queue + cmd + ' a.test.mjs')).toBe(false);
+  });
+
+  it.each(execVitestRuns)('requires admission and detects the logged full-suite escape for `%s` like npx', (cmd) => {
+    expect(decide('WE_FULL_SUITE_OK=1 ' + cmd, {})).toContain('heavy-enforce');
+    expect(decide('WE_FULL_SUITE_OK=1 ' + queue + cmd, {})).toBeNull();
+    for (const prefix of ['', queue]) {
+      expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=1 ' + prefix + cmd)).toBe(true);
+      expect(fullSuiteEscapeUsed('WE_FULL_SUITE_OK=0 ' + prefix + cmd)).toBe(false);
+    }
+  });
+
   it.each(bypassRuns)('denies bypass `%s` with its exact admitted form', (cmd) => {
     const result = decide(cmd, {});
     expect(result).toContain('heavy-enforce');

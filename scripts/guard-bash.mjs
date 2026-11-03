@@ -3501,10 +3501,12 @@ export function isFullSuiteHead(head, depth = 0) {
   // vitest's own entry scripts behind `node` (`node node_modules/vitest/dist/cli.js`) are the same bare run.
   if (w[0] === 'node' && VITEST_NODE_ENTRY.test(w[1] || '')) return isFullSuiteHead('vitest' + h.slice(words[1].end), depth + 1);
   if (RUNNER_NAMES.has(w[0])) {
+    const inv = runnerInvocation(h);
+    // Exec runners launch a command, not a script name; apply the same suite/target checks as npx.
+    if (inv?.exec) return isFullSuiteHead(canonicalCommand(inv.exec), depth + 1);
     let idx = -1;
     if (w[0] === 'npm' && ['test', 't', 'tst'].includes(w[1])) { idx = 1; w[1] = 'test'; }
     else {
-      const inv = runnerInvocation(h);
       const name = inv && Array.isArray(inv.names) && inv.names.length === 1 ? inv.names[0] : null;
       if (name) idx = w.indexOf(name, 1);
       if (idx > 0 && (name === 't' || name === 'tst')) w[idx] = 'test';
