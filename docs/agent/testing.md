@@ -3868,3 +3868,18 @@ With independent PR/detector reads succeeding, the disabled producers allow comp
 passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
 The tests also require the detector digest to remain enabled, excluding disable-time
 clearing as a false-positive proof of detector completeness.
+
+## Shard split-retry evidence
+
+`verify-shard-run` may clear incomplete inventory with a passing split only after exit 0
+with no observed failure. Admission forwards child exit codes, so exit 75 cannot prove
+the command never ran. An unexplained nonzero exit (including 75)
+stays UNSETTLED (75) after passing retries; observed failures stay FAIL. Retries must
+also execute at least as many of each previously reported passed/failed assertion,
+counted by normalized file path and `fullName` (falling back to `title`), including
+duplicate names. A skipped assertion or the same
+title in another file cannot satisfy that inventory. Split retry halves additionally
+require every assertion in every reported file to have status `passed`; pending,
+skipped, todo, disabled, or missing statuses leave the half INVENTORY-INCOMPLETE.
+This stricter rule does not change first-attempt inventory acceptance. The scoped regressions live in
+`scripts/lib/__tests__/verify-shard-run.test.mjs`; run them through heavy admission.

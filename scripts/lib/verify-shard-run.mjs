@@ -231,6 +231,11 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             const location = local ? {} : phaseRunLocation(readRemoteReport(attemptRemoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
             collectExecutedAssertions(reportText, retry ? retriedAssertions : initialAssertions, cwd, location);
             inventory = inventoryVerdict(reportText, attemptFiles, cwd, location);
+            // Split retries must finish every reported assertion, including in
+            // extra files. Keep the first-attempt inventory policy unchanged.
+            if (retry && inventory === 'PASS' && JSON.parse(reportText).testResults.some(r =>
+              !Array.isArray(r?.assertionResults) || !r.assertionResults.length
+              || r.assertionResults.some(a => a?.status !== 'passed'))) inventory = 'INVENTORY-INCOMPLETE';
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
           if (inventory === 'INVENTORY-INCOMPLETE') {
