@@ -3734,9 +3734,25 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   it('DENIES repeated -C that lands in a daemon clone (effective dir applied in order, like git)', () => {
     expect(daemonCloneWriteReason('git -C /ws -C wev-review-daemon reset --hard', { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
     expect(daemonCloneWriteReason(`git -C "/ws" -C 'wev-review-daemon' commit -am x`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
-    // a later absolute -C wins; a later ../ walks back out
-    expect(daemonCloneWriteReason(`git -C ${CLONE} -C ${LANE} reset --hard`, { cwd: LANE, roots })).toBeNull();
-    expect(daemonCloneWriteReason(`git -C ${CLONE} -C .. reset --hard`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it.each([
+    `${CLONE} -C ${LANE}`,
+    `${CLONE} -C ..`,
+    `${CLONE}/sub -C ../..`,
+  ])('DENIES mutations when an earlier -C targets a daemon clone despite a later escape: %s', (args) => {
+    const command = `git -C ${args} reset --hard`;
+    expect(daemonCloneWriteReason(command, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    `$UNKNOWN -C ${LANE}`,
+    `${LANE} -C $UNKNOWN`,
+  ])('DENIES mutations when any repeated -C target is unresolved: %s', (args) => {
+    const command = `git -C ${args} reset --hard`;
+    expect(daemonCloneWriteReason(command, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
   });
 
   it('DENIES --git-dir / --work-tree pointing into a daemon clone (both spellings)', () => {

@@ -2021,8 +2021,8 @@ function leadingAssignmentEnvs(env, segment) {
 }
 
 /** Every directory a git invocation TARGETS, from its GLOBAL options only (those before the subcommand): the
- *  effective dir after applying ALL `-C <path>` in order exactly as git does (each relative to the previous,
- *  an absolute one resets), plus `--git-dir` / `--work-tree` (both `=` and separate-arg spellings, resolved
+ *  effective dir first, then EVERY intermediate `-C <path>` target applied in order (each relative to the
+ *  previous, an absolute one resets), plus `--git-dir` / `--work-tree` (both `=` and separate-arg spellings, resolved
  *  against that effective dir). Pure — string-only, no fs. Returns `[]` when `segment` is not git. A
  *  subcommand's own `-C` (`git commit -C HEAD`) is NOT a global option and is never read here. Reads the
  *  SAME wrapper-peeled, basename-resolved `canonicalCommand` view `gitSubcommand` does. A leading `~` in a
@@ -2036,17 +2036,20 @@ function gitTargetDirs(segment, cwd, configEnv = {}) {
   let dir = cwd || '.';
   let gitDir = null;
   let workTree = null;
+  const changeDirs = [];
   const configuredTrees = [];
   for (let i = 1; i < toks.length; i++) {
     const t = toks[i];
     if (t === '-C' && i + 1 < toks.length) {
       dir = absoluteGitTarget(dir, toks[++i], home);
       if (dir === null) return [null];
+      changeDirs.push(dir);
       continue;
     }
     if (t.length > 2 && t.startsWith('-C')) { // not valid git, fail closed
       dir = absoluteGitTarget(dir, t.slice(2), home);
       if (dir === null) return [null];
+      changeDirs.push(dir);
       continue;
     }
     if (t === '--git-dir' && i + 1 < toks.length) { gitDir = toks[++i]; continue; }
@@ -2068,7 +2071,9 @@ function gitTargetDirs(segment, cwd, configEnv = {}) {
     if (t.startsWith('-')) continue;
     break; // the subcommand — everything after it is the subcommand's own options
   }
-  const out = [dir];
+  // A later -C must not erase evidence that an earlier target entered a protected clone.
+  // Keep the effective directory first for the config-file target reader.
+  const out = [dir, ...changeDirs];
   for (const env of leadingAssignmentEnvs(configEnv, segment)) {
     const envGitDir = gitDir ?? env.GIT_DIR ?? null;
     const envWorkTree = workTree ?? env.GIT_WORK_TREE ?? null;
