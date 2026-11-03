@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import {
   runDaemonLoop, buildCliDaemonEffects, realSleep, RECONCILE_FIX_DISPATCH_LEASE_KEY, DEFAULT_INTERVAL_MS,
   runReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
-  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, readPlanFingerprints, formatRefusalLine,
+  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, readPlanFingerprints, readPlanClaims, formatRefusalLine,
   runHungCiRecoveryAllRepos, formatHungActionLine,
   runMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
@@ -1921,5 +1921,15 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(plan.dispatch).toEqual([]);
     expect(plan.notes).toEqual([]);
     expect(plan.refusals).toHaveLength(1);
+  });
+
+  it('the default session probe changes when a lane-bound session resumes or rebinds, not when an unrelated chat flips busy', () => {
+    const probe = (agents) => [...readPlanClaims({ readAgents: () => agents })].filter((k) => k.startsWith('agent:')).sort();
+    const lane = (status, cwd = '/w/.lanes/web-everything/lane-1') => ({ sessionId: 's1', kind: 'background', cwd, status });
+    expect(probe([lane('idle')])).not.toEqual(probe([lane('busy')]));
+    expect(probe([lane('idle')])).not.toEqual(probe([lane('idle', '/w/.lanes/web-everything/lane-2')]));
+    const chat = (status) => ({ sessionId: 's2', kind: 'interactive', cwd: '/w/main', status });
+    expect(probe([chat('idle')])).toEqual(probe([chat('busy')]));
+    expect(() => readPlanClaims({ readAgents: () => null })).toThrow(/unreadable/);
   });
 });

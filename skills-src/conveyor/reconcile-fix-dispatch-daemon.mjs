@@ -760,7 +760,12 @@ export function readPlanClaims({ readAgents = () => defaultReadAgents() } = {}) 
   const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
   const agents = readAgents();
   if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
-  for (const a of agents) out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}`);
+  // Identity, working directory (the lane binding) and, for lane-bound or non-interactive sessions, activity state:
+  // any of those changing means the planner's liveness reading would differ.
+  for (const a of agents) {
+    const laneBound = a?.kind !== 'interactive' || /[\\/]\.lanes[\\/]/.test(String(a?.cwd ?? ''));
+    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${a?.cwd ?? ''}${laneBound ? `:${a?.status ?? ''}` : ''}`);
+  }
   return out;
 }
 
