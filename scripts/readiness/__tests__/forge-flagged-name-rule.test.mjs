@@ -83,14 +83,15 @@ describe('credential-name rule (R321)',()=>{
     expect(flagged).toContain('scripts/lib/secret-scrub.mjs');
     expect(refused).toContain('scripts/lib/secret-scrub.mjs');
     await git(['add','.']);await commit();
-    const manifest=await buildManifest({cwd,exec});
+    const offline=async()=>({status:404}); // R447: no network in tests; unpublished => stays excluded
+    const manifest=await buildManifest({cwd,exec,publicRequest:offline});
     expect(names(manifest.excluded)).toEqual(expect.arrayContaining(refused));
     expect(names(manifest.entries)).toContain('keep.txt');
     for(const p of refused)expect(names(manifest.entries)).not.toContain(p);
     expect(refusedTests.length).toBeGreaterThan(0);
     for(const [p,bytes] of refusedTests)await write(p,bytes);
     await git(['add','.']);await commit();
-    await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-test-file'});
+    await expect(buildManifest({cwd,exec,publicRequest:offline})).rejects.toMatchObject({code:'unshipped-test-file'});
   });
   it('keeps every real tracked design-system tokens file scan-clean and shippable',async()=>{
     const repo=fileURLToPath(new URL('../../../',import.meta.url));
