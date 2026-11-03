@@ -76,7 +76,14 @@ describe('merge-queue same-head failure admission', () => {
         headRefOid: head, mergeStateStatus: 'CLEAN',
         statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
       }, log: vi.fn(), approvedHeadHold: vi.fn(() => false), enqueueAllowed: vi.fn(() => true) };
+      f.workflowRuns = new Map();
       f.exec = vi.fn((_command, args) => {
+        const runPath = args.find(arg => /^repos\/[^/]+\/[^/]+\/actions\/runs\/\d+$/.test(arg));
+        if (runPath) {
+          const result = f.workflowRuns.get(runPath.split('/').at(-1));
+          if (result instanceof Error) throw result;
+          return result ?? JSON.stringify({ workflow_id: 900 });
+        }
         if (args.includes('PUT')) {
           if (f.refused) throw new Error('HTTP 422: head moved');
           return '{}';
@@ -107,6 +114,7 @@ describe('merge-queue same-head failure admission', () => {
         writeFileSync(memoPath, JSON.stringify(stale));
         const previous = process.env.WE_GH_READ_MEMO_DIR;
         process.env.WE_GH_READ_MEMO_DIR = memoDir;
+        f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
         const calls = [], stages = [];
         const original = f.exec.getMockImplementation();
         const exec = vi.fn((file, args, opts) => {
@@ -189,6 +197,8 @@ describe('merge-queue same-head failure admission', () => {
             + '\nreturn enqueueWithSameHeadGuard;')(...Object.values(wiring));
           expect(enqueue({ repo, num: pr }, head, {}, approvedHeadHold).kind).toBe('mq-same-head-failed');
           expect(calls.length).toBeGreaterThan(3);
+          expect(calls.filter(({ args }) => args.some(arg => /actions\/runs\/(100|101)$/.test(arg))))
+            .toHaveLength(2);
           for (const { opts, cached } of calls) {
             expect(cached).toBeUndefined();
             expect(opts.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
@@ -392,6 +402,37 @@ describe('merge-queue same-head failure admission', () => {
       startedAt: `2026-11-02T10:${minute}:00Z`, completedAt: `2026-11-02T10:${minute}:30Z`,
       detailsUrl: `https://github.com/fixture/drain/actions/runs/${run}/job/${run}01`, ...extra,
     });
+    it('distinct workflow_ids with identical workflow and job names stay blocking', () => fixture(f => {
+      f.workflowRuns.set('100', JSON.stringify({ workflow_id: 900 }));
+      f.workflowRuns.set('101', JSON.stringify({ workflow_id: 901 }));
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each(['100', '101'])('unreadable or missing workflow_id for run %s fails closed', run => fixture(f => {
+      const invalid = [new Error('lookup offline'), 'not JSON', '{}', 'null', '{"workflow_id":null}',
+        '{"workflow_id":""}', '{"workflow_id":0}'];
+      for (const result of invalid) {
+        f.workflowRuns.set(run, result);
+        f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
+        f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+      }
+    }));
+    it('same live workflow_id across different runs supersedes regardless of display workflow name', () => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'),
+        runCheck(101, 'SUCCESS', '05', { workflowName: 'renamed' })];
+      f.run(); expect(f.requests()).toHaveLength(1);
+    }));
+    it('workflow lookups are cached once per distinct run only within a decision', () => fixture(f => {
+      f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(100, 'FAILURE', '01'),
+        runCheck(101, 'SUCCESS', '05')];
+      f.approvedHeadHold.mockReturnValue(true); // Refuse after judging checks so a second decision is possible.
+      const lookups = () => f.exec.mock.calls.filter(([, args]) => args.some(arg => /actions\/runs\/\d+$/.test(arg)));
+      f.run(); expect(lookups()).toHaveLength(2);
+      f.workflowRuns.set('101', JSON.stringify({ workflow_id: 901 }));
+      f.approvedHeadHold.mockReturnValue(false);
+      f.run(); expect(lookups()).toHaveLength(4);
+      expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
     it.each([false, true])('same-name jobs in one run retain failure despite later SUCCESS: reversed=%s', reverse => fixture(f => {
       const rows = [runCheck(100, 'FAILURE', '00'), runCheck(100, 'SUCCESS', '05', {
         detailsUrl: 'https://github.com/fixture/drain/actions/runs/100/job/10002',
@@ -404,6 +445,7 @@ describe('merge-queue same-head failure admission', () => {
       f.run(); expect(f.requests()).toHaveLength(1); expect(existsSync(f.path)).toBe(true);
     }));
     it('workflow B failure stays blocking when workflow A succeeds with the same check name', () => fixture(f => {
+      f.workflowRuns.set('101', JSON.stringify({ workflow_id: 901 }));
       f.live.statusCheckRollup = [
         runCheck(100, 'FAILURE', '00', { workflowName: 'B' }),
         runCheck(101, 'SUCCESS', '05', { workflowName: 'A' }),
@@ -427,10 +469,10 @@ describe('merge-queue same-head failure admission', () => {
       f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05', { detailsUrl })];
       f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
-    it.each(['failure', 'success'])('missing workflowName on %s stays blocking despite valid run URLs', missing => fixture(f => {
+    it.each(['failure', 'success'])('missing workflowName on %s uses live workflow_id despite valid run URLs', missing => fixture(f => {
       f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
       delete f.live.statusCheckRollup[missing === 'failure' ? 0 : 1].workflowName;
-      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+      f.run(); expect(f.requests()).toHaveLength(1); expect(existsSync(f.path)).toBe(true);
     }));
     it('run URLs without job IDs still identify runs', () => fixture(f => {
       f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')]
@@ -533,6 +575,7 @@ describe('merge-queue same-head failure admission', () => {
       }));
     it('missing workflow identity cannot prove that a success supersedes a failure', () => fixture(f => {
       f.live.statusCheckRollup = rollup6287.map(({ workflowName, ...row }) => row);
+      for (let index = 0; index < rollup6287.length; index++) f.workflowRuns.set(String(300 + index), '{}');
       f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
     }));
     it.each([false, true])('unordered duplicates fail closed regardless of order: reversed=%s', reverse => fixture(f => {

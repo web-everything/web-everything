@@ -133,23 +133,25 @@ const mqSameHeadRefreshSkips = new Set();
 
 // Display names alone do not establish a check origin. StatusContext rows and
 // incomplete/non-Actions URLs cannot prove that a failed check was superseded.
-function mqRefreshCheckIdentity(check) {
+function mqRefreshCheckIdentity(check, workflowId) {
   const text = value => typeof value === 'string' && value.trim() ? value : null;
-  const name = text(check.name), workflowName = text(check.workflowName);
-  if (check.__typename === 'StatusContext' || !name || !workflowName || !text(check.detailsUrl)) return null;
+  const name = text(check.name);
+  if (check.__typename === 'StatusContext' || !name || !text(check.detailsUrl)) return null;
   let url;
   try { url = new URL(check.detailsUrl); } catch { return null; }
   if (url.origin !== 'https://github.com' || url.username || url.password) return null;
   const run = url.pathname.match(/^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9]\d*)(?:\/job\/([1-9]\d*))?\/?$/);
   if (!run) return null;
   const [, owner, repo, runId, jobId = null] = run;
-  return { name, workflowName, owner: owner.toLowerCase(), repo: repo.toLowerCase(), runId, jobId };
+  const identity = { name, owner: owner.toLowerCase(), repo: repo.toLowerCase(), runId, jobId };
+  const workflow_id = workflowId(identity);
+  return workflow_id === null ? null : { ...identity, workflow_id };
 }
 
 function mqRefreshSameWorkflow(first, second) {
   // Same-name jobs within one run are independent evidence, never retries.
   return second !== null && first.owner === second.owner && first.repo === second.repo
-    && first.name === second.name && first.workflowName === second.workflowName
+    && first.name === second.name && first.workflow_id === second.workflow_id
     && first.runId !== second.runId;
 }
 
@@ -166,7 +168,21 @@ function mqRefreshCheckLater(success, failure) {
   return true;
 }
 
-function mqRefreshChecksGreen(checks) {
+function mqRefreshChecksGreen(checks, exec, opts) {
+  // Cache successes AND unreadable evidence only for this decision, never across refreshes.
+  const workflows = new Map();
+  const workflowId = ({ owner, repo, runId }) => {
+    const endpoint = `repos/${owner}/${repo}/actions/runs/${runId}`;
+    if (!workflows.has(endpoint)) {
+      let id = null;
+      try {
+        const run = JSON.parse(exec('gh', ['api', endpoint], opts));
+        if (Number.isSafeInteger(run?.workflow_id) && run.workflow_id > 0) id = run.workflow_id;
+      } catch { /* Unknown workflow identity keeps the failure blocking. */ }
+      workflows.set(endpoint, id);
+    }
+    return workflows.get(endpoint);
+  };
   if (!Array.isArray(checks) || !checks.length) return false;
   // Never discard live work, even when a completed success appears later.
   if (checks.some(check => !check || typeof check !== 'object'
@@ -177,10 +193,10 @@ function mqRefreshChecksGreen(checks) {
     const conclusion = check.conclusion ?? check.state;
     if (['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(conclusion)) return true;
     if (check.status !== 'COMPLETED' || !failures.has(conclusion)) return false;
-    const identity = mqRefreshCheckIdentity(check);
+    const identity = mqRefreshCheckIdentity(check, workflowId);
     return identity !== null && checks.some(success => success.status === 'COMPLETED'
       && (success.conclusion ?? success.state) === 'SUCCESS'
-      && mqRefreshSameWorkflow(identity, mqRefreshCheckIdentity(success)) && mqRefreshCheckLater(success, check));
+      && mqRefreshSameWorkflow(identity, mqRefreshCheckIdentity(success, workflowId)) && mqRefreshCheckLater(success, check));
   });
 }
 
@@ -206,7 +222,7 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
       '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
     if (mqOid(live?.headRefOid) !== head) { skip('head moved'); return; }
     if (live.mergeStateStatus !== 'CLEAN') { skip('not CLEAN'); return; }
-    if (!mqRefreshChecksGreen(live.statusCheckRollup)) { skip('checks not green'); return; }
+    if (!mqRefreshChecksGreen(live.statusCheckRollup, exec, opts)) { skip('checks not green'); return; }
     // Unreadable enqueue or approval evidence is never permission to refresh.
     let allowed = false;
     try { allowed = allow?.() === true; } catch { /* Fail closed before labels or claim. */ }
