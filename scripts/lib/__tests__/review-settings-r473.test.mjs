@@ -3,9 +3,24 @@ import { spawnSync } from 'node:child_process';
 import { URL as NodeURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BUILT_IN_REVIEW_SETTINGS, defaultReviewSettingsPath, resolveReviewSettings,
-  validateReviewSettings } from '../review-settings.mjs';
+  resolveAuditSettings, resolveReviewSettingSource, validateReviewSettings } from '../review-settings.mjs';
 
 describe('R473 release settings', () => {
+  it.each([
+    [{ releaseStage: 'prod' }, {}, 'prerelease', 'prod', 'tool'],
+    [{}, { releaseStage: 'prod' }, 'prerelease', 'prod', 'platform'],
+    [{ releaseStage: 'invalid' }, {}, 'prerelease', 'prod', 'tool'],
+    [{ releaseStage: 'prerelease' }, {}, 'prod', 'prod', 'env'],
+    [{ releaseStage: 'prerelease' }, {}, 'prerelease', 'prerelease', 'env'],
+  ])('env only tightens configured stage: file=%j platform=%j env=%s', (fileConfig, platform, stage, expected, source) => {
+    const env = { WE_REVIEW_RELEASE_STAGE: stage };
+    expect(resolveAuditSettings({ fileConfig, platform, env })).toMatchObject({
+      value: { releaseStage: expected }, sources: { releaseStage: source },
+    });
+    expect(resolveReviewSettings({ fileConfig, platform, env }).releaseStage).toBe(expected);
+    expect(resolveReviewSettingSource('releaseStage', { fileRaw: fileConfig, platform, env })).toBe(source);
+  });
+
   const readers = [
     ['file loader', 'settings.loadReviewSettingsFile().releaseStage'],
     ['review resolver', 'settings.resolveReviewSettings({ platform: {}, env: {} }).releaseStage'],

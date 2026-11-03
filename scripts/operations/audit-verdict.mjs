@@ -1,5 +1,6 @@
 /** Pure audit projection of platform-decisions#review-stringency-classified-outcomes. */
 import { BUILT_IN_REVIEW_SETTINGS, RELEASE_STAGES } from '../lib/review-settings.mjs';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
 
 export const FINDING_CLASSES = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D1', 'D2', 'D3', 'X1', 'X2']);
 const scopeKeys = ['file', 'line', 'invariant', 'trigger', 'consequence', 'relation'];
@@ -26,6 +27,25 @@ function matchesPath(file, pattern) {
   return new RegExp(`^${source}$`).test(file);
 }
 
+const REPO_ROOT = fileURLToPath(new NodeURL('../../', import.meta.url));
+/** Repo-relative POSIX form of a reported path, or null when it cannot be established (callers fail closed). */
+function pathCandidates(file) {
+  if (typeof file !== 'string' || /[\u0000-\u001f]/.test(file) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) return null;
+  let path = file.replace(/\\/g, '/');
+  if (path.startsWith('/')) {
+    if (!path.startsWith(REPO_ROOT.replace(/\\/g, '/'))) return null;
+    path = path.slice(REPO_ROOT.length);
+  }
+  const parts = [];
+  for (const seg of path.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { if (!parts.length) return null; parts.pop(); continue; }
+    parts.push(seg);
+  }
+  return parts.length ? [parts.join('/')] : null;
+}
+const matchesAny = (file, pattern) => { const c = pathCandidates(file); return c === null || c.some(x => matchesPath(x, pattern)); };
+
 export function computeVerdict(findings, options = {}) {
   const { releaseStage = 'prerelease', raceBlockPaths = BUILT_IN_REVIEW_SETTINGS.raceBlockPaths, rulings = [] } = options;
   const result = { verdict: 'NOT WEAKENED', blocks: [], ships: [], cards: [], recheck: [] };
@@ -47,7 +67,7 @@ export function computeVerdict(findings, options = {}) {
         result.recheck.push({ ...f, class: 'X2' });
         continue;
       }
-      const protectedPath = [...BUILT_IN_REVIEW_SETTINGS.raceBlockPaths, ...raceBlockPaths].some(p => matchesPath(f.file, p));
+      const protectedPath = [...BUILT_IN_REVIEW_SETTINGS.raceBlockPaths, ...raceBlockPaths].some(p => matchesAny(f.file, p));
       if (protectedPath && !f.class.startsWith('B')) {
         if (validInterleaving(f.interleaving)) f.class = 'B4';
         else if (f.class !== 'D1') f.class = 'X2';

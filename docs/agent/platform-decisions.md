@@ -6458,7 +6458,11 @@ must be classified as the corresponding defect, rather than hidden as D3.
 
 **Concurrency carve-out.** In file-locks, lease/slot/lock reapers, lane-pool and merge/drain/mq paths,
 a race claim with a stated reachable interleaving is B4 regardless of a weaker model tag; no runnable
-reproduction is required. Interleavings use a structured `interleaving` array of 2–32 ordered
+reproduction is required. Before path matching, normalize separators, duplicate slashes and dot segments
+to a repo-relative POSIX path. Absolute paths under the running repo use that root; other absolute
+paths may match a protected repo-relative suffix. Escaping relative paths and unresolvable paths
+retain race protection; insufficient evidence requires the targeted recheck or human adjudication.
+Interleavings use a structured `interleaving` array of 2–32 ordered
 `{ actor, action }` steps involving at least two distinct actors; each field is nonblank and at most
 1024 characters. Classification never infers concurrency from English keywords or punctuation.
 On protected paths, a weaker claim without that evidence stays unresolved as X2 (D1 remains D1).
@@ -6488,7 +6492,10 @@ invalid audit evidence (maximum 1 MiB per answer) refuses clearance and requests
 Both keys use the shared standard → platform → tool → environment cascade with effective source diagnostics
 (`resolveAuditSettings` / `resolveReviewSettingSource`). Environment keys are `WE_REVIEW_RELEASE_STAGE` and
 `WE_REVIEW_RACE_BLOCK_PATHS` (JSON array); these are inputs to trusted operator-run tooling, never evidence of
-operator identity. Candidate settings cannot authorize their own audit. The trusted running checkout supplies
+operator identity. The release-stage environment override may only tighten the configured stage:
+`prod` may replace `prerelease`, but env `prerelease` cannot replace configured `prod` (including
+fail-closed `prod`). An ignored loosening retains the configured source in diagnostics.
+Candidate settings cannot authorize their own audit. The trusted running checkout supplies
 the resolved snapshot. The **prod trigger is the first outside user** of any constellation surface: first
 public npm package publish or first external user/customer on plateau-app. The operator records that level
 move; B rows never relax, and outstanding due debt gates the move.

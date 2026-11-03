@@ -152,9 +152,17 @@ export function resolveAuditSettings({ fileConfig = rawReviewSettings(), platfor
   const pick = layer => Object.fromEntries(keys.filter(k => Object.hasOwn(layer ?? {}, k)).map(k => [k, PARSERS[k](layer[k])]));
   const envValues = Object.fromEntries(keys.filter(k => Object.hasOwn(env ?? {}, REVIEW_SETTINGS_ENV[k]))
     .map(k => [k, PARSERS[k](env[REVIEW_SETTINGS_ENV[k]], { fromEnv: true })]));
-  return cascadePolicy('review', pick(fileConfig), {
+  const run = (envLayer, envVals) => cascadePolicy('review', pick(fileConfig), {
     standard: { releaseStage: 'prerelease', raceBlockPaths: RACE_BLOCK_PATHS },
-    platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env, envValues, log,
+    platform: pick(platform === undefined ? platformPreference('review', { env }) : platform), env: envLayer, envValues: envVals, log,
     valid: { releaseStage: v => RELEASE_STAGES.includes(v), raceBlockPaths: validPaths },
   });
+  const resolved = run(env, envValues);
+  // An env override may only tighten: it can never relax a configured prod.
+  if (envValues.releaseStage === 'prerelease') {
+    const { releaseStage: _drop, ...rest } = envValues;
+    const base = run({}, rest);
+    if (base.value?.releaseStage === 'prod') return base;
+  }
+  return resolved;
 }

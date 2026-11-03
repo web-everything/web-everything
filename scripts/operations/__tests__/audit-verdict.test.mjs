@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { URL as NodeURL } from 'node:url';
+import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BUILT_IN_REVIEW_SETTINGS } from '../../lib/review-settings.mjs';
 
@@ -146,6 +146,31 @@ describe('R473 pure classified verdict', () => {
   const protectedFiles = ['scripts/lib/file-locks.mjs', 'scripts/lib/file-locks-cache.mjs',
     'scripts/lease-reaper.mjs', 'scripts/slot-lock-reaper.mjs', 'scripts/lock-reaper.mjs',
     'scripts/lane-pool.mjs', 'scripts/merge.mjs', 'scripts/drain.mjs', 'scripts/mq.mjs'];
+  it.each([
+    './scripts/lib/file-locks.mjs',
+    'a/../scripts/lib/file-locks.mjs',
+    'scripts/lib/../lib/file-locks.mjs',
+    'scripts//lib///file-locks.mjs',
+    'scripts\\lib\\file-locks.mjs',
+    '.\\scripts\\lib\\file-locks.mjs',
+    fileURLToPath(new NodeURL('../../lib/file-locks.mjs', import.meta.url)),
+    '/other/checkout/scripts/lib/file-locks.mjs',
+    'C:\\other\\checkout\\scripts\\lib\\file-locks.mjs',
+    '../scripts/lib/file-locks.mjs',
+    'a/../../ordinary.mjs',
+    '/unresolvable/ordinary.mjs',
+    'file:///unresolvable/ordinary.mjs',
+    'ordinary\u0000.mjs',
+    '.',
+  ])('normalizes race path or fails closed for %j, preserving the plain-path block', async file => {
+    const race = finding({ class: 'D3', file: 'scripts/lib/file-locks.mjs', interleaving,
+      invariant: 'Only one owner may write', consequence: 'Race permits two owners' });
+    const plain = await compute([race], options());
+    const result = await compute([{ ...race, file }], options());
+    expect(plain.blocks).toEqual([expect.objectContaining({ id: 'f1', class: 'B4' })]);
+    expect(result).toEqual({ ...plain, blocks: [{ ...plain.blocks[0], file }] });
+  });
+
   it.each(protectedFiles)('built-in race paths force a stated interleaving in %s to B4', async file => {
     for (const cls of ['D1', 'D2', 'D3', 'E1']) {
       const f = finding({ file, class: cls, invariant: 'Only one owner may write',
@@ -204,6 +229,28 @@ describe('R473 pure classified verdict', () => {
 });
 
 describe('R473 reviewer evidence replay (not new reproductions of the original bugs)', () => {
+  it.each([1, 6, 12])('safety fixture #%s blocks at both stages, independently of fixture expectations', async number => {
+    const c = cases.find(c => c.number === number);
+    for (const stage of ['prerelease', 'prod']) {
+      const result = await compute(c.findings, options(stage, { rulings: c.rulings }));
+      expect(result.verdict).toBe('WEAKENED');
+      expect(result.blocks).toContainEqual(expect.objectContaining({ id: `${number}.1`, class: number === 6 ? 'B6' : 'B4' }));
+      expect(result.ships).toEqual([]);
+      expect(result.cards).toEqual([]);
+    }
+  });
+
+  it('R452 fixture ships with an accepted-risk card at both stages', async () => {
+    const c = cases[14];
+    for (const stage of ['prerelease', 'prod']) {
+      const result = await compute(c.findings, options(stage, { rulings: c.rulings }));
+      expect(result.verdict).toBe('NOT WEAKENED');
+      expect(ids(result.ships)).toEqual(['15.1']);
+      expect(result.cards).toEqual([expect.objectContaining({ id: '15.1', class: 'X1', ruling: 'R452', outcome: 'accepted-risk' })]);
+      expect(result.blocks).toEqual([]);
+    }
+  });
+
   it('pins all 15 cases and their revised classifications', () => {
     expect(cases.map(c => c.number)).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
     expect(cases.map(c => c.revisedClasses)).toEqual([
