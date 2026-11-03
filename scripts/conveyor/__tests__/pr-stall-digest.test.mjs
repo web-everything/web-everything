@@ -614,3 +614,100 @@ it('deadline identity crosses its bucket without timestamp churn and legacy stat
   run(legacy, [op(1, 'B')], { notify });
   expect(run(legacy, [op(1, 'A')], { notify }).notified).toBe(false);
 });
+
+
+it.each([
+  ['missing diff count', { changedFiles: undefined }], ['null diff count', { changedFiles: null }],
+  ['fractional diff count', { changedFiles: 0.5 }], ['negative diff count', { changedFiles: -1 }],
+  ['string diff count', { changedFiles: '0' }], ['unsafe diff count', { changedFiles: Number.MAX_SAFE_INTEGER + 1 }],
+  ['missing labels', { labels: undefined }], ['null labels', { labels: null }],
+  ['malformed labels', { labels: [{}] }], ['empty label name', { labels: [''] }],
+  ['missing head', { headRefOid: undefined }], ['null head', { headRefOid: null }],
+  ['empty head', { headRefOid: '' }], ['blank head', { headRefOid: '   ' }],
+  ['missing update time', { updatedAt: undefined }], ['null update time', { updatedAt: null }],
+  ['invalid update time', { updatedAt: 'invalid' }],
+])('preserves persisted empty-diff feed on %s until same-head positive diff proof', async (_name, patch) => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  const base = { number: 6254, title: 'diff recovery', headRefOid: H, labels: ['review:accepted'],
+    changedFiles: 0, updatedAt: new Date(NOW).toISOString() };
+  let previous = {}, rows = [base];
+  const passes = [];
+  const tick = async minutes => {
+    const report = await runPrSweep({ now: NOW + minutes * 60000, env: {}, config: {},
+      settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+      readPrs: () => rows, readPrevious: () => previous, readQueue: () => ({ ready: [], rulingNeeded: [] }),
+      readSignals: () => ({}), detector: async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }),
+      notify, flush: () => {}, persist: () => {}, append: () => {},
+      stallSweep: () => ({ mode: 'shadow', dir: ctx.stateDir, items: [], incomplete: false }),
+      stallDigest: (pass, options) => { passes.push(pass); return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath }); } });
+    previous = report.nextState;
+    return report;
+  };
+  expect((await tick(0)).errors).toEqual([]);
+  expect(passes[0].incomplete).toBe(false);
+  expect(unacknowledged({ path: ctx.feedPath })).toMatchObject([{ pr: 6254, head: H, state: 'empty-diff' }]);
+  rows = [{ ...base, changedFiles: 1, ...patch }];
+  await tick(1);
+  expect(passes[1].incomplete).toBe(true);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath }).some(e => e.pr === 6254 && e.head === H)).toBe(true);
+  if (Object.hasOwn(patch, 'changedFiles')) {
+    expect(passes[1].items).toEqual([]);
+    expect(unacknowledged({ path: ctx.feedPath })).toMatchObject([{ pr: 6254, head: H, state: 'empty-diff' }]);
+  }
+  rows = [{ ...base, changedFiles: 1 }];
+  expect((await tick(2)).errors).toEqual([]);
+  expect(passes[2]).toMatchObject({ incomplete: false, items: [] });
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toMatchObject([{ pr: 6254, head: H }]);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
+});
+
+
+it.each([
+  ['mode=off / unknown diff', { mode: 'off', digest: true }, { changedFiles: null }],
+  ['digest=false / unknown diff', { mode: 'shadow', digest: false }, { changedFiles: null }],
+  ['mode=off / unknown labels', { mode: 'off', digest: true }, { labels: null }],
+  ['digest=false / unknown labels', { mode: 'shadow', digest: false }, { labels: null }],
+])('incomplete listings preserve persisted detector findings with invariant producer disabled: %s', async (_name, producer, patch) => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  const base = { number: 5759, title: 'detector evidence', headRefOid: H, labels: [],
+    changedFiles: 1, updatedAt: new Date(NOW).toISOString() };
+  const finding = op(base.number, 'stalled-same-head', { action: 'stalled-detector' });
+  let previous = {}, rows = [base], detectorItems = [finding];
+  const passes = [];
+  const tick = async minutes => {
+    const report = await runPrSweep({ now: NOW + minutes * 60000, env: {}, config: {},
+      settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+      readPrs: () => rows, readPrevious: () => previous, readQueue: () => ({ ready: [], rulingNeeded: [] }),
+      readSignals: () => ({}), detector: async () => ({ enabled: true, items: detectorItems, errors: [], nextSeen: {} }),
+      notify, flush: () => {}, persist: () => {}, append: () => {},
+      stallSweep: () => ({ ...producer, dir: ctx.stateDir, items: [], incomplete: false }),
+      stallDigest: (pass, options) => {
+        passes.push({ pass, enabled: options.enabled });
+        return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath });
+      } });
+    previous = report.nextState;
+    expect(report.errors).toEqual([]);
+    return report;
+  };
+  // The invariant would publish no-labels if enabled; only the detector reaches the feed.
+  expect((await tick(0)).decisions[0].violation).toBe('no-labels');
+  expect(passes[0]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: false, items: [finding] } });
+  const opened = unacknowledged({ path: ctx.feedPath });
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ pr: base.number, head: H, state: finding.state });
+  detectorItems = [];
+  rows = [{ ...base, ...patch }];
+  await tick(1);
+  expect(passes[1]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: true, items: [] } });
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toEqual([]);
+  rows = [base];
+  await tick(2);
+  expect(passes[2]).toMatchObject({ enabled: true, pass: { ...producer, incomplete: false, items: [] } });
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
+  expect(replay({ path: ctx.feedPath }).filter(e => e.kind === 'cleared')).toHaveLength(1);
+});

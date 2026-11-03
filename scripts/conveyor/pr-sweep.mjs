@@ -16,7 +16,7 @@ import { healthDir } from './health-watch-section.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
-import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, stateFingerprint, stateSince, DEADLINE_MINUTES, labelNames } from './pr-sweep-core.mjs';
 import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
@@ -157,7 +157,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const readOpenPrs = readPrs ?? createOpenPrCommentReader({ env });
   for (const repo of value.repos) {
     const rows = await safe(`prs ${repo}`, () => readOpenPrs(repo), null);
-    if (!Array.isArray(rows) || rows.some((p) => !p || !Number.isInteger(Number(p.number)) || Number(p.number) <= 0 || !Number.isFinite(Date.parse(p.updatedAt)) || typeof p.headRefOid !== 'string')) {
+    if (!Array.isArray(rows) || rows.some((p) => !p || !Number.isInteger(Number(p.number)) || Number(p.number) <= 0 || !Number.isFinite(Date.parse(p.updatedAt)) || typeof p.headRefOid !== 'string' || !p.headRefOid.trim())) {
       if (rows !== null) errors.push(`prs ${repo}: invalid PR listing`);
       prsReadOk = false; continue;
     }
@@ -172,6 +172,13 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       } : {}),
     })));
   }
+  // Incomplete required evidence must never clear a previously published finding.
+  // This is independent of producer enablement: the digest also carries detector items.
+  const listingEvidenceIncomplete = prs.some(p => {
+    const labels = labelNames(p);
+    return p.diffEvidence === 'diff-unknown' || !labels
+      || labels.some(label => typeof label !== 'string' || !label.trim());
+  });
   const queue = await safe('operator queue', async () => readQueue ? readQueue() : JSON.parse(await command(process.execPath, [join(ROOT, 'scripts/operations/operator-queue.mjs'), '--json'], env)), null);
   const queueOk = queue && !queue.incomplete && !(queue.errors?.length) && Array.isArray(queue.ready) && Array.isArray(queue.rulingNeeded)
     && [...queue.ready, ...queue.rulingNeeded].every((p) => p && repoKeyForSlug(p.repo) !== null && Number.isInteger(Number(p.number)) && Number(p.number) > 0);
@@ -297,7 +304,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
         const d = stallDigest({ ...out, items: sortUnblockersFirst(published),
-          incomplete: out.incomplete || !prsReadOk || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
+          incomplete: out.incomplete || !prsReadOk || listingEvidenceIncomplete || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
         { now, env, stateDir: out.dir, notify, alertBackoffMinutes: value.alertBackoffMinutes,
           enabled: sweepDigestEnabled || invariantItems.length > 0 || detector.items.length > 0 || detector.enabled });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };

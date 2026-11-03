@@ -3952,3 +3952,17 @@ inspection note on the serialized decision. They never prove an empty diff or
 invalidate the whole repository listing. Only numeric integer zero permits the
 existing `empty-diff` closure action. The named cases in `pr-sweep-audit.test.mjs`
 pin unknown evidence, valid nonzero counts, zero, and unaffected sibling decisions.
+
+
+## PR sweep incomplete listing evidence preserves feed findings
+
+Unknown diff evidence also marks the shared stall digest incomplete. A same-head
+empty-diff finding stays open across missing/invalid `changedFiles`; a subsequent
+known positive integer count permits clearing it on a complete pass. Unknown or
+malformed labels likewise mark the digest incomplete without dropping the PR.
+Missing/invalid update time and missing, empty or blank heads invalidate discovery
+and preserve existing feed findings through `prsReadOk`. This completeness rule
+also protects detector items when the invariant producer is disabled.
+`pr-stall-digest.test.mjs` exercises real publication and persisted feed replay
+through empty diff, incomplete evidence and same-head positive-count recovery,
+asserting no cleared event until the recovery pass.
