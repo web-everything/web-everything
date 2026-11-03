@@ -421,7 +421,12 @@ export function smokeLaneHints({ root, env = process.env, max = SMOKE_LANE_HINT_
     // whose path is missing or unresolvable is dropped rather than trusted.
     const self = realpathSync(root);
     const rows = (list?.lanes ?? []).filter((l) => {
-      try { return l?.path && realpathSync(l.path) !== self; } catch { return false; }
+      // Bind path to number and pool: the row must be exactly <this pool>/lane-<N>, so a mismatched list cannot
+      // steer an explicit acquire at another checkout.
+      try {
+        const real = realpathSync(l.path);
+        return real !== self && real === join(realpathSync(poolDir), `lane-${l.lane}`);
+      } catch { return false; }
     });
     return freeLaneCandidates({ ...list, lanes: rows }).slice(0, max);
   } catch { return []; }
@@ -481,9 +486,10 @@ async function checkLaneAcquireRelease(ctx) {
         const busy = typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(env);
         const firstCap = Math.min(acquireCapMs, SMOKE_AUTOPICK_FIRST_MS);
         if (!hints.length || !isTimeout(e) || !busy || !((ctx.clock ?? Date.now)() - tStart >= firstCap * 0.9)) throw e;
-        try { await releaseSession(); } catch { throw e; }
+        try { await releaseSession(); } catch { throw new Error(`auto-pick timed out and its lease cleanup failed (lease may be leaked): ${firstLine(e)}`); }
         const hinted = await acquireHinted();
-        if (hinted === undefined) throw e;
+        // Distinct wording on purpose: no busy-pool signature, so an exhausted/failed hint set is a real failure.
+        if (hinted === undefined) throw new Error(`auto-pick timed out and every free-lane hint failed (${hints.join(',')}): ${firstLine(e)}`);
         return hinted;
       }
     };

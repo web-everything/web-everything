@@ -109,7 +109,9 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     });
     it('a failed cleanup after the timeout refuses the fallback (no leaked lease hidden)', async () => {
       const runChild = vi.fn().mockRejectedValueOnce(timedOut()).mockRejectedValueOnce(exit(1));
-      expect((await check.run(hinted([7], runChild))).lane).toBeUndefined();
+      const row = await check.run(hinted([7], runChild));
+      expect(row.ok).toBe(false);
+      expect(row.detail).toMatch(/lease cleanup failed/);
       expect(acquires(runChild)).toHaveLength(1);
     });
     it('a fast "no free lane" is NEVER rescued by a hint (no laundering)', async () => {
@@ -118,10 +120,10 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
       expect(acquires(runChild).some(([, args]) => args.some((x) => x.startsWith('--lane=')))).toBe(false);
     });
     it('every hint failing re-throws the original timeout (still a failure, leases released)', async () => {
-      const runChild = vi.fn().mockRejectedValue(timedOut());
+      const runChild = vi.fn((_c, args) => (args.includes('release') ? Promise.resolve('') : Promise.reject(timedOut())));
       const row = await check.run(hinted([7], runChild));
-      expect(row.lane).toBeUndefined();
-      expect(row.detail).toMatch(/timed out after/);
+      expect(row.ok).toBe(false);
+      expect(row.detail).toMatch(/every free-lane hint failed.*timed out after/);
       expect(runChild.mock.calls.some(([, args]) => args.includes('release') && args.includes('--all-pools'))).toBe(true);
     });
     it('a FAST failure worded like a timeout is not rescued', async () => {
@@ -129,15 +131,19 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
       expect((await check.run({ ...hinted([7], runChild), clock: () => 1000 })).ok).toBe(false);
       expect(acquires(runChild).some(([, args]) => args.some((x) => x.startsWith('--lane=')))).toBe(false);
     });
-    it('smokeLaneHints reads the list regardless of age, drops the caller\'s own lane (symlink-safe) and unresolvable rows', () => {
-      const dir = mkdtempSync(join(tmpdir(), 'hints-'));
+    it('smokeLaneHints reads the list regardless of age; drops own lane (symlink-safe), unresolvable and path/number-mismatched rows', () => {
+      const root = mkdtempSync(join(tmpdir(), 'hints-'));
+      const dir = join(root, 'web-everything'); mkdirSync(dir);
       const mk = (n) => { const d = join(dir, `lane-${n}`); mkdirSync(d); return d; };
       const own = mk(1); symlinkSync(own, join(dir, 'alias'));
+      const l5 = mk(5), l8 = mk(8), l11 = mk(11); mk(12);
       const file = join(dir, 'l.json');
       writeFileSync(file, JSON.stringify({ v: 1, writtenAt: 1, repo: 'web-everything', poolDir: dir,
-        lanes: [{ lane: 5, path: mk(5) }, { lane: 1, path: join(dir, 'alias') }, { lane: 8, path: mk(8) }, { lane: 9 }, { lane: 10, path: join(dir, 'gone') }, { lane: 11, path: mk(11) }, { lane: 12, path: mk(12) }] }));
-      expect(smokeLaneHints({ root: own, env: { LANE_POOL_FREE_LIST_FILE: file } })).toEqual([5, 8, 11]);
-      expect(smokeLaneHints({ root: own, env: { LANE_POOL_FREE_LIST_FILE: join(dir, 'none.json') } })).toEqual([]);
+        lanes: [{ lane: 5, path: l5 }, { lane: 1, path: join(dir, 'alias') }, { lane: 8, path: l8 }, { lane: 9 }, { lane: 10, path: join(dir, 'gone') },
+          { lane: 13, path: l5 }, { lane: 11, path: l11 }, { lane: 12, path: join(dir, 'lane-12') }] }));
+      const env = { LANE_POOL_ROOT: root, LANE_POOL_FREE_LIST_FILE: file };
+      expect(smokeLaneHints({ root: own, env, max: 10 })).toEqual([5, 8, 11, 12]);
+      expect(smokeLaneHints({ root: own, env: { ...env, LANE_POOL_FREE_LIST_FILE: join(dir, 'none.json') } })).toEqual([]);
     });
   });
 
