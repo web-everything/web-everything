@@ -3762,6 +3762,29 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     },
   );
 
+  it('retains protected Git targets across skipped conditional assignments', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    // The skipped assignment adds a possible value; the tracked protected target stays checked.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; false && export GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`export GIT_WORK_TREE=${CLONE}; false && export GIT_WORK_TREE=/safe; git clean -fd`, ctx)).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each(['declare -p', 'typeset -p', 'declare -f', 'declare -F', 'declare -xp', 'typeset -pr', 'export -f', 'readonly -f'])(
+    'DENIES after a printing or function-only directive that assigns nothing: %s', (directive) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+      // A printing directive is not a readonly lock either: a later safe assignment still replaces the target.
+      expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
+    },
+  );
+
+  it.each(['export -p', 'readonly -p'])('treats version-dependent %s assignments as possible values', (directive) => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    // Bash 3.2 assigns here, so a protected value is recorded; and the earlier value is never erased.
+    expect(decide(`${directive} GIT_DIR=${CLONE}/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+  });
+
   it('ALLOWS lane mutations after many skipped unrelated assignments', () => {
     // Possible values are tracked per variable, so unrelated conditional assignments add no unknown target.
     const skipped = Array.from({ length: 12 }, (_, i) => `false && export V${i}=${i}`).join('; ');

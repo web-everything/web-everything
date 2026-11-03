@@ -5077,7 +5077,16 @@ export function decide(command, ctx = {}) {
       const optionEnd = canonicalWords.indexOf('--');
       const badOption = !!knownOptions && canonicalWords.slice(1, optionEnd < 0 ? undefined : optionEnd)
         .some((t) => /^[-+]./.test(t) && !knownOptions.test(t));
-      const uncertain = redirected || badOption;
+      const optionWords = canonicalWords.slice(1, optionEnd < 0 ? undefined : optionEnd).filter((t) => /^[-+]./.test(t));
+      // `declare`/`typeset` with -p, -f or -F print or list and assign nothing; `export -f` and `readonly -f`
+      // name functions, never variables. Bash versions differ on `export -p X=v` / `readonly -p X=v`, so
+      // those only add a possible value.
+      const printsOnly = ['declare', 'typeset'].includes(canonicalWords[0])
+        ? optionWords.some((t) => /[pfF]/.test(t))
+        : ['export', 'readonly'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*f/.test(t));
+      const versionDependent = ['export', 'readonly'].includes(canonicalWords[0])
+        && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
+      const uncertain = redirected || badOption || versionDependent;
       if (!seg.trim().startsWith('(') && canonicalWords[0] === 'unset') {
         let variables = true;
         let options = true;
@@ -5099,7 +5108,8 @@ export function decide(command, ctx = {}) {
       if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
         const readonly = canonicalWords[0] === 'readonly'
           || (['declare', 'typeset'].includes(canonicalWords[0]) && canonicalWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));
-        const assignments = directive ? [...gitLeadingAssignments(seg).map((m) => m[0]), ...canonicalWords] : words;
+        const leadingWords = gitLeadingAssignments(seg).map((m) => m[0]);
+        const assignments = directive ? [...leadingWords, ...(printsOnly ? [] : canonicalWords)] : words;
         for (const word of assignments) {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
           if (m) setAssignment(m[1], m[2], readonly, uncertain);
