@@ -5,6 +5,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { createHash } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
 import {
@@ -50,11 +53,14 @@ const forbiddenEnv = {
   CREDENTIAL: 'secret-credential-marker', mixedCaseToken: 'secret-mixed-marker',
   HOME: 'private-home-marker', PATH: 'private-path-marker', OTHER: 'private-other-marker',
 };
-let cwd;
+let cwd, publicCacheFile;
 const auxiliary=[];
 beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
   cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
+  const cacheRoot = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-public-cache-')));
+  auxiliary.push(cacheRoot);
+  publicCacheFile = join(cacheRoot, 'public-blobs.jsonl');
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
 });
 afterEach(() => {rmSync(cwd, { recursive: true, force: true });for(const path of auxiliary.splice(0))rmSync(path,{recursive:true,force:true});});
@@ -1840,7 +1846,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
   async function build(options) {
     expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
-    return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
+    return remoteManifestAPI.buildManifest({publicCacheFile, exec:gitInventory([]), publicRequest:async()=>({status:404}), ...options});
   }
   it.each(['inventory','walk'])('carries a relative, lossy UTF-8, single-line path in an unshipped symlink refusal from %s', async site => {
     // LF/CR are unsafe manifest bytes; exercise detail sanitization with allowed
@@ -1875,9 +1881,8 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const exec=vi.fn(async call=>bindingEvidence(call)??({code:0,stdout:call.args.includes('-i')?Buffer.from('coverage/coverage-final.json\0'):Buffer.alloc(0)}));
     await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-symlink'});
   });
-  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}, github) {
+  function gitInventory(paths, stage = Buffer.alloc(0), tree = {code:0, stdout:Buffer.alloc(0)}) {
     return vi.fn(async call => {
-      if (call.file === 'gh' && github) return github(call);
       expect(call.file).toBe('git');
       const binding=bindingEvidence(call);if(binding)return binding;
       expect(call.args).toContain('-z');
@@ -2058,11 +2063,14 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
   const published = call => {
-    expect(call.args).toEqual(['api', '-i', '--hostname', 'github.com', expect.stringMatching(/^repos\/web-everything\/web-everything\/git\/blobs\/[a-f0-9]{40}$/)]);
-    expect(call.env.WE_GH_ETAG_CACHE).toBe('0');
-    expect(call.timeout).toBe(10000);
-    return {code:0, stdout:Buffer.from('HTTP/2.0 200 OK\r\n\r\n' + JSON.stringify({sha:call.args.at(-1).split('/').at(-1)}))};
+    expect(call.url).toMatch(/^https:\/\/api\.github\.com\/repos\/web-everything\/web-everything\/git\/blobs\/[a-f0-9]{40}$/);
+    expect(call.headers).toEqual({Accept:'application/vnd.github+json','User-Agent':'web-everything-publication'});
+    expect(Object.keys(call).sort()).toEqual(['headers','signal','url']);
+    expect(call.signal).toBeInstanceOf(AbortSignal);
+    return {status:200,body:JSON.stringify({sha:call.url.split('/').at(-1),url:call.url})};
   };
+  const cachedOids = () => readFileSync(publicCacheFile,'utf8').trimEnd().split('\n').map(line=>JSON.parse(line).oid);
+  const cacheLines = oids => oids.map(oid=>JSON.stringify({oid})).join('\n')+'\n';
   const publicTokenFixture = 'token=ghp_0123456789abcdefghijklmnopqrstuvwxyzABCD\n';
 
   it.each(['publish-secret-gate.test.mjs', '__tests__/secret-x.test.mjs', '__tests__/secret-fixture.mjs', 'secret-x.spec.mjs'])
@@ -2072,25 +2080,94 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const paths = [Buffer.from(name)];
     expect(credentialContentFinding(paths[0], Buffer.from(publicTokenFixture))).toBeTruthy();
     const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, publicTokenFixture),
-      {code:0, stdout:Buffer.alloc(0)}, published)});
+      {code:0, stdout:Buffer.alloc(0)}), publicRequest:published});
     expect(manifest.entries).toEqual([{path:paths[0], sha256:sha(publicTokenFixture), executable:false, tracked:true}]);
     expect(manifest.excluded).toEqual([]);
   });
 
-  it.each(['404','error','timeout','garbage','bare','304','wrong oid'])('closes fixture lookup: %s', async kind => {
+  it.each(['404','403','429','500','error','timeout','garbage','bare','304','302','wrong oid','wrong host','missing url'])('closes fixture lookup: %s', async kind => {
     const name='secret.test.mjs';
     writeFileSync(join(cwd,name),publicTokenFixture);
     const github=vi.fn(call=>{
       if(kind==='error'||kind==='timeout')throw Object.assign(new Error(kind),{code:kind==='timeout'?'ETIMEDOUT':'EIO'});
-      if(kind==='garbage')return {code:0,stdout:Buffer.from('HTTP/2.0 200 OK\r\n\r\n?')};
-      if(kind==='bare')return {code:0,stdout:Buffer.from(JSON.stringify({sha:blob(publicTokenFixture)}))};
-      if(kind==='wrong oid')return {code:0,stdout:Buffer.from('HTTP/2.0 200 OK\r\n\r\n'+JSON.stringify({sha:'a'.repeat(40)}))};
-      return {code:kind==='404'?1:0,stdout:Buffer.from(`HTTP/2.0 ${kind} Unknown\r\n\r\n{}`)};
+      const result=published(call);
+      if(kind==='garbage')return {...result,body:'?'};
+      if(kind==='bare')return {body:result.body};
+      if(kind==='wrong oid')return {...result,body:JSON.stringify({sha:'a'.repeat(40),url:call.url})};
+      if(kind==='wrong host')return {...result,body:JSON.stringify({sha:blob(publicTokenFixture),url:'https://example.com/blob'})};
+      if(kind==='missing url')return {...result,body:JSON.stringify({sha:blob(publicTokenFixture)})};
+      return {...result,status:Number(kind)};
     });
     // A rewritten local origin/main claims these exact private bytes are public.
     await expect(build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture),
-      {code:0,stdout:treeRecord(name,publicTokenFixture)},github)})).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
+      {code:0,stdout:treeRecord(name,publicTokenFixture)}),publicRequest:github})).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
     expect(github).toHaveBeenCalledTimes(1);
+    expect(existsSync(publicCacheFile)).toBe(false);
+  });
+
+  it('keeps credentials out of public lookup', async () => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    const github=vi.fn(published);
+    const env={...process.env,GH_TOKEN:'gh-token',GITHUB_TOKEN:'github-token',GH_CONFIG_DIR:'private-config',GH_APP_TOKEN:'app-token'};
+    const manifest=await build({cwd,env,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:github});
+    expect(manifest.entries).toHaveLength(1);
+    expect(github).toHaveBeenCalledTimes(1);
+    const call=github.mock.calls[0][0];
+    expect(call.env).toBeUndefined();
+    expect(Object.keys(call.headers).some(key=>key.toLowerCase()==='authorization')).toBe(false);
+    for(const token of ['gh-token','github-token','private-config','app-token'])expect(JSON.stringify(call)).not.toContain(token);
+  });
+
+  it('native transport sends anonymous requests with an isolated agent', async () => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    const tokens={GH_TOKEN:'gh-token',GITHUB_TOKEN:'github-token',GH_CONFIG_DIR:'private-config',GH_APP_TOKEN:'app-token',GITHUB_APP_TOKEN:'github-app-token'};
+    for(const [key,value] of Object.entries(tokens))vi.stubEnv(key,value);
+    const get=vi.spyOn(https,'get').mockImplementation((url,options,onResponse)=>{
+      const response=new PassThrough();
+      response.statusCode=200;
+      queueMicrotask(()=>{
+        onResponse(response);
+        response.end(JSON.stringify({sha:blob(publicTokenFixture),url}));
+      });
+      return new EventEmitter();
+    });
+    try {
+      const manifest=await build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:undefined});
+      expect(manifest.entries).toHaveLength(1);
+      expect(get).toHaveBeenCalledTimes(1);
+      const [url,options]=get.mock.calls[0];
+      expect(url).toBe(`https://api.github.com/repos/web-everything/web-everything/git/blobs/${blob(publicTokenFixture)}`);
+      expect(options.agent).toBe(false);
+      expect(options.headers).toEqual({Accept:'application/vnd.github+json','User-Agent':'web-everything-publication'});
+      expect(Object.keys(options.headers).some(key=>key.toLowerCase()==='authorization')).toBe(false);
+      expect(Object.keys(options).sort()).toEqual(['agent','headers','signal']);
+      for(const token of Object.values(tokens))expect(JSON.stringify([url,options])).not.toContain(token);
+    } finally {get.mockRestore();vi.unstubAllEnvs();}
+  });
+
+  it.each([301,302,307,308])('native transport refuses HTTP %s without a second request', async status => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    const response=new PassThrough();
+    response.statusCode=status;
+    response.headers={location:'https://other.example/private-blob'};
+    const get=vi.spyOn(https,'get').mockImplementation((url,options,onResponse)=>{
+      queueMicrotask(()=>{
+        onResponse(response);
+        // Even a redirect body claiming publication cannot authorize shipment.
+        if(!response.destroyed)response.end(JSON.stringify({sha:blob(publicTokenFixture),url}));
+      });
+      return new EventEmitter();
+    });
+    try {
+      await expect(build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:undefined}))
+        .rejects.toMatchObject({code:'unshipped-test-file',detail:name});
+      expect(response.destroyed).toBe(true);
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(get.mock.calls[0][0]).toBe(`https://api.github.com/repos/web-everything/web-everything/git/blobs/${blob(publicTokenFixture)}`);
+    } finally {get.mockRestore();response.destroy();}
   });
 
   it('bounds a hung blob read', async () => {
@@ -2101,23 +2178,123 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const github=vi.fn(()=>{started();return new Promise(()=>{});});
     vi.useFakeTimers({toFake:['setTimeout','clearTimeout']});
     try {
-      const pending=build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture),undefined,github)});
+      const pending=build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:github});
       const refused=expect(pending).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
       await ready;
       await vi.advanceTimersByTimeAsync(10000);
       await refused;
+      expect(github.mock.calls[0][0].signal.aborted).toBe(true);
     } finally {vi.useRealTimers();}
   });
 
-  it('reads publication afresh per build', async () => {
+  it('ships a cached positive oid across builds with zero network calls', async () => {
     const name='__tests__/secret-fixture.mjs';
     mkdirSync(join(cwd,'__tests__'));writeFileSync(join(cwd,name),publicTokenFixture);
     const github=vi.fn(published);
-    const exec=gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture),undefined,github);
-    expect((await build({cwd,exec})).entries).toHaveLength(1);
-    github.mockResolvedValue({code:1,stdout:Buffer.from('HTTP/2.0 404 Unknown\r\n\r\n{}')});
-    await expect(build({cwd,exec})).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
-    expect(github).toHaveBeenCalledTimes(2);
+    const exec=gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture));
+    expect((await build({cwd,exec,publicRequest:github})).entries).toHaveLength(1);
+    expect(cachedOids()).toContain(blob(publicTokenFixture));
+    const offline=vi.fn(()=>{throw new Error('network unavailable');});
+    expect((await build({cwd,exec,publicRequest:offline})).entries).toHaveLength(1);
+    expect(offline).not.toHaveBeenCalled();
+  });
+
+  it('does not look up a credential-named fixture without credential content', async () => {
+    const name='secret.test.mjs', data='export const harmless = true;\n';
+    writeFileSync(join(cwd,name),data);
+    expect(credentialContentFinding(Buffer.from(name),Buffer.from(data))).toBeFalsy();
+    const github=vi.fn(published);
+    expect((await build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,data)),publicRequest:github})).entries).toHaveLength(1);
+    expect(github).not.toHaveBeenCalled();
+    expect(existsSync(publicCacheFile)).toBe(false);
+  });
+
+  it.each(['corrupt','oversized','too many entries','unreadable'])('treats %s cache as a miss and re-looks up', async kind => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    if(kind==='unreadable')mkdirSync(publicCacheFile);
+    else writeFileSync(publicCacheFile,kind==='corrupt'?'?':kind==='oversized'?' '.repeat(1024*1024):cacheLines(Array(4097).fill(blob(publicTokenFixture))));
+    const github=vi.fn(published);
+    expect((await build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:github})).entries).toHaveLength(1);
+    expect(github).toHaveBeenCalledTimes(1);
+  });
+
+  it('cache write failure does not throw or prevent independently proven shipment', async () => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    // A regular file cannot be the cache's parent directory (works as root too).
+    writeFileSync(publicCacheFile,'blocked');
+    const github=vi.fn(published);
+    expect((await build({cwd,publicCacheFile:join(publicCacheFile,'cache.json'),exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:github})).entries).toHaveLength(1);
+    expect(github).toHaveBeenCalledTimes(1);
+    expect(readFileSync(publicCacheFile,'utf8')).toBe('blocked');
+  });
+
+  it('keeps at most 4096 positive oids and re-looks up evicted entries', async () => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    const old=Array.from({length:4096},(_,i)=>i.toString(16).padStart(40,'0'));
+    writeFileSync(publicCacheFile,cacheLines(old));
+    const github=vi.fn(published);
+    expect((await build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:github})).entries).toHaveLength(1);
+    const cached=cachedOids();
+    expect(cached).toHaveLength(4096);
+    expect(cached).toContain(blob(publicTokenFixture));
+    expect(cached).not.toContain(old[0]);
+    const evictedData=publicTokenFixture+'// evicted\n', evictedOid=blob(evictedData);
+    writeFileSync(publicCacheFile,cacheLines([evictedOid,...old.slice(1)]));
+    await build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture)),publicRequest:github});
+    writeFileSync(join(cwd,name),evictedData);
+    const offline=vi.fn(()=>({status:429,body:'{}'}));
+    await expect(build({cwd,exec:gitInventory([Buffer.from(name)],indexRecord(name,evictedData)),publicRequest:offline})).rejects.toMatchObject({code:'unshipped-test-file'});
+    expect(offline).toHaveBeenCalledOnce();
+    expect(cachedOids()).not.toContain(evictedOid);
+  });
+
+  it('stores default publication state under the admission pool outside the repository', async () => {
+    const name='secret.test.mjs';
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    const pool=join(publicCacheFile,'..');
+    const options={cwd,publicCacheFile:undefined,env:{LANE_POOL_ROOT:pool},exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture))};
+    expect((await build({...options,publicRequest:published})).entries).toHaveLength(1);
+    expect(existsSync(join(pool,'.admission','remote','public-blobs.jsonl'))).toBe(true);
+    const offline=vi.fn(()=>({status:429}));
+    expect((await build({...options,publicRequest:offline})).entries).toHaveLength(1);
+    expect(offline).not.toHaveBeenCalled();
+    expect(readdirSync(cwd).sort()).toEqual(['.git','package-lock.json',name]);
+  });
+
+  it('never reads or writes a publication cache configured inside the repository', async () => {
+    const name='secret.test.mjs', inside=join(cwd,'public-blobs.jsonl');
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    writeFileSync(inside,cacheLines([blob(publicTokenFixture)]));
+    const options={cwd,publicCacheFile:inside,exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture))};
+    const offline=vi.fn(()=>({status:429}));
+    await expect(build({...options,publicRequest:offline})).rejects.toMatchObject({code:'unshipped-test-file'});
+    expect(offline).toHaveBeenCalledOnce();
+    rmSync(inside);
+    expect((await build({...options,publicRequest:published})).entries).toHaveLength(1);
+    expect(existsSync(inside)).toBe(false);
+  });
+
+  it('never trusts or writes a publication cache whose external parent symlinks into the repository', async () => {
+    const name='secret.test.mjs', inside=join(cwd,'cache');
+    writeFileSync(join(cwd,name),publicTokenFixture);
+    mkdirSync(inside);
+    const alias=join(publicCacheFile,'..','repo-cache');
+    symlinkSync(inside,alias,'dir');
+    const poisoned=join(inside,'public-blobs.jsonl');
+    writeFileSync(poisoned,cacheLines([blob(publicTokenFixture)]));
+    const options={cwd,publicCacheFile:join(alias,'public-blobs.jsonl'),exec:gitInventory([Buffer.from(name)],indexRecord(name,publicTokenFixture))};
+    const offline=vi.fn(()=>({status:429}));
+    await expect(build({...options,publicRequest:offline})).rejects.toMatchObject({code:'unshipped-test-file',detail:name});
+    expect(offline).toHaveBeenCalledOnce();
+    rmSync(poisoned);
+    expect((await build({...options,publicRequest:published})).entries).toHaveLength(1);
+    expect(readdirSync(inside)).toEqual([]);
+    // Missing descendants must not let mkdir create host cache state in the repo.
+    expect((await build({...options,publicCacheFile:join(alias,'missing','public-blobs.jsonl'),publicRequest:published})).entries).toHaveLength(1);
+    expect(readdirSync(inside)).toEqual([]);
   });
 
   it('caps distinct blob reads', async () => {
@@ -2128,11 +2305,11 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     let active=0,peak=0;
     const github=vi.fn(async call=>{peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return published(call);});
     await expect(build({cwd,exec:gitInventory(names.map(name=>Buffer.from(name)),Buffer.concat(names.map((name,i)=>indexRecord(name,data[i]))),
-      {code:0,stdout:Buffer.concat(names.map((name,i)=>treeRecord(name,data[i])))},github)}))
+      {code:0,stdout:Buffer.concat(names.map((name,i)=>treeRecord(name,data[i])))}),publicRequest:github}))
       .rejects.toMatchObject({code:'unshipped-test-file',detail:names[65]});
     expect(github).toHaveBeenCalledTimes(64);
     expect(peak).toBeLessThanOrEqual(16);
-    const oids=callsOf(github).map(call=>call.args.at(-1));
+    const oids=callsOf(github).map(call=>call.url);
     expect(new Set(oids).size).toBe(64);
     expect(oids.some(endpoint=>endpoint.endsWith(blob(data[65])))).toBe(false);
   });

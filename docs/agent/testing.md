@@ -3732,6 +3732,27 @@ shapes and the filesystem/alias checks. Invalid environments continue to retain 
 refusal without launching discovery. Warm bases export tracked Git entries only, and policy
 exclusions still refuse test-shaped entries.
 
+Only credential-named test fixtures with a `credentialContentFinding` match need anonymous GitHub blob evidence: use native
+HTTPS without Authorization, gh config or token environment, and never follow redirects.
+Only HTTP 200 with the requested SHA and an `api.github.com` JSON URL qualifies; errors,
+rate limits and the ten-second deadline retain exclusion/refusal and local execution.
+`remote-exec.test.mjs` injects the request seam and checks credential isolation, rejected
+responses, cancellation, and the 64-distinct-OID/16-concurrent lookup bounds.
+Positive results persist by immutable OID in `.admission/remote/public-blobs.jsonl` under
+the shared lane pool, outside the repository. Validate the cache parent against the
+canonical repository path before every read/write, including existing ancestors of
+missing directories; external symlink aliases into the repository are never evidence
+and must not receive cache writes. The named symlink-parent regression proves a
+forged positive still requires a successful anonymous lookup. Atomic replacement of JSON-lines retains at most 4,096
+positives; negatives/errors never persist. Corrupt, unreadable or oversized (384 KiB)
+cache evidence is a miss: a fresh anonymous lookup must succeed or execution stays
+local. Eviction uses the same fallback. Cache write failure cannot invalidate a live
+positive. Named regressions cover zero-call reuse, harmless fixture content, 403/429,
+corruption/oversize/unreadability, eviction, and failed writes.
+Its named native-transport tests intercept `https.get` while exercising the production
+request helper: assert no Authorization/token options, `agent:false`, and one request
+only when GitHub responds with a cross-host redirect.
+
 A credential-named alias is refused like any excluded path. The one exemption is the
 `.claude/agent-memory/` bridge's exact image of a tracked `agent-memory-src/` source-extension
 file that itself passed the public-blob check; any other credential-named alias still refuses.

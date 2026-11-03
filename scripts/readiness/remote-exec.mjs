@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
+import https from 'node:https';
 import * as filesystem from 'node:fs/promises';
-import { constants, mkdirSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
+import { constants, mkdirSync, lstatSync, realpathSync, openSync, fstatSync, readSync, closeSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { join, resolve, relative, isAbsolute, win32, dirname, basename, sep } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +12,7 @@ import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, diges
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
+import {defaultPoolRoot} from '../lib/lane-pool-paths.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -394,7 +396,96 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
   }
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming} = {}) {
+// Native HTTPS neither reads gh credentials/config nor follows redirects. Use a
+// fresh agent so process-global agent configuration cannot add authentication.
+function anonymousBlobRequest({url, headers, signal}) {
+  return new Promise((resolve, reject) => {
+    const request=https.get(url,{headers,signal,agent:false},response=>{
+      if(response.statusCode!==200) {
+        response.destroy();
+        resolve({status:response.statusCode});
+        return;
+      }
+      const chunks=[];
+      let size=0;
+      response.on('data',chunk=>{
+        size+=chunk.length;
+        if(size>LIMIT)response.destroy(new Error('Public blob response too large'));
+        else chunks.push(chunk);
+      });
+      response.on('error',reject);
+      response.on('end',()=>resolve({status:response.statusCode,body:Buffer.concat(chunks).toString('utf8')}));
+    });
+    request.on('error',reject);
+  });
+}
+
+// Immutable public blob evidence is host state, never part of a shipped tree.
+// Concurrent processes may lose a cache addition; that only causes a new lookup.
+const PUBLIC_CACHE_ENTRIES=4096, PUBLIC_CACHE_BYTES=384*1024;
+const publicOidPattern=/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
+function outsideDirectory(root,path) {
+  const rel=relative(root,path);
+  return rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel);
+}
+// Resolve existing ancestors even when a fresh host has no cache directory yet.
+// Only ENOENT permits projection; unreadable/broken evidence disables the cache.
+function canonicalCacheParent(path) {
+  try {return realpathSync(path);} catch(error) {
+    const parent=dirname(path);
+    if(error.code!=='ENOENT'||parent===path)throw error;
+    return join(canonicalCacheParent(parent),basename(path));
+  }
+}
+function publicCachePath(file,cwd,create=false) {
+  try {
+    if(!outsideDirectory(resolve(cwd),file))return null;
+    const repo=realpathSync(cwd);
+    let parent=canonicalCacheParent(dirname(file));
+    if(!outsideDirectory(repo,parent))return null;
+    if(create)mkdirSync(parent,{recursive:true,mode:0o700});
+    // Validate again at each read/write, then use the canonical parent path so
+    // an external alias cannot redirect the operation into repository state.
+    parent=realpathSync(parent);
+    if(!outsideDirectory(repo,parent))return null;
+    return join(parent,basename(file));
+  } catch {return null;}
+}
+function readPublicCache(file,cwd) {
+  file=publicCachePath(file,cwd);
+  if(!file)return [];
+  let fd;
+  try {
+    fd=openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    const st=fstatSync(fd);
+    if(!st.isFile()||st.size>PUBLIC_CACHE_BYTES)return [];
+    const bytes=Buffer.alloc(PUBLIC_CACHE_BYTES+1);
+    const size=readSync(fd,bytes,0,bytes.length,0);
+    if(size>PUBLIC_CACHE_BYTES)return [];
+    const text=bytes.subarray(0,size).toString('utf8');
+    if(!text.endsWith('\n'))return [];
+    const lines=text.slice(0,-1).split('\n');
+    if(lines.length>PUBLIC_CACHE_ENTRIES)return [];
+    const oids=lines.map(line=>JSON.parse(line)?.oid);
+    if(!oids.every(oid=>typeof oid==='string'&&publicOidPattern.test(oid)))return [];
+    return [...new Set(oids)];
+  } catch {return [];} finally {if(fd!==undefined)try{closeSync(fd);}catch{ /* cache miss remains safe */ }}
+}
+function cachePublicBlob(file,oid,cwd) {
+  let temp;
+  try {
+    file=publicCachePath(file,cwd,true);
+    if(!file)return;
+    const oids=readPublicCache(file,cwd).filter(value=>value!==oid);
+    oids.push(oid);
+    temp=`${file}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+    writeFileSync(temp,oids.slice(-PUBLIC_CACHE_ENTRIES).map(oid=>JSON.stringify({oid})).join('\n')+'\n',{mode:0o600,flag:'wx'});
+    renameSync(temp,file);
+  } catch { /* Publication was independently proved; cache IO is best effort. */ }
+  finally {if(temp)try{unlinkSync(temp);}catch{ /* renamed or unwritable */ }}
+}
+
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, publicRequest=anonymousBlobRequest, publicCacheFile} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
@@ -483,26 +574,31 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     await publicLoad;
     return publicBlobs.get(key);
   }
-  // Publication proof is live and scoped to this build, never a local ref or
-  // shared ETag cache. The leaf pool bounds concurrent reads to 16; after 64
-  // distinct OIDs, retain exclusion (tests then require local execution).
+  // Only positive anonymous evidence persists. Corruption, eviction and IO
+  // failures fall back to a fresh lookup, whose failure retains local execution.
+  // The leaf pool bounds concurrency to 16; cap new OID lookups at 64 per build.
+  const cacheFile=resolve(publicCacheFile??join(defaultPoolRoot(cwd,env),'.admission','remote','public-blobs.jsonl'));
   const publishedBlobs=new Map();
   function githubPublished(oid) {
+    if(readPublicCache(cacheFile,cwd).includes(oid))return true;
     if(publishedBlobs.has(oid))return publishedBlobs.get(oid);
     if(publishedBlobs.size>=64)return false;
     const lookup=(async()=>{
       let timer;
+      const controller=new AbortController();
       try {
         const result=await Promise.race([
-          exec({file:'gh',args:['api','-i','--hostname','github.com',`repos/web-everything/web-everything/git/blobs/${oid}`],
-            cwd,env:{...env,WE_GH_ETAG_CACHE:'0'},timeout:10000}),
-          new Promise(resolve=>{timer=setTimeout(()=>resolve(null),10000);}),
+          publicRequest({url:`https://api.github.com/repos/web-everything/web-everything/git/blobs/${oid}`,
+            headers:{Accept:'application/vnd.github+json','User-Agent':'web-everything-publication'},signal:controller.signal}),
+          new Promise(resolve=>{timer=setTimeout(()=>{controller.abort();resolve(null);},10000);}),
         ]);
-        if(result?.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)return false;
-        // Unlike the general REST reader, bare bodies are unknown evidence.
-        const response=/^HTTP\/\S+ 200(?: [^\r\n]*)?\r?\n(?:[^\r\n]+\r?\n)*\r?\n([\s\S]*)$/.exec(result.stdout.toString('utf8'));
-        return !!response && JSON.parse(response[1])?.sha===oid;
-      } catch {return false;} finally {clearTimeout(timer);}
+        if(result?.status!==200||typeof result.body!=='string'||Buffer.byteLength(result.body)>LIMIT)return false;
+        const body=JSON.parse(result.body);
+        const url=new URL(body.url);
+        const published=body.sha===oid && url.protocol==='https:' && url.host==='api.github.com';
+        if(published)cachePublicBlob(cacheFile,oid,cwd);
+        return published;
+      } catch {return false;} finally {clearTimeout(timer);controller.abort();}
     })();
     publishedBlobs.set(oid,lookup);
     return lookup;
@@ -588,13 +684,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     hashDone();
-    // R447 fixtures may spell credential patterns only with GitHub's live
-    // publication proof for the actual working-tree blob just hashed above.
-    if(credentialSource&&publicOid&&testFixture) {
-      if(await githubPublished(workingOid))return {entry:manifestEntryFields(path,content,executable,tracked)};
+    // R447 publication evidence is needed only for matching credential content.
+    if(credentialSource&&credentialContentFinding(path,content)) {
+      if(publicOid&&testFixture&&await githubPublished(workingOid))
+        return {entry:manifestEntryFields(path,content,executable,tracked)};
       return {excluded:path};
     }
-    if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
     return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });
   for (const leaf of leaves) {
