@@ -248,6 +248,38 @@ describe('filterReraises — strict-true proof boundary (fail closed)', () => {
       expect(out).toEqual({ kept: [finding()], dropped: [] });
     });
   }
+  describe('asynchronous proof that rejects never crashes the caller', () => {
+    const rejecting = [
+      ['async function that throws', async () => { throw new Error('pin test runner unavailable'); }],
+      ['rejected Promise', () => Promise.reject(new Error('pin test runner unavailable'))],
+      ['thenable whose then rejects', () => ({ then: (_ok, fail) => { fail?.(new Error('x')); return Promise.reject(new Error('y')); } })],
+      ['thenable whose then getter throws', () => ({ get then() { throw new Error('hostile getter'); } })],
+    ];
+    for (const [name, pinStillHolds] of rejecting) {
+      it(`filterReraises retains the finding and raises no unhandled rejection: ${name}`, async () => {
+        const seen = [];
+        const onRejection = (reason) => seen.push(reason);
+        process.on('unhandledRejection', onRejection);
+        try {
+          expect(filterReraises(pinned(), [finding()], { pinStillHolds })).toEqual({ kept: [finding()], dropped: [] });
+          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setImmediate(resolve));
+        } finally { process.off('unhandledRejection', onRejection); }
+        expect(seen).toEqual([]);
+      });
+      it(`renderOpenForBrief keeps the entry listed and raises no unhandled rejection: ${name}`, async () => {
+        const seen = [];
+        const onRejection = (reason) => seen.push(reason);
+        process.on('unhandledRejection', onRejection);
+        try {
+          expect(renderOpenForBrief(pinned(), { pinStillHolds })).toContain(SUMMARY);
+          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setImmediate(resolve));
+        } finally { process.off('unhandledRejection', onRejection); }
+        expect(seen).toEqual([]);
+      });
+    }
+  });
   it('literal true suppresses only the matching test-pinned finding, not a merely fixed one', () => {
     const fixedOnly = markFixed(record(), findingKey(finding()), { head: H2 });
     expect(filterReraises(fixedOnly, [finding()], { pinStillHolds: () => true }).dropped).toEqual([]);

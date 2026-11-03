@@ -94,27 +94,36 @@ export function pinFinding(ledger, key, pinningTest) {
   return next;
 }
 
+/**
+ * Synchronous, strict-true proof only. A throw, a non-boolean or an asynchronous result is "not proven";
+ * a thenable result is never awaited, but its rejection is consumed so it cannot crash the process.
+ */
+function pinHolds(pinStillHolds, entry) {
+  if (!suppressible(entry) || typeof pinStillHolds !== 'function') return false;
+  try {
+    const result = pinStillHolds(structuredClone(entry));
+    if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
+      try {
+        if (typeof result.then === 'function') Promise.resolve(result).catch(() => {});
+      } catch { /* Hostile thenable: still unproven. */ }
+    }
+    return result === true;
+  } catch { return false; /* Retain on unknown evidence. */ }
+}
+
 /** Missing, unreadable or non-boolean proof retains the finding for review. */
 export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
   const kept = [], dropped = [];
   for (const finding of findings) {
     const entry = ledger.entries.find(candidate => matches(candidate, finding, { strict: true }));
-    let proven = false;
-    if (suppressible(entry) && typeof pinStillHolds === 'function') {
-      try { proven = pinStillHolds(structuredClone(entry)) === true; } catch { /* Retain on unknown evidence. */ }
-    }
-    (proven ? dropped : kept).push(finding);
+    (pinHolds(pinStillHolds, entry) ? dropped : kept).push(finding);
   }
   return { kept, dropped };
 }
 
 /** Lists open, fixed-unpinned and test-pinned entries whose pin is not currently proven (a stale pin must not hide a finding). */
 export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
-  const holds = (entry) => {
-    if (!suppressible(entry) || typeof pinStillHolds !== 'function') return false;
-    try { return pinStillHolds(structuredClone(entry)) === true; } catch { return false; }
-  };
-  const entries = ledger.entries.filter(entry => !holds(entry));
+  const entries = ledger.entries.filter(entry => !pinHolds(pinStillHolds, entry));
   if (!entries.length) return '';
   const body = entries.map(entry => `key=${entry.key} sources=${entry.sources.join(',')} status=${entry.status}\n`
     + [entry.finding, ...(entry.variants ?? [])].map(f => `${f.file ?? ''}:${f.line ?? ''} ${f.summary}`
