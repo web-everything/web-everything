@@ -152,6 +152,16 @@ describe('mechanical net-diff paths (R503)', () => {
     const nested = timings(2).replaceAll('scripts/ci/test-timings.json', 'x/scripts/ci/test-timings.json');
     expect(fp(code + nested)).not.toBe(fp(code));
   });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint treats a timing-file delete, add, rename or mode change as a real change', (_, fp) => {
+    const T = 'scripts/ci/test-timings.json';
+    const variants = [
+      `diff --git a/${T} b/${T}\ndeleted file mode 100644\nindex 1..0\n--- a/${T}\n+++ /dev/null\n@@ -1 +0,0 @@\n-{"t":1}\n`,
+      `diff --git a/${T} b/${T}\nnew file mode 100644\nindex 0..1\n--- /dev/null\n+++ b/${T}\n@@ -0,0 +1 @@\n+{"t":1}\n`,
+      `diff --git a/${T} b/${T}\nold mode 100644\nnew mode 100755\n`,
+      `diff --git a/${T} b/${T}\nsimilarity index 90%\nrename from ${T}\nrename to ${T}\n`,
+    ];
+    for (const v of variants) expect(fp(code + v)).not.toBe(fp(code));
+  });
   it('an operator clearance carries across a merge of main that only moved the timing file', () => {
     const cleared = liveCarryFingerprints(code + timings(2));
     const base = { enabled: true, headSha: 'b'.repeat(40), mechanical: { ok: true, kind: 'merge', reason: '1 merge(s) of origin/main' } };

@@ -46,8 +46,7 @@ const isQuotedHtmlBlock = (t) => t.type === 'html_block' && /<(?:pre|code)[\s>]/
 const md = new MarkdownIt({ html: true });
 // #x169fqe — the transient lane bookkeeping the reviewed-diff fingerprint excludes, imported rather than
 // re-spelled so the fingerprint and the rebase-drop pass that removes the file can never disagree on its name.
-import { MECHANICAL_DIFF_PATHS } from './transient-paths.mjs';
-const MECHANICAL_HEADERS = new Set(MECHANICAL_DIFF_PATHS.map((p) => `diff --git a/${p} b/${p}`));
+import { isMechanicalDiffSection } from './transient-paths.mjs';
 
 // Keep the forge port independent of the policy graph (which imports the fix-procedure caller).
 import { REVIEW_LABELS } from './review-labels.mjs';
@@ -1550,7 +1549,7 @@ export function normalizeDiffFingerprint(diffText) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     // A `diff --git` header opens a new file section and therefore always ends any skip in progress.
-    if (line.startsWith('diff --git ')) inManifestSection = MECHANICAL_HEADERS.has(line);
+    if (line.startsWith('diff --git ')) inManifestSection = isMechanicalDiffSection(lines, i);
     if (inManifestSection) continue;
     if (!keepIndexAt.has(i) && /^index [0-9a-f]+\.\.[0-9a-f]+/.test(line)) continue;
     kept.push(line);
@@ -1726,7 +1725,7 @@ export function normalizeContributionFingerprint(diffText) {
     if (line.startsWith('diff --git ')) {
       // A new file section always ends any skip AND any hunk in progress.
       closeRun();
-      inManifestSection = MECHANICAL_HEADERS.has(line);
+      inManifestSection = isMechanicalDiffSection(lines, i);
       inHunk = false;
       if (!inManifestSection) kept.push(line);
       continue;

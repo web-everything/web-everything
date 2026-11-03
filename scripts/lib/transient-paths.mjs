@@ -4,6 +4,22 @@
  *  timing file. Exact paths only: a nested lookalike stays substantive. */
 export const MECHANICAL_DIFF_PATHS = Object.freeze(['.lane-manifest.json', 'scripts/ci/test-timings.json']);
 
+/** The timing file is only mechanical as an in-place content refresh: adding, deleting, renaming, mode changes or
+ *  binary replacement of it are real changes. (The drain's lane manifest keeps its historical every-kind exclusion.) */
+const MODIFY_ONLY = new Set(['scripts/ci/test-timings.json']);
+const NOT_A_REFRESH = /^(?:deleted file mode|new file mode|old mode|new mode|rename |copy |similarity index|dissimilarity index|Binary files|GIT binary patch)/;
+/** PURE: does the `diff --git` header at lines[i] open a section the fingerprints skip? */
+export function isMechanicalDiffSection(lines, i) {
+  const header = lines[i];
+  const path = MECHANICAL_DIFF_PATHS.find((p) => header === `diff --git a/${p} b/${p}`);
+  if (!path) return false;
+  if (!MODIFY_ONLY.has(path)) return true;
+  for (let j = i + 1; j < lines.length && !lines[j].startsWith('diff --git ') && !lines[j].startsWith('@@'); j++) {
+    if (NOT_A_REFRESH.test(lines[j])) return false;
+  }
+  return true;
+}
+
 export function isFixEvidencePath(p) {
   return /^\.fix-(?:[^/]*-)?evidence[^/]*\.md$/.test(p) && !p.includes('/');
 }
