@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolveRoutingSettings, effectiveBuilder, BUILD_KINDS } from '../routing-settings.mjs';
+import { resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
 import { resolveFixExecutorChain } from '../fix-executor-chain.mjs';
 
 describe('routing settings', () => {
@@ -14,11 +15,21 @@ describe('routing settings', () => {
     expect(resolveRoutingSettings({ env: { WE_ROUTING_BUILDER: 'nope' }, repo: {} }).builder).toBe('claude');
     expect(resolveRoutingSettings({ env: {}, repo: { routing: { builder: 'cluade' } } }).builder).toBe('claude');
   });
-  it('auto goes to claude at the threshold; an unknown reading keeps codex', () => {
+  it('auto goes to claude at the threshold; an unknown reading goes to claude', () => {
     const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } };
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 90 }) }).builder).toBe('claude');
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 40 }) }).builder).toBe('codex');
-    expect(effectiveBuilder({ env: {}, repo, quota: () => null }).builder).toBe('codex');
+    expect(effectiveBuilder({ env: {}, repo, quota: () => null }).builder).toBe('claude');
+  });
+  it('a malformed settings file, or unreadable auto quota, resolves to claude', () => {
+    const bad = { settings: {}, errors: [{ source: 'settings/routing.json', error: 'Unexpected token' }] };
+    expect(resolveRoutingSettings({ env: {}, declared: bad })).toMatchObject({ builder: 'claude', source: 'unreadable-settings' });
+    expect(effectiveBuilder({ env: {}, repo: { routing: { builder: 'auto' } }, quota: () => null }).builder).toBe('claude');
+  });
+  it('explicit deliveryAgent=codex is refused with a named reason while the reserve is on', () => {
+    const r = resolveDispatchRoute({ kind: 'build', deliveryAgent: 'codex' }, {});
+    expect(r.outcome).toBe('refused');
+    expect(r.refusal).toMatch(/codexReserveForAudit/);
   });
   it('audit kinds are never build kinds; build is', () => {
     expect(BUILD_KINDS).toContain('build');

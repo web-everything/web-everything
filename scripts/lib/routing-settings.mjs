@@ -1,5 +1,5 @@
 /** Who writes code: routing.builder (claude | codex | auto). Audits and review seats stay on routing.auditProvider. */
-import { readSettings } from './settings-files.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
 import { readCodexQuota } from './codex-usage-ledger.mjs';
 
 export const BUILDERS = Object.freeze(['claude', 'codex', 'auto']);
@@ -7,9 +7,12 @@ export const BUILDERS = Object.freeze(['claude', 'codex', 'auto']);
 export const BUILD_KINDS = Object.freeze(['prepare', 'prepare-item', 'prepare-complex', 'prepare-card', 'takeover', 'design', 'fix', 'ci-heal', 'build', 'worker', 'doc-fix', 'prevention-card']);
 const DEFAULTS = Object.freeze({ builder: 'codex', auditProvider: 'codex', codexReserveForAudit: true, autoClaudeAbovePercent: 70 });
 
-export function resolveRoutingSettings({ env = process.env, repo = readSettings() } = {}) {
-  const file = repo?.routing ?? {};
+export function resolveRoutingSettings({ env = process.env, repo, declared } = {}) {
+  const read = repo === undefined ? (declared ?? readDeclaredSettings()) : { settings: repo, errors: [] };
+  const file = read.settings?.routing ?? {};
   const out = { ...DEFAULTS, source: 'default' };
+  // A malformed settings file fails closed to claude: the quota-safe direction.
+  if (read.errors?.length) { out.builder = 'claude'; out.source = 'unreadable-settings'; }
   // An invalid value fails closed to claude (keeps Codex reserved) rather than silently restoring codex.
   if (file.builder !== undefined) { out.builder = BUILDERS.includes(file.builder) ? file.builder : 'claude'; out.source = 'repo'; }
   if (typeof file.auditProvider === 'string' && file.auditProvider) out.auditProvider = file.auditProvider;
@@ -26,5 +29,6 @@ export function effectiveBuilder({ env = process.env, repo, quota = readCodexQuo
   if (s.builder !== 'auto') return { builder: s.builder, source: s.source, settings: s };
   const q = quota(env);
   const used = Number.isFinite(q?.used_percent) ? q.used_percent : null;
-  return { builder: used !== null && used >= s.autoClaudeAbovePercent ? 'claude' : 'codex', source: 'auto', usedPercent: used, settings: s };
+  // Unreadable quota is not "below threshold": the quota-safe direction is claude.
+  return { builder: used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude', source: 'auto', usedPercent: used, settings: s };
 }
