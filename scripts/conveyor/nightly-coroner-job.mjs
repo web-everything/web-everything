@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 /** Durable nightly extraction, followed by bounded coverage judgment and NEW-only filing. */
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -236,7 +237,7 @@ function readJudgeCoverage(sourceRoot, home) {
   };
   let held = ''; // a missing held list means nothing is held yet
   try { held = boundedRead(join(home, 'cards-to-file.md'), 512 * 1024); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const openPrs = JSON.parse(runGhSync(['pr', 'list', '--state', 'open', '--limit', '201', '--json', 'number,title'],
+  const openPrs = JSON.parse(runGhSync(['pr', 'list', '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--state', 'open', '--limit', '201', '--json', 'number,title'],
     { cwd: sourceRoot, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 }));
   if (!Array.isArray(openPrs) || openPrs.length > 200 || openPrs.some((p) => !Number.isSafeInteger(p.number) || typeof p.title !== 'string')) {
     throw new Error('coroner PR coverage incomplete or exceeds 200; run manual /coroner');
