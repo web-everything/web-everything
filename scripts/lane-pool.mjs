@@ -308,7 +308,11 @@ export function ignoredBuildOutputDirs(dir) {
     if (/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(name) && !name.includes('..')) dirs.add(name);
   };
   try {
-    const config = readFileSync(join(dir, '.eleventy.js'), 'utf8');
+    // Consume quoted strings (including escaped characters) before recognizing comments.
+    // Mask comments with whitespace so removing one cannot join separate tokens.
+    const config = readFileSync(join(dir, '.eleventy.js'), 'utf8')
+      .replace(/("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g,
+        (match, quoted) => quoted ?? match.replace(/[^\r\n]/g, ' '));
     const dirConfig = config.match(/\bdir\s*:\s*\{([^{}]*)\}/)?.[1];
     const output = dirConfig?.match(/\boutput\s*:\s*(["'])([^"'\r\n]*)\1/);
     if (output) add(output[2]);
@@ -317,7 +321,7 @@ export function ignoredBuildOutputDirs(dir) {
     const config = readFileSync(join(dir, 'playwright.config.ts'), 'utf8');
     for (const line of config.split(/\r?\n/)) {
       if (/^(?:\/\/|\*|\/\*)/.test(line.trimStart()) || !line.includes('@11ty/eleventy')) continue;
-      for (const match of line.matchAll(/--output=([^\s"'`]+)/g)) add(match[1]);
+      for (const match of line.matchAll(/@11ty\/eleventy\b[^`"'\n]*?--output=([^\s"'`]+)/g)) add(match[1]);
     }
   } catch { /* Unreadable config: no Playwright outputs are eligible. */ }
   return [...dirs].filter((name) => {

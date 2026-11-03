@@ -139,11 +139,65 @@ describe('ignored build output cleanup', () => {
     expect(existsSync(join(referenceDir, '_site/stale.test.ts'))).toBe(false);
   });
 
+  it.each([
+    '// dir: { output: "comment-output" }\n',
+    '/*\ndir: { output: "comment-output" }\n*/\n',
+  ])('preserves ignored output in an Eleventy comment %j', (comment) => {
+    put(referenceDir, '.gitignore', '_site/\ncomment-output/\n');
+    put(referenceDir, '.eleventy.js', `${comment}module.exports = { dir: { output: "_site" } };\n`);
+    put(referenceDir, 'comment-output/keep.test.ts');
+    put(referenceDir, '_site/stale.test.ts');
+    expect(ignoredBuildOutputDirs(referenceDir)).toEqual(['_site']);
+    cleanIgnoredBuildOutput(referenceDir);
+    expect(readFileSync(join(referenceDir, 'comment-output/keep.test.ts'), 'utf8')).toBe('keep\n');
+    expect(existsSync(join(referenceDir, '_site/stale.test.ts'))).toBe(false);
+  });
+
+  it.each([
+    'const commands = [`backup --output=backups`, `@11ty/eleventy --output=_site`];',
+    'const commands = [`@11ty/eleventy --output=_site`, "backup --output=backups"];',
+    'const command = `backup --output=backups && @11ty/eleventy --output=_site`;',
+  ])('preserves ignored backups named outside the Eleventy output argument in %j', (config) => {
+    put(referenceDir, '.gitignore', '_site/\nbackups/\n');
+    put(referenceDir, 'playwright.config.ts', config);
+    put(referenceDir, 'backups/keep.test.ts');
+    put(referenceDir, '_site/stale.test.ts');
+    expect(ignoredBuildOutputDirs(referenceDir)).toEqual(['_site']);
+    cleanIgnoredBuildOutput(referenceDir);
+    expect(readFileSync(join(referenceDir, 'backups/keep.test.ts'), 'utf8')).toBe('keep\n');
+    expect(existsSync(join(referenceDir, '_site/stale.test.ts'))).toBe(false);
+  });
+
+  it.each(['"', "'"])('preserves ignored backups when an Eleventy output string contains comment delimiters in %s quotes', (quote) => {
+    git(['init', '--quiet'], base);
+    put(base, '.gitignore', 'backups/\n');
+    put(base, '.eleventy.js', `module.exports = { dir: { output: ${quote}back/*archive*/ups${quote} } };`);
+    put(base, 'backups/unrelated.txt');
+    expect(ignoredBuildOutputDirs(base)).toEqual([]);
+    cleanIgnoredBuildOutput(base);
+    expect(existsSync(join(base, 'backups'))).toBe(true);
+    expect(readFileSync(join(base, 'backups/unrelated.txt'), 'utf8')).toBe('keep\n');
+  });
+
+  it('preserves the ignored parent and unrelated files for a nested Playwright output path', () => {
+    git(['init', '--quiet'], base);
+    put(base, '.gitignore', 'backups/\n');
+    put(base, 'playwright.config.ts', 'const command = `@11ty/eleventy --output=backups/site`;');
+    put(base, 'backups/site/stale.test.ts');
+    put(base, 'backups/unrelated.txt');
+    expect(ignoredBuildOutputDirs(base)).toEqual([]);
+    cleanIgnoredBuildOutput(base);
+    expect(existsSync(join(base, 'backups'))).toBe(true);
+    expect(readFileSync(join(base, 'backups/site/stale.test.ts'), 'utf8')).toBe('keep\n');
+    expect(readFileSync(join(base, 'backups/unrelated.txt'), 'utf8')).toBe('keep\n');
+  });
+
   it('derives custom names from dir.output and every Playwright output, deduplicating them', () => {
     git(['init', '--quiet'], base);
     put(base, '.gitignore', 'custom-site/\nvisual-one/\nvisual-two/\n');
     put(base, '.eleventy.js', 'module.exports = { output: "unrelated", dir: { output: "custom-site" } };');
     put(base, 'playwright.config.ts', 'const commands = [`@11ty/eleventy --output=visual-one`, "@11ty/eleventy --output=visual-two --quiet", `@11ty/eleventy --output=visual-one`];');
+    for (const name of ['custom-site', 'visual-one', 'visual-two']) put(base, `${name}/stale.test.ts`);
     expect(ignoredBuildOutputDirs(base)).toEqual(['custom-site', 'visual-one', 'visual-two']);
   });
 
@@ -152,7 +206,10 @@ describe('ignored build output cleanup', () => {
     put(base, '.gitignore', `${name}/\n`);
     put(base, '.eleventy.js', `module.exports = { dir: { output: "${name}" } };`);
     put(base, 'playwright.config.ts', `const command = \`@11ty/eleventy --output=${name}\`;`);
+    put(base, `${name}/keep.test.ts`);
     expect(ignoredBuildOutputDirs(base)).toEqual([]);
+    cleanIgnoredBuildOutput(base);
+    expect(readFileSync(join(base, name, 'keep.test.ts'), 'utf8')).toBe('keep\n');
   });
 
   it('refuses configured outputs when Git eligibility evidence is unavailable', () => {
