@@ -114,7 +114,7 @@ import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
   readOverrideViewerLogin, registrationIdentity,
 } from './lib/daemon-overlays.mjs';
-import { planRetirements } from './operations/prototype-retire.mjs';
+import { planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
@@ -271,6 +271,16 @@ export function proveReplaceContainment({ root, oldRef, newRef, expectedSha, env
   });
 }
 
+/** Resolve GitHub evidence against root's origin, never the scratch repo or gh's default. */
+function retirementGitHub({ root, env, run }) {
+  const call = (cmd, args) => {
+    const r = run(cmd, args, { cwd: root, encoding: 'utf8', timeout: 60_000, env });
+    return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') };
+  };
+  const gh = (args) => call('gh', args);
+  return resolveOriginRepository({ git: (args) => call('git', ['-C', root, ...args]), gh });
+}
+
 /**
  * R310: re-prove, here, that a registration is retired (`prototype-retire.mjs#planRetirements`) — the caller's own
  * plan is never trusted. Fresh fetch of main and the ref into a scratch repo; GitHub answers come from `gh` in root.
@@ -281,9 +291,8 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
     root, env, run, prefix: 'we-daemon-overlay-retire-',
     refspecs: ['+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${entry.ref}:refs/remotes/origin/${entry.ref}`],
   }, (git) => {
-    const gh = (args) => { const r = run('gh', args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
-    const repo = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
-    return planRetirements({ rows: [entry], git, gh, repo: repo.code === 0 ? repo.stdout.trim() : '' })[0];
+    const { gh, repo } = retirementGitHub({ root, env, run });
+    return planRetirements({ rows: [entry], git, gh, repo })[0];
   });
   if (result?.action === 'retire') return result;
   // Only a branch that is GONE from origin can have been squash-merged and deleted; anything else stays as proved above.
@@ -296,34 +305,18 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
 
 /**
  * A squash merge leaves the branch tip off main and (after deletion) unfetchable, so the ancestry proof cannot see it.
- * Prove it from GitHub instead: the ref is absent on origin, exactly ONE merged PR headed it, that PR's head commit is
- * the tip, and its merge commit is an ancestor of origin/main. Any missing, unreadable or ambiguous answer returns null.
+ * Prove it from GitHub instead (`prototype-retire.mjs#planFetchFailed`): the ref is absent on origin, exactly ONE
+ * origin PR ever headed it and it merged into main, and GitHub's ref activity shows the branch was last deleted at
+ * that PR's head commit. Any missing, unreadable or ambiguous answer keeps the registration.
  * @returns {{ref:string, action:'retire', reason:'pr-squash-merged', tip:string, pr:number, evidence:object}|null}
  */
 export function proveSquashMerged({ root, entry, env = process.env, run = spawnSync }) {
   if (entry.edgeResolution) return null;
   if (remoteTip({ root, ref: entry.ref, env, run }) !== null) return null; // still on origin (or unreadable): not this case
-  const gh = (args) => { const r = run('gh', args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
-  const repo = gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
-  const slug = repo.code === 0 ? repo.stdout.trim() : '';
-  if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
-  const list = gh(['pr', 'list', '--repo', slug, '--head', entry.ref, '--state', 'merged', '--json', 'number,state,headRefName,headRefOid,mergeCommit', '--limit', '10']);
-  if (list.code !== 0) return null;
-  let prs;
-  try { prs = JSON.parse(list.stdout || 'null'); } catch { return null; }
-  if (!Array.isArray(prs)) return null;
-  const hits = prs.filter((p) => p?.headRefName === entry.ref && p?.state === 'MERGED');
-  if (hits.length !== 1) return null;
-  const [pr] = hits;
-  if (Number.isInteger(entry.pr) && entry.pr !== pr.number) return null;
-  const tip = String(pr.headRefOid ?? '');
-  const mergeOid = String(pr.mergeCommit?.oid ?? '');
-  if (!/^[0-9a-f]{40}$/.test(tip) || !/^[0-9a-f]{40}$/.test(mergeOid) || !Number.isInteger(pr.number)) return null;
-  const landed = withScratchFetch({ root, env, run, prefix: 'we-daemon-overlay-squash-', refspecs: ['+refs/heads/main:refs/remotes/origin/main'] },
-    (git) => git(['merge-base', '--is-ancestor', mergeOid, 'origin/main']).code === 0);
-  if (landed !== true) return null;
-  return { ref: entry.ref, action: 'retire', reason: 'pr-squash-merged', tip, pr: pr.number,
-    evidence: { refGone: true, prState: 'MERGED', mergeCommit: mergeOid, prVia: 'head-ref' } };
+  const { gh, repo } = retirementGitHub({ root, env, run });
+  const plan = withScratchFetch({ root, env, run, prefix: 'we-daemon-overlay-squash-', refspecs: ['+refs/heads/main:refs/remotes/origin/main'] },
+    (git) => planFetchFailed({ row: entry, git, gh, repo }));
+  return plan?.action === 'retire' ? plan : null;
 }
 
 /** The single open origin PR headed by `ref`, or null (none, several, or incomplete evidence).
@@ -331,13 +324,9 @@ export function proveSquashMerged({ root, entry, env = process.env, run = spawnS
 export function inferPrNumber({ root, ref, env = process.env, run = spawnSync }) {
   try {
     const call = (cmd, args) => { const r = run(cmd, args, { cwd: root, encoding: 'utf8', timeout: 60_000, env }); return { code: r?.status ?? -1, stdout: String(r?.stdout ?? '') }; };
-    const origin = call('git', ['remote', 'get-url', 'origin']);
-    if (origin.code !== 0 || !origin.stdout.trim()) return null;
-    // gh's default repository can be an upstream or GH_REPO; overlays always load refs from origin.
-    const repo = call('gh', ['repo', 'view', origin.stdout.trim(), '--json', 'nameWithOwner', '--jq', '.nameWithOwner']);
-    const slug = repo.code === 0 ? repo.stdout.trim() : '';
-    if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) return null;
-    const list = call('gh', ['pr', 'list', '--repo', slug, '--head', ref, '--state', 'open', '--json', 'number,headRefName,headRepository,isCrossRepository', '--limit', '5']);
+    const { repo: slug, gh } = resolveOriginRepository({ git: (args) => call('git', args), gh: (args) => call('gh', args) });
+    if (!slug) return null;
+    const list = gh(['pr', 'list', '--repo', slug, '--head', ref, '--state', 'open', '--json', 'number,headRefName,headRepository,isCrossRepository', '--limit', '5']);
     if (list.code !== 0) return null;
     const prs = JSON.parse(list.stdout || 'null');
     // A full page cannot prove uniqueness. Leave --pr to the operator rather than infer from a partial list.
