@@ -392,6 +392,13 @@ describe('merge-queue same-head failure admission', () => {
       startedAt: `2026-11-02T10:${minute}:00Z`, completedAt: `2026-11-02T10:${minute}:30Z`,
       detailsUrl: `https://github.com/fixture/drain/actions/runs/${run}/job/${run}01`, ...extra,
     });
+    it.each([false, true])('same-name jobs in one run retain failure despite later SUCCESS: reversed=%s', reverse => fixture(f => {
+      const rows = [runCheck(100, 'FAILURE', '00'), runCheck(100, 'SUCCESS', '05', {
+        detailsUrl: 'https://github.com/fixture/drain/actions/runs/100/job/10002',
+      })];
+      f.live.statusCheckRollup = reverse ? rows.reverse() : rows;
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
     it('same workflow and name with valid distinct run URLs allows a later SUCCESS', () => fixture(f => {
       f.live.statusCheckRollup = [runCheck(100, 'FAILURE', '00'), runCheck(101, 'SUCCESS', '05')];
       f.run(); expect(f.requests()).toHaveLength(1); expect(existsSync(f.path)).toBe(true);

@@ -147,8 +147,10 @@ function mqRefreshCheckIdentity(check) {
 }
 
 function mqRefreshSameWorkflow(first, second) {
+  // Same-name jobs within one run are independent evidence, never retries.
   return second !== null && first.owner === second.owner && first.repo === second.repo
-    && first.name === second.name && first.workflowName === second.workflowName;
+    && first.name === second.name && first.workflowName === second.workflowName
+    && first.runId !== second.runId;
 }
 
 function mqRefreshCheckLater(success, failure) {
