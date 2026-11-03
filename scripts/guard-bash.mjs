@@ -1990,9 +1990,10 @@ function assignedValue(raw, home) {
 function absoluteGitTarget(base, p, home) {
   // Tokens have lost shell quoting here. Do not mistake a literal `$HOME`/`${VAR}` path for evidence
   // about the shell-expanded target; unknown targets must retain daemon-clone protection.
-  if (/[$`]/.test(p)) return null;
+  // Globs/brace expansion can select a protected directory; no filesystem or shell-state guess is safe.
+  if (/[$`*?\[{}]/.test(p)) return null;
   const expanded = expandHomeTilde(p, home);
-  if (expanded === null) return null;
+  if (expanded === null || /[$`*?\[{}]/.test(expanded)) return null;
   return resolve(base || '.', expanded);
 }
 
@@ -2092,6 +2093,7 @@ const GIT_FETCH_VALUE_FLAGS = new Set([
 
 /** Does a refspec name a local branch destination? Shared by persisted and command-line config. */
 function fetchDestinationIsBranch(spec) {
+  if (/[$`]/.test(spec)) return true; // unresolved shell refspec: it may write a protected branch
   const sp = spec.replace(/^\+/, '');
   if (sp.startsWith('^')) return false;
   const colon = sp.indexOf(':');
@@ -2143,8 +2145,14 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
         continue;
       }
       if (GIT_FETCH_VALUE_FLAGS.has(t)) { i += 1; continue; }
+      if (/^-[^-].+/.test(t)) {
+        // Parse the bundle individually. Value-taking/unknown letters leave its reading uncertain.
+        if ([...t.slice(1)].some((flag) => !'aPfkpqvnt46'.includes(flag))) return true;
+        continue;
+      }
       if (t.startsWith('-')) continue;
     }
+    if (/[$`]/.test(t)) return true; // even an unknown repository word can expand into extra refspecs
     if (!repositorySeen) { repositorySeen = true; continue; }
     if (fetchDestinationIsBranch(t)) return true;
   }
@@ -2887,7 +2895,7 @@ export function isDestructiveLaneGitOp(cmd) {
   if (/^git\s+restore\b[^\n]*\s\.(?:\s|$)/.test(c)) return true;                 // restore [--worktree/--staged/--] .
   if (/^git\s+switch\b[^\n]*\s(?:-f|--force|--discard-changes)(?=\s|$)/.test(c)) return true; // switch -f <branch>
   if (/^git\s+push\b/.test(c) &&
-      (/(?:^|\s)(?:-f|--force|--force-with-lease)(?=\s|$)/.test(c) || /(?:^|\s)\+\S/.test(c))) return true; // force-push (flag or +refspec)
+      (/(?:^|\s)(?:-[a-zA-Z]*f[a-zA-Z]*|--force|--force-with-lease)(?=\s|$)/.test(c) || /(?:^|\s)\+\S/.test(c))) return true; // force-push (flag or +refspec)
   return false;
 }
 
@@ -4411,6 +4419,10 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   // `lane/*` ref → PR → CI gate; a direct `git push … main` (or a bare `git push` from a checkout on main)
   // skips CI entirely. Only an explicit `lane/*` destination is allowed. Sanctioned override: prefix
   // `MAIN_PUSH_OK=1` (e.g. pr-land --fallback-git, or an emergency the user directs).
+  const resolvedPush = canonicalGitOp(s);
+  if (/^git\s+push\b/.test(resolvedPush) && /[$`]/.test(resolvedPush)
+      && !/\bMAIN_PUSH_OK=1\b/.test(s))
+    return 'unresolved git push arguments may target a protected ref. Use explicit literal remote/refspec arguments and push to a lane/* ref.';
   if (atCommand(/^git\s+push\b/) && !/\bMAIN_PUSH_OK=1\b/.test(s)) {
     const pushHead = heads.find((h) => /^git\s+push\b/.test(h));
     const rest = pushHead.replace(/^git\s+push\b/, '');
@@ -5267,7 +5279,8 @@ export function decide(command, ctx = {}) {
         && optionWords.some((t) => /^-[A-Za-z]*p/.test(t));
       // Recognized options are not all plain string assignments. Even a supported option can fail on
       // this variable or Bash version; attributes also survive a declaration without an assignment.
-      const attribute = !printsOnly && ['declare', 'typeset', 'readonly'].includes(canonicalWords[0])
+      // local may fail or expose a value from an unmodelled function scope; never trust its reassignment.
+      const attribute = canonicalWords[0] === 'local' ? 'value' : !printsOnly && ['declare', 'typeset', 'readonly'].includes(canonicalWords[0])
         && optionWords.some((t) => /[aAilunI]/.test(t))
         ? (optionWords.some((t) => /n/.test(t)) ? 'indirect' : 'value') : null;
       const uncertain = redirected || badOption || versionDependent || !!attribute;
@@ -5288,7 +5301,7 @@ export function decide(command, ctx = {}) {
         }
       }
       const directive = !seg.trim().startsWith('(')
-        && ['export', 'declare', 'typeset', 'readonly'].includes(canonicalWords[0]);
+        && ['export', 'declare', 'typeset', 'readonly', 'local'].includes(canonicalWords[0]);
       if (directive || words.every((t) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(t))) {
         const readonly = canonicalWords[0] === 'readonly'
           || (['declare', 'typeset'].includes(canonicalWords[0]) && optionWords.some((t) => /^-[A-Za-z]*r[A-Za-z]*$/.test(t)));

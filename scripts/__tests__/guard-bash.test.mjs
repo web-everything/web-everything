@@ -3611,6 +3611,62 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason(`rm ${CLONE}/old.md`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
   });
 
+  // R451: target and ref arguments requiring unmodelled shell state fail closed.
+  it.each(['HOME=/ws', 'export HOME=/ws', 'declare HOME=/ws',
+    'HOME=$(home)', 'false && HOME=/elsewhere'])(
+    'DENIES shell-expanded tilde target patterns after %s', (assignment) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: '/ws' } };
+      for (const target of ['~/wev-*', '~user/clone', '~+/clone', '~-/clone']) {
+        expect(decide(`${assignment}; git -C ${target} reset --hard`, ctx), target).toMatch(/DAEMON CLONE/);
+      }
+    },
+  );
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'TARGET'])(
+    'DENIES unresolved local declarations of %s', (key) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      // local can fail outside a function, or expose a prior shell-local value inside one.
+      const git = key === 'TARGET' ? 'git --config-env=core.worktree=TARGET' : 'git';
+      expect(decide(`local ${key}=${CLONE}; ${git} reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export ${key}=${CLONE}; local ${key}=/safe; ${git} reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['$SPEC', '"$SPEC"', '${SPEC}', '$(printf main:refs/heads/x)',
+    '`printf main:refs/heads/x`'])(
+    'DENIES unresolved refspec/ref operands: %s', (spec) => {
+      const ctx = { cwd: CLONE, daemonCloneRoots: roots };
+      for (const sub of ['push', 'fetch']) {
+        expect(decide(`SPEC=main:refs/heads/x; git ${sub} origin ${spec}`, ctx)).toMatch(/DAEMON CLONE/);
+      }
+      // An explicit lane ref must not disguise an additional unknown protected push destination.
+      expect(decide(`git push origin HEAD:lane/x ${spec}`, { cwd: LANE, daemonCloneRoots: roots })).toBeTruthy();
+    },
+  );
+
+  it.each(['-fz', '-zf', '-fu', '-zu'])(
+    'DENIES uncertain short fetch bundles: %s', (flags) => {
+      expect(decide(`git fetch ${flags} origin`, { cwd: CLONE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['-fz', '-zf', '-fu'])(
+    'recognizes force in short push bundles: %s', (flags) => {
+      expect(isDestructiveLaneGitOp(`git push ${flags} origin HEAD:lane/x`)).toBe(true);
+      expect(decide(`git -C ${CLONE} clean ${flags}`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it('SAFE-COMMAND REGRESSION: ALLOWS ordinary lane and non-daemon git commands', () => {
+    for (const cwd of [LANE, '/ordinary/repo']) {
+      for (const command of ['git status', 'git log -1', 'git diff', 'git add path',
+        'git commit -m example', 'git push origin HEAD:lane/x', `git -C ${LANE} status`,
+        'git fetch origin', 'git rebase origin/main']) {
+        expect(decide(command, { cwd, daemonCloneRoots: roots }), command).toBeNull();
+      }
+    }
+  });
+
   it('DENIES git reset/checkout/commit — cwd inside the clone, or via `-C <clone>` from elsewhere', () => {
     expect(daemonCloneWriteReason('git reset --hard origin/main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
     expect(daemonCloneWriteReason('git checkout -- .', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
