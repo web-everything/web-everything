@@ -219,7 +219,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             // evidence across attempts so splitting cannot retry it away.
             try {
               const report = JSON.parse(reportText);
-              observedFailure ||= (report?.success === false && report.numFailedTests > 0)
+              observedFailure ||= report?.success === false || report?.numRuntimeErrors > 0
+                || report?.numFailedTestSuites > 0 || report?.numFailedTests > 0
                 || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
                   || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
             } catch { /* Unparseable reports contain no observed test failure. */ }
@@ -262,7 +263,11 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
             const retried = [];
             // One split level only. Each half must prove its own complete inventory.
-            for (const [half, selected] of halves.entries()) retried.push(await attempt(false, selected, `retry-${half + 1}.`));
+            for (const [half, selected] of halves.entries()) {
+              const verdict = await attempt(false, selected, `retry-${half + 1}.`);
+              retried.push(verdict);
+              if (infraExit || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
+            }
             status = ['TIMEOUT', 'NOT-RUN', 'FAIL'].find(failure => retried.includes(failure))
               ?? (retried.every(r => r === 'PASS') ? 'PASS' : 'UNSETTLED');
             if (observedFailure && ['PASS', 'UNSETTLED'].includes(status)) status = 'FAIL';
