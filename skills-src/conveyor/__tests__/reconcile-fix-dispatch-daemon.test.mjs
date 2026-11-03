@@ -1941,4 +1941,11 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const kind = await readBack({ readPlanClaimSet: () => new Set(['claim:repo-a:7:fix', ...(n++ < 1 ? [] : ['claim:repo-a:7:fixing'])]) });
     expect(kind.dispatch).toEqual([{ kind: 'promote-draft', prNumber: 8 }]);
   });
+
+  it('a PR whose check rollup is at the list cap is never provably unchanged', () => {
+    const big = Array.from({ length: 100 }, (_, i) => ({ name: `c${i}`, status: 'COMPLETED', conclusion: 'SUCCESS' }));
+    const row = { number: 7, headRefOid: 'a', isDraft: false, labels: [], updatedAt: 'u', statusCheckRollup: big };
+    const exec = (_gh, args) => JSON.stringify(args[0] === 'run' ? [] : [row]);
+    expect(readPlanFingerprints('we', { exec }).get(7)).not.toBe(readPlanFingerprints('we', { exec }).get(7));
+  });
 });

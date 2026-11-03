@@ -741,6 +741,9 @@ const MAIN_STATE_KEY = 'main-ci-state';
 function prFingerprint(pr) {
   const checks = (pr.statusCheckRollup ?? []).map((c) => [c?.name ?? c?.context ?? null, c?.workflowName ?? null, c?.status ?? c?.state ?? null,
     c?.conclusion ?? null, c?.completedAt ?? c?.startedAt ?? null]).map((row) => JSON.stringify(row)).sort();
+  // A rollup at GitHub's list cap may be truncated (the planner hydrates those through separate check reads), so its
+  // fingerprint can never prove the checks unchanged: make every read of such a PR differ.
+  if ((pr.statusCheckRollup ?? []).length >= 100) return `unprovable:${Math.random()}`;
   return JSON.stringify([pr.headRefOid, pr.isDraft, pr.mergeStateStatus ?? null, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), checks, pr.updatedAt]);
 }
 
