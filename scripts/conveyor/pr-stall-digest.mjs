@@ -19,6 +19,8 @@ import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { diffFeed, appendLines, checkedFeedPath, sidecarsOf, REPORT_KINDS, resolveSettings as feedSettings } from '../operations/needs-you-feed.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
+import { repeatDue, labelNames } from './pr-sweep-core.mjs';
+import { sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 
 export const STALLED_KIND = 'stalled';
@@ -86,9 +88,12 @@ export function pasteReady(item) {
 export function feedItem(i) {
   const ev = (Array.isArray(i.evidence) ? i.evidence : []).filter((x) => typeof x === 'string' && x.trim()).slice(0, 3).map((x) => x.slice(0, 160));
   const command = pasteReady(i);
+  const relations = [...(i.blockedBy ?? []).map(n => `blocked-by #${n}`), ...(i.unblocks ?? []).map(n => `unblocks #${n}`)].join('; ');
   return { pr: i.pr, repo: i.repo, head: String(i.head ?? '').toLowerCase(), kind: STALLED_KIND, state: i.state,
-    reason: `${i.state}: ${String(i.reason ?? '').replace(/\s+/g, ' ')}`, title: i.title ?? '', command,
+    reason: `${relations ? `${relations}; ` : ''}${i.state}: ${String(i.reason ?? '').replace(/\s+/g, ' ')}`, title: i.title ?? '', command,
     ...(command !== i.command && typeof i.command === 'string' ? { template: i.command.slice(0, 400) } : {}),
+    labels: labelNames(i), blockedBy: i.blockedBy ?? [], unblocks: i.unblocks ?? [],
+    owner: i.owner, nextAction: i.nextAction, deadline: i.deadline,
     evidence: ev.length ? ev : [`waiting state ${i.state}; next: ${i.action ?? 'a person decides'}`] };
 }
 const feedKey = (f) => `${f.repo}#${f.pr}@${f.head}:${STALLED_KIND}`;
@@ -100,24 +105,24 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
  * @param {{items:object[], incomplete:boolean, settingsUnreadable?:boolean}} pass  the `runStallSweep` result
  * @param {{now?:number, env?:object, feedPath?:string, stateDir:string, notify?:Function, enabled?:boolean}} o
  */
-export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true } = {}) {
+export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes } = {}) {
   const errors = [];
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
   // Unknown policy is not an explicit disable: preserve open items, suppression and alert obligations until recovery.
   if (pass?.settingsUnreadable) return { lines: [], fresh: [], notified: false, errors, skipped: 'settings unreadable' };
   if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now });
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
-  const items = pass.items.filter((i) => i.lane === 'operator').map(feedItem);
+  const items = sortUnblockersFirst(pass.items.filter((i) => i.lane === 'operator').map(feedItem));
   // A feed configured as digest.lock may already contain events. Reject it before lock recovery can reclaim it.
   try { checkedDigestFeedPath(feedPath, env, stateDir); }
-  catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, unlocked: true }); }
+  catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
   // One delivery at a time: selection, sending and confirmation run under one lock, so two overlapping passes can never
   // both send the same owed alert. If the lock cannot be taken, every item is alerted (a repeat, never a drop).
-  try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors })); }
-  catch (e) { errors.push(`digest lock: ${String(e?.message ?? e).split('\n')[0]}`); return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, unlocked: true }); }
+  try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes })); }
+  catch (e) { errors.push(`digest lock: ${String(e?.message ?? e).split('\n')[0]}`); return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
 }
 
-function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, unlocked = false }) {
+function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked = false }) {
   let lines = []; let fresh = items; let lock = null;
   const id = (f) => `${f.repo}#${f.pr}@${f.head}:${f.state}`;
   const mine = join(stateDir, 'digest-state.json');
@@ -138,7 +143,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, un
       const mineNow = items.filter((f) => !other.some((k) => k.startsWith(`${f.repo}#${f.pr}@${f.head}:`)));
       // The FEED shows each open head's CURRENT state: a state change on an open head (A -> B, or back to A) drops the
       // old key so the diff re-publishes the head with the current reason and command. The ALERT identity is
-      // repo#pr@head:state: each is alerted once while that head's item stays open, so A -> B -> A alerts A once.
+      // repo#pr@head:state. Legacy consumers alert once (A -> B -> A alerts A once); configured sweeps repeat with backoff and reset on movement.
       const shown = Object.fromEntries(Object.entries(saved.current ?? {}).filter(([k]) => prev.openKeys.includes(k)));
       const alerted = new Set((saved.published ?? []).filter((x) => prev.openKeys.includes(feedKeyOfId(x))));
       const changed = new Set(mineNow.filter((f) => prev.openKeys.includes(feedKey(f)) && shown[feedKey(f)] !== f.state).map(feedKey));
@@ -146,19 +151,34 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, un
       const open = new Set(r.openKeys);
       const written = mineNow.filter((f) => r.lines.some((l) => l.startsWith(`NEEDS-YOU ${f.repo}#${f.pr} ${STALLED_KIND}:`)));
       const newly = written.filter((f) => !alerted.has(id(f)));
+      const repeats = Object.fromEntries(Object.entries(saved.repeats ?? {}).filter(([k]) => open.has(feedKeyOfId(k))));
+      const fingerprint = f => JSON.stringify([f.state, f.labels]);
+      // Persisted one-shot ids carry no send time. Start a bounded clock on migration instead of flooding.
+      if (alertBackoffMinutes) for (const f of mineNow) {
+        if (changed.has(feedKey(f))) {
+          for (const key of Object.keys(repeats)) if (feedKeyOfId(key) === feedKey(f)) delete repeats[key];
+        }
+        if (!changed.has(feedKey(f)) && alerted.has(id(f)) && !(saved.unnotified ?? []).includes(id(f)) && !repeats[id(f)]) repeats[id(f)] = { lastAlertAt: now, alertCount: 1, fingerprint: fingerprint(f) };
+      }
+      const due = mineNow.filter(f => alertBackoffMinutes && repeats[id(f)] &&
+        (repeats[id(f)].fingerprint !== fingerprint(f) || repeatDue(repeats[id(f)], now, alertBackoffMinutes)));
+      // State transitions reset repeats, including a return to a previously seen state.
+      if (alertBackoffMinutes) for (const f of mineNow) {
+        if (changed.has(feedKey(f))) due.push(f);
+      }
       // Owed alerts from a failed send are retried until delivered or resolved, even across an incomplete pass.
       const pending = new Set((saved.unnotified ?? []).filter((x) => open.has(feedKeyOfId(x))));
-      const toAlert = mineNow.filter((f) => newly.includes(f) || pending.has(id(f)));
+      const toAlert = mineNow.filter((f) => newly.includes(f) || pending.has(id(f)) || due.includes(f));
       const unnotified = [...new Set([...pending, ...toAlert.map(id)])];
       // Our own record goes first, marking every alert owed until confirmed; what the feed shows is recorded only once
       // its line is written. A failed save can repeat a line or an alert, never drop one.
-      writeJsonAtomic(mine, { published: [...alerted], current: shown, unnotified });
+      writeJsonAtomic(mine, { published: [...alerted], current: shown, unnotified, repeats });
       appendLines(path, r.lines);
       writeJsonAtomic(sidecar, { ...prev, openKeys: r.openKeys });
       for (const f of newly) alerted.add(id(f));
       for (const f of written) shown[feedKey(f)] = f.state;
       const keep = (k) => open.has(k);
-      writeJsonAtomic(mine, { published: [...alerted].filter((x) => keep(feedKeyOfId(x))), current: Object.fromEntries(Object.entries(shown).filter(([k]) => keep(k))), unnotified });
+      writeJsonAtomic(mine, { published: [...alerted].filter((x) => keep(feedKeyOfId(x))), current: Object.fromEntries(Object.entries(shown).filter(([k]) => keep(k))), unnotified, repeats });
       return { lines: r.lines, fresh: toAlert };
     }));
   } catch (e) {
@@ -168,7 +188,7 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, un
   }
   let notified = false;
   if (fresh.length) {
-    const body = fresh.slice(0, 5).map((f) => `${f.repo.split('/').pop()}#${f.pr} ${f.state}`).join(' | ') + (fresh.length > 5 ? ` (+${fresh.length - 5} more)` : '');
+    const body = fresh.slice(0, 5).map((f) => `${f.repo.split('/').pop()}#${f.pr} ${f.state} ${(f.blockedBy ?? []).map(n => `blocked-by #${n}`).join(' ')} ${(f.unblocks ?? []).map(n => `unblocks #${n}`).join(' ')}`).join(' | ') + (fresh.length > 5 ? ` (+${fresh.length - 5} more)` : '');
     let out = null;
     try { out = notify({ title: `PR stall sweep: ${fresh.length} need you`, body }); } catch (e) { out = { ok: false, error: e?.message }; }
     notified = out?.ok === true;
@@ -176,7 +196,14 @@ function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, un
     // Delivered: no longer owed (best effort; a failed save only repeats the alert next pass).
     // Under the same lock, re-read: another pass may have saved newer state meanwhile; only the delivered ids are removed.
     else if (lock) {
-      try { withFileLock(lock, () => { const cur = readJson(mine, { published: [], unnotified: [] }); writeJsonAtomic(mine, { ...cur, unnotified: (cur.unnotified ?? []).filter((x) => !fresh.some((f) => id(f) === x)) }); }); }
+      try { withFileLock(lock, () => { const cur = readJson(mine, { published: [], unnotified: [] });
+        const repeats = { ...cur.repeats };
+        if (alertBackoffMinutes) for (const f of fresh) {
+          const fingerprint = JSON.stringify([f.state, f.labels]);
+          const prior = repeats[id(f)];
+          repeats[id(f)] = { fingerprint, lastAlertAt: now, alertCount: (prior?.fingerprint === fingerprint ? prior.alertCount : 0) + 1 };
+        }
+        writeJsonAtomic(mine, { ...cur, repeats, unnotified: (cur.unnotified ?? []).filter((x) => !fresh.some((f) => id(f) === x)) }); }); }
       catch (e) { errors.push(`digest state: ${e.message}`); }
     }
   }

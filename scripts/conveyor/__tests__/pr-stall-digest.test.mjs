@@ -426,3 +426,88 @@ describe('paste-ready', () => {
     expect(feedItem(op(3)).evidence).toHaveLength(3);
   });
 });
+
+it('R437 repeats with configured backoff without duplicating feed events and resets on labels', () => {
+  const ctx = setup(), { notify, out } = sent();
+  const options = { notify, alertBackoffMinutes: [30,60,120,240] };
+  for (const minute of [0,30,90,210,450,690]) {
+    expect(run(ctx, [op(1, undefined, { labels: ['review:pending'] })], { ...options, now: NOW + minute * 60000 }).notified).toBe(true);
+    expect(run(ctx, [op(1, undefined, { labels: ['review:pending'] })], { ...options, now: NOW + (minute + 1) * 60000 }).notified).toBe(false);
+  }
+  expect(out).toHaveLength(6);
+  expect(replay({ path: ctx.feedPath })).toHaveLength(1);
+  expect(run(ctx, [op(1, undefined, { labels: ['review:changes'] })], { ...options, now: NOW + 692 * 60000 }).notified).toBe(true);
+});
+
+it('R437 migrates legacy digest state and retries failed repeat delivery immediately', () => {
+  const ctx = setup(), { notify } = sent();
+  run(ctx, [op(1)], { notify }); // old once-per-head state has no repeat clock
+  const options = { notify, alertBackoffMinutes: [30,60,120,240] };
+  expect(run(ctx, [op(1)], options).notified).toBe(false);
+  expect(run(ctx, [op(1)], { ...options, now: NOW + 30 * 60000, notify: () => ({ ok: false }) }).notified).toBe(false);
+  expect(run(ctx, [op(1)], { ...options, now: NOW + 31 * 60000 }).notified).toBe(true);
+  expect(run(ctx, [op(1, 'new-state')], { ...options, now: NOW + 32 * 60000 }).notified).toBe(true);
+  expect(run(ctx, [op(1)], { ...options, now: NOW + 33 * 60000 }).notified).toBe(true);
+  expect(run(ctx, [op(1)], { ...options, now: NOW + 63 * 60000 }).notified).toBe(true);
+});
+
+it('R437 keeps dependency annotations visible before the feed reason truncation', () => {
+  const ctx = setup(), { notify } = sent();
+  const item = op(6244, 'deadline-passed', { unblocks: [6193], reason: 'x'.repeat(200) });
+  expect(feedItem(item).reason).toMatch(/^unblocks #6193/);
+  run(ctx, [item], { notify });
+  expect(replay({ path: ctx.feedPath })[0].reason).toContain('unblocks #6193');
+});
+
+it('R437 a failed first delivery starts the 30-minute clock only when delivery succeeds', () => {
+  const ctx = setup(), { notify } = sent();
+  const options = { alertBackoffMinutes: [30,60,120,240] };
+  expect(run(ctx, [op(1)], { ...options, notify: () => ({ ok: false }) }).notified).toBe(false);
+  expect(run(ctx, [op(1)], { ...options, notify, now: NOW + 60000 }).notified).toBe(true);
+  expect(run(ctx, [op(1)], { ...options, notify, now: NOW + 30 * 60000 }).notified).toBe(false);
+  expect(run(ctx, [op(1)], { ...options, notify, now: NOW + 31 * 60000 }).notified).toBe(true);
+});
+
+it('R437 owner-signal read failure preserves a published invariant feed item while other reads succeed', async () => {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  let previous = {}, failOwner = false;
+  let prs = [{ number: 6254, title: 'no labels', headRefOid: H, labels: [], changedFiles: 1, updatedAt: new Date(NOW).toISOString() }];
+  const readPrs = vi.fn(() => prs);
+  const detector = vi.fn(async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }));
+  const passes = [];
+  const tick = async minutes => {
+    const report = await runPrSweep({ now: NOW + minutes * 60000, env: {}, config: {},
+      settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+      readPrs, readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => previous,
+      readSignals: () => { if (failOwner) throw new Error('injected owner read failure'); return {}; },
+      detector, notify, flush: () => {}, persist: () => {}, append: () => {},
+      stallSweep: async () => ({ mode: 'shadow', dir: ctx.stateDir, digest: true, items: [], incomplete: false }),
+      stallDigest: (pass, options) => {
+        passes.push(pass);
+        return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath });
+      } });
+    previous = report.nextState;
+    return report;
+  };
+  expect((await tick(0)).errors).toEqual([]);
+  const opened = unacknowledged({ path: ctx.feedPath });
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toMatchObject({ pr: 6254, state: 'no-labels', kind: 'stalled' });
+  failOwner = true;
+  const failed = await tick(1);
+  expect(failed.errors).toContain('owner signals: injected owner read failure');
+  expect(readPrs).toHaveBeenCalledTimes(2);
+  expect(detector).toHaveBeenCalledTimes(2);
+  expect(passes[1].items).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
+  expect(replay({ path: ctx.feedPath }).filter(event => event.kind === 'cleared')).toEqual([]);
+  expect(passes[1].incomplete).toBe(true);
+  failOwner = false;
+  expect((await tick(2)).errors).toEqual([]);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual(opened);
+  prs = [];
+  expect((await tick(3)).errors).toEqual([]);
+  expect(passes[3].incomplete).toBe(false);
+  expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
+});
