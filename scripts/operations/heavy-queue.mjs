@@ -161,6 +161,10 @@ export function assessHeavyQueue(read) {
     projectedWaitMinutesForNewJob: projected, rows, headline,
     queueAdmission: admission,
     remoteFallbacks: read.remoteFallbacks ?? {total:0, byReason:{}},
+    // R497 — fail closed: no read means UNKNOWN, never a default share.
+    forgeShare: read.forgeShare?.current
+      ? { ...read.forgeShare.current, earlier: { status: read.forgeShare.earlier?.status ?? 'unknown', share: read.forgeShare.earlier?.share ?? null } }
+      : { status: 'unknown', share: null, belowTarget: null, unknownReason: 'not-collected' },
   };
 }
 

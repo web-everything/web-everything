@@ -255,6 +255,7 @@ function judged({ head, verdict, trigger, files, card, grantsSoFar, acts, out, o
 
   switch (verdict.verdict) {
     case 'escalate': return operator('escalate', `the judge escalated: ${why}`);
+    case 'non-converging': return operator('non-converging', `the judge marks the PR non-converging (a new finding class each round); redesign, not round 3: ${why}`);
     case 'suggest-split': return operator('suggest-split', `the judge suggests splitting the PR: ${why}`);
     case 'not-real-verified': return operator('suggest-not-real', `every finding was mechanically refuted; only a person rules not-real (${(verdict.proof ?? []).slice(0, 2).join(' | ')})`,
       trigger === 'referral-hold' ? acts.referralRuling.command : acts.redTeamRuling.command);
