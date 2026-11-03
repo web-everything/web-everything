@@ -177,19 +177,14 @@ export function classifyManifestPath(path) {
   const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
-// Shared structural checks also apply to byte-verified public test fixtures.
-export function manifestEntryFields(path,content,executable,tracked) {
+export function manifestEntry(path,content,executable,tracked) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
-  return {path,sha256:sha(content),executable,tracked};
-}
-export function manifestEntry(path,content,executable,tracked) {
-  const entry=manifestEntryFields(path,content,executable,tracked);
   if(classifyManifestPath(path).credentialSource) {
     const finding=tracked?credentialContentFinding(path,content):'untracked';
     if(finding)throw Object.assign(new Error(`Excluded credential-named file ${path.toString('latin1')} (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
-  return entry;
+  return {path,sha256:sha(content),executable,tracked};
 }
 export function decodeManifest(manifest) {
   if(!manifest || manifest.v!==2 || Object.keys(manifest).sort().join(',')!=='excluded,executable,hashes,paths,tracked,v'
