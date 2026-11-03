@@ -115,7 +115,7 @@ export function transcriptActivityMs(row, { resolve = resolveSessionTranscript, 
   }
   return newest;
 }
-import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
+import { readHungInfo, resolveHungThresholdMs, PENDING_CALL_GRACE_MULTIPLIER } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -491,7 +491,10 @@ export function refreshLiveFixDispatchClaims({
     const quietLongEnough = (a) => {
       let at = null;
       try { at = activityMsFor(a); } catch { at = null; }
-      return Number.isFinite(at) && nowMs - at >= idleRelease.idleMinutes * 60_000;
+      // Minimum quiet = the hung detector's own pending-tool-call grace (threshold x multiplier, 90 min by default):
+      // a transcript is silent during a long foreground call, which is not idleness.
+      const quietMs = Math.max(idleRelease.idleMinutes * 60_000, hungThresholdMs * PENDING_CALL_GRACE_MULTIPLIER);
+      return Number.isFinite(at) && nowMs - at >= quietMs;
     };
     const isIdle = nonTerminal.length > 0
       && nonTerminal.every((a) => (a.state === 'idle' || a.status === 'idle') && boundToClaim(a) && quietLongEnough(a));

@@ -817,6 +817,7 @@ describe('idle-claim auto-release (R201)', () => {
 
   it.each([
     ['transcript touched inside the idle window', () => T0 + 60_000 + 25 * 60_000],
+    ['transcript silent 60 min (long tool call, inside the 90 min grace)', () => T0],
     ['transcript unreadable', () => null],
     ['activity resolver throws', () => { throw new Error('boom'); }],
   ])('keeps the claim when holder activity is %s', (_n, activityMsFor) => {
