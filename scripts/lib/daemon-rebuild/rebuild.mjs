@@ -153,7 +153,7 @@ function defaultForceWatchProbe(run, env) {
     const dirty = String(status?.stdout ?? '').trim();
     if (status?.status !== 0 || dirty) return { healthy: false };
     try {
-      execFileSync(process.execPath, ['--input-type=module', '-e', "await import('./scripts/lib/daemon-rebuild.mjs')"], { cwd: root, timeout: 60_000, stdio: 'ignore' });
+      execFileSync(process.execPath, ['--input-type=module', '-e', 'await import(process.argv[1])', './scripts/lib/daemon-rebuild.mjs'], { cwd: root, timeout: 60_000, stdio: 'ignore' });
       return { healthy: true };
     } catch { return { healthy: false }; }
   };
