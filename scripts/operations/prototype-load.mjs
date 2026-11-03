@@ -40,13 +40,18 @@ export function readyEvidence(records, input, ruledWeakened = []) {
 export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp = null) {
   // R503: an audit of an older head also speaks for this head when its stored net-diff fingerprint equals the live one.
   // No stored or live fingerprint, or any difference, means no carry (a real code change always re-audits).
-  const heads = new Set([sha]);
-  for (const r of records) if (r?.head && r.head !== sha && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)) heads.add(r.head);
+  // Eligibility is per RECORD: each carried record must itself hold the matching fingerprint, so one carried record
+  // can never lend its head's other (unfingerprinted or foreign) records.
+  const eligible = records.filter((r) => r?.head === sha || (r?.head && validSha(r.head) && carriesAcross(r.fingerprint, liveFp)));
+  const heads = new Set(eligible.map((r) => r.head));
+  // Fail closed the other way too: a valid WEAKENED verdict anywhere on a carried head blocks, fingerprint or not.
+  for (const r of records) if (r?.head && r.head !== sha && heads.has(r.head) && r.verdict === 'WEAKENED'
+    && r.questionHash === QUESTION_HASH && Number.isFinite(Date.parse(r.at))) return { ok: false, reason: 'weakened' };
   let pass = null;
   for (const head of heads) {
-    const bases = new Set(records.filter((r) => r?.head === head && r.base !== head).map((r) => r.base));
+    const bases = new Set(eligible.filter((r) => r.head === head && r.base !== head).map((r) => r.base));
     for (const base of bases) {
-      const record = findAudit(records, { head, base, questionHash: QUESTION_HASH });
+      const record = findAudit(eligible, { head, base, questionHash: QUESTION_HASH });
       if (record?.verdict === 'WEAKENED') return { ok: false, reason: 'weakened' };
       if (record && covers(base) && (!pass || Date.parse(record.at) >= Date.parse(pass.at))) pass = record;
     }

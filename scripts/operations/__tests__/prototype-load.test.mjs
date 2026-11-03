@@ -2001,6 +2001,15 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   it('a WEAKENED audit on the carried head blocks', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old({ verdict: 'WEAKENED' })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
   });
+  it('a carried record never lends its head other records without the fingerprint', () => {
+    const other = old({ fingerprint: undefined, base: 'f'.repeat(40), at: '2026-10-21T12:00:00Z' });
+    const weak = old({ fingerprint: undefined, base: '9'.repeat(40), verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+    expect(prototypeLoad.canonicalAuditEvidence([old(), other], SHA, () => true, FP)).toEqual({ ok: true, record: old() });
+    // ...but a valid WEAKENED verdict on that head still blocks, fingerprint or not (fail closed)
+    expect(prototypeLoad.canonicalAuditEvidence([old(), other, weak], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    // a foreign-question record is not a valid verdict and neither blocks nor enables
+    expect(prototypeLoad.canonicalAuditEvidence([old(), { ...weak, questionHash: 'foreign' }], SHA, () => true, FP)).toEqual({ ok: true, record: old() });
+  });
   it('the base must still be covered by main', () => {
     expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => false, FP)).toEqual({ ok: false, reason: 'no-record' });
   });
