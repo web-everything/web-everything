@@ -334,3 +334,34 @@ describe('helpers', () => {
     expect(formatJudgeLine(7, { verdict: 'send-back', reasons: ['a'] })).toBe('round-judge-shadow: #7 verdict=send-back reasons=a');
   });
 });
+
+describe('non-converging stop (R469: a new finding class each round)', () => {
+  const r1 = () => rt(H(1), [['src/a.mjs', 10, 'alpha parser drops the trailing record'], ['src/b.mjs', 20, 'beta cache never expires entries']]);
+  const r2 = () => rt(H(9), [['src/d.mjs', 5, 'delta timeout unit mismatch in header'], ['src/e.mjs', 8, 'epsilon path join loses the drive'], ['src/f.mjs', 9, 'zeta token refresh races']]);
+  it('is off by default: the same evidence is an ordinary send-back', () => {
+    expect(judge([r1(), r2()]).verdict).toBe('send-back');
+  });
+  it('fires at round 2 when every finding is a new class and the count is not shrinking', () => {
+    const r = judge([r1(), r2()], { nonConverging: { enabled: true } });
+    expect(r.verdict).toBe('non-converging');
+    expect(r.reasons[0]).toMatch(/new-finding-class-each-round/);
+    expect(validateVerdict(r).ok).toBe(true);
+  });
+  it('does not fire when findings are shrinking (legitimate progress)', () => {
+    const r = judge([r1(), rt(H(9), [['src/d.mjs', 5, 'delta timeout unit mismatch in header']])], { nonConverging: { enabled: true } });
+    expect(r.verdict).not.toBe('non-converging');
+  });
+  it('does not fire at round 1, or when a finding is re-raised (that is the repeat path)', () => {
+    expect(judge([r2()], { nonConverging: { enabled: true } }).verdict).not.toBe('non-converging');
+    const again = rt(H(9), [['src/a.mjs', 10, 'alpha parser drops the trailing record'], ['src/e.mjs', 8, 'epsilon path join loses the drive']]);
+    expect(judge([r1(), again], { nonConverging: { enabled: true } }).verdict).not.toBe('non-converging');
+  });
+  it('a second opinion cannot loosen it', () => {
+    const r = judge([r1(), r2()], { nonConverging: { enabled: true }, llm: () => ({ verdict: 'grant', k: 1, reasons: ['x'] }) });
+    expect(r.verdict).toBe('non-converging');
+  });
+  it('never preempts the guard-code path: findings in guard files keep their usual verdict', () => {
+    const g = rt(H(9), [['scripts/lib/red-team-gate.mjs', 5, 'delta timeout unit mismatch in header'], ['src/e.mjs', 8, 'epsilon path join loses the drive'], ['src/f.mjs', 9, 'zeta token refresh races']]);
+    expect(judge([r1(), g], { nonConverging: { enabled: true } }).verdict).not.toBe('non-converging');
+  });
+});
