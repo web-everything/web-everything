@@ -3134,7 +3134,9 @@ async function cmdRelease(repo) {
     // `release --force` reclaim, which delegates here) leaves the registry pointing at a lane that is free
     // again, and conveyor-state.mjs's health-stall scan overcounts `building` forever.
     unmapLanes({ ...repo, referencePath: repo.registryReferencePath || repo.referencePath }, [n]);
-    touchFreeList(repo, n, !isReservedLease(lease));
+    // Only a lane PROVEN clean and fully pushed right now is published as free (the same bar auto-pick's scan applies).
+    const afterRelease = isReservedLease(lease) ? null : laneStateSnapshot(dir, `origin/${repo.branch}`);
+    touchFreeList(repo, n, afterRelease?.unpushed === false && afterRelease?.ahead === 0 && afterRelease?.dirty === 0);
     log(`  released lane-${n} (was ${describeLease(lease)})`);
     released++;
   }

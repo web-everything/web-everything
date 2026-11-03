@@ -84,6 +84,7 @@ export function parseFreeLaneList(text) {
       path: typeof l.path === 'string' ? l.path : null,
       head: typeof l.head === 'string' ? l.head : null,
       branch: typeof l.branch === 'string' ? l.branch : null,
+      at: Number.isFinite(l.at) ? l.at : raw.writtenAt,
     });
   }
   return { v: raw.v, writtenAt: raw.writtenAt, repo: raw.repo, poolDir: typeof raw.poolDir === 'string' ? raw.poolDir : null, lanes };
@@ -123,7 +124,7 @@ export function buildFreeLaneList({ repoName, poolDir = null, writtenAt, lanes }
     const lane = Number(l?.lane);
     if (!Number.isInteger(lane) || lane < 0 || seen.has(lane)) continue;
     seen.add(lane);
-    rows.push({ lane, path: l.path ?? null, head: l.head ?? null, branch: l.branch ?? null });
+    rows.push({ lane, path: l.path ?? null, head: l.head ?? null, branch: l.branch ?? null, at: Number.isFinite(l.at) ? l.at : writtenAt });
   }
   rows.sort((a, b) => a.lane - b.lane);
   return { v: FREE_LANE_LIST_VERSION, writtenAt, repo: repoName, poolDir, lanes: rows };
@@ -219,18 +220,20 @@ const defaultTmpPathFor = (path) => `${path}.${process.pid}.${Date.now()}.${rand
  * Event-driven refresh: apply ONE lane's change (a release makes it free, an acquire/trim makes it not) to the
  * published list and stamp it fresh NOW, without waiting for the periodic health-watch pass (its cadence was
  * 8-44 min apart on 2026-11-03, so the list sat past its freshness limit and `acquire` fell into the full
- * per-lane scan). Entries not touched here are carried over unverified, which is safe: `acquire` re-claims and
+ * per-lane scan). Carried entries keep their own `at` and are dropped once older than the freshness limit; `acquire` also re-claims and
  * re-verifies every candidate it takes from the list. Best-effort and never throws, so a lane-pool command can
  * never fail because of it.
  * @param {{path:string, repoName:string, poolDir:string, lane:number, free:boolean, now?:number, laneDir?:string, head?:(string|null), branch?:(string|null)}} o
  * @returns {boolean} whether the list was rewritten
  */
-export function touchFreeLaneList({ path, repoName, poolDir, lane, free, now = Date.now(), laneDir = null, head = null, branch = null }) {
+export function touchFreeLaneList({ path, repoName, poolDir, lane, free, now = Date.now(), maxAgeMs = DEFAULT_FREE_LANE_LIST_MAX_AGE_MS, laneDir = null, head = null, branch = null }) {
   try {
     if (!Number.isInteger(lane) || lane < 0) return false;
     const prior = readFreeLaneList(path);
-    const kept = (prior?.lanes ?? []).filter((l) => l.lane !== lane);
-    if (free) kept.push({ lane, path: laneDir ?? join(poolDir, `lane-${lane}`), head, branch });
+    // Carried entries keep their OWN timestamp and are pruned once older than the freshness limit, so an
+    // unrelated lane event can never keep an old candidate "fresh" past the maximum age.
+    const kept = (prior?.lanes ?? []).filter((l) => l.lane !== lane && Number.isFinite(l.at) && l.at <= now + 1000 && now - l.at < maxAgeMs);
+    if (free) kept.push({ lane, path: laneDir ?? join(poolDir, `lane-${lane}`), head, branch, at: now });
     writeFreeLaneListAtomic(path, buildFreeLaneList({ repoName, poolDir, writtenAt: now, lanes: kept }));
     return true;
   } catch { return false; }
