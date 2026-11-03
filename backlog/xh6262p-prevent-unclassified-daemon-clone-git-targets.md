@@ -9,7 +9,7 @@ tags: [prevention, security]
 
 # Prevent unclassified daemon-clone Git targets and mutations
 
-Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. This files the prevention obligations. A1–A3 remain open and do not change guard behavior. A4 is delivered on the same PR: the HOME finding at `we:scripts/guard-bash.mjs:1975` was first ruled `not-real`, then ruled `block` by policy on head `89f25a08be610a54e92e6f6bfa751e8d7102d5c2`, and the fix follows the later `block` ruling.
+Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. A1–A3 now have implementations and named tests in the operator send-back repair; final verification remains with the launcher. A4 is delivered on the same PR: the HOME finding at `we:scripts/guard-bash.mjs:1975` was first ruled `not-real`, then ruled `block` by policy on head `89f25a08be610a54e92e6f6bfa751e8d7102d5c2`, and the fix follows the later `block` ruling.
 
 ## Design
 
@@ -66,6 +66,16 @@ If the reconciled semantics require tracked HOME, carry the same effective value
 - Who wrote it — candidate command text is data; never execute it to discover targets.
 
 ## Test and proof plan
+
+Acceptance witnesses in `we:scripts/__tests__/guard-bash.test.mjs`:
+
+- A1: `A1 daemon command inventory denies unclassified commands and preserves read controls` checks a synthetic command, the named mutator inventory and diagnostic reads. The daemon policy uses its own read classification; unrelated guard policies retain their existing mutator inventory.
+- A2: `A2 daemon wrapper matrix carries or refuses directory effects: %s` covers env, time, command, builtin, nice, sudo, xargs, npx and bunx, plus env -C / --chdir, sudo -D and unknown path-taking options. Unresolved wrapper state cannot supply safe fetch-config evidence.
+- A3: `A3 compound exports retain possible targets and isolate child scope` and `A3 hook compound exports retain possible targets and isolate child scope` cover function, loop and if exports, read controls and explicit child-shell isolation at the decision and JSON hook boundaries.
+
+The pre-fix heavy-admission run exposed failures in A1, A2, A3, unknown global options,
+backtick fetch configuration and child-process selection. Existing `$SPEC` and config-file
+cluster cases already passed on the dispatched head; they remain regression pins.
 
 Run the focused guard test file through the admitted unit-test command. Demonstrate each new regression on the pre-change implementation before repairing that behavior, except where the current ruling already establishes a non-defect; record that case explicitly. Verify decision-level cases and the real hook JSON boundary using temporary registry fixtures. The final gate must report the affected tests and whether each new regression discriminates with the source change reverted.
 
