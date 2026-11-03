@@ -66,6 +66,7 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
 import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
 import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
 import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
@@ -738,11 +739,13 @@ function prFingerprint(pr) {
 }
 
 /**
- * Default live probe for plan reuse: one light open-PR list per repo (shared host snapshot when fresh).
+ * Default live probe for plan reuse: one light open-PR list per repo, read DIRECTLY from GitHub. It must never use the
+ * host-shared PR snapshot (valid for ~75 s): that could hide a stand-down comment posted after the plan was made.
  * Throws when a row lacks `updatedAt`, so the cache fails closed to a full recompute.
  */
-export function readPlanFingerprints(repo) {
-  const rows = defaultReadOpenPrs({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt'] });
+export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThrottled(...args) } = {}) {
+  // A wrapper `exec` (not the throttled function itself) makes defaultReadOpenPrs skip the shared snapshot.
+  const rows = defaultReadOpenPrs({ exec, repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt'] });
   if (!Array.isArray(rows) || rows.some((pr) => !pr || typeof pr.updatedAt !== 'string')) throw new Error('plan fingerprint unreadable');
   return new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
 }

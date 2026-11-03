@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import {
   runDaemonLoop, buildCliDaemonEffects, realSleep, RECONCILE_FIX_DISPATCH_LEASE_KEY, DEFAULT_INTERVAL_MS,
   runReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
-  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, formatRefusalLine,
+  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, readPlanFingerprints, formatRefusalLine,
   runHungCiRecoveryAllRepos, formatHungActionLine,
   runMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
@@ -1880,5 +1880,16 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     await runTickAllRepos({ ...base, repos: ['repo-a'],
       readPlanFingerprint: () => { if (calls++ > 0) throw new Error('gh down'); return new Map(); }, ...phases([]) });
     expect(spy).toHaveBeenCalledTimes(4);
+  });
+
+  it('the default live probe reads GitHub directly (never the shared snapshot) and fails closed without updatedAt', () => {
+    const rows = [{ number: 7, headRefOid: 'abc', isDraft: false, labels: [{ name: 'x' }], updatedAt: '2026-11-02T00:00:00Z' }];
+    const exec = vi.fn(() => JSON.stringify(rows));
+    const out = readPlanFingerprints('we', { exec });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][0]).toBe('gh');
+    expect(exec.mock.calls[0][1].join(' ')).toMatch(/updatedAt/);
+    expect([...out.keys()]).toEqual([7]);
+    expect(() => readPlanFingerprints('we', { exec: () => JSON.stringify([{ number: 7 }]) })).toThrow(/unreadable/);
   });
 });
