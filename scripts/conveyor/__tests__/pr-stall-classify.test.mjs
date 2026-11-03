@@ -285,7 +285,8 @@ describe('fail closed', () => {
 
 describe('policy guardrails', () => {
   it.each(['scripts/operations/pr-sweep-core.mjs', 'scripts/lib/red-team-gate.mjs', '.github/workflows/test.yml', 'scripts/lib/merge-gate-ci.mjs', 'scripts/conveyor/pr-stall-classify.mjs',
-    'scripts/lib/round-judge.mjs', 'scripts/conveyor/round-extension-mark.mjs', 'scripts/operations/extend-rounds-io.mjs', 'scripts/operations/record-referral-ruling.mjs'])('a guard path %s blocks every policy action', (path) => {
+    'scripts/lib/round-judge.mjs', 'scripts/conveyor/round-extension-mark.mjs', 'scripts/operations/extend-rounds-io.mjs', 'scripts/operations/record-referral-ruling.mjs',
+    'scripts/lib/red-team-pending-watchdog.mjs'])('a guard path %s blocks every policy action', (path) => {
     for (const v of ['grant', 'send-back']) {
       const r = at('ruling-needed:red-team-round-cap', { verdict: verdict(v), files: ['scripts/foo.mjs', path] });
       expect([r.lane, r.action]).toEqual(['operator', 'guard-file-touched']);

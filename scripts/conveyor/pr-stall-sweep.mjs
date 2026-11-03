@@ -244,6 +244,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   let readFailed = !Array.isArray(raw.prs) || !raw.prs.every(readable);
   const items = [];
   const pending = [];
+  // A live job proves ownership, so its pending row is not stalled; restarting it risks a duplicate run.
   for (const row of report.prs.filter((r) => r.stalled)) {
     const pr = prs.get(`${row.repo}#${row.number}`);
     const head = String(pr?.headRefOid ?? '');

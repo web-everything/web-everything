@@ -125,7 +125,7 @@ const keyOf = (row, head) => `${row.repo}#${row.number}@${String(head ?? '').toL
 const fill = (cmd) => (typeof cmd === 'string' ? cmd : null);
 /** Guard code for THIS policy, on top of the shared roster (`isGuardPath`): the judge, the round ceiling, the ruling and
  *  grant writers, and the stall sweep itself. A PR that edits the rules policy acts under is never acted on by policy. */
-const POLICY_FILE = /(?:^|\/)(?:round-judge[\w-]*|round-extension-mark|extend-rounds[\w-]*|record-referral-ruling[\w-]*|pr-stall-[\w-]+|referral-card-readable|marker-authorship|pr-sweep-core)\.mjs$/;
+const POLICY_FILE = /(?:^|\/)(?:round-judge[\w-]*|round-extension-mark|extend-rounds[\w-]*|record-referral-ruling[\w-]*|pr-stall-[\w-]+|referral-card-readable|marker-authorship|pr-sweep-core|red-team-pending-watchdog)\.mjs$/;
 const guarded = (p) => isGuardPath(p) || POLICY_FILE.test(p);
 /** A plain record: an array (or anything else) dressed up with the right fields is not one. */
 const isRec = (x) => !!x && typeof x === 'object' && !Array.isArray(x);

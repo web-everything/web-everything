@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
+import { assessPrSweep } from '../../operations/pr-sweep-core.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
 import { runPrSweepJob } from '../pr-sweep-job.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
@@ -510,6 +511,23 @@ describe('pending red-team watchdog in the shadow sweep', () => {
       .toContain(`pr-stall-sweep (shadow) would restart-red-team ${prHead} [system]:`);
     expect(lines(dir).filter(r => r.phase === 'would-do')).toMatchObject([{ action: 'restart-red-team', mode: 'shadow' }]);
     expectReadOnly(calls);
+  });
+  it('a red-team-pending row with a liveJob yields no watchdog action even at 300 minutes', async () => {
+    const pendingAt = new Date(NOW - 300 * 60_000).toISOString();
+    const prs = [pendingPr({ updatedAt: pendingAt, createdAt: pendingAt })];
+    const { gh } = fakeGh({ prs });
+    const read = vi.fn(input => ({ ...reader(gh)(input),
+      liveJobs: [{ repo: REPO, pr: 11, kind: 'red-team' }] }));
+    const { out, readRedTeamStatus, probe } = await sweep({ prs, read });
+    expect(read).toHaveBeenCalledOnce();
+    expect(assessPrSweep(read.mock.results[0].value).prs).toMatchObject([
+      { waitingOn: 'red-team-pending', ageMinutes: 300, liveJob: 'red-team', stalled: false },
+    ]);
+    expect(out.incomplete).toBe(false);
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+    expect(readRedTeamStatus).not.toHaveBeenCalled();
+    expect(probe.isAlive).not.toHaveBeenCalled();
   });
   it.each(['queued', 'running'])('a live %s owner is probed and never restarted even after 120 minutes', async status => {
     const { out, probe } = await sweep({ status: statusFor({ status }), alive: true });
