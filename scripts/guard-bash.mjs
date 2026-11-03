@@ -3361,10 +3361,12 @@ function ungatedHeavyHead(head, depth = 0) {
       const flag = w[i];
       i += 1;
       // --test is a boolean runtime option, not a value-taking flag or a script argument.
-      if (flag === '--test') { testRun = true; continue; }
+      if (/^--test(?:=|$)/.test(flag)) { testRun = true; continue; }
       if (NODE_SCRIPT_VALUE_FLAGS.has(flag) || flag === '--title') i += 1;
       // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
-      else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])) i += 1;
+      // Known extensionless executable paths are scripts too, not option values.
+      else if (!flag.includes('=') && w[i] && !w[i].startsWith('-') && !NODE_SCRIPT_WORD.test(w[i])
+        && !TSC_NODE_ENTRY.test(w[i]) && !VITEST_NODE_ENTRY.test(w[i])) i += 1;
     }
     if (testRun) return { kind: 'node-test' };
     if (w[i] === '--') i += 1;
@@ -3381,9 +3383,10 @@ function ungatedHeavyHead(head, depth = 0) {
   }
   const inv = runnerInvocation(head);
   if (inv?.exec) return ungatedHeavyHead(canonicalCommand(inv.exec), depth + 1);
-  // pnpm/yarn/bun resolve a bare `vitest` script name to the vitest bin (npm does not).
-  if (w[0] !== 'npm' && inv?.names?.length === 1 && VITEST_WORD.test(inv.names[0])) {
-    return ungatedHeavyHead('vitest' + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
+  // pnpm/yarn/bun resolve bare tool names to their bins (npm does not).
+  if (w[0] !== 'npm' && inv?.names?.length === 1
+    && (VITEST_WORD.test(inv.names[0]) || TSC_WORD.test(inv.names[0]))) {
+    return ungatedHeavyHead(inv.names[0] + head.slice(words[w.indexOf(inv.names[0], 1)].end), depth + 1);
   }
   let at = -1;
   const scope = []; // npm's package-selecting options (`-w x`, `--prefix x`, …), kept in the replacement

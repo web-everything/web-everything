@@ -61,6 +61,19 @@ describe('client argv compatibility with the unchanged Forge allowlist', () => {
     expect(allowedCommand(remote.normalizeRemoteArgv(argv))).toBe(false);
   });
 
+  it.each(['run', 'related'].flatMap(mode =>
+    ['./--passWithNoTests', './--coverage', './-h', './--testTimeout=100'].map(file => [mode, file])
+  ))('preserves option-looking positional %s argument %s and refuses remote dispatch', async (mode, file) => {
+    const argv = ['npx', 'vitest', mode, files[0], file];
+    const exec = vi.fn(), stage = vi.fn();
+    expect(remote.normalizeRemoteArgv(argv)).toEqual(argv);
+    expect(allowedCommand(remote.normalizeRemoteArgv(argv))).toBe(false);
+    expect(await remote.runRemote({ argv, exec, fs: { mkdtemp: stage } }))
+      .toMatchObject({ reason: 'command-not-allowed' });
+    expect(exec).not.toHaveBeenCalled();
+    expect(stage).not.toHaveBeenCalled();
+  });
+
   it('preserves option values rather than treating them as file arguments', () => {
     const argv = ['npx', 'vitest', 'run', `./${files[0]}`, '-t', './name', '--config', './vitest.soak.config.ts'];
     expect(remote.normalizeRemoteArgv(argv)).toEqual([

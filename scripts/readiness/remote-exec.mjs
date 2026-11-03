@@ -86,7 +86,8 @@ export function normalizeRemoteArgv(argv) {
       normalized.push(arg);
       if (++i < argv.length) normalized.push(argv[i]);
     } else {
-      normalized.push(arg.startsWith('./') ? arg.slice(2) : arg);
+      // A positional path must never become an option when its prefix is removed.
+      normalized.push(arg.startsWith('./') && !arg.slice(2).startsWith('-') ? arg.slice(2) : arg);
     }
   }
   return normalized;
