@@ -104,8 +104,7 @@ function pinHolds(pinStillHolds, entry) {
     const result = pinStillHolds(structuredClone(entry));
     if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
       try {
-        // Not Promise.resolve(result): that reads result.constructor, which a hostile value can make throw before the rejection is handled.
-        if (typeof result.then === 'function') new Promise(resolve => resolve(result)).catch(() => {});
+        if (typeof result.then === 'function') Promise.resolve(result).catch(() => {});
       } catch { /* Hostile thenable: still unproven. */ }
     }
     return result === true;
