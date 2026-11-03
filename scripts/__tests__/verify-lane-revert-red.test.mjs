@@ -6,7 +6,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,10 +22,15 @@ const FIXED = "export const guard = (name) => name.length > 0 && !name.startsWit
 const OLD_TEST = "import { it, expect } from 'vitest';\nimport { guard } from '../guard.mjs';\nit('accepts a plain name', () => expect(guard('a')).toBe(true));\n";
 const NEW_TEST = `${OLD_TEST}it('refuses a dot name', () => expect(guard('.a')).toBe(false));\nit('weak: a long name is fine', () => expect(guard('abc')).toBe(true));\n`;
 
+// Hermetic: the host's ~/.claude/platform-preferences.json can route the gate to a remote executor that cannot see
+// this temp repo. Point admission at a private empty preferences file instead (honoured only under test).
+const PREFS = join(mkdtempSync(join(tmpdir(), 'we-vlrr-prefs-')), 'platform-preferences.json');
+writeFileSync(PREFS, '{}\n');
+
 function verify(ctx, mode) {
   const r = spawnSync(process.execPath, [join(WE, 'scripts/verify-lane.mjs'), `--repo=${ctx.root}`, `--gate=npx vitest run ${TEST} --run`, '--json'], {
     cwd: ctx.root, encoding: 'utf8', timeout: 180_000,
-    env: { ...process.env, WE_VERIFY_REVERT_RED: mode, WE_COORDINATION_ROOT: join(ctx.tmp, 'coord') },
+    env: { ...process.env, WE_VERIFY_REVERT_RED: mode, WE_PLATFORM_PREFERENCES: PREFS, WE_UNDER_TEST: '1', WE_COORDINATION_ROOT: join(ctx.tmp, 'coord') },
   });
   const last = r.stdout.trim().split('\n').at(-1);
   return { status: r.status, out: JSON.parse(last), stderr: r.stderr };
