@@ -544,4 +544,18 @@ describe('brief red-team before code (R469)', () => {
     expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
     expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
   });
+  it('preserves the plain brief when red-team execution rejects', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn(async () => { throw new Error('rt boom'); });
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/p.md'], { ...o, redTeamBrief, readText: () => 'x' })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(o.stderr.write.mock.calls.join('')).toContain('rt boom');
+  });
+  it('preserves the plain brief when prep-file reading fails', async () => {
+    const o = io();
+    const redTeamBrief = vi.fn();
+    expect(await main(['--purpose=gate-fix', '--files=scripts/lib/red-team-gate.mjs', '--prep-file=/missing.md'], { ...o, redTeamBrief, readText: () => { throw new Error('ENOENT'); } })).toBe(0);
+    expect(o.stdout.write.mock.calls[0][0]).toContain('Standard worker rules');
+    expect(redTeamBrief).not.toHaveBeenCalled();
+  });
 });

@@ -1,0 +1,4 @@
+{
+  "$description": "Advisory brief red-team before code for guard, daemon and credential/security touch-sets. Cascade: standard → platform briefRedTeam → repository briefRedTeam → WE_BRIEF_RED_TEAM_ENABLED (true/false or 1/0) / WE_BRIEF_RED_TEAM_TIMEOUT_MS (positive number). Effective values and sources use the shared policy-cascade logger. Defaults: enabled true, timeoutMs 120000, maxClasses 6 (positive integer). Failures and timeouts log and leave the plain brief available. Set leaves here only to override platform preferences.",
+  "briefRedTeam": {}
+}
