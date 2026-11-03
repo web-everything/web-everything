@@ -82,7 +82,7 @@ import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
-import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { readSharedOpenPrs, sampleDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
@@ -405,6 +405,8 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
     const listed = withListRetry(() => {
       const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
+        // A declared smoke sample (WE_PR_SNAPSHOT_SAMPLE, smoke/dry-run) is accepted; a sample flag with no declared sample is not.
+        if (shared.sampled === true && !sampleDeclared(process.env)) throw Object.assign(new Error(`open-PR snapshot for ${repo} is a sample but no sample is declared — refusing a partial inventory`), { code: 'pr-list-truncated' });
         if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
         return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
       }

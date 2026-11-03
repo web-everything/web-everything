@@ -131,3 +131,25 @@ it('an author lookup failure fails the whole read; a row is never accepted witho
     readRest: () => ({ json: {} }),
     retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/author/);
 });
+
+describe('a declared smoke sample is not truncation (follow-up regression, 2026-11-03 16:23 ET)', () => {
+  const rowsWith = (flags) => { const r = [{ number: 1, labels: [], comments: [], statusCheckRollup: [], author: { login: 'x' } }]; for (const [k, v] of Object.entries(flags)) Object.defineProperty(r, k, { value: v }); return r; };
+  const read = async (flags, env) => {
+    const prev = process.env.WE_PR_SNAPSHOT_SAMPLE;
+    if (env === undefined) delete process.env.WE_PR_SNAPSHOT_SAMPLE; else process.env.WE_PR_SNAPSHOT_SAMPLE = env;
+    try {
+      const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+      const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+      return defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => rowsWith(flags) });
+    } finally { if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_SAMPLE; else process.env.WE_PR_SNAPSHOT_SAMPLE = prev; }
+  };
+  it('accepts rows marked sampled when the sample env is declared', async () => {
+    expect((await read({ sampled: true }, '12')).map(p => p.number)).toEqual([1]);
+  });
+  it('refuses a sampled flag when no sample env is set', async () => {
+    await expect(read({ sampled: true }, undefined)).rejects.toThrow(/sample/);
+  });
+  it('refuses a truncated snapshot even when a sample is declared', async () => {
+    await expect(read({ discoveryIncomplete: true }, '12')).rejects.toThrow(/truncated/);
+  });
+});

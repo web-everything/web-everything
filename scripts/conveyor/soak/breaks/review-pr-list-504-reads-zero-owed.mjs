@@ -26,7 +26,7 @@ import { pathToFileURL } from 'node:url';
 
 const SPECIFIC = new Set([
   'transient-504-not-retried', 'persistent-504-read-as-list', 'persistent-504-no-event',
-  'persistent-504-not-bounded', 'heavy-list-issued',
+  'persistent-504-not-bounded', 'declared-sample-read-as-truncated',
 ]);
 
 const e504 = () => Object.assign(new Error('gh failed'), { stderr: 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)' });
@@ -57,7 +57,16 @@ export async function replayPrList504(root) {
       persistentReturned = true;
     } catch { /* surfaced, as required */ }
   }
-  return { transientOk, persistentReturned, persistentCalls, events };
+  // Follow-up regression (2026-11-03 16:23 ET): a DECLARED smoke sample (WE_PR_SNAPSHOT_SAMPLE) is not truncation.
+  let sampleAccepted = true;
+  const prev = process.env.WE_PR_SNAPSHOT_SAMPLE;
+  process.env.WE_PR_SNAPSHOT_SAMPLE = '12';
+  try {
+    const sampled = [row(1)];
+    Object.defineProperty(sampled, 'sampled', { value: true });
+    sampleAccepted = read.defaultReadPrs({ ...base, readShared: () => sampled, retryOpts: retryOpts({ streaks: new Map() }) }).length === 1;
+  } catch { sampleAccepted = false; } finally { if (prev === undefined) delete process.env.WE_PR_SNAPSHOT_SAMPLE; else process.env.WE_PR_SNAPSHOT_SAMPLE = prev; }
+  return { transientOk, persistentReturned, persistentCalls, events, sampleAccepted };
 }
 
 export default {
@@ -79,6 +88,7 @@ export default {
     if (r.persistentReturned) violations.push({ invariant: 'persistent-504-read-as-list', detail: 'a persistent 504 returned a list instead of failing' });
     if (r.persistentCalls !== 9) violations.push({ invariant: 'persistent-504-not-bounded', detail: `3 reads x 3 attempts expected 9 list calls, saw ${r.persistentCalls}` });
     if (!r.events.some((e) => e.kind === 'gh-list-failed')) violations.push({ invariant: 'persistent-504-no-event', detail: 'three failed reads in a row raised no gh-list-failed event' });
+    if (!r.sampleAccepted) violations.push({ invariant: 'declared-sample-read-as-truncated', detail: 'a declared WE_PR_SNAPSHOT_SAMPLE sample was refused as a partial inventory' });
     return { violations };
   },
   judge(report) {

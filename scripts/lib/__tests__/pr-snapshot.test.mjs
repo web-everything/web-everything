@@ -192,14 +192,26 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(readSharedOpenPrs(opts({ fields: 'reviewDecision', exec }))).toEqual(PRS.map(p => ({ reviewDecision: p.reviewDecision })));
   });
 
-  it('a WE_PR_SNAPSHOT_SAMPLE subset is flagged discoveryIncomplete so reconcile cannot plan it as complete', () => {
+  it('a DECLARED WE_PR_SNAPSHOT_SAMPLE subset is marked sampled (not truncated); real truncation still fails closed', () => {
     const { exec } = fakeExec();
     const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
     expect(rows.length).toBe(1);
     expect(PRS.length).toBeGreaterThan(1);
-    expect(rows.discoveryIncomplete).toBe(true);
+    expect(rows.sampled).toBe(true);
+    expect(rows.discoveryIncomplete).toBeUndefined();
     const whole = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    expect(whole.sampled).toBeUndefined();
     expect(whole.discoveryIncomplete).toBeUndefined();
+  });
+  it('a snapshot truncated at its cap is incomplete even when a sample is declared', () => {
+    const { exec } = fakeExec(Array.from({ length: 3 }, (_, i) => ({ ...PRS[0], number: i + 1 })));
+    const first = readSharedOpenPrs(opts({ fields: 'number', exec }));
+    void first;
+    const snapFile = snapshotPath(dir, REPO);
+    const snap = JSON.parse(readFileSync(snapFile, 'utf8'));
+    writeFileSync(snapFile, JSON.stringify({ ...snap, truncated: true }));
+    const rows = readSharedOpenPrs(opts({ fields: 'number', exec, env: { VITEST: '1', WE_PR_SNAPSHOT_SAMPLE: '1' } }));
+    expect(rows.discoveryIncomplete).toBe(true);
   });
 
   it('a short inventory (fewer rows than totalCount) is never published as a complete snapshot', () => {
