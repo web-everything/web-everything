@@ -233,7 +233,8 @@ async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
  */
 export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(), log = console.error, deadlineMs = 120000, concurrency = 4,
   fixClaimLive = (repo, pr) => { try { return readLiveFixClaim({ repo, pr }) !== null; } catch { return null; } } } = {}) {
-  const ready = new Set((report.ready ?? []).map((r) => `${r.repo}#${r.number ?? r.pr}`));
+  // "your review" and "needs your merge" rows both ask the operator to approve: both pass the same live red-team gate.
+  const ready = new Set([...(report.ready ?? []), ...(report.needsYourMerge ?? [])].map((r) => `${r.repo}#${r.number ?? r.pr}`));
   const deadline = Date.now() + deadlineMs;
   const undecided = item => ({ ...item, kind: 'red-team-undecided',
     reason: 'the red team has no result recorded on the live head' });

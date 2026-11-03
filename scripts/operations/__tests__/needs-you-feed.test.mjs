@@ -388,7 +388,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(held).toEqual([]);
     expect(kept).toHaveLength(2);
     expect(expectUndecided(kept)).toEqual({ ...items()[0], head, kind: 'red-team-undecided', reason: expect.any(String) });
-    expect(kept.find(i => i.pr === 9)).toEqual(items()[1]);
+    expect(kept.find(i => i.pr === 9)).toMatchObject({ kind: 'red-team-undecided' });
   });
 
   it.each(['broken', 'degraded'])('a confirmed %s break with no gate record yet still blocks all gates pass', async impact => {
@@ -486,17 +486,17 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
   it('drops a ready item whose live PR is red-team:blocked + review:changes, and says why', async () => {
     const gh = gate({ headRefOid: head, labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }, []);
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
-    expect(kept.map((i) => i.pr)).toEqual([9]);
+    expect([...kept]).toEqual([]); // the needs-your-merge row #9 is held back by the same live labels
     expect(held[0].reasons).toEqual(expect.arrayContaining(['the red team blocked the live head', 'it was sent back (review:changes)']));
   });
-  it('keeps needs-you all gates pass only with a result and no-send-back record on the live head, and never judges needs-your-merge rows', async () => {
+  it('keeps needs-you all gates pass only with a result and no-send-back record on the live head, and needs-your-merge rows pass the same live gate', async () => {
     const gh = gate({ headRefOid: head, labels: [{ name: 'red-team:clear' }] }, gateComments());
     const { kept, held } = await gateReadyItems(items(), report, { gh, log: () => {} });
     expect(kept.map((i) => i.pr).sort((a, b) => a - b)).toEqual([9, 5768]);
     expect(held).toEqual([]);
     expect(kept[0]).toEqual({ ...items()[0], head });
     expect(kept[0].reason).toContain('all gates pass');
-    expect(kept[1]).toEqual(items()[1]);
+    expect(kept[1]).toMatchObject({ pr: 9, kind: 'red-team-undecided' }); // no result for #9 in this thread
   });
   it('needs-your-merge rows pass the same live red-team gate: a confirmed break blocks the approval alert', async () => {
     const r = { needsYourMerge: [{ repo, number: 6239, title: 'm' }], ready: [] };
