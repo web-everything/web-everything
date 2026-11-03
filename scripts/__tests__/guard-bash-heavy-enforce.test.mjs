@@ -10,11 +10,29 @@ import { resolve } from 'node:path';
 import { decide } from '../guard-bash.mjs';
 
 const queue = 'node scripts/readiness/heavy-admission.mjs run -- ';
+const separateNodeOptions = [
+  '--test-reporter spec.mjs',
+  '--test-reporter-destination results.mjs',
+  '--test-name-pattern example.mjs',
+  '--test-skip-pattern skipped.mjs',
+  '--test-shard 1/2',
+  '--test-concurrency 2',
+  '--test-timeout 1000',
+  '--import ./setup.mjs',
+  '--require ./setup.cjs',
+  '--loader ./loader.mjs',
+];
 const bypassRuns = [
   'node --test scripts/__tests__/a.test.mjs',
   'node --test',
   ...['true', 'false', '', '1', 'anything'].map(value => `node --test=${value} scripts/x.test.mjs`),
   'node --test-reporter=spec --test a.mjs',
+  ...separateNodeOptions.flatMap((options) => [
+    `node ${options} --test`,
+    `node ${options} --test a.mjs`,
+    `node ${options} node_modules/vitest/vitest.mjs run a.test.mjs`,
+  ]),
+  'node --test-reporter spec.mjs --test-name-pattern example.mjs --test',
   'npm x vitest run a.test.mjs',
   'npm x -- vitest run a',
   'node --no-warnings node_modules/.bin/vitest run a.test.mjs',
@@ -44,6 +62,12 @@ describe('heavy-enforce — every direct test run requires admission', () => {
     'node --check scripts/__tests__/a.test.mjs', 'node --version',
     'node --check --test a.mjs', 'node --version --test',
     'node a.mjs --test', 'node --title --test a.mjs',
+    'node --test-reporter=spec x.mjs',
+    ...separateNodeOptions.flatMap((options) => [
+      `node ${options} x.mjs`,
+      `node ${options} --check --test a.mjs`,
+    ]),
+    'node --test-name-pattern --test x.mjs',
     'npm run x -- vitest run a.test.mjs',
   ])('allows non-run `%s`', (cmd) => expect(decide(cmd, {})).toBeNull());
 

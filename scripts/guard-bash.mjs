@@ -3263,7 +3263,9 @@ const VITEST_WATCH_FLAG = /^(?:--watch|-w)(?:=(?:true|1|yes|on))?$/i;
 const NPM_SCOPE_VALUE_FLAGS = new Set(['-w', '--workspace', '--prefix', '-C']);
 const NPM_SCOPE_BARE_FLAG = /^(?:-ws|--workspaces|--include-workspace-root|-iwr)$/;
 const NODE_SCRIPT_WORD = /\.(?:[cm]?js|ts)$/;
-const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader']);
+const NODE_SCRIPT_VALUE_FLAGS = new Set(['--require', '-r', '--import', '--loader', '--experimental-loader',
+  '--test-reporter', '--test-reporter-destination', '--test-name-pattern', '--test-skip-pattern',
+  '--test-shard', '--test-concurrency', '--test-timeout']);
 
 /** How many leading words of a canonical head are exec wrappers `canonicalCommand` does not peel
  *  (`timeout [opts] <duration>`, and the `-n <N>` it leaves behind after peeling `nice`)? `nohup` is left
@@ -3356,6 +3358,7 @@ function ungatedHeavyHead(head, depth = 0) {
       i += 1;
       // --test is a boolean runtime option, not a value-taking flag or a script argument.
       if (/^--test(?:=|$)/.test(flag)) { testRun = true; continue; }
+      // Known value options consume even script-like values (or a value spelled `--test`).
       if (NODE_SCRIPT_VALUE_FLAGS.has(flag) || flag === '--title') i += 1;
       // a separate option value (`--title standards`, `--env-file .env`, `--max-old-space-size 4096`) is not the script
       // Known extensionless executable paths are scripts too, not option values.
