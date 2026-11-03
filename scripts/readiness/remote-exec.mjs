@@ -127,7 +127,7 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, timeout }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
       cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
@@ -135,6 +135,9 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
     const stdout = [];
     let bytes = 0;
     let exceeded = false;
+    // R475: a bounded phase is killed here; the result says so, so the caller can name the phase.
+    let timedOut = false;
+    const bound = timeout === undefined ? undefined : setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeout);
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on('data', (chunk) => {
         if (onOutput) onOutput(chunk, stream === child.stdout ? 'stdout' : 'stderr');
@@ -148,9 +151,9 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
         if (stream === child.stdout) stdout.push(chunk);
       });
     }
-    child.on('error', reject);
-    child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
-      : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
+    child.on('error', (error) => { clearTimeout(bound); reject(error); });
+    child.on('close', (code) => { clearTimeout(bound); return exceeded ? reject(new Error('Captured output limit exceeded'))
+      : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout), ...(timedOut ? {timedOut: true} : {}) }); });
     if (input !== undefined) {
       child.stdin.on('error', () => {}); // A failed SSH may close stdin before reading.
       child.stdin.end(input);
@@ -1060,6 +1063,7 @@ export async function runRemote(options={}) {
   const begin=stage=>{
     const at=clock(),item={stage,startedAtET:easternTimestamp(at),ms:0};
     timings.push(item);pending.set(item,at);
+    try {options.onPhase?.({stage,startedAtMs:at,done:timings.filter(t=>!pending.has(t)).map(t=>({stage:t.stage,ms:t.ms}))});} catch { /* advisory only */ }
     return extra=>{pending.delete(item);Object.assign(item,{ms:Math.max(0,Math.round(clock()-at)),...extra});};
   };
   const result=await executeRemote({...options,clock,timings,begin});
@@ -1071,7 +1075,7 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, onRun, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, onRun, shipTimeoutMs, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
   argv = normalizeRemoteArgv(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
@@ -1098,9 +1102,9 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     if (/\bskipp(?:ing|ed)\b|\bno-scope\b|\bENOENT\b|no changed tier lines; nothing to attribute/i.test(text)) incompleteStandards = true;
     tails[stream] = text.slice(-128);
   };
-  const ssh = (command, request, inherit = false) => exec({file:'ssh',
+  const ssh = (command, request, inherit = false, timeout) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
-    input:JSON.stringify(request), cwd, inherit, sshOptions,
+    input:JSON.stringify(request), cwd, inherit, sshOptions, ...(timeout===undefined?{}:{timeout}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {})});
   let run;
   let staging;
@@ -1198,8 +1202,9 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const inputDigest = delta ? await digestDeltaInput(delta,workStage,cwd,exec) : await digestInput(workStage, selected);
       stageDone();
       const prepareDone=begin('forge-prepare');
-      const prepared = await ssh('prepare',{nonce,label:runId,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
+      const prepared = await ssh('prepare',{nonce,label:runId,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})},false,shipTimeoutMs);
       prepareDone();
+      if(prepared.timedOut)throw Object.assign(new Error('Ship timed out'),{code:'ship-timeout',detail:`forge-prepare exceeded ${shipTimeoutMs}ms`});
       if(prepared.code !== 0) {
         // Prepare precedes every byte transfer and cannot have started work.
         try {if(protocolText(prepared.stdout,4096).trim()===JSON.stringify({reason:'forge-busy'}))return {mode:'not-started',terminated:true,reason:'forge-busy'};}catch { /* malformed prepare stays a safe pre-transfer failure */ }
@@ -1236,23 +1241,33 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const copied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
         ...(presynced?.count?['--checksum',`--copy-dest=${PRESYNC_ROOT}/${presynced.key}/`]:[]),
         '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
-        './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
+        './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory,...(shipTimeoutMs===undefined?{}:{timeout:shipTimeoutMs})});
+      if(copied.timedOut)throw Object.assign(new Error('Ship timed out'),{code:'ship-timeout',detail:`rsync exceeded ${shipTimeoutMs}ms`});
       if(copied.code !== 0) throw new Error('Copy failed');
       if (manifest.siblings) {
         const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
         const siblingsCopied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
           '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
-          './',`${host}:${runRoot}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
+          './',`${host}:${runRoot}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory,...(shipTimeoutMs===undefined?{}:{timeout:shipTimeoutMs})});
+        if(siblingsCopied.timedOut)throw Object.assign(new Error('Ship timed out'),{code:'ship-timeout',detail:`sibling rsync exceeded ${shipTimeoutMs}ms`});
         if (siblingsCopied.code !== 0) throw new Error('Sibling copy failed');
       }
       rsyncDone({shipMode:delta?'delta':'full',fileCount:transferCount,bytesSent:transferBytes,deltaFileCount:delta?selected.length:0,deltaBytes:delta?delta.deltaBytes:0,...(delta?{presyncClaimed:{count:presynced?.count??0,bytes:presynced?.bytes??0}}:{})});
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:wireDigest,...(manifest.siblings ? {siblingShas:siblingShas(wire)} : {})};
       expectedManifest = wire;
     } catch (error) {
+      // A stalled ship (forge-prepare or rsync) never sent the Forge `run` request, but killing the local ssh/rsync
+      // does not prove Forge released its reserved worker. Report a confirmed non-start ONLY when the bounded
+      // `finish` cleanup of the prepared run is confirmed; otherwise stay unconfirmed (slot retained), fast and
+      // naming the phase instead of waiting out the whole run timeout.
+      if(error.code==='ship-timeout') {
+        const cleaned=run?await Promise.race([finish().catch(()=>null),new Promise(resolve=>setTimeout(resolve,15000).unref())]):null;
+        return cleaned?.code===0?{mode:'not-started',terminated:true,reason:'ship-timeout',detail:error.detail}:{mode:'unconfirmed',reason:`ship-timeout: ${error.detail}`};
+      }
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,log});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,shipTimeoutMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1285,7 +1300,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,log});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,onRun,shipTimeoutMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }

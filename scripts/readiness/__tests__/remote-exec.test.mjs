@@ -914,6 +914,36 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-busy'});
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c)||isCleanup(c))).toBe(false);
   });
+  it('R475: a stalled rsync fails fast with ship-timeout naming the phase, never starting the run',async()=>{
+    const f=fixture(),execute=f.exec;f.shipTimeoutMs=1234;
+    f.exec=vi.fn(async call=>call.file==='rsync'?{code:1,stdout:Buffer.alloc(0),timedOut:true}:execute(call));
+    const result=await runRemote(f);
+    expect(result).toMatchObject({mode:'not-started',terminated:true,reason:'ship-timeout',detail:'rsync exceeded 1234ms'});
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+    expect(callsOf(f.exec).find(c=>c.file==='rsync').timeout).toBe(1234);
+  });
+  it('R475: a stalled forge-prepare (run id unknown) stays unconfirmed, fast and naming the phase',async()=>{
+    const f=fixture(),execute=f.exec;f.shipTimeoutMs=777;
+    f.exec=vi.fn(async call=>isPrepare(call)?{code:1,stdout:Buffer.alloc(0),timedOut:true}:execute(call));
+    expect(await runRemote(f)).toMatchObject({mode:'unconfirmed',reason:'ship-timeout: forge-prepare exceeded 777ms'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+  });
+  it('R475: a stalled rsync whose cleanup is NOT confirmed stays unconfirmed (slot retained)',async()=>{
+    const f=fixture(),execute=f.exec;f.shipTimeoutMs=1234;
+    f.exec=vi.fn(async call=>call.file==='rsync'?{code:1,stdout:Buffer.alloc(0),timedOut:true}:isCleanup(call)?{code:1,stdout:Buffer.alloc(0)}:execute(call));
+    expect(await runRemote(f)).toMatchObject({mode:'unconfirmed',reason:'ship-timeout: rsync exceeded 1234ms'});
+  });
+  it('R475: reports each phase through onPhase with the finished phases',async()=>{
+    const f=fixture(),seen=[];f.onPhase=p=>seen.push(p);
+    await runRemote(f);
+    const stages=seen.map(p=>p.stage);
+    expect(stages).toEqual(expect.arrayContaining(['forge-prepare','rsync','forge-run']));
+    expect(seen.find(p=>p.stage==='rsync').done.map(t=>t.stage)).toContain('forge-prepare');
+  });
+  it('R475: without a ship bound no timeout is passed to rsync',async()=>{
+    const f=fixture();await runRemote(f);
+    expect('timeout' in callsOf(f.exec).find(c=>c.file==='rsync')).toBe(false);
+  });
   it.each(['forge-exec-2','root','forge-exec-3','forge-exec-01'])('rsync targets only a valid server-reserved pool member: %s',async slot=>{
     const f=fixture(),execute=f.exec;
     f.exec=vi.fn(async call=>{

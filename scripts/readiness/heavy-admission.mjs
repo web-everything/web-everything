@@ -241,7 +241,9 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null,
-    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15 }),
+    maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15,
+    // R475: ship (forge-prepare + rsync) is killed after this long and the run falls back locally, naming the phase.
+    shipTimeoutMs: 90000 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -275,6 +277,7 @@ const ADMISSION_VALID = {
   'remote.backoffFailures': (v) => Number.isSafeInteger(v) && v >= 1,
   'remote.maxLoadPerCore': (v) => Number.isFinite(v) && v > 0,
   'remote.minFreeRamPct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
+  'remote.shipTimeoutMs': (v) => Number.isSafeInteger(v) && v >= 5000 && v <= 600000,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -868,10 +871,11 @@ export async function runWithRemoteDecision({
   let terminated = false;
   remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   const refuseLocal = (reason) => {
-    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
+    log(`heavy-admission: remote failed (${oneLine(reason)}${describePhase()}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
   };
   let reason; let detail; let timer;
+  let describePhase = () => '';
   const controller = new AbortController();
   const timedOut = Symbol('remote-timeout');
   try {
@@ -896,7 +900,13 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, onRun: run => recordMarkerRun(executionMarker, {owner, run}) }));
+    // R475: remember the current phase; once the Forge run id is known keep it in the marker sidecar, so a
+    // run that later dies unconfirmed names where it stalled (ship, dispatch, run, fetch or confirm).
+    let phase = null; let knownRun = null;
+    const onPhase = (next) => { phase = next; if (knownRun) recordMarkerRun(executionMarker, {owner, run: knownRun, phase}); };
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, shipTimeoutMs: policy.settings.remote.shipTimeoutMs, onPhase,
+      onRun: run => { knownRun = run; recordMarkerRun(executionMarker, {owner, run, phase}); } }));
+    describePhase = () => phase ? ` [last phase ${phase.stage}, ${Math.round((clock() - phase.startedAtMs) / 1000)}s]` : '';
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {
       const termination = await Promise.race([

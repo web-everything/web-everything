@@ -282,6 +282,15 @@ describe('stale remote slot markers (perf10)', () => {
     expect(await reaper.step(tel(1, undefined, [done(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
     expect(existsSync(file + '.run')).toBe(false);
   });
+  it('R475: keeps the current phase beside the run id, bounded, without changing the run binding', async () => {
+    const root = setup({0: {pid: 111}});
+    const file = join(root, 'slot-0.unconfirmed');
+    expect(recordMarkerRun(file, {owner: 'o', run: RUN_A, phase: {stage: 'rsync\nx', startedAtMs: 5, done: [{stage: 'forge-prepare', ms: 120.4}]}})).toBe(true);
+    const saved = JSON.parse(readFileSync(file + '.run', 'utf8'));
+    expect(saved).toEqual({owner: 'o', run: RUN_A, phase: {stage: 'rsync?x', startedAtMs: 5, done: [{stage: 'forge-prepare', ms: 120}]}});
+    const reaper = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
+    expect(await reaper.step(tel(1, undefined, [done(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
+  });
   it('records the Forge run id into its own marker only', () => {
     const root = setup({0: {pid: 111}});
     const file = join(root, 'slot-0.unconfirmed');

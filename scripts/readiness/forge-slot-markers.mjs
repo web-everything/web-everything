@@ -29,12 +29,19 @@ const RUN = /^r-[a-f0-9]{32}(?![\s\S])/;
  * Record the Forge run id beside this client's marker, in a sidecar bound to the marker's owner. The marker file itself is
  * never rewritten (a reaper may be judging its inode), and a stale sidecar of another owner is ignored.
  */
-export function recordMarkerRun(file, {owner, run}) {
+/** R475: advisory per-phase evidence (ship/dispatch/run/fetch/confirm) kept beside the run id; bounded and plain. */
+function markerPhase(phase) {
+  const stage = String(phase.stage ?? '').replace(/[^a-z0-9._-]/gi, '?').slice(0, 40);
+  const ms = (list) => Array.isArray(list) ? list.slice(0, 16).map((t) => ({stage: String(t.stage).replace(/[^a-z0-9._-]/gi, '?').slice(0, 40), ms: Math.max(0, Math.round(Number(t.ms) || 0))})) : undefined;
+  return {stage, startedAtMs: Number(phase.startedAtMs) || 0, done: ms(phase.done)};
+}
+
+export function recordMarkerRun(file, {owner, run, phase}) {
   if (typeof run !== 'string' || !RUN.test(run)) return false;
   const tmp = `${file}.run-${randomBytes(6).toString('hex')}`;
   try {
     if (JSON.parse(readFileSync(file, 'utf8'))?.owner !== owner) return false;
-    writeFileSync(tmp, JSON.stringify({owner, run}) + '\n', {flag: 'wx', mode: 0o600});
+    writeFileSync(tmp, JSON.stringify({owner, run, ...(phase ? {phase: markerPhase(phase)} : {})}) + '\n', {flag: 'wx', mode: 0o600});
     renameSync(tmp, `${file}.run`);
     return true;
   } catch { try { unlinkSync(tmp); } catch { /* none */ } return false; }
