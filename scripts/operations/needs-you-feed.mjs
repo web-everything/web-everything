@@ -262,6 +262,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       // The shared disposition (red-team-gate) decides what still holds on the live head; no private marker parser.
       const disposition = state.result === null ? null
         : readRedTeamDisposition({ comments: view.comments, pr: item.pr, head: view.headRefOid, repo: item.repo, setting: ALERT_BREAK_POLICY });
+      if (disposition?.unparsed.length) { out[index] = undecided(checked); return; }
       // Only an operator's own card / not-real / clear ruling settles a confirmed break: the gate's automatic card record
       // is written before the card job succeeds, so it is no proof (nor is a policy that leaves degraded to a card).
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));

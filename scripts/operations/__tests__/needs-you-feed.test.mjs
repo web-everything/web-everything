@@ -452,6 +452,14 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
     expectUndecided(kept);
   });
+
+  it('an unparsed confirmed finding stays undecided without an approval action', async () => {
+    const comments = gateComments().slice(0, 1).map(c => ({ ...c,
+      body: `${c.body}\n  - [**confirmed**] (edge-case, broken) — unparsed finding` }));
+    const { kept } = await gateReadyItems(items(), report, { gh: gate({ headRefOid: head, labels: [] }, comments), log: () => {} });
+    const row = expectUndecided(kept);
+    expect(row.command).toBeUndefined();
+  });
   it.each([
     ['a marker-only comment', c => c.body.split('\n')[0]],
     ['a confirmed finding the parser cannot read', c => c.body.replace(/\n1\. .*/, '\n1. [**confirmed**] (edge-case, broken) `` — ')],

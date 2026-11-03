@@ -3903,3 +3903,13 @@ Child report identities re-emitted as FAIL lines must strip C0/C1 controls and U
 line separators; the hostile-input table checks the resulting failure collector entries.
 When changing an existing test's expected verdict, disclose the behavior change in
 the PR description so reviewers can distinguish a policy change from a regression fix.
+
+
+## Unparsed red-team finding holds
+
+`readRedTeamDisposition` exposes skipped finding-shaped lines as `unparsed` and retains a
+synthetic held entry (`index: -1`). It is not a parsed finding: exclude it from operator ruling
+and card selection, and keep readiness feeds undecided. Only reposting a fully parsed live
+result removes the hold; gate actions and human clearance cannot release it.
+`red-team-gate.test.mjs` covers the closed path, clear advisories, release attempts and repost
+recovery; `record-red-team-ruling.test.mjs` and `needs-you-feed.test.mjs` cover the consumers.

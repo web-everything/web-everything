@@ -49,10 +49,10 @@ export function redTeamMarker(pr, rev) {
 
 const MARKER_RE = /^<!-- we:red-team-advisory pr=(\d+) rev=([0-9a-f]{7,64}) -->/i;
 const FINDING_RE = /^(\d+)\. \[(\*\*confirmed\*\*|not confirmed|unverifiable)\] \(([^,()]+), ([^()]+?)\)(?: `([^`]+)`)? — (.*)$/;
-// Any line that LOOKS like a finding (leading whitespace, any case, loose punctuation). Used only to key the result
-// digest, never to decide what blocks: a line the strict FINDING_RE skips still changes the digest.
+// Any line that LOOKS like a finding (leading whitespace, any case, loose punctuation).
+// Skipped lines key the result digest and hold disposition until the comment is reposted parsed.
 // Include repeated/mixed Markdown emphasis; a closing underscore is a word character, so also allow it at the boundary.
-const FINDING_SHAPED_RE = /^\s*\d+\s*[.)]\s*\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
+const FINDING_SHAPED_RE = /^\s*(?:\d+\s*[.)]|[-*+])\s*\[\s*[*_]*\s*(?:confirmed|not confirmed|unverifiable)(?:\b|_)/i;
 const SUB_RE = /^ {3}- (Scenario|Re-check): (.*)$/;
 // Any reviewed-sha marker the shared parser reads (full or abbreviated, any case), and a case variant of the marker
 // name too: only used to SUPERSEDE a ruling, where reading more holds more.
@@ -89,7 +89,7 @@ export function parseRedTeamComment(body) {
     if (s && findings.length) findings.at(-1)[s[1] === 'Scenario' ? 'scenario' : 'recheck'] = s[2].trim();
   }
   const parsed = { pr: Number(m[1]), rev: m[2].toLowerCase(), findings };
-  // Non-enumerable: it only keys the digest and must not change the parsed shape callers compare or serialise.
+  // Non-enumerable: digest/disposition evidence without changing the parsed shape callers compare or serialise.
   Object.defineProperty(parsed, 'shapedLines', { value: shapedLines, enumerable: false });
   return parsed;
 }
@@ -723,7 +723,16 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     if (effectiveAction === 'held') held.push(f);
     if (effectiveAction === 'send-back') sendBack.push(f);
   }
-  return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
+  const unparsed = [...(result?.shapedLines ?? [])];
+  if (unparsed.length) {
+    // Not a parsed finding: no gate action, card or operator ceremony can release it.
+    // Only a new, fully parsed result removes this hold. Never offer it for ruling/card filing.
+    held.push({ index: -1, confirmed: true, synthetic: true,
+      summary: `unparsed finding-shaped line: ${unparsed[0]} — repost the red-team comment with parsed findings` });
+    dispositions.set(-1, { state: 'held', by: null });
+    findingRulings.set(-1, []);
+  }
+  return { result, sendBack, held, unparsed, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
 }
 
 /**

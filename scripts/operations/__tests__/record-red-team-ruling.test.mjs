@@ -80,6 +80,11 @@ describe('any-state rulings after clear-human', () => {
 });
 
 describe('cap-only existing-card declaration', () => {
+  it.each([false, true])('never offers an unparsed synthetic hold for ruling (anyState=%s)', anyState => {
+    const comments = [bot(`<!-- we:red-team-advisory pr=${PR} rev=${HEAD} -->\n  - [**confirmed**] (edge-case, broken) — unparsed`), capped()];
+    expect(() => rulableBreaks({ comments, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS,
+      scope: { anyState }, ruling: 'card', repo })).toThrow(/no .*break/);
+  });
   it.each([
     ['a non-operator actor', { actor: 'mallory' }, /registered operator login/],
     ['a blank reason', { reason: '  ' }, /--reason is required/],

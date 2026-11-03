@@ -17,6 +17,58 @@ const OTHER = '1111111111111111111111111111111111111111';
 export const BODY_4722 = "<!-- we:red-team-advisory pr=4722 rev=ea117e881164c3b6366b0bb78a3660c9a00503b1 -->\n### Post-accept red team — 2 possible break(s), 2 confirmed by Claude's re-check\n\nAdvisory only: this pass never blocks or unblocks the merge. Head `ea117e881164` · red team codex/gpt-6-astra · re-check ok · recorded verdict `changes`.\n\n1. [**confirmed**] (edge-case, broken) `scripts/conveyor/resource-sampler-daemon.mjs:31` — A child claiming its job during replacement escapes retirement and remains a second snapshot writer.\n   - Scenario: During an upgrade, store.list() reads the old job as launching with handle=null. Before retire(live), that child claims the record and starts sampling. retire receives the stale null handle, so sends no signal; the subsequent unconditional update marks the now-running job failed and clears its handle, then queues its replacement. An in-memory probe reproduced observedHandle=null alongside an actual claimed handle, followed by old=failed and new=queued. The orphan continues sampling: runJob checks supersession between steps, but this job's single runSamplerLoop step never returns. Both processe\n   - Re-check: retire(live) uses the stale list-time record (null handle → no signal), then store.update marks it failed unconditionally without rechecking the current record. A child that claims in that window is never signalled. The window is narrow, and the runtime's reaction to a failed record isn't visible, but the non-atomic sequence is in the diff.\n2. [**confirmed**] (failing-input, degraded) `scripts/conveyor/resource-sampler-daemon.mjs:29` — Restarting with changed sampler configuration silently preserves the old configuration forever.\n   - Scenario: Start normally with WE_COORDINATION_ROOT=/coord-old, then restart the supervisor at the same commit with WE_COORDINATION_ROOT=/coord-new, keeping the same daemon-jobs directory. ensureSamplerJob compares only codeSha and retains the infinite job with root=/coord-old. Readers using /coord-new never receive snapshots. Changing --interval-ms is likewise ignored. An in-memory probe requesting root=/coord-new and intervalMs=1000 returned enqueued=false with root=/coord-old and intervalMs=10000. Reattachment should compare effective job inputs and safely replace or reconfigure the job when they chan\n   - Re-check: ensureSamplerJob returns the live job whenever live.job.codeSha === codeSha, and never compares input (root, intervalMs, checkoutRoot). A restart at the same commit with a new --root or --interval-ms keeps the old job's input.\n\nA confirmed break is recorded as a miss for the accepting review and for the builder's model.";
 const bot = (body, createdAt = '2026-10-10T02:04:41Z') => ({ author: { login: 'web-everything' }, body, createdAt });
 
+describe('readRedTeamDisposition: unparsed findings fail closed', () => {
+  const marker = `<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->`;
+  const line = '  - [**confirmed**] (edge-case, broken) `a.mjs:1` — skipped finding';
+  const read = (body, extra = []) => readRedTeamDisposition({
+    comments: [bot(body), ...extra], pr: 4722, head: HEAD, env: {},
+    operatorRulings: { anyState: true },
+  });
+
+  it('holds an indented confirmed advisory finding and exposes the unparsed line', () => {
+    const d = read(`${marker}\n${line}`);
+    expect(d.result.findings).toEqual([]);
+    expect(d.unparsed).toEqual([line.trim()]);
+    expect(d.held).toEqual([expect.objectContaining({ index: -1, confirmed: true, synthetic: true })]);
+    expect(d.dispositions.get(-1).state).toBe('held');
+  });
+
+  it('keeps a well-formed clear advisory clear', () => {
+    expect(read(`${marker}\nNo findings.`)).toMatchObject({ unparsed: [], held: [], sendBack: [] });
+  });
+
+  it.each([
+    '1. [**CONFIRMED**] (edge-case, broken) `a.mjs:1` — wrong case',
+    '1. [**confirmed**] edge-case broken — malformed',
+  ])('holds other skipped finding shapes: %s', skipped => {
+    expect(read(`${marker}\n${skipped}`)).toMatchObject({ unparsed: [skipped], held: [expect.objectContaining({ synthetic: true })] });
+  });
+
+  it.each(['operator-card', 'operator-not-real', 'card-queued'])('cannot release unparsed evidence with %s', outcome => {
+    const body = `${marker}\n${line}`;
+    const record = { author: { login: outcome.startsWith('operator-') ? 'chalbert' : 'web-everything' },
+      body: `${redTeamGateMarker(4722, HEAD, outcome, redTeamResultId(parseRedTeamComment(body)))}\n- 1 finding(s) filed as a follow-up card (#1).` };
+    const d = read(body, [record]);
+    expect(d.held).toHaveLength(1);
+    expect(d.dispositions.get(-1)).toEqual({ state: 'held', by: null });
+    expect(d.rulings.get(-1)).toEqual([]);
+  });
+
+  it('a newer fully parsed result removes the unparsed hold', () => {
+    expect(read(`${marker}\n${line}`, [bot(`${marker}\nNo findings.`, '2026-10-10T02:05:00Z')]))
+      .toMatchObject({ unparsed: [], held: [], sendBack: [] });
+  });
+
+  it('a human clearance ceremony cannot release the synthetic hold', () => {
+    const clear = { author: { login: 'chalbert' }, body: [
+      '✅ review — `review:human` cleared via the sanctioned path', '',
+      'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+      buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator'),
+    ].join('\n') };
+    expect(read(`${marker}\n${line}`, [clear]).held).toHaveLength(1);
+  });
+});
+
 describe('parseRedTeamComment', () => {
   it('reads the live #4722 comment: finding 1 confirmed broken, finding 2 confirmed degraded', () => {
     const p = parseRedTeamComment(BODY_4722);
