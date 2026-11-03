@@ -63,7 +63,7 @@ describe('salvage push contract', () => {
 
   it('pushes HEAD rather than only the unmatched ancestor, with exactly three arguments and no force option', async () => {
     const h = harness();
-    expect(await h.run()).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(await h.run()).toMatchObject({ status: 'pushed', ref, sha: head, unmatched: [older] });
     expect(h.io.push.mock.calls).toEqual([[laneDir, ref, head]]);
     expect(h.io.push.mock.calls.flat().some(arg => /force|^\+|^-f$/.test(String(arg)))).toBe(false);
   });
@@ -131,7 +131,7 @@ describe('salvage push contract', () => {
     expect(h.io.record).toHaveBeenCalledTimes(1); expect(h.io.record).toHaveBeenCalledWith(7, `${ref} ${head}\n`);
     expect(settled).toBe(false);
     finishRecord();
-    expect(await pending).toMatchObject({ status: 'pushed', ref, unmatched: [older] });
+    expect(await pending).toMatchObject({ status: 'pushed', ref, sha: head, unmatched: [older] });
     expect(settled).toBe(true);
   });
 
