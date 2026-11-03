@@ -126,6 +126,13 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
       expect(row.detail).toMatch(/every free-lane hint failed.*timed out after/);
       expect(runChild.mock.calls.some(([, args]) => args.includes('release') && args.includes('--all-pools'))).toBe(true);
     });
+    it('a hinted acquire with malformed output is released and never passes the gate', async () => {
+      const runChild = vi.fn((_c, args) => (args.includes('release') ? Promise.resolve('')
+        : args.includes('--lane=7') ? Promise.resolve('{}') : Promise.reject(timedOut())));
+      const row = await check.run(hinted([7], runChild));
+      expect(row.ok).toBe(false);
+      expect(runChild.mock.calls.filter(([, args]) => args.includes('release')).length).toBeGreaterThanOrEqual(2);
+    });
     it('a FAST failure worded like a timeout is not rescued', async () => {
       const runChild = vi.fn().mockRejectedValue(exit(1, { message: 'exited 1: x timed out after 120000ms (process group killed)' }));
       expect((await check.run({ ...hinted([7], runChild), clock: () => 1000 })).ok).toBe(false);

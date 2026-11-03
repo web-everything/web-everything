@@ -465,7 +465,9 @@ async function checkLaneAcquireRelease(ctx) {
             'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`, `--lane=${hint}`,
             '--ttl-minutes=10', '--json',
           ], { cwd: root, timeoutMs: Math.min(SMOKE_LANE_HINT_TIMEOUT_MS, acquireCapMs), env });
-          if (Number.isInteger(JSON.parse(hinted)?.lane)) return hinted;
+          // Malformed output or a lane other than the one asked for is a failed hint: it takes the cleanup path below.
+          if (JSON.parse(hinted)?.lane === hint) return hinted;
+          throw new Error('hinted acquire returned an unexpected lane');
         } catch {
           // A failed explicit acquire may still have written a lease: drop this session's leases; if even that
           // fails, stop trying hints (the caller re-throws the original failure).
