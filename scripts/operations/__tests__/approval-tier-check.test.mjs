@@ -18,6 +18,7 @@ function deps({ paths = ['docs/examples/example.md'], humanRequired = false, set
     readReviewLedger: async pr => [buildVerdictRecord({ repo, pr, headSha: head, verdict: 'accepted',
       at: clear.at, source: 'synthetic-fixture', writer: 'fixture' })],
     readAudits: async () => audit ? [audit] : [], readApprovalSettings: async () => structuredClone(settings),
+    readRedTeam: async () => ({ head, result: 'clear' }), cardExists: async () => true,
     readShape: async () => ({ humanRequired }), readExplicitAsk: async () => null,
     readEmergency: async () => null, readAuthorModelFamily: async () => 'author',
     readJudgeModelFamily: async () => 'judge', stdout: vi.fn(), stderr: vi.fn(), ...extra,
@@ -28,6 +29,54 @@ const weakened = findings => ({ ...clear, verdict: 'WEAKENED', findings });
 const ask = { quote: 'Please implement this direction.', timestamp: clear.at, rulingId: 'R456' };
 
 describe('approval tiers (synthetic, in-memory evidence)', () => {
+  it('R455 never passes punctuation-containing net paths mentioned beside an outside path', async () => {
+    const path = 'docs/examples/my(file).md';
+    const findings = [`${path}:3 and blocks/old.ts pre-existing; backlog #123`];
+    expect(classifyFindings(findings, [path]).status).not.toBe('PASS');
+    expect((await check(deps({ paths: [path], audit: weakened(findings) }))).approvableBy).toBe('operator');
+  });
+  it.each([false, true])('red-team evidence is required on the current head (elevated=%s)', async humanRequired => {
+    for (const [evidence, tier] of [[null, 'unknown'], [{ head: base, result: 'clear' }, 'human'],
+      [{ head, result: 'held' }, 'human'], [{ head }, 'human']]) {
+      const readRedTeam = vi.fn(async () => evidence);
+      expect(await check(deps({ humanRequired, readRedTeam }))).toMatchObject({ tier, approvableBy: 'operator' });
+      expect(readRedTeam).toHaveBeenCalledWith(6244, head);
+    }
+    for (const readRedTeam of [undefined, async () => { throw Error('unreadable red team'); }]) {
+      expect(await main(['--pr=6244', `--repo=${repo}`], deps({ humanRequired, readRedTeam }))).toBe(2);
+    }
+  });
+  it('R455 requires an existing card and rejects reliance on a pre-existing weakness', async () => {
+    const cardExists = vi.fn(async () => false);
+    expect((await check(deps({ audit: weakened([oldFinding]), cardExists }))).tier).toBe('human');
+    expect(cardExists).toHaveBeenCalledWith('123');
+    for (const phrase of ['relies on', 'depends on', 'now exposes', 'newly exposes']) {
+      expect(classifyFindings([`${oldFinding}; change ${phrase} weakness`], ['docs/examples/example.md']).status).not.toBe('PASS');
+    }
+    expect((await check(deps({ audit: weakened([oldFinding]), cardExists: async () => { throw Error('unreadable cards'); } }))).tier).toBe('unknown');
+  });
+  it.each([
+    ['secrets-access', 'SECRET access', 'title'],
+    ['forge-root-deploy', 'ROOT deployment', 'body'],
+    ['irreversible-deletion', 'IRREVERSIBLE removal', 'body'],
+    ['pricing-licensing', 'PRICING update', 'title'],
+    ['forge-root-deploy', 'docs/examples/DEPLOY.md', 'path'],
+  ])('always-human category %s matches %s in %s', async (category, value, field) => {
+    const d = deps({ ...(field === 'path' ? { paths: [value] } : {}),
+      readPr: async () => ({ headRefOid: head, baseRefName: 'main', title: field === 'title' ? `Fix #6244 ${value}` : 'Fix #6244', body: field === 'body' ? value : '' }) });
+    const r = await check(d);
+    expect(r).toMatchObject({ tier: 'human', emergencyEligible: false });
+    expect(r.reasons.join(' ')).toContain(category);
+  });
+  it('rejects missing, empty, oversized and unconfigured category keyword lists', async () => {
+    for (const categoryKeywords of [undefined, {}, { ...policy.alwaysHuman.categoryKeywords, 'secrets-access': [] },
+      { ...policy.alwaysHuman.categoryKeywords, 'secrets-access': Array(1001).fill('secret') },
+      { ...policy.alwaysHuman.categoryKeywords, extra: ['extra'] }]) {
+      const settings = structuredClone(policy);
+      settings.alwaysHuman.categoryKeywords = categoryKeywords;
+      expect((await check(deps({ settings }))).tier).toBe('unknown');
+    }
+  });
   it('R455 rejects whitespace-containing in-diff paths', async () => {
     for (const [path, citedPath] of [
       ['docs/my file.md', 'docs/my file.md'],
@@ -204,6 +253,45 @@ describe('finding classification and default shape IO', () => {
     [['docs/examples/example.md:1 pre-existing #123'], 'FAIL'], [[], 'UNKNOWN'],
   ])('classifies every finding: %j', (findings, status) => {
     expect(classifyFindings(findings, ['docs/examples/example.md']).status).toBe(status);
+  });
+  it('reads the newest trusted current-head red-team verdict through bounded gh api argv', async () => {
+    const record = (rev, verdict, created_at, login = 'chalbert') => ({ user: { login }, created_at,
+      body: `<!-- we:red-team-advisory pr=6244 rev=${rev} -->\n### Post-accept red team\nAdvisory only: this comment changes no label itself; Head \`${rev.slice(0, 12)}\` · recorded verdict \`${verdict}\`.` });
+    const rows = [record(head, 'accept', '2026-11-01T00:00:00Z'),
+      record(head, 'changes', '2026-11-02T00:00:00Z'),
+      record(base, 'accept', '2026-11-03T00:00:00Z'),
+      record(head, 'accept', '2026-11-04T00:00:00Z', 'untrusted')];
+    const exec = vi.fn(() => JSON.stringify(rows));
+    const d = createApprovalDeps({ exec });
+    expect(await d.readRedTeam(6244, head)).toEqual({ head, result: 'changes' });
+    rows.push(record(head, 'accept', '2026-11-05T00:00:00Z'));
+    expect(await d.readRedTeam(6244, head)).toEqual({ head, result: 'clear' });
+    expect(exec).toHaveBeenCalledWith('gh', ['api', `repos/${repo}/issues/6244/comments?per_page=100&page=1`],
+      expect.objectContaining({ timeout: 60_000, maxBuffer: 1024 * 1024 }));
+    expect(await createApprovalDeps({ exec: () => JSON.stringify([record(base, 'accept', clear.at)]) }).readRedTeam(6244, head)).toBeNull();
+    expect(await createApprovalDeps({ exec: () => JSON.stringify([{ ...rows[0], body: `quoted marker: ${rows[0].body}` }]) }).readRedTeam(6244, head)).toBeNull();
+  });
+  it('red-team incomplete, unreadable, oversized and page-capped comments require operator repair', async () => {
+    for (const exec of [() => { throw Error('offline'); }, () => '{}',
+      () => JSON.stringify([{ body: null }]), () => 'x'.repeat(1024 * 1024 + 1),
+      () => JSON.stringify(Array.from({ length: 100 }, () => ({ body: '' })))]) {
+      const d = deps({ readRedTeam: createApprovalDeps({ exec }).readRedTeam });
+      expect(await main(['--pr=6244', `--repo=${repo}`], d)).toBe(2);
+      expect((await check(d)).reasons.join(' ')).toContain('operator');
+    }
+    const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, () => ({ body: '' }))));
+    expect(() => createApprovalDeps({ exec }).readRedTeam(6244, head)).toThrow(/page cap/);
+    expect(exec).toHaveBeenCalledTimes(10);
+  });
+  it('default cardExists checks a real matching backlog file in the selected checkout', () => {
+    const entry = (name, file = true) => ({ name, isFile: () => file });
+    const readdirSync = vi.fn(() => [entry('123-old.md'), entry('456-directory.md', false), entry('789-other.txt')]);
+    const d = createApprovalDeps({ cwd: 'fixture-checkout', fs: { readdirSync } });
+    expect(d.cardExists('123')).toBe(true);
+    for (const id of ['12', '456', '789', '999']) expect(d.cardExists(id)).toBe(false);
+    expect(readdirSync).toHaveBeenCalledWith('fixture-checkout/backlog', { withFileTypes: true });
+    expect(() => d.cardExists('../123')).toThrow();
+    expect(() => createApprovalDeps({ fs: { readdirSync: () => { throw Error('unreadable'); } } }).cardExists('123')).toThrow('unreadable');
   });
   it('uses bounded argv-only shape invocation through injectable IO', async () => {
     const exec = vi.fn(async () => JSON.stringify({ humanRequired: true }));

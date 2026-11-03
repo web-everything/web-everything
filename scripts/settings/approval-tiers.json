@@ -13,8 +13,14 @@
     "human": { "approvableBy": "operator" }
   },
   "alwaysHuman": {
-    "_doc": "Never orchestrator- or elevated-approvable. Globs match net-diff paths.",
+    "_doc": "Never orchestrator- or elevated-approvable. Globs match net-diff paths; category keywords match PR title, body and net-diff paths case-insensitively.",
     "categories": ["secrets-access", "forge-root-deploy", "irreversible-deletion", "pricing-licensing"],
+    "categoryKeywords": {
+      "secrets-access": ["secret", "credential", "token", "permission", "access control", "access-control"],
+      "forge-root-deploy": ["forge", "root", "deploy"],
+      "irreversible-deletion": ["irreversible", "delet", "purge", "migration"],
+      "pricing-licensing": ["pricing", "licens", "monetization"]
+    },
     "pathGlobs": [
       "**/*secret*", "**/*credential*", "**/*token*", "**/*permission*", "**/*access-control*",
       "scripts/forge-exec-run*", "scripts/forge-setup*", "**/forge-exec-run*", "**/forge-setup*",
