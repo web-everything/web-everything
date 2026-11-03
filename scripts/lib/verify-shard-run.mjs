@@ -187,7 +187,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
-        let lastResult = null;
+        let lastResult = null, observedFailure = false;
         async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
           const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
@@ -207,13 +207,24 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             infraExit ||= result.signal ? 137 : result.exitCode;
             return 'FAIL';
           }
-          let inventory;
+          let inventory, reportText;
           try {
+            reportText = Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8');
             const location = local ? {} : phaseRunLocation(readRemoteReport(attemptRemoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
-            inventory = inventoryVerdict(Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8'), attemptFiles, cwd, location);
+            inventory = inventoryVerdict(reportText, attemptFiles, cwd, location);
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
-          if (inventory === 'INVENTORY-INCOMPLETE') return inventory;
+          if (inventory === 'INVENTORY-INCOMPLETE') {
+            // Missing inventory may coexist with a real failure. Keep that
+            // evidence across attempts so splitting cannot retry it away.
+            try {
+              const report = JSON.parse(reportText);
+              observedFailure ||= (report?.success === false && report.numFailedTests > 0)
+                || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
+                  || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
+            } catch { /* Unparseable reports contain no observed test failure. */ }
+            return inventory;
+          }
           return result.exitCode === 0 && !result.signal && inventory === 'PASS' ? 'PASS' : 'FAIL';
         }
         let status;
@@ -254,6 +265,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
             for (const [half, selected] of halves.entries()) retried.push(await attempt(false, selected, `retry-${half + 1}.`));
             status = ['TIMEOUT', 'NOT-RUN', 'FAIL'].find(failure => retried.includes(failure))
               ?? (retried.every(r => r === 'PASS') ? 'PASS' : 'UNSETTLED');
+            if (observedFailure && ['PASS', 'UNSETTLED'].includes(status)) status = 'FAIL';
           }
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).

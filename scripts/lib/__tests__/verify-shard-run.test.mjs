@@ -147,6 +147,8 @@ describe('one split retry for incomplete inventory', () => {
         const mode = modes[calls.length - 1];
         if (mode === 'remote-incomplete') reports.set(options.remoteReport, JSON.stringify({ location: 'remote', exitCode: 1 }) + '\n');
         if (mode === 'timeout') return { exitCode: 124, timedOut: true };
+        if (typeof mode === 'object') return { exitCode: 1, reportText: JSON.stringify(mode) };
+        if (mode === 'malformed') return { exitCode: 1, reportText: '{invalid JSON' };
         const reportText = mode === 'oversized' ? streamedInventory('x'.repeat(SHARD_REPORT_MAX_BYTES + 1))
           : JSON.stringify({ testResults: (['missing', 'remote-incomplete'].includes(mode) ? [] : options.files).map(name => ({ name,
             status: mode === 'fail' ? 'failed' : 'passed', assertionResults: [{ status: mode === 'fail' ? 'failed' : 'passed' }] })) });
@@ -162,6 +164,36 @@ describe('one split retry for incomplete inventory', () => {
     expect(new Set(f.calls.map(c => c.report)).size).toBe(3);
     expect(new Set(f.calls.map(c => c.remoteReport)).size).toBe(3);
     for (const c of f.calls) expect(c.args.slice(3)).toEqual(['npx', 'vitest', 'run', ...c.files, '--pool', 'forks', '--reporter=json']);
+  });
+  const observedFailures = [
+    ['failed suite', { testResults: [{ name: 'a', status: 'failed', assertionResults: [{ status: 'passed' }] }] }],
+    ['failed assertion', { testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'failed' }] }] }],
+    ['failed summary', { success: false, numFailedTests: 1, testResults: [] }],
+  ];
+  it.each(observedFailures)('%s with missing files stays RED after passing retries', async (_label, report) => {
+    const f = await run([report, 'pass', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
+    expect(f.output).toContain('verify-shard 1/1: FAIL');
+    expect(f.output).not.toContain('GREEN'); expect(f.calls).toHaveLength(3);
+  });
+  it.each(observedFailures)('%s with missing files stays RED after incomplete retries', async (_label, report) => {
+    const f = await run([report, 'missing', 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
+    expect(f.output).not.toContain('verify-shards: UNSETTLED'); expect(f.calls).toHaveLength(3);
+  });
+  it.each([
+    ['passing partial report', { success: true, testResults: [{ name: 'a', status: 'passed', assertionResults: [{ status: 'passed' }] }] }],
+    ['capacity failure without failed tests', { success: false, numFailedTests: 0, testResults: [] }],
+    ['unparseable report', 'malformed'],
+  ])('%s without observed failure may become GREEN after passing retries', async (_label, report) => {
+    const f = await run([report, 'pass', 'pass']);
+    expect(f.code).toBe(0); expect(f.output).toContain('verify-shards: GREEN');
+    expect(f.calls).toHaveLength(3);
+  });
+  it('a failed assertion in an incomplete retry makes the shard RED', async () => {
+    const f = await run(['missing', observedFailures[1][1], 'pass']);
+    expect(f.code).toBe(1); expect(f.output).toContain('verify-shards: RED');
+    expect(f.calls).toHaveLength(3);
   });
   it.each(['missing', 'oversized'])('%s half stays UNSETTLED, never PASS; split depth and execute count are bounded', async mode => {
     const f = await run(['missing', mode, 'pass']);
