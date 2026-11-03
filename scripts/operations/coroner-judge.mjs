@@ -43,6 +43,7 @@ export async function judgeFrictions({ ranked, held = [], openPrs = [], recentCa
     const keys = new Set(ranked.map((r) => r.key)), seen = new Set();
     for (const row of verdicts) {
       if (!row || !keys.has(row.key) || seen.has(row.key) || !['NEW', 'COVERED-BY'].includes(row.verdict) ||
+        (row.verdict === 'NEW' && row.coveredBy != null && row.coveredBy !== '') ||
         (row.verdict === 'COVERED-BY' && (typeof row.coveredBy !== 'string' || !row.coveredBy.trim()))) {
         throw new Error('invalid judge verdict entry');
       }
@@ -59,12 +60,14 @@ export async function fileNewCards({ ranked, verdicts, state, fileItem, maxCards
   for (const row of ranked) {
     if (filed.length >= maxCards) break;
     const matches = verdicts.filter((v) => v.key === row.key);
-    if (!matches.length || matches.some((v) => v.verdict !== 'NEW') || seen.has(row.key) ||
+    if (!Array.isArray(row.examples) || !row.examples.length || !matches.length || matches.some((v) => v.verdict !== 'NEW') || seen.has(row.key) ||
       Object.hasOwn(state.filed, row.key)) continue;
     seen.add(row.key);
     signal?.throwIfAborted();
-    const item = await fileItem({ title: `Coroner: ${row.metric} / ${row.cause}`, kind: 'story', size: '3',
-      queue: 'false', digest: `Recurring delivery friction: ${row.cause}. Count: ${row.count}; minutes: ${row.minutes ?? 'unknown'}. Evidence: ${JSON.stringify(row.examples)}. Investigate the cause and implement an automatic prevention in the responsible tooling. Coroner key: ${row.key}` });
+    // The sink must deduplicate by key: recovery after a failed save returns the same receipt.
+    // Recovered receipts count toward this run's cap exactly like newly appended cards.
+    const item = await fileItem({ key: row.key, examples: row.examples, title: `Coroner: ${row.metric} / ${row.cause}`, kind: 'story', size: '3',
+      queue: 'false', digest: `Recurring delivery friction: ${row.cause}. Count: ${row.count}; minutes: ${row.minutes ?? 'unknown'}. Evidence: ${JSON.stringify(row.examples)}. Investigate the cause and implement an automatic prevention in the responsible tooling.` });
     if (!item || !(item.id || item.rel)) throw new Error('file-item returned no card receipt');
     state.filed[row.key] = item.id ?? item.rel;
     await save(state);

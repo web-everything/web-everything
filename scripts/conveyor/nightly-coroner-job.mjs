@@ -248,6 +248,30 @@ function readJudgeCoverage(sourceRoot, home) {
     .map(({ name }) => ({ id: name, content: boundedRead(join(backlog, name), 32 * 1024) }));
   return { held, openPrs, recentCards };
 }
+/** Held-list sink shared by fresh filings and crash recovery. The key line is the durable receipt. */
+export function appendHeldCoronerCard(input, { home = handoffHome(), night } = {}) {
+  if (typeof input.key !== 'string' || !input.key || /[\r\n]/.test(input.key)) throw new Error('invalid coroner filing key');
+  const path = join(home, 'cards-to-file.md');
+  let held = '';
+  try { held = readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  let number = 0, lastNumber = 0;
+  for (const line of held.split('\n')) {
+    const heading = line.match(/^(\d+)\.\s/);
+    if (heading) { number = Number(heading[1]); lastNumber = Math.max(lastNumber, number); }
+    if (line.trim() === `Coroner key: ${input.key}`) {
+      if (!number) throw new Error('coroner held receipt lacks item number; run manual /coroner');
+      return { id: `cards-to-file.md#${number}` };
+    }
+  }
+  number = lastNumber + 1;
+  // Atomic publication keeps the final key line and its entire numbered item together on a crash.
+  atomicWrite(path, `${held}${held.endsWith('\n') || !held ? '' : '\n'}\n${number}. (coroner-${night}, held) **${input.title}.** ${input.digest}
+    Fix idea: Investigate the cause and implement automatic prevention in the responsible tooling.
+    Evidence: ${JSON.stringify(input.examples ?? [])}. Scope: we:scripts/. Size ${input.size}.
+    Coroner key: ${input.key}
+`);
+  return { id: `cards-to-file.md#${number}` };
+}
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT, laneSession = CORONER_LANE_SESSION }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
@@ -263,12 +287,7 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
     return codexJudgeSpawn({ ...request, input: `${request.input}\n${fenceUntrusted('material', JSON.stringify(coverage))}`,
       timeoutMs: 5 * 60000 });
   },
-  fileItem = async (input) => {
-    const output = JSON.parse(await run([join(root, 'scripts/operations/run.mjs'), 'file-item',
-      ...Object.entries(input).map(([key, value]) => `--${key}=${value}`), '--json'], sourceRoot, { signal, timeout: 60000 }));
-    if (output.stopped !== 'complete' || output.error) throw new Error('file-item did not complete');
-    return output.verdict;
-  },
+  fileItem = async (input) => appendHeldCoronerCard(input, { home, night }),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
   const cursorPath = join(dir, 'nightly-coroner-cursor.json');
@@ -378,6 +397,7 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
         appendLines(statusFeed, [`${failureMarker} — ${JSON.stringify({ at: window.until, kind: 'coroner-judge-failed', report: reportName,
           error: sanitizeForFeed(scrubText(String(e.message ?? e)), 1000), reason: 'Judgment or filing incomplete; retry or run manual /coroner' })}`]);
       }
+      throw e;
     }
   }
   return { night, window, report: reportName };

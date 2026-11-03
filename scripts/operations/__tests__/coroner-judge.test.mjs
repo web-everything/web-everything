@@ -95,6 +95,9 @@ describe('judgeFrictions', () => {
     ['missing verdicts', () => ({})],
     ['unknown verdict', (key) => ({ verdicts: [{ key, verdict: 'MAYBE' }] })],
     ['coverage without a reference', (key) => ({ verdicts: [{ key, verdict: 'COVERED-BY' }] })],
+    ['NEW with coverage rejects the whole answer', (key) => ({ verdicts: [
+      { key, verdict: 'NEW', coveredBy: 'PR #42' }, { key: 'gateRuns:flaky', verdict: 'NEW' },
+    ] })],
     ['unknown key', () => ({ verdicts: [{ key: 'invented', verdict: 'NEW' }] })],
     ['conflicting duplicate key', (key) => ({ verdicts: [{ key, verdict: 'NEW' }, { key, verdict: 'COVERED-BY', coveredBy: 'held-7' }] })],
     ['mixed valid and invalid entries', (key) => ({ verdicts: [{ key, verdict: 'NEW' }, { verdict: 'NEW' }] })],
@@ -114,6 +117,34 @@ describe('judgeFrictions', () => {
 });
 
 describe('fileNewCards', () => {
+  it('never files ranked rows without examples, even with an explicit NEW verdict', async () => {
+    const ranked = rankFrictions(metrics()).slice(0, 3);
+    ranked[0].examples = []; delete ranked[1].examples; ranked[2].examples = null;
+    const fileItem = vi.fn();
+    expect(await fileNewCards({ ranked, verdicts: allNew(ranked), state: {}, fileItem })).toEqual([]);
+    expect(fileItem).not.toHaveBeenCalled();
+  });
+
+  it('recovers an idempotent filing after save fails and counts the recovered key toward the cap', async () => {
+    const ranked = rankFrictions(metrics()); const cards = new Map();
+    const fileItem = vi.fn(async (input) => {
+      expect(input.key).toBe(ranked[0].key);
+      if (!cards.has(input.key)) cards.set(input.key, { id: 'held-1' });
+      return cards.get(input.key);
+    });
+    const save = vi.fn().mockRejectedValueOnce(new Error('disk full')).mockResolvedValue(undefined);
+    const attempt = (state) => fileNewCards({ ranked, verdicts: allNew(ranked), state, fileItem, save, maxCards: 1 });
+    await expect(attempt({})).rejects.toThrow('disk full');
+    const state = {};
+    expect(await attempt(state)).toEqual([{ key: ranked[0].key, item: { id: 'held-1' } }]);
+    expect(cards.size).toBe(1);
+    expect(fileItem).toHaveBeenCalledTimes(2);
+    expect(state.filed).toEqual({ [ranked[0].key]: 'held-1' });
+    await fileNewCards({ ranked, verdicts: allNew(ranked.slice(0, 1)),
+      state: JSON.parse(JSON.stringify(state)), fileItem, save, maxCards: 1 });
+    expect(fileItem).toHaveBeenCalledTimes(2);
+  });
+
   it('files only explicit NEW candidates, never covered, omitted, unknown or uncertain candidates', async () => {
     const ranked = rankFrictions(metrics()); const fileItem = vi.fn(async () => ({ id: 'card-1' }));
     await fileNewCards({ ranked, state: {}, fileItem, verdicts: [

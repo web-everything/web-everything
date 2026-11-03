@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { EventEmitter } from 'node:events';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
+import { appendHeldCoronerCard, coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
@@ -186,6 +186,52 @@ function seedUnjudgedReport({ input, io, metrics }) {
   ].join('\n'));
   writeFileSync(join(input.dir, 'nightly-coroner-cursor.json'), JSON.stringify({ lastNight: input.night, lastEnd: input.until }));
 }
+
+it('appends numbered held cards in the handoff home by default and recovers existing key receipts', async () => {
+  const { input, io } = judgedExtraction();
+  mkdirSync(io.home, { recursive: true });
+  const heldPath = join(io.home, 'cards-to-file.md');
+  writeFileSync(heldPath, '7. (earlier, held) **Existing item.**\n');
+  delete io.fileItem;
+  await extractNightlyCoroner(input, io);
+  const held = readFileSync(heldPath, 'utf8');
+  expect(held).toMatch(/^8\. \(coroner-2026-10-16, held\) \*\*Coroner:/m);
+  expect(held).toContain('Fix idea:'); expect(held).toContain('Evidence:');
+  expect(held).toContain('PR #101'); expect(held).toContain('Size 3.');
+  expect(held).toMatch(/^    Coroner key: gateRuns:cause-0$/m);
+  expect(held.match(/Coroner key:/g)).toHaveLength(3);
+  expect(io.run).toHaveBeenCalledOnce();
+  const statePath = join(input.dir, 'nightly-coroner-judge.json');
+  const original = JSON.parse(readFileSync(statePath, 'utf8'));
+  rmSync(statePath); // Crash after sink append, before durable judge state.
+  await extractNightlyCoroner(input, io);
+  expect(readFileSync(heldPath, 'utf8')).toBe(held);
+  const recovered = JSON.parse(readFileSync(statePath, 'utf8'));
+  expect(recovered.filed).toEqual(original.filed);
+  expect(recovered.completed[input.night].filed).toBe(3);
+  expect(io.run).toHaveBeenCalledOnce();
+});
+it('refuses a held key without a numbered receipt and leaves the held list untouched', () => {
+  const home = temp(); const path = join(home, 'cards-to-file.md');
+  const held = 'Coroner key: ci:flaky\n'; writeFileSync(path, held);
+  expect(() => appendHeldCoronerCard({ key: 'ci:flaky' }, { home, night: '2026-10-16' })).toThrow('run manual /coroner');
+  expect(readFileSync(path, 'utf8')).toBe(held);
+});
+it.each(['', 'ci:flaky\nforged'])('refuses invalid held key %j without writing a card', (key) => {
+  const home = temp();
+  expect(() => appendHeldCoronerCard({ key }, { home, night: '2026-10-16' })).toThrow('invalid coroner filing key');
+  expect(existsSync(join(home, 'cards-to-file.md'))).toBe(false);
+});
+it('deduplicates held cards by an exact key line, including after evidence changes', () => {
+  const home = temp();
+  const input = { key: 'ci:flaky', title: 'Coroner: ci / flaky', size: '3', digest: 'Evidence PR #42' };
+  const first = appendHeldCoronerCard(input, { home, night: '2026-10-16' });
+  const before = readFileSync(join(home, 'cards-to-file.md'), 'utf8');
+  expect(appendHeldCoronerCard({ ...input, digest: 'Changed PR #99' }, { home, night: '2026-10-17' })).toEqual(first);
+  expect(readFileSync(join(home, 'cards-to-file.md'), 'utf8')).toBe(before);
+  expect(appendHeldCoronerCard({ ...input, key: 'ci:flaky-extra' }, { home, night: '2026-10-17' })).not.toEqual(first);
+});
+
 it('judges after extraction publication by default, files only NEW with the default three-card cap, and updates report wording', async () => {
   const { input, io } = judgedExtraction();
   const judge = io.judge.getMockImplementation();
@@ -241,9 +287,8 @@ it.each(['exception', 'invalid answer', 'filing exception'])('preserves extracti
   if (failure === 'exception') io.judge.mockRejectedValue(new Error('judge unavailable'));
   if (failure === 'invalid answer') io.judge.mockResolvedValue({ value: 'unparseable judge answer' });
   if (failure === 'filing exception') io.fileItem.mockRejectedValue(new Error('file-item unavailable'));
-  const result = await extractNightlyCoroner(input, io);
-  expect(result.report).toBe(`coroner-${input.night}.md`);
-  expect(existsSync(join(io.home, result.report))).toBe(true);
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow();
+  expect(existsSync(join(io.home, `coroner-${input.night}.md`))).toBe(true);
   expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-cursor.json'), 'utf8')).lastEnd).toBe(input.until);
   expect(io.judge).toHaveBeenCalledOnce();
   if (failure !== 'filing exception') expect(io.fileItem).not.toHaveBeenCalled();
@@ -252,6 +297,16 @@ it.each(['exception', 'invalid answer', 'filing exception'])('preserves extracti
   expect(feed).toContain('coroner-judge-failed');
   if (failure !== 'invalid answer') expect(feed).toContain(failure === 'exception' ? 'judge unavailable' : 'file-item unavailable');
   expect(io.release).toHaveBeenCalledOnce();
+  expect(existsSync(join(input.dir, 'nightly-coroner-judge.json'))).toBe(false);
+  // Restore successful ports explicitly after each failure mode.
+  const healthy = judgedExtraction();
+  io.judge.mockImplementation(healthy.io.judge.getMockImplementation());
+  io.fileItem.mockImplementation(healthy.io.fileItem.getMockImplementation());
+  await extractNightlyCoroner(input, io);
+  expect(io.judge).toHaveBeenCalledTimes(2);
+  expect(io.run).toHaveBeenCalledOnce(); expect(io.acquire).toHaveBeenCalledOnce();
+  expect(JSON.parse(readFileSync(join(input.dir, 'nightly-coroner-judge.json'), 'utf8')).completed[input.night]).toBeDefined();
+  expect(readFileSync(io.statusFeed, 'utf8').match(/coroner-judge-failed/g)).toHaveLength(1);
 });
 it('honors an already aborted signal on report replay without launching the pending judge', async () => {
   const fixture = judgedExtraction(); seedUnjudgedReport(fixture);
