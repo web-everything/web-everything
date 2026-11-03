@@ -33,7 +33,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
  *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) OPT-IN bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure, instead of failing on the very first full-pool reading (omitted ⇒ today's instant-fail, unchanged); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
- *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved]   # #2275 hand a leased lane back to the pool (own lease, or --force); #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
+ *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
  *   node scripts/lane-pool.mjs trim    [--max=N] [--dry-run] [--json]  # #4025 shrink the pool toward a cap (default per-repo, `LANE_POOL_TRIM_MAX` overridable): deletes HIGHEST-numbered lane dirs first among those with no live (or provably dead) lease, never reserved, nothing uncommitted beyond the scratch allowlist, and every ahead commit provably pushed — a lane with real unpushed/uncommitted work is reported, never removed. Crash-safe (rename to `.trash-<n>` then delete). Wired into `scripts/conveyor/lane-pool-health-watch.mjs`'s periodic pass.
  *   node scripts/lane-pool.mjs map     --lane=N --item=NNN[,NNN…]   # register item(s) → lane page-port (#2139 proxy)
@@ -2825,6 +2825,37 @@ function assertReleaseReservedScoped() {
   }
 }
 
+// Compares against existing origin/* tracking refs only (no fetch: release must not use lane-controlled transport config).
+// An absent upstream branch is not an error.
+// A successful salvage has separately verified its remote SHA, even when pushing by URL
+// did not create a local remote-tracking ref. Only that verified tip is also excluded.
+function releaseWorkRefuses(dir, label, salvage) {
+  const safe = value => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
+  const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+  const commits = tryGit(['rev-list', 'HEAD', '--branches', '--not',
+    '--exclude=origin/HEAD', '--exclude=origin/ops/*', '--remotes=origin/*',
+    ...(salvage?.status === 'pushed' ? [salvage.sha] : [])], dir);
+  // Only tracked changes are in scope by design; untracked files do not block release, and litter is reaped separately.
+  const tracked = tryGit(['status', '--porcelain', '--untracked-files=no'], dir);
+  if (commits === '' && tracked === '') return false;
+  const details = [
+    commits === null ? 'commit evidence unreadable or exceeds the Git output limit; inspect local history manually'
+      : commits ? `unpushed commits: ${commits.split('\n').map(sha => sha.slice(0, 12)).join(', ')}` : '',
+    tracked === null ? 'tracked status unreadable or exceeds the Git output limit; inspect the index and worktree manually'
+      : tracked ? `tracked changes: ${safe(tracked)}` : '',
+  ].filter(Boolean).join('; ');
+  if (flags.discard) {
+    log(`  WARNING ${safe(label)}: --discard accepts loss on reuse of ${details}; releasing`);
+    return false;
+  }
+  const branch = tryGit(['symbolic-ref', '--quiet', '--short', 'HEAD'], dir) || `lane/${basename(dir)}-preserve`;
+  log(`  ${safe(label)}: UNPUSHED_WORK — ${details}; lane and lease kept. Preserve work (commit tracked changes first):\n` +
+    `    git -C ${quote(safe(dir))} push origin HEAD:refs/heads/${quote(safe(branch))}\n` +
+    '    Push other unpushed local branches too, then retry release; pass --discard to deliberately release without preserving this work.');
+  process.exitCode = 1;
+  return true;
+}
+
 // #2667 — cross-pool release-by-session. `release --all-pools --session=<slug>` sweeps EVERY pool under
 // POOL_ROOT and hands back every lane that `<slug>` leases — clearing a cross-locus couple's lease in the WE
 // pool AND the plateau-app pool in ONE call (the exact toil the auto-release + this selector remove). It is BY
@@ -2904,14 +2935,21 @@ async function cmdReleaseAllPools(repo) {
         log(`  ${name}/lane-${n}: ${describeLease(lease)} — reserved; skipped (un-reserve is single-lane --release-reserved)`);
         continue;
       }
+      let salvage, salvageIo;
       if (recoveryEnabled()) {
         // Other pools must resolve their own primary's origin; never reuse this pool's URL or a lane remote.
         salvageRepo ??= name === repo.name ? repo
           : resolveRepo({ reference: primarySiblingPath(repo, name), pool: name });
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
-        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        salvageIo = realSalvageIo({ repo: salvageRepo, preflightLaneDir: dir });
+      }
+      scrubClaimedLaneConfig(dir, 'before release work check');
+      cleanLaneLitter(dir);
+      if (salvageIo) {
+        salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
+        if (salvage.status === 'failed') log(`  WARNING ${name}/lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; checking remaining work before release`);
         else if (salvage.status === 'pushed') log(`  ${name}/lane-${n}: salvaged to ${salvage.ref}`);
       }
+      if (releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage)) continue;
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
         continue;
@@ -3075,7 +3113,7 @@ async function cmdRelease(repo) {
     if (!sameLease(readLease(dir), lease)) { log(`  lane-${n}: lease changed since it was read — not releasing; re-run if lane-${n} still looks wrong`); continue; }
     const cards = salvageLaneCards({ dir, lane: n, pool: basename(repo.poolDir), reason: `release of lane-${n} (${lease.purpose || 'no purpose'})`,
       isLeaseCurrent: () => sameLease(readLease(dir), lease) });
-    if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); releasing without cleaning — inspect the lane before reuse`);
+    if (cards.status === 'unknown') log(`  WARNING lane-${n}: card salvage skipped (${cards.reason}); checking remaining work before release`);
     if (cards.status === 'failed') { log(`  lane-${n}: KEPT — card files could not be saved (${cards.reason}); not releasing a lane that would lose them`); continue; }
     if (cards.status === 'salvaged') {
       log(`  lane-${n}: saved ${cards.removed.length} leftover card file(s) to ${cards.outDir} and cleaned them`);
@@ -3087,15 +3125,17 @@ async function cmdRelease(repo) {
     // have released and a brand-new acquirer could already be sitting on this exact lane. An unconditional
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
+    let salvage;
     if (recoveryEnabled()) {
       if (!repo.originUrl) {
-        log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
+        log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage; checking remaining work before release`);
       } else {
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
-        if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
+        salvage = await salvagePushLane({ lane: n, laneDir: dir, io: salvageIo });
+        if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; checking remaining work before release`);
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }
     }
+    if (releaseWorkRefuses(dir, `lane-${n}`, salvage)) continue;
     releaseTestBarrier();
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
@@ -4830,7 +4870,7 @@ function cmdUnmap(repo) {
 // reading a flag meant for a different command is a much smaller, less surprising mistake than an
 // unrecognized flag vanishing outright, and a flat set can't drift out of sync with which command reads what.
 const KNOWN_FLAGS = new Set([
-  'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'force', 'item', 'json', 'lane',
+  'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
   'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
