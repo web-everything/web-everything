@@ -8,6 +8,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 export const REVIEW_TIMING_DEFAULTS = Object.freeze({
   startBeforeCi: false, startAfter: 'fast-checks', startEarly: 'shadow', fastChecks: Object.freeze({ we: Object.freeze(['standards', 'test-shard (1)']) }), cancelOnCiRed: false,
   deltaMaxLines: 50, deltaMaxFiles: 3, skipDrainMechanical: true,
+  startEarlyPublishWaitMs: 1500000, startEarlyPollMs: 30000,
   earlyStartShadow: false, earlyStartCare: Object.freeze(['none', 'low']),
   earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: Object.freeze(['code']),
 });
@@ -113,7 +114,8 @@ export function earlyStartShadow({ headSha, checks, requiredChecks, verifyGreen,
 }
 /** Validate raw evidence before permitting a pending-only bypass; collapse must not hide malformed rows. */
 function readableEarlyChecks(checks, headSha) {
-  if (!Array.isArray(checks)) return false;
+  // Rows without head_sha come from the IO reader's pinned commit-status endpoint.
+  if (!Array.isArray(checks) || !checks.length) return false;
   return Array.from(checks).every(row => {
     if (!row || typeof row !== 'object' || Array.isArray(row)
       || typeof (row.name ?? row.context) !== 'string' || !(row.name ?? row.context).trim()

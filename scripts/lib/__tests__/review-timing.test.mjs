@@ -9,6 +9,16 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it('resolves shipped R468 timing from review.json as push start, red cancellation, and shadow early policy', () => {
+    const resolved = resolveTimingPolicy({ env: {}, fix: {}, platformReview: {}, platformFix: {}, log: () => {} });
+    expect(resolved.review).toMatchObject({ startAfter: 'push', cancelOnCiRed: true, startEarly: 'shadow' });
+    expect(resolved.sources.review).toMatchObject({ startAfter: 'tool', cancelOnCiRed: 'tool', startEarly: 'tool' });
+  });
+  it.each(['fast-checks', 'ci-green'])('allows an environment rollback of shipped push timing to %s', startAfter => {
+    const resolved = resolveTimingPolicy({ env: { WE_REVIEW_START_AFTER: startAfter }, fix: {}, platformReview: {}, platformFix: {}, log: () => {} });
+    expect(resolved.review.startAfter).toBe(startAfter);
+    expect(resolved.sources.review.startAfter).toBe('env');
+  });
   const args = { headSha: head, repo: 'we', requiredChecks: ['integration'],
     checks: [check('standards'), check('test-shard (1)', null, { status: 'in_progress' })] };
   it('starts early only in on mode; shadow reports the opportunity and off is unchanged', () => {
@@ -21,10 +31,36 @@ describe('pending-CI start policy', () => {
       affected: [{ name: 'test-shard (1)', reason: 'pending' }] });
   });
   it.each(['fast-checks', 'ci-green'])('allows queued and missing checks under %s', startAfter => {
-    for (const checks of [[], [check('test-shard (1)', null, { status: 'queued' })]]) {
+    for (const checks of [[check('registered')], [check('test-shard (1)', null, { status: 'queued' })]]) {
       expect(reviewStartGate({ ...args, checks, policy: { ...review, startAfter, startEarly: 'on' } }))
         .toMatchObject({ allowed: true, earlyStart: true, headSha: head });
     }
+  });
+  it.each(['on', 'shadow'])('refuses empty or absent registered CI evidence without an early-start note (%s)', startEarly => {
+    for (const checks of [[], undefined, null]) {
+      const result = reviewStartGate({ ...args, checks, policy: { ...review, startEarly } });
+      expect(result.allowed).toBe(false);
+      expect(result.wouldStartEarly).not.toBe(true);
+      expect(result.earlyStartNote).toBeUndefined();
+    }
+  });
+  it('validates and cascades the early publication wait and poll settings with provenance', () => {
+    const base = { env: {}, read: () => '{}', review: {}, fix: {}, platformReview: {}, platformFix: {} };
+    expect(resolveTimingPolicy(base).review).toMatchObject({ startEarlyPublishWaitMs: 1500000, startEarlyPollMs: 30000 });
+    const logs = [];
+    resetCascadeLogForTest();
+    const resolved = resolveTimingPolicy({ ...base, platformReview: { startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 },
+      review: { startEarlyPublishWaitMs: 500, startEarlyPollMs: 80 },
+      env: { WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: '250', WE_REVIEW_START_EARLY_POLL_MS: '100', WE_POLICY_CASCADE_LOG: '1' },
+      log: line => logs.push(line) });
+    expect(resolved.review).toMatchObject({ startEarlyPublishWaitMs: 250, startEarlyPollMs: 100 });
+    expect(resolved.sources.review).toMatchObject({ startEarlyPublishWaitMs: 'env', startEarlyPollMs: 'env' });
+    expect(logs.join('\n')).toContain('startEarlyPublishWaitMs=250 (env)');
+    expect(logs.join('\n')).toContain('startEarlyPollMs=100 (env)');
+    expect(resolveTimingPolicy({ ...base, platformReview: { startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 },
+      review: { startEarlyPublishWaitMs: -1, startEarlyPollMs: 0 },
+      env: { WE_REVIEW_START_EARLY_PUBLISH_WAIT_MS: 'invalid', WE_REVIEW_START_EARLY_POLL_MS: '1.5' } }).review)
+      .toMatchObject({ startEarlyPublishWaitMs: 700, startEarlyPollMs: 90 });
   });
   it.each(['off', 'shadow', 'on'])('never permits healable red CI in %s mode', startEarly => {
     for (const startAfter of ['fast-checks', 'ci-green']) {

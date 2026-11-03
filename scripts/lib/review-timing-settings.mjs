@@ -36,6 +36,8 @@ export function resolveTimingPolicy({ env = process.env, read = readFileSync, re
     envValues: reviewEnv, valid: {
       startAfter: v => ['fast-checks', 'ci-green', 'push'].includes(v),
       startEarly: v => ['off', 'shadow', 'on'].includes(v),
+      startEarlyPublishWaitMs: nonnegative,
+      startEarlyPollMs: v => Number.isSafeInteger(v) && v > 0,
       fastChecks: validFastChecks,
       startBeforeCi: boolean, cancelOnCiRed: boolean, skipDrainMechanical: boolean, deltaMaxLines: nonnegative, deltaMaxFiles: nonnegative,
       earlyStartShadow: boolean, earlyStartCare: enumList(['none', 'low', 'elevated', 'high']),

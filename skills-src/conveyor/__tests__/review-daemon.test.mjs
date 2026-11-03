@@ -994,14 +994,14 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     expect(out.pendingNotDispatched[0].reasons.join('\n')).toContain('held by host admission (host memory low)');
   });
 
-  it('EMERGENCY live-review cap: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
+  it('R468 shipped live-review cap of 6: a shared budget bounds new reviews across repos; 0 left dispatches nothing', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
     const budget = liveReviewRoundBudget({ env: {}, listCommands: () => '101 1 node scripts/operations/review-job.mjs --pr=1\n102 101 node x/review-loop-cli.mjs\n103 1 node other.mjs\n' });
-    expect(budget).toMatchObject({ live: 1, max: 3, left: 2 });
+    expect(budget).toMatchObject({ live: 1, max: 6, left: 5 });
     const dispatch = vi.fn(({ pr }) => ({ agentId: `agent-${pr}` }));
     for (let i = 0; i < 2; i++) runReviewTick({ reconcile: () => reviewsPlan(3), dispatch, tagRound: () => {}, tagStatus: () => {},
       statusCandidates: () => [], acquirableLanes: () => 10, liveReviewBudget: budget });
-    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch).toHaveBeenCalledTimes(5);
     const closed = liveReviewRoundBudget({ env: {}, listCommands: () => { throw Error('ps failed'); } });
     expect(closed.left).toBe(0);
     expect(liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '5' }, listCommands: () => '' })).toMatchObject({ max: 5, left: 5 });
@@ -1017,7 +1017,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       'grep review-job.mjs',
       'vim scripts/operations/review-loop-cli.mjs',
     ].join('\n');
-    expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: 3, left: 2 });
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => ps })).toMatchObject({ live: 1, max: 6, left: 5 });
     // a preload / loader value is not the script; other node runtimes and a direct (shebang) run still count
     const preloaded = [
       'node --import ./boot.mjs scripts/operations/review-loop-cli.mjs --pr=1',
@@ -1025,7 +1025,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       '/usr/bin/nodejs scripts/operations/review-loop-cli.mjs --pr=3',
       '/clone/scripts/operations/review-loop-cli.mjs --pr=4',
     ].join('\n');
-    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: 0 });
+    expect(liveReviewRoundBudget({ env: {}, listCommands: () => preloaded })).toMatchObject({ live: 4, left: 2 });
   });
 
   it.each(['-r ./package.json', '--require ./package.json', '--require=./package.json',
@@ -1199,17 +1199,17 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       mkdirSync(`${prefix} Work`);
       writeFileSync(script, '');
       const read = () => liveReviewRoundBudget({ env: {}, listCommands: () => `node ${script} run --pr=1` });
-      expect(read()).toMatchObject({ live: 1, left: 2 });
+      expect(read()).toMatchObject({ live: 1, left: 5 });
       // Both argv interpretations now name real files: taking either interpretation could undercount.
       writeFileSync(prefix, '');
       expect(read()).toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
       expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node /missing/Review.mjs Work/review-job.mjs' }))
         .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
       expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${prefix} inspect scripts/operations/review-job.mjs` }))
-        .toMatchObject({ live: 0, left: 3 });
+        .toMatchObject({ live: 0, left: 6 });
       for (const files of ['x'.repeat(1500), Array(150).fill('scripts/some-file.mjs').join(' ')]) {
         expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${prefix} --files=${files} scripts/operations/review-job.mjs` }))
-          .toMatchObject({ live: 0, left: 3 });
+          .toMatchObject({ live: 0, left: 6 });
       }
       const shortPrefix = join(root, 'Review');
       const otherScript = join(`${shortPrefix} Work`, 'review-loop-cli.mjs');
@@ -1227,7 +1227,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       rmSync(shortPrefix);
       // Once only the full script exists, the option-like directory fragment must not hide it.
       expect(liveReviewRoundBudget({ env: {}, listCommands: () => `node ${dashScript} run --pr=1` }))
-        .toMatchObject({ live: 1, left: 2 });
+        .toMatchObject({ live: 1, left: 5 });
       expect(liveReviewRoundBudget({ env: {}, listCommands: () => 'node Review Work/scripts/operations/review-job.mjs run --pr=1' }))
         .toMatchObject({ left: 0, reason: expect.stringContaining('ambiguous script path') });
       expect(() => countLiveReviewRounds(['node /a/Review Work/review-job.mjs'], {
@@ -1238,14 +1238,14 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
 
   it('a cap-bound tick says the live-review cap held the review, never "no acquirable lane"', async () => {
     const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
-    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node a/review-job.mjs run\nnode b/review-job.mjs run\nnode c/review-job.mjs run' });
+    const budget = liveReviewRoundBudget({ env: {}, listCommands: () => 'node a/review-job.mjs run\nnode b/review-job.mjs run\nnode c/review-job.mjs run\nnode d/review-job.mjs run\nnode e/review-job.mjs run\nnode f/review-job.mjs run' });
     const prs = [100, 101].map((number) => ({ number, labels: [{ name: 'review:human' }] }));
     const out = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40, liveReviewBudget: budget });
     expect(out.deferredForLanes).toBe(0);
     expect(out.deferredForCap).toBe(2);
     const reasons = out.pendingNotDispatched.flatMap((p) => p.reasons).join('\n');
-    expect(reasons).toMatch(/held by the live-review cap \(live review rounds 3 of maxLiveReviewRounds=3 \(tool\); 40 lane\(s\) acquirable\)/);
+    expect(reasons).toMatch(/held by the live-review cap \(live review rounds 6 of maxLiveReviewRounds=6 \(tool\); 40 lane\(s\) acquirable\)/);
     expect(reasons).not.toMatch(/no acquirable lane/);
     const starved = runReviewTick({ reconcile: () => reviewsPlan(2), readPrs: () => prs, readAgents: () => [], dispatch: vi.fn(),
       tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 0 });
@@ -2371,7 +2371,9 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
     });
     dispatched.push(out.dispatched.length);
     if (conclusion !== 'success') {
-      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: expect.stringMatching(/^review-ci: required-checks-not-successful: daemon-soak=\w+$/) }]);
+      expect(out.notStarted).toEqual([{ prNumber: 3432, reason: conclusion === 'failure'
+        ? 'review-ci: ci-red: daemon-soak=failure'
+        : 'review-ci: required-checks-not-successful: daemon-soak=pending' }]);
       expect(tagRound).not.toHaveBeenCalled();
       expect(spawnAgent).not.toHaveBeenCalled();
     }
