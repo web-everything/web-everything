@@ -249,7 +249,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, credentialContentFinding, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {classifyManifestPath, credentialContentFinding, sourceExtension, manifestEntry, manifestEntryFields, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -561,9 +561,11 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     hashDone();
-    // R447: the public-blob identity check above authorizes these exact bytes,
-    // including public fixtures that deliberately spell credential patterns.
-    if(credentialSource&&publicOid)return {entry:{path,sha256:createHash('sha256').update(content).digest('hex'),executable,tracked}};
+    // R447: only test fixtures may deliberately spell credential patterns, and
+    // only after the public-blob identity check has verified their exact bytes.
+    const testFixture=isTestFile(path)||parts.slice(0,-1).some(part=>part.equals(Buffer.from('__tests__')))
+      ||/\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
+    if(credentialSource&&publicOid&&testFixture)return {entry:manifestEntryFields(path,content,executable,tracked)};
     if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
     return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });

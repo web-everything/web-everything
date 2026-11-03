@@ -2058,8 +2058,9 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 
   const publicTokenFixture = 'token=ghp_0123456789abcdefghijklmnopqrstuvwxyzABCD\n';
 
-  it.each(['publish-secret-gate.test.mjs', 'secrets.txt'])
+  it.each(['publish-secret-gate.test.mjs', '__tests__/secret-x.test.mjs', '__tests__/secret-fixture.mjs', 'secret-x.spec.mjs'])
   ('ships tracked credential-pattern fixture %s only with identical public bytes', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
     writeFileSync(join(cwd, name), publicTokenFixture);
     const paths = [Buffer.from(name)];
     expect(credentialContentFinding(paths[0], Buffer.from(publicTokenFixture))).toBeTruthy();
@@ -2069,8 +2070,20 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.excluded).toEqual([]);
   });
 
-  it('refuses a locally edited credential-pattern fixture despite matching public index evidence', async () => {
-    const name = 'publish-secret-gate.test.mjs';
+  it('keeps identical tracked secrets.txt with a token excluded despite public evidence', async () => {
+    const name = 'secrets.txt';
+    writeFileSync(join(cwd, name), publicTokenFixture);
+    const paths = [Buffer.from(name)];
+    expect(credentialContentFinding(paths[0], Buffer.from(publicTokenFixture))).toBeTruthy();
+    const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, publicTokenFixture),
+      {code:0, stdout:treeRecord(name, publicTokenFixture)})});
+    expect(manifest.entries).toEqual([]);
+    expect(manifest.excluded).toEqual(paths);
+  });
+
+  it.each(['publish-secret-gate.test.mjs', '__tests__/secret-x.test.mjs'])
+  ('refuses locally edited credential-pattern fixture %s despite matching public index evidence', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
     writeFileSync(join(cwd, name), publicTokenFixture + '// local edit\n');
     await expect(build({cwd, exec:gitInventory([Buffer.from(name)], indexRecord(name, publicTokenFixture),
       {code:0, stdout:treeRecord(name, publicTokenFixture)})}))
