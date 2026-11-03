@@ -30,6 +30,12 @@ import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Every test drives real `git` (init/clone/fetch/rebase) in temp repos: several seconds each on a loaded host (CI shard
+// + coverage, or a busy laptop), so vitest's 5s default timed out a different test on every run (main red @ 4535653df,
+// the same cause as daemon-rebuild.test.mjs). A generous per-test cap stays a hang guard without making the assertions
+// depend on host speed.
+vi.setConfig({ testTimeout: 60_000 });
+
 // ── fixture helpers — copied from daemon-rebuild.test.mjs (never imported from it) ──────────────────────────
 
 const tempDirs = [];
