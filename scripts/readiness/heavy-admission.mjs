@@ -159,7 +159,7 @@ import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
-import { reserve, releaseLockDir, readLockEntry, heartbeatOwn } from './file-locks.mjs';
+import { reserve, releaseLockDir, readLockEntry, heartbeatOwn, lockDirFor } from './file-locks.mjs';
 import { probePidLiveness } from './pid-liveness.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -172,7 +172,7 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
-import { createMarkerReaper, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
+import { createMarkerReaper, reapDeadSlotLocks, markerContent, recordMarkerRun, blockedSlots, heldTombstone } from './forge-slot-markers.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
@@ -832,6 +832,7 @@ export async function runWithRemoteDecision({
       // Throttled and cheap (one readdir) when no marker is stale, so it runs on every pass, not only once the pool is full.
       if(nowMs-reapedAt>=2000){
         reapedAt=nowMs;
+        try { reapDeadSlotLocks({root:remoteRoot,host,clock,ttlMs:ADMISSION_LEASE_MINUTES*60000,log}); } catch { /* best-effort cleanup */ }
         await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs).catch(()=>[]);
       }
       const blocked=blockedSlots(remoteRoot,cap),slots=Array.from({length:cap},(_,i)=>i).filter(i=>!blocked.has(i));
@@ -868,7 +869,7 @@ export async function runWithRemoteDecision({
   let terminated = false;
   remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log, runOverride: remoteClientOverride });
   const refuseLocal = (reason) => {
-    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
+    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; blocked by remote slot-${slot.slot} (lock ${join(lockDirFor(remoteRoot,`slot-${slot.slot}`),'lock.json')}, marker ${executionMarker}); remote slot-${slot.slot} retained until its .unconfirmed marker is cleared.\n`);
     return { handled: true, exitCode: 124 };
   };
   let reason; let detail; let timer;

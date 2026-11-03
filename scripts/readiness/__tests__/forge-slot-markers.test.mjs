@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {lockDirFor} from '../file-locks.mjs';
 import {parseTelemetry, easternTimestamp} from '../forge-exec-run.mjs';
-import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun, runVerdict} from '../forge-slot-markers.mjs';
+import {createMarkerReaper, markerContent, blockedSlots, heldTombstone, recordMarkerRun, runVerdict, reapDeadSlotLocks} from '../forge-slot-markers.mjs';
 
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, {recursive: true, force: true}); });
@@ -327,5 +327,69 @@ describe('stale remote slot markers (perf10)', () => {
     const telemetry = {sampledAtET: iso(NOW + 120_000), activeRuns: 0, ...(recent === undefined ? {} : {recent})};
     expect(await reaper.step(async () => telemetry)).toEqual([]);
     expect(names(root)).toEqual(['0']);
+  });
+});
+
+
+describe('dead remote slot locks', () => {
+  function fixture(overrides = {}) {
+    const root = setup({});
+    const entry = {owner: 'dead-owner', path: 'slot-99', pid: 111, heartbeatAt: iso(NOW - 3_600_001), ...overrides};
+    const dir = lockDirFor(root, entry.path);
+    mkdirSync(dir);
+    const file = join(dir, 'lock.json');
+    writeFileSync(file, JSON.stringify(entry));
+    const reap = (options = {}) => reapDeadSlotLocks({root, host: 'forge', clock: () => NOW,
+      liveness: () => 'dead', selfPid: 222, ...options});
+    return {root, entry, dir, file, reap};
+  }
+  it.each([{}, {host: 'forge'}, {meta: {host: 'forge'}}])('reaps a dead pid with a stale heartbeat beyond the cap: %j', binding => {
+    const f = fixture(binding), logs = [];
+    expect(f.reap({log: line => logs.push(line), liveness: (pid, selfPid) => {
+      expect([pid, selfPid]).toEqual([111, 222]); return 'dead';
+    }})).toEqual(['slot-99']);
+    expect(existsSync(f.dir)).toBe(false);
+    expect(logs).toHaveLength(1);
+    for (const value of ['slot-99', f.file, 'dead-owner', '111']) expect(logs[0]).toContain(value);
+  });
+  it.each(['alive', 'unknown'])('keeps a pid with %s liveness', verdict => {
+    const f = fixture();
+    expect(f.reap({liveness: () => verdict})).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it.each([
+    {host: 'other'}, {meta: {host: 'other'}}, {host: 'other', meta: {host: 'forge'}},
+    {heartbeatAt: iso(NOW)}, {heartbeatAt: iso(NOW - 3_600_000)}, {heartbeatAt: 'invalid'},
+    {pid: null}, {pid: '111'}, {pid: 1.5}, {path: 'not-a-slot'},
+  ])('keeps incomplete, foreign, fresh or non-slot evidence: %j', fields => {
+    const f = fixture(fields);
+    expect(f.reap()).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it.each(['corrupt', 'entryless', 'unreadable'])('keeps a %s lock', kind => {
+    const f = fixture();
+    if (kind === 'corrupt') writeFileSync(f.file, '{');
+    else { rmSync(f.file); if (kind === 'unreadable') mkdirSync(f.file); }
+    expect(f.reap()).toEqual([]);
+    expect(existsSync(f.dir)).toBe(true);
+  });
+  it('honors a refreshed owner heartbeat sidecar', async () => {
+    const {heartbeatOwn} = await import('../file-locks.mjs');
+    const f = fixture();
+    heartbeatOwn(f.root, f.entry.path, f.entry.owner, iso(NOW));
+    expect(f.reap()).toEqual([]);
+    expect(existsSync(f.file)).toBe(true);
+  });
+  it('keeps a lock retaken during the liveness probe', () => {
+    const f = fixture();
+    expect(f.reap({liveness: () => {
+      writeFileSync(f.file, JSON.stringify({...f.entry, owner: 'new-owner', pid: 333}));
+      return 'dead';
+    }})).toEqual([]);
+    expect(JSON.parse(readFileSync(f.file, 'utf8')).owner).toBe('new-owner');
+  });
+  it('returns an empty list when the root is absent', () => {
+    const root = setup({});
+    expect(reapDeadSlotLocks({root: join(root, 'absent'), host: 'forge'})).toEqual([]);
   });
 });

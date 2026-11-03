@@ -8,6 +8,7 @@ import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createRemoteExec, formatAdmissionPolicy, loadAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision, settleClientProvenance } from '../heavy-admission.mjs';
+import { lockDirFor } from '../file-locks.mjs';
 import { easternTimestamp } from '../forge-exec-run.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
@@ -544,6 +545,9 @@ describe('remote client override', () => {
     const f = fixture("throw new Error('import-boom');");
     expect(await f.run()).toEqual({ handled: true, exitCode: 124 });
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('remote client override import failed: import-boom'));
+    const remoteRoot = join(dirname(f.admission.lockRoot), 'remote');
+    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining(
+      `blocked by remote slot-0 (lock ${join(lockDirFor(remoteRoot, 'slot-0'), 'lock.json')}, marker ${join(remoteRoot, 'slot-0.unconfirmed')})`));
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('refusing local rerun'));
     expect(f.seams.log).not.toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
   });

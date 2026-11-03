@@ -6,8 +6,37 @@
 import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
-import {readLockEntry, lockDirFor} from './file-locks.mjs';
+import {readLockEntry, lockDirFor, releaseLockDirIf} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
+
+/** Reap expired local slot leases only on proof their owner is dead, including slots above the current cap. */
+export function reapDeadSlotLocks({root, host, clock = Date.now, liveness = probePidLiveness,
+  selfPid = process.pid, ttlMs = 60 * 60_000, log = () => {}}) {
+  const reaped = [], nowMs = clock();
+  let dirs;
+  try { dirs = readdirSync(root, {withFileTypes: true}); } catch { return reaped; }
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const file = join(root, dir.name, 'lock.json');
+    try {
+      // readLockEntry honors owner heartbeat sidecars but does not preserve a top-level host.
+      const raw = JSON.parse(readFileSync(file, 'utf8'));
+      if (typeof raw?.path !== 'string' || !/^slot-\d+$/.test(raw.path)
+        || lockDirFor(root, raw.path) !== join(root, dir.name)) continue;
+      const entry = readLockEntry(root, raw.path);
+      if (!entry || !Number.isInteger(entry.pid) || entry.owner !== String(raw.owner) || entry.pid !== raw.pid) continue;
+      const entryHost = raw.host ?? entry.meta?.host;
+      if (entryHost != null && entryHost !== host) continue;
+      const heartbeatMs = Date.parse(entry.heartbeatAt);
+      if (!Number.isFinite(heartbeatMs) || !(nowMs - heartbeatMs > ttlMs)) continue;
+      if (liveness(entry.pid, selfPid) !== 'dead') continue;
+      if (!releaseLockDirIf(root, entry.path, entry)) continue;
+      reaped.push(entry.path);
+      log(`heavy-admission: reaped ${entry.path} (lock ${JSON.stringify(file)}, owner ${JSON.stringify(entry.owner)}, pid ${entry.pid})\n`);
+    } catch { /* Unreadable or incomplete evidence keeps the lock; retry on the next throttled pass. */ }
+  }
+  return reaped;
+}
 
 export const MARKER_GRACE_MS = 120_000;
 // The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
