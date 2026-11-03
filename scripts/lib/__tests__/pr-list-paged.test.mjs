@@ -34,6 +34,7 @@ describe('query and gh row shape', () => {
     expect(q).toContain('repository(owner:"owner",name:"name")');
     expect(q).toContain('states:OPEN,first:20,orderBy:');
     expect(q).toContain('author{login __typename}');
+    expect(q).toContain('contexts(first:100){pageInfo{hasNextPage}');
     expect(q).not.toContain('after:');
     expect([...q].filter(c => c === '{')).toHaveLength([...q].filter(c => c === '}').length);
     const after = 'cursor"\\\n';
@@ -56,13 +57,14 @@ describe('query and gh row shape', () => {
       conclusion: null, startedAt: null, detailsUrl: 'https://example.com/check' };
     const status = { __typename: 'StatusContext', context: 'ci', createdAt: 'today', state: 'PENDING', targetUrl: null };
     const n = node(1, { labels: { nodes: [{ id: 'id', name: 'ready', description: '', color: 'abc123' }] },
-      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status] } } } }] } });
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status], pageInfo: { hasNextPage: false } } } } }] } });
     expect(mapGraphqlPr(n)).toEqual({ ...node(1), reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
       { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: '', detailsUrl: check.detailsUrl,
         name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '' },
       { __typename: 'StatusContext', context: 'ci', startedAt: 'today', state: 'PENDING', targetUrl: '' },
     ] });
-    expect(Object.keys(row(1))).toEqual(PAGED_LIGHT_FIELDS);
+    expect(Object.keys(row(1))).toEqual([...PAGED_LIGHT_FIELDS, 'rollupIncomplete']);
+    expect(mapGraphqlPr(n).rollupIncomplete).toBeUndefined();
     expect(row(1)).toMatchObject({ labels: [], statusCheckRollup: [], reviewDecision: '' });
     check.checkSuite = { workflowRun: { workflow: { name: 'build' } } };
     expect(mapGraphqlPr(n).statusCheckRollup[0].workflowName).toBe('build');
@@ -82,6 +84,20 @@ describe('query and gh row shape', () => {
     }
     expect(isTransientGhFailure('HTTP 401')).toBe(false);
   });
+  it.each([true, undefined, null, 'false'])(
+    'marks truncated or unknown check pages incomplete: %s', hasNextPage => {
+      const contexts = { pageInfo: { hasNextPage }, nodes: Array.from({ length: 100 }, (_, i) => ({
+        __typename: 'CheckRun', name: `check-${i}`, status: 'COMPLETED', conclusion: 'SUCCESS',
+        completedAt: '2026-10-12T00:00:00Z',
+      })) };
+      const mapped = parseOpenPrPage(page([node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts } } }] } })])).rows[0];
+      expect(mapped.rollupIncomplete).toBe(true);
+      expect(mapped.statusCheckRollup).toHaveLength(100);
+      contexts.pageInfo.hasNextPage = false;
+      const complete = mapGraphqlPr(node(1, { commits: { nodes: [{ commit: { statusCheckRollup: { contexts } } }] } }));
+      expect(complete.rollupIncomplete).toBeUndefined();
+      expect(complete.statusCheckRollup).toHaveLength(100);
+    });
 });
 
 describe('light paging', () => {

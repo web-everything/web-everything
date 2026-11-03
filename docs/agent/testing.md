@@ -3827,3 +3827,16 @@ churn or unreadable credentials deliberately retain reservations. In `forge-exec
 keep the live host busy probe, but pin the idle probe's PID listing to the test process and read
 its real status file. Inject process churn, unreadable entries, and settled scans separately to
 verify the production scanner's fail-closed behavior without relying on host quiescence.
+
+## Review restoration requires complete check evidence
+
+Validate every run's timestamp before collapsing duplicate check names. An unreadable
+run cannot be proven superseded; a readable older failed status may still yield to a
+completed CheckRun. Both lane and bot-head restoration require completed latest runs
+with readable timestamps and the full ten-minute grace.
+
+Paged check fixtures must include `contexts.pageInfo.hasNextPage: false` when complete.
+True or unknown pagination carries `rollupIncomplete` through snapshot projection and
+JSON persistence; all restoration branches hold until a complete read is available.
+Keep regression coverage in `reconcile-core.test.mjs`, `pr-list-paged.test.mjs`, and
+`pr-snapshot.test.mjs`, plus the existing unlabelled-bot daemon soak scenario.

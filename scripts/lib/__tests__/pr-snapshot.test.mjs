@@ -14,7 +14,7 @@ import {
   readSharedOpenPrs, nextLimit, isServable, projectPrs, SNAPSHOT_FIELDS, MIN_LIMIT, DIRTY_REFRESH_FLOOR_MS,
   readShaCache, writeShaCache, snapshotOpenCount,
 } from '../pr-snapshot.mjs';
-import { PrListUnreadableError } from '../pr-list-paged.mjs';
+import { PrListUnreadableError, mapGraphqlPr } from '../pr-list-paged.mjs';
 import { ghThrottleLogPath } from '../gh-throttle.mjs';
 import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 
@@ -45,6 +45,7 @@ function fakeExec(prs = PRS) {
       const nodes = prs.slice(start, end).map(({ comments, body, files, labels, statusCheckRollup, author, ...p }) => ({
         ...p, author: author && { login: author.login, __typename: author.is_bot ? 'Bot' : 'User' },
         labels: { nodes: labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+          pageInfo: { hasNextPage: false },
           nodes: statusCheckRollup.map(({ workflowName, ...c }) => c.__typename === 'CheckRun'
             ? { ...c, checkSuite: { workflowRun: { workflow: { name: workflowName } } } }
             : { ...c, createdAt: c.startedAt }),
@@ -83,6 +84,20 @@ describe('pure helpers', () => {
   });
   it('projectPrs returns exactly the asked-for fields', () => {
     expect(projectPrs([{ number: 1, body: 'x', labels: [] }], ['number', 'labels'])).toEqual([{ number: 1, labels: [] }]);
+  });
+  it('keeps incomplete-check evidence whenever a reader requests the rollup', () => {
+    const pr = { number: 1, statusCheckRollup: [], rollupIncomplete: true };
+    expect(projectPrs([pr], ['number', 'statusCheckRollup'])).toEqual([pr]);
+    expect(projectPrs([pr], ['number'])).toEqual([{ number: 1 }]);
+  });
+  it('preserves mapper completeness through snapshot projection and JSON persistence', () => {
+    for (const hasNextPage of [true, undefined, false]) {
+      const mapped = mapGraphqlPr({ number: 1, commits: { nodes: [{ commit: { statusCheckRollup: {
+        contexts: { nodes: [], pageInfo: { hasNextPage } },
+      } } }] } });
+      const [projected] = projectPrs(JSON.parse(JSON.stringify([mapped])), ['number', 'statusCheckRollup']);
+      expect(projected.rollupIncomplete).toBe(hasNextPage === false ? undefined : true);
+    }
   });
   it('repoFromGhArgs reads --repo / -R / --repo=', () => {
     expect(repoFromGhArgs(['pr', 'edit', '1', '--repo', 'o/n'])).toBe('o/n');

@@ -152,11 +152,12 @@ export function isServable(snap, { fields, nowMs, ttlMs, dirtyMs = 0 }) {
   return true;
 }
 
-/** Project each PR to just `fields` — a caller sees the exact shape its own `--json` would have returned. PURE. */
+/** Project requested fields, preserving incomplete-read evidence alongside check data. PURE. */
 export function projectPrs(prs, fields) {
   return prs.map((p) => {
     const o = {};
     for (const f of fields) if (p && Object.prototype.hasOwnProperty.call(p, f)) o[f] = p[f];
+    if (fields.includes('statusCheckRollup') && p?.rollupIncomplete === true) o.rollupIncomplete = true;
     return o;
   });
 }
