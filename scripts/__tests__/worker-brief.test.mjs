@@ -16,6 +16,22 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
+    const dirs = ['abc12345', 'def67890'].map(owner => {
+      const brief = renderWorkerBrief({ ...params, owner });
+      const dir = `/tmp/we-scratch-${params.purpose}-${owner}`;
+      expect(brief).toContain(`**Scratch dir.** \`${dir}\``);
+      expect(brief).toContain(`mkdir -p ${dir}`);
+      expect(brief).toContain(`--bodyFile=${dir}/body.md`);
+      expect(brief).toContain(`report file: \`${dir}/report.md\``);
+      expect(brief).toContain('ALL PR body and notes/report files go ONLY there');
+      expect(brief).toContain('never into the repo or committed');
+      expect(brief).toContain('never to a shared path like /tmp/body.md');
+      return dir;
+    });
+    expect(dirs[0]).not.toBe(dirs[1]);
+  });
+
   it('runs the printed plateau-app check outside WE and reports JSON for the explicit target', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-brief-verify-'));
     const target = path.join(root, 'plateau lane');

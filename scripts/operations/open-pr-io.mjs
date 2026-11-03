@@ -15,10 +15,11 @@
  */
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { dirname, isAbsolute, join, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
+import { checkBodyFileLocation } from '../lib/open-pr-body-location.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -148,6 +149,23 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
   git: gitOpt,
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
+  bodyLocation = spawn !== spawnSync ? () => ({ ok: true }) : (opts) => checkBodyFileLocation({
+    ...opts, home: homedir(), tmp: tmpdir(),
+    isTracked: (path) => {
+      // ls-files errors on external/nonexistent paths. Prove the repository boundary
+      // first: a path outside its worktree cannot be tracked in this index.
+      const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
+      }).trim();
+      const rel = relative(root, path);
+      if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false;
+      const result = spawnSync('git', ['ls-files', '--error-unmatch', '--', path], {
+        cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
+      });
+      if (result.error || ![0, 1].includes(result.status)) throw new Error('Git tracking check unavailable');
+      return result.status === 0;
+    },
+  }),
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
   const git = gitOpt === undefined ? createGitReader(cwd) : gitOpt;
@@ -163,6 +181,8 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       let readable = true;
       const bodyFile = arg('body-file');
       if (bodyFile) {
+        const location = bodyLocation({ bodyFile, cwd });
+        if (!location.ok) return { outcome: 'refused', reason: location.code, detail: location.message };
         try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
         catch (error) {
           readable = false;

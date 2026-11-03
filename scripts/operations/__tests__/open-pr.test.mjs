@@ -667,3 +667,50 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     expect(deriveLaneRef({ read: () => { throw new Error('none'); } })).toBe('');
   });
 });
+
+
+describe('PR body location admission', () => {
+  it.each(['body-file-shared-path', 'body-file-tracked'])('refuses %s before reading the body or spawning', code => {
+    const calls = [];
+    const run = createPrLandRunner({
+      cwd: '/lane', bodyLocation: input => { calls.push(input); return { ok: false, code, message: 'use scratch' }; },
+      readPrepBody: () => { throw new Error('must not read'); },
+      spawn: () => { calls.push('spawn'); return { status: 0, stdout: '{"pr":7}' }; },
+      prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
+    });
+    expect(run({ argv: ['--ref=lane/x', '--body-file=/tmp/body.md'] })).toEqual({ outcome: 'refused', reason: code, detail: 'use scratch' });
+    expect(calls).toEqual([{ bodyFile: '/tmp/body.md', cwd: '/lane' }]);
+  });
+
+  it('passes an accepted body through location admission before reading and spawning', () => {
+    const calls = [];
+    const run = createPrLandRunner({
+      bodyLocation: () => { calls.push('location'); return { ok: true }; },
+      readPrepBody: () => { calls.push('read'); return 'body'; },
+      spawn: () => { calls.push('spawn'); return { status: 0, stdout: '{"pr":7}' }; },
+      prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
+    });
+    expect(run({ argv: ['--ref=lane/x', '--body-file=body.md'] })).toMatchObject({ outcome: 'opened', pr: 7 });
+    expect(calls).toEqual(['location', 'read', 'spawn']);
+  });
+
+  it('does not check body location for a dry run', () => {
+    const run = createPrLandRunner({
+      bodyLocation: () => { throw new Error('must not check'); },
+      spawn: () => ({ status: 0, stdout: '{"reason":"dry-run"}' }),
+    });
+    expect(run({ argv: ['--dry-run', '--body-file=/tmp/body.md'] })).toMatchObject({ reason: 'dry-run' });
+  });
+});
+
+
+describe('real body tracking adapter', () => {
+  it.each(['/tmp/we-scratch-location-probe-abcdef123456/nonexistent/body.md', 'nonexistent-body-location-probe/notes/body.md'])('allows nonexistent body file %s through to the next gate', bodyFile => {
+    const run = createPrLandRunner({
+      env: {}, readPrepBody: () => 'body', prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'refuse', reason: 'next-gate', message: 'stop before publishing' }),
+    });
+    expect(run({ argv: ['--ref=lane/x', `--body-file=${bodyFile}`] }))
+      .toEqual({ outcome: 'refused', reason: 'next-gate', detail: 'stop before publishing' });
+  });
+});
