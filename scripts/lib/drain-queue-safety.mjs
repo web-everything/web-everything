@@ -13,7 +13,8 @@ import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
-const mqFailureReasons = new Set(['failed_checks', 'ci_failure', 'merge_conflict',
+const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
+const mqFailureReasons = new Set(['failed_checks', 'ci_failure',
   'branch_protection_failure', 'invalid_merge_commit']);
 const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reason.trim().toLowerCase() : '';
 
@@ -49,11 +50,18 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
   // Force-push events omit fast-forwards: a push TO this SHA can be a restoration of a failed head.
   // Neither those events nor commit dates can bind an otherwise unbound removal to an older head.
   // Retain the operator-visible hold; a live operator re-enqueue can still reach bookkeeping below.
+  let mergeConflictRemovals = 0;
   for (const event of timeline.nodes) {
     if (event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent') continue;
     if (event?.__typename !== 'RemovedFromMergeQueueEvent') return hold('unreadable merge-queue event');
     const reason = mqRemovalReason(event);
     if (reason === 'manual' || reason === 'merged') continue;
+    // Callers admit only CLEAN candidates: a base-dependent conflict is not head-failure evidence.
+    // Callers admit only CLEAN candidates: a base-dependent conflict is not head-failure evidence.
+    if (reason === 'merge_conflict') {
+      mergeConflictRemovals++;
+      continue;
+    }
     if (!mqFailureReasons.has(reason))
       return hold('unknown removal reason; operator must inspect history and enqueue manually');
     const testedHead = mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid);
@@ -62,6 +70,8 @@ export function decideMqSameHead({ pr, head, timeline } = {}) {
     }
     if (testedHead === currentHead) return hold(reason || 'unknown removal reason');
   }
+  if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
+    return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
   return { hold: false, line: null };
 }
 
@@ -272,7 +282,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
       && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
         event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
         || (event?.__typename === 'RemovedFromMergeQueueEvent'
-          && (['manual', 'merged'].includes(mqRemovalReason(event))
+          && (['manual', 'merged'].includes(mqRemovalReason(event)) || mqRemovalReason(event) === 'merge_conflict'
             || (mqFailureReasons.has(mqRemovalReason(event))
               && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
       && timeline.nodes.some(event =>

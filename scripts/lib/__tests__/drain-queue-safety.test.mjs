@@ -232,7 +232,7 @@ describe('merge-queue same-head failure admission', () => {
         expect(f.approvedHeadHold).not.toHaveBeenCalled();
         expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/operator.*inspect/i));
       }));
-    it.each(['CI_FAILURE', 'MERGE_CONFLICT', 'FAILED_CHECKS', 'BRANCH_PROTECTION_FAILURE', 'INVALID_MERGE_COMMIT'])(
+    it.each(['CI_FAILURE', 'FAILED_CHECKS', 'BRANCH_PROTECTION_FAILURE', 'INVALID_MERGE_COMMIT'])(
       'explicit failure %s bound to the current head permits one refresh', reason => fixture(f => {
         f.timeline = timeline(removed(reason));
         expect(f.run().hold).toBe(true);
@@ -735,6 +735,17 @@ describe('merge-queue same-head failure admission', () => {
       });
       f.run(); expect(f.requests()).toHaveLength(0);
     }));
+    it('an unbound merge_conflict does not unconfirm a same-head failed_checks refresh', () => fixture(f => {
+      f.timeline = timeline({ ...removed('merge_conflict'), beforeCommit: null }, removed());
+      expectHold(f.run(), /— failed_checks$/);
+      expect(f.requests()).toHaveLength(1);
+    }));
+    it('repeated merge_conflict alone cannot confirm a failure or spend a refresh', () => fixture(f => {
+      f.timeline = timeline(...Array.from({ length: 3 }, () => removed('merge_conflict')));
+      expectHold(f.run(), /repeated merge_conflict ejection \(3 times\)/);
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+    }));
     it('422 is logged and never retried, including by another store', () => fixture(f => {
       f.refused = true; f.run(); f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests()).toHaveLength(1);
@@ -759,12 +770,35 @@ describe('merge-queue same-head failure admission', () => {
   it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
     expect(decide(timeline(removed()))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — failed_checks` });
   });
-  it.each(['branch_protection_failure', 'invalid_merge_commit', 'merge_conflict'])('removal for %s holds the tested head', reason => {
+  it.each(['branch_protection_failure', 'invalid_merge_commit', 'ci_failure'])('removal for %s holds the tested head', reason => {
     expect(decide(timeline(removed(reason)))).toEqual({ hold: true, line: `mq-same-head-failed: #6215 head ${head} — ${reason}` });
   });
-  it.each(['manual', 'merged', ' MANUAL ', ' MERGED '])('removed with release reason %s permits re-enqueue regardless of binding', reason => {
+  it.each(['manual', 'merged', ' MANUAL ', ' MERGED ', 'merge_conflict', ' MERGE_CONFLICT '])('removed with release reason %s permits re-enqueue regardless of binding', reason => {
     for (const beforeCommit of [removed(reason).beforeCommit, null, { parents: { nodes: [] } }]) {
       expect(decide(timeline({ ...removed(reason), beforeCommit }))).toEqual(released);
+    }
+  });
+  it('#6288: merge_conflict with null commit binding releases a CLEAN candidate', () => {
+    expect(decide(timeline({ ...removed('merge_conflict'), beforeCommit: null }))).toEqual(released);
+  });
+  it('two merge_conflict removals release regardless of head binding', () => {
+    expect(decide(timeline(removed('merge_conflict'),
+      { ...removed('merge_conflict', prior), beforeCommit: null }))).toEqual(released);
+  });
+  it.each([3, 4, 100])('R466: %i merge_conflict removals hold with an operator fallback', count => {
+    const events = Array.from({ length: count }, (_, i) => ({
+      ...removed(i % 2 ? ' MERGE_CONFLICT ' : 'merge_conflict', prior), beforeCommit: null,
+    }));
+    expect(decide(timeline(...events))).toEqual({ hold: true,
+      line: `mq-same-head-failed: #${pr} head ${head} — repeated merge_conflict ejection (${count} times); operator must inspect history and enqueue manually` });
+  });
+  it.each([false, true])('merge_conflict preserves failed_checks head binding (same head: %s)', sameHead => {
+    const conflict = { ...removed('merge_conflict'), beforeCommit: null };
+    const failure = removed('failed_checks', sameHead ? head : prior);
+    for (const events of [[conflict, failure], [failure, conflict]]) {
+      const decision = decide(timeline(...events));
+      if (sameHead) expectHold(decision, /— failed_checks$/);
+      else expect(decision).toEqual(released);
     }
   });
   it('removed with merge-group parent pointing at an OLDER head releases the new head', () => {
@@ -793,10 +827,10 @@ describe('merge-queue same-head failure admission', () => {
     'compares tested OID %s and current OID %s case-insensitively', (testedHead, currentHead) => {
       expect(decideMqSameHead({ pr, head: currentHead, timeline: timeline(removed('failed_checks', testedHead)) }).hold).toBe(true);
     });
-  // Prevention owed: add recorded GitHub merge_conflict and branch_protection_failure payloads here.
+  // Prevention owed: add recorded GitHub branch_protection_failure payloads here.
   // These null-beforeCommit fixtures are synthetic; this repair runs without live GitHub access.
   it('a server-timestamped force push cannot bind an old unbound failure to a different head', () => {
-    for (const reason of ['merge_conflict', 'branch_protection_failure', 'invalid_merge_commit']) {
+    for (const reason of ['ci_failure', 'branch_protection_failure', 'invalid_merge_commit']) {
       expectHold(decide(timeline({ ...removed(reason), beforeCommit: null }, pushed())), /no commit binding/i);
     }
   });
@@ -805,7 +839,7 @@ describe('merge-queue same-head failure admission', () => {
     for (let seed = 1; seed <= 64; seed++) {
       const currentHead = seed.toString(16).padStart(40, '0');
       const events = Array.from({ length: seed % 20 + 1 }, (_, i) => ({
-        ...removed(i % 2 ? 'merge_conflict' : 'branch_protection_failure', prior),
+        ...removed(i % 2 ? 'ci_failure' : 'branch_protection_failure', prior),
         createdAt: new Date(Date.UTC(2026, 10, 1, 0, 0, i)).toISOString(),
       }));
       events.push(pushed(currentHead));
@@ -844,7 +878,7 @@ describe('merge-queue same-head failure admission', () => {
   });
   it('restoring a failed head after an invisible fast-forward detour retains its hold', () => {
     // H -> J is a fast-forward, so the filtered timeline only records J -> H.
-    const failure = { ...removed('merge_conflict'), beforeCommit: null };
+    const failure = { ...removed('failed_checks'), beforeCommit: null };
     expectHold(decide(timeline(failure, pushed())), /no commit binding/i);
   });
   it.each([null, { error: 'API unavailable' }, {}, { nodes: null }, { nodes: {} }])('unreadable timeline %j holds', evidence => {
