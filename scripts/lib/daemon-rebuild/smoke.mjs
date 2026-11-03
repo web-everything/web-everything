@@ -12,12 +12,13 @@ import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidat
 import { releaseBuildLease } from './lease.mjs';
 import { readForceAdopt, clearForceAdopt, recordForcedAdoption, abortForcedAdoption } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { infraDegradedDecision } from './smoke-classify/infra-degraded.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, posix } from 'node:path';
+import { basename, dirname, join, posix } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
@@ -681,6 +682,22 @@ export async function smokeAndAdopt({
     if (forced.moved !== true && forced.readyRecorded !== true) clearReadyCandidate(root, stEnv); // never leave the failed build adoptable unwatched
     if (forced.moved !== true && forced.readyRecorded !== true) await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
     return forced;
+  }
+  // R508 part 2: infra-only failures (timeouts, gh 5xx, throttle, lane-acquire) with every code-path step passed are
+  // retried after a backoff, then adopted as degraded; any code failure still blocks (the ladder below is unchanged).
+  {
+    const priorInfra = readRebuildState(root, stEnv).infraDegraded ?? null;
+    const infra = infraDegradedDecision({ smokeResult: a.smokeResult, prior: priorInfra, inputsKey: plan.inputsKey, nowMs: now(), env });
+    if (infra.action === 'adopt') {
+      alert('smoke-infra-degraded', { failed: infra.failed, attempts: infra.attempts, target: plan.finalSha, message: 'only infra steps failed on repeated smokes and every code-path step passed — adopting as degraded (R508)' });
+      await appendDaemonEvent({ kind: 'smoke-infra-degraded', daemon: basename(root), detail: { failed: infra.failed, attempts: infra.attempts, target: plan.finalSha } }, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } });
+      await locked((st) => { st.infraDegraded = null; });
+      return finalize(plan, undefined, undefined, a.smokeResult);
+    }
+    if (infra.action === 'retry') {
+      await locked((st) => { st.infraDegraded = infra.next; });
+      alert('smoke-infra-retry', { failed: infra.failed, attempts: infra.next.attempts, retryAt: new Date(infra.next.retryAt).toISOString() });
+    } else if (priorInfra) await locked((st) => { st.infraDegraded = null; });
   }
   if (a.reused) {
     await hold('smoke-reused-env-failed', failedA);

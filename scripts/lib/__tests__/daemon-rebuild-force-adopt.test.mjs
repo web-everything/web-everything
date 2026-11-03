@@ -185,4 +185,36 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(readForceWatch(cloneDir, env)).toBeNull();
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
   });
+
+  it('R508 part 2: infra-only failures are retried then adopted as degraded; a code failure still blocks', async () => {
+    const { base, originDir, cloneDir, env: e0 } = makeFixture();
+    const env = { ...forceEnv(e0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0', WE_DAEMON_REJECT_RETRY_BASE_MS: '1000', WE_SMOKE_INFRA_DEGRADED_ATTEMPTS: '2' };
+    const lastGood = headOf(cloneDir);
+    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    const infraSmoke = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [
+      { ok: true, name: 'daemon-entries-boot', mayBeTransient: false },
+      { ok: false, name: 'reconcile-dry-run', detail: 'gh pr list: HTTP 504 Gateway Timeout', mayBeTransient: true }] } }));
+    let t = Date.now();
+    const go = (runSmoke) => rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t });
+    const first = await go(infraSmoke);
+    expect(first.moved).not.toBe(true);
+    expect(headOf(cloneDir)).toBe(lastGood);
+    t += 10_000; // past the backoff
+    const second = await go(infraSmoke);
+    expect(second.moved).toBe(true);
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/smoke-infra-degraded/);
+  });
+
+  it('R508 part 2: a code-step failure alongside an infra failure never adopts', async () => {
+    const { base, originDir, cloneDir, env: e0 } = makeFixture();
+    const env = { ...forceEnv(e0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0', WE_DAEMON_REJECT_RETRY_BASE_MS: '1', WE_SMOKE_INFRA_DEGRADED_ATTEMPTS: '1' };
+    const lastGood = headOf(cloneDir);
+    advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
+    const mixed = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [
+      { ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false },
+      { ok: false, name: 'reconcile-dry-run', detail: 'HTTP 504', mayBeTransient: true }] } }));
+    const r = await rebuildClone({ root: cloneDir, env, runSmoke: mixed, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(r.moved).not.toBe(true);
+    expect(headOf(cloneDir)).toBe(lastGood);
+  });
 });
