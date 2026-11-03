@@ -2,7 +2,7 @@
 // remote run is confirmed finished. A client that dies mid-run leaves its marker behind, and the old code kept it
 // forever, so a few dead clients walled off the whole cap while Forge sat idle ("remote-full" with load ~0.5).
 // A marker is reaped here only on liveness evidence: its owner process is provably dead AND Forge's own fresh
-// telemetry cannot account for it as a still-running remote run. Nothing is ever reaped on age alone.
+// telemetry settles its run, or two samples support an age-ceiling inference: Forge exposes no active run ids.
 import {lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync, renameSync, linkSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
@@ -10,6 +10,7 @@ import {readLockEntry, lockDirFor} from './file-locks.mjs';
 import {probePidLiveness} from './pid-liveness.mjs';
 
 export const MARKER_GRACE_MS = 120_000;
+export const RUN_CEILING_MS = 2 * 3600_000;
 // The Forge sample must be taken this long AFTER the owner was first seen dead: it covers Forge-vs-Mac clock skew and
 // a receipt created between Forge's receipt listing and its timestamp, so a sample can never predate a surviving run.
 export const DEATH_SAMPLE_MARGIN_MS = 90_000;
@@ -175,16 +176,18 @@ function ownerGone(root, index, file, liveness, selfPid) {
  * failure codes (97/254), which require zero active runs as cleanup evidence. A dead-owner,
  * host-bound marker is reaped when it is past the grace window, the telemetry sample was taken at least
  * DEATH_SAMPLE_MARGIN_MS after the owner was first seen dead (the stamp persists in a sidecar, so a later client completes
- * what an earlier one began), and Forge's readable telemetry shows ITS run finished or absent. A run still listed without
- * a result keeps the marker; an absent run is unknown whenever Forge reports active runs. A marker whose run id
- * was never recorded (the client died before prepare returned) is kept while Forge reports any active runs or any
+ * what an earlier one began), and Forge's readable telemetry settles ITS run or supports a confirmed idle/overdue verdict.
+ * An unfinished or absent run while Forge is busy is retained unless 'overdue': both the marker and any listed run reach
+ * runCeilingMs at the sample. This is an age-ceiling inference because Forge exposes no active run ids, confirmed
+ * by two qualifying samples from this reaper separated by idleConfirmMs. Codes 97/254 still require zero active runs.
+ * A marker whose run id was never recorded (the client died before prepare returned) is kept while Forge reports any active runs or any
  * run started inside its own possible window ([at - skew, first-seen-dead + skew]) is still unfinished.
  * Unreadable or malformed telemetry reaps nothing. A bare legacy text marker has no host or run binding: retain it
  * until an operator confirms remote cleanup and removes it. Local owner death alone cannot settle remote work.
  */
 export function createMarkerReaper({root, host, clock = Date.now, liveness = probePidLiveness, selfPid = process.pid,
   graceMs = MARKER_GRACE_MS, log = () => {}, fs = {readdirSync, statSync, unlinkSync},
-  signal = () => {}, idleConfirmMs = 30_000, stuckMinSlots = 2, stuckAgeMs = 600_000, signalEveryMs = 600_000}) {
+  signal = () => {}, idleConfirmMs = 30_000, runCeilingMs = RUN_CEILING_MS, stuckMinSlots = 2, stuckAgeMs = 600_000, signalEveryMs = 600_000}) {
   const signalledAt = new Map();
   // R475: tell the health loop (and so the coroner) about a stuck pool; throttled per kind, never throws.
   const raise = (kind, detail, now) => {
@@ -281,16 +284,22 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
             let verdict = 'run-less';
             if (entry.run) {
               verdict = runVerdict(telemetry, entry.run);
-              if (verdict !== 'idle') resetIdle(entry);
-              if (!['finished', 'absent', 'idle'].includes(verdict)) continue;
+              const recent = telemetry.recent.find(item => item?.runId === entry.run);
+              if (!evidence.complete && (!recent || recent.code === null)
+                && sampledAt - (entry.at ?? entry.mtimeMs) >= runCeilingMs
+                && (!recent || sampledAt - Date.parse(recent.startedAtET) >= runCeilingMs)) verdict = 'overdue';
+              if (verdict !== 'idle' && verdict !== 'overdue') resetIdle(entry);
+              if (!['finished', 'absent', 'idle', 'overdue'].includes(verdict)) continue;
               // 'idle' rests on Forge's active-run count, taken from a directory listing without a per-run cleanup
               // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
               // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
               if (verdict === 'idle') {
                 const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
                 if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; } // not fully qualifying: restart the window
-                // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
-                // taken by THIS reaper, that still reports zero active runs before releasing.
+              }
+              if (verdict === 'idle' || verdict === 'overdue') {
+                // Confirm idle counts (which can miss a prepared->running rename) and the overdue inference with
+                // a second qualifying sample taken by THIS reaper before releasing.
                 const first = idleStamp(entry.file, entry.key, sampledAt);
                 if (sampledAt - first < idleConfirmMs) continue;
               }
@@ -307,7 +316,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
       }
       const stuck = held.filter(h => !reaped.includes(h.name));
       if (stuck.length >= stuckMinSlots) raise('stuck-slots', {slots: stuck.map(h => h.name), minAgeMs: stuckAgeMs}, now);
-      if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; its Forge run is finished or absent)\n`);
+      if (reaped.length) log(`heavy-admission: reaped stale remote slot marker(s) ${reaped.join(', ')} (owner dead; Forge run settled, idle, or inferred overdue)\n`);
       return reaped;
     },
   };
