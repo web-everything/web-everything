@@ -215,12 +215,17 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     try { unlinkSync(idleFile(entry.file)); return; } catch (error) { if (error?.code === 'ENOENT') return; }
     try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); return; } catch { /* try the void marker */ }
     try { writeFileSync(voidFile(entry.file), JSON.stringify({key: entry.key}), {mode: 0o600}); }
-    catch { unpersisted.add(entry.key); }
+    catch {
+      // Nothing about the sample can be written. Quarantine the marker itself under a held name: it keeps blocking its
+      // slot for every process and is never released automatically (an operator clears it).
+      try { renameSync(entry.file, `${entry.file}.held-${randomBytes(8).toString('hex')}`); } catch { unpersisted.add(entry.key); }
+    }
     log(`heavy-admission: idle sample reset failed for ${entry.name}; holding the slot until it is cleared\n`);
   }
   function idleStamp(file, key, sampledAt) {
     let voided = unpersisted.has(key);
-    try { if (JSON.parse(readFileSync(voidFile(file), 'utf8')).key === key) voided = true; } catch { /* no void marker */ }
+    try { if (JSON.parse(readFileSync(voidFile(file), 'utf8')).key === key) voided = true; }
+    catch (error) { if (error?.code !== 'ENOENT') voided = true; } // only a missing file proves there is no void marker
     if (voided) {
       // Hold: restart the window and clear the void only once both the fresh stamp and the cleanup are written.
       try {
