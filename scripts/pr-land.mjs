@@ -368,15 +368,15 @@ export function resolveDraft({ mode, optOut, ref = '', title = '', readyOnOpen =
   return mode === 'park' && !optOut;
 }
 
-/** R502 item 2 — does this PR skip the draft step? ONLY two explicit, narrow flags (fail closed otherwise):
- *  an `Operator-pre-approved: R<id>[+R<id>]` line in the PR body, or a net diff touching ONLY the configured
- *  `guardConfigPaths` (scripts/settings/pr-land-ready.json). Review still happens: this removes the draft step, not
- *  the review label. Pure. */
+/** R502 item 2 — does this PR skip the draft step? Fail closed, and NEVER on a caller-controlled claim alone: the net
+ *  diff must be non-empty and confined to the configured `readyPaths` (scripts/settings/pr-land-ready.json), i.e.
+ *  guard-config files. Inside that allowlist an `Operator-pre-approved: R<id>[+R<id>]` body line marks a pre-approved
+ *  entry PR (reason `pre-approved`); without it the PR is `guard-config`. Anything else stays a draft. Review still
+ *  happens (the review label is unchanged) and required CI still gates the merge: this removes only the draft step. */
 export function decideReadyOnOpen({ body = '', changedFiles = [], guardConfigPaths = null } = {}) {
-  if (/^Operator-pre-approved:[ \t]*R\d+(?:\+R\d+)*[ \t]*$/m.test(String(body))) return { ready: true, why: 'pre-approved' };
-  if (Array.isArray(guardConfigPaths) && guardConfigPaths.length && Array.isArray(changedFiles) && changedFiles.length
-    && changedFiles.every((f) => guardConfigPaths.includes(f))) return { ready: true, why: 'guard-config' };
-  return { ready: false, why: 'not-flagged' };
+  if (!Array.isArray(guardConfigPaths) || !guardConfigPaths.length || !Array.isArray(changedFiles) || !changedFiles.length
+    || !changedFiles.every((f) => guardConfigPaths.includes(f))) return { ready: false, why: 'not-flagged' };
+  return { ready: true, why: /^Operator-pre-approved:[ \t]*R\d+(?:\+R\d+)*[ \t]*$/m.test(String(body)) ? 'pre-approved' : 'guard-config' };
 }
 
 /** R502 item 2 — apply a label with bounded retries (a single transient gh failure left #6339/#6343 with no review

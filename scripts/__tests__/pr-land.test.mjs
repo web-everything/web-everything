@@ -904,11 +904,12 @@ describe('resolveDraft — a red-main fix PR always opens ready (card xu1nixv, i
 // ── R502 item 2: pre-approved / guard-config PRs open READY; a park label is retried, never silently dropped ──
 describe('decideReadyOnOpen — only flagged PRs skip the draft step (fail closed)', () => {
   const cfg = { guardConfigPaths: ['scripts/settings/prototype-load.json'] };
-  it('an Operator-pre-approved body marker with a ruling id opens ready', () => {
-    expect(decideReadyOnOpen({ body: 'x\nOperator-pre-approved: R474\n', changedFiles: ['a.mjs'], ...cfg })).toMatchObject({ ready: true, why: 'pre-approved' });
+  it('an Operator-pre-approved marker opens ready ONLY when the diff is confined to guard-config paths', () => {
+    expect(decideReadyOnOpen({ body: 'x\nOperator-pre-approved: R474\n', changedFiles: ['scripts/settings/prototype-load.json'], ...cfg })).toMatchObject({ ready: true, why: 'pre-approved' });
+    expect(decideReadyOnOpen({ body: 'x\nOperator-pre-approved: R474\n', changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
   });
-  it('a malformed or missing marker does not', () => {
-    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', '', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
+  it('a malformed or missing marker is only guard-config, never pre-approved', () => {
+    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', '', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: ['scripts/settings/prototype-load.json'], ...cfg }).why).toBe('guard-config');
   });
   it('a PR touching ONLY guard-config paths opens ready; any extra file keeps it a draft', () => {
     expect(decideReadyOnOpen({ body: '', changedFiles: ['scripts/settings/prototype-load.json'], ...cfg })).toMatchObject({ ready: true, why: 'guard-config' });
