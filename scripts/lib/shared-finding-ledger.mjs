@@ -33,6 +33,12 @@ function sameSpot(a, b) {
 
 const rawClaim = (f) => String(f?.summary ?? '');
 
+/** One predicate for filter AND brief: only a complete, test-pinned, variant-free entry may ever be suppressed. */
+function suppressible(entry) {
+  return entry?.status === 'test-pinned' && !entry.variants?.length && Boolean(entry.pinningTest)
+    && Boolean(entry.finding?.file) && Number.isInteger(entry.finding?.line) && entry.finding.line > 0;
+}
+
 function matches(entry, finding, { strict = false } = {}) {
   if (exactMatch(entry, finding)) return !strict || (rawClaim(entry.finding) === rawClaim(finding) && sameSpot(entry.finding, finding));
   if (strict) return false; // suppression needs the same path and the same claim: no anchor-only or fuzzy match
@@ -85,7 +91,7 @@ export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
   for (const finding of findings) {
     const entry = ledger.entries.find(candidate => matches(candidate, finding, { strict: true }));
     let proven = false;
-    if (entry?.status === 'test-pinned' && !entry.variants?.length && entry.pinningTest && typeof pinStillHolds === 'function') {
+    if (suppressible(entry) && typeof pinStillHolds === 'function') {
       try { proven = pinStillHolds(structuredClone(entry)) === true; } catch { /* Retain on unknown evidence. */ }
     }
     (proven ? dropped : kept).push(finding);
@@ -96,7 +102,7 @@ export function filterReraises(ledger, findings, { pinStillHolds } = {}) {
 /** Lists open, fixed-unpinned and test-pinned entries whose pin is not currently proven (a stale pin must not hide a finding). */
 export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
   const holds = (entry) => {
-    if (entry.status !== 'test-pinned' || entry.variants?.length || !entry.finding?.file || !(entry.finding.line > 0) || typeof pinStillHolds !== 'function') return false;
+    if (!suppressible(entry) || typeof pinStillHolds !== 'function') return false;
     try { return pinStillHolds(structuredClone(entry)) === true; } catch { return false; }
   };
   const entries = ledger.entries.filter(entry => !holds(entry));

@@ -394,3 +394,13 @@ describe('audit round 11 hardening', () => {
     expect(renderOpenForBrief(pin(finding({ line: undefined })), { pinStillHolds: () => true })).toContain(SUMMARY);
   });
 });
+
+describe('audit round 12 hardening', () => {
+  it('fractional-line and pinless entries stay in the brief', () => {
+    const a = finding({ line: 12.5 });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(renderOpenForBrief(l, { pinStillHolds: () => true })).toContain(SUMMARY);
+    const p = pinned(); p.entries[0].pinningTest = null;
+    expect(renderOpenForBrief(p, { pinStillHolds: () => true })).toContain(SUMMARY);
+  });
+});
