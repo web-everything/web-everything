@@ -1,0 +1,108 @@
+{% from "display-toolbar.njk" import displayToolbar %}
+{% import "backlog-badges.njk" as bk with context %}
+{# Select before rendering: resolved history must never add tile bytes to /backlog/. #}
+{% set gridItems = [] %}
+{% for item in backlog %}
+{% if (resolvedView and item.status == 'resolved') or (not resolvedView and item.status != 'resolved') %}
+{% set gridItems = (gridItems.push(item), gridItems) %}
+{% endif %}
+{% endfor %}
+{% set statusOrder = ["resolved"] if resolvedView else ["open", "active", "preparing", "parked", "closed"] %}
+{# Item kinds present in the backlog, in preferred order — the one merged nature+hierarchy axis (#466/#487). #}
+{% set kindOrder = ["feature", "story", "epic", "task", "decision", "investigation"] %}
+{% set kindChips = [] %}
+{% for k in kindOrder %}{% if (gridItems | where("kind", k) | length) %}{% set kindChips = (kindChips.push(k), kindChips) %}{% endif %}{% endfor %}
+{# Agile-point estimates, in Fibonacci order; only sizes actually present become chips. #}
+{% set sizeOrder = [1, 2, 3, 5, 8, 13] %}
+{% set sizeChips = [] %}
+{% for s in sizeOrder %}{% if (gridItems | where("size", s) | length) %}{% set sizeChips = (sizeChips.push(s), sizeChips) %}{% endif %}{% endfor %}
+{# Agent-readiness tiers actually present (only open items carry one); chip lets you filter to Tier A. #}
+{% set tierOrder = ["A", "B", "C"] %}
+{% set tierChips = [] %}
+{% for t in tierOrder %}{% if (gridItems | where("tier", t) | length) %}{% set tierChips = (tierChips.push(t), tierChips) %}{% endif %}{% endfor %}
+<section class="mb-12" data-status-default-exclude="{{ '' if resolvedView else 'closed' }}">
+    <h2 class="section-title">{{ 'Resolved work' if resolvedView else 'Tracked work' }} <span class="count-badge" data-count-target>{{ gridItems | length }}</span></h2>
+    {% if resolvedView %}<p class="section-desc">Delivered stories, epics, tasks, and decisions. Filter by kind, size, or keyword, or switch to a compact list.</p>{% else %}<p class="section-desc">Stories, epics, tasks, and decisions — ordered by status. Filter by status, kind, or keyword, or switch to a compact list. Resolved history has its own <a href="/backlog/resolved/">resolved work page</a>.</p>{% endif %}
+    <div class="backlog-filter-row">
+        <div class="filter-groups">
+            <div class="status-filter" role="group" aria-label="Filter by status">
+                {# SSR defaults match home-display.js; resolved history is visible in its own view. #}
+                {% for s in statusOrder %}
+                <we-filter-chip data-status-chip="{{ s }}"{% if s != 'closed' %} selected class="fui-filter-chip--selected"{% endif %}>{{ s | title }}</we-filter-chip>
+                {% endfor %}
+            </div>
+            <div class="status-filter" role="group" aria-label="Filter by kind">
+                {% for k in kindChips %}
+                <we-filter-chip data-kind-chip="{{ k }}" selected class="fui-filter-chip--selected" title="{% if k == 'feature' %}grouping tier above epic — product-level grouping epics roll up into{% elif k == 'epic' %}umbrella — rolls up child stories/tasks{% elif k == 'task' %}bounded sub-work under a parent{% elif k == 'decision' %}a design fork to ratify (Tier B){% else %}an independently valuable, sized deliverable{% endif %}">{{ k | title }}</we-filter-chip>
+                {% endfor %}
+            </div>
+            {% if sizeChips | length %}
+            <div class="status-filter" role="group" aria-label="Filter by size">
+                {% for s in sizeChips %}
+                <we-filter-chip data-size-chip="{{ s }}" selected class="fui-filter-chip--selected">{{ s }} pt{% if s != 1 %}s{% endif %}</we-filter-chip>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if tierChips | length %}
+            <div class="status-filter" role="group" aria-label="Filter by agent-readiness">
+                {% for t in tierChips %}
+                <we-filter-chip data-tier-chip="{{ t }}" selected class="fui-filter-chip--selected" title="{{ backlogMeta.tierMeaning[t] }}">{{ backlogMeta.tierLabel[t] }}</we-filter-chip>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+        {{ displayToolbar("backlog") }}
+    </div>
+    {# Legend for the "Contains" circles on epic tiles — each child is a numbered circle coloured by the
+       SAME agent-readiness palette as the dependency-graph nodes. Only shown if some epic has children. #}
+    {% set hasEpicChildren = false %}
+    {% for item in gridItems %}{% if item.children | length %}{% set hasEpicChildren = true %}{% endif %}{% endfor %}
+    {% if hasEpicChildren %}
+    <details class="bk-collapse" data-persist="legend-epic-children" open>
+    <summary>Readiness legend</summary>
+    <div class="epic-children-legend" style="display:flex; flex-wrap:wrap; align-items:center; gap:0.4rem 1rem; margin:0.5rem 0 1rem; font-size:0.8em; color:var(--color-text-muted);">
+        <span style="flex-basis:100%; font-weight:600;">Epic tiles list the items they <strong style="text-transform:uppercase; letter-spacing:0.03em; font-weight:700;">contain</strong> as numbered circles, coloured by readiness:</span>
+        <span style="display:inline-flex; align-items:center; gap:0.35rem;"><span style="width:14px; height:14px; border-radius:50%; background:#dcfce7; border:1.5px solid #16a34a;"></span><strong style="color:#166534;">Agent-ready</strong></span>
+        <span style="display:inline-flex; align-items:center; gap:0.35rem;"><span style="width:14px; height:14px; border-radius:50%; background:#fef3c7; border:1.5px solid #d97706;"></span><strong style="color:#92400e;">Decision-ready</strong></span>
+        <span style="display:inline-flex; align-items:center; gap:0.35rem;"><span style="width:14px; height:14px; border-radius:50%; background:#f1f5f9; border:1.5px solid #94a3b8;"></span><strong style="color:#475569;">Not ready</strong></span>
+        <span style="display:inline-flex; align-items:center; gap:0.35rem;"><span style="width:14px; height:14px; border-radius:50%; background:#dbeafe; border:1.5px solid #2563eb;"></span><strong style="color:#1e40af;">In progress</strong></span>
+        <span style="display:inline-flex; align-items:center; gap:0.35rem;"><span style="width:14px; height:14px; border-radius:50%; background:#f8fafc; border:1.5px solid #cbd5e1;"></span>Resolved</span>
+    </div>
+    </details>
+    {% endif %}
+    {# Legend for the `unsliced · <why>` badge — why a childless epic (or feature — #2998 epic-parity: the
+       grouping tier ABOVE epic gets the same badge via epicStatusBadge) has no child slices yet. Only shown
+       if some childless epic/feature carries a recorded reason. Colours match childlessReasonMeta / the badges. #}
+    {% set hasUnslicedReason = false %}
+    {% for item in gridItems %}{% if (item.kind == 'epic' or item.kind == 'feature') and not (item.children | length) and item.childlessReason %}{% set hasUnslicedReason = true %}{% endif %}{% endfor %}
+    {% if hasUnslicedReason %}
+    <details class="bk-collapse" data-persist="legend-unsliced" open>
+    <summary>Epic status legend</summary>
+    <div class="unsliced-legend" style="display:flex; flex-wrap:wrap; align-items:center; gap:0.4rem 1rem; margin:0.5rem 0 1rem; font-size:0.8em; color:var(--color-text-muted);">
+        <span style="flex-basis:100%; font-weight:600;">An <strong style="text-transform:uppercase; letter-spacing:0.03em; font-weight:700;">unsliced</strong> epic has no child stories cut yet; the tag says <em>why</em>:</span>
+        {% for key, m in backlogMeta.childlessReasonMeta %}
+        <span style="display:inline-flex; align-items:center; gap:0.4rem;" title="{{ m.tip }}"><span style="padding:0.05rem 0.45rem; border-radius:9999px; font-size:0.92em; font-weight:700; text-transform:uppercase; letter-spacing:0.03em; background:{{ m.bg }}; color:{{ m.fg }};">{{ m.label }}</span><span>{% if key == 'blocked' %}waiting on prerequisites (see Blocked-by){% elif key == 'undecided' %}open decisions set where the slices fall{% elif key == 'untriaged' %}candidates to promote / fold / drop first{% else %}continuous program — no fixed child stories{% endif %}</span></span>
+        {% endfor %}
+        <span style="flex-basis:100%; font-weight:600; margin-top:0.2rem;">A <em>storied</em> epic (one with child slices) may also flag its completion state:</span>
+        <span style="display:inline-flex; align-items:center; gap:0.4rem;" title="Every child slice is resolved but the epic is still open — its scope looks delivered. Review the epic: resolve it, or add the remaining child work."><span style="padding:0.05rem 0.45rem; border-radius:9999px; font-size:0.92em; font-weight:700; text-transform:uppercase; letter-spacing:0.03em; background:#dcfce7; color:#166534;">all slices done</span><span>every child resolved — review &amp; resolve the epic (or add stories)</span></span>
+        <span style="display:inline-flex; align-items:center; gap:0.4rem;" title="The epic is resolved but some child slice is still open — a contradiction. Reopen the epic, re-parent, or resolve the children."><span style="padding:0.05rem 0.45rem; border-radius:9999px; font-size:0.92em; font-weight:700; text-transform:uppercase; letter-spacing:0.03em; background:#fef2f2; color:#991b1b;">&#9888; open slice</span><span>epic resolved but a child is still open — contradiction to fix</span></span>
+    </div>
+    </details>
+    {% endif %}
+    {# #2018 (keystone #2016): the tracked-work tiles are SSR'd from our `we-card` at BUILD TIME. Each
+       item's inner body (the badge/tag row, blockers, summary, epic-children circles, and meta links) is
+       still composed HERE by the SHARED `backlog-badges.njk` macros — the anti-drift single source of
+       truth — captured per-item into `backlogTiles`, then `weBacklogGrid` shells out to the pinned FUI
+       build-CLI in ONE subprocess batch (render-from-data per #2007) and wraps each captured body in a real
+       `<article class="fui-card">` (the `#num Title` becomes the card title). Correct with JS off,
+       view-source-visible; the transient `<we-card>` client upgrade (base.njk) is a pure enhancement, and
+       the badge/tag children stay transient-CE as before. The outer `.project-card` chrome (grid layout +
+       the `data-status/kind/size/tier` filter facets `home-display.js` reads + the `.project-card-link`
+       overlay) is emitted by the filter around the SSR card. #}
+    {% set backlogTiles = [] %}
+    {% for group in statusOrder %}{% for item in gridItems %}{% if item.status == group %}
+    {% set inner %}<div class="backlog-badges" style="margin-bottom: 0.6rem; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;">{{ bk.kindBadge(item.kind) }}{{ bk.statusBadge(item.status) }}{{ bk.closedBadge(item) }}{{ bk.buildStateBadge(item.buildState) }}{% if item.size %}{{ bk.sizeBadge(item.size) }}{% endif %}{{ bk.tierBadge(item.tier) }}{{ bk.unshapedScopeBadge(item) }}{{ bk.epicStatusBadge(item) }}{{ bk.reasonPill(item) }}</div>{% if item.blockers | length %}<div class="backlog-blockers" style="position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin: 0 0 0.6rem;"><span style="font-size: 0.72em; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.03em; font-weight: 600;">Blocked by</span>{% for b in item.blockers %}{{ bk.blockerChip(b) }}{% endfor %}</div>{% endif %}<p class="backlog-summary" style="margin: 0 0 0.75rem 0; color: var(--color-text-muted); font-size: 0.9em;">{{ item.summary }}</p>{% if item.children | length %}<div class="epic-children" style="position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin: 0 0 0.75rem;"><span style="font-size: 0.72em; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.03em; font-weight: 600;">Contains</span>{% for child in item.children %}{{ bk.childCircle(child) }}{% endfor %}</div>{% endif %}<div class="backlog-meta">{{ bk.tagsRow(item.tags) }}<div style="display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8em;">{% if item.crossRef %}<a href="{{ item.crossRef.url }}" style="color: var(--color-primary); text-decoration: none;">&rarr; {{ item.crossRef.label }}</a>{% endif %}{% if item.relatedProject %}<a href="/projects/{{ item.relatedProject }}/" style="color: var(--color-primary); text-decoration: none;">&rarr; project: {{ item.relatedProject }}</a>{% endif %}{% if item.relatedReport %}<span style="color: var(--color-text-muted); font-family: var(--font-mono, monospace);">report{% if item.reportDate %} · {{ item.reportDate }}{% endif %}: {{ item.relatedReport }}</span>{% endif %}{% if item.graduatedTo %}<span style="color: #166534; font-weight: 600;">graduated &rarr; {{ item.graduatedTo }}</span>{% endif %}</div></div>{% endset %}
+    {% set backlogTiles = (backlogTiles.push({ id: item.id, num: item.num, title: item.title, status: item.status, kind: item.kind, size: item.size, tier: item.tier, innerHtml: inner }), backlogTiles) %}
+    {% endif %}{% endfor %}{% endfor %}
+    {{ backlogTiles | weBacklogGrid | safe }}
+</section>

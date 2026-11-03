@@ -86,6 +86,31 @@ describe('dispatch-eligibility: holds', () => {
   it.each(['promote-draft', 'main-fix-green'])('%s: draft exception dispatches', population => {
     expect(eligibility(pr({ isDraft: true }), clean(population))).toMatchObject({ dispatch: true });
   });
+  it.each(['red-team:blocked', 'red-team:pending'])('a draft labelled %s cannot use a promotion exemption', label => {
+    const bound = known({ state: 'send-back', resultId: 'r1', sendBackResultId: 'r1' });
+    for (const population of ['promote-draft', 'main-fix-green']) {
+      for (const labels of [[label], [{ name: label }]]) {
+        expect(eligibility(pr({ isDraft: true, labels }), withFact(population, 'redTeam', bound)))
+          .toEqual({ hold: REASONS.DRAFT });
+      }
+    }
+  });
+  it.each(['red-team:blocked', 'red-team:pending'])('a draft labelled %s allows only a live-bound send-back repair', label => {
+    for (const labels of [[label], [{ name: label }]]) {
+      const state = pr({ isDraft: true, labels });
+      const bound = known({ state: 'send-back', resultId: 'r1', sendBackResultId: 'r1' });
+      expect(eligibility(state, withFact('red-team-send-back', 'redTeam', bound))).toMatchObject({ dispatch: true });
+      for (const redTeam of [
+        known({ state: 'send-back', resultId: 'r2', sendBackResultId: 'r1' }),
+        known({ state: 'send-back', resultId: null, sendBackResultId: null }),
+        known({ state: 'held', resultId: 'r1', sendBackResultId: null }),
+        known({ state: 'blocked', resultId: 'r1', sendBackResultId: null }),
+        known({ state: 'pending', resultId: 'r1', sendBackResultId: null }),
+      ]) {
+        expect(eligibility(state, withFact('red-team-send-back', 'redTeam', redTeam))).toEqual({ hold: REASONS.DRAFT });
+      }
+    }
+  });
   it('red-team-send-back: draft allowed ONLY for a send-back bound to the live result', () => {
     const bound = known({ state: 'send-back', resultId: 'r1', sendBackResultId: 'r1' });
     expect(eligibility(pr({ isDraft: true }), withFact('red-team-send-back', 'redTeam', bound))).toMatchObject({ dispatch: true });

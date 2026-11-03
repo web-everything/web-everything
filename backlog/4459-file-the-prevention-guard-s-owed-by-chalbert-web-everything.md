@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/sweep-orphan-backlog-cards.mjs", "we:scripts/operations/__tests__/sweep-orphan-backlog-cards.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-11-01"
-preparedAgainstSha: "f2f29efc53968a5f81915c02718717bfe832bb38"
+preparedDate: "2026-11-03"
+preparedAgainstSha: "3ad6c4114ae1bd031a903c786de603faef122335"
 tags: []
 ---
 
@@ -76,3 +76,5 @@ All matching source tests live in `we:scripts/operations/__tests__/sweep-orphan-
 
 - Simultaneous sweeps can both observe no open PR before either publishes. Atomic reservation is outside the review's sequential re-run guard; capture a separate follow-up if simultaneous execution must be supported. Do not describe this check as a lock.
 - No global retry-loop lint, shared exec helper or source-clone cleanup is required here. The owed conventions and local regression tests are part of this item, not deferred work.
+
+revalidated: The supplied diff adds testing conventions without changing the sweep implementation, preparation premises, scope, or required proof plan.

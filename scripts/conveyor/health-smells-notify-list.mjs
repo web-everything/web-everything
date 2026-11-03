@@ -45,6 +45,9 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'red-pr-unattended',
   'repeated-pr-attempts', // Operator rule, 2026-09-30: surface repeated trials per PR.
   'pr-no-owner',
+  // Operator order R437, 2026-11-02: PR movement and stage stalls notify in shadow.
+  'pr-no-movement',
+  'pr-stage-stall',
   'daemon-silent',
   'build-session-idle',    // Operator order, 2026-10-06: supervise build/prepare so models never spin for nothing.
   'build-session-overrun',

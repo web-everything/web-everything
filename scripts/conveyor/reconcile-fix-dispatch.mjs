@@ -153,6 +153,7 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
 import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
 import { FIX_SETTINGS_DEFAULTS, resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, launchProvedNotStarted, withTakeover } from './fix-takeover.mjs';
 import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
+import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from './dispatch-eligibility-shadow.mjs';
 // Takeover budget — takeover 2+ is briefed with the previous takeover's diff and the review that rejected it.
 import { renderPreviousTakeover } from './takeover-budget.mjs';
 // Card xrbu1bp — resume the previous round's fixer session; the stronger-model rung from round 3.
@@ -1797,6 +1798,7 @@ export function classifyEnvFaultRefusals(refusals) {
  *   print the reconcile layer's real reason instead of discarding it to a count.
  */
 export function runReconcileFixDispatch({
+  shadowDeps,
   root = REPO_ROOT,
   repo = null,
   findItemFn = findItem,
@@ -1965,6 +1967,16 @@ export function runReconcileFixDispatch({
     const idle = planFixesFromReconcile([synthetic], findItemFn, loadItems, resolveFallbackScope,
       repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true });
     planRefusals.push(...idle.refusals);
+    try {
+      // planFixesFromReconcile drops kind and renames prNumber to pr; adapt only the shadow copy.
+      const dispatch = idle.planned.map(entry => ({ ...entry, kind: entry.kind ?? synthetic.kind, prNumber: entry.pr }))
+        .filter(entry => ['fix', 'ci-heal'].includes(entry.kind));
+      if (dispatch.length) {
+        const deps = eligibilityShadowDeps({ hermetic: isUnderTestEnv() || !!shadowDeps || reconcile !== runReconcilePass, ...shadowDeps });
+        runEligibilityShadow({ ...deps, dispatch,
+          prs: [{ ...synthetic, number: synthetic.prNumber }], pathId: 'reconcile-fix-dispatch-idle-restack' });
+      }
+    } catch (error) { reportShadowError(error); }
     const ordered = applyStackOrder(idle.planned, stacks, { settings: prStackSettings, used: restackedHeads });
     // An idle top is only ever dispatched for its restack, so a release to ordinary dispatch is not one: say nothing of it.
     stackOrder.refusals.push(...ordered.refusals.filter(r => r.kind !== 'stacked-above-aged'));
