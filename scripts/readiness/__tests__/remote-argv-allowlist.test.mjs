@@ -28,8 +28,6 @@ function mainGateArgv() {
 describe('client argv compatibility with the unchanged Forge allowlist', () => {
   it.each([
     ['verify-lane main gate', mainGateArgv],
-    ['verify-lane isolated retry', () => isolatedRetryArgv(files, timeouts)],
-    ['verify-base-rerun', () => baseRerunArgv(files)],
     ['verify-shard-run after heavy-admission run --', () => shardRunArgv(files.map(f => `./${f}`), timeouts)],
   ])('accepts the real %s argv after normalization', (_name, build) => {
     const argv = build(), original = [...argv];
@@ -42,10 +40,10 @@ describe('client argv compatibility with the unchanged Forge allowlist', () => {
     }
   });
 
-  it.each(['--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism'])('drops only remote worker control %s', flag => {
+  it.each(['--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism'])('preserves local-only worker control %s', flag => {
     const argv = ['npx', 'vitest', 'run', files[0], flag];
     expect(allowedCommand(argv)).toBe(false);
-    expect(remote.normalizeRemoteArgv(argv)).toEqual(argv.slice(0, -1));
+    expect(remote.normalizeRemoteArgv(argv)).toEqual(argv);
   });
 
   it.each([
@@ -71,9 +69,17 @@ describe('client argv compatibility with the unchanged Forge allowlist', () => {
     expect(allowedCommand(remote.normalizeRemoteArgv(argv))).toBe(false);
   });
 
-  it('normalizes before the transport allowlist check', async () => {
-    const exec = vi.fn(async () => { throw Error('transport probe'); });
-    const result = await remote.runRemote({ argv: isolatedRetryArgv(files, timeouts), exec });
-    expect(result.reason).not.toBe('command-not-allowed');
+  it.each([
+    ['verify-lane isolated retry', () => isolatedRetryArgv(files, timeouts)],
+    ['verify-base-rerun', () => baseRerunArgv(files)],
+  ])('%s is local-only by design', async (_name, build) => {
+    const argv = build(), exec = vi.fn(), stage = vi.fn();
+    expect(remote.normalizeRemoteArgv(argv)).toEqual(argv.map(arg => arg.startsWith('./') ? arg.slice(2) : arg));
+    expect(argv).toEqual(expect.arrayContaining(['--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism']));
+    expect(allowedCommand(remote.normalizeRemoteArgv(argv))).toBe(false);
+    expect(await remote.runRemote({ argv, exec, fs: { mkdtemp: stage } }))
+      .toMatchObject({ reason: 'command-not-allowed' });
+    expect(exec).not.toHaveBeenCalled();
+    expect(stage).not.toHaveBeenCalled();
   });
 });

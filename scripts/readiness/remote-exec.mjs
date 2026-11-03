@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
-import { isBuiltin } from 'node:module';
 import * as filesystem from 'node:fs/promises';
 import { constants, mkdirSync, lstatSync, realpathSync } from 'node:fs';
 import { join, resolve, relative, dirname, isAbsolute, win32 } from 'node:path';
@@ -75,7 +74,7 @@ export function isAllowedCommand(argv) {
   return allowedCommand(argv);
 }
 
-/** Adapt local Vitest spellings to Forge's fixed command contract and worker policy. */
+/** Strip leading ./ from Vitest file arguments without changing execution policy. */
 export function normalizeRemoteArgv(argv) {
   if (!Array.isArray(argv) || !argv.every(arg => typeof arg === 'string')
     || argv[0] !== 'npx' || argv[1] !== 'vitest' || !['run', 'related'].includes(argv[2])) return argv;
@@ -86,8 +85,6 @@ export function normalizeRemoteArgv(argv) {
     if (arg === '-t' || arg === '--config') {
       normalized.push(arg);
       if (++i < argv.length) normalized.push(argv[i]);
-    } else if (arg === '--no-file-parallelism' || /^--(?:maxWorkers|minWorkers)=/.test(arg)) {
-      // Forge owns concurrency for the admitted remote slot.
     } else {
       normalized.push(arg.startsWith('./') ? arg.slice(2) : arg);
     }
@@ -329,91 +326,8 @@ function matchesTestFilters(path, filters, cwd) {
     || name.includes(relative(cwd, resolve(cwd, filter)).toLocaleLowerCase()));
 }
 
-// A literal-only dependency list cannot certify runtime-resolved loaders.
-// Refuse unknown loader expressions while ignored tests would be omitted.
-function assertLiteralDependencyLoading(ts, source, path) {
-  const tree = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
-  const unresolved = () => { throw manifestRefusal('unresolved-test-dependency', path); };
-  if (tree.parseDiagnostics.length) unresolved();
-  function visit(node) {
-    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
-      && !ts.isStringLiteral(node.arguments[0])) unresolved();
-    if (ts.isIdentifier(node) && node.text === 'require') {
-      const call = node.parent;
-      if (!ts.isCallExpression(call) || call.expression !== node || call.arguments.length !== 1
-        || !ts.isStringLiteral(call.arguments[0])) unresolved();
-    }
-    // Factory-created/aliased loaders and glob discovery require runtime evidence.
-    if (ts.isIdentifier(node) && node.text === 'createRequire') unresolved();
-    if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression)
-      && ['require','createRequire'].includes(node.argumentExpression.text)) unresolved();
-    if (ts.isPropertyAccessExpression(node) && ts.isMetaProperty(node.expression)
-      && node.expression.keywordToken === ts.SyntaxKind.ImportKeyword
-      && ['glob','globEager'].includes(node.name.text)) unresolved();
-    ts.forEachChild(node, visit);
-  }
-  visit(tree);
-}
-
-// Follow literal local imports through helpers as well as direct test imports.
-// Unknown/unreadable or oversized dependency evidence keeps local admission.
-async function selectedDependencyPaths({cwd, fs, selectedTests, ignoredTests}) {
-  const paths = new Set(selectedTests.map(path => relative(cwd, resolve(cwd, path))));
-  if (!ignoredTests.length) return paths;
-  // Configuration can load tests through setupFiles/globalSetup (including
-  // computed values and imported helpers), independently of selected imports.
-  // Until that execution graph is certified, keep local admission rather than
-  // dropping ignored files it might need. Inspect disk, not just Git's inventory:
-  // configuration itself can be ignored or omitted by an injected file listing.
-  let rootNames;
-  try { rootNames = await fs.readdir(cwd); }
-  catch { throw manifestRefusal('unresolved-test-dependency', '.'); }
-  const config = rootNames.sort().find(name =>
-    /^(?:(?:vitest|vite)(?:\.[^.]+)*\.config|vitest\.workspace)\.[cm]?[jt]s$/.test(name));
-  if (config) throw manifestRefusal('unresolved-test-dependency', config);
-  const ts = await import('typescript');
-  const ignored = new Set(ignoredTests.map(path => path.toString()));
-  let bytes = 0;
-  for (const path of paths) {
-    if (ignored.has(path)) throw manifestRefusal('ignored-test-file', path);
-    if (paths.size > 10000) throw manifestRefusal('manifest-walk-limit', path);
-    // Do not follow symlinks while discovering imports.
-    const parts = pathParts(Buffer.from(path));
-    let component = Buffer.from(cwd);
-    for (const part of parts) {
-      component = bytePath(component, part);
-      const st = await fs.lstat(component);
-      if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink', path);
-    }
-    const stat = await fs.lstat(bytePath(cwd, Buffer.from(path)));
-    if (!stat.isFile() || (bytes += stat.size) > LIMIT) throw manifestRefusal('manifest-walk-limit', path);
-    const source = await fs.readFile(bytePath(cwd, Buffer.from(path)), 'utf8');
-    assertLiteralDependencyLoading(ts, source, path);
-    for (const {fileName} of ts.preProcessFile(source, true, true).importedFiles) {
-      if (isBuiltin(fileName)) continue;
-      // Package imports, self-references and aliases can resolve to ignored
-      // local tests too. Their graph is not certified by relative traversal.
-      if (!fileName.startsWith('.')) throw manifestRefusal('unresolved-test-dependency', path);
-      const target = relative(cwd, resolve(cwd, dirname(path), fileName));
-      if (target === '..' || target.startsWith('../')) throw manifestRefusal('manifest-worktree-mismatch', target);
-      const stem = target.replace(/\.[cm]?jsx?$/, '');
-      const candidates = [target, ...['.ts','.tsx','.mts','.cts','.js','.jsx','.mjs','.cjs'].map(ext => stem+ext),
-        ...['.ts','.tsx','.js','.mjs'].map(ext => target+'/index'+ext)];
-      let found;
-      for (const candidate of candidates) {
-        try { if ((await fs.lstat(bytePath(cwd, Buffer.from(candidate)))).isFile()) {found=candidate; break;} }
-        catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
-      }
-      if (!found) throw manifestRefusal('manifest-worktree-mismatch', target);
-      if (ignored.has(found)) throw manifestRefusal('ignored-test-file', found);
-      if (/\.[cm]?[jt]sx?$/.test(found)) paths.add(found);
-    }
-  }
-  return paths;
-}
-
 // Walk independently of Git's inventory. Never follow a directory link.
-async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,selectedPaths,exec,head,rootInfo,scoped}) {
+async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,skippedIgnoredTests,exec,head,rootInfo,scoped}) {
   const shipped=new Map(entries.map(entry=>[entry.path.toString('hex'),entry]));
   const walked=new Map();
   let count=0,bytes=0;
@@ -437,8 +351,8 @@ async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedL
       }
       if(st.isDirectory())await walk(absolute,path);
       else if(st.isFile()) {
-        // Unselected ignored tests are stale artifacts, not transport inputs.
-        if(isTestFile(path)&&ignoredPaths.has(key)&&selectedPaths&&!selectedPaths.has(path.toString()))continue;
+        // Only ignored tests in certified generated top-level directories may be omitted.
+        if(skippedIgnoredTests.has(key))continue;
         if(isTestFile(path)&&!shipped.has(key))throw manifestRefusal('unshipped-test-file',path);
         // Ignored leaves may become tests or excluded paths through directory
         // aliases. Follow projections transitively, sharing the walk's limits.
@@ -523,14 +437,6 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
   }
-  const matchingTests = selectedTests?.length
-    ? files.filter(path => isTestFile(path) && matchesTestFilters(path, selectedTests, cwd)).map(path => path.toString()) : [];
-  const selectedPaths = selectedTests?.length
-    ? await selectedDependencyPaths({cwd,fs,selectedTests:[...selectedTests,...matchingTests],ignoredTests}) : null;
-  if (selectedPaths) {
-    const skipped = new Set(ignoredTests.map(path => path.toString('hex')));
-    files = files.filter(path => !skipped.has(path.toString('hex')));
-  }
   // Only this ignored coverage input is transportable; it uses the same leaf
   // safety checks and digests below as ordinary inventory entries.
   if (!trackedOnly) files.push(...ignoredPaths.filter(path => path.equals(Buffer.from('coverage/coverage-final.json'))));
@@ -553,6 +459,18 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
   }
+  // Use the complete Git index, never the transport inventory or an import graph.
+  // Root-level tests have no generated directory and therefore always stay local.
+  const trackedTopLevels = new Set([...indexBlobs.keys()].map(key =>
+    pathParts(Buffer.from(key, 'base64'))[0].toString('hex')));
+  const skippedIgnoredTests = new Set();
+  for (const path of ignoredTests) {
+    const parts = pathParts(path);
+    if (parts.length < 2 || trackedTopLevels.has(parts[0].toString('hex')))
+      throw manifestRefusal('ignored-test-file', path);
+    skippedIgnoredTests.add(path.toString('hex'));
+  }
+  files = files.filter(path => !skippedIgnoredTests.has(path.toString('hex')));
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
     const link={linkPath:Buffer.from(key,'base64'),linkOid:indexBlobs.get(key)};
@@ -753,7 +671,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     }
   }
   try {await timed(beginSub,'cross-check',()=>crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,
-    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),selectedPaths,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles}));}
+    ignoredPaths:new Set(ignoredPaths.map(path=>path.toString('hex'))),skippedIgnoredTests,exec,head,rootInfo,scoped:trackedOnly&&!!listFiles}));}
   catch(error) {throw error.code?.startsWith('manifest-')||['unshipped-test-file','unshipped-symlink'].includes(error.code)
     ? error : manifestRefusal('manifest-worktree-mismatch',error.detail??(error.path?relative(cwd,Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path):'.'));}
   const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
@@ -1369,7 +1287,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unresolved-test-dependency','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');

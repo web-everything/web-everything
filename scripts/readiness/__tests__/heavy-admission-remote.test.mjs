@@ -109,11 +109,13 @@ describe('remote admission policy', () => {
     }
   });
 
-  it('runs unsupported check:standards arguments locally with a reason and no remote staging',async()=>{
+  it.each([
+    ['unsupported standards', ['npm','run','check:standards','--','--unknown']],
+    ['serial retry local-only by design', ['npx','vitest','run','scripts/example.test.mjs','--maxWorkers=1','--minWorkers=1','--no-file-parallelism']],
+  ])('runs %s locally with a reason and no remote staging',async(_name,command)=>{
     const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
     const preferences=join(root,'preferences.json');
     writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
-    const command=['npm','run','check:standards','--','--unknown'];
     const exited=new Error('test exit'),transport=vi.fn(),stage=vi.fn();
     const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
     const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);

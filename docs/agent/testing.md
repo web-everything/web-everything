@@ -3726,23 +3726,30 @@ workspace selection or include patterns omit `b.test.mjs` from `globTestFiles(fi
 Static imports, re-exports, dynamic imports and imports through helpers all need the
 dependency bytes at execution time. Discovery alone is insufficient evidence for omission.
 
-Full and delta manifest admission therefore retain `ignored-test-file` local fallback for
-every ignored test-shaped file outside dependency/Git internals. The independent filesystem
-walk also refuses unshipped tests (`unshipped-test-file`) and ignored leaves projected into
-test paths by tracked directory aliases (`unshipped-symlink`), including nested aliases.
-No discovery result, argv, environment, warm base or retry exempts those checks. Until
-dependency inclusion can be established, use local execution through heavy admission.
-The refusal names the path; no remote prepare, transfer or execution follows it.
+Full and delta manifest admission refuse `ignored-test-file` with the path for unknown
+selection (whole-suite runs), selected ignored tests, and ignored tests whose top-level
+directory contains any Git-tracked file. Root-level ignored tests also refuse. Only an
+unselected ignored test inside a top-level directory with zero tracked files may be omitted
+as generated output (for example `_site/` or `_site-visual-fixtures/`). The complete Git index,
+not the transport inventory, establishes that directory boundary; unavailable index evidence
+keeps execution local. Do not traverse imports or use test discovery to relax this rule.
+This directory rule does not establish execution dependency closure: a selected test can
+import an omitted ignored test beneath a generated directory. Such imports may fail remotely
+or be caught by the test. The named generated-directory import regression pins this deliberate
+policy boundary for full and delta manifests; selecting the ignored test itself still refuses.
+Requiring reachability-based refusal would change this policy and must not be added as an
+import-traversal repair.
 
-`forge-test-selection.mjs` remains a bounded diagnostic of test entry points, separate from
-manifest admission. Its native child resolves the lane's Vitest and physical cwd, mirrors the
-CLI environment prelude and closes discovery without running tests. Its 60-second SIGKILL
-deadline, 4 MiB output bound and conservative error handling do not prove dependency closure.
-Keep the real-Vitest regression showing that an ignored dependency executes despite being
-absent from discovery, along with full/delta and pre-transport refusal tests for all import
-shapes and the filesystem/alias checks. Invalid environments continue to retain manifest
-refusal without launching discovery. Warm bases export tracked Git entries only, and policy
-exclusions still refuse test-shaped entries.
+The independent filesystem walk still refuses unshipped tests (`unshipped-test-file`) and
+ignored leaves projected into test paths by tracked directory aliases (`unshipped-symlink`).
+Keep full/delta tests for omitted generated tests and pre-transport refusals for selected
+ignored tests, unknown selection and ignored tests beside tracked files.
+
+Remote argv normalization only removes a leading `./` from Vitest file arguments. Isolated
+verify-lane and verify-base-rerun retries are local-only by design: retain `--maxWorkers=1`,
+`--minWorkers=1` and `--no-file-parallelism`. Forge's unchanged allowlist refuses these flags;
+heavy-admission must log `command-not-allowed` and its local fallback without staging or
+remote transport. Main-gate and shard argv remain admissible.
 
 A credential-named alias is refused like any excluded path. The one exemption is the
 `.claude/agent-memory/` bridge's exact image of a tracked `agent-memory-src/` source-extension
