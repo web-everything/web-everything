@@ -99,6 +99,15 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     expect(list.lanes.map((l) => l.lane)).toContain(lane);
   });
 
+  it('a release of a lane with an unpushed commit does NOT publish it as free', () => {
+    const { lane } = acquireOneLane();
+    const dir = laneDir(lane);
+    writeFileSync(join(dir, 'new.txt'), 'x\n'); git(['add', 'new.txt'], dir); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'unpushed'], dir);
+    writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [] }));
+    runPool(['release', `--lane=${lane}`, ...poolArgs(), '--session=owner', '--json']);
+    expect(readFreeLaneList(listFile()).lanes.map((l) => l.lane)).not.toContain(lane);
+  });
+
   it('an acquire drops the lane from the list and keeps it fresh', () => {
     expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
     writeFileSync(listFile(), JSON.stringify({ v: 1, writtenAt: 1, repo: 'freepool', poolDir: null, lanes: [{ lane: 1 }] }));
@@ -106,6 +115,16 @@ describe('free-lane list is refreshed by lane-pool events', () => {
     const list = readFreeLaneList(listFile());
     expect(list.lanes.map((l) => l.lane)).not.toContain(a.lane);
     expect(isFreeLaneListFresh(list, Date.now(), 60_000)).toBe(true);
+  });
+});
+
+describe('touchFreeLaneList staleness', () => {
+  it('prunes carried entries older than the max age, so a touch never freshens old candidates', () => {
+    const f = join(mkdtempSync(join(tmpdir(), 'touch-')), 'l.json');
+    touchFreeLaneList({ path: f, repoName: 'r', poolDir: '/p', lane: 3, free: true, now: 0 });
+    touchFreeLaneList({ path: f, repoName: 'r', poolDir: '/p', lane: 4, free: true, now: 30_000 });
+    touchFreeLaneList({ path: f, repoName: 'r', poolDir: '/p', lane: 5, free: true, now: 700_000, maxAgeMs: 600_000 });
+    expect(readFreeLaneList(f).lanes.map((x) => x.lane)).toEqual([5]);
   });
 });
 
