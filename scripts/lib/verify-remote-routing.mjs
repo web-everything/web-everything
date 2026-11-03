@@ -109,10 +109,13 @@ export function phaseAdmissionPlan({ command, decision, cwd = process.cwd() }) {
 export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn } = {}) {
   // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
   // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
+  // Exit 75 from an ordinary nested command may be an admission deferral. Only the shard
+  // wrapper owns the UNSETTLED verdict; its guard below prevents an outer confirmation.
+  const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
   return !plan?.shardWrapper && plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
     && ranOn.failureLocation === 'remote'
     && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
-    && !timedOut && !verificationInfrastructureFailure({ exitCode, signal });
+    && !timedOut && (!infrastructure || infrastructure.reason === 'verify-unsettled');
 }
 
 // This is a preflight only. The nested wrapper remains the sole remote executor and fallback owner.

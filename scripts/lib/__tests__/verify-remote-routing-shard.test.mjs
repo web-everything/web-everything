@@ -56,3 +56,18 @@ it('ordinary local and remote plans stay unchanged', () => {
   expect(phaseAdmissionPlan({ command: 'npx vitest run a', decision: { remote: false } })).toEqual({ command: 'npx vitest run a', takeLocalSlot: true, setHeld: true });
   expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: 1, ranOn: { location: 'remote', failureLocation: 'remote' } })).toBe(true);
 });
+it.each([
+  ['remote deferral', { ranOn: { location: 'remote', failureLocation: 'remote' } }, true],
+  ['mixed remote deferral', { ranOn: { location: 'mixed', failureLocation: 'remote' } }, true],
+  ['local fallback', { ranOn: { location: 'local', failureLocation: 'local' } }, false],
+  ['mixed local failure', { ranOn: { location: 'mixed', failureLocation: 'local' } }, false],
+  ['unreported deferral', { ranOn: { location: 'unknown' } }, false],
+  ['successful remote prefix', { ranOn: { location: 'remote' } }, false],
+  ['watchdog timeout', { ranOn: { location: 'remote', failureLocation: 'remote' }, timedOut: true }, false],
+  ['signalled process', { ranOn: { location: 'remote', failureLocation: 'remote' }, signal: 'SIGTERM' }, false],
+])('exit 75 confirmation respects the shard boundary: %s', (_name, result, confirm) => {
+  for (const shardWrapper of [false, true]) {
+    expect(shouldConfirmRemoteRed({ plan: { takeLocalSlot: false, shardWrapper }, exitCode: 75, ...result }))
+      .toBe(!shardWrapper && confirm);
+  }
+});
