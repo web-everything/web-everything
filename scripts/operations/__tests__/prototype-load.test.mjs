@@ -2006,10 +2006,10 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   });
   it('the loader carries on a matching fingerprint and refuses on a differing or unreadable one', async () => {
     const audits = auditLines([old()]);
-    const ok = await auditedFixture('refuse', { audits, fingerprint: () => FP }).run();
+    const ok = await auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
     for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
-      const out = await auditedFixture('refuse', { audits, fingerprint }).run();
+      const out = await auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint }).run();
       expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
     }
   });
