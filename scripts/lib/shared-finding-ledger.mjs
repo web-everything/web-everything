@@ -31,7 +31,7 @@ function sameSpot(a, b) {
     && a.verdict === b.verdict && a.impactIfUnfixed === b.impactIfUnfixed;
 }
 
-const rawClaim = (f) => String(f?.summary ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+const rawClaim = (f) => String(f?.summary ?? '');
 
 function matches(entry, finding, { strict = false } = {}) {
   if (exactMatch(entry, finding)) return !strict || (rawClaim(entry.finding) === rawClaim(finding) && sameSpot(entry.finding, finding));

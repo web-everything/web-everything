@@ -374,3 +374,11 @@ describe('audit round 9 hardening', () => {
     expect(filterReraises(l, [finding({ line: -1 })], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
+
+describe('audit round 10 hardening', () => {
+  it('width-folded identifiers are not suppressed', () => {
+    const a = finding({ summary: 'AUTH_ADMIN bypasses authorization' });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [finding({ summary: 'ＡＵＴＨ_ADMIN bypasses authorization' })], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+});
