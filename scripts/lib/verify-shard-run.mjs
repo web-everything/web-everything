@@ -6,6 +6,9 @@ import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readRemoteReport, shouldConfirmRemoteRed, phaseRunLocation } from './verify-remote-routing.mjs';
 import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { boundFailureDetails } from './verify-failures.mjs';
+import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
+export { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 import { startTreeWatchdog } from './tree-watchdog.mjs';
 import { acquireSlotBlocking, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
@@ -44,18 +47,18 @@ export function splitVitestArgs(argv, count) {
   return { shards, flags };
 }
 
+function inventoryPath(name, cwd, receiptId) {
+  // Rebase only paths belonging to the completed remote run.
+  const remote = /^\/srv\/forge-exec\/(?:slot-[1-9]\d*\/)?(r-[a-f0-9]{32})\/work\/(.+)$/.exec(name);
+  if (remote && remote[2].split('/').some(part => part === '.' || part === '..')) throw Error('invalid remote inventory path');
+  return resolve(cwd, remote && remote[1] === receiptId ? remote[2] : name);
+}
+
 export function inventoryVerdict(text, files, cwd = process.cwd(), { receiptId } = {}) {
   try {
     const report = JSON.parse(text);
     if (!Array.isArray(report.testResults)) return 'INVENTORY-INCOMPLETE';
-    const results = new Map(report.testResults.map(r => {
-      // Forge runs the same repo at a different absolute root. Only rebase names
-      // belonging to the completed run, never arbitrary matching path suffixes.
-      const remote = /^\/srv\/forge-exec\/(?:slot-[1-9]\d*\/)?(r-[a-f0-9]{32})\/work\/(.+)$/.exec(r.name);
-      if (remote && remote[2].split('/').some(part => part === '.' || part === '..')) throw Error('invalid remote inventory path');
-      const name = remote && remote[1] === receiptId ? remote[2] : r.name;
-      return [resolve(cwd, name), r];
-    }));
+    const results = new Map(report.testResults.map(r => [inventoryPath(r.name, cwd, receiptId), r]));
     const assigned = files.map(f => results.get(resolve(cwd, f)));
     // A suite reported but skipped/pending is not execution evidence.
     if (assigned.some(r => !r || !['passed', 'failed'].includes(r.status)
@@ -164,7 +167,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     const found = planned.length ? discover({ files: planned, cwd }) : null;
     let excluded = found ? planned.filter(f => !found.has(canonical(resolve(cwd, f)))) : [];
     // Discovery that rejects EVERY selected file is more likely a path/config mismatch than a fully excluded selection:
-    // keep them all so any file that really cannot run shows up as INVENTORY-INCOMPLETE (red) instead of a vacuous green.
+    // keep them all so any file that really cannot run shows up as incomplete inventory instead of a vacuous green.
     if (excluded.length === planned.length) excluded = [];
     if (excluded.length) {
       log(`verify-shards: NOTE ${excluded.length} selected file(s) are excluded by the vitest config (never runnable here or in CI), not run: ${excluded.join(' ')}\n`);
@@ -173,7 +176,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
     const { shards, flags } = splitVitestArgs(argv, Math.max(1, Math.min(count, planned.length - excluded.length)));
     const deadline = now() + budgetMs, results = new Array(shards.length);
     directory = fs.mkdtempSync(join(tmpdir(), 'verify-shards-'));
-    let next = 0, infraExit = 0, stopLaunching = false;
+    let next = 0, infraExit = 0, stopLaunching = false, failureBeforeInfra = false;
     // The slot helpers identify holders by process. Serialize confirmation in
     // this process so one confirmation cannot release another's slot.
     let localTail = Promise.resolve();
@@ -185,32 +188,70 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
-        let lastResult = null;
-        async function attempt(local) {
+        let lastResult = null, observedFailure = false;
+        async function attempt(local, attemptFiles = files, retry = '') {
           if (!remaining()) return 'NOT-RUN';
-          const report = join(directory, `${index}.${local ? 'local' : 'initial'}.json`);
+          const report = join(directory, `${index}.${retry}${local ? 'local' : 'initial'}.json`);
           // Preserve the npx command class through admission. JSON travels on
           // stdout through the existing SSH stream; no remote file is left behind
           // for finish() to delete before the inventory can be retrieved.
-          const args = shardRunArgv(files, flags);
+          const args = shardRunArgv(attemptFiles, flags);
+          const attemptRemoteReport = retry ? join(directory, `${index}.${retry}remote.jsonl`) : remoteReport;
+          const attemptEnv = { ...childEnv, WE_VERIFY_REMOTE_REPORT: attemptRemoteReport };
           const result = await execute({ command: local ? 'npx' : 'node',
             args: local ? args.slice(1) : [HEAVY_ADMISSION_SCRIPT, 'run', '--', ...args],
-            files, report, remoteReport, cwd, env: local ? { ...childEnv, [ADMISSION_HELD_ENV]: '1' } : childEnv,
+            files: attemptFiles, report, remoteReport: attemptRemoteReport, cwd, env: local ? { ...attemptEnv, [ADMISSION_HELD_ENV]: '1' } : attemptEnv,
             timeoutMs: remaining(), prefix: `[verify-shard ${index + 1}/${shards.length}] `, log });
           lastResult = result;
           if (result.timedOut || result.exitCode === 124) return 'TIMEOUT';
-          let inventory;
+          if (verificationInfrastructureFailure(result) && result.exitCode !== SHARD_UNSETTLED_EXIT) {
+            infraExit ||= result.signal ? 137 : result.exitCode;
+            failureBeforeInfra ||= observedFailure;
+            if (observedFailure) log(`verify-shard ${index + 1}/${shards.length}: retry infrastructure failure; retaining observed test failure\n`);
+            return 'FAIL';
+          }
+          let inventory, reportText;
           try {
-            const location = local ? {} : phaseRunLocation(readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
-            inventory = inventoryVerdict(Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8'), files, cwd, location);
+            reportText = Object.hasOwn(result, 'reportText') ? result.reportText : fs.readFileSync(report, 'utf8');
+            const location = local ? {} : phaseRunLocation(readRemoteReport(attemptRemoteReport, (path, encoding) => fs.readFileSync(path, encoding)));
+            inventory = inventoryVerdict(reportText, attemptFiles, cwd, location);
           }
           catch { inventory = 'INVENTORY-INCOMPLETE'; }
+          // Retain real failures from every attempt, including complete remote
+          // inventory followed by an incomplete local confirmation.
+          observedFailure ||= inventory === 'FAIL';
+          // Preserve nonzero evidence even when the remote inventory is complete
+          // and passing: a later incomplete confirmation must not forget this exit.
+          observedFailure ||= result.exitCode !== 0 && result.exitCode !== SHARD_UNSETTLED_EXIT;
+          try {
+            const report = JSON.parse(reportText);
+            const reportFailed = report?.success === false || report?.numRuntimeErrors > 0
+              || report?.numFailedTestSuites > 0 || report?.numFailedTests > 0
+              || (Array.isArray(report?.testResults) && report.testResults.some(r => r?.status === 'failed'
+                || (Array.isArray(r?.assertionResults) && r.assertionResults.some(a => a?.status === 'failed'))));
+            observedFailure ||= reportFailed;
+            // A complete inventory cannot pass this attempt's failure evidence.
+            if (reportFailed && inventory === 'PASS') inventory = 'FAIL';
+            if (reportFailed) {
+              // Re-emit bounded identities outside the JSON/prefixed child output so
+              // verify-lane's failure collector retains them even if a retry dies.
+              const details = boundFailureDetails({ tests: (report?.testResults ?? []).flatMap(r => {
+                const failed = (r?.assertionResults ?? []).filter(a => a?.status === 'failed');
+                return failed.length ? failed.map(a => ({ file: r.name, name: a.fullName ?? a.title ?? null }))
+                  : r?.status === 'failed' ? [{ file: r.name, name: null }] : [];
+              }), summary: reportText, truncated: false });
+              const clean = text => String(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+              for (const test of details.tests) log(`FAIL ${clean(test.file)}${test.name ? ` > ${clean(test.name)}` : ''}\n`);
+              log(`verify-shard ${index + 1}/${shards.length}: observed failure ${clean(details.summary)}\n`);
+            }
+          } catch { /* Unparseable reports contain no observed test failure. */ }
           if (inventory === 'INVENTORY-INCOMPLETE') return inventory;
           return result.exitCode === 0 && !result.signal && inventory === 'PASS' ? 'PASS' : 'FAIL';
         }
         let status;
         try {
           status = await attempt(false);
+          const initiallyIncomplete = status === 'INVENTORY-INCOMPLETE';
           let ranOn = { location: 'unknown' };
           try {
             ranOn = phaseRunLocation(readRemoteReport(remoteReport, (path, encoding) => fs.readFileSync(path, encoding)), { remoteAttempt: true });
@@ -218,6 +259,7 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
           // Same predicate verify-lane uses: needs a REPORTED remote failure, and a signal, timeout or infrastructure exit
           // (e.g. 137) is never replaced by a local pass.
           if (['FAIL', 'INVENTORY-INCOMPLETE'].includes(status) && lastResult
+            && !(lastResult.exitCode === SHARD_UNSETTLED_EXIT && observedFailure)
             && shouldConfirmRemoteRed({ plan: { takeLocalSlot: false }, exitCode: lastResult.exitCode, signal: lastResult.signal,
               timedOut: lastResult.timedOut, ranOn })) {
             log(`verify-shard ${index + 1}/${shards.length}: remote red; confirming locally\n`);
@@ -237,9 +279,26 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
               } finally { unlock(); }
             }
           }
+          if (status === 'INVENTORY-INCOMPLETE') {
+            log(`verify-shard ${index + 1}/${shards.length}: INVENTORY-INCOMPLETE; retrying once in ${Math.min(2, files.length)} part(s)\n`);
+            const middle = Math.ceil(files.length / 2);
+            const halves = files.length === 1 ? [files] : [files.slice(0, middle), files.slice(middle)];
+            const retried = [];
+            // One split level only, to surface failures; passing halves cannot settle the shard.
+            for (const [half, selected] of halves.entries()) {
+              const verdict = await attempt(false, selected, `retry-${half + 1}.`);
+              retried.push(verdict);
+              if (infraExit || !['PASS', 'INVENTORY-INCOMPLETE'].includes(verdict)) break;
+            }
+            status = retried.find(r => ['TIMEOUT', 'NOT-RUN', 'FAIL'].includes(r))
+              ?? (observedFailure ? 'FAIL' : 'UNSETTLED');
+          }
+          // Ordinary complete remote reds remain clearable by local confirmation.
+          // Incomplete shards retain their failure evidence even if confirmation passes.
+          if (initiallyIncomplete && observedFailure && status === 'PASS') status = 'FAIL';
         } catch (error) { status = 'FAIL'; log(`verify-shard error: ${String(error.message).replace(/[\x00-\x1f\x7f]/g, '')}\n`); }
         // A killed/infrastructure shard must reach the caller as such (its guard refuses to run later phases on it).
-        if (status !== 'PASS' && lastResult && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
+        if (status !== 'PASS' && lastResult && lastResult.exitCode !== SHARD_UNSETTLED_EXIT && verificationInfrastructureFailure({ exitCode: lastResult.exitCode, signal: lastResult.signal })) infraExit ||= lastResult.signal ? 137 : lastResult.exitCode;
         if (status === 'TIMEOUT' || infraExit) stopLaunching = true;
         results[index] = status;
         log(`verify-shard ${index + 1}/${shards.length}: ${status} (${files.length} files, ${now() - started} ms)\n`);
@@ -251,7 +310,14 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
       log(`verify-shards: GREEN (all ${shards.length} shards, ${shards.flat().length} files executed and passed)\n`);
       return 0;
     }
+    if (!infraExit && !results.some(r => ['FAIL', 'TIMEOUT', 'NOT-RUN'].includes(r)) && results.includes('UNSETTLED')) {
+      log(`verify-shards: UNSETTLED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; incomplete inventory after one split retry; retry or wait)\n`);
+      return SHARD_UNSETTLED_EXIT;
+    }
     log(`verify-shards: RED (${results.map((r, i) => `${i + 1}:${r}`).join(', ')}; inspect shard output and rerun the affected selection)\n`);
+    // A later infrastructure exit cannot replace an already observed test verdict
+    // and cause verify-lane to discard its recorded failure details.
+    if (failureBeforeInfra) return 1;
     if (infraExit > 0 && infraExit < 256 && infraExit !== 124) return infraExit;
     return results.some(r => ['TIMEOUT', 'NOT-RUN'].includes(r)) ? 124 : 1;
   } catch (error) {
