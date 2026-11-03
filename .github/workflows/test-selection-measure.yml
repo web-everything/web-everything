@@ -86,9 +86,15 @@ jobs:
         run: npx vitest run --reporter=json --outputFile=vitest-full.json || true
 
       # Record the false-green sample: decide off the diff, compare against the shadow full run's failures, append.
+      # A timed-out or malformed shadow run must not record a clean "no escape" sample: require a parseable report.
+      - name: Validate shadow report
+        id: report
+        continue-on-error: true
+        working-directory: web-everything
+        run: node -e "const j=JSON.parse(require('fs').readFileSync('vitest-full.json','utf8')); if(!Array.isArray(j.testResults)||j.testResults.length===0) process.exit(1)"
+
       - name: Record false-green signal (#2681)
-        # A timed-out shadow run leaves no report; recording then would log a false "no escape" sample.
-        if: ${{ hashFiles('web-everything/vitest-full.json') != '' }}
+        if: ${{ steps.report.outcome == 'success' }}
         working-directory: web-everything
         run: node scripts/readiness/test-selection.mjs --measure --vitest-json=vitest-full.json
         env:
