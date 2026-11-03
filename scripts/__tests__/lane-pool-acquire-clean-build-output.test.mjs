@@ -23,7 +23,7 @@ beforeAll(() => {
   git(['clone', '--quiet', originDir, referenceDir]);
   put(referenceDir, '.gitignore', '_site/\n_site-visual-fixtures/\nnode_modules/\n');
   put(referenceDir, '.eleventy.js', 'module.exports = { dir: { output: "_site" } };\n');
-  put(referenceDir, 'playwright.config.ts', 'export default { webServer: { command: `eleventy --output=_site-visual-fixtures` } };\n');
+  put(referenceDir, 'playwright.config.ts', 'export default { webServer: { command: `@11ty/eleventy --output=_site-visual-fixtures` } };\n');
   git(['add', '.gitignore', '.eleventy.js', 'playwright.config.ts'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'build output fixture'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
@@ -89,7 +89,7 @@ describe('ignored build output cleanup', () => {
   it.each(['.eleventy.js', 'playwright.config.ts'])('refuses an ignored output containing tracked files from %s', (config) => {
     put(referenceDir, config, config === '.eleventy.js'
       ? 'module.exports = { dir: { output: "tracked-output" } };'
-      : 'const command = `build --output=tracked-output`;');
+      : 'const command = `@11ty/eleventy --output=tracked-output`;');
     put(referenceDir, '.gitignore', 'tracked-output/\n');
     put(referenceDir, 'tracked-output/tracked.txt');
     git(['add', '-f', 'tracked-output/tracked.txt'], referenceDir);
@@ -101,7 +101,7 @@ describe('ignored build output cleanup', () => {
   });
 
   it('preserves ignored node_modules when a Playwright comment names it as output', () => {
-    put(referenceDir, 'playwright.config.ts', '// build --output=node_modules\nexport default {};\n');
+    put(referenceDir, 'playwright.config.ts', '// @11ty/eleventy --output=node_modules\nexport default {};\n');
     put(referenceDir, 'node_modules/keep.js');
     put(referenceDir, '_site/stale.test.ts');
     cleanIgnoredBuildOutput(referenceDir);
@@ -117,11 +117,33 @@ describe('ignored build output cleanup', () => {
     expect(readFileSync(join(referenceDir, 'node_modules/keep.js'), 'utf8')).toBe('keep\n');
   });
 
+  it.each(['//', '*', '/*'])('preserves ignored output named on a %s comment line', (prefix) => {
+    put(referenceDir, '.gitignore', '_site/\ncomment-output/\n');
+    put(referenceDir, 'playwright.config.ts', `  ${prefix} @11ty/eleventy --output=comment-output\n`);
+    put(referenceDir, 'comment-output/keep.test.ts');
+    put(referenceDir, '_site/stale.test.ts');
+    expect(ignoredBuildOutputDirs(referenceDir)).not.toContain('comment-output');
+    cleanIgnoredBuildOutput(referenceDir);
+    expect(readFileSync(join(referenceDir, 'comment-output/keep.test.ts'), 'utf8')).toBe('keep\n');
+    expect(existsSync(join(referenceDir, '_site/stale.test.ts'))).toBe(false);
+  });
+
+  it('preserves ignored output named in a non-Eleventy command string', () => {
+    put(referenceDir, '.gitignore', '_site/\nunrelated-output/\n');
+    put(referenceDir, 'playwright.config.ts', 'const command = `other-build --output=unrelated-output`;\n');
+    put(referenceDir, 'unrelated-output/keep.test.ts');
+    put(referenceDir, '_site/stale.test.ts');
+    expect(ignoredBuildOutputDirs(referenceDir)).not.toContain('unrelated-output');
+    cleanIgnoredBuildOutput(referenceDir);
+    expect(readFileSync(join(referenceDir, 'unrelated-output/keep.test.ts'), 'utf8')).toBe('keep\n');
+    expect(existsSync(join(referenceDir, '_site/stale.test.ts'))).toBe(false);
+  });
+
   it('derives custom names from dir.output and every Playwright output, deduplicating them', () => {
     git(['init', '--quiet'], base);
     put(base, '.gitignore', 'custom-site/\nvisual-one/\nvisual-two/\n');
     put(base, '.eleventy.js', 'module.exports = { output: "unrelated", dir: { output: "custom-site" } };');
-    put(base, 'playwright.config.ts', 'const commands = [`build --output=visual-one`, "build --output=visual-two --quiet", `build --output=visual-one`];');
+    put(base, 'playwright.config.ts', 'const commands = [`@11ty/eleventy --output=visual-one`, "@11ty/eleventy --output=visual-two --quiet", `@11ty/eleventy --output=visual-one`];');
     expect(ignoredBuildOutputDirs(base)).toEqual(['custom-site', 'visual-one', 'visual-two']);
   });
 
@@ -129,7 +151,7 @@ describe('ignored build output cleanup', () => {
     git(['init', '--quiet'], base);
     put(base, '.gitignore', `${name}/\n`);
     put(base, '.eleventy.js', `module.exports = { dir: { output: "${name}" } };`);
-    put(base, 'playwright.config.ts', `// build --output=${name}\n`);
+    put(base, 'playwright.config.ts', `const command = \`@11ty/eleventy --output=${name}\`;`);
     expect(ignoredBuildOutputDirs(base)).toEqual([]);
   });
 
@@ -137,14 +159,17 @@ describe('ignored build output cleanup', () => {
     put(base, '.eleventy.js', 'module.exports = { dir: { output: "output" } };');
     put(base, '.gitignore', 'output/\n');
     put(base, 'output/keep.txt');
-    expect(ignoredBuildOutputDirs(base)).toEqual([]);
-    cleanIgnoredBuildOutput(base);
+    expect(() => ignoredBuildOutputDirs(base)).toThrow();
+    expect(() => cleanIgnoredBuildOutput(base)).toThrow(expect.objectContaining({
+      message: expect.stringContaining('ignored build output cleanup failed'),
+      ignoredBuildOutputCleanupFailure: true,
+    }));
     expect(existsSync(join(base, 'output/keep.txt'))).toBe(true);
   });
 
   it.each(['', '.', '..', '../outside', 'nested/output', '/absolute', '.hidden', 'a..b', 'a\\b', '*', ':(glob)*', '${output}'])('rejects unsafe output name %j', (name) => {
     put(base, '.eleventy.js', `module.exports = { dir: { output: "${name}" } };`);
-    put(base, 'playwright.config.ts', `const command = \`build --output=${name}\`;`);
+    put(base, 'playwright.config.ts', `const command = \`@11ty/eleventy --output=${name}\`;`);
     expect(ignoredBuildOutputDirs(base)).toEqual([]);
   });
 
@@ -178,20 +203,22 @@ describe('ignored build output cleanup', () => {
   });
 
   for (const command of ['acquire', 'refresh']) {
-    it(`surfaces cleanup failure on ${command} without a corruption retry`, () => {
+    it.each([['clean', 1], ['ls-files', 1], ['ls-files', 128], ['check-ignore', 128]])(
+      `surfaces %s exit %i as cleanup failure on ${command} without a corruption retry`, (probe, exitCode) => {
       const lane = provision();
       put(lane, '_site/stale.test.ts');
       const bin = join(base, 'bin');
       const attempts = join(base, 'cleanup-attempts');
-      // Fail only ignored-output cleanup; every other Git operation uses the real binary.
+      // Fail only this cleanup operation; every other Git operation uses the real binary.
       put(bin, 'git', `#!${process.execPath}
 const { execFileSync } = require('node:child_process');
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
-if (args.includes('clean') && args.includes('-fdX')) {
+if (args.includes(${JSON.stringify(probe)}) &&
+    args.includes(${JSON.stringify(probe === 'clean' ? '-fdX' : '_site/')})) {
   appendFileSync(${JSON.stringify(attempts)}, 'attempt\\n');
   process.stderr.write('fatal: bad object cleanup probe\\n');
-  process.exit(1);
+  process.exit(${exitCode});
 }
 try {
   execFileSync('git', args, { stdio: 'inherit', timeout: 20000,

@@ -315,14 +315,24 @@ export function ignoredBuildOutputDirs(dir) {
   } catch { /* Unreadable config: no Eleventy output is eligible. */ }
   try {
     const config = readFileSync(join(dir, 'playwright.config.ts'), 'utf8');
-    for (const match of config.matchAll(/--output=([^\s"'`]+)/g)) add(match[1]);
+    for (const line of config.split(/\r?\n/)) {
+      if (/^(?:\/\/|\*|\/\*)/.test(line.trimStart()) || !line.includes('@11ty/eleventy')) continue;
+      for (const match of line.matchAll(/--output=([^\s"'`]+)/g)) add(match[1]);
+    }
   } catch { /* Unreadable config: no Playwright outputs are eligible. */ }
   return [...dirs].filter((name) => {
     if (denied.has(name)) return false;
-    // Unknown Git evidence fails closed, including when this is not a repository.
+    // Absent or symlinked outputs are never cleaned, so they need no git evidence (git rejects symlink pathspecs).
+    try { if (!lstatSync(join(dir, name)).isDirectory()) return false; } catch { return false; }
+    // Unknown Git evidence aborts cleanup; only check-ignore's exit 1 means not ignored.
     const path = `${name}/`;
-    return tryGit(['ls-files', '--', path], dir) === ''
-      && tryGit(['check-ignore', '-q', '--', path], dir) === '';
+    if (git(['ls-files', '--', path], dir) !== '') return false;
+    try {
+      return git(['check-ignore', '-q', '--', path], dir) === '';
+    } catch (error) {
+      if (error.code === 'exit' && error.status === 1) return false;
+      throw error;
+    }
   });
 }
 
