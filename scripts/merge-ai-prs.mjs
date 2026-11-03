@@ -6573,7 +6573,7 @@ async function runCli() {
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
         // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
         const mode = resolveRedMainMode();
-        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual');
+        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual') && !sig.sources.includes('freeze-unreadable');
         let qList = null;
         let filesOf = () => null;
         if (quarantine) {

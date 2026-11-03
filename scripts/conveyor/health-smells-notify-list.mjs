@@ -28,6 +28,7 @@
 export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'nightly-coroner-failed', // Operator: missed nights and repeated probe errors must alert.
   'disk-space',
+  'drain-landed-nothing', // EMERGENCY-1 / R461: queued PRs but nothing landed for 30+ min must alert, with backoff reminders.
   // Previously approved (earlier operator decisions; the old scattered `notifyEvenInShadow: true` field) — kept.
   'claude-auth-expired',
   'daemon-held-on-last-good',
