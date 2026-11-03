@@ -35,3 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Audit finding carried from PR 6262 (R451)
+
+The final audit found one origin/main deny that HEAD no longer denies: `git branch -C <name> <copy>` read as a `-C <dir>` target on main (a false positive, since `branch -C` copies a branch). The new parser stops reading `-C` at the subcommand. No protected-clone write bypass was shown. Decide in the allowlist redesign whether to restore a deny for this shape.
