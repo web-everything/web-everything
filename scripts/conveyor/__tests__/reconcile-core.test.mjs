@@ -3966,6 +3966,11 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     const p = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: greenRollup.map(({ completedAt, ...c }) => c) });
     expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
   });
+  it('a non-lane bot PR with ONE old and one timestamp-less green check is not settled (strict grace)', () => {
+    const rollup = [{ ...greenRollup[0], completedAt: new Date(NOW - 30 * 60_000).toISOString() }, { ...greenRollup[0], name: 'other' }];
+    const p = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: rollup });
+    expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
+  });
   it('waits out the grace so a label-on-green producer can label ready-to-merge first', () => {
     const fresh = open({ statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 60_000).toISOString() })) });
     expect(planReconcile({ prs: [fresh], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);

@@ -2074,7 +2074,9 @@ export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
 /** True when the newest completed check finished at least the grace ago (or no timestamp is readable). */
 export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
-  const times = (Array.isArray(rollup) ? rollup : []).map((c) => Date.parse(c?.completedAt)).filter(Number.isFinite);
+  const checks = Array.isArray(rollup) ? rollup : [];
+  const times = checks.map((c) => Date.parse(c?.completedAt)).filter(Number.isFinite);
+  if (strict && (times.length !== checks.length)) return false; // strict: ANY unreadable timing is NOT settled
   if (!times.length || !Number.isFinite(now) || !now) return !strict; // strict: unknown timing is NOT settled
   return now - Math.max(...times) >= graceMs;
 }

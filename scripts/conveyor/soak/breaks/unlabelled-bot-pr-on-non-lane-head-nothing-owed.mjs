@@ -10,7 +10,7 @@ export default {
   title: 'PR #6254: an unlabelled open green bot PR on a non-lane head (ci/refresh-test-timings) is refused nothing-owed forever and never reviewed',
   card: 'D-R338 reconcile treats no labels as already reviewed',
   fixedBy: { sha: '49e6b4224b463a6a6d6a0092369d0d42a6295e1a,99634539ae2deccbd1f6bfa73759bb038708ee80,28b0aa9fb78fbfe4e723229a1d21974f8e38e678', where: 'lane/reconcile-unlabelled-nonlane-pr', paths: ['scripts/conveyor/reconcile-core.mjs'] },
-  fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('botAuthored'); },
+  fixPresent(root) { const src = readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8'); return src.includes('botAuthored') && src.includes('strict: !laneHead') && src.includes('times.length !== checks.length'); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
