@@ -1682,3 +1682,32 @@ it('a truncated shared snapshot is refused loudly too', async () => {
   Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
   expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readShared: () => rows })).toThrow(/truncated/);
 });
+
+describe('direct (snapshot-disabled) list path: retried and truncation-safe', () => {
+  const withDisabled = async (fn) => {
+    const prev = process.env.WE_PR_SNAPSHOT; process.env.WE_PR_SNAPSHOT = '0';
+    try { return await fn(); } finally { if (prev === undefined) delete process.env.WE_PR_SNAPSHOT; else process.env.WE_PR_SNAPSHOT = prev; }
+  };
+  const row = (n) => ({ number: n, labels: [], comments: [], statusCheckRollup: [], author: { login: 'x' } });
+  const e504 = () => Object.assign(new Error('gh failed'), { stderr: 'HTTP 504: 504 Gateway Timeout' });
+  it('refuses a capped 200-row inventory (after retrying the 504 before it)', () => withDisabled(async () => {
+    const { defaultReadPrs, PR_LIST_LIMIT } = await import('../reconcile-pass.mjs');
+    const { execFileSync } = await import('node:child_process');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    let n = 0;
+    execFileSync.mockReset().mockImplementation(() => { if (++n === 1) throw e504(); return JSON.stringify(Array.from({ length: PR_LIST_LIMIT }, (_, i) => row(i + 1))); });
+    expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/cap — refusing/);
+    expect(n).toBe(2);
+  }));
+  it('returns a normal listing after a retried 504', () => withDisabled(async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSync } = await import('node:child_process');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    let n = 0;
+    execFileSync.mockReset().mockImplementation(() => { if (++n === 1) throw e504(); return JSON.stringify([row(1)]); });
+    const prs = defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } });
+    expect(prs.map(p => p.number)).toEqual([1]);
+  }));
+});
