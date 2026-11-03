@@ -2141,12 +2141,15 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       .rejects.toMatchObject({message:'Excluded source: use local fallback', code:'excluded-source-file'});
   });
 
+  // Short labels: a %s of the 4 MiB buffer put ~25 MB into every JSON report (verify shard inventory cap).
   it.each([
-    {code:128, stdout:Buffer.alloc(0)}, new Error('unreadable origin/main'),
-    {code:0, stdout:Buffer.from('malformed\0')},
-    {code:0, stdout:Buffer.alloc(4 * 1024 * 1024 + 1)},
-    {code:0, stdout:treeRecord('credentials.md', 'public').subarray(0, -1)},
-  ])('refuses credential source when origin/main evidence is unavailable or incomplete: %s', async tree => {
+    ['git exit 128', () => ({code:128, stdout:Buffer.alloc(0)})],
+    ['unreadable origin/main', () => new Error('unreadable origin/main')],
+    ['malformed record', () => ({code:0, stdout:Buffer.from('malformed\0')})],
+    ['oversized tree output', () => ({code:0, stdout:Buffer.alloc(4 * 1024 * 1024 + 1)})],
+    ['truncated record', () => ({code:0, stdout:treeRecord('credentials.md', 'public').subarray(0, -1)})],
+  ])('refuses credential source when origin/main evidence is unavailable or incomplete: %s', async (_label, makeTree) => {
+    const tree = makeTree();
     writeFileSync(join(cwd, 'credentials.md'), 'public');
     await expect(build({cwd, exec:gitInventory([Buffer.from('credentials.md')], indexRecord('credentials.md', 'public'), tree)}))
       .rejects.toMatchObject({code:'excluded-source-file'});
