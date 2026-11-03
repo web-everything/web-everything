@@ -2,12 +2,14 @@
 // the wrapped git call returns/throws exactly what it would have; every logging step is inside try/catch.
 // Exports: formatTimingLine, summarizeTrace2, summarizePackets, contentionSnapshot, instrumentGit, TIMING_LOG
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdtempSync, openSync, readSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export const TIMING_LOG = process.env.WE_FREEZE_READ_TIMING_LOG || join(homedir(), '.claude', 'freeze-read-timing.log');
 const LOG_CAP_BYTES = 2 * 1024 * 1024;
+const TRACE_READ_CAP = 256 * 1024; // trace files are read only up to this many bytes
+const LINE_CAP = 8 * 1024; // one log line never exceeds this
 
 /** One log line: `freeze-read-timing {json}`. Pure. */
 export function formatTimingLine(rec) { return `freeze-read-timing ${JSON.stringify(rec)}`; }
@@ -42,7 +44,7 @@ export function summarizePackets(text, startMs = null) {
 export function contentionSnapshot(cwd, { exec = execFileSync } = {}) {
   const snap = { load: loadavg().map((n) => +n.toFixed(2)) };
   try {
-    const ps = exec('ps', ['-axo', 'pid=,etime=,command='], { encoding: 'utf8', timeout: 5000 }).split('\n');
+    const ps = exec('ps', ['-axo', 'pid=,etime=,command='], { encoding: 'utf8', timeout: 1000, maxBuffer: 4 * 1024 * 1024 }).split('\n');
     const git = ps.filter((l) => /(^|[\s/])git(\s|$)|git-(remote|upload|pack|index|unpack)/.test(l));
     snap.gitProcs = git.length;
     snap.heavyGit = git.filter((l) => /\b(gc|repack|pack-objects|maintenance|index-pack|prune|fsck)\b/.test(l)).map((l) => l.trim().slice(0, 140)).slice(0, 5);
@@ -58,7 +60,8 @@ export function contentionSnapshot(cwd, { exec = execFileSync } = {}) {
 
 function appendLog(line, file = TIMING_LOG) {
   try { if (existsSync(file) && statSync(file).size > LOG_CAP_BYTES) renameSync(file, `${file}.1`); } catch { /* ignore */ }
-  appendFileSync(file, `${new Date().toISOString()} ${line}\n`);
+  try { if (existsSync(file) && statSync(file).size > 2 * LOG_CAP_BYTES) return; } catch { return; } // rotation failed: stop writing rather than grow
+  appendFileSync(file, `${new Date().toISOString()} ${line.slice(0, LINE_CAP)}\n`);
 }
 
 /**
@@ -84,7 +87,7 @@ export function instrumentGit(run, { label = 'freeze-read', slowMs = 5000, log =
         if (args[0] === 'fetch' || err || ms > slowMs) {
           const rec = { label, cmd: String(args[0]), ms, ok: !err, err: err ? String(err.code || err.signal || err.message).slice(0, 60) : null, pre };
           if (tdir) {
-            const rd = (f) => { try { return readFileSync(join(tdir, f), 'utf8'); } catch { return ''; } };
+            const rd = (f) => { try { const fd = openSync(join(tdir, f), 'r'); try { const b = Buffer.alloc(TRACE_READ_CAP); return b.toString('utf8', 0, readSync(fd, b, 0, TRACE_READ_CAP, 0)); } finally { closeSync(fd); } } catch { return ''; } };
             rec.children = summarizeTrace2(rd('t2')); rec.packets = summarizePackets(rd('pkt'), startClock);
           }
           try { rec.post = contentionSnapshot(opts.cwd); } catch { /* ignore */ }
