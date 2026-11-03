@@ -223,12 +223,32 @@ export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, need
     ms: light.ms, hydrated, reused, cache: nextCache };
 }
 
-/** PURE: fewer rows than GitHub's own `totalCount` (without a declared truncation) is a partial inventory. It must
- *  fail closed with a named reason, never be reported as a complete list. */
+/** PURE: a PR-list read must never look complete when it is not. Unique PR numbers (duplicates cannot hide an
+ *  omitted PR) are counted against GitHub's own `totalCount`; a shortfall, without a declared truncation, fails
+ *  closed with a named reason. */
 export function assertInventoryComplete({ repo, rows, totalCount, truncated = false }) {
-  if (truncated || !Number.isInteger(totalCount) || rows.length >= totalCount) return;
+  const numbers = rows.map(r => r?.number).filter(Number.isInteger);
+  const unique = new Set(numbers).size;
+  const have = numbers.length === rows.length ? unique : rows.length;
+  if (numbers.length === rows.length && unique < rows.length) {
+    throw new PrListUnreadableError({ repo, stage: 'page', page: 'inventory',
+      cause: new Error(`duplicate PR numbers in the listing (${unique} unique of ${rows.length} rows) — refusing an inconsistent inventory`) });
+  }
+  if (truncated || !Number.isInteger(totalCount) || have >= totalCount) return;
   throw new PrListUnreadableError({ repo, stage: 'page', page: 'inventory',
-    cause: new Error(`pages carried ${rows.length} of ${totalCount} open PRs — refusing a partial inventory`) });
+    cause: new Error(`pages carried ${have} unique of ${totalCount} open PRs (${have} of ${totalCount}) — refusing a partial inventory`) });
+}
+
+/** PURE: parse the stdout of a `gh pr list --json` read. Empty/blank output, non-JSON and non-array JSON are
+ *  FAILURES (never an empty inventory); only a literal JSON list is a result. */
+export function parseListOutput(text, { repo = '' } = {}) {
+  const raw = text == null ? '' : String(text);
+  const where = repo ? ` for ${repo}` : '';
+  if (!raw.trim()) throw Object.assign(new Error(`open-PR list${where} returned empty output — refusing to read it as an empty inventory`), { code: 'pr-list-empty' });
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (cause) { throw Object.assign(new Error(`open-PR list${where} was not JSON`, { cause }), { code: 'pr-list-malformed' }); }
+  if (!Array.isArray(parsed)) throw Object.assign(new Error(`open-PR list${where} was not a list — refusing to read it as an empty inventory`), { code: 'pr-list-malformed' });
+  return parsed;
 }
 
 /** {@link listOpenPrsPagedHydrated} that refuses a short inventory (drain-facing). */

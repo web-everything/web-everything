@@ -183,7 +183,7 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
@@ -5155,7 +5155,7 @@ async function runCli() {
         return resolveListedChecks(repo, listed.rows);
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return resolveListedChecks(repo, JSON.parse(stdout.trim() || '[]'));
+      return resolveListedChecks(repo, parseListOutput(stdout, { repo }));
     },
     // #2417 — fan out the per-PR manifest + commits reads across ALL repos' open PRs at once (bounded pool), cached
     // across `--watch` passes on unchanged head SHA + body. Returns key→{manifest, commits, degraded}.
@@ -5471,7 +5471,7 @@ async function runCli() {
         '--json', RECONCILE ? SWEEP_LIST_FIELDS
           : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '')];
       const { stdout } = await execFileP('gh', listArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      return JSON.parse(stdout.trim() || '[]');
+      return parseListOutput(stdout, { repo });
     };
     try {
       const slug = repo || localSlug;

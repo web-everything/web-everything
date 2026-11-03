@@ -84,7 +84,7 @@ import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled } from '../lib/pr-snapshot-store.mjs';
-import { listOpenPrsPagedHydrated, resolvePrListPaging } from '../lib/pr-list-paged.mjs';
+import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput } from '../lib/pr-list-paged.mjs';
 import { ghRestGetJson } from '../lib/gh-rest-read.mjs';
 import { withListRetry } from '../lib/gh-list-retry.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -325,19 +325,20 @@ const pagedHeavyCache = new Map();
 const authorByPr = new Map();
 
 /** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
- *  Shape matches `gh pr list --json author`. A failed read leaves the row without `author` (never fails the list). */
+ *  Shape matches `gh pr list --json author`. A failed/empty read FAILS CLOSED (the 5xx retry wrapper covers a transient one). */
 export function withRestAuthors(rows, { repo, readRest = ghRestGetJson } = {}) {
   if (!repo) return rows;
   return rows.map(pr => {
     if (pr?.author || !Number.isInteger(pr?.number)) return pr;
     const key = `${repo}#${pr.number}`;
     if (!authorByPr.has(key)) {
-      try {
-        const u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.json?.user;
-        if (u?.login) authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
-      } catch { /* leave unset; bot detection degrades, the list does not */ }
+      let u;
+      try { u = readRest(`repos/${repo}/pulls/${pr.number}`, { context: repo, op: 'pr author (reconcile)' })?.json?.user; }
+      catch (cause) { throw Object.assign(new Error(`author of ${key} unreadable — refusing to accept the row without it`, { cause }), { code: 'pr-author-unreadable', stderr: cause?.stderr }); }
+      if (!u?.login) throw Object.assign(new Error(`author of ${key} missing from the REST response — refusing to accept the row without it`), { code: 'pr-author-unreadable' });
+      authorByPr.set(key, { login: u.login, is_bot: u.type === 'Bot' });
     }
-    return authorByPr.has(key) ? { ...pr, author: authorByPr.get(key) } : pr;
+    return { ...pr, author: authorByPr.get(key) };
   });
 }
 
@@ -394,35 +395,31 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       throttle: { deferrable: true }, // this reader checks isGhDeferred below
     });
     if (isGhDeferred(out)) return JSON.parse(String(out));
-    const parsed = JSON.parse(String(out || '[]'));
+    const parsed = parseListOutput(out, { repo });
     // A full page means the inventory may be capped: refuse it rather than plan as if the overflow did not exist.
-    if (Array.isArray(parsed) && parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
-    if (!Array.isArray(parsed)) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} was not a list — refusing to read it as an empty inventory`), { code: 'pr-list-malformed' });
+    if (parsed.length >= PR_LIST_LIMIT) throw Object.assign(new Error(`open-PR list${repo ? ` for ${repo}` : ''} hit the ${PR_LIST_LIMIT} cap — refusing a possibly partial inventory`), { code: 'pr-list-truncated' });
     return parsed;
   };
   if (exec === execFileSyncThrottled && repo) {
     const usePaged = prSnapshotEnabled(process.env) || listPaged !== listOpenPrsPagedHydrated;
-    let viaDirect = false; // the legacy direct list already asks for `author`
     const listed = withListRetry(() => {
       const shared = readShared({ repo, fields: SNAPSHOT_LIST_FIELDS, allowDeferred: true });
       if (shared) {
         if (shared.discoveryIncomplete === true) throw Object.assign(new Error(`open-PR snapshot for ${repo} is truncated — refusing a partial inventory`), { code: 'pr-list-truncated' });
-        return shared;
+        return Array.isArray(shared) ? withRestAuthors(shared, { repo, readRest }) : shared; // author lookups sit INSIDE the retried read
       }
-      if (!usePaged) { viaDirect = true; return direct(); }
+      if (!usePaged) return direct(); // the legacy direct list already asks for `author`
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
         cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
       pagedHeavyCache.set(repo, paged.cache);
       // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
       if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });
       // The page reader trusts GitHub's own totalCount only loosely: fewer rows than it reported is a partial inventory.
-      if (Number.isInteger(paged.totalCount) && paged.rows.length < paged.totalCount) throw Object.assign(new Error(`open-PR pages for ${repo} returned ${paged.rows.length} of ${paged.totalCount} PRs — refusing a partial inventory`), { code: 'pr-list-truncated' });
-      return paged.rows;
+      assertInventoryComplete({ repo, rows: paged.rows, totalCount: paged.totalCount, truncated: paged.truncated });
+      return withRestAuthors(paged.rows, { repo, readRest });
     }, { repo, op: 'reconcile-pr-list', ...retryOpts });
     if (!Array.isArray(listed)) return listed;
-    const withAuthors = viaDirect ? listed : withRestAuthors(listed, { repo, readRest });
-    if (listed.discoveryIncomplete === true && withAuthors !== listed) Object.defineProperty(withAuthors, 'discoveryIncomplete', { value: true }); // before enrich, so its completeness guard sees it
-    return enrich(withAuthors);
+    return enrich(listed);
   }
   if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: PR_LIST_JSON_FIELDS, allowDeferred: true }); if (shared) return Array.isArray(shared) ? enrich(shared) : shared; }
   const rows = direct();

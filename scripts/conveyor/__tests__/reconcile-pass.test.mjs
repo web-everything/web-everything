@@ -1708,6 +1708,14 @@ describe('direct (snapshot-disabled) list path: retried and truncation-safe', ()
     expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
       retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/not a list/);
   }));
+  it('empty subprocess output is a failure, never an empty inventory', () => withDisabled(async () => {
+    const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+    const { execFileSync } = await import('node:child_process');
+    const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+    execFileSync.mockReset().mockReturnValue('');
+    expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
+      retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/empty output/);
+  }));
   it('returns a normal listing after a retried 504', () => withDisabled(async () => {
     const { defaultReadPrs } = await import('../reconcile-pass.mjs');
     const { execFileSync } = await import('node:child_process');
@@ -1725,4 +1733,16 @@ it('a paged fallback that returns fewer rows than GitHub reported is refused', a
   const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
   expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => null,
     listPaged: () => ({ rows: [], truncated: false, totalCount: 7, cache: {} }), readRest: () => ({ json: {} }) })).toThrow(/0 of 7/);
+});
+
+it('an author lookup failure fails the whole read; a row is never accepted without its author', async () => {
+  const { defaultReadPrs } = await import('../reconcile-pass.mjs');
+  const { execFileSyncThrottled } = await import('../../lib/gh-throttle.mjs');
+  const rows = [{ number: 41, labels: [], comments: [], statusCheckRollup: [] }];
+  expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => rows,
+    readRest: () => { throw Object.assign(new Error('boom'), { stderr: 'HTTP 404' }); },
+    retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/author/);
+  expect(() => defaultReadPrs({ repo: 'o/r', exec: execFileSyncThrottled, readCommits: () => [], readShared: () => [{ ...rows[0], number: 42 }],
+    readRest: () => ({ json: {} }),
+    retryOpts: { sleep: () => {}, persist: false, onEvent: () => {} } })).toThrow(/author/);
 });

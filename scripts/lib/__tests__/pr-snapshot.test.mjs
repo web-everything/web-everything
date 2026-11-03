@@ -304,7 +304,7 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
 
   it.each([
     // `readCommits` stubbed: its default (`fetchPrCommits`) runs a real `git fetch origin` per unlabelled PR.
-    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [] }],
+    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [], readRest: () => ({ json: { user: { login: 'a', type: 'User' } } }) }],
     ['../../conveyor/advisory-label-sweep.mjs', 'defaultListPrs'],
     ['../../conveyor/ci-red-recovery-watch.mjs', 'defaultReadOpenPrs'],
     ['../../conveyor/parked-pr-conflict-watch.mjs', 'defaultListParkedPrs'],
