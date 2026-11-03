@@ -1990,6 +1990,7 @@ describe('catch-up miss backoff', () => {
     ['batching-deferred', false], ['merge-lock-held', false], ['prestage', false],
     ['branch-preparation', false], ['card-group-hold', false], ['card-grouped', false],
     ['enqueue-backoff', false], ['live-state-unreadable', false], ['bornas-unreadable', false],
+    ['mq-same-head-failed', false],
     ['conflict', false], ['unconfirmed', false], ['enqueue-error', false],
     ['red-team-pending', true], ['sent-back', true], ['bornas-collision', true],
   ];

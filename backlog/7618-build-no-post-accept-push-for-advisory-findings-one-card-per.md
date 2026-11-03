@@ -3,7 +3,7 @@ bornAs: x5vjl3o
 kind: story
 size: 5
 parent: "5467"
-status: open
+status: resolved
 scaffoldedBy: "post-accept-advisory"
 dateScaffolded: "2026-11-01"
 blockedBy: ["7617"]
@@ -15,6 +15,7 @@ scope:
   - "we:scripts/operations/__tests__/review-loop-cli.test.mjs"
   - "we:scripts/conveyor/__tests__/advisory-fix-mark.test.mjs"
 dateOpened: "2026-11-01"
+dateResolved: "2026-11-02"
 tags: []
 ---
 

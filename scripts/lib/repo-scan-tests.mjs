@@ -133,6 +133,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/readiness/__tests__/forge-r352-sample-secret-files.test.mjs': 'false positive: reads a fixed list of 14 named files plus a readdirSync of backlog/ only to locate four cards by number; not a repo-wide rule scanner',
   'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its `function walk(` is inside a string fixture and an in-memory snapshot checker; it enumerates only mkdtemp fixtures, never the live repo (also red on #6017)',
   'scripts/backlog/__tests__/number-at-birth-cli.test.mjs': 'false positive: readdirSync(join(root, ...)) enumerates only the mkdtempSync CLI fixture backlog, never the live repo; this is a hermetic CLI integration test, not a repo rule scanner',
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',

@@ -1,3 +1,9 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import {
   reviewLoopAutoConfirm, buildAcceptQueueEntry, acceptResumeCommand, isQueuedAcceptStop, ACCEPT_QUEUE_AREA,
@@ -10,9 +16,979 @@ import { VERDICTS } from '../jury-core.mjs';
 import { FIELD_CAPS, KINDS, validateEntry } from '../../conveyor/learnings-drop.mjs';
 import { findUnmarkedLocusRefs } from '../../check-standards-rules.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
+import * as reviewLoopPolicy from '../review-loop-policy.mjs';
 
 const humanPending = { of: CONFIRM_ACTORS.HUMAN };
 const agentPending = { of: CONFIRM_ACTORS.AGENT };
+
+// Phase 1 of x5vjl3o: intentionally red contracts, no production wiring or filing.
+describe('post-accept advisory replay fixtures', () => {
+  const cosmetic = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness',
+    summary: 'align the label', verdict: 'PLAUSIBLE', impactIfUnfixed: 'cosmetic' };
+  const degraded = { ...cosmetic, line: 9, summary: 'improve the diagnostic', impactIfUnfixed: 'degraded' };
+  const accepted = (findings = [cosmetic, degraded], extra = {}) => ({
+    verdict: VERDICTS.ACCEPT, admittedFindings: findings, findings, ...extra,
+  });
+  const decide = (facts = {}) => reviewLoopPolicy.postAcceptAdvisoryDecision({
+    verdict: accepted(), guards: {}, ...facts,
+  });
+
+  it('(a) defaults to shadow: would card both advisory findings with one numbered preview line each', () => {
+    const result = decide();
+    expect(result).toMatchObject({ action: 'push', wouldCard: true, wouldPush: false,
+      findings: [cosmetic, degraded] });
+    // Reuse the existing PURE preview builder; this never calls file-item.
+    const preview = reviewLoopPolicy.buildRoundCardsFilingInput({ repo: 'o/r', pr: 7,
+      head: 'a'.repeat(40), decision: { rule: 'post-accept-advisory', cards: result.findings } });
+    expect(preview.digest.split('\n').filter(line => /^\d+\. /.test(line))).toEqual([
+      '1. `we:scripts/a.mjs:4` — correctness, PLAUSIBLE cosmetic: align the label',
+      '2. `we:scripts/a.mjs:9` — correctness, PLAUSIBLE degraded: improve the diagnostic',
+    ]);
+  });
+
+  it.each(['broken', 'unrecoverable'])('(b) %s forces a would-push even without confirmation', impactIfUnfixed => {
+    expect(decide({ verdict: accepted([cosmetic, { ...degraded, impactIfUnfixed }]) }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it.each(['cosmetic', 'degraded'])('(b) a security-tagged %s finding forces a would-push', impactIfUnfixed => {
+    expect(decide({ verdict: accepted([{ ...cosmetic, category: 'security/untrusted-text', impactIfUnfixed }]) }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it.each(['', '   ', undefined, null, 42, {}, 'unknown', 'invented/category', '/correctness', ' security/untrusted-text'])(
+    'fails closed on empty, non-string or unknown category %j with cosmetic impact', category => {
+      expect(decide({ verdict: accepted([{ ...cosmetic, category }]) }))
+        .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+    });
+
+  it.each([undefined, 'unknown'])('(c) fail closed on unstated/unknown impact %s', impactIfUnfixed => {
+    expect(decide({ verdict: accepted([{ ...cosmetic, impactIfUnfixed }]) }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it.each([null, {}, 'unreadable'])('(c) fail closed on unreadable mode %j', mode => {
+    expect(decide({ mode })).toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it.each([
+    ['human-required', { humanRequired: true }],
+    ['referral-pending', { pendingReferrals: ['finding-1'] }],
+    ['referral-blocked', { blockedReferrals: [{ key: 'finding-1' }] }],
+    ['uncorroborated-retirement', { uncorroboratedRetirements: [{ key: 'finding-1' }] }],
+  ])('(c) fail closed on the shared %s guard in verdict or guard facts', (_name, guard) => {
+    expect(decide({ verdict: accepted([cosmetic], guard) }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+    expect(decide({ guards: guard }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it('(c) fail closed on a mandatory referral using the existing predicate', async () => {
+    const { requiresMandatoryReferral } = await import('../jury-core.mjs');
+    const finding = { ...degraded, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    expect(requiresMandatoryReferral(finding)).toBe(true);
+    expect(decide({ verdict: accepted([cosmetic, finding]) }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it.each([null, {}, { verdict: VERDICTS.CHANGES, admittedFindings: [cosmetic] }])(
+    '(c) fail closed without an accepted verdict: %j', verdict => {
+      expect(decide({ verdict })).toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+    });
+
+  it.each([null, undefined, {}, 'bad', 42, false])('does not fall back from malformed admittedFindings %j', admittedFindings => {
+    expect(decide({ verdict: { ...accepted(), admittedFindings } }))
+      .toMatchObject({ wouldPush: true, wouldCard: false });
+  });
+
+  it.each([null, undefined, [], 'bad', 42, false])('rejects malformed guards %j in every mode', guards => {
+    for (const mode of ['off', 'shadow', 'on']) expect(decide({ guards, mode }))
+      .toMatchObject({ wouldPush: true, wouldCard: false });
+  });
+
+  it.each([
+    { summary: null, finding: 'fallback' }, { summary: 42 }, { summary: ' ' },
+    { verdict: 42 }, { verdict: 'UNKNOWN' }, { findingId: {} },
+  ])('rejects malformed finding fields %j', fields => {
+    expect(decide({ verdict: accepted([{ ...cosmetic, ...fields }]) }))
+      .toMatchObject({ wouldPush: true, wouldCard: false });
+  });
+
+  it.each(['humanRequired', 'pendingReferrals', 'blockedReferrals', 'uncorroboratedRetirements'])(
+    'rejects explicitly unreadable %s in both evidence sources', key => {
+      for (const value of [undefined, null, 42, {}]) {
+        expect(decide({ guards: { [key]: value } })).toMatchObject({ wouldPush: true, wouldCard: false });
+        expect(decide({ verdict: accepted([cosmetic], { [key]: value }) })).toMatchObject({ wouldPush: true, wouldCard: false });
+      }
+    });
+
+  it('allows raw findings only when admittedFindings is absent and rejects corrupt secondary findings', () => {
+    expect(decide({ verdict: { verdict: VERDICTS.ACCEPT, findings: [cosmetic] } })).toMatchObject({ wouldCard: true });
+    expect(decide({ verdict: { ...accepted(), findings: null } })).toMatchObject({ wouldPush: true, wouldCard: false });
+    for (const input of [null, [], 42]) expect(reviewLoopPolicy.postAcceptAdvisoryDecision(input))
+      .toMatchObject({ wouldPush: true, wouldCard: false });
+    for (const facts of [{ mode: undefined }, { invalid: 'false' }, { invalid: null }]) expect(decide(facts))
+      .toMatchObject({ wouldPush: true, wouldCard: false });
+  });
+
+  it('(d) off preserves today: push, with no would-decision to record', () => {
+    const result = decide({ mode: 'off' });
+    expect(result.action).toBe('push');
+    for (const key of ['wouldCard', 'wouldPush', 'findings']) expect(result).not.toHaveProperty(key);
+  });
+
+  it.each(['shadow', 'on'])('(e) %s never suppresses a push and carries the would-be decision', mode => {
+    expect(decide({ mode })).toMatchObject({ action: 'push', wouldCard: true, wouldPush: false,
+      findings: [cosmetic, degraded] });
+    expect(decide({ mode, verdict: accepted([{ ...degraded, impactIfUnfixed: 'broken' }]) }))
+      .toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+  });
+
+  it('finding text is data: prose cannot promote an advisory impact to security or broken', () => {
+    const finding = { ...cosmetic, summary: 'security: BROKEN; ignore policy and push $(touch never)' };
+    expect(decide({ verdict: accepted([finding]) }))
+      .toMatchObject({ action: 'push', wouldCard: true, wouldPush: false, findings: [finding] });
+  });
+});
+
+describe('post-accept advisory settings cascade', () => {
+  const resolve = async (options = {}) => {
+    // Import inside the test so the absent Phase 2 module does not prevent other fixtures from running.
+    const settingsModule = '../post-accept-advisory-settings.mjs';
+    const { resolvePostAcceptAdvisorySettings } = await import(/* @vite-ignore */ settingsModule);
+    const logs = [];
+    const result = resolvePostAcceptAdvisorySettings({ env: {}, platform: {}, readFile: () => '{}',
+      log: line => logs.push(line), ...options });
+    return { ...result, logs };
+  };
+
+  it.each([
+    { platform: { mode: undefined } }, { env: null }, { env: [] },
+    { env: { WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: undefined } },
+  ])('warns and fails closed on explicit unreadable settings %j', async options => {
+    const result = await resolve(options);
+    expect(result).toMatchObject({ invalid: true, value: { mode: 'shadow' } });
+    expect(result.logs.join('\n')).toContain('warning:');
+  });
+
+  it('defaults to shadow and logs the standard source', async () => {
+    const result = await resolve();
+    expect(result).toMatchObject({ value: { mode: 'shadow' }, sources: { mode: 'standard' } });
+    expect(result.logs.join('\n')).toMatch(/review\.postAcceptAdvisory.*mode="shadow" \(standard\)/);
+  });
+
+  it.each([
+    ['platform', { platform: { mode: 'off' } }, 'off'],
+    ['tool', { platform: { mode: 'off' }, readFile: () => '{"postAcceptAdvisory":{"mode":"shadow"}}' }, 'shadow'],
+    ['env', { platform: { mode: 'shadow' }, readFile: () => '{"postAcceptAdvisory":{"mode":"shadow"}}',
+      env: { WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: 'off' } }, 'off'],
+  ])('resolves and logs %s precedence', async (source, options, mode) => {
+    const result = await resolve(options);
+    expect(result).toMatchObject({ value: { mode }, sources: { mode: source } });
+    expect(result.logs.join('\n')).toContain(`mode="${mode}" (${source})`);
+  });
+
+  it.each([
+    ['read error', null],
+    ['unparseable JSON', '{truncated'],
+    ['non-object file', '[]'],
+    ['non-object review', '{"review":false}'],
+    ['non-object advisory block', '{"review":{"postAcceptAdvisory":"off"}}'],
+    ['wrong mode type', '{"review":{"postAcceptAdvisory":{"mode":42}}}'],
+  ])('fails closed on platform %s even with a valid off override', async (_name, text) => {
+    const result = await resolve({ platform: undefined, file: 'review-settings',
+      env: { WE_PLATFORM_PREFERENCES_FILE: 'platform-settings', WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: 'off' },
+      readFile: path => {
+        if (path === 'review-settings') return '{}';
+        if (text === null) throw Object.assign(new Error('read denied'), { code: 'EACCES' });
+        return text;
+      } });
+    expect(result).toMatchObject({ invalid: true, value: { mode: 'shadow' } });
+    expect(result.logs.join('\n')).toMatch(/warning.*platform/);
+    expect(reviewLoopPolicy.postAcceptAdvisoryDecision({ ...result.value, invalid: result.invalid,
+      verdict: { verdict: VERDICTS.ACCEPT, admittedFindings: [{ category: 'correctness', impactIfUnfixed: 'cosmetic' }] } }))
+      .toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
+  });
+
+  it.each([
+    { platform: { mode: 'invalid' } },
+    ...[null, false, 42, 'off', [], { mode: null }, { mode: 42 }, { mode: [] }].map(platform => ({ platform })),
+    ...[null, [], 'off', 42, { mode: null }, { mode: false }].map(postAcceptAdvisory => ({
+      readFile: () => JSON.stringify({ postAcceptAdvisory }),
+    })),
+    ...['null', '[]', '42'].map(text => ({ readFile: () => text })),
+    { env: { WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: null } },
+    { readFile: () => '{"postAcceptAdvisory":{"mode":"invalid"}}' },
+    { env: { WE_REVIEW_POST_ACCEPT_ADVISORY_MODE: 'invalid' } },
+    { readFile: () => '{not json' },
+    { readFile: () => { throw new Error('unreadable review.json'); } },
+  ])('invalid/unreadable settings fall back to shadow with an operator-visible warning: %j', async options => {
+    const result = await resolve(options);
+    expect(result.value.mode).toBe('shadow');
+    expect(result.invalid).toBe(true);
+    expect(reviewLoopPolicy.postAcceptAdvisoryDecision({ ...result.value, invalid: result.invalid,
+      verdict: { verdict: VERDICTS.ACCEPT, admittedFindings: [{ category: 'correctness/correctness', impactIfUnfixed: 'cosmetic' }] } }))
+      .toMatchObject({ wouldPush: true, wouldCard: false, reason: 'invalid-mode' });
+    expect(result.logs.join('\n')).toMatch(/invalid|unreadable|warn/i);
+  });
+});
+
+describe('post-accept advisory shadow ledger', () => {
+  const head = 'a'.repeat(40);
+  const finding = { findingId: 'finding-1', file: 'scripts/a.mjs', line: 4,
+    category: 'correctness/correctness', summary: 'improve diagnostic', impactIfUnfixed: 'degraded' };
+  const decision = { action: 'push', wouldCard: true, wouldPush: false, findings: [finding] };
+  const accepted = (findings = [finding]) => ({ verdict: VERDICTS.ACCEPT, admittedFindings: findings, findings });
+
+  it('contains deterministic malformed-row fuzz through report, replay and all three unrelated-PR recorders', async () => {
+    const boom = () => { throw new Error('hostile persisted value'); };
+    const cyclic = {}; cyclic.self = cyclic;
+    const values = [null, undefined, [], {}, 0, -1, 1.5, true, NaN, Infinity, 1n, Symbol('bad'),
+      '', '__proto__', 'constructor', 'x'.repeat(128 * 1024), cyclic,
+      { toString: boom }, { toString: null }, Object.create(null),
+      Object.defineProperty({}, 'value', { enumerable: true, get: boom }),
+      JSON.parse('{"__proto__":{"polluted":true}}')];
+    const badFinding = { ...finding, rootCause: { toString: null }, quote: { toString: null } };
+    const base = { kind: 'we.post-accept-advisory-shadow', repo: 'corrupt/repo', pr: 99,
+      headSha: 'old', ...decision, findings: [badFinding], loopsAfter: null };
+    const corpus = [null, [], cyclic, { toString: boom },
+      JSON.parse('{"__proto__":{"kind":"loops","repo":"o/r","pr":7}}')];
+    for (const key of ['kind', 'repo', 'pr', 'headSha', 'head', 'wouldCard', 'wouldPush', 'findings',
+      'loopsAfter', 'laterRatings', 'runId', 'findingIdentity', 'impactIfUnfixed', 'verdict', '__proto__']) {
+      for (const value of values) {
+        corpus.push({ ...base, [key]: value });
+        corpus.push(Object.defineProperty({ ...base }, key, { enumerable: true, get: boom }));
+      }
+    }
+    for (const key of ['category', 'summary', 'finding', 'findingId', 'file', 'line', 'verdict',
+      'impactIfUnfixed', 'rootCause', 'prevention', 'preventionCaptured', 'failure_scenario',
+      'outcome', 'citationScope', 'quote', 'reproCommand', 'evidenceKind', 'disposition',
+      'introduced', 'worseThanBase', 'parallelizable', 'judgmentCall', '__proto__']) {
+      for (const value of values) {
+        corpus.push({ ...base, findings: [{ ...badFinding, [key]: value }] });
+        corpus.push({ ...base, findings: [Object.defineProperty({ ...badFinding }, key,
+          { enumerable: true, get: boom })] });
+      }
+    }
+    for (const kind of ['loops', 'advisory-run', 'advisory-rating']) {
+      for (const key of ['repo', 'pr', 'headSha', 'runId', 'loopsAfter', 'findingIdentity', 'impactIfUnfixed', 'verdict']) {
+        for (const value of values) corpus.push({ ...base, kind, [key]: value });
+      }
+    }
+    expect(corpus.length).toBeGreaterThan(1900);
+    for (const row of corpus) expect(() => reviewLoopPolicy.postAcceptAdvisoryShadowReport([row])).not.toThrow();
+    // Both same-repo/different-PR and different-repo/same-PR must remain writable.
+    for (const identity of [{ repo: 'corrupt/repo', pr: 7 }, { repo: 'o/r', pr: 99 }]) {
+      const rows = [...corpus], logs = [];
+      const io = { ...identity, head: 'A', decision, readLedgerRows: () => rows,
+        appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryShadow(io)).resolves.toMatchObject({ headSha: 'A' });
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryShadow(io)).resolves.toBeNull();
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 1 })).resolves.toMatchObject({ loopsAfter: 1 });
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'later' })).resolves.toBeNull();
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...io, head: 'B', runId: 'later',
+        findings: [{ ...finding, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] })).resolves.toBeNull();
+      expect(rows.slice(corpus.length).map(row => row.kind)).toEqual([
+        'we.post-accept-advisory-shadow', 'loops', 'advisory-run', 'loops', 'advisory-rating',
+      ]);
+      expect(logs).toEqual([]);
+      expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+        prs: 1, wouldCard: 1, findings: 1, loopsAfter: 2, laterBroken: 1,
+      });
+    }
+    // Producer x reader probe: persist exactly what the append sink receives, then replay it.
+    const producers = [reviewLoopPolicy.recordPostAcceptAdvisoryShadow,
+      reviewLoopPolicy.recordPostAcceptAdvisoryLoops, reviewLoopPolicy.recordPostAcceptAdvisoryRating];
+    for (const value of values) {
+      for (const input of [value, { verdict: value }, { verdict: accepted(), guards: { humanRequired: value } },
+        { verdict: accepted([value]) }, { verdict: Object.defineProperty({}, 'findings', { get: boom }) }]) {
+        let result;
+        expect(() => { result = reviewLoopPolicy.postAcceptAdvisoryDecision(input); }).not.toThrow();
+        expect(result).toMatchObject({ action: 'push', wouldCard: false, wouldPush: true });
+      }
+    }
+    for (const row of corpus) {
+      const input = { verdict: row };
+      // Getter reads themselves belong inside the producer boundary.
+      if (row && typeof row === 'object') input.verdict = row;
+      expect(() => reviewLoopPolicy.postAcceptAdvisoryDecision(input)).not.toThrow();
+      const written = [];
+      await expect(reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head: 'probe',
+        get decision() { return { ...decision, findings: row?.findings }; },
+        readLedgerRows: () => written, appendLedgerRow: candidate => { written.push(candidate); return { ok: true }; },
+      })).resolves.toBeDefined();
+      for (const candidate of written) expect(reviewLoopPolicy.validatePostAcceptAdvisoryRow(candidate)).toEqual(candidate);
+      expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(JSON.parse(JSON.stringify(written))))
+        .toMatchObject({ skipped: 0, unresolved: 0 });
+    }
+    const seed = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      headSha: 'A', ...decision, loopsAfter: null };
+    for (const value of values) {
+      for (const producer of producers) {
+        for (const key of ['decision', 'findings', 'loopsAfter', 'now', 'repo', 'head', 'runId']) {
+          const rows = [structuredClone(seed), { kind: 'advisory-run', repo: 'o/r', pr: 7, headSha: 'B', runId: 'R' }], logs = [];
+          const io = { repo: 'o/r', pr: 7, head: 'B', runId: 'R', decision, findings: [finding],
+            readLedgerRows: () => rows, out: line => logs.push(line),
+            appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+          const baseline = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+          const options = { ...io, [key]: value };
+          if (key === 'now') options.now = () => value;
+          await expect(producer(options)).resolves.toBeDefined();
+          for (const row of rows) expect(reviewLoopPolicy.validatePostAcceptAdvisoryRow(row)).toEqual(row);
+          expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(JSON.parse(JSON.stringify(rows))))
+            .toMatchObject({ skipped: 0, unresolved: 0 });
+          expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows).prs).toBeGreaterThanOrEqual(baseline.prs);
+          await expect(producer(Object.defineProperty({ ...io }, key, { get: boom }))).resolves.toBeNull();
+        }
+      }
+    }
+    expect({}.polluted).toBeUndefined();
+  });
+
+  it('counts normalization exceptions and refuses only their own PR identity', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, findings: [{ ...finding, rootCause: { toString: null } }], loopsAfter: null }];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ prs: 0, skipped: 1, unresolved: 1 });
+    const writes = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, head, decision, runId: 'R', findings: [finding],
+      readLedgerRows: () => rows, appendLedgerRow: row => { writes.push(row); return { ok: true }; },
+      out: line => logs.push(line) };
+    for (const recorder of [reviewLoopPolicy.recordPostAcceptAdvisoryShadow,
+      reviewLoopPolicy.recordPostAcceptAdvisoryLoops, reviewLoopPolicy.recordPostAcceptAdvisoryRating]) {
+      await expect(recorder(io)).resolves.toBeNull();
+    }
+    expect(writes).toEqual([]);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+  });
+
+  it.each([
+    { repo: 42 }, { repo: '  ' }, { pr: '7' }, { pr: true }, { pr: 0 }, { pr: 1.5 },
+    { pr: Number.MAX_SAFE_INTEGER + 1 }, { head: 42 }, { head: '' }, { head: '  ' },
+  ])('rejects identity %j consistently in both writers and reports', async invalid => {
+    const rows = [], logs = [];
+    const facts = { repo: 'o/r', pr: 7, head, ...invalid, decision, loopsAfter: 1,
+      readLedgerRows: () => [], appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) };
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow(facts)).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(facts)).toBeNull();
+    expect(rows).toEqual([]);
+    expect(logs).toHaveLength(2);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport([{ ...facts, kind: 'we.post-accept-advisory-shadow', ...decision }]))
+      .toMatchObject({ prs: 0, skipped: 1 });
+  });
+
+  it('contains throwing decision evidence and marks the fail-closed result invalid', () => {
+    const boom = () => { throw new Error('hostile'); };
+    const cyclic = {}; cyclic.self = cyclic;
+    for (const input of [cyclic, Object.defineProperty({}, 'verdict', { get: boom, enumerable: true }),
+      { verdict: accepted([{ ...finding, rootCause: { toString: boom } }]) },
+      { verdict: accepted(), guards: Object.defineProperty({}, 'humanRequired', { get: boom, enumerable: true }) }]) {
+      expect(reviewLoopPolicy.postAcceptAdvisoryDecision(input)).toMatchObject({
+        action: 'push', wouldPush: true, wouldCard: false, invalid: true, findings: [],
+      });
+    }
+  });
+
+  it('refuses normalization-poisoned decisions and invalid whole batches before any append', async () => {
+    const cyclic = {}; cyclic.self = cyclic;
+    for (const key of ['rootCause', 'prevention', 'line', 'file', 'quote', 'reproCommand', 'failure_scenario']) {
+      const rows = [], logs = [];
+      const io = { repo: 'o/r', pr: 7, head: 'A', readLedgerRows: () => rows,
+        appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io,
+        decision: { ...decision, findings: [{ ...finding, [key]: { toString: null } }] } })).toBeNull();
+      expect(rows).toEqual([]);
+      expect(logs).toHaveLength(1);
+    }
+    for (const name of ['recordPostAcceptAdvisoryShadow', 'recordPostAcceptAdvisoryLoops', 'recordPostAcceptAdvisoryRating']) {
+      const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: 'A',
+        ...decision, loopsAfter: null }];
+      if (name.endsWith('Rating')) rows.push({ kind: 'advisory-run', repo: 'o/r', pr: 7, headSha: 'B', runId: 'R' });
+      const before = structuredClone(rows), logs = [];
+      let calls = 0;
+      const result = await reviewLoopPolicy[name]({ repo: 'o/r', pr: 7, head: 'B', runId: 'R', decision,
+        findings: [{ ...finding, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }],
+        now: () => ++calls === 1 && name.endsWith('Loops') ? 'valid-first-measurement' : cyclic,
+        readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+        out: line => logs.push(line) });
+      expect(result).toBeNull();
+      expect(rows).toEqual(before);
+      expect(logs).toHaveLength(1);
+    }
+  });
+
+  it('reads historical head rows idempotently and writes canonical non-SHA head identities', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, head: 'review-head', ...decision, loopsAfter: null }];
+    const io = { repo: 'o/r', pr: 7, head: 'review-head', decision, readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow(io)).toBeNull();
+    expect(rows).toHaveLength(1);
+    const loop = await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 2 });
+    expect(loop).toMatchObject({ headSha: 'review-head', loopsAfter: 2 });
+    expect(loop).not.toHaveProperty('head');
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 2 })).toBeNull();
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 1, loopsAfter: 2, skipped: 0 });
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'next' }))
+      .toMatchObject({ headSha: 'next' });
+  });
+
+  it('refuses corrupt run IDs without letting ignored aliases or unknown row kinds poison replay', async () => {
+    const base = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: null };
+    const rows = [base, { ...base, head: 'conflict' }, { ...base, kind: 'unknown' },
+      { kind: 'loops', repo: 'o/r', pr: 7, head, loopsAfter: 99, runId: 42 }];
+    const before = structuredClone(rows), logs = [];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, wouldCard: 0, skipped: 3, unmeasured: 0, unresolved: 1,
+    });
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'next', runId: 'later',
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs.join(' ')).toContain('invalid loop history; inspect shadow ledger');
+    for (const input of [null, {}, 'rows']) expect(() => reviewLoopPolicy.postAcceptAdvisoryShadowReport(input))
+      .toThrow('unreadable shadow ledger; inspect shadow ledger');
+  });
+
+  it('uses the shared ledger IO seam: one row per PR+head, including loops that followed', async () => {
+    // Same readLedgerRows/appendLedgerRow seam as recordScopedRereviewShadow; no live store or forge IO.
+    const { recordPostAcceptAdvisoryShadow } = await import('../../operations/review-pr-io.mjs');
+    const rows = [];
+    const io = { repo: 'o/r', readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; },
+      now: () => '2026-11-01T20:00:00.000Z', out: () => {} };
+    const facts = { ...io, pr: 7, head, decision, loopsAfter: 3 };
+    await recordPostAcceptAdvisoryShadow(facts);
+    // A fresh reader over the persisted rows, not an in-process dedup cache.
+    await recordPostAcceptAdvisoryShadow({ ...facts, readLedgerRows: () => structuredClone(rows) });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      wouldCard: true, wouldPush: false, findings: [finding], loopsAfter: 3 });
+    await recordPostAcceptAdvisoryShadow({ ...facts, head: 'b'.repeat(40) });
+    await recordPostAcceptAdvisoryShadow({ ...facts, pr: 8 });
+    expect(rows).toHaveLength(3);
+  });
+
+  it.each([null, 42, {}, { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head },
+    { kind: 'we.post-accept-advisory-shadow', pr: 7, headSha: head, ...decision }])(
+    'skips malformed or identity-only row %j without suppressing a valid observation', async bad => {
+      const rows = [bad];
+      const row = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision,
+        readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+      expect(row).toMatchObject({ wouldCard: true, loopsAfter: null });
+      expect(rows).toHaveLength(2);
+    });
+
+  it.each([
+    ['both decisions true', { wouldPush: true }],
+    ['both decisions false', { wouldCard: false }],
+    ['missing push decision', { wouldPush: undefined }],
+    ['broken card', { findings: [{ ...finding, impactIfUnfixed: 'broken' }] }],
+    ['unrecoverable card', { findings: [{ ...finding, impactIfUnfixed: 'unrecoverable' }] }],
+    ['unstated-impact card', { findings: [{ ...finding, impactIfUnfixed: undefined }] }],
+    ['security card', { findings: [{ ...finding, category: 'security/security' }] }],
+    ['unknown-category card', { findings: [{ ...finding, category: 'unknown/unknown' }] }],
+    ['empty card', { findings: [] }],
+    ['mixed blocking card', { findings: [finding, { ...finding, impactIfUnfixed: 'broken' }] }],
+    ['mixed security card', { findings: [finding, { ...finding, category: 'security/security' }] }],
+    ['null finding', { findings: [null] }],
+    ['sparse findings', { findings: new Array(1) }],
+    ['malformed finding verdict', { findings: [{ ...finding, verdict: 42 }] }],
+    ['malformed finding identity', { findings: [{ ...finding, findingId: ' ' }] }],
+    ['corrupt summary alias', { findings: [{ ...finding, summary: null, finding: 'fallback' }] }],
+    ['whitespace rating identity', { laterRatings: [{ findingId: ' ', impactIfUnfixed: 'broken' }] }],
+    ['sparse ratings', { laterRatings: new Array(1) }],
+    ['scalar finding', { findings: [42] }],
+    ['array finding', { findings: [[]] }],
+    ['empty finding', { findings: [{}] }],
+    ['empty category', { findings: [{ ...finding, category: '' }] }],
+    ['non-string category', { findings: [{ ...finding, category: 42 }] }],
+    ['unknown impact', { findings: [{ ...finding, impactIfUnfixed: 'unknown' }] }],
+    ['non-string impact', { findings: [{ ...finding, impactIfUnfixed: 42 }] }],
+    ['empty text', { findings: [{ ...finding, summary: '  ' }] }],
+    ['non-string text', { findings: [{ ...finding, summary: 42 }] }],
+    ['negative loop count', { loopsAfter: -9 }],
+    ['fractional loop count', { loopsAfter: 1.5 }],
+    ['non-string loop count', { loopsAfter: '2' }],
+    ['non-array laterRatings', { laterRatings: {} }],
+    ['null laterRatings', { laterRatings: null }],
+    ['null rating entry', { laterRatings: [null] }],
+    ['missing rating identity', { laterRatings: [{ impactIfUnfixed: 'broken' }] }],
+    ['unknown rating impact', { laterRatings: [{ findingId: 'finding-1', impactIfUnfixed: 'unknown' }] }],
+  ])('skips a persisted %s in reports and permits a valid replacement observation', async (_name, malformed) => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, loopsAfter: null, ...malformed }];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, wouldCard: 0, findings: 0, skipped: 1,
+    });
+    if (Object.keys(malformed).some(key => ['wouldCard', 'wouldPush', 'findings'].includes(key))) {
+      const writes = [];
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head,
+        decision: { ...decision, ...malformed }, readLedgerRows: () => [],
+        appendLedgerRow: row => { writes.push(row); return { ok: true }; } })).toBeNull();
+      expect(writes).toEqual([]);
+    }
+    const replacement = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision,
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(replacement).toMatchObject({ wouldCard: true, findings: [finding] });
+    expect(rows).toHaveLength(2);
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 1, skipped: 1 });
+    expect(report.text).toContain('Skipped: 1');
+  });
+
+  it.each([
+    { impactIfUnfixed: 'broken' }, { impactIfUnfixed: 'unrecoverable' },
+    { impactIfUnfixed: undefined }, { category: 'security/security' },
+  ])('persists a required push for blocking finding %j', async blocking => {
+    const rows = [];
+    const push = { wouldCard: false, wouldPush: true, findings: [finding, { ...finding, ...blocking }] };
+    const row = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision: push,
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(row).toMatchObject(push);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldPush: 1, wouldCard: 0, skipped: 0 });
+  });
+
+  it('keeps the existing undeclared-impact marker and finding-text alias readable', async () => {
+    const { impactIfUnfixed, summary, ...undeclared } = finding;
+    const rows = [];
+    const recorded = await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head,
+      decision: { ...decision, wouldCard: false, wouldPush: true, findings: [{ ...undeclared, finding: summary }] },
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(recorded).toMatchObject({ wouldPush: true, loopsAfter: null });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldPush: 1, skipped: 0 });
+  });
+
+  it.each([null, 42, ' ', {}, []])('rejects malformed run ID %j even with explicit loops', async runId => {
+    const rows = [];
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head, runId, loopsAfter: 1,
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; } })).toBeNull();
+    expect(rows).toEqual([]);
+  });
+
+  it('refuses exhausted measured loop counts with an operator-visible ledger inspection fallback', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, loopsAfter: Number.MAX_SAFE_INTEGER }];
+    const logs = [];
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'b'.repeat(40), runId: 'later',
+      readLedgerRows: () => rows, appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) })).toBeNull();
+    expect(rows).toHaveLength(1);
+    expect(logs.join('\n')).toContain('loop count exhausted; inspect shadow ledger; live review unaffected');
+  });
+
+  it('refuses to persist a new observation containing a null finding', async () => {
+    const rows = [];
+    const logs = [];
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head,
+      decision: { ...decision, findings: [null] }, readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) })).toBeNull();
+    expect(rows).toEqual([]);
+    expect(logs.join('\n')).toContain('incomplete shadow evidence; live review unaffected');
+  });
+
+  it('serializes concurrent calls with independent ledger snapshots', async () => {
+    const { recordPostAcceptAdvisoryShadow } = await import('../../operations/review-pr-io.mjs');
+    const rows = [];
+    const facts = { repo: 'o/r', pr: 7, head, decision,
+      readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    await Promise.all([recordPostAcceptAdvisoryShadow(facts), recordPostAcceptAdvisoryShadow(facts)]);
+    expect(rows).toHaveLength(1);
+  });
+
+  it('serializes concurrent persisted writers across processes to exactly one row', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'advisory-concurrency-'));
+    const ledgerPath = join(dir, 'shadow.jsonl');
+    const moduleUrl = pathToFileURL(resolve('scripts/operations/review-pr-io.mjs')).href;
+    const source = `import { recordPostAcceptAdvisoryShadow } from ${JSON.stringify(moduleUrl)};
+      await recordPostAcceptAdvisoryShadow(${JSON.stringify({ repo: 'o/r', pr: 7, head, decision, ledgerPath })});`;
+    try {
+      writeFileSync(ledgerPath, 'null\n');
+      await Promise.all([1, 2].map(() => promisify(execFile)(process.execPath, ['--input-type=module', '-e', source], { timeout: 10000, maxBuffer: 64 * 1024 })));
+      const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows).toHaveLength(2);
+      expect(rows[1]).toMatchObject({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, loopsAfter: null });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('bounds a busy ledger lock and reports a shadow miss without disturbing the lock or ledger', async () => {
+    const { recordPostAcceptAdvisoryShadow } = await import('../../operations/review-pr-io.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'advisory-lock-'));
+    const ledgerPath = join(dir, 'shadow.jsonl');
+    const logs = [];
+    try {
+      writeFileSync(ledgerPath, 'null\n');
+      writeFileSync(`${ledgerPath}.lock`, 'another writer');
+      expect(await recordPostAcceptAdvisoryShadow({ repo: 'o/r', pr: 7, head, decision, ledgerPath,
+        out: line => logs.push(line) })).toBeNull();
+      expect(readFileSync(ledgerPath, 'utf8')).toBe('null\n');
+      expect(readFileSync(`${ledgerPath}.lock`, 'utf8')).toBe('another writer');
+      expect(logs.join('\n')).toMatch(/lock busy after 2000ms; inspect writer.*live review unaffected/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('records loops later, dedupes by identity/value, and reports latest measurement separately from unmeasured', async () => {
+    const { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops } = await import('../../operations/review-pr-io.mjs');
+    const rows = [];
+    const io = { repo: 'o/r', pr: 7, head, readLedgerRows: () => rows,
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    await recordPostAcceptAdvisoryShadow({ ...io, decision });
+    await recordPostAcceptAdvisoryShadow({ ...io, pr: 8, decision });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ unmeasured: 2, loopsAfter: 0 });
+    await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 2 });
+    await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 4 });
+    await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 2 });
+    expect(rows).toHaveLength(4);
+    expect(rows[2]).toMatchObject({ kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter: 2 });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ prs: 2, wouldCard: 2, loopsAfter: 4, unmeasured: 1 });
+    await recordPostAcceptAdvisoryLoops({ ...io, pr: 8, loopsAfter: 0 });
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ loopsAfter: 4, unmeasured: 0, skipped: 0 });
+    expect(report.text).toContain('Unmeasured: 0');
+    expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: -1 })).toBeNull();
+    expect(await recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
+  });
+
+  it.each([3, 2, 4])('accept count 3, later run 4, explicit replay %i appends nothing and reports 4', async loopsAfter => {
+    const rows = [];
+    const io = { repo: 'o/r', pr: 7, head, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, loopsAfter: 3 });
+    const accepted = structuredClone(rows);
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 3 })).toBeNull();
+    expect(rows).toEqual(accepted);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'later', runId: 'later' });
+    expect(rows.at(-1)).toMatchObject({ headSha: head, loopsAfter: 4, runId: 'later' });
+    const before = structuredClone(rows);
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 4, skipped: 0 });
+  });
+
+  it('adversarial persisted lower and equal explicit replays cannot regress the report or next run', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      headSha: head, ...decision, loopsAfter: 3 },
+    ...[4, 3, 2, 4].map(loopsAfter => ({ kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter }))];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 4, skipped: 3 });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head: 'later', runId: 'later',
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; } });
+    expect(rows.at(-1)).toMatchObject({ headSha: head, loopsAfter: 5, runId: 'later' });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 5, skipped: 3 });
+  });
+
+  it('adversarial interleaved accepts keep independent measurements across explicit and run replays', async () => {
+    const rows = [];
+    const io = { repo: 'o/r', pr: 7, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'A', loopsAfter: 3 });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'B' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', loopsAfter: 0 });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', loopsAfter: 3 });
+    const before = structuredClone(rows);
+    for (const [head, loopsAfter] of [['A', 3], ['A', 2], ['A', 4], ['B', 0], ['B', 2], ['B', 3]]) {
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head, loopsAfter })).toBeNull();
+    }
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'B' });
+    expect(rows).toEqual(before);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows.slice(-2)).toMatchObject([
+      { headSha: 'A', loopsAfter: 5, runId: 'C' }, { headSha: 'B', loopsAfter: 4, runId: 'C' },
+    ]);
+    const after = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows).toEqual(after);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 9, skipped: 0 });
+  });
+
+  it.each([undefined, 'R'])('orphan measurement with run ID %s refuses all later recording for its PR', async runId => {
+    const orphan = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, loopsAfter: 1,
+      ...(runId === undefined ? {} : { runId }) };
+    const rows = [orphan, { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      headSha: head, ...decision, loopsAfter: null }];
+    const before = structuredClone(rows), logs = [];
+    const io = { repo: 'o/r', pr: 7, head, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; }, out: line => logs.push(line) };
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, loopsAfter: 1 })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'R' })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', decision })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 0, wouldCard: 0, loopsAfter: 0, unmeasured: 0, skipped: 1, unresolved: 1 });
+    expect(report.text).toContain('Unresolved: 1');
+  });
+
+  it('accept A; corrupt run R count 99; record R on A then B refuses without binding or counting R', async () => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; }, out: line => logs.push(line) };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'A', decision });
+    rows.push({ kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', runId: 'R', loopsAfter: 99 });
+    const before = structuredClone(rows);
+    for (const head of ['A', 'B']) {
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head, runId: 'R' })).toBeNull();
+      expect(rows).toEqual(before);
+    }
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, loopsAfter: 0, wouldCard: 0, unresolved: 1, skipped: 1,
+    });
+  });
+
+  it.each([
+    ['bad count', { kind: 'loops', headSha: 'A', runId: 'R', loopsAfter: -1 }],
+    ['missing head', { kind: 'loops', runId: 'R', loopsAfter: 1 }],
+    ['conflicting aliases', { kind: 'loops', headSha: 'A', head: 'B', runId: 'R', loopsAfter: 1 }],
+    ['bad run marker', { kind: 'advisory-run', headSha: 'B', runId: '' }],
+    ['conflicting run marker', { kind: 'advisory-run', headSha: 'C', runId: 'R' }],
+    ['different duplicate count', { kind: 'loops', headSha: 'A', runId: 'R', loopsAfter: 2 }],
+    ['missing accepted head', { kind: 'loops', headSha: 'missing', loopsAfter: 1 }],
+    ['same-head measurement', { kind: 'loops', headSha: 'B', runId: 'R', loopsAfter: 1 }],
+  ])('sweep: %s invalidates earlier measurements, but only for its repository and PR', async (_name, corrupt) => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; }, out: line => logs.push(line) };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'A', decision });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'B', runId: 'R' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', decision });
+    rows.push({ repo: 'o/r', pr: 7, ...corrupt });
+    const before = structuredClone(rows);
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'next' })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'A', loopsAfter: 9 })).toBeNull();
+    expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'C', decision })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(3);
+    expect(logs.every(line => line.includes('invalid loop history; inspect shadow ledger'))).toBe(true);
+    for (const identity of [{ repo: 'o/r', pr: 8 }, { repo: 'other/r', pr: 7 }]) {
+      expect(await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, ...identity, head: 'A', decision })).not.toBeNull();
+      await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, ...identity, head: 'C', runId: 'next' });
+    }
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 2, wouldCard: 2, loopsAfter: 2, unresolved: 1,
+    });
+  });
+
+  it('sweep: historical measurements with no known run head cannot bind that run to a new head', async () => {
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, head: 'A', ...decision, loopsAfter: null },
+      { kind: 'loops', repo: 'o/r', pr: 7, head: 'A', runId: 'R', loopsAfter: 1 }];
+    const before = structuredClone(rows), logs = [];
+    for (const head of ['A', 'B']) expect(await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head, runId: 'R',
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) })).toBeNull();
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('unknown historical run head; inspect shadow ledger'))).toBe(true);
+  });
+
+  it('prints counts and counts only shadow-carded findings later re-rated CONFIRMED broken, matched by identity', () => {
+    const rows = [
+      { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: 3,
+        laterRatings: [{ findingId: 'finding-1', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' },
+          { findingId: 'unrelated', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] },
+      { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 8, headSha: head, ...decision, loopsAfter: 2,
+        laterRatings: [{ findingId: 'finding-1', verdict: 'CONFIRMED', impactIfUnfixed: 'cosmetic' }] },
+      { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 9, headSha: head, wouldCard: false, wouldPush: true, findings: [finding], loopsAfter: 1,
+        laterRatings: [{ findingId: 'finding-1', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }] },
+    ];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 3, wouldCard: 2, wouldPush: 1, findings: 2,
+      loopsAfter: 6, laterBroken: 1, unconfirmedBroken: 0 });
+    expect(report.text).toMatch(/would.?card[^\n]*2/i);
+    expect(report.text).toMatch(/would.?push[^\n]*1/i);
+    expect(report.text).toMatch(/broken[^\n]*1/i);
+  });
+
+  it.each([
+    ['plausible', { verdict: 'PLAUSIBLE' }],
+    ['absent', {}],
+    ['undefined', { verdict: undefined }],
+    ['null', { verdict: null }],
+    ['lowercase', { verdict: 'confirmed' }],
+    ['padded', { verdict: 'CONFIRMED ' }],
+    ['unknown', { verdict: 'UNKNOWN' }],
+    ['number', { verdict: 42 }],
+    ['object', { verdict: { verdict: 'CONFIRMED' } }],
+    ['array', { verdict: ['CONFIRMED'] }],
+  ])('reports %s broken re-rates as unconfirmed without overstating confirmed evidence', (_name, verdict) => {
+    const rating = { findingId: finding.findingId, impactIfUnfixed: 'broken', ...verdict };
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, loopsAfter: 3, laterRatings: [rating, structuredClone(rating),
+        { ...rating, findingId: 'unrelated' }] }];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 1, loopsAfter: 3,
+      laterBroken: 0, unconfirmedBroken: 1, skipped: 0 });
+    expect(report.text).toContain('Later broken: 0\nUnconfirmed broken: 1');
+  });
+
+  it.each([
+    ['absent', {}],
+    ['undefined', { findingId: undefined }],
+    ['null', { findingId: null }],
+    ['empty', { findingId: '' }],
+    ['whitespace', { findingId: '  ' }],
+    ['number', { findingId: 42 }],
+  ])('keeps anonymous findings counted without matching broken ratings with %s identities', (_name, identity) => {
+    const { findingId, ...anonymous } = finding;
+    const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, findings: [anonymous, structuredClone(anonymous)], loopsAfter: null,
+      laterRatings: [
+        { findingId: 'unrelated-confirmed', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' },
+        { findingId: 'unrelated-plausible', verdict: 'PLAUSIBLE', impactIfUnfixed: 'broken' },
+      ] };
+    // Unidentified ratings already fail ledger validation. Preserve that closed path
+    // while keeping the earlier valid observation and its anonymous finding count.
+    const rows = [accept, { ...accept, laterRatings: [
+      { ...identity, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' },
+      { ...identity, verdict: 'PLAUSIBLE', impactIfUnfixed: 'broken' },
+      { ...identity, impactIfUnfixed: 'broken' },
+    ] }];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 2, unmeasured: 1,
+      laterBroken: 0, unconfirmedBroken: 0, skipped: 1 });
+    expect(report.text).toContain('Findings: 2');
+    expect(report.text).toContain('Later broken: 0\nUnconfirmed broken: 0');
+  });
+
+  it('counts repeated finding IDs and confirmed re-rates once while preserving anonymous findings', () => {
+    const { findingId, ...anonymous } = finding;
+    const confirmed = { findingId, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const rows = [{ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head,
+      ...decision, findings: [finding, structuredClone(finding), anonymous, structuredClone(anonymous)],
+      loopsAfter: 0, laterRatings: [confirmed, structuredClone(confirmed),
+        { ...confirmed, verdict: 'PLAUSIBLE' }, { ...confirmed, findingId: 'unrelated' }] }];
+    const report = reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows);
+    expect(report).toMatchObject({ prs: 1, wouldCard: 1, findings: 3,
+      laterBroken: 1, unconfirmedBroken: 0, skipped: 0 });
+    expect(report.text).toContain('Findings: 3');
+  });
+
+  it('adversarial replay: accept A, accept B, replay A, and replay an earlier nonaccept after restart', async () => {
+    const { recordPostAcceptAdvisoryShadow: accept, recordPostAcceptAdvisoryLoops: run } = await import('../../operations/review-pr-io.mjs');
+    let rows = [];
+    const io = { repo: 'o/r', pr: 7, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await run({ ...io, head: 'pre', runId: 'pre' });
+    await run({ ...io, head: 'A', runId: 'A' });
+    await accept({ ...io, head: 'A' });
+    await run({ ...io, head: 'B', runId: 'B' });
+    await accept({ ...io, head: 'B' });
+    rows = JSON.parse(JSON.stringify(rows)); // No remembered in-process replay state.
+    const before = structuredClone(rows);
+    await run({ ...io, head: 'A', runId: 'A' });
+    await run({ ...io, head: 'pre', runId: 'pre' });
+    await run({ ...io, head: 'B', runId: 'B' });
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([{ headSha: 'A', runId: 'B', loopsAfter: 1 }]);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 2, loopsAfter: 1, unmeasured: 1, skipped: 0 });
+    await Promise.all(['C', 'C', 'D'].map(runId => run({ ...io, head: runId, runId })));
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: 'A', runId: 'B', loopsAfter: 1 },
+      { headSha: 'A', runId: 'C', loopsAfter: 2 }, { headSha: 'B', runId: 'C', loopsAfter: 1 },
+      { headSha: 'A', runId: 'D', loopsAfter: 3 }, { headSha: 'B', runId: 'D', loopsAfter: 2 },
+    ]);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ loopsAfter: 5, skipped: 0 });
+  });
+
+  it('adversarial historical accept A, accept B, replay A twice remains fenced after marker migration', async () => {
+    const rows = ['A', 'B'].map(head => ({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7,
+      head, ...decision, loopsAfter: null }));
+    const io = { repo: 'o/r', pr: 7, head: 'A', runId: 'A', readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io);
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops(io);
+    expect(rows).toEqual(before);
+    expect(rows.filter(row => row.kind === 'loops')).toEqual([]);
+    // Even a structurally valid injected measurement cannot turn the migrated run into a later run.
+    rows.push({ kind: 'loops', repo: 'o/r', pr: 7, head: 'B', runId: 'A', loopsAfter: 1 });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ prs: 0, loopsAfter: 0, unmeasured: 0, unresolved: 1, skipped: 1 });
+  });
+
+  it('adversarial partial fanout recovers after restart without counting a later accept', async () => {
+    let rows = [];
+    const io = { repo: 'o/r', pr: 7, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(structuredClone(row)); return { ok: true }; } };
+    for (const head of ['A', 'B']) await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head });
+    let attempts = 0;
+    const logs = [];
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C', out: line => logs.push(line),
+      appendLedgerRow: row => ++attempts === 3 ? { ok: false } : io.appendLedgerRow(row) });
+    expect(logs.join(' ')).toContain('shadow ledger write failed');
+    expect(rows.filter(row => row.kind === 'loops')).toHaveLength(1);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'D' });
+    rows = JSON.parse(JSON.stringify(rows));
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows.filter(row => row.kind === 'loops')).toMatchObject([
+      { headSha: 'A', runId: 'C', loopsAfter: 1 }, { headSha: 'B', runId: 'C', loopsAfter: 1 },
+    ]);
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'C' });
+    expect(rows).toEqual(before);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ wouldCard: 3, loopsAfter: 2, unmeasured: 1, skipped: 0 });
+  });
+
+  it('adversarial report excludes identities with orphan, preaccept measurements, and corrupt counts', () => {
+    const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: head, ...decision, loopsAfter: null };
+    const loop = { kind: 'loops', repo: 'o/r', pr: 7, headSha: head, runId: 'later', loopsAfter: 1 };
+    const rows = [{ ...loop, runId: 'early' }, accept, structuredClone(accept), loop, structuredClone(loop),
+      { ...loop, runId: 'corrupt', loopsAfter: 99 }, null, {}, { kind: 'advisory-run', repo: 'o/r' }];
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({
+      prs: 0, wouldCard: 0, findings: 0, loopsAfter: 0, unmeasured: 0, skipped: 7, unresolved: 1,
+    });
+  });
+
+  it('adversarial changed run head fails closed with an inspection fallback', async () => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; } };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'A', runId: 'one' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow({ ...io, head: 'B', decision });
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, head: 'C', runId: 'one', out: line => logs.push(line) });
+    expect(rows).toEqual(before);
+    expect(logs.join(' ')).toContain('conflicting run head; inspect shadow ledger');
+  });
+
+  it('adversarial sparse ledger rows are counted skipped, not silently lost', () => {
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(new Array(2))).toMatchObject({ prs: 0, skipped: 2 });
+  });
+
+  it('adversarial oversized report totals refuse imprecise output with an inspection fallback', () => {
+    const rows = [7, 8].map(pr => ({ kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr, headSha: head,
+      ...decision, loopsAfter: Number.MAX_SAFE_INTEGER }));
+    expect(() => reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toThrow('loop total exhausted; inspect shadow ledger');
+  });
+
+  it('adversarial explicit measurement without an earlier accept refuses to write with an inspection fallback', async () => {
+    const rows = [], logs = [];
+    await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ repo: 'o/r', pr: 7, head, loopsAfter: 2,
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; },
+      out: line => logs.push(line) });
+    expect(rows).toEqual([]);
+    expect(logs.join(' ')).toContain('missing accept; inspect shadow ledger');
+  });
+
+  it('adversarial mixed run ID and explicit counts cannot bypass run replay deduplication', async () => {
+    const rows = [], logs = [];
+    const io = { repo: 'o/r', pr: 7, head, decision, readLedgerRows: () => structuredClone(rows),
+      appendLedgerRow: row => { rows.push(row); return { ok: true }; }, out: line => logs.push(line) };
+    await reviewLoopPolicy.recordPostAcceptAdvisoryShadow(io);
+    const before = structuredClone(rows);
+    for (const loopsAfter of [1, 2]) await reviewLoopPolicy.recordPostAcceptAdvisoryLoops({ ...io, runId: 'same-run', loopsAfter });
+    expect(rows).toEqual(before);
+    expect(logs).toHaveLength(2);
+    expect(logs.every(line => line.includes('supply a run ID or an explicit count; inspect shadow ledger'))).toBe(true);
+  });
+
+  it('reports zero counts for an empty shadow ledger', () => {
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport([])).toMatchObject({
+      prs: 0, wouldCard: 0, wouldPush: 0, findings: 0, loopsAfter: 0, laterBroken: 0,
+    });
+  });
+});
 
 describe('reviewLoopAutoConfirm — the #3072/#3383/#3434 ruling, in code', () => {
   it('declines a HUMAN-addressed confirm no matter what the verdict is — UNCHANGED by #3434/#3442', () => {
@@ -916,5 +1892,82 @@ describe('card 5471 [A3]: the round-cards report (count + later fix rate)', asyn
   });
   it('no cards: zero, with a null rate (nothing to divide)', () => {
     expect(roundCardsReport([])).toMatchObject({ cards: 0, findings: 0, fixRate: null });
+  });
+});
+
+
+describe('production post-accept advisory ratings', () => {
+  const finding = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness',
+    summary: 'cosmetic at accept', impactIfUnfixed: 'cosmetic', verdict: 'CONFIRMED' };
+  const accept = { kind: 'we.post-accept-advisory-shadow', repo: 'o/r', pr: 7, headSha: 'A',
+    wouldCard: true, wouldPush: false, findings: [finding], loopsAfter: null };
+  const run = { kind: 'advisory-run', repo: 'o/r', pr: 7, headSha: 'B', runId: 'later' };
+  const rated = { ...finding, summary: 'different prose', impactIfUnfixed: 'broken' };
+  const setup = (rows = [structuredClone(accept), structuredClone(run)]) => ({ rows,
+    facts: { repo: 'o/r', pr: 7, head: 'B', runId: 'later', findings: [rated],
+      readLedgerRows: () => structuredClone(rows), appendLedgerRow: row => { rows.push(row); return { ok: true }; } } });
+
+  it('matches shared fingerprints without prose, isolates PRs/heads, and deduplicates identity plus rating across runs', async () => {
+    const { rows, facts } = setup();
+    rows.unshift({ ...accept, pr: 8 }, { ...accept, repo: 'other/repo' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [rated, rated,
+      { ...rated, line: 99 }, { ...rated, file: 'scripts/other.mjs' }] });
+    const snapshot = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating(facts);
+    expect(rows).toEqual(snapshot);
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toEqual([expect.objectContaining({
+      headSha: 'A', repo: 'o/r', pr: 7, impactIfUnfixed: 'broken', verdict: 'CONFIRMED',
+      findingIdentity: `fingerprint:${reviewLoopPolicy.roundCardsFindingsFingerprint([finding])}`,
+    })]);
+    rows.push({ ...run, runId: 'later-again' });
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, runId: 'later-again' });
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(1);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [{ ...rated, verdict: 'PLAUSIBLE' }] });
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toHaveLength(2);
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows)).toMatchObject({ laterBroken: 1, unconfirmedBroken: 0 });
+  });
+
+  it.each([
+    ['missing run', [accept]], ['historical unknown head', [accept, { kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', runId: 'later', loopsAfter: 1 }]],
+    ['conflicting run head', [accept, { ...run, headSha: 'C' }]],
+    ['corrupt loops', [accept, run, { kind: 'loops', repo: 'o/r', pr: 7, headSha: 'A', loopsAfter: -1 }]],
+    ['corrupt rating', [accept, run, { ...run, kind: 'advisory-rating', findingIdentity: 'unknown', impactIfUnfixed: 'broken', verdict: 'CONFIRMED', headSha: 'A' }]],
+  ])('refuses %s with an inspect-ledger fallback and no writes', async (_name, initial) => {
+    const { rows, facts } = setup(structuredClone(initial)), logs = [];
+    const before = structuredClone(rows);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, out: line => logs.push(line) });
+    expect(rows).toEqual(before);
+    expect(logs.join('\n')).toContain('inspect shadow ledger');
+  });
+
+  it.each([{ repo: '' }, { pr: '7' }, { head: '' }, { runId: '' }, { findings: null },
+    { findings: [{ ...rated, impactIfUnfixed: 'unknown' }] }, { findings: [{ ...rated, verdict: undefined }] }])(
+    'refuses incomplete evidence %j', async invalid => {
+      const { rows, facts } = setup(), logs = [];
+      await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, ...invalid, out: line => logs.push(line) });
+      expect(rows).toHaveLength(2);
+      expect(logs.join('\n')).toContain('live review unaffected');
+    });
+
+  it('never matches free text, future accepts, same heads, or would-push observations', async () => {
+    const { rows, facts } = setup([{ ...accept, findings: [{ category: finding.category, summary: rated.summary, impactIfUnfixed: 'cosmetic' }] },
+      { ...accept, headSha: 'B' }, { ...accept, headSha: 'push', wouldCard: false, wouldPush: true }, run,
+      { ...accept, headSha: 'future' }]);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating(facts);
+    expect(rows.filter(row => row.kind === 'advisory-rating')).toEqual([]);
+  });
+
+  it('supports stable IDs without paths and refuses unreadable ledgers or failed writes', async () => {
+    const byId = { ...finding, file: undefined, findingId: 'stable' };
+    const { rows, facts } = setup([{ ...accept, findings: [byId] }, run]);
+    await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [{ ...byId, summary: 'new prose', impactIfUnfixed: 'broken' }] });
+    expect(reviewLoopPolicy.postAcceptAdvisoryShadowReport(rows).laterBroken).toBe(1);
+    for (const override of [{ readLedgerRows: () => null }, { appendLedgerRow: () => ({ ok: false }) }]) {
+      const logs = [];
+      await reviewLoopPolicy.recordPostAcceptAdvisoryRating({ ...facts, findings: [{ ...byId, impactIfUnfixed: 'degraded' }],
+        ...override, out: line => logs.push(line) });
+      expect(logs.join('\n')).toContain('live review unaffected');
+    }
+    expect(rows).toHaveLength(3);
   });
 });
