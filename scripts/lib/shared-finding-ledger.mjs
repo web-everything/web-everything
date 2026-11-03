@@ -25,7 +25,8 @@ function exactMatch(entry, finding) {
 function sameSpot(a, b) {
   const ia = normalizeFindingIdentity(a), ib = normalizeFindingIdentity(b);
   if (ia?.anchor && ib?.anchor && ia.anchor !== ib.anchor) return false;
-  return !(Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) > 3);
+  // Fail closed: a missing line on either side is not the same spot.
+  return Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) <= 3;
 }
 
 function matches(entry, finding, { strict = false } = {}) {
@@ -44,7 +45,7 @@ export function recordFindings(ledger, { source, head, findings }) {
     const entry = next.entries.find(candidate => matches(candidate, finding));
     if (entry) {
       // A merge that is not the exact same claim keeps the incoming wording and reopens the entry: a pin never covers it.
-      if (!exactMatch(entry, finding)) {
+      if (!matches(entry, finding, { strict: true })) {
         (entry.variants ??= []).push(structuredClone(finding));
         Object.assign(entry, { status: 'open', pinningTest: null });
       }

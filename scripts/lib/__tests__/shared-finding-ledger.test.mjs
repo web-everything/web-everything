@@ -122,7 +122,7 @@ describe('immutable shared ledger', () => {
 describe('filterReraises — suppress only a currently proven test pin', () => {
   it('drops only the matching test-pinned finding when the test exists on head and passes', () => {
     const ledger = deepFreeze(pinned());
-    const reraised = finding({ category: 'security', line: 100 });
+    const reraised = finding({ category: 'security', line: 13 });
     const unrelated = finding({ file: 'policy/other.md' });
     const findings = deepFreeze([reraised, unrelated]);
     const pinStillHolds = vi.fn(entry => {
@@ -312,5 +312,20 @@ describe('audit round 4 hardening', () => {
     const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
     expect(filterReraises(l, [b], { pinStillHolds: () => true }).dropped).toEqual([]);
     expect(filterReraises(l, [{ ...a, line: 14 }], { pinStillHolds: () => true }).dropped).toHaveLength(1);
+  });
+});
+
+describe('audit round 5 hardening', () => {
+  it('a same-claim report at another spot is kept as a variant and reopens the entry', () => {
+    const a = finding({ line: 12 });
+    let l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    l = recordFindings(l, { source: 'audit', head: H2, findings: [finding({ line: 90 })] });
+    expect(l.entries[0].status).toBe('open');
+    expect(renderOpenForBrief(l, { pinStillHolds: () => true })).toContain(':90');
+  });
+  it('a finding with no line is never suppressed', () => {
+    const a = finding({ line: 12 });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [finding({ line: undefined })], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
