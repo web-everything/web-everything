@@ -323,6 +323,14 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
  *  bypass the shared paged snapshot and run a heavy 200-row `gh pr list` (HTTP 504 all day, 2026-11-03). */
 export const SNAPSHOT_LIST_FIELDS = PR_LIST_JSON_FIELDS.split(',').filter(f => f !== 'author').join(',');
 const pagedHeavyCache = new Map();
+/** A `fresh` read may reuse a cached heavy read (comments/body/files) only if it was taken AFTER its PR's `updatedAt`
+ *  second had ended: updatedAt has 1 s granularity, so a comment posted in the same second as a cached read would leave
+ *  updatedAt unchanged and stay invisible (a stand-down missed after the planner's baseline probe). */
+export const FRESH_SETTLE_MS = 2000;
+export function settledHeavyCache(cache) {
+  return Object.fromEntries(Object.entries(cache || {}).filter(([, e]) => Number.isFinite(e?.fetchedAtMs)
+    && Number.isFinite(Date.parse(e?.updatedAt)) && e.fetchedAtMs - Date.parse(e.updatedAt) >= FRESH_SETTLE_MS));
+}
 const authorByPr = new Map();
 
 /** An immutable per-PR fact (author), read through the ETag-cached REST reader and remembered in-process.
@@ -461,7 +469,7 @@ export function defaultReadPrs({ exec = execFileSyncThrottled, repo = null, read
       }
       if (!usePaged) return direct(); // snapshot explicitly disabled (opt-out / hermetic tests): the legacy direct read, no author fill
       const paged = listPaged({ repo, exec, paging: resolvePrListPaging(), heavyFields: ['comments', 'body', 'files'],
-        cache: pagedHeavyCache.get(repo) || {}, maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
+        cache: fresh ? settledHeavyCache(pagedHeavyCache.get(repo)) : (pagedHeavyCache.get(repo) || {}), maxRows: PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (reconcile page)' } } });
       pagedHeavyCache.set(repo, paged.cache);
       // A capped inventory is incomplete discovery: fail loudly rather than plan as if the omitted PRs did not exist.
       if (paged.truncated) throw Object.assign(new Error(`open-PR list for ${repo} truncated at ${PR_LIST_LIMIT} rows (${paged.totalCount} open) — refusing a partial inventory`), { code: 'pr-list-truncated' });

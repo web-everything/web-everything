@@ -295,3 +295,15 @@ describe('fresh read (the fix daemon plans from a read taken AFTER its baseline 
     expect(arg.attributionRepo).toBe('web-everything/web-everything');
   });
 });
+
+it('a fresh read reuses a cached heavy read only once its PR updatedAt second had ended (same-second comments stay visible)', async () => {
+  const { settledHeavyCache, FRESH_SETTLE_MS } = await import('../reconcile-pass.mjs');
+  const U = Date.parse('2026-11-03T22:00:00Z');
+  const cache = {
+    1: { updatedAt: '2026-11-03T22:00:00Z', fetchedAtMs: U + 500, comments: ['maybe stale'] },
+    2: { updatedAt: '2026-11-03T22:00:00Z', fetchedAtMs: U + FRESH_SETTLE_MS, comments: ['settled'] },
+    3: { updatedAt: 'garbage', fetchedAtMs: U + 99999 },
+  };
+  expect(Object.keys(settledHeavyCache(cache))).toEqual(['2']);
+  expect(settledHeavyCache(undefined)).toEqual({});
+});
