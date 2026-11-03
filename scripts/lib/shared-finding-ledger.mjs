@@ -15,12 +15,19 @@ export function emptyLedger() {
   return { entries: [] };
 }
 
+function exactMatch(entry, finding) {
+  const identity = normalizeFindingIdentity(finding);
+  const original = normalizeFindingIdentity(entry.finding);
+  return Boolean(identity && original && identity.path === original.path && identity.normSummary === original.normSummary);
+}
+
 function matches(entry, finding, { strict = false } = {}) {
+  if (exactMatch(entry, finding)) return true;
+  if (strict) return false; // suppression needs the same path and the same claim: no anchor-only or fuzzy match
   const identity = normalizeFindingIdentity(finding);
   const original = normalizeFindingIdentity(entry.finding);
   if (sameFindingIdentity(original, identity, { ignoreLens: true })) return true;
-  // Fuzzy similarity may MERGE reports into one entry, but never decides a suppression (a near claim is not the same defect).
-  return !strict && Boolean(original?.path && identity?.path && sameFinding(
+  return Boolean(original?.path && identity?.path && sameFinding(
       { ...entry.finding, file: original.path }, { ...finding, file: identity.path }));
 }
 
@@ -29,6 +36,11 @@ export function recordFindings(ledger, { source, head, findings }) {
   for (const finding of findings) {
     const entry = next.entries.find(candidate => matches(candidate, finding));
     if (entry) {
+      // A merge that is not the exact same claim keeps the incoming wording and reopens the entry: a pin never covers it.
+      if (!exactMatch(entry, finding)) {
+        (entry.variants ??= []).push(structuredClone(finding));
+        Object.assign(entry, { status: 'open', pinningTest: null });
+      }
       if (!entry.sources.includes(source)) entry.sources.push(source);
     } else {
       next.entries.push({ key: findingKey(finding), finding: structuredClone(finding),
@@ -78,7 +90,7 @@ export function renderOpenForBrief(ledger, { pinStillHolds } = {}) {
   const entries = ledger.entries.filter(entry => !holds(entry));
   if (!entries.length) return '';
   const body = entries.map(entry => `key=${entry.key} sources=${entry.sources.join(',')} status=${entry.status}\n`
-    + `${entry.finding.file ?? ''}:${entry.finding.line ?? ''} ${entry.finding.summary}`).join('\n\n');
+    + [entry.finding, ...(entry.variants ?? [])].map(f => `${f.file ?? ''}:${f.line ?? ''} ${f.summary}`).join('\n')).join('\n\n');
   return `${FENCED_DATA_RULE}\n\n${fenceUntrusted('findings', `Shared finding ledger DATA:\n${body}`)}`;
 }
 
@@ -90,5 +102,8 @@ export function sharedLedgerEnabled(settings, env = process.env) {
 /** Wrap ledger text as fenced untrusted DATA unless it already is, so a supplied brief cannot carry instructions. */
 export function fenceLedgerBrief(text) {
   if (typeof text !== 'string' || !text.trim()) return '';
-  return text.includes('<findings>') ? text : `${FENCED_DATA_RULE}\n\n${fenceUntrusted('findings', text)}`;
+  const rest = text.startsWith(FENCED_DATA_RULE) ? text.slice(FENCED_DATA_RULE.length).trim() : '';
+  const ours = rest.startsWith('<findings>') && rest.endsWith('</findings>')
+    && rest.split('<findings>').length === 2 && rest.split('</findings>').length === 2;
+  return ours ? text : `${FENCED_DATA_RULE}\n\n${fenceUntrusted('findings', text)}`;
 }

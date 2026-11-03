@@ -1,3 +1,4 @@
+import { FENCED_DATA_RULE } from '../../lib/mandate-fence.mjs';
 /**
  * Card xrbu1bp — round N>1 resumes the previous round's fixer session (chosen / declined), and the fixer ladder's
  * stronger-model rung starts at `fix.strongerModelFromRound` (rung by round).
@@ -312,7 +313,7 @@ describe('buildRoundResumePrompt — optional shared finding ledger (R469)', () 
   const input = { pr: 77, round: 2, lane: freeLane, headRefOid: HEAD, history: '# All rounds so far' };
 
   it('includes a non-empty ledger brief alongside the existing round history', () => {
-    const ledgerBrief = '<findings>\nShared finding ledger DATA: key=manifest-gap source=juror status=open\n</findings>';
+    const ledgerBrief = FENCED_DATA_RULE + '\n\n<findings>\nShared finding ledger DATA: key=manifest-gap source=juror status=open\n</findings>';
     const prompt = buildRoundResumePrompt({ ...input, ledgerBrief });
     expect(prompt).toContain(ledgerBrief);
     expect(prompt.split(ledgerBrief)).toHaveLength(2);

@@ -1,3 +1,4 @@
+import { FENCED_DATA_RULE } from '../../lib/mandate-fence.mjs';
 /** @file Hermetic standalone audit contract and real-adapter boundary tests. */
 import { createHash } from 'node:crypto';
 import * as realFs from 'node:fs';
@@ -25,7 +26,7 @@ function fixture(answer = 'NOT WEAKENED') {
 }
 
 describe('audit shared ledger context (R469)', () => {
-  const ledgerBrief = '<findings>\nShared finding ledger DATA: key=guard-gap source=juror status=test-pinned\n'
+  const ledgerBrief = FENCED_DATA_RULE + '\n\n<findings>\nShared finding ledger DATA: key=guard-gap source=juror status=test-pinned\n'
     + 'scripts/gate.mjs:12 guard removed\n</findings>';
 
   it('appends a non-empty deps.ledgerBrief after the unchanged canonical question and range', async () => {
