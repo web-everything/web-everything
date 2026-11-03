@@ -24,7 +24,7 @@ export default {
       const released = [];
       for (let t = T0 + 60_000; t <= T0 + 60_000 + 35 * 60_000; t += 120_000) {
         const r = m.refreshLiveFixDispatchClaims({
-          lockRoot, listAgentsAll: () => rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+          lockRoot, listAgentsAll: () => rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
           prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
           idleRelease: { enabled: true, idleMinutes: 30, sources: { enabled: 'soak', idleMinutes: 'soak' }, invalid: [] },
         });

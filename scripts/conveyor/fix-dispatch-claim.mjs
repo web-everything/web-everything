@@ -86,6 +86,29 @@ import {
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
+import { resolveSessionTranscript } from '../operations/agent-usage-report.mjs';
+import { readdirSync, statSync } from 'node:fs';
+import { dirname, join as joinPath, basename } from 'node:path';
+
+/** Newest mtime (ms) of the holder's transcript and any bound subagent transcripts, or null when the main
+ *  transcript cannot be read (callers fail closed: unknown activity means the holder is not idle). */
+export function transcriptActivityMs(row, { resolve = resolveSessionTranscript, stat = statSync, list = readdirSync } = {}) {
+  const sessionId = row?.sessionId, cwd = row?.cwd;
+  if (!sessionId) return null;
+  let file;
+  try { file = resolve({ session: String(sessionId), cwd: String(cwd ?? '') }); } catch { return null; }
+  let newest;
+  try { newest = stat(file).mtimeMs; } catch { return null; }
+  if (!Number.isFinite(newest)) return null;
+  try {
+    const subDir = joinPath(dirname(file), basename(file, '.jsonl'), 'subagents');
+    for (const f of list(subDir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      try { newest = Math.max(newest, stat(joinPath(subDir, f)).mtimeMs); } catch { /* unreadable subagent: main stands */ }
+    }
+  } catch { /* no subagent dir */ }
+  return newest;
+}
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
 import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
@@ -343,6 +366,7 @@ export function refreshLiveFixDispatchClaims({
   hungThresholdMs = resolveHungThresholdMs(),
   alive = isPidAlive,
   identity = pidIdentity,
+  activityMsFor = transcriptActivityMs,
   idleRelease = resolveIdleClaimRelease(),
   prHeadFor = readPrHead,
   recordEvent = appendDaemonEvent,
@@ -456,8 +480,15 @@ export function refreshLiveFixDispatchClaims({
     const boundToClaim = (a) => (entry.meta.sessionId
       ? a.sessionId === entry.meta.sessionId
       : Number.isFinite(claimedMs) && startedAtMs(a.startedAt) >= claimedMs);
+    // A holder whose transcript (or a bound subagent's) changed inside the idle window is working, however idle it
+    // reads at each sample; unreadable activity is unknown, so the claim is kept (fail closed).
+    const quietLongEnough = (a) => {
+      let at = null;
+      try { at = activityMsFor(a); } catch { at = null; }
+      return Number.isFinite(at) && nowMs - at >= idleRelease.idleMinutes * 60_000;
+    };
     const isIdle = nonTerminal.length > 0
-      && nonTerminal.every((a) => (a.state === 'idle' || a.status === 'idle') && boundToClaim(a));
+      && nonTerminal.every((a) => (a.state === 'idle' || a.status === 'idle') && boundToClaim(a) && quietLongEnough(a));
     let idleHeadSha = null;
     if (!isAwaiting && idleRelease.enabled && isIdle) {
       try {

@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchClaimOwner, fixDispatchResource,
   releaseSessionFixDispatchClaims, acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, fixDispatchSessionName,
-  isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
+  isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, transcriptActivityMs, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
   resolveIdleClaimRelease, readPrHead, recordIdleRelease, MAX_IDLE_CLAIM_OBSERVATION_GAP_MS,
 } from '../fix-dispatch-claim.mjs';
 import * as dispatchIo from '../../operations/dispatch-lane-io.mjs';
@@ -685,7 +685,7 @@ describe('idle-claim auto-release (R201)', () => {
   const acquire = (pr = 5996) => acquireFixDispatchClaim({ repo: 'we', pr, kind: 'fix', headSha: 'sha1', owner: 'A', lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
   const sweep = (at, { state = 'idle', head = 'sha1', events = [], extra = {} } = {}) => refreshLiveFixDispatchClaims({
     lockRoot: claimRoot, listAgentsAll: () => [{ name: 'fix-5996', startedAt: T0 + 1000, state }], hungInfoFor: () => null,
-    awaitingVerifyFor: null, prHeadFor: () => head, recordEvent: (e) => events.push(e), nowIso: () => iso(at),
+    awaitingVerifyFor: null, activityMsFor: () => 0, prHeadFor: () => head, recordEvent: (e) => events.push(e), nowIso: () => iso(at),
     idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
   });
   // Explicit intervening observations use two-minute steps for continuous-observation fixtures.
@@ -773,7 +773,7 @@ describe('idle-claim auto-release (R201)', () => {
     const extra = { };
     const rows = () => [{ name: 'fix-5996', startedAt: T0 + 1000, state: 'working', status: 'idle', startedAt: T0 + 1000 }];
     const run = (at) => refreshLiveFixDispatchClaims({
-      lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+      lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
       prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(at),
       idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
     });
@@ -789,7 +789,7 @@ describe('idle-claim auto-release (R201)', () => {
     let released = 0;
     for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
       released += (refreshLiveFixDispatchClaims({
-        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
         prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
         idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
       }).released ?? []).length;
@@ -807,12 +807,39 @@ describe('idle-claim auto-release (R201)', () => {
     let released = 0;
     for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
       released += (refreshLiveFixDispatchClaims({
-        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null,
+        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: () => 0,
         prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
         idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
       }).released ?? []).length;
     }
     expect(released).toBe(0);
+  });
+
+  it.each([
+    ['transcript touched inside the idle window', () => T0 + 60_000 + 25 * 60_000],
+    ['transcript unreadable', () => null],
+    ['activity resolver throws', () => { throw new Error('boom'); }],
+  ])('keeps the claim when holder activity is %s', (_n, activityMsFor) => {
+    acquire();
+    const rows = () => [{ name: 'fix-5996', state: 'working', status: 'idle', startedAt: T0 + 1000 }];
+    let released = 0;
+    for (let t = T0 + 60_000; t <= T0 + 60_000 + 2 * IDLE_MS; t += 120_000) {
+      released += (refreshLiveFixDispatchClaims({
+        lockRoot: claimRoot, listAgentsAll: rows, hungInfoFor: () => null, awaitingVerifyFor: null, activityMsFor: (a) => activityMsFor(a),
+        prHeadFor: () => 'sha1', recordEvent: () => {}, nowIso: () => iso(t),
+        idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }),
+      }).released ?? []).length;
+    }
+    expect(released).toBe(0);
+  });
+
+  it('transcriptActivityMs takes the newest of the main and subagent transcripts, null when unreadable', () => {
+    const stat = (f) => { if (f.endsWith('main.jsonl')) return { mtimeMs: 100 }; if (f.endsWith('sub.jsonl')) return { mtimeMs: 500 }; throw new Error('x'); };
+    const row = { sessionId: 'main', cwd: '/c' };
+    expect(transcriptActivityMs(row, { resolve: () => '/p/main.jsonl', stat, list: () => ['sub.jsonl', 'junk.txt'] })).toBe(500);
+    expect(transcriptActivityMs(row, { resolve: () => '/p/main.jsonl', stat, list: () => { throw new Error('none'); } })).toBe(100);
+    expect(transcriptActivityMs(row, { resolve: () => { throw new Error('no'); }, stat })).toBeNull();
+    expect(transcriptActivityMs(row, { resolve: () => '/p/other.jsonl', stat })).toBeNull();
   });
 
   it.each(['abc', '0'])('malformed WE_IDLE_CLAIM_RELEASE_MINUTES=%s falls back to the 30 min standard', (value) => {
