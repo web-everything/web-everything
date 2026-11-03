@@ -352,6 +352,10 @@ export function latestAudit(records, head, base) {
   if (!Array.isArray(records) || records.length > MAX_AUDITS) throw new Error('invalid or oversized audit ledger');
   const valid = [];
   for (const record of records) {
+    if (record && typeof record === 'object'
+      && (typeof record.head !== 'string' || record.head.length !== 40 || !SHA.test(record.head))) {
+      throw new Error('malformed audit record');
+    }
     if (record?.head !== head) continue;
     // Only evidence for this head and question participates. Malformed canonical
     // evidence must never silently revive an older clearance.

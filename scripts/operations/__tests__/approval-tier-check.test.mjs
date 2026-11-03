@@ -153,6 +153,24 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     expect((await check(deps())).approvableBy).toBe('orchestrator');
     expect((await check(deps({ humanRequired: true }))).approvableBy).not.toBe('orchestrator');
   });
+  it.each(['.github/workflows/ci.yml', '.github/example-guard.yml', 'tools/workflows/ci.yml'])
+    ('workflow/GitHub path %s stays human with all evidence clear', async path => {
+      expect(await check(deps({ paths: [path], humanRequired: true, readExplicitAsk: async () => ask })))
+        .toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    });
+  it.each([
+    ['scripts/lib/review-core.mjs'],
+    ['scripts/example-guard.mjs', 'scripts/lib/review-core.mjs'],
+  ])('humanRequired cannot elevate non-security protected paths: %j', async (...paths) => {
+    const r = await check(deps({ paths, humanRequired: true }));
+    expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+    expect(r.reasons.join(' ')).toContain('unclassified paths require human review: scripts/lib/review-core.mjs');
+  });
+  it('humanRequired permits security-critical paths mixed only with harmless docs and tests', async () => {
+    expect(await check(deps({ humanRequired: true, paths: ['scripts/example-guard.mjs',
+      'docs/examples/example.md', 'tests/example.spec.ts', 'blocks/__tests__/example.test.ts'] })))
+      .toMatchObject({ tier: 'elevated', approvableBy: 'elevated-judge' });
+  });
   it.each([true, false])('#6244 dispatch/scope code never delegates to orchestrator (humanRequired=%s)', async humanRequired => {
     const r = await check(deps({ humanRequired, paths: ['scripts/dispatch.mjs'],
       audit: weakened(['scripts/dispatch.mjs:3 scope guard removed']) }));

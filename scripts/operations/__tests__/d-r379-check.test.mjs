@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { checkPr, main, matchesGlob } from '../d-r379-check.mjs';
+import { checkPr, main, matchesGlob, latestAudit } from '../d-r379-check.mjs';
 import { createCheckDeps } from '../d-r379-check-io.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../../lib/verdict-ledger.mjs';
 import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
@@ -1254,6 +1254,25 @@ describe('round 7 live hold chronology', () => {
 });
 
 describe('round 8 malformed audit evidence', () => {
+  it.each([undefined, null, 42, {}, '', 'abc', 'z'.repeat(40), 'f'.repeat(40) + '\n'])
+    ('a newer WEAKENED record with invalid head %j cannot revive an older clearance', async invalidHead => {
+      const head = fixture(6223).headRefOid;
+      const record = audit(head, { at: '2026-11-02T11:00:00Z', verdict: 'WEAKENED' });
+      if (invalidHead === undefined) delete record.head;
+      else record.head = invalidHead;
+      const records = [audit(head), record];
+      expect(() => latestAudit(records, head, base)).toThrow('malformed audit record');
+      const r = await checkPr(6223, deps(undefined, { readAudits: () => records }));
+      expect(condition(r, 2).status).toBe('UNKNOWN');
+      expect(r.eligible).toBe(false);
+    });
+  it('skips a newer WEAKENED record with a valid different head', async () => {
+    const head = fixture(6223).headRefOid;
+    const r = await checkPr(6223, deps(undefined, { readAudits: () => [audit(head),
+      audit('f'.repeat(40), { at: '2026-11-02T11:00:00Z', verdict: 'WEAKENED' })] }));
+    expect(condition(r, 2).status).toBe('PASS');
+    expect(r.eligible).toBe(true);
+  });
   it('a newer malformed WEAKENED record for the head does not revive the older clearance', async () => {
     const head = fixture(6223).headRefOid;
     const r = await checkPr(1, deps(undefined, { readAudits: () => [audit(head), audit(head, { at: '2026-11-02T11:00:00Z', verdict: 'WEAKENED', findings: null })] }));

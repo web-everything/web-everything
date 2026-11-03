@@ -168,8 +168,13 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     // Condition 4 stops at protected hits. Independently account for every path
     // before elevating so a protected file cannot hide unrelated runtime changes.
     const pathPolicy = validatePathSettings(await snapshot.readSettings());
+    // A human-required shape may delegate only security-critical code and
+    // harmless companion paths; protected status alone does not grant authority.
+    const delegablePaths = [...settings.securityCriticalGlobs, ...(shape.humanRequired
+      ? ['tests/**', '**/*.spec.*', '**/*.test.*', '**/__tests__/**']
+      : pathPolicy.protectedPaths)];
     const unclassified = facts.netDiffPaths.filter(path =>
-      ![...settings.securityCriticalGlobs, ...pathPolicy.protectedPaths].some(glob => matchesGlob(path, glob))
+      !delegablePaths.some(glob => matchesGlob(path, glob))
       && (!pathPolicy.harmlessPaths.some(glob => matchesGlob(path, glob))
         || pathPolicy.enforcementTrees.some(glob => matchesGlob(path, glob))));
     if (unclassified.length) blockers.push(`unclassified paths require human review: ${unclassified.join(', ')}`);
