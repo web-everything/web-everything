@@ -561,9 +561,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     hashDone();
-    // Match warm export: pattern-spelling public files stay excluded without
-    // aborting unrelated work. The public worktree identity check above still
-    // refuses private edits; manifestEntry remains a fail-closed leaf guard.
+    // R447: the public-blob identity check above authorizes these exact bytes,
+    // including public fixtures that deliberately spell credential patterns.
+    if(credentialSource&&publicOid)return {entry:{path,sha256:createHash('sha256').update(content).digest('hex'),executable,tracked}};
     if(credentialSource&&credentialContentFinding(path,content))return {excluded:path};
     return {entry:manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64')))};
   });

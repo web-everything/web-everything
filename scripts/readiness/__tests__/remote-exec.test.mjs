@@ -14,6 +14,7 @@ import {
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
+import {credentialContentFinding} from '../forge-exec-manifest.mjs';
 import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
 import {materializeWorktree} from '../forge-exec-bases.mjs';
 import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
@@ -2054,6 +2055,46 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const blob = data => createHash('sha1').update(`blob ${Buffer.byteLength(data)}\0`).update(data).digest('hex');
   const indexRecord = (name, data) => Buffer.from(`100644 ${blob(data)} 0\t${name}\0`);
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
+
+  const publicTokenFixture = 'token=ghp_0123456789abcdefghijklmnopqrstuvwxyzABCD\n';
+
+  it.each(['publish-secret-gate.test.mjs', 'secrets.txt'])
+  ('ships tracked credential-pattern fixture %s only with identical public bytes', async name => {
+    writeFileSync(join(cwd, name), publicTokenFixture);
+    const paths = [Buffer.from(name)];
+    expect(credentialContentFinding(paths[0], Buffer.from(publicTokenFixture))).toBeTruthy();
+    const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, publicTokenFixture),
+      {code:0, stdout:treeRecord(name, publicTokenFixture)})});
+    expect(manifest.entries).toEqual([{path:paths[0], sha256:sha(publicTokenFixture), executable:false, tracked:true}]);
+    expect(manifest.excluded).toEqual([]);
+  });
+
+  it('refuses a locally edited credential-pattern fixture despite matching public index evidence', async () => {
+    const name = 'publish-secret-gate.test.mjs';
+    writeFileSync(join(cwd, name), publicTokenFixture + '// local edit\n');
+    await expect(build({cwd, exec:gitInventory([Buffer.from(name)], indexRecord(name, publicTokenFixture),
+      {code:0, stdout:treeRecord(name, publicTokenFixture)})}))
+      .rejects.toMatchObject({code:'excluded-source-file'});
+  });
+
+  it('never ships an untracked .env containing a token even with a public blob', async () => {
+    writeFileSync(join(cwd, '.env'), publicTokenFixture);
+    const paths = [Buffer.from('.env')];
+    const manifest = await build({cwd, exec:gitInventory(paths, Buffer.alloc(0),
+      {code:0, stdout:treeRecord('.env', publicTokenFixture)})});
+    expect(manifest.entries).toEqual([]);
+    expect(manifest.excluded).toEqual(paths);
+  });
+
+  it('keeps a tracked credential-pattern fixture excluded when the public tree is unavailable', async () => {
+    const name = 'secrets.txt';
+    writeFileSync(join(cwd, name), publicTokenFixture);
+    const paths = [Buffer.from(name)];
+    const manifest = await build({cwd, exec:gitInventory(paths, indexRecord(name, publicTokenFixture),
+      {code:128, stdout:Buffer.alloc(0)})});
+    expect(manifest.entries).toEqual([]);
+    expect(manifest.excluded).toEqual(paths);
+  });
 
   it.each([
     '.claude/skills/x/SKILL.md', '.eleventy.js',
