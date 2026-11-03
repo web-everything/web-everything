@@ -498,6 +498,18 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
     expect(kept[0].reason).toContain('all gates pass');
     expect(kept[1]).toEqual(items()[1]);
   });
+  it('needs-your-merge rows pass the same live red-team gate: a confirmed break blocks the approval alert', async () => {
+    const r = { needsYourMerge: [{ repo, number: 6239, title: 'm' }], ready: [] };
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] },
+      gateComments({ pr: 6239, broken: true, impact: 'degraded' }).slice(0, 1)), log: () => {} });
+    expect(kept[0]).toMatchObject({ pr: 6239, kind: 'confirmed-break-owed-send-back' });
+    expect(kept[0].reason).not.toMatch(/approved|all gates pass/);
+  });
+  it('a needs-your-merge row with a clean live head keeps its merge wording', async () => {
+    const r = { needsYourMerge: [{ repo, number: 9, title: 'm' }], ready: [] };
+    const { kept } = await gateReadyItems(itemsFromReport(r), r, { gh: gate({ headRefOid: head, labels: [] }, gateComments({ pr: 9 })), log: () => {} });
+    expect(kept[0]).toEqual({ ...itemsFromReport(r)[0], head });
+  });
   it('keeps red-team-undecided when the live PR cannot be read, and logs it', async () => {
     const logs = [];
     const { kept } = await gateReadyItems(items(), report, { gh: async () => { throw new Error('rate limited'); }, log: (l) => logs.push(l) });
