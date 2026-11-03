@@ -227,10 +227,13 @@ export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, need
  *  omitted PR) are counted against GitHub's own `totalCount`; a shortfall, without a declared truncation, fails
  *  closed with a named reason. */
 export function assertInventoryComplete({ repo, rows, totalCount, truncated = false }) {
-  const numbers = rows.map(r => r?.number).filter(Number.isInteger);
-  const unique = new Set(numbers).size;
-  const have = numbers.length === rows.length ? unique : rows.length;
-  if (numbers.length === rows.length && unique < rows.length) {
+  if (rows.some(r => !Number.isInteger(r?.number) || r.number < 1)) {
+    throw new PrListUnreadableError({ repo, stage: 'page', page: 'inventory',
+      cause: new Error('a listed PR has a malformed number (not a positive integer) — refusing an inconsistent inventory') });
+  }
+  const unique = new Set(rows.map(r => r.number)).size;
+  const have = unique;
+  if (unique < rows.length) {
     throw new PrListUnreadableError({ repo, stage: 'page', page: 'inventory',
       cause: new Error(`duplicate PR numbers in the listing (${unique} unique of ${rows.length} rows) — refusing an inconsistent inventory`) });
   }

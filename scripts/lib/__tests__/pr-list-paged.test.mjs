@@ -318,7 +318,7 @@ describe('inventory completeness (fewer rows than GitHub reported is never a com
   it('assertInventoryComplete names the shortfall and passes complete or truncated-declared lists', () => {
     expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: 7 })).toThrow(PrListUnreadableError);
     expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: 7 })).toThrow(/0 of 7/);
-    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [{}], totalCount: 1 })).not.toThrow();
+    expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [{ number: 1 }], totalCount: 1 })).not.toThrow();
     expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: 7, truncated: true })).not.toThrow();
     expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [], totalCount: undefined })).not.toThrow();
   });
@@ -335,6 +335,11 @@ describe('fail-closed list parsing and uniqueness (one class: a list read must n
     const dup = [{ number: 1 }, { number: 1 }];
     expect(() => assertInventoryComplete({ repo: 'owner/name', rows: dup, totalCount: 2 })).toThrow(/1 unique of 2|duplicate/);
     expect(() => assertInventoryComplete({ repo: 'owner/name', rows: [{ number: 1 }, { number: 2 }], totalCount: 2 })).not.toThrow();
+  });
+  it('a row whose PR number is not a positive integer fails the read closed (no raw-count fallback)', () => {
+    for (const bad of [[{ number: 1 }, { number: 1 }, {}], [{ number: 1 }, { number: 'x' }], [{ number: 0 }], [{ number: -2 }], [null], [{ number: 1.5 }]]) {
+      expect(() => assertInventoryComplete({ repo: 'owner/name', rows: bad, totalCount: bad.length })).toThrow(/malformed|positive integer/);
+    }
   });
   it('parseListOutput: empty/blank output, non-JSON and non-array JSON throw; a real empty list is fine', () => {
     for (const bad of ['', '   \n', undefined, null, '{"message":"oops"}', 'not json']) {

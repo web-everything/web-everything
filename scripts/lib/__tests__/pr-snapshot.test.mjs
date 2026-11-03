@@ -149,7 +149,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
   });
 
   it('60 PRs at pageSize 20 use three GraphQL pages', () => {
-    const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i }));
+    const many = Array.from({ length: 60 }, (_, i) => ({ ...PRS[0], number: i + 1 }));
     const { exec, calls } = fakeExec(many);
     const got = readSharedOpenPrs(opts({ fields: 'number', exec }));
     expect(got).toHaveLength(60);
@@ -210,7 +210,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
   });
 
   it.each([false, true])('failed pages never publish or update a snapshot (previous=%s)', previous => {
-    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i }));
+    const many = Array.from({ length: 21 }, (_, i) => ({ ...PRS[0], number: i + 1 }));
     const fake = fakeExec(many);
     const path = snapshotPath(dir, REPO);
     if (previous) readSharedOpenPrs(opts({ fields: 'number', exec: fake.exec }));
