@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import workers, { workerLoadSettings } from '../worker-count-vs-load.mjs';
@@ -10,11 +10,13 @@ import { validateSmellShape } from '../../health-smells-shape.mjs';
 import { emptyHealthState, stepEpisodes, planActions, runHealthTick, MINUTE } from '../../health-watch-core.mjs';
 import { foldPrAttempts } from '../../health-pr-attempts.mjs';
 import { probeLanePools } from '../../health-watch.mjs';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
+import { DAEMON_MANIFEST } from '../../../../skills-src/conveyor/daemon-manifest.mjs';
 
 const NOW = Date.parse('2026-11-03T12:00:00Z');
 const host = (count = 4, load1 = 20) => ({
   machineLoad: { load1, cpuCount: 8 },
-  lanePools: [{ repo: 'we', health: { leased: count } }],
+  lanePools: Object.keys(CONSTELLATION_REPOS).map(repo => ({ repo, at: NOW, health: { leased: repo === 'we' ? count : 0 } })),
 });
 const rows = (reasons, pr = 'owner/repo#42') => reasons.map((reason, i) => ({
   pr, reason, action: 'fix-dispatch', at: NOW - (reasons.length - i) * 1000,
@@ -44,7 +46,7 @@ describe('worker-count-vs-load', () => {
     expect(workers.evaluate(host(4, 0), context([], config))[0].breach).toBe(false);
     expect(workers.evaluate(host(5, 0), context([], config))[0].breach).toBe(true);
     const p = host(4, 0);
-    p.lanePools.push({ repo: 'fui', health: { leased: 2 } });
+    p.lanePools.find(p => p.repo === 'frontierui').health.leased = 2;
     expect(workers.evaluate(p, context([], config))[0].measure.liveWorkers).toBe(6);
   });
   it('supports health config overrides and exposes effective thresholds and provenance', () => {
@@ -98,11 +100,103 @@ describe('worker-count-vs-load', () => {
     expect(workers.evaluate(host(), context([], config))[0].breach).toBe(true);
     expect(workers.evaluate(host(201, 0), context([], config))[0].breach).toBe(true);
   });
+  it.each(Object.keys(CONSTELLATION_REPOS))('preserves an open episode when %s is missing or unparseable in the real probe', repo => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-partial-'));
+    try {
+      for (const key of Object.keys(CONSTELLATION_REPOS)) {
+        const path = join(dir, `lane-pool-health-watch-${key}.log`);
+        writeFileSync(path, JSON.stringify({ checked: true, health: { leased: key === 'we' ? 4 : 0 } }));
+        utimesSync(path, NOW / 1000, NOW / 1000);
+      }
+      const first = runHealthTick(emptyHealthState(), { ...host(), lanePools: probeLanePools(dir) }, [workers], NOW);
+      expect(first.transitions.map(t => t.type)).toContain('opened');
+      const path = join(dir, `lane-pool-health-watch-${repo}.log`);
+      rmSync(path);
+      let state = first.state;
+      for (const broken of [null, 'unparseable health log']) {
+        if (broken !== null) writeFileSync(path, broken);
+        const next = runHealthTick(state, { ...host(0, 0), lanePools: probeLanePools(dir) }, [workers], NOW + MINUTE);
+        expect(next.evaluations[0].error).toMatch(/evidence/i);
+        expect(Object.values(next.state.episodes)[0].cleanStreak).toBe(0);
+        expect(next.transitions.map(t => t.type)).not.toContain('closed');
+        state = next.state;
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('defaults freshness to three tick cadences and bounds overrides with visible fallback provenance', () => {
+    const fallback = 3 * DAEMON_MANIFEST['health-watch'].intervalMs;
+    expect(workerLoadSettings({}, {}, {}).maxEvidenceAgeMs).toBe(fallback);
+    for (const value of [MINUTE, 60 * MINUTE]) {
+      const settings = workerLoadSettings({ workerCountVsLoad: { maxEvidenceAgeMs: value } }, {}, {});
+      expect(settings.maxEvidenceAgeMs).toBe(value);
+      expect(settings.sources.maxEvidenceAgeMs).toBe('tool');
+    }
+    for (const value of [0, MINUTE - 1, 60 * MINUTE + 1, 1e12, Infinity, NaN, '60000', null]) {
+      const settings = workerLoadSettings({ workerCountVsLoad: { maxEvidenceAgeMs: value } }, {}, {});
+      expect(settings.maxEvidenceAgeMs).toBe(fallback);
+      expect(settings.sources.maxEvidenceAgeMs).toBe('standard');
+    }
+  });
+  it('resolves freshness through platform, health config, and environment with invalid layers falling back', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-age-policy-'));
+    try {
+      const path = join(dir, 'preferences.json');
+      writeFileSync(path, JSON.stringify({ workerCountVsLoad: { maxEvidenceAgeMs: 4 * MINUTE } }));
+      const env = { WE_PLATFORM_PREFERENCES_FILE: path };
+      const config = { workerCountVsLoad: { maxEvidenceAgeMs: 5 * MINUTE } };
+      expect(workerLoadSettings({}, {}, env)).toMatchObject({ maxEvidenceAgeMs: 4 * MINUTE, sources: { maxEvidenceAgeMs: 'platform' } });
+      expect(workerLoadSettings(config, {}, env)).toMatchObject({ maxEvidenceAgeMs: 5 * MINUTE, sources: { maxEvidenceAgeMs: 'tool' } });
+      expect(workerLoadSettings(config, {}, { ...env, WE_WORKER_COUNT_VS_LOAD_MAX_EVIDENCE_AGE_MS: '360000' }))
+        .toMatchObject({ maxEvidenceAgeMs: 6 * MINUTE, sources: { maxEvidenceAgeMs: 'env' } });
+      expect(workerLoadSettings({ workerCountVsLoad: { maxEvidenceAgeMs: 1e12 } }, {}, {
+        ...env, WE_WORKER_COUNT_VS_LOAD_MAX_EVIDENCE_AGE_MS: '1000000000000',
+      })).toMatchObject({ maxEvidenceAgeMs: 4 * MINUTE, sources: { maxEvidenceAgeMs: 'platform' } });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('rejects a stale zero-worker pool timestamp emitted by the real probe', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-stale-'));
+    try {
+      for (const repo of Object.keys(CONSTELLATION_REPOS)) {
+        const path = join(dir, `lane-pool-health-watch-${repo}.log`);
+        writeFileSync(path, JSON.stringify({ checked: true, health: { leased: 0 } }));
+        const at = repo === 'we' ? NOW - 3 * DAEMON_MANIFEST['health-watch'].intervalMs - 1000 : NOW;
+        utimesSync(path, at / 1000, at / 1000);
+      }
+      expect(() => workers.evaluate({ ...host(0, 0), lanePools: probeLanePools(dir) }, context())).toThrow(/evidence/i);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(Object.keys(CONSTELLATION_REPOS))('rejects stale or invalid timestamps for %s and keeps an open alert', repo => {
+    const maxEvidenceAgeMs = 2 * MINUTE;
+    const config = { workerCountVsLoad: { maxEvidenceAgeMs } };
+    const first = runHealthTick(emptyHealthState(), host(), [workers], NOW, { config });
+    for (const at of [NOW - maxEvidenceAgeMs - 1, undefined, NaN, 'today', NOW + MINUTE]) {
+      const sample = host(0, 0);
+      sample.lanePools.find(p => p.repo === repo).at = at;
+      expect(() => workers.evaluate(sample, context([], config))).toThrow(/evidence/i);
+      let state = first.state;
+      for (const now of [NOW, NOW + 1]) {
+        const next = runHealthTick(state, sample, [workers], now, { config });
+        expect(next.evaluations[0].error).toMatch(/evidence/i);
+        expect(Object.values(next.state.episodes)[0].cleanStreak).toBe(0);
+        expect(next.transitions.map(t => t.type)).not.toContain('closed');
+        state = next.state;
+      }
+    }
+    const boundary = host(0, 0);
+    boundary.lanePools.find(p => p.repo === repo).at = NOW - maxEvidenceAgeMs;
+    expect(workers.evaluate(boundary, context([], config))[0]).toMatchObject({
+      breach: false, measure: { settings: { maxEvidenceAgeMs }, sources: { maxEvidenceAgeMs: 'tool' } },
+    });
+  });
   it('evaluates on consecutive local ticks without the gh agents probe, including no-gh operation', () => {
     const dir = mkdtempSync(join(tmpdir(), 'worker-load-'));
     try {
       const sample = leased => {
-        writeFileSync(join(dir, 'lane-pool-health-watch-we.log'), JSON.stringify({ checked: true, health: { leased } }));
+        for (const repo of Object.keys(CONSTELLATION_REPOS)) {
+          const path = join(dir, `lane-pool-health-watch-${repo}.log`);
+          writeFileSync(path, JSON.stringify({ checked: true, health: { leased: repo === 'we' ? leased : 0 } }));
+          utimesSync(path, NOW / 1000, NOW / 1000);
+        }
         return { machineLoad: host().machineLoad, lanePools: probeLanePools(dir) };
       };
       const first = runHealthTick(emptyHealthState(), sample(4), [workers], NOW);
@@ -190,11 +284,11 @@ describe('real core delivery in shadow mode', () => {
     const first = runHealthTick(emptyHealthState(), host(), [workers], NOW, { config });
     expect(first.plan).toContainEqual(expect.objectContaining({ kind: 'notify', suppressed: null }));
 
-    const before = runHealthTick(first.state, host(), [workers], NOW + reminderAfterMs - 1, { config });
+    const before = runHealthTick(first.state, { ...host(), lanePools: host().lanePools.map(p => ({ ...p, at: NOW + reminderAfterMs - 1 })) }, [workers], NOW + reminderAfterMs - 1, { config });
     expect(before.transitions.map(t => t.type)).not.toContain('reminder');
     expect(before.plan.filter(p => p.kind === 'notify')).toEqual([]);
 
-    const boundary = runHealthTick(before.state, host(), [workers], NOW + reminderAfterMs, { config });
+    const boundary = runHealthTick(before.state, { ...host(), lanePools: host().lanePools.map(p => ({ ...p, at: NOW + reminderAfterMs })) }, [workers], NOW + reminderAfterMs, { config });
     expect(boundary.transitions.map(t => t.type)).toContain('reminder');
     expect(boundary.plan).toContainEqual(expect.objectContaining({
       kind: 'notify', key: `${workers.id}::machine`, reason: 'reminder', suppressed: null,

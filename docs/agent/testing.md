@@ -246,7 +246,7 @@ episodes notify on open and remind after the default four hours; medium refusal 
 opt into opening notification with `notifyOnOpen: true`, then notify after their 30-minute escalation.
 Other medium openings stay quiet. `escalateAfterMs` does not replace the global `reminderAfterMs`
 for an already-high episode. Shadow suppression and tracked silences still apply to opening opt-ins.
-Health-dir config overrides are `workerCountVsLoad.{loadPerCore,minWorkersForLoad,workerCap}`
+Health-dir config overrides are `workerCountVsLoad.{loadPerCore,minWorkersForLoad,workerCap,maxEvidenceAgeMs}`
 and `sameRefusalStreak.streakLength`; effective thresholds and their sources appear in episode measures.
 Worker cap inherits the existing `workerCapacity.ceiling` setting/environment override, falling back
 to 12 when absent or outside [1,200]. Load/core accepts [0.5,20], minimum workers accepts integers
@@ -256,6 +256,15 @@ threshold and provenance. Worker pressure sums leased lanes from the existing lo
 not a second agent listing. Missing/empty lane-pool evidence and missing/null attempt arrays throw
 so the core preserves episodes and records probe errors; only explicit empty attempt arrays mean
 no attempts. Cover persisted daemon memory without `prAttempts` and oversized settings explicitly.
+Worker pressure requires every repo in the shared `CONSTELLATION_REPOS` table used by `probeLanePools`;
+a partial probe (including skipped unparseable logs) is incomplete evidence. Every reading's numeric
+`at` must be no later than the tick and no older than `maxEvidenceAgeMs` (inclusive). That setting
+defaults to three health-watch manifest tick intervals, bounded to [1 minute,1 hour]; invalid values
+fall back through standard → platform `workerCountVsLoad` → health config → environment
+`WE_WORKER_COUNT_VS_LOAD_MAX_EVIDENCE_AGE_MS`. The shared policy cascade logs provenance, also carried
+in measures. Refresh/inspect all configured pool logs before resuming dispatch on incomplete evidence.
+Test each missing/corrupt pool through the real producer and preserve open episodes over repeated
+incomplete ticks; test stale/invalid timestamps, the exact age boundary, and oversized age settings.
 
 ## Health tick watchdog deadlines
 
