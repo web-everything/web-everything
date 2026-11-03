@@ -9,8 +9,8 @@ scope:
   - "plateau-app:src/feature-tracker/rollup.ts"
   - "plateau-app:src/feature-tracker/rollup.css"
   - "plateau-app:src/feature-tracker/rollup.test.ts"
-  - "plateau-app:src/feature-tracker/read-model.ts" # owned re-edit
-  - "plateau-app:src/feature-tracker/read-model.test.ts" # owned re-edit
+  - "plateau-app:src/feature-tracker/read-model.ts (owned re-edit)"
+  - "plateau-app:src/feature-tracker/read-model.test.ts (owned re-edit)"
 scopeRationale: "plateau-app:rollup.ts/.css render the epic->slice rollup; plateau-app:rollup.test.ts is its own unit-test sibling per this epic's own convention (S1a pairs plateau-app:read-model.ts with plateau-app:read-model.test.ts; plateau-app:lane-board.ts/.test.ts does the same). plateau-app:read-model.ts gains a rollup accessor here (declared 'owned re-edit' by the original card) -- its test sibling plateau-app:read-model.test.ts (created by #2718) must be re-edited in lockstep or the new accessor ships untested. No consumer outside plateau-app: plateau-app:detail.ts (#2725) is the sole importer (the section registry self-registration point); plateau-app:mount.ts (#2721) never imports plateau-app:rollup.ts directly. Test harnesses (#2717 webcases conformance, #2720 mount-conformance, #2735 golden baseline, #2730 behavioral gate) exercise plateau-app:rollup.ts's rendered OUTPUT through the mounted DOM, not as direct callers -- named as consumers of the render contract, not scope."
 dateOpened: "2026-07-27"
 tags: []

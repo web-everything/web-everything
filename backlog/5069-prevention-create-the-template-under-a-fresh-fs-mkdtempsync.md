@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:vitest.shared.ts", "we:__tests__/vitest.shared.test.mjs"]
+scope: ["we:vitest.shared.ts", "we:./__tests__/vitest.shared.test.mjs"]
 dateOpened: "2026-10-04"
 tags: []
 ---

@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:__tests__/vitest.globalSetup.test.mjs"]
+scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:./__tests__/vitest.globalSetup.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---

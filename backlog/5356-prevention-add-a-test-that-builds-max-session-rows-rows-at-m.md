@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:wip-relay.js", "we:src/wip/sessions-feed.test.ts", "we:__tests__/wip-relay.test.mjs"]
+scope: ["we:wip-relay.js", "we:src/wip/sessions-feed.test.ts", "we:./__tests__/wip-relay.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
