@@ -16,7 +16,8 @@ import { healthDir } from './health-watch-section.mjs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
-import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
+import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession, evaluateInvariant, resolveWaitState, stateFingerprint, stateSince, DEADLINE_MINUTES } from './pr-sweep-core.mjs';
+import { readLiveFixClaim } from './fix-procedure.mjs';
 import { buildBlockedMap, sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { createOpenPrCommentReader } from './pr-comments-complete.mjs';
 import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
@@ -92,6 +93,8 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     return readTranscriptTailActivity(agent, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 })?.lastActivityMs ?? null;
   }, readHealth = () => JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')),
   cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
+  // R502 item 5: the live fixer claim is a wait state of its own; a failed read just means no claim evidence.
+  readClaim = (pr) => readLiveFixClaim({ repo: repoKeyForSlug(pr.repo), pr: Number(pr.number) }),
 }) {
   let sessions = []; let health = {}; const logs = []; let unreadSessions = [];
   const recordError = (source, text) => { errorSources.push({ index: errors.length, source }); errors.push(text); };
@@ -140,7 +143,10 @@ export async function collectOwnerSignals({ prs, dir, env, errors, errorSources 
     }
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
-    return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions }];
+    let claim = null;
+    try { claim = readClaim(pr); } catch { claim = null; }
+    const fixClaim = claim?.meta?.who ? { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null } : null;
+    return [prKey(pr), { sessions, daemons, smell: episode?.smell, unreadSessions, ...(fixClaim ? { fixClaim } : {}) }];
   }));
 }
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
@@ -184,7 +190,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     const key = prKey(p), fingerprint = stateFingerprint(p), old = previous?.invariantClocks?.[key];
     const since = stateSince(p, old?.fingerprint === fingerprint ? old.since : now, now);
     clocks[key] = { fingerprint, since };
-    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, ...dependencies.get(key) }) };
+    return { ...p, ...dependencies.get(key), ...evaluateInvariant(p, owners[key], { now, since, settings: value, waitState: resolveWaitState(p, (signals ?? {})[key]), ...dependencies.get(key) }) };
   }));
   const annotate = item => {
     const decision = decisions.find(p => p.repo === item.repo && p.number === item.pr);

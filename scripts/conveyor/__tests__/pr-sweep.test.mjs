@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { classifyIdlePrs, resolveOwner, planSweep } from '../pr-sweep-core.mjs';
 import { collectOwnerSignals, runPrSweep } from '../pr-sweep.mjs';
+import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
 import * as completeComments from '../pr-comments-complete.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -584,4 +585,53 @@ describe('R437 sanctioned dependency comment discovery', () => {
     expect(() => read(pr.repo)).toThrow(/budget.*operator/i);
     expect(calls).toBe(1);
   });
+});
+
+// R502 item 5: the sweep reported owner=daemon:fix-dispatch-daemon / owner-stale for PRs the daemon had REFUSED or PARKED,
+// or that a live fixer claim held (13 NEEDS-YOU at once). It now reports the real wait state.
+describe('R502 wait state replaces the implied daemon owner', () => {
+  const stale = { state: 'active', owner: 'daemon:review', ownerLastSeenAt: now - 46 * 60000 };
+  const open = { ...pr, isDraft: false, labels: ['review:pending'] };
+  const evalFor = async (p, wait, owner = stale) => {
+    const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
+    return evaluateInvariant(p, owner, { now, since: now, settings, waitState: wait });
+  };
+  it('resolveWaitState: live claim beats refusal beats parked; nothing known stays null', async () => {
+    const { resolveWaitState } = await import('../pr-sweep-core.mjs');
+    const refusal = { kind: 'refusal', at: new Date(now - 10 * 60000).toISOString(), reason: 'review-referrals-pending', name: 'fix-dispatch-daemon' };
+    expect(resolveWaitState(open, { fixClaim: { who: 'fix-12' }, daemons: [refusal] })).toMatchObject({ kind: 'live-claim' });
+    expect(resolveWaitState(open, { daemons: [refusal] })).toMatchObject({ kind: 'refused', detail: expect.stringContaining('review-referrals-pending') });
+    expect(resolveWaitState({ ...open, labels: ['review:human'] }, {})).toMatchObject({ kind: 'parked' });
+    expect(resolveWaitState({ ...open, isDraft: true }, {})).toMatchObject({ kind: 'parked' });
+    expect(resolveWaitState(open, {})).toBeNull();
+  });
+  it('a refusal older than the newest daemon progress is not the current wait state', async () => {
+    const { resolveWaitState } = await import('../pr-sweep-core.mjs');
+    const daemons = [{ kind: 'refusal', at: new Date(now - 30 * 60000).toISOString(), reason: 'nothing-owed', name: 'x' }, { kind: 'progress', at: new Date(now - 5 * 60000).toISOString(), name: 'x' }];
+    expect(resolveWaitState(open, { daemons })).toBeNull();
+  });
+  it('a stale owner with a known wait state reports it, not owner-stale and not the implied daemon', async () => {
+    const r = await evalFor(open, { kind: 'refused', detail: 'review-referrals-pending' });
+    expect(r).toMatchObject({ violation: 'waiting-refused', owner: 'wait:refused', waitState: { kind: 'refused' } });
+  });
+  it('without a wait state the old owner-stale report is unchanged; deadline-passed still wins', async () => {
+    expect((await evalFor(open, null)).violation).toBe('owner-stale');
+    const { evaluateInvariant } = await import('../pr-sweep-core.mjs');
+    expect(evaluateInvariant(open, stale, { now, since: now - 10 * 3600000, settings, waitState: { kind: 'parked' } }).violation).toBe('deadline-passed');
+  });
+  it('the sweep decisions carry the wait state from owner signals', async () => {
+    const out = await runPrSweep({ now, config: {}, settings: { value: settings, sources: {} }, readPrevious: () => null, readPrs: () => [open],
+      readQueue: () => ({ ready: [], rulingNeeded: [] }), readSignals: () => ({ [`${ghRepoSlug(open.repo)}#12`]: { fixClaim: { who: 'fix-12' }, daemons: [], sessions: [] } }),
+      notify: () => ({ ok: false }), persist: () => {}, append: () => {}, flush: () => {}, stallSweep: () => ({ mode: 'off' }) });
+    expect(out.decisions[0].waitState).toMatchObject({ kind: 'live-claim' });
+    expect(out.decisions[0].violation).not.toBe('owner-stale');
+  });
+});
+
+it('R502: collectOwnerSignals attaches the live fixer claim as evidence and tolerates a failing claim read', async () => {
+  const base = { prs: [pr], dir: tmpdir(), env: {}, errors: [], readAgents: () => [], cloneRoots: () => [], listLogs: () => [], readHealth: () => ({}) };
+  const withClaim = await collectOwnerSignals({ ...base, readClaim: () => ({ meta: { who: 'fix-12', claimedAt: 'x' } }) });
+  expect(withClaim[`${pr.repo}#12`].fixClaim).toEqual({ who: 'fix-12', claimedAt: 'x' });
+  const broken = await collectOwnerSignals({ ...base, readClaim: () => { throw new Error('EACCES'); } });
+  expect(broken[`${pr.repo}#12`].fixClaim).toBeUndefined();
 });
