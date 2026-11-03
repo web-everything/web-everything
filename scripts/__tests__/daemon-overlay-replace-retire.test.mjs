@@ -67,8 +67,8 @@ function fixture() {
     const name = readdirSync(state).find((n) => n.endsWith('.json'));
     return JSON.parse(readFileSync(join(state, name), 'utf8')).overlays.find((o) => o.ref === ref);
   };
-  /** Replace the gh stub: `prs` is what every `pr list` answers; `repo view` still names the repo. */
-  const ghPrs = (prs) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo '{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}'; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+  /** Replace the gh stub: `prs` is what every `pr list` answers, `activity` what the ref activity log answers (default: unreadable); `repo view` still names the repo. */
+  const ghPrs = (prs, activity) => writeFileSync(join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '${JSON.stringify(prs)}'; exit 0; fi\n${activity ? `if [ "$1" = "api" ]; then echo '${JSON.stringify(activity)}'; exit 0; fi\n` : ''}if [ "$1 $2" = "repo view" ]; then echo '{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}'; exit 0; fi\nexit 1\n`, { mode: 0o755 });
   /** Squash-merge: main gets the same content in a NEW commit, then the branch is deleted. Returns the main commit. */
   const squash = (ref, file, content) => {
     gitOk(author, ['fetch', '-q', 'origin']);
@@ -282,6 +282,9 @@ describe('daemon-overlay.mjs retire', () => {
 describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
   const merged = (ref, tip, mergeOid, n = 7) => ({ number: n, state: 'MERGED', headRefName: ref, headRefOid: tip,
     headRepository: { nameWithOwner: 'web-everything/web-everything' }, isCrossRepository: false, mergeCommit: { oid: mergeOid } });
+  /** The ref activity GitHub reports for a branch last deleted at `tip`. */
+  const deletedAt = (tip) => [{ activity_type: 'branch_deletion', before: tip, after: '0'.repeat(40), timestamp: '2026-11-02T11:00:00Z' },
+    { activity_type: 'push', before: '1'.repeat(40), after: tip, timestamp: '2026-11-02T10:00:00Z' }];
   const setup = () => {
     const f = fixture();
     const tip = f.push('lane/sq', 'a.txt', 'squashed\n');
@@ -291,7 +294,17 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
   };
   const retire = (f, tip) => f.run(['retire', '--ref=lane/sq', `--expected-tip=${tip}`]);
 
-  it('keeps a deleted branch even when the merged PR head matches expected-tip and its merge commit is on main', () => {
+  it('retires when the merged PR headed this ref, the branch was last deleted at its head, and its merge commit is on main', () => {
+    const { f, tip, mergeOid } = setup();
+    f.ghPrs([merged('lane/sq', tip, mergeOid)], deletedAt(tip));
+    const r = retire(f, tip);
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ retired: true, reason: 'pr-squash-merged' });
+    expect(f.list()).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: 'lane/sq', tip });
+  });
+
+  it('keeps a deleted branch when GitHub cannot show its activity', () => {
     const { f, tip, mergeOid } = setup();
     f.ghPrs([merged('lane/sq', tip, mergeOid)]);
     const r = retire(f, tip);
@@ -309,7 +322,8 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.run(['add', '--ref=lane/sq', '--pr=7']).status).toBe(0);
     const before = f.entry('lane/sq');
     gitOk(f.author, ['push', '-q', 'origin', ':refs/heads/lane/sq']);
-    f.ghPrs([merged('lane/sq', oldTip, mergeOid)]);
+    // The log shows the name reused after the merged PR and deleted again at the unmerged tip.
+    f.ghPrs([merged('lane/sq', oldTip, mergeOid)], deletedAt(currentTip));
     // Neither a caller's historical tip nor the actual deleted tip authorizes the drop.
     for (const tip of [oldTip, currentTip]) {
       const r = retire(f, tip);
@@ -327,7 +341,7 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     const mergeOid = gitOk(f.author, ['rev-parse', 'origin/main']);
     gitOk(f.author, ['push', '-q', 'origin', ':refs/heads/lane/sq']);
     f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), isCrossRepository: true,
-      headRepository: { nameWithOwner: 'contributor/web-everything' } }]);
+      headRepository: { nameWithOwner: 'contributor/web-everything' } }], deletedAt(tip));
     const r = retire(f, tip);
     expect(r.status, r.stderr).toBe(3);
     expect(JSON.parse(r.stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
@@ -353,37 +367,37 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.list()).toEqual([]);
     expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => tip } })).toEqual([{ ref: 'lane/sq', outcome: 'restored' }]);
     expect(f.list()).toEqual(['lane/sq']);
-    // Legacy intents are also unproved when the branch is still deleted: its last tip is unknown.
+    // and with the branch still deleted, the drop is confirmed
     await expect(retireRegistration({ root: f.clone, ref: 'lane/sq', expectedTip: tip, env: f.env, deps: {
       prove: () => ({ ref: 'lane/sq', action: 'retire', reason: 'pr-squash-merged', tip, pr: 7, evidence: { refGone: true, mergeCommit: mergeOid } }),
       tip: () => null, afterDrop: () => { throw new Error('killed'); } } })).rejects.toThrow('killed');
-    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'restored' }]);
-    expect(f.list()).toEqual(['lane/sq']);
+    expect(await settlePendingDrops({ root: f.clone, env: f.env, deps: { tip: () => null } })).toEqual([{ ref: 'lane/sq', outcome: 'drop-confirmed' }]);
+    expect(f.list()).toEqual([]);
   });
 
   it('refuses when the merge commit is not an ancestor of main', () => {
     const { f, tip } = setup();
-    f.ghPrs([merged('lane/sq', tip, tip)]); // the (deleted) branch tip is not on main
+    f.ghPrs([merged('lane/sq', tip, tip)], deletedAt(tip)); // the (deleted) branch tip is not on main
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
     expect(f.list()).toEqual(['lane/sq']);
   });
 
   it('refuses when the merged PR head was a different commit than the expected tip', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([merged('lane/sq', 'e'.repeat(40), mergeOid)]);
+    f.ghPrs([merged('lane/sq', 'e'.repeat(40), mergeOid)], deletedAt(tip));
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false });
     expect(f.list()).toEqual(['lane/sq']);
   });
 
   it('refuses when two merged PRs headed this ref (ambiguous)', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([merged('lane/sq', tip, mergeOid, 7), merged('lane/sq', tip, mergeOid, 8)]);
+    f.ghPrs([merged('lane/sq', tip, mergeOid, 7), merged('lane/sq', tip, mergeOid, 8)], deletedAt(tip));
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
   });
 
   it('refuses when the PR is not merged', () => {
     const { f, tip, mergeOid } = setup();
-    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), state: 'CLOSED' }]);
+    f.ghPrs([{ ...merged('lane/sq', tip, mergeOid), state: 'CLOSED' }], deletedAt(tip));
     expect(JSON.parse(retire(f, tip).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
   });
 
@@ -398,7 +412,7 @@ describe('daemon-overlay.mjs retire of a squash-merged, deleted branch', () => {
     expect(f.run(['add', '--ref=lane/sq']).status).toBe(0);
     const mergeOid = f.squash('lane/sq', 'a.txt', 'first\n');
     const tip2 = f.push('lane/sq', 'b.txt', 'extra unmerged work\n', tip);
-    f.ghPrs([merged('lane/sq', tip, mergeOid)]);
+    f.ghPrs([merged('lane/sq', tip, mergeOid)], deletedAt(tip));
     expect(JSON.parse(retire(f, tip2).stdout)).toMatchObject({ retired: false, refused: 'not-proved' });
     expect(f.list()).toEqual(['lane/sq']);
   });

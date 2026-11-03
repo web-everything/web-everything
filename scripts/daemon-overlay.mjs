@@ -114,7 +114,7 @@ import {
   addOverlay, removeOverlay, readOverlayState, readOverlays, appendOverlayEvent, overlayFilePath, recordEdgeResolution, allowConflictGate,
   readOverrideViewerLogin, registrationIdentity,
 } from './lib/daemon-overlays.mjs';
-import { planRetirements, resolveOriginRepository } from './operations/prototype-retire.mjs';
+import { planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { previewOverlayConflict } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
@@ -294,17 +294,29 @@ export function proveRetirement({ root, entry, env = process.env, run = spawnSyn
     const { gh, repo } = retirementGitHub({ root, env, run });
     return planRetirements({ rows: [entry], git, gh, repo })[0];
   });
+  if (result?.action === 'retire') return result;
+  // Only a branch that is GONE from origin can have been squash-merged and deleted; anything else stays as proved above.
+  if (!result || result.reason === 'fetch-failed') {
+    const squash = proveSquashMerged({ root, entry, env, run });
+    if (squash) return squash;
+  }
   return result?.action ? result : { ref: entry.ref, action: 'keep', reason: result?.reason || 'unprovable' };
 }
 
 /**
- * Legacy proof entry point. A historical squash merge cannot prove the last tip of a deleted mutable branch.
- * Registrations have no authoritative tip to compare with its PR head; callers must recover the branch's work
- * and use the fetched-ref proof. Preserve the export while refusing every unprovable deleted-branch retirement.
- * @returns {null}
+ * A squash merge leaves the branch tip off main and (after deletion) unfetchable, so the ancestry proof cannot see it.
+ * Prove it from GitHub instead (`prototype-retire.mjs#planFetchFailed`): the ref is absent on origin, exactly ONE
+ * origin PR ever headed it and it merged into main, and GitHub's ref activity shows the branch was last deleted at
+ * that PR's head commit. Any missing, unreadable or ambiguous answer keeps the registration.
+ * @returns {{ref:string, action:'retire', reason:'pr-squash-merged', tip:string, pr:number, evidence:object}|null}
  */
-export function proveSquashMerged() {
-  return null;
+export function proveSquashMerged({ root, entry, env = process.env, run = spawnSync }) {
+  if (entry.edgeResolution) return null;
+  if (remoteTip({ root, ref: entry.ref, env, run }) !== null) return null; // still on origin (or unreadable): not this case
+  const { gh, repo } = retirementGitHub({ root, env, run });
+  const plan = withScratchFetch({ root, env, run, prefix: 'we-daemon-overlay-squash-', refspecs: ['+refs/heads/main:refs/remotes/origin/main'] },
+    (git) => planFetchFailed({ row: entry, git, gh, repo }));
+  return plan?.action === 'retire' ? plan : null;
 }
 
 /** The single open origin PR headed by `ref`, or null (none, several, or incomplete evidence).
@@ -376,9 +388,8 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
     if (list.some((o) => o?.ref === record.ref)) { clearPending(root, env, record.ref); settled.push({ ref: record.ref, outcome: 'still-registered' }); continue; }
     const tipNow = tip(record.ref);
     const newNow = record.newRef ? tip(record.newRef) : undefined;
-    // Legacy deleted-branch proofs used a historical PR head, not the registration's authoritative tip.
-    // Restore those interrupted drops even if the remote branch is still absent.
-    if (record.refGone !== true && tipNow === record.tip && (!record.newRef || newNow === record.newTip)) {
+    // A squash-merged retire was proved on a DELETED branch: only a still-deleted branch confirms it.
+    if ((record.refGone === true ? tipNow === null : tipNow === record.tip) && (!record.newRef || newNow === record.newTip)) {
       clearPending(root, env, record.ref);
       appendOverlayEvent(root, { kind: record.kind === 'replace' ? 'replaced' : 'auto-retired', ref: record.ref, by, tip: record.tip, recovered: true }, { env });
       settled.push({ ref: record.ref, outcome: 'drop-confirmed' });

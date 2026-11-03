@@ -326,47 +326,117 @@ describe('planRetirements', () => {
 describe('planFetchFailed (registration whose branch could not be fetched)', () => {
   const REPO = 'web-everything/web-everything';
   const OFF = 'f'.repeat(40);
-  const listGh = (prs, { fail = false } = {}) => (args) => {
-    if (fail || args[0] !== 'pr' || args[1] !== 'list') return { code: 1, stdout: '' };
-    return { code: 0, stdout: JSON.stringify(prs) };
-  };
+  const ZERO = '0'.repeat(40);
+  const T = (n) => `2026-11-02T10:0${n}:00Z`;
+  const event = (activity_type, before, after, n) => ({ activity_type, before, after, timestamp: T(n) });
   const merged = (head, extra = {}) => ({ number: 7, state: 'MERGED', headRefName: 'lane/gone', headRefOid: head,
     headRepository: { nameWithOwner: REPO }, isCrossRepository: false, mergeCommit: { oid: head }, ...extra });
-  const run = (r, gh, row = { ref: 'lane/gone' }) => planFetchFailed({ row, git: r.git, gh, repo: REPO });
+  /** gh stub: `prs` answers `pr list`, `activity` answers the ref activity log (newest first, as GitHub returns it). */
+  const stub = (prs, activity, { failList = false, failActivity = false, raw } = {}) => {
+    const calls = [];
+    const gh = (args) => {
+      calls.push(args);
+      if (args[0] === 'pr' && args[1] === 'list') return failList ? { code: 1, stdout: '' } : { code: 0, stdout: raw ?? JSON.stringify(prs) };
+      if (args[0] === 'api') return failActivity ? { code: 1, stdout: '' } : { code: 0, stdout: JSON.stringify(activity) };
+      return { code: 1, stdout: '' };
+    };
+    return { gh, calls };
+  };
+  const deletedAt = (tip) => [event('branch_deletion', tip, ZERO, 5), event('push', OFF, tip, 3), event('branch_creation', ZERO, OFF, 1)];
+  const run = (r, s, row = { ref: 'lane/gone' }) => planFetchFailed({ row, git: r.git, gh: s.gh, repo: REPO });
   const withMain = () => { const r = repo(); r.setRemote('main', r.ok('rev-parse', 'HEAD')); return r; };
+  const KEEP = { action: 'keep', reason: 'fetch-failed' };
 
-  it('keeps a MERGED PR whose merge commit is on origin/main when the current branch tip is unknown', () => {
+  it('retires a MERGED origin PR whose head is the branch tip at its newest deletion and whose merge commit is on origin/main', () => {
     const r = withMain();
     const sha = r.ok('rev-parse', 'HEAD');
-    expect(run(r, listGh([merged(sha)]))).toEqual({ ref: 'lane/gone', action: 'keep', reason: 'fetch-failed' });
+    const s = stub([merged(sha)], deletedAt(sha));
+    expect(run(r, s)).toEqual({ ref: 'lane/gone', action: 'retire', reason: 'pr-squash-merged', tip: sha, pr: 7,
+      evidence: { refGone: true, prState: 'MERGED', mergeCommit: sha, prVia: 'head-ref', deletedTip: sha } });
+    // the activity read names the exact ref and the PR read covers every state
+    const api = s.calls.find((c) => c[0] === 'api');
+    expect(api[1]).toBe(`repos/${REPO}/activity?ref=refs%2Fheads%2Flane%2Fgone&per_page=10`);
+    expect(s.calls.find((c) => c[0] === 'pr')[s.calls.find((c) => c[0] === 'pr').indexOf('--state') + 1]).toBe('all');
+  });
+  it('retires when the recorded PR number matches', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, stub([merged(sha)], deletedAt(sha)), { ref: 'lane/gone', pr: 7 })).toMatchObject({ action: 'retire', pr: 7 });
+  });
+  it('keeps a reused name deleted at a different tip (unmerged work after the merged PR)', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    const reused = [event('branch_deletion', OFF, ZERO, 9), event('push', sha, OFF, 8), event('branch_creation', ZERO, sha, 7), event('branch_deletion', sha, ZERO, 5)];
+    expect(run(r, stub([merged(sha)], reused))).toEqual({ ref: 'lane/gone', ...KEEP });
+  });
+  it('keeps when the newest ref event is not a deletion (the branch exists or was recreated)', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, stub([merged(sha)], [event('branch_creation', ZERO, sha, 9), ...deletedAt(sha)]))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], [event('push', OFF, sha, 9), ...deletedAt(sha)]))).toMatchObject(KEEP);
+  });
+  it('keeps when the activity log is unreadable, empty, malformed or ties for newest', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, stub([merged(sha)], [], { failActivity: true }))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], []))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], { not: 'a list' }))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], [{ ...event('branch_deletion', sha, ZERO, 5), timestamp: 'never' }]))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], [event('branch_deletion', sha, ZERO, 5), event('push', OFF, sha, 5)]))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], [event('branch_deletion', 'short', ZERO, 5)]))).toMatchObject(KEEP);
+  });
+  it('keeps when the deleted tip is not the merged PR head', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, stub([merged(sha)], deletedAt(OFF)))).toMatchObject(KEEP);
   });
   it('keeps when the PR is not MERGED', () => {
     const r = withMain();
     const sha = r.ok('rev-parse', 'HEAD');
-    expect(run(r, listGh([merged(sha, { state: 'OPEN' })]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    for (const state of ['OPEN', 'CLOSED']) expect(run(r, stub([merged(sha, { state })], deletedAt(sha)))).toMatchObject(KEEP);
   });
-  it('keeps when the lookup fails or is unparseable', () => {
+  it('keeps when the PR lookup fails or is unparseable', () => {
     const r = withMain();
-    expect(run(r, listGh([], { fail: true }))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
-    expect(run(r, () => ({ code: 0, stdout: 'not json' }))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    const sha = r.ok('rev-parse', 'HEAD');
+    expect(run(r, stub([], deletedAt(sha), { failList: true }))).toMatchObject(KEEP);
+    expect(run(r, stub([], deletedAt(sha), { raw: 'not json' }))).toMatchObject(KEEP);
   });
   it('keeps when the merge commit is not an ancestor of origin/main', () => {
     const r = withMain();
     r.ok('checkout', '-q', '-b', 'side');
     const off = r.commit('side.txt', 'x\n');
-    expect(run(r, listGh([merged(off)]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
-    expect(run(r, listGh([merged(OFF)]))).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    expect(run(r, stub([merged(off)], deletedAt(off)))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(OFF)], deletedAt(OFF)))).toMatchObject(KEEP);
   });
-  it('keeps when several PRs or a different recorded PR number match, or an edge resolution is recorded', () => {
+  it('keeps when several PRs, a different recorded PR number, a full result page or an edge resolution is present', () => {
     const r = withMain();
     const sha = r.ok('rev-parse', 'HEAD');
-    expect(run(r, listGh([merged(sha), merged(sha, { number: 8 })]))).toMatchObject({ action: 'keep' });
-    expect(run(r, listGh([merged(sha)]), { ref: 'lane/gone', pr: 99 })).toMatchObject({ action: 'keep' });
-    expect(run(r, listGh([merged(sha)]), { ref: 'lane/gone', edgeResolution: { x: 1 } })).toMatchObject({ action: 'keep' });
+    const events = deletedAt(sha);
+    expect(run(r, stub([merged(sha), merged(sha, { number: 8, state: 'CLOSED', mergeCommit: null })], events))).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], events), { ref: 'lane/gone', pr: 99 })).toMatchObject(KEEP);
+    expect(run(r, stub([merged(sha)], events), { ref: 'lane/gone', edgeResolution: { x: 1 } })).toMatchObject(KEEP);
+    const full = [merged(sha), ...Array.from({ length: 9 }, (_, i) => merged(sha, { number: 20 + i, state: 'CLOSED', mergeCommit: null, headRefName: 'other' }))];
+    expect(run(r, stub(full, events))).toMatchObject(KEEP);
   });
-  it('keeps for an unknown repository', () => {
+  it('keeps a PR from a fork or whose head repository cannot be classified', () => {
     const r = withMain();
     const sha = r.ok('rev-parse', 'HEAD');
-    expect(planFetchFailed({ row: { ref: 'lane/gone' }, git: r.git, gh: listGh([merged(sha)]), repo: '' })).toMatchObject({ action: 'keep', reason: 'fetch-failed' });
+    const events = deletedAt(sha);
+    expect(run(r, stub([merged(sha, { isCrossRepository: true, headRepository: { nameWithOwner: 'contributor/web-everything' } })], events))).toMatchObject(KEEP);
+    for (const extra of [{ isCrossRepository: undefined }, { isCrossRepository: 'false' }, { headRepository: null }, { headRepository: { nameWithOwner: `${REPO}\n` } },
+      { headRepository: { nameWithOwner: 'contributor/web-everything' } }]) {
+      expect(run(r, stub([merged(sha, extra)], events))).toMatchObject(KEEP);
+    }
+    // a fork's same-named PR beside the single origin PR does not block it, an unclassifiable one does
+    const fork = merged(sha, { number: 9, state: 'OPEN', isCrossRepository: true, headRepository: { nameWithOwner: 'contributor/web-everything' } });
+    expect(run(r, stub([merged(sha), fork], events))).toMatchObject({ action: 'retire' });
+    expect(run(r, stub([merged(sha), { ...fork, headRepository: null }], events))).toMatchObject(KEEP);
+  });
+  it('keeps for an unknown repository or missing IO', () => {
+    const r = withMain();
+    const sha = r.ok('rev-parse', 'HEAD');
+    const s = stub([merged(sha)], deletedAt(sha));
+    expect(planFetchFailed({ row: { ref: 'lane/gone' }, git: r.git, gh: s.gh, repo: '' })).toMatchObject(KEEP);
+    expect(planFetchFailed({ row: { ref: 'lane/gone' } })).toMatchObject(KEEP);
   });
 });
