@@ -195,6 +195,14 @@ describe('stale remote slot markers (perf10)', () => {
         expect(names(root)).toEqual(expected.length ? [] : ['0']);
       }
     });
+    it('restarts confirmation after a non-qualifying (too-young) sample between two qualifying ones', async () => {
+      const {root, reaper} = mk();
+      expect(await reaper.step(tel(0, S1, [going(RUN_A, S1 - 90_000)]))).toEqual([]); // qualifying: starts the window
+      expect(await reaper.step(tel(0, S1 + 10_000, [going(RUN_A, S1 + 10_000 - 89_999)]))).toEqual([]); // too young: resets
+      expect(await reaper.step(tel(0, S1 + 31_000, [going(RUN_A, S1 + 31_000 - 90_000)]))).toEqual([]); // fresh window starts here
+      expect(names(root)).toEqual(['0']);
+      expect(await reaper.step(tel(0, S1 + 61_000, [going(RUN_A, S1 + 61_000 - 90_000)]))).toEqual(['slot-0.unconfirmed']);
+    });
     it('does not start confirmation from a sample whose run is younger than the margin', async () => {
       const {root, reaper} = mk();
       await reaper.step(tel(0, S1, [going(RUN_A, S1 - 10_000)]));

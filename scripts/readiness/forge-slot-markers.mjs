@@ -277,7 +277,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
           dead.sort((a, b) => a.mtimeMs - b.mtimeMs);
           for (const entry of dead) {
             const diedBy = firstDead.get(entry.key);
-            if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) continue;
+            if (now - entry.mtimeMs < graceMs || sampledAt < diedBy + DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; }
             let verdict = 'run-less';
             if (entry.run) {
               verdict = runVerdict(telemetry, entry.run);
@@ -288,7 +288,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
               // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
               if (verdict === 'idle') {
                 const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
-                if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) continue;
+                if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) { resetIdle(entry); continue; } // not fully qualifying: restart the window
                 // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
                 // taken by THIS reaper, that still reports zero active runs before releasing.
                 const first = idleStamp(entry.file, entry.key, sampledAt);
