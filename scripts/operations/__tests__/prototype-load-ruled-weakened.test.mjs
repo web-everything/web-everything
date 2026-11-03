@@ -41,11 +41,12 @@ describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
   it('NOT WEAKENED records are unchanged', () => {
     expect(readyEvidence([{ ref: REF, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' }], input, [])).toMatchObject({ source: 'ready-record' });
   });
-  it('ships exactly the eight ruled entries with pinned refs, full shas and rulings', () => {
+  it('ships exactly the nine ruled entries with pinned refs, full shas and rulings', () => {
     const shipped = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
     expect(shipped.ruledWeakened.map(({ ref, sha, ruling }) => [ref, sha, ruling])
       .sort(([a], [b]) => a.localeCompare(b))).toEqual([
       ['lane/dispatch-scope-multi', '2fe6208f8409668f0a74a637c5b53ac46f5031cf', 'R396'],
+      ['lane/forge-slot-reconciler-r475', '0cbd4303bc0a961fdafda162bec407af8b8709dc', 'R475+R485'],
       ['lane/freeze-read-retry-lkg', 'f8564fc77a42e3c5a326fc17e38c3873f66696b3', 'R432'],
       ['lane/mq-removed-event-hold', '9730180d08259a7def9e8c4590ac9b7697515c65', 'R443'],
       ['lane/mq-same-head-merge-conflict', '94eb862d0f5595cb6d322c09d5945bbdcf92bfa9', 'R466+R484'],
