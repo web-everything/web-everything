@@ -30,7 +30,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
   decideSmokeVerdict, resolveSmokeBudgets, SMOKE_BUDGET_ENV, isSmokeGateDisabled, SMOKE_KILL_SWITCH_ENV,
   runLiveSmoke, SMOKE_CHECKS, rollbackToSha, readRejectedSha, recordRejectedSha, clearRejectedSha,
-  smokeStatePath, gateMergedCommit, ghDispatchedSessionEnv,
+  smokeStatePath, gateMergedCommit, ghDispatchedSessionEnv, smokeLaneHints,
   TRANSIENT_FAILURE_PATTERNS, classifySmokeFailure, runLiveSmokeWithRetry,
   SMOKE_TRANSIENT_RETRIES_ENV, SMOKE_RETRY_BACKOFF_MS_ENV,
   refreshSmokeGithubEnv, probeGithubAuth, hasGithubAuthSignature,
@@ -81,6 +81,36 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(row.ok).toBe(false);
     expect(row.detail).toBe('lane-pool acquire --purpose=smoke failed: exited 1: no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision');
     expect(row.detail).not.toContain('reclaiming');
+  });
+
+  describe('explicit-lane fast path from the published free-lane hints (no pool-wide scan)', () => {
+    const hinted = (hints, runChild) => ({ ...context(runChild), laneHints: () => hints });
+    it('acquires the hinted lane by --lane=N and never runs the auto-pick', async () => {
+      const runChild = vi.fn().mockResolvedValueOnce(JSON.stringify({ lane: 7 })).mockResolvedValueOnce('');
+      const row = await check.run(hinted([7, 9], runChild));
+      expect(row).toMatchObject({ ok: true, lane: 7 });
+      const a = acquires(runChild);
+      expect(a).toHaveLength(1);
+      expect(a[0][1]).toContain('--lane=7');
+      expect(a[0][1].some((x) => x.startsWith('--wait-ms'))).toBe(false);
+    });
+    it('a stale hint that fails is released best-effort, the next hint is tried, then auto-pick as the last resort', async () => {
+      const runChild = vi.fn()
+        .mockRejectedValueOnce(exit(1)).mockResolvedValueOnce('') // hint 7 fails + release
+        .mockResolvedValueOnce(JSON.stringify({ lane: 9 })).mockResolvedValueOnce('');
+      expect(await check.run(hinted([7, 9], runChild))).toMatchObject({ ok: true, lane: 9 });
+      const bad = vi.fn().mockRejectedValue(exit(1, { stderr: '✗ no free lane in pool "web-everything" (3 all held/dirty)' }));
+      const row = await check.run(hinted([7], bad));
+      expect(row.ok).toBe(false); // still a real failure: the unchanged auto-pick ran and failed
+      expect(acquires(bad).some(([, args]) => args.some((x) => x.startsWith('--wait-ms')))).toBe(true);
+    });
+    it('smokeLaneHints reads the list regardless of age and returns [] when it is missing', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'hints-'));
+      const file = join(dir, 'l.json');
+      writeFileSync(file, JSON.stringify({ v: 1, writtenAt: 1, repo: 'web-everything', poolDir: dir, lanes: [{ lane: 5 }, { lane: 2 }, { lane: 8 }, { lane: 9 }] }));
+      expect(smokeLaneHints({ root: '/x', env: { LANE_POOL_FREE_LIST_FILE: file } })).toEqual([5, 2, 8]);
+      expect(smokeLaneHints({ root: '/x', env: { LANE_POOL_FREE_LIST_FILE: join(dir, 'none.json') } })).toEqual([]);
+    });
   });
 
   it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {

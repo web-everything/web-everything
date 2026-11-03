@@ -92,6 +92,8 @@ import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
 import { collectImportClosure, closureHits } from './import-closure.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { gitRun } from './main-staleness.mjs';
+import { readFreeLaneList, resolveFreeLaneListPath, freeLaneCandidates } from './free-lane-list.mjs';
+import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { DAEMON_BOOT_SMOKE_CHECK, DEFAULT_DAEMON_BOOT_MS } from './daemon-boot-smoke.mjs';
 import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 
@@ -395,6 +397,28 @@ export const lanePoolFailureLine = (e) => {
   return reason && Number.isInteger(e?.status) ? `exited ${e.status}: ${reason.slice(2)}` : firstLine(e);
 };
 
+/** How many published free-lane hints the smoke tries by explicit `--lane=N` before the pool-wide auto-pick. */
+export const SMOKE_LANE_HINT_TRIES = 3;
+/** Per-hint cap: one lane's reset is a single-lane git probe, never a pool scan. */
+export const SMOKE_LANE_HINT_TIMEOUT_MS = 60_000;
+/**
+ * Lane numbers the smoke may try by explicit `--lane=N`, read straight from the health-watch's published free-lane
+ * list (we:scripts/lib/free-lane-list.mjs). AGE IS DELIBERATELY IGNORED here: an explicit acquire re-verifies the
+ * one lane itself (live lease, reserved lane and dirty lane all refuse), so a stale entry costs one failed try
+ * and a fall-through to the auto-pick, never a clobbered lane. Reserved lanes never appear in that list. Read-only.
+ * 2026-11-03: the list went 44 min stale under load, auto-pick fell to the full per-lane scan and blew 300 s.
+ */
+export function smokeLaneHints({ root, env = process.env, max = SMOKE_LANE_HINT_TRIES } = {}) {
+  // A vitest run must never read the host's real pool state unless it names its own pool/list.
+  const underTest = process.env.VITEST || process.env.WE_UNDER_TEST;
+  if (underTest && !env.LANE_POOL_ROOT && !env.LANE_POOL_FREE_LIST_FILE) return [];
+  try {
+    const poolDir = join(defaultPoolRoot(root, env), 'web-everything');
+    const list = readFreeLaneList(resolveFreeLaneListPath({ repoName: 'web-everything', poolDir, env }));
+    return freeLaneCandidates(list).slice(0, max);
+  } catch { return []; }
+}
+
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
   let laneNum = null;
@@ -417,8 +441,21 @@ async function checkLaneAcquireRelease(ctx) {
       cwd: root, timeoutMs: acquireCapMs, env,
     });
     let out;
+    // Fast path: explicit `--lane=N` from the published free-lane hints — no pool-wide scan. Any failure falls
+    // through to the unchanged auto-pick below, so a real "no free lane" regression is still caught there.
+    for (const hint of (ctx.laneHints ?? smokeLaneHints)({ root, env })) {
+      try {
+        const hinted = await runChild('node', [
+          'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`, `--lane=${hint}`,
+          '--ttl-minutes=10', '--json',
+        ], { cwd: root, timeoutMs: Math.min(SMOKE_LANE_HINT_TIMEOUT_MS, acquireCapMs), env });
+        if (Number.isInteger(JSON.parse(hinted)?.lane)) { out = hinted; break; }
+      } catch {
+        try { await runChild('node', ['scripts/lane-pool.mjs', 'release', `--lane=${hint}`, `--session=${sessionSlug}`], { cwd: root, timeoutMs: budgets.laneReleaseMs, env }); } catch { /* 10-minute TTL covers it */ }
+      }
+    }
     try {
-      out = await acquire();
+      if (out === undefined) out = await acquire();
     } catch (e) {
       if (!isEnvOnlyAcquireExit(e)) throw e;
       try {
