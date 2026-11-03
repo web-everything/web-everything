@@ -128,40 +128,77 @@ export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, enqueu
     && approvedHeadHold({ repo, num: pr }, head, { strict: true }) === false };
 }
 
+// Skip diagnostics are process-local: refusing a refresh must never spend a shared claim.
+const mqSameHeadRefreshSkips = new Set();
+
+function mqRefreshChecksGreen(checks) {
+  if (!Array.isArray(checks) || !checks.length) return false;
+  const byIdentity = new Map();
+  for (const check of checks) {
+    if (!check || typeof check !== 'object') return false;
+    const name = check.name || check.context;
+    // Display names collide across workflows. Unknown origins are independent
+    // evidence and must never be discarded as retries of a named check.
+    const workflow = check.workflowName;
+    const identity = typeof workflow === 'string' && workflow.trim()
+      && typeof name === 'string' && name.trim()
+      ? JSON.stringify([workflow, name]) : Symbol();
+    // Completion order is not attempt order: an older run can finish last.
+    // Without a start time, keep the row as unordered evidence rather than
+    // letting its completion timestamp supersede another attempt.
+    const time = Date.parse(check.startedAt);
+    const group = byIdentity.get(identity) ?? { latest: -Infinity, rows: [], unordered: [] };
+    if (!Number.isFinite(time)) group.unordered.push(check);
+    else if (time > group.latest) { group.latest = time; group.rows = [check]; }
+    else if (time === group.latest) group.rows.push(check);
+    byIdentity.set(identity, group);
+  }
+  // Missing-start or tied rows cannot supersede one another: the worse result wins.
+  return [...byIdentity.values()].every(group => [...group.rows, ...group.unordered].every(check =>
+    (check.status == null || check.status === 'COMPLETED') && check.state !== 'PENDING'
+      && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state)));
+}
+
 function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
-  if (!store) return;
   const key = `${repo}#${pr}@${head}`;
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
   const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
-  const unavailable = () => log(`${prefix}state unavailable; not requesting; inspect shared refresh ledger and lock before retrying`);
-  try { if (store.has(key)) return; } catch { unavailable(); return; }
+  const skip = reason => {
+    if (mqSameHeadRefreshSkips.has(key)) return;
+    mqSameHeadRefreshSkips.add(key);
+    log(`${prefix}skipped (${safe(reason)})`);
+  };
+  const unavailable = () => skip('state unavailable; inspect shared refresh ledger and lock before retrying');
+  if (!store) { unavailable(); return; }
+  try { if (store.has(key)) { skip('already requested'); return; } } catch { unavailable(); return; }
   exec = createMqLiveReader(exec);
   const opts = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
+  let stage = 'checks unreadable';
   try {
     const live = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
       '--json', 'mergeStateStatus,headRefOid,statusCheckRollup'], opts));
-    if (mqOid(live?.headRefOid) !== head || live.mergeStateStatus !== 'CLEAN') return;
-    const checks = live.statusCheckRollup;
-    if (!Array.isArray(checks) || !checks.length || !checks.every(check => check
-      && (check.status == null || check.status === 'COMPLETED')
-      && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state))) return;
+    if (mqOid(live?.headRefOid) !== head) { skip('head moved'); return; }
+    if (live.mergeStateStatus !== 'CLEAN') { skip('not CLEAN'); return; }
+    if (!mqRefreshChecksGreen(live.statusCheckRollup)) { skip('checks not green'); return; }
     // Unreadable enqueue or approval evidence is never permission to refresh.
     let allowed = false;
     try { allowed = allow?.() === true; } catch { /* Fail closed before labels or claim. */ }
     if (!allowed) {
-      log(`${prefix}authorization refused or unreadable; inspect red-team evidence and workflow/human approval before retrying`);
+      skip('authorization refused or unreadable; inspect red-team evidence and workflow/human approval before retrying');
       return;
     }
     // Read labels LIVE after approval and before spending the claim. Recheck the head too.
+    stage = 'labels unreadable';
     const labeled = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo,
       '--json', 'labels,headRefOid'], opts));
-    if (mqOid(labeled?.headRefOid) !== head || !Array.isArray(labeled.labels)) return;
+    if (mqOid(labeled?.headRefOid) !== head) { skip('head moved'); return; }
+    if (!Array.isArray(labeled.labels)) { skip('labels unreadable'); return; }
     const names = queueLabels(labeled.labels);
-    if (names.some(name => typeof name !== 'string' || !name.trim())
-      || sendBackReason(names) || redTeamLabelHoldReason(names)) return;
-  } catch { return; }
-  try { if (store.claim(key) !== true) { unavailable(); return; } }
+    if (names.some(name => typeof name !== 'string' || !name.trim())) { skip('labels unreadable'); return; }
+    if (sendBackReason(names) || redTeamLabelHoldReason(names)) { skip('blocking label'); return; }
+  } catch { skip(stage); return; }
+  try { if (store.claim(key) !== true) { skip('claim lost'); return; } }
   catch { unavailable(); return; }
   try {
     exec('gh', ['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`,

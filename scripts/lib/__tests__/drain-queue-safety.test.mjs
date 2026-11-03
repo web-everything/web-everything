@@ -86,12 +86,15 @@ describe('merge-queue same-head failure admission', () => {
           return JSON.stringify({ labels: f.labels, headRefOid: f.labelHead ?? head });
         }
         if (args.includes('mergeStateStatus,headRefOid,statusCheckRollup')) return JSON.stringify(f.live);
-        if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse();
-        return response(f.timeline ?? timeline(removed()));
+        if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse(false, f.guardHead ?? head);
+        return response(f.timeline ?? timeline(removed('failed_checks', f.guardHead ?? head)));
       });
-      f.run = (selectedStore = store) => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log,
-        refresh: createMqSameHeadRefreshOptions({ store: selectedStore, approvedHeadHold: f.approvedHeadHold,
-          enqueueAllowed: f.enqueueAllowed, repo, pr, head }) });
+      f.run = (selectedStore = store, identity = {}) => {
+        f.guardHead = identity.head ?? head;
+        return mqSameHeadGuard({ repo, pr, head, ...identity, exec: f.exec, log: f.log,
+          refresh: createMqSameHeadRefreshOptions({ store: selectedStore, approvedHeadHold: f.approvedHeadHold,
+            enqueueAllowed: f.enqueueAllowed, repo, pr, head, ...identity }) });
+      };
       f.requests = () => f.exec.mock.calls.filter(([, args]) => args.includes('PUT'));
       try { test(f); } finally { rmSync(dir, { recursive: true, force: true }); }
     }
@@ -307,7 +310,7 @@ describe('merge-queue same-head failure admission', () => {
           expect(reads.every(read => read.cached)).toBe(true);
           expect(reads.every(read => !read.opts.env && !read.opts.throttle)).toBe(true);
           reads.length = 0;
-          f.run();
+          f.run(f.store, { repo: `fixture/stale-approval-${stage}` });
           expect(f.requests()).toHaveLength(0);
           expect(existsSync(f.path)).toBe(false);
           expect(f.exec.mock.calls.some(([, args]) => args.includes('labels,headRefOid'))).toBe(false);
@@ -355,6 +358,110 @@ describe('merge-queue same-head failure admission', () => {
         expect(readHold).not.toHaveBeenCalled();
         expect(stderr.write).toHaveBeenCalledWith(expect.stringMatching(/unreadable.*not requesting same-head refresh/));
       }));
+    // Trimmed from #6287's rollup: preserve the actual run timestamps and mixed outcomes.
+    const rollup6287 = [
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE', state: null, startedAt: '2026-11-02T23:06:39Z', completedAt: '2026-11-02T23:06:42Z' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'CANCELLED', state: null, startedAt: '2026-11-02T23:06:35Z', completedAt: '2026-11-02T23:06:35Z' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'CANCELLED', state: null, startedAt: '2026-11-02T23:15:28Z', completedAt: '2026-11-02T23:15:28Z' },
+      { name: 'merge-gate', status: 'COMPLETED', conclusion: 'SUCCESS', state: null, startedAt: '2026-11-02T22:52:02Z', completedAt: '2026-11-02T22:59:48Z' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS', state: null, startedAt: '2026-11-02T22:52:04Z', completedAt: '2026-11-02T22:52:27Z' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'SUCCESS', state: null, startedAt: '2026-11-02T23:26:39Z', completedAt: '2026-11-02T23:26:43Z' },
+      { name: 'visual', status: 'COMPLETED', conclusion: 'SKIPPED', state: null, startedAt: '2026-11-02T22:52:03Z', completedAt: '2026-11-02T22:52:02Z' },
+    ];
+    it.each(['SUCCESS', 'FAILURE'])('#6287 rollup with explicit shared workflow identity judges latest review-gate %s', conclusion => fixture(f => {
+      // Synthetic identity enrichment; the trimmed original has no workflow metadata.
+      f.live.statusCheckRollup = rollup6287.map(row => ({ ...row, workflowName: 'CI',
+        ...(row.completedAt === '2026-11-02T23:26:43Z' ? { conclusion } : {}),
+      }));
+      f.run();
+      expect(f.requests()).toHaveLength(conclusion === 'SUCCESS' ? 1 : 0);
+      expect(existsSync(f.path)).toBe(conclusion === 'SUCCESS');
+    }));
+    it.each([
+      ['completed failure', { status: 'COMPLETED', conclusion: 'FAILURE' }],
+      ['cancelled', { status: 'COMPLETED', conclusion: 'CANCELLED' }],
+      ['running', { status: 'IN_PROGRESS', conclusion: null }],
+      ['pending context', { name: '', context: 'review-gate', state: 'PENDING' }],
+    ])('latest %s blocks an older success', (_name, latest) => fixture(f => {
+      f.live.statusCheckRollup = [{ ...rollup6287[5], workflowName: 'CI' }, { name: 'review-gate', workflowName: 'CI', ...latest, startedAt: '2026-11-02T23:27:00Z' }];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each([
+      ['running', { status: 'IN_PROGRESS', conclusion: null }],
+      ['failed', { status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-11-02T10:06:00Z' }],
+    ])('newer %s attempt blocks an older success that finishes later', (_kind, newer) => fixture(f => {
+      f.live.statusCheckRollup = [
+        { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-02T10:00:00Z', completedAt: '2026-11-02T10:10:00Z' },
+        { name: 'gate', workflowName: 'CI', startedAt: '2026-11-02T10:05:00Z', ...newer },
+      ];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each(['success', 'failure', 'both'])('missing %s start time keeps overlapping failure blocking', missing => fixture(f => {
+      const success = { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-02T10:00:00Z', completedAt: '2026-11-02T10:10:00Z' };
+      const failure = { name: 'gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-02T10:05:00Z', completedAt: '2026-11-02T10:06:00Z' };
+      if (missing !== 'failure') delete success.startedAt;
+      if (missing !== 'success') delete failure.startedAt;
+      f.live.statusCheckRollup = [success, failure];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each(['other workflow', 'missing workflow', 'blank workflow'])(
+      'a later success from another workflow cannot hide a same-name failure: %s', source => fixture(f => {
+        f.live.statusCheckRollup = [
+          { name: 'test', workflowName: 'Security', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-11-02T10:00:00Z' },
+          { name: 'test', workflowName: source === 'other workflow' ? 'CI' : source === 'blank workflow' ? '' : undefined,
+            status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-11-02T10:05:00Z' },
+        ];
+        f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+      }));
+    it('missing workflow identity cannot prove that a success supersedes a failure', () => fixture(f => {
+      f.live.statusCheckRollup = rollup6287;
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it.each([false, true])('unordered duplicates fail closed regardless of order: reversed=%s', reverse => fixture(f => {
+      const rows = [{ context: 'gate', state: 'SUCCESS' }, { context: 'gate', state: 'FAILURE' }];
+      f.live.statusCheckRollup = reverse ? rows.reverse() : rows;
+      f.run(); expect(f.requests()).toHaveLength(0);
+    }));
+    it.each(['tied', 'undated'])('%s failure cannot be superseded by a dated success', kind => fixture(f => {
+      f.live.statusCheckRollup = [{ ...rollup6287[5], workflowName: 'CI' }, {
+        name: 'review-gate', workflowName: 'CI', status: 'COMPLETED', conclusion: 'FAILURE',
+        ...(kind === 'tied' ? { startedAt: rollup6287[5].startedAt, completedAt: rollup6287[5].completedAt } : {}),
+      }];
+      f.run(); expect(f.requests()).toHaveLength(0); expect(existsSync(f.path)).toBe(false);
+    }));
+    it('context identity and startedAt order permit a later success', () => fixture(f => {
+      f.live.statusCheckRollup = [
+        { context: 'gate', workflowName: 'CI', state: 'FAILURE', startedAt: '2026-11-02T23:06:39Z' },
+        { name: '', context: 'gate', workflowName: 'CI', state: 'SUCCESS', startedAt: '2026-11-02T23:26:39Z' },
+      ];
+      f.run(); expect(f.requests()).toHaveLength(1);
+    }));
+    it.each([[], null])('empty/missing rollup fails closed: %s', rollup => fixture(f => {
+      f.live.statusCheckRollup = rollup; f.run(); expect(f.requests()).toHaveLength(0);
+    }));
+    it.each([
+      ['head moved', f => { f.live.headRefOid = prior; }],
+      ['not CLEAN', f => { f.live.mergeStateStatus = 'BEHIND'; }],
+      ['checks not green', f => { f.live.statusCheckRollup = []; }],
+      ['blocking label', f => { f.labels.push('review:changes'); }],
+      ['authorization refused or unreadable', f => { f.approvedHeadHold.mockReturnValue(true); }],
+      ['labels unreadable', f => { f.labels = null; }],
+      ['claim lost', f => { f.store.claim = vi.fn(() => false); }],
+      ['state unavailable', f => { f.store.has = () => { throw Error('offline'); }; }],
+      ['already requested', f => { f.store.has = () => true; }],
+    ])('logs %s once per repository/PR/head without writing skips', (reason, arrange) => fixture(f => {
+      arrange(f);
+      const identity = { repo: `fixture/skip-${reason}` };
+      f.run(f.store, identity); f.run(f.store, identity);
+      const lines = () => f.log.mock.calls.map(([line]) => line).filter(line => line.startsWith('mq-same-head-refresh:'));
+      expect(lines()).toEqual([`mq-same-head-refresh: #${pr} head ${head} — skipped (${reason}${reason === 'state unavailable' ? '; inspect shared refresh ledger and lock before retrying' : reason === 'authorization refused or unreadable' ? '; inspect red-team evidence and workflow/human approval before retrying' : ''})`]);
+      f.run(f.store, { ...identity, head: 'c'.repeat(40) });
+      f.run(f.store, { ...identity, pr: pr + 1 });
+      f.run(f.store, { repo: `${identity.repo}-other` });
+      expect(lines()).toHaveLength(4);
+      expect(f.requests()).toHaveLength(0);
+      expect(existsSync(f.path)).toBe(false);
+    }));
     it('uses shared home state with an explicit test override', () => {
       expect(mqSameHeadRefreshStatePath({})).toBe(join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json'));
       expect(mqSameHeadRefreshStatePath({ WE_DRAIN_MQ_REFRESH_STATE_PATH: '/fixture/state.json' })).toBe('/fixture/state.json');
@@ -391,7 +498,7 @@ describe('merge-queue same-head failure admission', () => {
       f.enqueueAllowed.mockImplementation(() => decideDrainWorkflowEditHold({
         files: ['scripts/safe.mjs'], filesComplete: false, headSha: head, setting: 'on',
       }).hold === false);
-      f.run();
+      f.run(f.store, { repo: 'fixture/incomplete-workflow' });
       expect(f.requests()).toHaveLength(0);
       expect(existsSync(f.path)).toBe(false);
       expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/authorization refused or unreadable; inspect.*approval before retrying/));
@@ -399,7 +506,7 @@ describe('merge-queue same-head failure admission', () => {
     it.each(['unreadable', 'incomplete', 'missing'])('enqueue evidence %s fails closed before labels or ledger spend', kind => fixture(f => {
       if (kind === 'missing') f.enqueueAllowed = undefined;
       else f.enqueueAllowed.mockImplementation(() => { if (kind === 'unreadable') throw Error('offline'); });
-      f.run();
+      f.run(f.store, { repo: `fixture/enqueue-${kind}` });
       expect(f.requests()).toHaveLength(0);
       expect(f.exec.mock.calls.some(([, args]) => args.includes('labels,headRefOid'))).toBe(false);
       expect(existsSync(f.path)).toBe(false);
@@ -483,7 +590,7 @@ describe('merge-queue same-head failure admission', () => {
     }));
     it.each(['locked', 'malformed'])('%s ledger refuses with operator fallback', kind => fixture(f => {
       writeFileSync(kind === 'locked' ? `${f.path}.lock` : f.path, kind === 'locked' ? `${process.pid}\n` : '{}');
-      f.run(); expect(f.requests()).toHaveLength(0);
+      f.run(f.store, { repo: `fixture/ledger-${kind}` }); expect(f.requests()).toHaveLength(0);
       expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/state unavailable;.*inspect.*ledger/));
     }));
   });
