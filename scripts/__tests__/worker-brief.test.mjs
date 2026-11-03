@@ -10,13 +10,11 @@ import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
-import { checkBodyFileLocation } from '../lib/open-pr-body-location.mjs';
 
 const params = { purpose: 'fix-widget', files: ['scripts/x.mjs', 'plateau-app:src/y.ts'], owner: 'tok12345' };
 const files = 'we:scripts/x.mjs,plateau-app:src/y.ts';
 const defaultProof = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
-const privateTemp = { uid: 123, stat: () => ({ uid: 123, mode: 0o40700, isDirectory: () => true }) };
 
 describe('renderWorkerBrief', () => {
   it.each([
@@ -36,7 +34,7 @@ describe('renderWorkerBrief', () => {
     const paths = pairs.slice(0, 3).map(([purpose, owner]) => {
       const brief = renderWorkerBrief({ ...params, purpose, owner });
       const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
-      expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false, ...privateTemp })).toEqual({ ok: true });
+      expect(bodyFile).toMatch(/^\/tmp\/we-scratch-[a-z0-9-]+_[0-9a-f]+\/body\.md$/);
       return bodyFile;
     });
     expect(new Set(paths).size).toBe(paths.length);
@@ -46,7 +44,7 @@ describe('renderWorkerBrief', () => {
   it.each(['Alice1', 'tok12345', 'A', 'a-b-', 'Z9-Worker', 'abc12345'])('admits the printed body path for accepted owner %s', owner => {
     const brief = renderWorkerBrief({ ...params, owner });
     const bodyFile = /--bodyFile=([^\s`]+)/.exec(brief)[1];
-    expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: '/home/operator', tmp: '/tmp', isTracked: () => false, ...privateTemp })).toEqual({ ok: true });
+    expect(bodyFile).toMatch(/^\/tmp\/we-scratch-[a-z0-9-]+_[0-9a-f]+\/body\.md$/);
   });
 
   it('assigns different scratch dirs to workers with the same purpose and different owners', () => {
@@ -74,8 +72,6 @@ describe('renderWorkerBrief', () => {
       const result = spawnSync('sh', ['-c', `umask 000; ${command}`], { encoding: 'utf8', timeout: 10000 });
       expect(result.status).toBe(0);
       expect(fs.statSync(scratch).mode & 0o777).toBe(0o700);
-      expect(checkBodyFileLocation({ bodyFile, cwd: '/lanes/worker', home: os.homedir(), tmp: os.tmpdir(),
-        isTracked: () => false })).toEqual({ ok: true });
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
   });
 

@@ -15,13 +15,12 @@
  */
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
-import { checkBodyFileLocation } from '../lib/open-pr-body-location.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
-import { existsSync, readFileSync, realpathSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { buildGhShimSettingsEnv, defaultShimDir, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 
@@ -113,22 +112,6 @@ function bodyFilePath(path, cwd) {
   return isAbsolute(expanded) ? expanded : `${cwd}${sep}${expanded}`;
 }
 
-/** Resolve filesystem traversal before normalizing. Missing tails are allowed for
- * callers that prepare their body later; other resolution failures stay closed. */
-function physicalBodyPath(path) {
-  let directory = path;
-  const tail = [];
-  for (;;) {
-    try { return join(realpathSync.native(directory), ...tail); }
-    catch (error) {
-      const parent = dirname(directory);
-      if (error.code !== 'ENOENT' || parent === directory) throw error;
-      tail.unshift(basename(directory));
-      directory = parent;
-    }
-  }
-}
-
 /** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
 const GATE_ACTIONS = Object.freeze(['pass', 'advise', 'refuse']);
 
@@ -165,30 +148,6 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
   git: gitOpt,
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
-  bodyLocation = spawn !== spawnSync ? () => ({ ok: true }) : (opts) => checkBodyFileLocation({
-    ...opts, home: homedir(), tmp: tmpdir(), resolvePath: physicalBodyPath,
-    isTracked: (path) => {
-      // Check both the directory entry (a tracked symlink remains tracked) and
-      // the actual file read by the publisher (an untracked symlink may target it).
-      const entryPath = join(physicalBodyPath(dirname(path)), basename(path));
-      const targetPath = physicalBodyPath(path);
-      // ls-files errors on external/nonexistent paths. Prove the repository boundary
-      // first: a path outside its worktree cannot be tracked in this index.
-      const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-        cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
-      }).trim();
-      for (const trackingPath of new Set([entryPath, targetPath])) {
-        const rel = relative(root, trackingPath);
-        if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) continue;
-        const result = spawnSync('git', ['--literal-pathspecs', 'ls-files', '--error-unmatch', '--', trackingPath], {
-          cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000, maxBuffer: 1024 * 1024,
-        });
-        if (result.error || ![0, 1].includes(result.status)) throw new Error('Git tracking check unavailable');
-        if (result.status === 0) return true;
-      }
-      return false;
-    },
-  }),
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
   const git = gitOpt === undefined ? createGitReader(cwd) : gitOpt;
@@ -204,10 +163,6 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       let readable = true;
       const bodyFile = arg('body-file');
       if (bodyFile) {
-        const extraPrivateRoots = env.WE_CARD_BATCH_STATE_DIR
-          ? [resolve(cwd, env.WE_CARD_BATCH_STATE_DIR)] : [];
-        const location = bodyLocation({ bodyFile, cwd, extraPrivateRoots });
-        if (!location.ok) return { outcome: 'refused', reason: location.code, detail: location.message };
         try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
         catch (error) {
           readable = false;

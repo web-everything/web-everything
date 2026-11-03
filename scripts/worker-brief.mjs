@@ -3,7 +3,19 @@ import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
 import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
 import { VERIFY_LANE_CLI } from './operations/verify-io.mjs';
 import { shellQuoteWord } from './readiness/heavy-admission.mjs';
-import { workerScratchDir } from './lib/open-pr-body-location.mjs';
+const PURPOSE_TOKEN = /^[a-z0-9][a-z0-9-]*(?![\s\S])/;
+const OWNER_TOKEN = /^[A-Za-z0-9][A-Za-z0-9-]*(?![\s\S])/;
+
+function workerScratchDir(purpose, owner) {
+  if (typeof owner !== 'string' || !OWNER_TOKEN.test(owner)) throw new Error('--owner must be an alphanumeric token.');
+  if (typeof purpose !== 'string' || !PURPOSE_TOKEN.test(purpose)) throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
+  // Hex preserves every owner byte even on case-insensitive filesystems. Neither
+  // component permits underscores, so purpose/owner boundaries stay unambiguous.
+  const prefix = `we-scratch-${purpose}_`;
+  if (prefix.length + owner.length * 2 > 255) throw new Error('Scratch directory name exceeds 255 bytes; use a shorter --purpose or --owner.');
+  return `/tmp/${prefix}${Buffer.from(owner, 'utf8').toString('hex')}`;
+}
+
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
