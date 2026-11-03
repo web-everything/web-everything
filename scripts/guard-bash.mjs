@@ -2421,14 +2421,14 @@ function daemonWrapperUncertain(segment) {
   return false;
 }
 
-// Exact, whole-token spellings in which a `$VAR` cannot pick the push destination: a push-option value that is ONE
-// double-quoted simple variable (no word splitting, nothing glued to it), or a redirect target (a redirect word is
-// never split). Matched on the RAW text and removed; ANY other `$`/backtick left over (unquoted, partly quoted,
+// The one exact, whole-token spelling in which a `$VAR` cannot pick the push destination: a push-option value that is
+// ONE double-quoted simple variable (no word splitting, nothing glued to it). A redirect target is NOT allowed: bash
+// opens/truncates it before git runs, so `>"$X"` can write a daemon clone. Matched on the RAW text and removed; ANY other `$`/backtick left over (unquoted, partly quoted,
 // ANSI-C `$'..'`, command substitution, positional remote/refspec, --repo/--receive-pack/--exec) stays denied.
-const PUSH_SAFE_EXPANSION = /(?:^|\s)(?:--push-option=|--push-option\s+|-o\s+)"\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)"(?=\s|$)|(?:^|\s)\d*>>?\s*"?\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)"?(?=\s|$)/g;
+const PUSH_SAFE_EXPANSION = /(?:^|\s)(?:--push-option=|--push-option\s+|-o\s+)"\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)"(?=\s|$)/g;
 
 /** Does a `git push` carry a `$`/backtick expansion where it can choose the destination? Pure, structural:
- *  strip the two exact harmless spellings above, then any remaining `$`/backtick fails closed. */
+ *  strip the one exact harmless spelling above, then any remaining `$`/backtick fails closed. */
 function pushHasUnresolvedTarget(command) {
   if (!/[$`]/.test(command)) return false;
   return /[$`]/.test(String(command).replace(PUSH_SAFE_EXPANSION, ' '));
