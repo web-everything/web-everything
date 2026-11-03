@@ -3,7 +3,8 @@
   "rounds": {
     "judge": {
       "mode": "shadow",
-      "maxGrants": 20
+      "maxGrants": 20,
+      "nonConverging": true
     }
   }
 }

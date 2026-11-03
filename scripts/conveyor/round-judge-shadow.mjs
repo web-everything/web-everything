@@ -37,8 +37,8 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = {}; }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference('rounds', { env }); } catch { plat = undefined; } }
-  const resolved = resolveCascade({ standard: { judge: { mode: 'off', maxGrants: ROUND_JUDGE_MAX_GRANTS_STANDARD } }, platform: plat, tool: file?.rounds ?? file,
-    valid: { judge: (v) => (typeof v === 'number' ? Number.isInteger(v) && v >= 1 && v <= 100 : normMode(v?.mode ?? v) !== null) } });
+  const resolved = resolveCascade({ standard: { judge: { mode: 'off', maxGrants: ROUND_JUDGE_MAX_GRANTS_STANDARD, nonConverging: false } }, platform: plat, tool: file?.rounds ?? file,
+    valid: { judge: (v) => (typeof v === 'boolean' ? true : typeof v === 'number' ? Number.isInteger(v) && v >= 1 && v <= 100 : normMode(v?.mode ?? v) !== null) } });
   logCascadeSources('rounds', resolved, { env, ...(log ? { log } : {}) });
   let mode = normMode(resolved.leafValues?.['judge.mode']) ?? 'off';
   let source = resolved.sources?.['judge.mode'] ?? 'standard';
@@ -47,7 +47,8 @@ export function resolveRoundJudgeMode({ env = process.env, path = ROUND_JUDGE_SE
   if (fromEnv) { mode = fromEnv; source = 'env'; }
   const mg = resolved.leafValues?.['judge.maxGrants'];
   const maxGrants = Number.isInteger(mg) && mg >= 1 ? mg : ROUND_JUDGE_MAX_GRANTS_STANDARD;
-  return { mode, source, maxGrants, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
+  const nonConverging = resolved.leafValues?.['judge.nonConverging'] === true;
+  return { mode, source, maxGrants, nonConverging, line: `${formatCascadeSourcesLine('rounds', resolved)}${source === 'env' ? ` · env ${ROUND_JUDGE_MODE_ENV}=${mode}` : ''}` };
 }
 
 const DIR_NAME = 'round-judge-shadow';
@@ -133,7 +134,7 @@ export function observeRoundCap({ pr, repo = null, state = null, subject = {}, e
       : (Number.isFinite(subject?.additions) ? subject.additions + (subject.deletions ?? 0) : null);
     const vrepo = verifyRepo ?? makeGitRepo({ head, cwd: repoRoot });
     const result = judgeRound({ pr, repo, head, trigger: cap.trigger, comments, files, diff: { size, prevSize: lastSize(outDir, pr) },
-      setting: setting ?? readConfirmedBreaks({ env }).value, verify: (f) => verifyFinding(f, vrepo), maxGrants: cfg.maxGrants });
+      setting: setting ?? readConfirmedBreaks({ env }).value, verify: (f) => verifyFinding(f, vrepo), maxGrants: cfg.maxGrants, nonConverging: { enabled: cfg.nonConverging === true } });
 
     const line = formatJudgeLine(pr, result);
     const record = write({ ts: new Date(now).toISOString(), pr: Number(pr), repo, head, trigger: cap.trigger, key: cap.key,
