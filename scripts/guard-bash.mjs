@@ -2032,6 +2032,8 @@ function leadingAssignmentEnvs(env, segment) {
 function gitTargetDirs(segment, cwd, configEnv = {}) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   if (!toks.length || toks[0] !== 'git') return [];
+  // An unknown global option may consume a word that looks like a subcommand or hide later targets.
+  if (gitSubcommandIndex(toks) < 0) return [null];
   const home = configEnv.HOME;
   let dir = cwd || '.';
   let gitDir = null;
@@ -2172,6 +2174,7 @@ function fetchWritesLocalBranch(segment, fetchConfig) {
 function gitConfigOrRemoteWrites(segment, sub) {
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
   const args = toks.slice(gitSubcommandIndex(toks) + 1);
+  if (args.some((arg) => /[$`]/.test(arg))) return true;
   if (sub === 'remote') {
     if (!args.length || args.every((a) => a === '-v' || a === '--verbose')) return false;
     const rest = args.filter((a) => a !== '-v' && a !== '--verbose');
@@ -2261,7 +2264,10 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   // Do not read the lane's config and mistake it for proof about that other repository.
   if (envDirs.length) return null;
   const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
-  const globals = toks.slice(1, gitSubcommandIndex(toks));
+  const subIndex = gitSubcommandIndex(toks);
+  if (subIndex < 0 || toks[subIndex] !== 'fetch') return null;
+  const globals = toks.slice(1, subIndex);
+  if (globals.some((token) => /[$`]/.test(token))) return null;
   // execFileSync does no shell expansion. Normalize target values with the same tracked shell HOME as
   // gitTargetDirs, preserving option order and leaving config payloads untouched.
   const home = configEnv.HOME;
@@ -2289,11 +2295,34 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   // Inline assignments with more than one possible reading leave the repository unknown.
   const readings = leadingAssignmentEnvs(configEnv, segment);
   if (readings.length !== 1) return null;
-  const env = { ...process.env, ...readings[0], GIT_OPTIONAL_LOCKS: '0' };
+  const effective = { ...process.env, ...readings[0] };
+  // Allow only inputs Git needs to reproduce config selection. Never inherit executable/loader search
+  // paths, tracing hooks, or arbitrary command assignments into this privileged read-only subprocess.
+  const env = { GIT_OPTIONAL_LOCKS: '0' };
+  for (const key of Object.keys(effective)) {
+    if (/^(?:HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM|GIT_CONFIG_(?:GLOBAL|SYSTEM|NOSYSTEM|COUNT|PARAMETERS|KEY_\d+|VALUE_\d+))$/.test(key)) {
+      env[key] = effective[key];
+    }
+  }
+  // Resolve --config-env to literal -c arguments: even PATH/LD_PRELOAD can be a config value without
+  // becoming an executable environment variable in the child. Unknown expansion is not evidence.
+  for (let i = 0; i < globals.length; i++) {
+    const token = globals[i];
+    if (token === '--config-env' || token.startsWith('--config-env=')) {
+      const separate = token === '--config-env';
+      const pair = separate ? globals[i + 1] : token.slice('--config-env='.length);
+      const equal = pair?.indexOf('=') ?? -1;
+      if (equal < 1) return null;
+      const value = effective[pair.slice(equal + 1)];
+      if (typeof value !== 'string' || /[$`]/.test(value)) return null;
+      globals.splice(i, separate ? 2 : 1, '-c', `${pair.slice(0, equal)}=${value}`);
+      i += 1;
+    } else if (GIT_VALUE_FLAGS.has(token)) i += 1;
+  }
   // An undefined tracked value is an unset tombstone: do not resurrect the inherited process value.
   for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
-  // Git reads global fetch config under HOME; an unresolved value cannot be read faithfully.
-  if (/[$`]/.test(env.HOME ?? '')) return null;
+  // Unresolved config paths/values cannot be read faithfully; missing files may otherwise look empty.
+  if (Object.values(env).some((value) => /[$`]/.test(value))) return null;
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE']) {
     if (env[key] === undefined) continue;
     if (/[$`]/.test(env[key])) return null;
@@ -2306,7 +2335,8 @@ export function readDaemonFetchConfig(segment, cwd, envDirs = [], configEnv = {}
   // let a safe decoy hide the repository's actual branch-writing fetch config.
   delete env.GIT_CONFIG;
   try {
-    const output = run('git', [...globals, '--no-pager', 'config', '--null', '--get-regexp', '^remote\\..*\\.fetch$'], {
+    // System Git is the trust anchor on the supported Unix hosts; no PATH fallback on absence/failure.
+    const output = run('/usr/bin/git', [...globals, '--no-pager', 'config', '--null', '--get-regexp', '^remote\\..*\\.fetch$'], {
       cwd: cwd || '.', env, encoding: 'utf8', timeout: 2000, maxBuffer: 128 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
     });
@@ -2346,7 +2376,7 @@ function daemonCloneWriteMessage(dir) {
  * the CLI wrapper exactly like `primaryCwd`/`foreignLiveLease` above — this function does no fs I/O itself.
  *
  * TWO SHAPES, both real 2026-09-26 incidents:
- *   1. a git STATE-MUTATING subcommand (`GIT_STATE_SUBCOMMANDS`, plus config/remote write forms) whose EFFECTIVE directory —
+ *   1. a Git command without an affirmative read classification whose EFFECTIVE directory —
  *      its own `-C <path>` if it has one, else `cwd` — resolves inside a daemon clone: `git reset`/
  *      `checkout`/`commit`/… run either with cwd already inside the clone, or from anywhere via
  *      `git -C <clone-path> reset --hard`.
@@ -2357,15 +2387,13 @@ function daemonCloneWriteMessage(dir) {
  * A diagnostic `git fetch` stays allowed when its explicit AND effective configured refspecs write no local
  * branches. The CLI injects a bounded, read-only config reader; pure callers can inject `fetchConfig` directly
  * (default: an empty configuration). Missing, unreadable or incomplete CLI config evidence denies the fetch.
- * Every OTHER `GIT_STATE_SUBCOMMANDS` entry
- * (including `pull`, which fetches AND merges into the working tree) is denied. The effective target is every
+ * Every other command without read proof (including unknown commands and aliases) is denied.
+ * The effective target is every
  * directory `gitTargetDirs` finds (ALL `-C` in order, `--git-dir`, `--work-tree`); `fetch` into a daemon clone is
  * denied when `fetchWritesLocalBranch` (an explicit/configured local-branch destination, `--update-head-ok`,
  * unavailable stdin refspecs or unavailable config evidence). Config/remote mutations are denied while their
- * known read forms remain allowed. A pure READ op (`log`/
- * `status`/`diff`/`show`/`rev-parse`/…) is never in scope at all: `gitSubcommand` still returns it, but this
- * function denies only the listed mutations and config/remote write forms, so `git -C <clone> log` and `cat`
- * never match either arm below and pass through unmentioned.
+ * known read forms remain allowed. `daemonGitKnownRead` classifies supported read commands and options;
+ * unknown global options or wrapper directory effects cannot supply read proof or a safe target.
  *
  * A non-git write resolves EVERY operand it can find (the redirect/tee/sed-i/perl-pi targets `fileWriteTargets`
  * already extracts, or an FS-mutating program's plain file operands) against `cwd` and denies if ANY lands in
@@ -2376,10 +2404,11 @@ function daemonCloneWriteMessage(dir) {
 export function daemonCloneWriteReason(segment, { cwd = null, roots = [], envDirs = [], configEnv = {}, fetchConfig = [], daemonFetchConfigReader = null, unknownTarget = false } = {}) {
   if (!roots.length) return null;
   const s = String(segment || '');
+  if (daemonGitWrapperUncertain(s)) return daemonCloneWriteMessage('unresolved Git wrapper directory or environment');
   const sub = gitSubcommand(s);
-  if (sub) {
+  if (programWord(s) === 'git') {
     const configWrite = (sub === 'config' || sub === 'remote') && gitConfigOrRemoteWrites(s, sub);
-    if (!GIT_STATE_SUBCOMMANDS.has(sub) && !configWrite) return null;
+    if (daemonGitKnownRead(s, sub)) return null;
     // Named environment follows shell scope/order; envDirs remains a conservative explicit caller input.
     const targets = gitTargetDirs(s, cwd, configEnv).concat(envDirs.map((p) => absoluteGitTarget(cwd, p, configEnv.HOME)));
     if (unknownTarget) targets.push(null); // too many possible environment values to check one by one
@@ -4892,6 +4921,79 @@ const FS_MUTATING_PROGRAMS = new Set([
 /** git's own global flags that SWALLOW the next token, so the subcommand walk below does not mistake their
  *  VALUE for the subcommand (`git -C /some/path add -A` → `add`, never `/some/path`). */
 const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env']);
+const GIT_GLOBAL_FLAGS = new Set(['--no-pager', '--paginate', '-P', '-p', '--bare', '--no-replace-objects',
+  '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '--no-optional-locks',
+  '--no-lazy-fetch', '--no-advice', '--version', '-v', '--help', '-h']);
+
+// This inventory is deliberately independent of GIT_STATE_SUBCOMMANDS: new commands and aliases have
+// no read proof, even when the generic collateral-warning mutator list has never heard of them.
+const DAEMON_GIT_READ_COMMANDS = new Set(['status', 'log', 'diff', 'show', 'rev-parse', 'rev-list',
+  'ls-files', 'ls-tree', 'ls-remote', 'cat-file', 'show-ref', 'merge-base', 'name-rev', 'describe',
+  'for-each-ref', 'check-ref-format', 'check-ignore', 'check-attr', 'count-objects', 'version']);
+
+function daemonGitKnownRead(segment, sub) {
+  const toks = shellTokens(canonicalCommand(segment)).filter((t) => !t.op).map((t) => t.text);
+  const index = gitSubcommandIndex(toks);
+  if (index < 0) return false;
+  const args = toks.slice(index + 1);
+  if (args.some((arg) => /[$`]/.test(arg))) return false;
+  if (sub === 'config' || sub === 'remote') return !gitConfigOrRemoteWrites(segment, sub);
+  if (sub === 'symbolic-ref') {
+    const refs = args.filter((a) => !['-q', '--quiet', '--short', '--no-recurse', '--recurse', '--'].includes(a));
+    return refs.length === 1 && !refs[0].startsWith('-') && !/[$`]/.test(refs[0]);
+  }
+  if (sub === 'reflog') {
+    if (args.length && args[0] !== 'show' && !(args[0] === 'exists' && args.length === 2)) return false;
+  } else if (!DAEMON_GIT_READ_COMMANDS.has(sub)) return false;
+  // Options need affirmative read proof too: --output has abbreviated spellings, and future options
+  // need review before admission. Values and revisions remain inert; expansions may add options.
+  const flags = new Set(['--', '--short', '--porcelain', '--branch', '--show-toplevel', '--show-prefix',
+    '--git-dir', '--absolute-git-dir', '--is-inside-work-tree', '--is-bare-repository', '--verify',
+    '--quiet', '--all', '--tags', '--branches', '--remotes', '--heads', '--abbrev-ref', '--symbolic-full-name',
+    '--oneline', '--stat', '--numstat', '--shortstat', '--name-only', '--name-status', '--raw', '--patch',
+    '--no-patch', '--no-ext-diff', '--no-textconv', '--no-color', '--cached', '--staged', '--check',
+    '--no-index', '--exit-code', '--count', '--left-right', '--graph', '--decorate', '--no-decorate',
+    '--reverse', '--first-parent', '--no-merges', '--ancestry-path', '--topo-order', '--date-order',
+    '-s', '-b', '-z', '-p', '-q', '-v', '-r', '-t', '-u']);
+  const values = new Set(['--format', '--pretty', '--date', '--max-count', '--since', '--until', '-n']);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (/[$`]/.test(arg)) return false;
+    if (!arg.startsWith('-') || flags.has(arg) || /^-\d+$/.test(arg)) continue;
+    const flag = arg.split('=')[0];
+    if (values.has(flag)) {
+      if (!arg.includes('=') && (args[++i] === undefined || /[$`]/.test(args[i]))) return false;
+      continue;
+    }
+    if (/^--(?:porcelain|color|decorate|abbrev)=/.test(arg) || /^-n\d+$/.test(arg)) continue;
+    return false;
+  }
+  return true;
+}
+
+/** Wrapper options outside the canonical parser's supported grammar cannot prove a Git target safe.
+ *  Refuse them here rather than letting an option value become the apparent program word. */
+function daemonGitWrapperUncertain(segment) {
+  const words = shellTokens(String(segment).trim().replace(/^[({]\s*/, '')).filter((t) => !t.op).map((t) => t.text);
+  const wrappers = new Set(['env', 'time', 'command', 'builtin', 'nice', 'sudo', 'xargs', 'npx', 'bunx']);
+  const mayRunGit = (rest) => rest.some((word) => /(?:^|[\s/])git(?:\s|$)|[$`]/.test(word));
+  for (let i = 0; i < words.length;) {
+    if (/^[A-Za-z_]\w*=/.test(words[i])) { i++; continue; }
+    const wrapper = words[i++];
+    if (!wrappers.has(wrapper)) {
+      return wrappers.has(wrapper.replace(/^.*\//, '')) && mayRunGit(words.slice(i));
+    }
+    while (i < words.length && words[i].startsWith('-')) {
+      const flag = words[i++];
+      if (wrapper === 'sudo' && ['-u', '-g', '-U'].includes(flag)) { i++; continue; }
+      if (['npx', 'bunx'].includes(wrapper) && ['-p', '--package', '-c'].includes(flag)) { i++; continue; }
+      if ((wrapper === 'sudo' && flag === '-n') || (wrapper === 'xargs' && /^-[nI].+/.test(flag))
+        || (['npx', 'bunx'].includes(wrapper) && flag === '-y')) continue;
+      return mayRunGit(words.slice(i));
+    }
+  }
+  return false;
+}
 
 /** The git SUBCOMMAND of `segment`, or '' when it is not git. Pure. Reads the wrapper-peeled, basename-
  *  resolved `canonicalCommand` view, so `/usr/bin/git`, `env git` and `"git"` all resolve — the same
@@ -4904,8 +5006,15 @@ function gitSubcommand(segment) {
 
 function gitSubcommandIndex(toks) {
   for (let i = 1; i < toks.length; i++) {
-    if (GIT_VALUE_FLAGS.has(toks[i])) { i += 1; continue; }
-    if (toks[i].startsWith('-')) continue;
+    const token = toks[i];
+    if (GIT_VALUE_FLAGS.has(token)) {
+      if (i + 1 >= toks.length) return -1;
+      i += 1;
+      continue;
+    }
+    if (GIT_GLOBAL_FLAGS.has(token) || /^-(?:c|C).+/.test(token)
+      || /^--(?:git-dir|work-tree|namespace|exec-path|config-env)=/.test(token)) continue;
+    if (token.startsWith('-') || /[$`]/.test(token)) return -1;
     return i;
   }
   return toks.length;
@@ -5286,6 +5395,20 @@ export function decide(command, ctx = {}) {
       }
       const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
       const canonicalWords = shellTokens(canonicalCommand(seg)).filter((t) => !t.op).map((t) => t.text);
+      // Compound syntax may put a declaration behind `then`, `do`, or a function header. It can run in
+      // this shell, so retain its possible assignments even when the normal directive parser cannot
+      // classify the statement. Explicit child-shell strings stay in checkNested's copied scope.
+      if (/^\s*(?:(?:then|else|elif|do|if|while|until|for|select|function)\b|[A-Za-z_]\w*\s*\(\s*\))/.test(seg)) {
+        const declaration = words.findIndex((word) => ['export', 'readonly', 'declare', 'typeset', 'local'].includes(word));
+        if (declaration >= 0) {
+          // Unmodelled declaration attributes (notably namerefs) can affect a different variable.
+          if (words.slice(declaration + 1).some((word) => /^[-+]/.test(word) && !/^-[rx]+$/.test(word))) uncertainAttributes.add(null);
+          for (const word of words.slice(declaration + 1)) {
+            const assignment = /^([A-Za-z_]\w*)=(.*)$/s.exec(word);
+            if (assignment) assignValue(assignment[1], assignment[2], [gitConfigEnv.HOME], false, true, null);
+          }
+        }
+      }
       // A failed redirection skips the builtin, and an unknown option makes it refuse: either way its
       // assignment or unset may not run, so it only adds a possible value.
       const redirected = shellTokens(seg).some((t) => t.op && /[<>]/.test(t.text));

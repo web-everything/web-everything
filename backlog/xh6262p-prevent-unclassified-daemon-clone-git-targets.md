@@ -9,7 +9,7 @@ tags: [prevention, security]
 
 # Prevent unclassified daemon-clone Git targets and mutations
 
-Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. This files the prevention obligations. A1–A3 remain open and do not change guard behavior. A4 is delivered on the same PR: the HOME finding at `we:scripts/guard-bash.mjs:1975` was first ruled `not-real`, then ruled `block` by policy on head `89f25a08be610a54e92e6f6bfa751e8d7102d5c2`, and the fix follows the later `block` ruling.
+Track the guard prevention work requested by the advisory on web-everything/web-everything#6262 at head `e70d38e16b31b1984632d24f3ae4617998467477`. A1–A3 now have implementation and named tests on the PR, pending the launcher's final verification. A4 is delivered on the same PR: the HOME finding at `we:scripts/guard-bash.mjs:1975` was first ruled `not-real`, then ruled `block` by policy on head `89f25a08be610a54e92e6f6bfa751e8d7102d5c2`, and the fix follows the later `block` ruling.
 
 ## Design
 
@@ -37,8 +37,11 @@ Prevention receipt for the advisory posted **2026-11-03T04:01:53Z**, `codex-corr
 ## Acceptance
 
 - [A1] Executable — a deterministic Git-command inventory test fails for an unclassified command, including a synthetic newly introduced command. Cover update-index, bisect, sparse-checkout, maintenance, replace, symbolic-ref writes, submodule update, reflog expire and filter-branch. Read controls remain allowed.
+  - Named test: `A1 daemon Git inventory denies unclassified commands and preserves known reads` in `we:scripts/__tests__/guard-bash.test.mjs`. Protected targets use a read allowlist independent of the generic mutation inventory; unknown global options also fail closed. Argument-sensitive symbolic-ref and reflog reads remain allowed.
 - [A2] Executable — a parameterized wrapper table covers every wrapper peeled by canonicalCommand, including env -C / --chdir and sudo -D, proving its directory effect is carried or refused. Unknown path-taking options cannot establish a safe target.
+  - Named test: `A2 daemon wrapper matrix carries or refuses directory effects: %s` in `we:scripts/__tests__/guard-bash.test.mjs`. Covers assignments, env, time, command, builtin, nice, sudo, xargs, npx and bunx. Unmodelled directory/environment options are refused; supported wrapper read controls pass.
 - [A3] Executable — named decision and hook tests cover an export inside a function body and a loop/if branch preceding a Git mutation, plus read controls and child-scope isolation.
+  - Named tests: `A3 compound Git exports preserve possible targets and child scope isolation` and `A3 compound Git exports reach the hook without leaking child scope` in `we:scripts/__tests__/guard-bash.test.mjs`. Function/loop/conditional declarations retain possible targets; explicit child shells use copied state.
 - [A4] Executable — a named parameterized regression, `DENIES tilde targets after an earlier HOME assignment`, covers -C, --git-dir and --work-tree where the supported semantics require denial. Include separated/equals spellings, earlier assignments/exports, quoted literal tilde, unset/unknown HOME, assignments after the command and read controls. Record the operator-ruling reconciliation before changing behavior.
   - Status: delivered on PR #6262. Decision and hook tests named `DENIES tilde targets after an earlier HOME assignment` pin the matrix. Command words use the tracked shell HOME; assignment values expand when they run (bare prefixes left to right, env operands and declaration arguments with the statement's starting HOME, the left-to-right reading also kept); possibly skipped HOME values stay checked; unknown HOME fails closed. HOME writers the tracker does not model (`HOME+=`, `read`, `printf -v`, a prefix on a special or declaration builtin) leave HOME unknown, and past the alternate cap HOME is unknown. The fetch-config reader uses the same tracked HOME, `git config --global` is checked against the git process HOME / XDG_CONFIG_HOME, and a leading `cd ~` the cd resolver cannot follow leaves the target unknown.
 

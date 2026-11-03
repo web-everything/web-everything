@@ -10,11 +10,12 @@ tags: []
 
 # guard-bash: replace shell-state tracking with an allowlist that fails closed on unresolved git targets
 
-Residuals from PR 6262 (R451), same family as 7625. Replace we:scripts/guard-bash.mjs shell-state tracking (assignments, declare, conditionals, eval, wrappers, tilde) with an allowlist: any git invocation whose target dir or refspec cannot be resolved statically, while a daemon clone is registered, is denied unless provably a lane clone. Also cover persisted remote.*.fetch config and git config / git remote mutation (class G). 6262 ships only interim fail-closed handling for tilde/HOME, declare/local, SPEC refspec expansion and bundled short flags.
+Residuals from PR 6262 (R451), same family as 7625. Replace we:scripts/guard-bash.mjs shell-state tracking with a unified allowlist for statically resolved targets. PR 6262 already handles persisted fetch configuration and config/remote mutation, and admits protected-target Git commands only with known read classification or a verified diagnostic fetch. Unknown global options and unsupported wrapper directory effects fail closed. The remaining redesign concerns shell-state tracking and filesystem path identity; delivered checks are not residual bypass claims.
 
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A2] **Executable** — add a hook regression for a Git target reached through a filesystem alias of a registered root (including a noncanonical temporary-directory prefix). The registry canonicalizes roots, while the command target parser currently resolves paths lexically; unify those representations without losing relative-directory or missing-path fail-closed behavior. An isolated hook probe during the PR 6262 repair observed this pre-existing path-identity limitation; the command-classification repair does not claim to resolve filesystem aliases.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
