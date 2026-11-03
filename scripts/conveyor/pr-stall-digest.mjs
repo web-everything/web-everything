@@ -92,8 +92,12 @@ export function feedItem(i) {
   return { pr: i.pr, repo: i.repo, head: String(i.head ?? '').toLowerCase(), kind: STALLED_KIND, state: i.state,
     reason: `${relations ? `${relations}; ` : ''}${i.state}: ${String(i.reason ?? '').replace(/\s+/g, ' ')}`, title: i.title ?? '', command,
     ...(command !== i.command && typeof i.command === 'string' ? { template: i.command.slice(0, 400) } : {}),
-    labels: labelNames(i), blockedBy: i.blockedBy ?? [], unblocks: i.unblocks ?? [],
-    owner: i.owner, nextAction: i.nextAction, deadline: i.deadline,
+    ...(i.labels !== undefined ? { labels: labelNames(i) } : {}),
+    ...(i.blockedBy !== undefined ? { blockedBy: i.blockedBy } : {}),
+    ...(i.unblocks !== undefined ? { unblocks: i.unblocks } : {}),
+    ...(i.owner !== undefined ? { owner: i.owner } : {}),
+    ...(i.nextAction !== undefined ? { nextAction: i.nextAction } : {}),
+    ...(i.deadline !== undefined ? { deadline: i.deadline } : {}),
     evidence: ev.length ? ev : [`waiting state ${i.state}; next: ${i.action ?? 'a person decides'}`] };
 }
 const feedKey = (f) => `${f.repo}#${f.pr}@${f.head}:${STALLED_KIND}`;

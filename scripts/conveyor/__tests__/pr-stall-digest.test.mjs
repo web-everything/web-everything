@@ -511,3 +511,65 @@ it('R437 owner-signal read failure preserves a published invariant feed item whi
   expect(passes[3].incomplete).toBe(false);
   expect(unacknowledged({ path: ctx.feedPath })).toEqual([]);
 });
+
+it('R437 legacy feed items keep their exact shape without invariant metadata', () => {
+  const item = { lane: 'operator', repo: REPO, pr: 1, head: H, state: 'legacy', reason: 'readable reason',
+    title: 'legacy title', command: 'inspect locally', evidence: ['proof'] };
+  expect(feedItem(item)).toStrictEqual({ pr: 1, repo: REPO, head: H, kind: 'stalled', state: 'legacy',
+    reason: 'legacy: readable reason', title: 'legacy title', command: 'inspect locally', evidence: ['proof'] });
+});
+
+// Exercise the completeness contract through the production sweep and real feed publisher.
+async function ownerFailureWithObsoleteDetectorItem(producer) {
+  const { runPrSweep } = await import('../pr-sweep.mjs');
+  const ctx = setup(), { notify } = sent();
+  const seeded = run(ctx, [op(5759, 'stalled-same-head', { action: 'stalled-detector' })], { notify });
+  expect(seeded.errors).toEqual([]);
+  const before = unacknowledged({ path: ctx.feedPath });
+  expect(before).toHaveLength(1);
+  expect(before[0]).toMatchObject({ pr: 5759, kind: 'stalled', state: 'stalled-same-head' });
+  const readPrs = vi.fn(() => [{ number: 5759, title: 'detector resolved', headRefOid: H, labels: ['review:accepted'],
+    changedFiles: 1, updatedAt: new Date(NOW).toISOString() }]);
+  const detector = vi.fn(async () => ({ enabled: true, items: [], errors: [], nextSeen: {} }));
+  const published = [];
+  const report = await runPrSweep({ now: NOW + 60000, env: {}, config: {},
+    settings: { value: { repos: [REPO], idleMinutes: 45, stuckAfterMinutes: 90, stuckAlertMinutes: 90 }, sources: {} },
+    readPrs, detector, readQueue: () => ({ ready: [], rulingNeeded: [] }), readPrevious: () => ({}),
+    readSignals: () => { throw new Error('injected owner read failure'); },
+    notify, flush: () => {}, persist: () => {}, append: () => {},
+    stallSweep: async () => ({ ...producer, dir: ctx.stateDir, items: [], incomplete: false }),
+    stallDigest: (pass, options) => {
+      published.push({ pass, options });
+      return publishStalledDigest(pass, { ...options, feedPath: ctx.feedPath });
+    } });
+  expect(report.errors).toEqual(['owner signals: injected owner read failure']);
+  expect(readPrs).toHaveBeenCalledTimes(1);
+  expect(detector).toHaveBeenCalledTimes(1);
+  expect(report.stallDetector).toMatchObject({ enabled: true, stalled: 0 });
+  expect(published).toHaveLength(1);
+  expect(published[0].options.enabled).toBe(true); // Detector stays enabled; this is not disable-time clearing.
+  expect(published[0].pass).toMatchObject({ ...producer, items: [] });
+  return { pass: published[0].pass, before, after: unacknowledged({ path: ctx.feedPath }),
+    cleared: replay({ path: ctx.feedPath }).filter(event => event.kind === 'cleared') };
+}
+
+it('R437 mode=off preserves detector completeness and clears stale detector items despite owner-read failure', async () => {
+  const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'off', digest: true });
+  expect(result.pass.incomplete).toBe(false);
+  expect(result.after).toEqual([]);
+  expect(result.cleared).toMatchObject([{ pr: 5759, kind: 'cleared', was: 'stalled' }]);
+  expect(result.cleared).toHaveLength(1);
+});
+it('R437 digest=false preserves detector completeness and clears stale detector items despite owner-read failure', async () => {
+  const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'shadow', digest: false });
+  expect(result.pass.incomplete).toBe(false);
+  expect(result.after).toEqual([]);
+  expect(result.cleared).toMatchObject([{ pr: 5759, kind: 'cleared', was: 'stalled' }]);
+  expect(result.cleared).toHaveLength(1);
+});
+it('R437 enabled invariant producer marks owner-read failure incomplete and preserves the existing feed item', async () => {
+  const result = await ownerFailureWithObsoleteDetectorItem({ mode: 'shadow', digest: true });
+  expect(result.pass.incomplete).toBe(true);
+  expect(result.after).toEqual(result.before);
+  expect(result.cleared).toEqual([]);
+});

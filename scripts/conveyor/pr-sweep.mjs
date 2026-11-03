@@ -187,6 +187,11 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const annotate = item => {
     const decision = decisions.find(p => p.repo === item.repo && p.number === item.pr);
     if (!decision) return item;
+    // Legacy rows only need labels for configured repeat identities; unrelated
+    // invariant metadata belongs to the new invariant rows, not every consumer.
+    if (!decision.blockedBy.length && !decision.unblocks.length && decision.violation !== 'empty-diff') {
+      return value.alertBackoffMinutes ? { ...item, labels: decision.labels } : item;
+    }
     return { ...item, labels: decision.labels, blockedBy: decision.blockedBy, unblocks: decision.unblocks,
       owner: decision.owner, nextAction: decision.nextAction, deadline: decision.deadline,
       ...(['empty-diff', 'waiting-on-blocked'].includes(decision.violation) ? { lane: 'operator', state: decision.violation, reason: decision.nextAction, action: decision.nextAction } : {}) };
@@ -262,8 +267,9 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
       // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
       const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
-      const invariantItems = ownerReadsOk && prsReadOk ? decisions.filter(p => p.violation || p.unblocks.length).map(p => annotate({
+      const invariantItems = sweepDigestEnabled && ownerReadsOk && prsReadOk ? decisions.filter(p => p.violation || p.unblocks.length).map(p => annotate({
         repo: p.repo, pr: p.number, head: p.headRefOid, title: p.title, lane: 'operator', state: p.violation ?? 'unblocks',
+        labels: p.labels, blockedBy: p.blockedBy, unblocks: p.unblocks, owner: p.owner, nextAction: p.nextAction, deadline: p.deadline,
         action: p.nextAction, reason: `${p.nextAction}; owner=${p.owner}; deadline=${p.deadline}`,
         command: `gh pr view ${p.number} --repo ${p.repo} --comments`,
         evidence: [`owner=${p.owner}`, `next=${p.nextAction}`, `deadline=${p.deadline}`] })) : [];
@@ -272,7 +278,7 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
       // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
       if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
         const d = stallDigest({ ...out, items: sortUnblockersFirst([...published, ...detector.items.map(annotate).filter(d => !published.some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))]),
-          incomplete: out.incomplete || !prsReadOk || !ownerReadsOk || detectorErrors.length > 0 },
+          incomplete: out.incomplete || !prsReadOk || (sweepDigestEnabled && !ownerReadsOk) || detectorErrors.length > 0 },
         { now, env, stateDir: out.dir, notify, alertBackoffMinutes: value.alertBackoffMinutes,
           enabled: sweepDigestEnabled || invariantItems.length > 0 || detector.items.length > 0 || detector.enabled });
         report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };

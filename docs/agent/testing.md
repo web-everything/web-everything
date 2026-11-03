@@ -3837,7 +3837,7 @@ unchanged while removing the target, then proves the dependent regains a stall e
 per-action map. The settings-to-evaluator contract cases in `pr-sweep.test.mjs` exercise
 both shapes from tool and environment settings, including effective deadlines and provenance.
 
-The invariant producer's owner-signal failures must mark the shared stall digest incomplete.
+When the invariant digest producer is enabled, its owner-signal failures must mark the shared digest incomplete.
 `pr-stall-digest.test.mjs` exercises the real sweep and feed publisher across an owner-read
 failure, recovery, and a later confirmed PR removal: incomplete evidence preserves the open
 invariant item, while a complete listing may clear it.
@@ -3848,3 +3848,17 @@ for unterminated spans. The indented/quoted-example sweep regressions prove thes
 cannot suppress a stall episode. Empty diffs take precedence over dependency waits in the
 action, deadline, violation, legacy report, and digest while preserving dependency metadata.
 The four-case soak keeps a live blocker on its empty-diff fixture to pin that precedence.
+
+Legacy sweep/detector rows retain their original shape unless dependencies, empty-diff
+precedence, or configured alert backoff require enrichment. New invariant rows carry their
+own metadata; the feed serializer omits extensions absent from a legacy item. An explicit
+sweep-off or digest-false pass preserves detector-only behavior: agent listing failures do
+not make the independent detector incomplete, while enabled invariant producers still
+preserve published items when ownership cannot be read.
+
+The named `mode=off`, `digest=false`, and `enabled invariant producer` cases in
+`pr-stall-digest.test.mjs` seed a real detector feed item before an owner-read failure.
+With independent PR/detector reads succeeding, the disabled producers allow complete
+passes to clear the stale item; the enabled producer preserves it as incomplete evidence.
+The tests also require the detector digest to remain enabled, excluding disable-time
+clearing as a false-positive proof of detector completeness.
