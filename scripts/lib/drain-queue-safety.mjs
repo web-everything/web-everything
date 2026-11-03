@@ -131,32 +131,56 @@ export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, enqueu
 // Skip diagnostics are process-local: refusing a refresh must never spend a shared claim.
 const mqSameHeadRefreshSkips = new Set();
 
+// Compare every supplied identity field, including presence. An absent origin is
+// not proof that same-name rows are retries. Conservatively retain unfamiliar shapes.
+function mqRefreshCheckIdentity(check) {
+  const text = value => typeof value === 'string' && value.trim() ? value : null;
+  const canonical = value => {
+    if (typeof value === 'string') return text(value);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.keys(value).sort().map(key => [key, value[key]]);
+    return entries.length ? JSON.stringify(entries) : null;
+  };
+  const name = text(check.name), context = text(check.context);
+  const workflowName = text(check.workflowName), workflow = canonical(check.workflow);
+  const app = canonical(check.app);
+  // A run URL cannot establish workflow identity. Only an explicit workflow URL can.
+  const detailsWorkflow = text(check.detailsUrl)?.match(/^(https:\/\/[^?#]+\/actions\/workflows\/[^/?#]+)(?:[/?#]|$)/)?.[1] ?? null;
+  if (!(name || context) || !(workflowName || workflow || (app && detailsWorkflow))) return null;
+  // Keep unknown/non-workflow URLs as additional evidence: never merge differing origins.
+  return JSON.stringify([name, context, workflowName, workflow, app, detailsWorkflow, text(check.detailsUrl)]);
+}
+
+function mqRefreshCheckLater(success, failure) {
+  // Completion order alone cannot identify retries: overlapping older attempts
+  // can finish last. Require valid start ordering before discarding a failure.
+  const laterStart = Date.parse(success.startedAt), earlierStart = Date.parse(failure.startedAt);
+  if (!Number.isFinite(laterStart) || !Number.isFinite(earlierStart) || laterStart <= earlierStart) return false;
+  for (const field of ['startedAt', 'completedAt']) {
+    if (success[field] == null && failure[field] == null) continue;
+    const later = Date.parse(success[field]), earlier = Date.parse(failure[field]);
+    // Missing, tied or contradictory ordering cannot prove supersession.
+    if (!Number.isFinite(later) || !Number.isFinite(earlier) || later <= earlier) return false;
+  }
+  return true;
+}
+
 function mqRefreshChecksGreen(checks) {
   if (!Array.isArray(checks) || !checks.length) return false;
-  const byIdentity = new Map();
-  for (const check of checks) {
-    if (!check || typeof check !== 'object') return false;
-    const name = check.name || check.context;
-    // Display names collide across workflows. Unknown origins are independent
-    // evidence and must never be discarded as retries of a named check.
-    const workflow = check.workflowName;
-    const identity = typeof workflow === 'string' && workflow.trim()
-      && typeof name === 'string' && name.trim()
-      ? JSON.stringify([workflow, name]) : Symbol();
-    // Completion order is not attempt order: an older run can finish last.
-    // Without a start time, keep the row as unordered evidence rather than
-    // letting its completion timestamp supersede another attempt.
-    const time = Date.parse(check.startedAt);
-    const group = byIdentity.get(identity) ?? { latest: -Infinity, rows: [], unordered: [] };
-    if (!Number.isFinite(time)) group.unordered.push(check);
-    else if (time > group.latest) { group.latest = time; group.rows = [check]; }
-    else if (time === group.latest) group.rows.push(check);
-    byIdentity.set(identity, group);
-  }
-  // Missing-start or tied rows cannot supersede one another: the worse result wins.
-  return [...byIdentity.values()].every(group => [...group.rows, ...group.unordered].every(check =>
-    (check.status == null || check.status === 'COMPLETED') && check.state !== 'PENDING'
-      && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.conclusion ?? check.state)));
+  // Never discard live work, even when a completed success appears later.
+  if (checks.some(check => !check || typeof check !== 'object'
+    || (check.status != null && check.status !== 'COMPLETED')
+    || ['IN_PROGRESS', 'QUEUED', 'PENDING', 'WAITING'].includes(check.state))) return false;
+  const failures = new Set(['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+  return checks.every(check => {
+    const conclusion = check.conclusion ?? check.state;
+    if (['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(conclusion)) return true;
+    if (check.status !== 'COMPLETED' || !failures.has(conclusion)) return false;
+    const identity = mqRefreshCheckIdentity(check);
+    return identity !== null && checks.some(success => success.status === 'COMPLETED'
+      && (success.conclusion ?? success.state) === 'SUCCESS'
+      && mqRefreshCheckIdentity(success) === identity && mqRefreshCheckLater(success, check));
+  });
 }
 
 function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
@@ -164,8 +188,9 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow }) {
   const safe = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
   const prefix = `mq-same-head-refresh: #${safe(pr)} head ${safe(head)} — `;
   const skip = reason => {
-    if (mqSameHeadRefreshSkips.has(key)) return;
-    mqSameHeadRefreshSkips.add(key);
+    const skipKey = JSON.stringify([repo, pr, head, reason]);
+    if (mqSameHeadRefreshSkips.has(skipKey)) return;
+    mqSameHeadRefreshSkips.add(skipKey);
     log(`${prefix}skipped (${safe(reason)})`);
   };
   const unavailable = () => skip('state unavailable; inspect shared refresh ledger and lock before retrying');
