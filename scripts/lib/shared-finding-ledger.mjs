@@ -29,7 +29,7 @@ function sameSpot(a, b) {
   return Number.isInteger(a.line) && Number.isInteger(b.line) && Math.abs(a.line - b.line) === 0;
 }
 
-const rawClaim = (f) => String(f?.summary ?? '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+const rawClaim = (f) => String(f?.summary ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim();
 
 function matches(entry, finding, { strict = false } = {}) {
   if (exactMatch(entry, finding)) return !strict || (rawClaim(entry.finding) === rawClaim(finding) && sameSpot(entry.finding, finding));

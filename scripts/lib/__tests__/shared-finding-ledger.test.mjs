@@ -343,3 +343,12 @@ describe('audit round 6 hardening', () => {
     expect(filterReraises(l, [finding({ line: 14 })], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
+
+describe('audit round 7 hardening', () => {
+  it('case-differing identifiers are not suppressed', () => {
+    const a = finding({ summary: 'ALLOW_ADMIN flag bypasses authorization' });
+    const b = finding({ summary: 'allow_admin flag bypasses authorization' });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [b], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+});
