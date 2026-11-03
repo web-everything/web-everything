@@ -455,8 +455,8 @@ describe('R502 item 3: stale claim (holder silent, head unmoved, claim old) — 
   it('old claim + silent holder + unmoved head → one stale-claim finding with the thresholds in it', () => {
     expect(plan([row(40)], [claim()])).toEqual([expect.objectContaining({ type: 'stale-claim', repo: 'we', pr: 6300, claimAgeMinutes: 120, holderIdleMinutes: 40, holderClass: CLASSES.ACTIVE, thresholdMinutes: 90, idleThresholdMinutes: 20 })]);
   });
-  it('a holder that is not listed at all counts as silent', () => {
-    expect(plan([], [claim()])).toEqual([expect.objectContaining({ holderClass: 'not-listed', holderIdleMinutes: null })]);
+  it('a holder missing from the rows might be an interactive session: it never alerts (fail closed)', () => {
+    expect(plan([], [claim()])).toEqual([]);
   });
   it('fails closed: young claim, active holder, moved head, unknown head or unknown idle never alert', () => {
     expect(plan([row(40)], [claim({ claimedAt: new Date(NOW - 30 * MIN).toISOString() })])).toEqual([]);

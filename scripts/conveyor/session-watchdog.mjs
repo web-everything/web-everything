@@ -384,10 +384,11 @@ export function planWatchdog({ rows, claims, prHeadFor = () => null, standardFor
     if (claimAgeMs != null && claimAgeMs >= standard.ms && head && m.headSha && head === m.headSha) {
       findings.push({ type: 'fix-claim-held-no-progress', ...base, prHead: head, holderClass: holder?.class ?? 'not-listed' });
     }
-    // R502 item 3 — stale claim: old, holder silent (or not listed at all), head unmoved. Unknown head or unknown idle
+    // R502 item 3 — stale claim: old, holder listed and silent, head unmoved. Unknown head or unknown idle
     // never breach (fail closed: no alarm on missing evidence). Detection only; release is a separate path (#6346).
     const holderIdle = holder ? holder.evidence?.idleMinutes : null;
-    const holderSilent = holder ? Number.isFinite(holderIdle) && holderIdle >= cfg.staleClaimIdleMinutes : true;
+    // A holder missing from `rows` may be an interactive/unrecognised session, so only a listed holder with a KNOWN idle time counts.
+    const holderSilent = !!holder && Number.isFinite(holderIdle) && holderIdle >= cfg.staleClaimIdleMinutes;
     if (claimAgeMs != null && claimAgeMs >= cfg.staleClaimMinutes * MINUTE && head && m.headSha && head === m.headSha && holderSilent) {
       findings.push({ type: 'stale-claim', ...base, prHead: head, holderClass: holder?.class ?? 'not-listed', holderIdleMinutes: Number.isFinite(holderIdle) ? holderIdle : null,
         thresholdMinutes: cfg.staleClaimMinutes, idleThresholdMinutes: cfg.staleClaimIdleMinutes });

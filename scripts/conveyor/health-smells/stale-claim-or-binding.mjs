@@ -1,7 +1,7 @@
 /**
  * @file scripts/conveyor/health-smells/stale-claim-or-binding.mjs
  * @description R502 item 3 — a PR fix claim held longer than `staleClaimMinutes` whose holder shows no transcript
- *   activity for `staleClaimIdleMinutes` (or is not listed) while the PR head is still the head the claim was taken
+ *   activity for `staleClaimIdleMinutes` while the PR head is still the head the claim was taken
  *   on. The orchestrator kept finding these by hand (fix claims and review-session bindings that outlived their
  *   holder). DETECTION AND ALERT ONLY: it never releases anything (auto-release is PR #6346). Thresholds are
  *   settings (`sessionWatchdog.staleClaimMinutes` / `staleClaimIdleMinutes`); the watchdog fails closed when the head
