@@ -91,7 +91,7 @@ jobs:
         id: report
         continue-on-error: true
         working-directory: web-everything
-        run: node -e "const j=JSON.parse(require('fs').readFileSync('vitest-full.json','utf8')); if(!Array.isArray(j.testResults)||j.testResults.length===0) process.exit(1)"
+        run: node -e "const j=JSON.parse(require('fs').readFileSync('vitest-full.json','utf8')); if(!Array.isArray(j.testResults)||j.testResults.length===0||j.testResults.some(r=>typeof r.name!=='string'||!r.name||!['passed','failed'].includes(r.status))) process.exit(1)"
 
       - name: Record false-green signal (#2681)
         if: ${{ steps.report.outcome == 'success' }}
