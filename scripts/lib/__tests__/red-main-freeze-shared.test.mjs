@@ -846,9 +846,9 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
   const CLEAR = { source: 's', frozen: false, kind: 'manual', reason: null };
   const FROZEN = { source: 's', frozen: true, kind: 'manual', reason: 'red main' };
   const mk = () => ({ file: join(mkdtempSync(join(tmpdir(), 'lkg-')), 'lkg.json'), t: 1_000_000 });
-  const run = async (readShared, { file, t }, extra = {}) => {
+  const run = async (readShared, { file, t }, extra = {}, env = {}) => {
     const logs = [];
-    const s = await prepareDrainFreeze({ settings, readShared, stderr: x => logs.push(x), logSettings: false, lkg: { file, now: () => t, sleepSync: () => {}, ...extra } });
+    const s = await prepareDrainFreeze({ settings, readShared, env, stderr: x => logs.push(x), logSettings: false, lkg: { file, now: () => t, sleepSync: () => {}, ...extra } });
     return { s, log: logs.join('') };
   };
   it('retries a timeout (bounded) and takes the successful read', async () => {
@@ -866,6 +866,38 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     const { s, log } = await run(() => T, { ...m, t: m.t + 60_000 });
     expect(s.frozen).toBe(false); expect(log).toMatch(/freeze read timed out — using last-known-good from 60s/);
   });
+  it('a child timing out after writing stderr retains ETIMEDOUT, retries and uses a fresh clear cache', async () => {
+    const m = mk(); await run(() => CLEAR, m);
+    let calls = 0; const waits = []; const errors = [];
+    const git = timedGit(500, { exec: (_bin, _args, opts) => {
+      calls++;
+      return execFileSync(process.execPath, ['-e', "process.stderr.write('Warning: SSH connection notice\\n'); setInterval(() => {}, 1000);"], opts);
+    } });
+    const { s } = await run(() => {
+      const r = readSharedFreeze({ board: '/b', branch: BRANCH, run: git }); errors.push(r); return r;
+    }, { ...m, t: m.t + 1000 }, { sleepSync: ms => waits.push(ms) });
+    expect(calls).toBe(3); expect(waits).toEqual([1000, 2000]);
+    for (const r of errors) {
+      expect(r.code).toBe('ETIMEDOUT'); expect(r.error).toContain('Warning: SSH connection notice');
+    }
+    expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
+  });
+  it.each(['returned code', 'thrown code', 'returned killed', 'thrown killed', 'stderr text', 'empty stderr code'])(
+    'timeout classification preserves %s even when the diagnostic is only an SSH warning', async variant => {
+      const m = mk(); await run(() => CLEAR, m);
+      let calls = 0;
+      const { s } = await run(() => {
+        calls++;
+        const metadata = variant.endsWith('code') ? { code: 'ETIMEDOUT' } : { killed: true };
+        if (variant.startsWith('thrown') || variant === 'empty stderr code') throw Object.assign(new Error('SSH warning'), { stderr: variant === 'empty stderr code' ? Buffer.alloc(0) : 'SSH warning', ...metadata });
+        if (variant === 'stderr text') return readSharedFreeze({ board: '/b', branch: BRANCH, run: () => {
+          throw Object.assign(new Error('fetch failed'), { stderr: 'SSH connection timed out' });
+        } });
+        return { error: 'SSH warning', ...metadata };
+      }, { ...m, t: m.t + 1000 });
+      expect(calls).toBe(3); expect(s.frozen).toBe(false); expect(s.shared.lastKnownGood).toBe(true);
+    },
+  );
   it('timeout + last-known-good frozen: holds', async () => {
     const m = mk(); await run(() => FROZEN, m);
     const { s } = await run(() => T, { ...m, t: m.t + 1000 });
@@ -889,6 +921,33 @@ describe('prepareDrainFreeze: timed-out read retry + last-known-good', () => {
     await run(() => CLEAR, m, { key: 'k' });
     writeFileSync(m.file, JSON.stringify({ key: 'k', at: m.t + 500, result: FROZEN }));
     expect((await run(() => T, { ...m, t: m.t + 1000 }, { key: 'k' })).s.frozen).toBe(true);
+  });
+  it.each(['memory', 'disk'])('equal timestamps prefer frozen=true when the freeze is in %s', async frozenIn => {
+    const m = mk(); await run(() => frozenIn === 'memory' ? FROZEN : CLEAR, m, { key: 'k' });
+    writeFileSync(m.file, JSON.stringify({ key: 'k', at: m.t, result: frozenIn === 'disk' ? FROZEN : CLEAR }));
+    const { s } = await run(() => T, { ...m, t: m.t + 1000 }, { key: 'k' });
+    expect(s.frozen).toBe(true); expect(s.shared.lastKnownGood).toBeUndefined();
+  });
+  it('WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES=0 switches fallback off even with a fresh clear cache', async () => {
+    const m = mk(); await run(() => CLEAR, m);
+    let calls = 0;
+    const { s, log } = await run(() => { calls++; return T; }, { ...m, t: m.t + 1000 }, {}, { WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES: '0' });
+    expect(calls).toBe(3); expect(s.frozen).toBe(true); expect(s.shared.lastKnownGood).toBeUndefined();
+    expect(log).not.toContain('using last-known-good');
+  });
+  it.each(['-1', 'NaN'])('WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES=%s falls back to 2 minutes', async value => {
+    const m = mk(); await run(() => CLEAR, m);
+    const env = { WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES: value };
+    const fresh = (await run(() => T, { ...m, t: m.t + 119_000 }, {}, env)).s;
+    expect(fresh.frozen).toBe(false); expect(fresh.shared.lastKnownGood).toBe(true);
+    const stale = (await run(() => T, { ...m, t: m.t + 121_000 }, {}, env)).s;
+    expect(stale.frozen).toBe(true); expect(stale.shared.lastKnownGood).toBeUndefined();
+  });
+  it('WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES parses a fractional minute window', async () => {
+    const m = mk(); await run(() => CLEAR, m);
+    const env = { WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES: '0.5' };
+    expect((await run(() => T, { ...m, t: m.t + 29_000 }, {}, env)).s.frozen).toBe(false);
+    expect((await run(() => T, { ...m, t: m.t + 31_000 }, {}, env)).s.frozen).toBe(true);
   });
   it('a configured window above the 2-minute cap is clamped', async () => {
     const m = mk(); await run(() => CLEAR, m);

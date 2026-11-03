@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { evaluateDrainFreeze, prepareDrainFreeze, resolveDrainFreezeSettings, drainFreezeSignal } from '../red-main-freeze-shared.mjs';
 import { decideRedMainHold } from '../red-main-hold.mjs';
 
@@ -34,7 +37,14 @@ describe('A1 shared reader and cascade', () => {
   });
 });
 
+const fixtureDirs = [];
+afterEach(() => {
+  for (const dir of fixtureDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 function fixture(o = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'rmf-drain-'));
+  fixtureDirs.push(dir);
   const log = []; const readShared = vi.fn(() => clear); const publish = vi.fn(async () => ({ ok: false }));
   const exec = vi.fn((bin, args, opts) => {
     expect(bin).toBe('gh'); expect(opts.timeout).toBeGreaterThan(0);
@@ -42,7 +52,7 @@ function fixture(o = {}) {
     if (query.includes('mutation')) return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } });
     return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes: [7, 8].map(number => ({ pullRequest: { id: `PR_${number}`, number } })), pageInfo: { hasNextPage: false } } } } } });
   });
-  return { local: manual, settings: settings(), repo: 'owner/local', branch: 'trunk', enqueues: false, readShared, publish, exec, stderr: s => log.push(s), log, ...o };
+  return { local: manual, settings: settings(), repo: 'owner/local', branch: 'trunk', enqueues: false, readShared, publish, exec, stderr: s => log.push(s), log, ...o, lkg: { ...o.lkg, file: join(dir, 'lkg.json') } };
 }
 
 describe('A2 unpublished manual containment', () => {

@@ -220,15 +220,24 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
   return { ok: false, error, attempts: attempt };
 }
 
+/** Preserve timeout metadata independently of stderr, which may contain only an SSH warning. */
+function freezeReadError(e, prefix = '') {
+  return {
+    error: flatText(`${prefix}${String(e?.stderr ?? '').trim() || String(e?.message ?? e).trim()}`),
+    ...(e?.code != null ? { code: flatText(e.code) } : {}),
+    ...(e?.killed === true ? { killed: true } : {}),
+  };
+}
+
 /**
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
- * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
+ * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string, code?:string, killed?:boolean}}
  */
 export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = timedGit() } = {}) {
   const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
   let text;
   try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
-  catch (e) { return { source, error: flatText(`branch unreadable: ${String(e?.stderr || e?.message || e).trim()}`) }; }
+  catch (e) { return { source, ...freezeReadError(e, 'branch unreadable: ') }; }
   if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   let doc;
   try { doc = JSON.parse(text); } catch { return { source, error: flatText(`${SHARED_FREEZE_FILE} is not JSON`) }; }
@@ -344,6 +353,7 @@ export function dequeueUnpublishedFreeze({ repo, branch, dryRun = false, exec = 
 
 /** One pass of IO around the pure decision. Retry once, then reuse the new shared read. */
 const TIMEOUT_RE = /ETIMEDOUT|timed out/i;
+const isReadTimeout = r => r?.killed === true || TIMEOUT_RE.test(r?.code ?? '') || TIMEOUT_RE.test(r?.error ?? '');
 const LKG_RETRIES = 2;
 const LKG_BACKOFF_MS = 1000;
 const LKG_DEFAULT_MINUTES = 2;
@@ -362,9 +372,9 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
   const minutesRaw = lkg.minutes ?? Number(env.WE_DRAIN_RED_MAIN_FREEZE_LKG_MINUTES ?? LKG_DEFAULT_MINUTES);
   const minutes = Number.isFinite(minutesRaw) && minutesRaw >= 0 ? Math.min(minutesRaw, LKG_MAX_MINUTES) : LKG_DEFAULT_MINUTES;
   const key = lkg.key ?? '';
-  const once = () => { try { return readShared(); } catch (e) { return { error: flatText(e?.message ?? e) }; } };
+  const once = () => { try { return readShared(); } catch (e) { return freezeReadError(e); } };
   let r = once();
-  for (let i = 0; i < LKG_RETRIES && r?.error && TIMEOUT_RE.test(r.error); i++) {
+  for (let i = 0; i < LKG_RETRIES && r?.error && isReadTimeout(r); i++) {
     sleepSync((lkg.backoffMs ?? LKG_BACKOFF_MS) * (i + 1));
     r = once();
   }
@@ -374,11 +384,11 @@ function readSharedWithFallback({ readShared, env, stderr, lkg = {} }) {
     try { mkdirSync(dirname(file), { recursive: true }); const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(rec)); renameSync(tmp, file); } catch { /* cache is best-effort */ }
     return r;
   }
-  if (!r?.error || !TIMEOUT_RE.test(r.error) || minutes === 0) return r;
-  // The newest record wins (memory vs disk): another drain process may have recorded a later read, e.g. a frozen one.
+  if (!r?.error || !isReadTimeout(r) || minutes === 0) return r;
+  // The newest record wins (memory vs disk); equal timestamps prefer a freeze from either process.
   let disk = null; try { disk = JSON.parse(readFileSync(file, 'utf8')); } catch { /* none */ }
   const cands = [lkgMemory.get(file), disk].filter(x => x && x.key === key && Number.isFinite(x.at));
-  const rec = cands.sort((a, b) => b.at - a.at)[0] ?? null;
+  const rec = cands.sort((a, b) => b.at - a.at || Number(b.result?.frozen === true) - Number(a.result?.frozen === true))[0] ?? null;
   const age = rec ? now() - rec.at : Infinity;
   if (rec?.result?.frozen === false && !rec.result.error && age >= 0 && age <= minutes * 60_000) {
     stderr(`red-main freeze: freeze read timed out — using last-known-good from ${Math.round(age / 1000)}s ago\n`);
