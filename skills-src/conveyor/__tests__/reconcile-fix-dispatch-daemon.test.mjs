@@ -1782,3 +1782,65 @@ describe('fix daemon pass timing', () => {
     expect(lines[summary + 1]).toContain('pass-timing total');
   });
 });
+
+describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const planOf = (extra = {}) => ({ dispatch: [], notes: [], refusals: [], prs: 1, agents: 0, ...extra });
+  const phases = (calls, extra = {}) => {
+    const use = name => (opts) => { calls.push(`${name}:${opts.repo}`); opts.reconcile({ repo: opts.repo }); return null; };
+    return {
+      fixTick: vi.fn(opts => { use('fix')(opts); return { dispatched: [], refusals: [] }; }),
+      ciHealTick: vi.fn(async opts => { use('ci-heal')(opts); return { dispatched: [], refusals: [] }; }),
+      promoteDraftTick: vi.fn(opts => { use('promote-draft')(opts); return { dispatched: [], refusals: [] }; }),
+      notesTick: vi.fn(opts => { use('notes')(opts); return { notes: [], prsByNumber: new Map() }; }),
+      hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick,
+      ...extra,
+    };
+  };
+  const base = { repos: ['repo-a', 'repo-b'], allowStandDownAutoProceed: false,
+    authGateOverride: () => ({ paused: false, reason: null }), reuseReconcilePlan: true };
+
+  it('runs the reconcile planner once per repo and lets fix, ci-heal, promote-draft and notes reuse it', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf());
+    const calls = [];
+    await runTickAllRepos({ ...base, ...phases(calls) });
+    expect(calls.filter(c => c.endsWith(':repo-a'))).toHaveLength(4);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('hands each phase its own copy, so one phase mutating the plan cannot change another', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf({ dispatch: [{ kind: 'fix', prNumber: 1 }] }));
+    const seen = [];
+    const mutate = (opts) => { const p = opts.reconcile({ repo: opts.repo }); seen.push(p.dispatch.length); p.dispatch.length = 0; return p; };
+    await runTickAllRepos({ ...base, repos: ['repo-a'], ...phases([], {
+      fixTick: vi.fn(opts => { mutate(opts); return { dispatched: [], refusals: [] }; }),
+      ciHealTick: vi.fn(async opts => { mutate(opts); return { dispatched: [], refusals: [] }; }),
+    }) });
+    expect(seen).toEqual([1, 1]);
+  });
+
+  it('drops plan rows for a PR an earlier phase already acted on (fail closed)', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf({
+      dispatch: [{ kind: 'fix', prNumber: 7 }, { kind: 'promote-draft', prNumber: 7 }, { kind: 'promote-draft', prNumber: 8 }],
+      notes: [{ prNumber: 7 }, { prNumber: 9 }] }));
+    let promoteRows; let noteRows;
+    await runTickAllRepos({ ...base, repos: ['repo-a'], ...phases([], {
+      fixTick: vi.fn(opts => { opts.reconcile({ repo: opts.repo }); return { dispatched: [{ pr: 7, repo: 'repo-a', kind: 'fix' }], refusals: [] }; }),
+      promoteDraftTick: vi.fn(opts => { promoteRows = opts.reconcile({ repo: opts.repo }).dispatch; return { dispatched: [], refusals: [] }; }),
+      notesTick: vi.fn(opts => { noteRows = opts.reconcile({ repo: opts.repo }).notes; return { notes: [], prsByNumber: new Map() }; }),
+    }) });
+    expect(promoteRows).toEqual([{ kind: 'promote-draft', prNumber: 8 }]);
+    expect(noteRows).toEqual([{ prNumber: 9 }]);
+  });
+
+  it('recomputes when the cached plan is older than the reuse window', async () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const spy = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => planOf());
+    let t = 0;
+    await runTickAllRepos({ ...base, repos: ['repo-a'], now: () => (t += 400_000), ...phases([]) });
+    expect(spy.mock.calls.length).toBeGreaterThan(1);
+  });
+});
