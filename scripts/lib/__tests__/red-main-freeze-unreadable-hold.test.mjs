@@ -20,6 +20,7 @@ describe('readSharedFreeze timeout retry', () => {
     const r = readSharedFreeze({ board: '/b', branch: BRANCH, runFor: mk });
     expect(r).toMatchObject({ frozen: false });
     expect(timeouts[0]).toBeLessThan(timeouts[timeouts.length - 1]);
+    expect(timeouts[0] + timeouts[timeouts.length - 1]).toBeLessThanOrEqual(60_000); // total worst-case bound
   });
   it('still fails closed with a timeout marker when the retry also times out', () => {
     const r = readSharedFreeze({ board: '/b', branch: BRANCH, runFor: () => () => { throw timeoutErr(); } });

@@ -49,8 +49,8 @@ export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 export const PUBLISH_ATTEMPTS = 4;
 /** Per-git-call ceiling: a hung fetch/push FAILS (writer: reported + exit 1; reader: `{error}`, fail closed). */
 export const GIT_TIMEOUT_MS = 20_000;
-/** A timed-out freeze READ is retried once with this many times the bound. */
-const READ_RETRY_FACTOR = 4;
+/** A timed-out freeze READ is retried once with this many times the bound (so a fully hung read fails closed within 3x the bound). */
+const READ_RETRY_FACTOR = 2; // worst case one read is GIT_TIMEOUT_MS x (1 + factor) = 60 s, then it fails closed
 /** Captured git output cap: the freeze doc is a few hundred bytes; anything near this is not our file (fail). */
 const GIT_MAX_BUFFER = 4 * 1024 * 1024;
 

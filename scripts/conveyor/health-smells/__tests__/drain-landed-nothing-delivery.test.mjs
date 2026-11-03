@@ -52,4 +52,12 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     expect(Object.keys(s.episodes).length).toBe(1);
     expect(reminded).toBeGreaterThanOrEqual(1);
   });
+  it('opens an alert from scratch when the drain stopped completing passes with queued work', () => {
+    const old = [{ at: T0 - 20 * MIN, considered: 4, merged: 0 }];
+    const now = T0 + 40 * MIN;
+    const out = stepEpisodes(empty, [{ smell, results: smell.evaluate({ drainHistory: old }, { now }) }], now);
+    const plan = planActions(out.transitions, { [smell.id]: smell }, { mode: 'shadow' }).filter((p) => p.kind === 'notify');
+    expect(plan.length).toBe(1);
+    expect(plan[0].suppressed).toBeNull();
+  });
 });

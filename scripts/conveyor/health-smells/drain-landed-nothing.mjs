@@ -13,7 +13,14 @@ const MIN = 60 * 1000;
 /** PURE: the stall over the last `windowMs`, or null when the drain landed something / had nothing queued / is not covered. */
 export function landedNothing(history, { now, windowMs = 30 * MIN, minPasses = 2 } = {}) {
   const inWin = (history || []).filter((p) => now - p.at >= 0 && now - p.at <= windowMs).sort((a, b) => a.at - b.at);
-  if (inWin.length < minPasses) return null;
+  if (inWin.length < minPasses) {
+    // The drain stopped completing passes: if its LAST pass (any age) had queued PRs and merged none, that is still a stall.
+    const lastAny = (history || []).filter((p) => now - p.at >= 0).sort((a, b) => b.at - a.at)[0];
+    if (lastAny && now - lastAny.at > windowMs && (Number(lastAny.considered) || 0) > 0 && (Number(lastAny.merged) || 0) === 0) {
+      return { passes: 0, considered: Number(lastAny.considered) || 0, reason: `no drain pass completed in ${Math.round((now - lastAny.at) / MIN)} min; the last pass had ${Number(lastAny.considered)} queued and landed none` };
+    }
+    return null;
+  }
   const everyIdle = inWin.every((p) => (Number(p.considered) || 0) > 0 && (Number(p.merged) || 0) === 0);
   if (!everyIdle) return null;
   const earlierCover = (history || []).some((p) => now - p.at >= windowMs * 0.9);
