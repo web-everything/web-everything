@@ -3,6 +3,10 @@ import { parseBlockedBy, buildBlockedMap, sortUnblockersFirst } from '../pr-bloc
 it('parses all four dependency phrases, case-insensitively and deduplicates', () => {
   expect(parseBlockedBy('Blocked by #6244; DEPENDS ON #2; waits on #3; waiting on #4; blocked by #2')).toEqual([6244, 2, 3, 4]);
 });
+it('parses colon-delimited dependency annotations without joining lines or quoted examples', () => {
+  expect(parseBlockedBy('Blocked by: #6244; DEPENDS ON : #2; waits on:\t#3; waiting on: #4')).toEqual([6244, 2, 3, 4]);
+  expect(parseBlockedBy('Blocked by:\n#6244\n\n> Blocked by: #2\n\n`Blocked by: #3`')).toEqual([]);
+});
 it('ignores quotes, fenced code, inline code and self references', () => {
   const body = '> blocked by #1\n```md\nblocked by #2\n```\n~~~\nwaits on #3\n~~~\n`blocked by #4` ``depends on #5``\nblocked by #6';
   expect(parseBlockedBy(body)).toEqual([6]);

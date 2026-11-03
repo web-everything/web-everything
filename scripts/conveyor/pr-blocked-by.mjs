@@ -25,7 +25,7 @@ export function parseBlockedBy(text) {
     cursor = run.index + run[0].length;
   }
   if (delimiter === null) clean += plain.slice(cursor);
-  return [...new Set([...clean.matchAll(/\b(?:blocked[ \t]+by|depends[ \t]+on|waits[ \t]+on|waiting[ \t]+on)[ \t]+#([1-9]\d*)\b/gi)]
+  return [...new Set([...clean.matchAll(/\b(?:blocked[ \t]+by|depends[ \t]+on|waits[ \t]+on|waiting[ \t]+on)(?:[ \t]*:)?[ \t]+#([1-9]\d*)\b/gi)]
     .map(m => Number(m[1])).filter(Number.isSafeInteger))];
 }
 /** Inputs are the current open-PR listing for ONE repository (state may be omitted).
