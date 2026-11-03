@@ -18,7 +18,7 @@ import {
   usageReportSecretReadReason,
   isTruncatedOperationJson, truncatedOperationJsonReason,
   isTreeWritingBuildRun, isGeneratorScriptRun, isFileWriteRedirect, primaryTreeWriteReason,
-  daemonCloneWriteReason,
+  daemonCloneWriteReason, readDaemonFetchConfig,
   mainSessionDelegateNudge, hasLeadingEnvEscape, canonicalCommand, shellTokens, stripHeredocBodies,
   splitSegments, runnerInvocation, parseSegments, unparseableReason, heredocScan,
   nestedCommandStrings, fileWriteTargets, collateralStepsNotice, mergeBreakGlassUsed,
@@ -3648,6 +3648,673 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     expect(daemonCloneWriteReason('cp fix.md notes.md', { cwd: CLONE, roots: [] })).toBeNull();
   });
 
+  it('DENIES repeated -C that lands in a daemon clone (effective dir applied in order, like git)', () => {
+    expect(daemonCloneWriteReason('git -C /ws -C wev-review-daemon reset --hard', { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C "/ws" -C 'wev-review-daemon' commit -am x`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    // a later absolute -C wins; a later ../ walks back out
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -C ${LANE} reset --hard`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -C .. reset --hard`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('DENIES --git-dir / --work-tree pointing into a daemon clone (both spellings)', () => {
+    expect(daemonCloneWriteReason(`git --git-dir=${CLONE}/.git reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --git-dir ${CLONE}/.git commit -am x`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --work-tree=${CLONE} checkout .`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --work-tree ${CLONE} checkout .`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git --git-dir=${CLONE}/.git log`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('does not mistake a subcommand option -C for a global -C', () => {
+    expect(daemonCloneWriteReason('git commit -C HEAD', { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} commit -C HEAD`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each(['~', '$HOME', '${HOME}', '$TARGET', '${TARGET}'].flatMap((home) =>
+    ['-C ', '--git-dir=', '--git-dir ', '--work-tree=', '--work-tree '].map((option) => ({ home, option }))))(
+    'DENIES equivalent or unresolved global targets: $option ($home)', ({ home, option }) => {
+      // The tracked shell HOME is injected; the hook process's own HOME is never read.
+      const target = `${home}/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
+      const ctx = { cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: '/ws' } };
+      for (const path of [target, `"${target}"`]) {
+        expect(decide(`git ${option}${path} reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+        expect(decide(`git ${option}${path} log`, ctx)).toBeNull();
+      }
+    },
+  );
+
+  // Card xh6262p A4. Ruling reconciliation: the HOME finding at guard-bash.mjs:1975 was ruled `not-real`, then
+  // `block` by policy on head 89f25a08b; this pins the blocked behavior. Shell-local HOME (/ws) differs from the
+  // injected hook HOME (/hook-home), and neither is the test process's own HOME.
+  describe('DENIES tilde targets after an earlier HOME assignment', () => {
+    const HOOK_HOME = '/hook-home';
+    const ctx = (home = HOOK_HOME) => ({ cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { HOME: home } });
+    const tilde = (option) => `~/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
+    const ASSIGNMENTS = ['HOME=/ws; ', 'export HOME=/ws; ', 'HOME=/ws && ', 'HOME="/ws"; ', "HOME=/w's'; ",
+      'declare -x HOME=/ws; ', 'true && HOME=/ws; '];
+    it.each(['-C ', '--git-dir ', '--git-dir=', '--work-tree ', '--work-tree='].flatMap((option) =>
+      ASSIGNMENTS.map((assignment) => ({ option, assignment }))))(
+      '$assignment git $option<tilde> mutation is denied, read allowed', ({ option, assignment }) => {
+        expect(decide(`${assignment}git ${option}${tilde(option)} reset --hard`, ctx())).toMatch(/DAEMON CLONE/);
+        expect(decide(`${assignment}git ${option}${tilde(option)} log`, ctx())).toBeNull();
+      });
+
+    it.each([
+      ['an assignment after the command', 'git -C ~/wev-review-daemon reset --hard; HOME=/ws', HOOK_HOME, false],
+      ['a command-local HOME prefix leaves command words on the shell HOME', 'HOME=/ws git -C ~/wev-review-daemon reset --hard', HOOK_HOME, false],
+      ['a command-local HOME prefix cannot move command words away', 'HOME=/elsewhere git -C ~/wev-review-daemon reset --hard', '/ws', true],
+      ['an earlier HOME moves the target away from the hook HOME', 'HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', false],
+      ['a possibly skipped HOME keeps the earlier value', 'false && HOME=/elsewhere; git -C ~/wev-review-daemon reset --hard', '/ws', true],
+      ['a child shell uses its own HOME', "bash -c 'HOME=/ws; git -C ~/wev-review-daemon reset --hard'", HOOK_HOME, true],
+      ['an earlier prefix HOME applies to a later prefix value', 'HOME=/ws GIT_DIR=~/wev-review-daemon/.git git reset --hard', HOOK_HOME, true],
+      ['an assignment value expands when it runs', 'export GIT_DIR=~/wev-review-daemon/.git; HOME=/elsewhere; git reset --hard', '/ws', true],
+      ['a later HOME does not retarget an earlier value', 'export GIT_WORK_TREE=~/wev-review-daemon; HOME=/ws; git clean -fd', HOOK_HOME, false],
+      ['a possibly skipped HOME keeps both values for a later assignment', 'false && HOME=/elsewhere; export GIT_DIR=~/wev-review-daemon/.git; git reset --hard', '/ws', true],
+      ['unset HOME is unknown', 'unset HOME; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['an unresolved HOME is unknown', 'HOME=$(mktemp -d); git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a relative HOME is unknown', 'HOME=ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['an unresolved HOME is unknown for a later assignment', 'HOME=$(x); export GIT_DIR=~/wev-review-daemon/.git; git reset --hard', HOOK_HOME, true],
+      ['a user tilde is unknown', 'git -C ~nobody/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a quoted literal tilde stays conservative', 'HOME=/ws; git -C "~/wev-review-daemon" reset --hard', HOOK_HOME, true],
+      // HOME writers the assignment tracker does not model leave HOME unknown, never stale.
+      ['an append to HOME is unknown', 'HOME=/; HOME+=ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['read HOME is unknown', 'read HOME <<< /ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['printf -v HOME is unknown', 'printf -v HOME /ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a HOME prefix on export keeps the earlier HOME', 'HOME=/ws; HOME=/tmp export X=1; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a HOME prefix on a special builtin may persist', 'HOME=/ws :; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, true],
+      ['a GIT_DIR prefix on export keeps the earlier GIT_DIR', 'export GIT_DIR=/ws/wev-review-daemon/.git; GIT_DIR=/tmp export X=1; git reset --hard', HOOK_HOME, true],
+      ['readonly HOME refuses the reassignment', 'readonly HOME; HOME=/ws; git -C ~/wev-review-daemon reset --hard', HOOK_HOME, false],
+    ])('%s', (_name, command, home, denied) => {
+      const out = decide(command, ctx(home));
+      if (denied) expect(out).toMatch(/DAEMON CLONE/);
+      else expect(out).toBeNull();
+      expect(decide(command.replace(/reset --hard|clean -fd/, 'log'), ctx(home))).toBeNull();
+    });
+
+    it.each([
+      ['a command-local HOME prefix', 'HOME=/ws/wev-review-daemon git config --global x.y z'],
+      ['an earlier HOME assignment', 'HOME=/ws/wev-review-daemon; git config --global --unset x.y'],
+      ['an XDG_CONFIG_HOME prefix', 'XDG_CONFIG_HOME=/ws/wev-review-daemon git config --global x.y z'],
+      ['an unknown HOME', 'HOME=$(x) git config --global x.y z'],
+    ])('git config --global writes under the git process HOME: %s', (_name, command) => {
+      expect(decide(command, ctx())).toMatch(/DAEMON CLONE/);
+      expect(decide(command.replace(/ x\.y z$| --unset x\.y$/, ' --get x.y'), ctx())).toBeNull();
+      expect(decide('git config --global x.y z', ctx())).toBeNull();
+    });
+
+    it('bounds possible HOME values: past the cap HOME is unknown and stays fast', () => {
+      const command = `${'true && HOME=/h; '.repeat(2000)}${'A=~/x B=~/y C=i true; '.repeat(2000)}git -C ~/wev-review-daemon reset --hard`;
+      let n = 0;
+      const started = Date.now();
+      expect(decide(command.replace(/HOME=\/h/g, () => `HOME=/h${n++}`), ctx())).toMatch(/DAEMON CLONE/);
+      expect(Date.now() - started).toBeLessThan(6000);
+    });
+  });
+
+  it.each(['--git-dir', '--work-tree'].flatMap((option) =>
+    ['separate', 'equals'].flatMap((spelling) =>
+      ['before', 'between', 'after'].map((position) => ({ option, spelling, position })))))(
+    'resolves relative $option ($spelling, $position repeated -C) against the final directory',
+    ({ option, spelling, position }) => {
+      const relative = option === '--git-dir' ? 'wev-review-daemon/.git' : 'wev-review-daemon';
+      const target = spelling === 'equals' ? `${option}='${relative}'` : `${option} '${relative}'`;
+      const command = (first, last) => {
+        const args = position === 'before' ? `${target} -C ${first} -C ${last}`
+          : position === 'between' ? `-C ${first} ${target} -C ${last}`
+            : `-C ${first} -C ${last} ${target}`;
+        return `git ${args} clean -fd`;
+      };
+      // Neither the original cwd nor the first -C reaches the protected target.
+      const inside = command('/elsewhere', '/ws');
+      expect(daemonCloneWriteReason(inside, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+      expect(decide(inside, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      // Resolving at the original cwd or the first -C would falsely deny this write.
+      const outside = command('/ws', '/safe');
+      expect(daemonCloneWriteReason(outside, { cwd: '/ws', roots })).toBeNull();
+    });
+
+  it('ALLOWS legitimate repeated -C and read-only git on a daemon clone', () => {
+    expect(daemonCloneWriteReason(`git -C ${LANE} -C sub status`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git -C /ws/wev-review-daemon log', { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git -C /ws -C wev-review-daemon rev-parse HEAD', { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('ALLOWS symbolic-ref reads in a daemon clone', () => {
+    expect(daemonCloneWriteReason('git symbolic-ref HEAD', { cwd: CLONE, roots })).toBeNull();
+    expect(decide('git symbolic-ref HEAD', { cwd: CLONE, daemonCloneRoots: roots })).toBeNull();
+  });
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG'])(
+    'allows lane mutations after unsetting an exported Git target: %s', (key) => {
+      const target = key === 'GIT_DIR' ? `${CLONE}/.git` : key === 'GIT_CONFIG' ? `${CLONE}/config` : CLONE;
+      const mutation = key === 'GIT_CONFIG' ? 'git config user.name example' : 'git reset --hard';
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const unset of [`unset ${key}`, `unset -v -- ${key}`, `eval 'unset ${key}'`]) {
+        expect(decide(`export ${key}=${target}; ${unset}; ${mutation}`, ctx), unset).toBeNull();
+      }
+      expect(decide(`export ${key}=${target}; bash -c 'unset ${key}'; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export ${key}=${target}; unset -f ${key}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      for (const directive of ['readonly', 'declare -rx', 'typeset -r', "eval 'readonly"]) {
+        const declaration = directive.startsWith('eval') ? `${directive} ${key}=${target}'` : `${directive} ${key}=${target}`;
+        expect(decide(`${declaration}; unset ${key}; ${mutation}`, ctx), declaration).toMatch(/DAEMON CLONE/);
+      }
+      expect(decide(`export ${key}=${target}; readonly ${key}; unset ${key}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export ${key}=${target}; readonly ${key}; bash -c 'unset ${key}; ${mutation}'`, ctx)).toBeNull();
+      for (const skipped of [`false && unset ${key}`, `true || unset ${key}`, `unset ${key} | cat`, `false && eval 'unset ${key}'`, `if false; then true; unset ${key}; fi`]) {
+        expect(decide(`export ${key}=${target}; ${skipped}; ${mutation}`, ctx), skipped).toMatch(/DAEMON CLONE/);
+      }
+    },
+  );
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'TARGET'])(
+    'DENIES when a possibly-skipped reassignment would hide an active protected target: %s', (key) => {
+      // A conditional assignment may not run. Its value must join the earlier one, never replace it.
+      const target = key === 'GIT_DIR' ? `${CLONE}/.git` : key === 'GIT_CONFIG' ? `${CLONE}/config` : CLONE;
+      const safe = key === 'GIT_DIR' ? `${LANE}/.git` : key === 'GIT_CONFIG' ? `${LANE}/config` : LANE;
+      const mutation = key === 'GIT_CONFIG' ? 'git config user.name example'
+        : key === 'TARGET' ? 'git --config-env=core.worktree=TARGET reset --hard' : 'git reset --hard';
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const skipped of [
+        `false && export ${key}=${safe}`, `true || export ${key}=${safe}`, `false && ${key}=${safe}`,
+        `export ${key}=${safe} | cat`, `false && declare -x ${key}=${safe}`, `false && eval 'export ${key}=${safe}'`,
+        `if false; then export ${key}=${safe}; fi`, `false && readonly ${key}=${safe}`,
+        `false && eval 'false && export ${key}=${safe}'`,
+      ]) {
+        expect(decide(`export ${key}=${target}; ${skipped}; ${mutation}`, ctx), skipped).toMatch(/DAEMON CLONE/);
+      }
+      // A readonly declaration that may not have run must not block a later protected assignment.
+      expect(decide(`false && readonly ${key}=${safe}; export ${key}=${target}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      // Unconditional reassignment still replaces the protected target; conditional safe values stay allowed.
+      expect(decide(`export ${key}=${target}; export ${key}=${safe}; ${mutation}`, ctx)).toBeNull();
+      expect(decide(`false && export ${key}=${safe}; ${mutation}`, { ...ctx, gitConfigEnv: { [key]: safe } })).toBeNull();
+      // A possibly-skipped first assignment leaves the variable possibly unset; an unset worktree source is unknown.
+      expect(decide(`export ${key}=${safe} && ${mutation}`, ctx)).toSatisfy((r) => (key === 'TARGET' ? /DAEMON CLONE/.test(r) : r === null));
+      // The possible protected value reaches child shells, substitutions and eval scripts too.
+      const quoted = mutation.replace(/'/g, '');
+      for (const command of [
+        `export ${key}=${target}; false && export ${key}=${safe}; bash -c '${quoted}'`,
+        `export ${key}=${target}; false && export ${key}=${safe}; echo "$(${quoted})"`,
+        `export ${key}=${target}; false && export ${key}=${safe}; eval '${quoted}'`,
+        // A conditional inside an eval script keeps the earlier value in the calling shell as well.
+        `export ${key}=${target}; eval 'false && export ${key}=${safe}'; ${mutation}`,
+        `export ${key}=${target}; eval 'export ${key}=${safe} | cat'; ${mutation}`,
+      ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      // A command-local assignment always applies to its own command and child shell.
+      expect(decide(`export ${key}=${target}; false && export ${key}=${safe}; ${key}=${safe} bash -c '${quoted}'`, ctx)).toBeNull();
+    },
+  );
+
+  it('retains protected Git targets across skipped conditional assignments', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    // The skipped assignment adds a possible value; the tracked protected target stays checked.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; false && export GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`export GIT_WORK_TREE=${CLONE}; false && export GIT_WORK_TREE=/safe; git clean -fd`, ctx)).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE'].flatMap((key) => [
+    `${key}=/safe`, `export ${key}=/safe`, `declare -x ${key}=/safe`,
+    `typeset -x ${key}=/safe`, `readonly ${key}=/safe`, `unset ${key}`, `unset -v ${key}`,
+    `eval 'export ${key}=/safe'`,
+  ].map((mutation) => ({ key, mutation }))))(
+    'DENIES a skipped reassignment inside a multi-command subshell: $mutation', ({ key, mutation }) => {
+      const value = key === 'GIT_DIR' ? `${CLONE}/.git` : CLONE;
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const body of [`(true; ${mutation})`, `( true; ${mutation}; true )`, `(true\n${mutation}\n)`]) {
+        expect(decide(`export ${key}=${value}; ${body}; git reset --hard`, ctx), body).toMatch(/DAEMON CLONE/);
+        expect(decide(`export ${key}=${value}; ${body}; git log`, ctx), body).toBeNull();
+      }
+    },
+  );
+
+  it.each(['declare -p', 'typeset -p', 'declare -f', 'declare -F', 'declare -xp', 'typeset -pr', 'export -f', 'readonly -f'])(
+    'DENIES after a printing or function-only directive that assigns nothing: %s', (directive) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+      // A printing directive is not a readonly lock either: a later safe assignment still replaces the target.
+      expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR; export GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
+    },
+  );
+
+  it.each(['declare -x GIT_DIR=TARGET -p', 'export GIT_DIR=TARGET -f', 'typeset -x GIT_DIR=TARGET -F', 'export GIT_DIR=TARGET -Q'])(
+    'records an assignment followed by a dash word, which bash reads as a name, not an option: %s', (directive) => {
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      const command = directive.replace('TARGET', `${CLONE}/.git`);
+      expect(decide(`${command}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export GIT_DIR=${LANE}/.git; ${command}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['export -p', 'readonly -p'])('treats version-dependent %s assignments as possible values', (directive) => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    // Bash 3.2 assigns here, so a protected value is recorded; and the earlier value is never erased.
+    expect(decide(`${directive} GIT_DIR=${CLONE}/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`export GIT_DIR=${CLONE}/.git; ${directive} GIT_DIR=/safe/.git; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'TARGET'].flatMap((key) =>
+    ['declare -i', 'typeset -i', 'declare -a', 'declare -A', 'declare -l', 'declare -u',
+      'declare -n', 'declare -I', 'readonly -a', 'readonly -A'].map((directive) => ({ key, directive }))))(
+    'retains protected targets after value-changing declaration options: $directive $key', ({ key, directive }) => {
+      const target = key === 'GIT_DIR' ? `${CLONE}/.git` : key === 'GIT_CONFIG' ? `${CLONE}/config` : CLONE;
+      const mutation = key === 'GIT_CONFIG' ? 'git config user.name example'
+        : key === 'TARGET' ? 'git --config-env=core.worktree=TARGET reset --hard' : 'git reset --hard';
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      expect(decide(`export ${key}=${target}; ${directive} ${key}=/safe; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      // Attributes survive the declaration and can also make a later ordinary assignment fail or transform.
+      expect(decide(`export ${key}=${target}; ${directive} ${key}; export ${key}=/safe; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      expect(decide(`export ${key}=${target}; ${directive} ${key}=/safe; git log`, ctx)).toBeNull();
+    },
+  );
+
+  it('fails closed for transformed, indexed, appended and indirect declaration targets', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    for (const declaration of [
+      `declare -l GIT_WORK_TREE=${CLONE.toUpperCase()}`, `declare -u GIT_WORK_TREE=/safe`,
+      `declare -a GIT_WORK_TREE[0]=${CLONE}`, `declare -a GIT_WORK_TREE+=${CLONE}`,
+      `declare -n ALIAS=GIT_WORK_TREE; ALIAS=${CLONE}`,
+      `declare -n ALIAS=TARGET; ALIAS=${CLONE}`,
+      `declare -n ALIAS; ALIAS=GIT_WORK_TREE; ALIAS=${CLONE}`,
+    ]) {
+      expect(decide(`${declaration}; git reset --hard`, ctx), declaration).toMatch(/DAEMON CLONE/);
+      expect(decide(`${declaration}; git log`, ctx), declaration).toBeNull();
+    }
+    for (const directive of ['declare -xi', 'typeset -x -i', 'de""clare -i', 'builtin declare -i',
+      'command declare -i', 'declare -i --', 'declare +i']) {
+      expect(decide(`export GIT_DIR='${CLONE}'/.git; ${directive} GIT_DIR="/safe"; git reset --hard`, ctx), directive)
+        .toMatch(/DAEMON CLONE/);
+    }
+    // A plain string declaration and options after the first name retain their established semantics.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git -i; git reset --hard`, ctx)).toBeNull();
+    expect(decide(`declare -i COUNT=1; git reset --hard`, ctx)).toBeNull();
+    expect(decide(`declare -p GIT_DIR; git reset --hard`, ctx)).toBeNull();
+  });
+
+  it('carries uncertain declaration attributes through eval and child scopes without leaking child changes', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    for (const command of [
+      `export GIT_DIR=${CLONE}/.git; eval 'declare -i GIT_DIR'; export GIT_DIR=/safe; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; declare -i GIT_DIR; bash -c 'export GIT_DIR=/safe; git reset --hard'`,
+      `eval 'declare -n ALIAS=GIT_WORK_TREE'; ALIAS=${CLONE}; git reset --hard`,
+      `declare -ir GIT_WORK_TREE=/safe; unset GIT_WORK_TREE; git reset --hard`,
+    ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+    expect(decide(`bash -c 'declare -i GIT_DIR'; git reset --hard`, ctx)).toBeNull();
+  });
+
+  it('ALLOWS lane mutations after many skipped unrelated assignments', () => {
+    // Possible values are tracked per variable, so unrelated conditional assignments add no unknown target.
+    const skipped = Array.from({ length: 12 }, (_, i) => `false && export V${i}=${i}`).join('; ');
+    expect(decide(`${skipped}; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+    expect(decide(`${skipped}; export GIT_DIR=${CLONE}/.git; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('DENIES when a function body, comment or quote-split eval keyword hides a skipped Git target change', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    for (const command of [
+      // A function body is defined, not run.
+      `export GIT_DIR=${CLONE}/.git\nf() {\nexport GIT_DIR=${LANE}/.git\n}\ngit reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; function f { export GIT_DIR=${LANE}/.git; }; git reset --hard`,
+      // A comment runs nothing after it on its line.
+      `export GIT_DIR=${CLONE}/.git; # ; export GIT_DIR=${LANE}/.git\ngit reset --hard`,
+      // Quote-split keywords hide the condition from the calling scope; the eval script still sees it.
+      `eval "i""f true\nth""en\nreadonly GIT_DIR=${CLONE}/.git\nf""i"\nexport GIT_DIR=${LANE}/.git\ngit reset --hard`,
+      `eval "i""f true\nth""en\nreadonly GIT_DIR=${CLONE}/.git\nf""i"\nunset GIT_DIR\ngit reset --hard`,
+      // A failed redirection skips the builtin; an unknown option makes it refuse; `enable -n` disables it.
+      `export GIT_DIR=${CLONE}/.git; export GIT_DIR=${LANE}/.git >/nonexistent/d/f; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; unset GIT_DIR 2>/nonexistent/d/f; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; export -Q GIT_DIR=${LANE}/.git; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; declare -Qx GIT_DIR=${LANE}/.git; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; readonly -Q GIT_DIR=${LANE}/.git; git reset --hard`,
+      `export GIT_DIR=${CLONE}/.git; enable -n export; export GIT_DIR=${LANE}/.git; git reset --hard`,
+    ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+    // Known options and no redirection still replace the earlier value.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; declare -x GIT_DIR=${LANE}/.git; git reset --hard`, ctx)).toBeNull();
+  });
+
+  it('ALLOWS an unconditional reassignment after a file-descriptor redirection', () => {
+    // `2>&1` is a redirection, not a background or conditional list.
+    expect(decide(`export GIT_DIR=${CLONE}/.git; git log 2>&1; export GIT_DIR=${LANE}/.git; git reset --hard`,
+      { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+  });
+
+  it('bounds possible-value checks: fails closed past the cap and stays fast on long commands', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    // More possible GIT_DIR values than the per-segment cap: the target is unknown, so a write fails closed.
+    const many = Array.from({ length: 20 }, (_, i) => `false && export GIT_DIR=${LANE}/w${i}/.git`).join('; ');
+    expect(decide(`${many}; git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`${many}; git status`, ctx)).toBeNull();
+    // Unrelated possible values are never re-checked, so a long command stays cheap.
+    const long = Array.from({ length: 300 }, (_, i) => `false && export V${i}=${i}; git status`).join('; ');
+    const started = Date.now();
+    expect(decide(`${long}; git reset --hard`, ctx)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10000);
+  });
+
+  it.each(['refs/*', 'refs/h*', 'refs/heads*', 'refs/hea*s/*'])(
+    'DENIES explicit and configured fetch glob destinations that can write branches: %s', (destination) => {
+      for (const command of [
+        `git fetch origin '+refs/heads/*:${destination}'`,
+        `git fetch --refmap='+refs/heads/*:${destination}' origin main`,
+        `git -c 'remote.origin.fetch=+refs/heads/*:${destination}' fetch origin`,
+      ]) expect(daemonCloneWriteReason(command, { cwd: CLONE, roots }), command).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason('git fetch origin', {
+        cwd: CLONE, roots, fetchConfig: [`+refs/heads/*:${destination}`],
+      })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['refs/Heads/main', 'REFS/HEADS/main', 'Refs/H*', 'REFS/HEA*S/*'])(
+    'DENIES mixed-case branch fetch destinations on case-insensitive filesystems: %s', (destination) => {
+      for (const command of [
+        `git fetch origin main:${destination}`,
+        `git fetch --refmap=main:${destination} origin main`,
+        `git -c remote.origin.fetch=main:${destination} fetch origin`,
+      ]) expect(decide(command, { cwd: CLONE, daemonCloneRoots: roots }), command).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason('git fetch origin', {
+        cwd: CLONE, roots, fetchConfig: [`main:${destination}`],
+      })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each(['refs/Remotes/origin/main', 'REFS/TAGS/v1', 'Refs/Custom/main', 'REFS/REMOTES/*'])(
+    'ALLOWS mixed-case fetch destinations disjoint from branches: %s', (destination) => {
+      expect(decide(`git fetch origin main:${destination}`, {
+        cwd: CLONE, daemonCloneRoots: roots,
+      })).toBeNull();
+      expect(daemonCloneWriteReason('git fetch origin', {
+        cwd: CLONE, roots, fetchConfig: [`main:${destination}`],
+      })).toBeNull();
+    },
+  );
+
+  it.each(['-Pu', '-4u', '-6u', '-uP', '-P4u'])(
+    'DENIES update-head-ok in mixed short fetch bundles: %s', (bundle) => {
+      expect(decide(`git fetch ${bundle} origin`, { cwd: CLONE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it.each([
+    `GIT_DIR=${CLONE}/.git git log && git commit -m x`,
+    `env GIT_WORK_TREE=${CLONE} git log; git reset --hard`,
+    `echo GIT_DIR=${CLONE}/.git; git add scripts/guard-bash.mjs`,
+    `git reset --hard; printf '%s\\n' GIT_DIR=${CLONE}/.git`,
+    `git reset --hard; export GIT_WORK_TREE=${CLONE}`,
+    `git reset --hard; GIT_DIR=${CLONE}/.git`,
+    `bash -c 'export GIT_DIR=${CLONE}/.git; git log'; git reset --hard`,
+    `bash -c 'git reset --hard'; export GIT_DIR=${CLONE}/.git`,
+    `export GIT_DIR=${CLONE}/.git; GIT_DIR=${LANE}/.git git reset --hard`,
+    `GIT_DIR=${CLONE}/.git echo "$(git reset --hard)"`,
+  ])('ignores literal, later and command-local Git targets for lane mutations: %s', (command) => {
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+  });
+
+  it.each([
+    `export GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `GIT_WORK_TREE=${CLONE}; git clean -fd`,
+    `command env GIT_DIR=${CLONE}/.git git reset --hard`,
+    `export GIT_DIR=${CLONE}/.git; bash -c 'git reset --hard'`,
+    `bash -c 'export GIT_DIR=${CLONE}/.git; git reset --hard'`,
+    `command env GIT_DIR=${CLONE}/.git bash -c 'git reset --hard'`,
+    `command env GIT_WORK_TREE=${CLONE} bash -c 'git clean -fd'`,
+    `command export GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `GIT_DIR=${CLONE}/.git export GIT_DIR; git reset --hard`,
+    `declare -x GIT_DIR=${CLONE}/.git; git reset --hard`,
+    `eval 'export GIT_DIR=${CLONE}/.git'; git reset --hard`,
+    `eval "eval 'export GIT_DIR=${CLONE}/.git'"; git reset --hard`,
+    `{ export GIT_DIR=${CLONE}/.git; }; git reset --hard`,
+  ])('DENIES active exported, bare and wrapped Git targets: %s', (command) => {
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    `git -c core.worktree=${CLONE} reset --hard`,
+    `git -ccore.worktree=${CLONE} clean -fd`,
+    `git -c 'core.worktree=${CLONE}' reset --hard`,
+    `git -c CORE.WorkTree=${CLONE} reset --hard`,
+    `git -c core.worktree=../wev-review-daemon reset --hard`,
+    `git -c core.bare=false -c core.worktree=${CLONE} reset --hard`,
+    `TARGET=${CLONE} git --config-env=core.worktree=TARGET reset --hard`,
+    `env TARGET=${CLONE} git --config-env core.worktree=TARGET clean -fd`,
+    `export TARGET=${CLONE}; git --config-env=core.worktree=TARGET reset --hard`,
+    'git --config-env=core.worktree=MISSING_GUARD_TEST_TARGET reset --hard',
+  ])('DENIES configured worktree targets including unavailable env evidence: %s', (command) => {
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS configured worktrees outside daemon clones and configured worktree reads', () => {
+    expect(decide(`git -c core.worktree=${LANE} reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+    expect(decide(`git -c core.worktree=${CLONE} log`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+    expect(decide('git --config-env=core.worktree=TARGET reset --hard', {
+      cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { TARGET: LANE },
+    })).toBeNull();
+    expect(decide('git --config-env=core.worktree=TARGET reset --hard', {
+      cwd: LANE, daemonCloneRoots: roots, gitConfigEnv: { TARGET: CLONE },
+    })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('DENIES fetch that writes a local branch or uses --update-head-ok in a daemon clone', () => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --update-head-ok origin main:main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch origin +main:refs/heads/main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch origin 'refs/heads/*:refs/heads/*'`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git fetch -u origin main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git fetch --update-head-ok origin main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason('git fetch --depth 1 origin main:main', { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C /ws -C wev-review-daemon fetch origin main:main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS fetch in a daemon clone that writes no branch, and any fetch elsewhere', () => {
+    expect(daemonCloneWriteReason('git fetch origin main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch origin', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch --depth 1 origin main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch origin main:refs/remotes/origin/main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch origin +refs/heads/*:refs/remotes/origin/*', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch git@github.com:org/repo.git main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch github.com:org/repo.git main', { cwd: CLONE, roots })).toBeNull();
+    expect(daemonCloneWriteReason('git fetch --update-head-ok origin main:main', { cwd: LANE, roots })).toBeNull();
+  });
+
+  it.each(['clean', 'read-tree', 'checkout-index', 'gc', 'prune', 'repack'])(
+    'DENIES each additional state-changing git command in a daemon clone: %s', (sub) => {
+      expect(daemonCloneWriteReason(`git -C ${CLONE} ${sub}`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+      expect(decide(`git -C ${CLONE} ${sub}`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+      expect(daemonCloneWriteReason(`git ${sub}`, { cwd: LANE, roots })).toBeNull();
+    },
+  );
+
+  it.each([
+    'origin feature@v1:main',
+    "origin feature'@v1':main",
+    'origin feature\\@v1:main',
+    '-- origin feature@v1:main',
+    'git@host:org/repo.git "feature@v1:refs/heads/main"',
+    'host:org/repo.git +feature@v1:main',
+    '--repo=origin feature@v1:main',
+    '--repo origin feature@v1:main',
+    '--refm=refs/heads/*:refs/heads/* origin main',
+    '--refm refs/heads/*:refs/heads/* origin main',
+    '--update-he origin main',
+    '--stdin origin',
+  ])('DENIES branch-writing fetch variants after the repository: %s', (args) => {
+    expect(daemonCloneWriteReason(`git fetch ${args}`, { cwd: CLONE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(`git fetch ${args}`, { cwd: CLONE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    ['persisted branch mapping', ['+refs/heads/*:refs/heads/*']],
+    ['persisted unqualified branch mapping', ['feature@v1:main']],
+    ['a branch mapping after a safe mapping', ['+refs/heads/*:refs/remotes/origin/*', '+main:main']],
+    ['unreadable or incomplete configuration', null],
+  ])('DENIES fetch with %s', (_name, fetchConfig) => {
+    expect(daemonCloneWriteReason('git fetch origin main', { cwd: CLONE, roots, fetchConfig })).toMatch(/DAEMON CLONE/);
+    expect(decide('git fetch origin main', {
+      cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: () => fetchConfig,
+    })).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    'config remote.origin.fetch +main:main',
+    'config --add remote.origin.fetch +main:main',
+    'config set remote.origin.fetch +main:main',
+    'config --unset-all remote.origin.fetch',
+    'config --get --add remote.origin.fetch +main:main',
+    'config --rename-section remote.origin remote.other',
+    'config --edit',
+    'config edit',
+    'remote add upstream host:org/repo.git',
+    'remote set-branches origin main',
+    'remote set-url origin host:org/repo.git',
+    'remote update',
+    'remote prune origin',
+  ])('DENIES daemon-clone config/remote mutations: %s', (args) => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} ${args}`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(`git -C ${CLONE} ${args} && git -C ${CLONE} fetch origin`, {
+      cwd: LANE, daemonCloneRoots: roots,
+    })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git ${args}`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it.each([
+    'config remote.origin.url', 'config --local user.name',
+    'config --type=path remote.origin.url', 'config --file /tmp/guard-config user.name',
+    'config -- user.name',
+    'config --get remote.origin.fetch', 'config --get-all remote.origin.fetch',
+    'config --get-regexp remote.*.fetch', 'config --list', 'config get remote.origin.fetch',
+    'config list', 'config get --all remote.origin.fetch',
+    `config -f${CLONE}/config --get remote.origin.fetch`,
+    'remote', 'remote -v', 'remote get-url origin', 'remote show -n origin',
+  ])('ALLOWS daemon-clone config/remote reads: %s', (args) => {
+    expect(daemonCloneWriteReason(`git ${args}`, { cwd: CLONE, roots })).toBeNull();
+  });
+
+  it.each([
+    `git config --file ${CLONE}/config remote.origin.fetch +main:main`,
+    `git config --file=${CLONE}/config remote.origin.fetch +main:main`,
+    `git config --fil=${CLONE}/config remote.origin.fetch +main:main`,
+    `git config -f ${CLONE}/config remote.origin.fetch +main:main`,
+    `git config -f${CLONE}/config remote.origin.fetch +main:main`,
+    `GIT_CONFIG=${CLONE}/config git config remote.origin.fetch +main:main`,
+    `command env GIT_CONFIG=${CLONE}/config git config remote.origin.fetch +main:main`,
+    `GIT_CONFIG_GLOBAL=${CLONE}/config git config --global remote.origin.fetch +main:main`,
+    `GIT_CONFIG_SYSTEM=${CLONE}/config git config --system remote.origin.fetch +main:main`,
+    `git -C /ws config -f wev-review-daemon/config remote.origin.fetch +main:main`,
+  ])('DENIES explicit config-file writes from a lane: %s', (command) => {
+    expect(daemonCloneWriteReason(command, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(decide(command, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS explicit config-file reads and config writes to another lane', () => {
+    expect(daemonCloneWriteReason(`git config -f ${CLONE}/config --get remote.origin.fetch`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git config -f ${LANE}/config remote.origin.fetch +main:main`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('protects exported and inherited config-file targets without applying literals or future assignments', () => {
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    expect(decide(`export GIT_CONFIG=${CLONE}/config; git config remote.origin.fetch +main:main`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide('git config remote.origin.fetch +main:main', { ...ctx, gitConfigEnv: { GIT_CONFIG: `${CLONE}/config` } })).toMatch(/DAEMON CLONE/);
+    expect(decide(`git config remote.origin.fetch +main:main; export GIT_CONFIG=${CLONE}/config`, ctx)).toBeNull();
+    expect(decide(`echo GIT_CONFIG=${CLONE}/config; git config remote.origin.fetch +main:main`, ctx)).toBeNull();
+    expect(decide(`GIT_CONFIG=${CLONE}/config git log; git config remote.origin.fetch +main:main`, ctx)).toBeNull();
+  });
+
+  it.each(['refs/remotes/origin/main', 'refs/tags/v1', 'refs/custom/main', 'refs/remotes/origin/*', 'refs/tags/*', 'refs/custom/*'])(
+    'ALLOWS persisted and explicit non-branch fetch destinations: %s', (destination) => {
+      expect(daemonCloneWriteReason(`git fetch host:repo.git feature@v1:${destination}`, {
+        cwd: CLONE, roots, fetchConfig: [`+main:${destination}`],
+      })).toBeNull();
+    },
+  );
+
+  it('bounds the persisted-config read and preserves global git options without invoking a pager', () => {
+    const calls = [];
+    const spec = '+refs/heads/*:refs/heads/*';
+    const result = readDaemonFetchConfig('GIT_CONFIG=/decoy VALUE=+main:main git -C /ws -C repo --config-env=remote.origin.fetch=VALUE fetch origin', LANE, [], {},
+      (...args) => { calls.push(args); return `remote.origin.fetch\n${spec}\0`; });
+    expect(result).toEqual([spec]);
+    expect(calls[0][0]).toBe('git');
+    expect(calls[0][1]).toEqual(['-C', '/ws', '-C', 'repo', '--config-env=remote.origin.fetch=VALUE',
+      '--no-pager', 'config', '--null', '--get-regexp', '^remote\\..*\\.fetch$']);
+    expect(calls[0][2]).toMatchObject({ cwd: LANE, timeout: 2000, maxBuffer: 128 * 1024, env: { VALUE: '+main:main' } });
+    expect(calls[0][2].env).not.toHaveProperty('GIT_CONFIG');
+  });
+
+  it.each([
+    ['truncated record', () => 'remote.origin.fetch\n+main:main'],
+    ['malformed record', () => 'remote.origin.fetch\0'],
+    ['timeout', () => { throw Object.assign(new Error('timeout'), { status: null, signal: 'SIGTERM' }); }],
+    ['output overflow', () => { throw Object.assign(new Error('maxBuffer'), { code: 'ENOBUFS', stdout: 'partial' }); }],
+    ['invalid configuration', () => { throw Object.assign(new Error('invalid config'), { status: 128 }); }],
+    ['partial failed read', () => { throw Object.assign(new Error('partial'), { status: 1, stdout: 'partial' }); }],
+  ])('fails closed on a %s config read', (_name, run) => {
+    expect(readDaemonFetchConfig('git fetch origin', CLONE, [], {}, run)).toBeNull();
+  });
+
+  it('accepts an empty config result and no-match exit, and refuses an unmodelled inherited target', () => {
+    expect(readDaemonFetchConfig('git fetch origin', CLONE, [], {}, () => '')).toEqual([]);
+    expect(readDaemonFetchConfig('git fetch origin', CLONE, [], {}, () => {
+      throw Object.assign(new Error('no match'), { status: 1, stdout: '' });
+    })).toEqual([]);
+    let called = false;
+    expect(readDaemonFetchConfig('git fetch origin', LANE, [CLONE], {}, () => { called = true; return ''; })).toBeNull();
+    expect(called).toBe(false);
+    expect(decide('git fetch origin', {
+      cwd: CLONE, daemonCloneRoots: roots, daemonFetchConfigReader: () => { throw new Error('read failed'); },
+    })).toMatch(/DAEMON CLONE/);
+  });
+
+  it('removes unset tombstones from the config-reader process environment', () => {
+    readDaemonFetchConfig('git fetch origin', CLONE, [], { GIT_DIR: undefined, GIT_WORK_TREE: undefined }, (_git, _args, options) => {
+      expect(options.env).not.toHaveProperty('GIT_DIR');
+      expect(options.env).not.toHaveProperty('GIT_WORK_TREE');
+      return '';
+    });
+  });
+
+  it.each(['-C ', '--git-dir=', '--git-dir ', '--work-tree=', '--work-tree '])(
+    'fails closed before reading fetch config with unresolved global targets: %s', (option) => {
+      for (const target of ['$HOME/clone', '${HOME}/clone', '$TARGET/clone', '${TARGET}/clone']) {
+        let called = false;
+        expect(readDaemonFetchConfig(`git ${option}"${target}" fetch origin`, LANE, [], {}, () => {
+          called = true;
+          return '';
+        })).toBeNull();
+        expect(called).toBe(false);
+      }
+    },
+  );
+
+  it.each(['GIT_DIR', 'GIT_WORK_TREE'])(
+    'fails closed before reading fetch config with unresolved environment targets: %s', (key) => {
+      let called = false;
+      expect(readDaemonFetchConfig('git fetch origin', LANE, [], { [key]: '$HOME/clone' }, () => {
+        called = true;
+        return '';
+      })).toBeNull();
+      expect(called).toBe(false);
+      expect(decide(`export ${key}=$HOME/clone; git reset --hard`, {
+        cwd: LANE, daemonCloneRoots: roots,
+      })).toMatch(/DAEMON CLONE/);
+    },
+  );
+
+  it('DENIES clean, GIT_DIR/GIT_WORK_TREE env, attached -C, and configured/refmap branch-writing fetch', () => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} clean -fd`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`GIT_DIR=${CLONE}/.git GIT_WORK_TREE=${CLONE} git reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`env GIT_DIR=${CLONE}/.git git reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C${CLONE} reset --hard`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --refmap 'refs/heads/*:refs/heads/other/*' origin main`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -c 'remote.origin.fetch=+refs/heads/*:refs/heads/other/*' fetch origin`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --refmap=refs/heads/*:refs/remotes/origin/* origin main`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} config --get remote.origin.url`, { cwd: LANE, roots })).toBeNull();
+    expect(daemonCloneWriteReason(`git -C ${CLONE} remote -v`, { cwd: LANE, roots })).toBeNull();
+  });
+
+  it('DENIES attached -c, --repo= fetch, and GIT_DIR exported in an earlier segment', () => {
+    expect(daemonCloneWriteReason(`git -C ${CLONE} -cremote.origin.fetch=+main:refs/heads/other fetch origin`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    expect(daemonCloneWriteReason(`git -C ${CLONE} fetch --repo=origin main:refs/heads/other`, { cwd: LANE, roots })).toMatch(/DAEMON CLONE/);
+    const ctx = { cwd: LANE, daemonCloneRoots: roots };
+    expect(decide(`export GIT_DIR=${CLONE}/.git GIT_WORK_TREE=${CLONE} && git reset --hard`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide(`GIT_DIR=${CLONE}/.git; git clean -fd`, ctx)).toMatch(/DAEMON CLONE/);
+    expect(decide('export FOO=1 && git reset --hard', ctx)).toBeNull();
+  });
+
   it('reaches reason()/decide() — the real enforcement points, not just the pure predicate', () => {
     const ctx = { cwd: CLONE, daemonCloneRoots: roots };
     expect(reason('git reset --hard origin/main', ctx)).toMatch(/DAEMON CLONE/);
@@ -3686,12 +4353,131 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
   const runHook = (command, cwd, home) => {
     const res = execFileSync(process.execPath, [GUARD], {
       input: JSON.stringify({ tool_input: { command }, cwd }),
-      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home ? { HOME: home } : {}) },
+      env: { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, ...(home !== undefined ? { HOME: home } : {}) },
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'ignore'],
     }).trim();
     return res ? JSON.parse(res) : null;
   };
+
+  // Bare repository fixtures avoid modifying the checkout's .git or running any git mutation.
+  const configRepos = {};
+  for (const [name, config] of [
+    ['branch', '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n'],
+    ['tracking', '[remote "origin"]\nfetch = +refs/heads/*:refs/remotes/origin/*\n'],
+    ['broken', '[remote "origin"\nfetch = +main:main\n'],
+    ['included', '[include]\npath = fetch-config\n'],
+    ['worktree', '[core]\nrepositoryformatversion = 1\n[extensions]\nworktreeConfig = true\n'],
+  ]) {
+    const repo = join(fakeClone, name);
+    mkdirSync(join(repo, 'objects'), { recursive: true });
+    mkdirSync(join(repo, 'refs'), { recursive: true });
+    writeFileSync(join(repo, 'HEAD'), 'ref: refs/heads/main\n');
+    writeFileSync(join(repo, 'config'), config);
+    configRepos[name] = repo;
+  }
+  writeFileSync(join(configRepos.included, 'fetch-config'), '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n');
+  writeFileSync(join(configRepos.worktree, 'config.worktree'), '[remote "origin"]\nfetch = +refs/heads/*:refs/heads/*\n');
+
+  it.each(['included', 'worktree'])('DENIES fetch with %s branch mappings through the CLI', (name) => {
+    const command = `git -C ${configRepos[name]} fetch origin main`;
+    const out = runHook(command, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    // A failed reader also denies: prove the fixture is readable and contains the branch mapping.
+    expect(readDaemonFetchConfig(command, lane)).toEqual(['+refs/heads/*:refs/heads/*']);
+  });
+
+  it.each([
+    '-C ~/some-new-daemon-clone/tracking',
+    '--git-dir=~/some-new-daemon-clone/tracking',
+    '--git-dir ~/some-new-daemon-clone/tracking',
+    '-C ~/some-new-daemon-clone -C tracking',
+    '--git-dir=~/some-new-daemon-clone/tracking --work-tree=~/lane',
+    '--git-dir ~/some-new-daemon-clone/tracking --work-tree ~/lane',
+  ])('ALLOWS diagnostic fetch through home-spelled global targets: %s', (globals) => {
+    expect(runHook(`git ${globals} fetch origin main`, lane, root)).toBeNull();
+  });
+
+  it.each(['branch', 'broken'])('DENIES fetch through the CLI with %s persisted config', (name) => {
+    const out = runHook(`git -C ${configRepos[name]} fetch origin main`, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  it('ALLOWS fetch through the CLI with only remote-tracking persisted config', () => {
+    expect(runHook(`git -C ${configRepos.tracking} fetch origin main`, lane)).toBeNull();
+  });
+
+  it.each(['-C ', '--git-dir=', '--git-dir ', '--work-tree=', '--work-tree '])(
+    'DENIES unresolved HOME global targets through the CLI: %s', (option) => {
+      for (const home of ['$HOME', '${HOME}']) {
+        const suffix = option.startsWith('--git-dir') ? '/tracking' : '';
+        const command = `git ${option}"${home}/some-new-daemon-clone${suffix}" reset --hard`;
+        expect(runHook(command, lane, root)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      }
+    },
+  );
+
+  it('DENIES non-persisting subshell environment mutations through the CLI', () => {
+    for (const mutation of [`export GIT_DIR=${lane}/.git`, 'unset GIT_DIR']) {
+      const command = `export GIT_DIR=${fakeClone}/.git; (true; ${mutation}); git reset --hard`;
+      expect(runHook(command, lane, root)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    }
+  });
+
+  it('DENIES failed and transformed declaration reassignments through the CLI', () => {
+    for (const declaration of ['declare -i', 'typeset -a', 'declare -n', 'readonly -A']) {
+      const command = `export GIT_DIR=${fakeClone}/.git; ${declaration} GIT_DIR=/safe; git reset --hard`;
+      const out = runHook(command, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision, declaration).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason, declaration).toMatch(/DAEMON CLONE/);
+      expect(runHook(command.replace('git reset --hard', 'git log'), lane, root)).toBeNull();
+    }
+  });
+
+  it('DENIES mixed-case branch fetch destinations with readable safe config through the CLI', () => {
+    const command = `git -C ${configRepos.tracking} fetch origin main:refs/Heads/main`;
+    expect(readDaemonFetchConfig(command, lane)).toEqual(['+refs/heads/*:refs/remotes/origin/*']);
+    expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  it('reads fetch config through --git-dir and leading GIT_DIR, including earlier exports', () => {
+    for (const command of [
+      `git --git-dir=${configRepos.branch} fetch origin main`,
+      `GIT_DIR=${configRepos.branch} git fetch origin main`,
+      `export GIT_DIR=${configRepos.branch}; git fetch origin main`,
+    ]) expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision, command).toBe('deny');
+  });
+
+  it.each([
+    `git -c core.worktree=${fakeClone} reset --hard`,
+    `TARGET=${fakeClone} git --config-env=core.worktree=TARGET reset --hard`,
+    `export TARGET=${fakeClone}; git --config-env=core.worktree=TARGET reset --hard`,
+  ])('DENIES configured worktree targets at the real CLI boundary: %s', (command) => {
+    const out = runHook(command, lane);
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+  });
+
+  it.each([
+    `GIT_DIR=${fakeClone}/.git git log; git reset --hard`,
+    `echo GIT_WORK_TREE=${fakeClone}; git reset --hard`,
+    `git reset --hard; export GIT_DIR=${fakeClone}/.git`,
+    `bash -c 'export GIT_DIR=${fakeClone}/.git; git log'; git reset --hard`,
+  ])('ALLOWS unrelated lane writes at the real CLI boundary: %s', (command) => {
+    expect(runHook(command, lane)).toBeNull();
+  });
+
+  it('does not let GIT_CONFIG hide persisted branch mappings from the CLI', () => {
+    const command = `GIT_CONFIG=${configRepos.tracking}/config git -C ${configRepos.branch} fetch origin main`;
+    expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  it('DENIES explicit config-file mutation through the CLI from a lane', () => {
+    const command = `git config --file=${configRepos.tracking}/config --add remote.origin.fetch +main:main`;
+    expect(runHook(command, lane)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
 
   it('DENIES `cp` into the registry-discovered clone, run from a lane', () => {
     const out = runHook(`cp fix.md ${join(fakeClone, 'fix.md')}`, lane);
@@ -3711,6 +4497,117 @@ describe('#xpt9fvd — the guard-bash CLI protects a clone discovered via the da
 
   it('ALLOWS the sanctioned overlay CLI invoked with --clone=<path> from a lane', () => {
     expect(runHook(`node scripts/daemon-overlay.mjs add --clone=${fakeClone} --ref=lane/fix`, lane)).toBeNull();
+  });
+
+  describe('home-spelled git targets use the same normalization at the CLI boundary', () => {
+    const homeClone = join(root, 'workspace', 'wev-review-daemon');
+    mkdirSync(homeClone, { recursive: true });
+    writeFileSync(join(overlayDir, 'home-clone.json'), JSON.stringify({ clone: homeClone, overlays: [{ ref: 'lane/x', pr: null }] }));
+
+    it.each([
+      'git -C ~/workspace/wev-review-daemon reset --hard',
+      'GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard',
+      'env GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard',
+      'export GIT_DIR=~/workspace/wev-review-daemon/.git; git clean -fd',
+      'export GIT_DIR=~/workspace/../workspace/wev-review-daemon/.git && git reset --hard',
+    ])('DENIES %s', (command) => {
+      const out = runHook(command, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it('ALLOWS git -C ~/workspace/wev-review-daemon log', () => {
+      expect(runHook('git -C ~/workspace/wev-review-daemon log', lane, root)).toBeNull();
+    });
+
+    it('DENIES an exported bare ~ when HOME itself is a daemon clone', () => {
+      const out = runHook('export GIT_DIR=~; git reset --hard', lane, homeClone);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it.each([
+      `GIT_WORK_TREE=${homeClone} git reset --hard`,
+      'GIT_WORK_TREE=~/workspace/wev-review-daemon git clean -fd',
+      'export GIT_WORK_TREE=~/workspace/wev-review-daemon; git clean -fd',
+    ])('DENIES GIT_WORK_TREE alone: %s', (command) => {
+      const out = runHook(command, lane, root);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it.each([
+      `GIT_WORK_TREE=${homeClone} git status`,
+      'export GIT_WORK_TREE=~/workspace/wev-review-daemon; git log',
+    ])('ALLOWS reads with GIT_WORK_TREE alone: %s', (command) => {
+      expect(runHook(command, lane, root)).toBeNull();
+    });
+
+    it.each([
+      ['', 'export GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard'],
+      ['', 'git -C ~/workspace/wev-review-daemon reset --hard'],
+      ['relative-home', 'export GIT_WORK_TREE=~; git clean -fd'],
+      ['relative-home', `git -C ~ -C ${lane} reset --hard`],
+    ])('fails closed with unresolved HOME=%s: %s', (home, command) => {
+      const out = runHook(command, lane, home);
+      expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+    });
+
+    it('keeps reads allowed when a tilde target cannot be resolved', () => {
+      expect(runHook('export GIT_WORK_TREE=~; git log', lane, '')).toBeNull();
+    });
+
+    // Card xh6262p A4 at the hook JSON boundary: the hook process HOME is a different directory.
+    describe('DENIES tilde targets after an earlier HOME assignment', () => {
+      const hookHome = join(root, 'hook-home');
+      it.each(['-C ', '--git-dir ', '--git-dir=', '--work-tree ', '--work-tree='].flatMap((option) =>
+        ['', 'export '].map((prefix) => ({ option, prefix }))))('$prefix HOME then git $option', ({ option, prefix }) => {
+        const target = `~/workspace/wev-review-daemon${option.startsWith('--git-dir') ? '/.git' : ''}`;
+        const out = runHook(`${prefix}HOME=${root}; git ${option}${target} reset --hard`, lane, hookHome);
+        expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        expect(out?.hookSpecificOutput?.permissionDecisionReason).toMatch(/DAEMON CLONE/);
+        expect(runHook(`${prefix}HOME=${root}; git ${option}${target} log`, lane, hookHome)).toBeNull();
+      });
+
+      // [command, hook HOME, denied]. Bash: an env operand and a declaration argument see the HOME from
+      // before the statement; the export row is also denied because the left-to-right reading is kept.
+      it.each([
+        [`HOME=${root}; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
+        [`HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard`, hookHome, true],
+        [`env HOME=${hookHome} GIT_DIR=~/workspace/wev-review-daemon/.git git reset --hard`, root, true],
+        [`export HOME=${hookHome} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, root, true],
+        [`export HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git; git reset --hard`, hookHome, true],
+        [`env HOME=${root} GIT_DIR=~/workspace/wev-review-daemon/.git git log`, hookHome, false],
+        [`git -C ~/workspace/wev-review-daemon reset --hard; HOME=${root}`, hookHome, false],
+        // A leading `cd ~` the cd resolver cannot follow leaves the target unknown, not the literal `~` join.
+        [`read HOME <<< ${root}; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
+        [`HOME=${root}; HOME=/tmp export X=1; cd ~/workspace/wev-review-daemon && git reset --hard`, hookHome, true],
+        [`read HOME <<< ${root}; cd ~/workspace/wev-review-daemon && git status`, hookHome, false],
+        [`cd ~ && git status`, hookHome, false],
+        // Chains the simple cd resolver does not read still expand `~` when nothing touched HOME.
+        ['git status && cd ~/lane && git commit -m x', root, false],
+        ['git status && cd ~/workspace/wev-review-daemon && git reset --hard', root, true],
+        ['git status && cd "$HOME/workspace/wev-review-daemon" && git reset --hard', root, true],
+        // cd options never name the directory; a bare cd goes to HOME.
+        ['cd -P ~/workspace/wev-review-daemon && git reset --hard', root, true],
+        [`cd -- ${homeClone} && git reset --hard`, root, true],
+        [`HOME=${homeClone}; cd; git reset --hard`, hookHome, true],
+        [`HOME=${homeClone}; cd; git status`, hookHome, false],
+      ])('applies Bash HOME timing at the hook: %s', (command, home, denied) => {
+        const out = runHook(command, lane, home);
+        if (denied) expect(out?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        else expect(out).toBeNull();
+      });
+
+      it('reads fetch config through the same tracked HOME', () => {
+        const fetch = (name) => `git -C ~/some-new-daemon-clone/${name} fetch origin main`;
+        expect(readDaemonFetchConfig(fetch('branch'), lane, [], { HOME: root })).toEqual(['+refs/heads/*:refs/heads/*']);
+        expect(readDaemonFetchConfig(fetch('tracking'), lane, [], { HOME: root })).toEqual(['+refs/heads/*:refs/remotes/origin/*']);
+        expect(runHook(`HOME=${root}; ${fetch('branch')}`, lane, hookHome)?.hookSpecificOutput?.permissionDecision).toBe('deny');
+        expect(runHook(`HOME=${root}; ${fetch('tracking')}`, lane, hookHome)).toBeNull();
+      });
+    });
   });
   // These preserve main's single-directory behavior; the proposed shell strings are never executed.
   it.each([
