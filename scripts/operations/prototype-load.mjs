@@ -25,11 +25,11 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFp = null)
   if (input.testsRun?.trim() && /^NOT WEAKENED$/i.test(input.audit || '')) return { source: 'arguments', testsRun: input.testsRun };
   // R503: a record speaks for the live sha when it names it exactly, or its stored net-diff fingerprint equals the live one.
   // A rebase or merge of main that leaves the code alone therefore keeps the evidence; any code change does not.
-  const covers = (r) => r?.ref === input.branch && (r.sha === input.sha || carriesAcross(r.fingerprint, liveFp));
+  const covers = (r) => r?.ref === input.branch && (r.sha === input.sha || validSha(r.sha) && carriesAcross(r.fingerprint, liveFp));
   const record = records.find((r) => covers(r) && r.tests === 'green' && /^NOT WEAKENED$/i.test(r.audit || ''));
   if (record) return { source: 'ready-record', record };
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
-  const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
+  const binds = (e, r) => e.sha === r.sha && r.sha === input.sha || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
   const ruled = records.find((r) => covers(r) && r.tests === 'green' && r.audit === 'WEAKENED'
     && validSha(r.sha) && RULING.test(r.auditRuling || '')
     && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())

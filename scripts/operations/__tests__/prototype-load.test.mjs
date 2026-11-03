@@ -2055,6 +2055,12 @@ describe('readyEvidence fingerprint carry (R503)', () => {
   ])('%s refuses the carry', (_, entries) => {
     expect(prototypeLoad.readyEvidence([weak()], input, entries, FP)).toBeNull();
   });
+  it('carry keeps the sha for provenance: a record or entry without a valid originating sha never carries', () => {
+    expect(prototypeLoad.readyEvidence([green({ sha: undefined })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ sha: 'invalid' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak()], input, [entry({ sha: 'invalid' })], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak()], input, [entry({ sha: undefined })], FP)).toBeNull();
+  });
   it('the exact-sha path is unchanged without any fingerprint', () => {
     const r = weak({ sha: SHA, fingerprint: undefined });
     expect(prototypeLoad.readyEvidence([r], input, [entry({ sha: SHA, fingerprint: undefined })])).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
