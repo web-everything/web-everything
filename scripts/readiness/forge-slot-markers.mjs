@@ -206,37 +206,18 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     return at;
   }
   const idleFile = file => file + '.idle';
-  // A failed reset must never leave the old first-idle sample usable by ANY process. Fail closed, in order: delete the
-  // sample; else overwrite it; else persist a `.idle-void` marker (a different file) that makes every reader treat the
-  // sample as void and hold the slot; else (total I/O failure) hold in this instance. Nothing here is process-global.
-  const voidFile = file => file + '.idle-void';
-  const unpersisted = new Set();
+  // The release decision rests ONLY on this reaper's own live samples (kept in memory). The `.idle` sidecar is written
+  // best-effort for the alarm and age reporting and is never read back as evidence, so a stale or unreadable stamp from
+  // any process, or failing writes, can never cause a release.
+  const firstIdle = new Map();
   function resetIdle(entry) {
-    try { unlinkSync(idleFile(entry.file)); return; } catch (error) { if (error?.code === 'ENOENT') return; }
-    try { writeFileSync(idleFile(entry.file), '{}', {mode: 0o600}); return; } catch { /* try the void marker */ }
-    try { writeFileSync(voidFile(entry.file), JSON.stringify({key: entry.key}), {mode: 0o600}); }
-    catch {
-      // Nothing about the sample can be written. Quarantine the marker itself under a held name: it keeps blocking its
-      // slot for every process and is never released automatically (an operator clears it).
-      try { renameSync(entry.file, `${entry.file}.held-${randomBytes(8).toString('hex')}`); } catch { unpersisted.add(entry.key); }
-    }
-    log(`heavy-admission: idle sample reset failed for ${entry.name}; holding the slot until it is cleared\n`);
+    firstIdle.delete(entry.key);
+    try { unlinkSync(idleFile(entry.file)); } catch { /* advisory only */ }
   }
   function idleStamp(file, key, sampledAt) {
-    let voided = unpersisted.has(key);
-    try { if (JSON.parse(readFileSync(voidFile(file), 'utf8')).key === key) voided = true; }
-    catch (error) { if (error?.code !== 'ENOENT') voided = true; } // only a missing file proves there is no void marker
-    if (voided) {
-      // Hold: restart the window and clear the void only once both the fresh stamp and the cleanup are written.
-      try {
-        writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600});
-        try { unlinkSync(voidFile(file)); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
-        unpersisted.delete(key);
-      } catch { /* still void: held, retried next pass */ }
-      return sampledAt;
-    }
-    try { const saved = JSON.parse(readFileSync(idleFile(file), 'utf8')); if (saved.key === key && Number.isFinite(saved.sampledAt)) return saved.sampledAt; } catch { /* none yet */ }
-    try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* retried next pass */ }
+    if (firstIdle.has(key)) return firstIdle.get(key);
+    firstIdle.set(key, sampledAt);
+    try { writeFileSync(idleFile(file), JSON.stringify({key, sampledAt}), {mode: 0o600}); } catch { /* advisory only */ }
     return sampledAt;
   }
   function claimAndRemove(entry) {
@@ -257,7 +238,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     try { linkSync(tomb, entry.file); unlinkSync(tomb); } catch { /* the held tombstone stays and keeps blocking its slot */ }
     return false;
   }
-  const forget = (file, key) => { firstDead.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } try { unlinkSync(idleFile(file)); } catch { /* absent */ } try { unlinkSync(voidFile(file)); } catch { /* absent */ } };
+  const forget = (file, key) => { firstDead.delete(key); firstIdle.delete(key); try { unlinkSync(sidecar(file)); } catch { /* absent */ } try { unlinkSync(idleFile(file)); } catch { /* absent */ } };
   return {
     async step(getTelemetry, now = clock()) {
       let names;
@@ -306,11 +287,11 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
               // receipt. So the run must also have existed for the whole death-sample margin before that sample (both
               // stamps are Forge's clock): a run that old has its state on disk and would be counted if it were active.
               if (verdict === 'idle') {
+                // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample,
+                // taken by THIS reaper, that still reports zero active runs before releasing.
+                const first = idleStamp(entry.file, entry.key, sampledAt);
                 const started = Date.parse(telemetry.recent.find(item => item?.runId === entry.run)?.startedAtET);
                 if (!Number.isFinite(started) || sampledAt - started < DEATH_SAMPLE_MARGIN_MS) continue;
-                // The count can miss a concurrent prepared->running rename in ONE listing. Require a second, later sample
-                // that still reports zero active runs (first idle sample persisted beside the marker) before releasing.
-                const first = idleStamp(entry.file, entry.key, sampledAt);
                 if (sampledAt - first < idleConfirmMs) continue;
               }
             } else if (!evidence.complete || maybeOwnsInflight(telemetry, entry.at ?? entry.mtimeMs, diedBy)) continue;

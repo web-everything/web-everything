@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {describe, it, expect, afterEach} from 'vitest';
-import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync, statSync, chmodSync} from 'node:fs';
+import {readdirSync, readFileSync, mkdirSync, renameSync, mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync, statSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {lockDirFor} from '../file-locks.mjs';
@@ -188,38 +188,27 @@ describe('stale remote slot markers (perf10)', () => {
     });
     it('retains a young run across two idle samples (run-age guard alone) and releases at the margin', async () => {
       const young = mk();
-      seedIdle(young.root, S1 - 60_000);
-      expect(await young.reaper.step(tel(0, S1, [going(RUN_A, S1 - 89_999)]))).toEqual([]);
+      await young.reaper.step(tel(0, S1, [going(RUN_A, S1 - 10_000)]));
+      expect(await young.reaper.step(tel(0, S1 + 30_000, [going(RUN_A, S1 + 30_000 - 89_999)]))).toEqual([]);
       expect(names(young.root)).toEqual(['0']);
       const old = mk();
-      seedIdle(old.root, S1 - 60_000);
-      expect(await old.reaper.step(tel(0, S1, [going(RUN_A, S1 - 90_000)]))).toEqual(['slot-0.unconfirmed']);
+      await old.reaper.step(tel(0, S1, [going(RUN_A, S1 - 10_000)]));
+      expect(await old.reaper.step(tel(0, S1 + 30_000, [going(RUN_A, S1 + 30_000 - 90_000)]))).toEqual(['slot-0.unconfirmed']);
     });
-    it('retains the slot until the death-sample margin has passed, releasing at it', async () => {
+    it('ignores a sample taken before the death-sample margin and releases only on two samples after it', async () => {
       const {root, reaper} = mk();
-      seedIdle(root, NOW - 60_000);
       const recent = [going(RUN_A, NOW - 700_000)];
-      // first-seen-dead stamp is taken at clock() = NOW; a sample 1 ms short of the margin cannot speak for it
-      expect(await reaper.step(tel(0, NOW + 89_999, recent))).toEqual([]);
-      expect(await reaper.step(tel(0, NOW + 90_000, recent))).toEqual(['slot-0.unconfirmed']);
+      expect(await reaper.step(tel(0, NOW + 89_999, recent))).toEqual([]); // too early to speak for the death
+      expect(await reaper.step(tel(0, NOW + 119_999, recent))).toEqual([]); // this is the first usable idle sample
+      expect(await reaper.step(tel(0, NOW + 149_999, recent))).toEqual(['slot-0.unconfirmed']);
     });
-    it('resumes idle confirmation after recreating the reaper', async () => {
+    it('a recreated reaper needs its own two live samples and never releases on a predecessor stamp', async () => {
       const {root, reaper} = mk();
       expect(await reaper.step(tel(0, S1, [going(RUN_A)]))).toEqual([]);
       const second = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-      expect(await second.step(tel(0, S1 + 29_999, [going(RUN_A)]))).toEqual([]);
-      expect(await second.step(tel(0, S1 + 30_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
-    });
-    it('rejects a predecessor marker idle timestamp after recreating the reaper', async () => {
-      const {root, reaper} = mk();
-      await reaper.step(tel(0, S1, [going(RUN_A)]));
-      const file = join(root, 'slot-0.unconfirmed');
-      rmSync(file); rmSync(file + '.dead', {force: true});
-      writeFileSync(file, markerContent({owner: 'o2', pid: 111, nowMs: NOW - 500_000, host: 'forge', run: RUN_A}));
-      const t = (NOW - 500_000) / 1000; utimesSync(file, t, t);
-      const second = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-      expect(await second.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]); // successor starts its own window
+      expect(await second.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]);
       expect(names(root)).toEqual(['0']);
+      expect(await second.step(tel(0, S1 + 61_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
     });
     it.each([
       ['a failed probe', async () => { throw new Error('ssh down'); }],
@@ -232,16 +221,6 @@ describe('stale remote slot markers (perf10)', () => {
       expect(await reaper.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]); // new window began here
       expect(names(root)).toEqual(['0']);
       expect(await reaper.step(tel(0, S1 + 61_000, [going(RUN_A)]))).toEqual(['slot-0.unconfirmed']);
-    });
-    it('restarts idle confirmation even when deleting the stale idle sample fails', async () => {
-      const {root, reaper} = mk();
-      await reaper.step(tel(0, S1, [going(RUN_A)]));
-      chmodSync(root, 0o500); // unlink of the sidecar now fails with EACCES
-      try { await reaper.step(async () => null); } finally { chmodSync(root, 0o700); }
-      const recreated = createMarkerReaper({root, host: 'forge', clock: () => NOW, liveness: liveness([111])});
-      expect(await recreated.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]); // neutralised on disk, not just in memory
-      expect(await reaper.step(tel(0, S1 + 31_000, [going(RUN_A)]))).toEqual([]);
-      expect(names(root)).toEqual(['0']);
     });
     it('logs a complete structured record for every released slot', async () => {
       const root = setup({0: {pid: 111, run: RUN_A}, 1: {pid: 112, run: RUN_B}});
