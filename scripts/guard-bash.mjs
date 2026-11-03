@@ -2421,37 +2421,17 @@ function daemonWrapperUncertain(segment) {
   return false;
 }
 
-// Push options whose VALUE steers where the push goes (remote, helper program): an expansion there is as unresolved as
-// one in a positional remote/refspec. Other option values (`--push-option`, `--force-with-lease=`, `-o`) do not pick a ref.
-const PUSH_TARGET_OPTIONS = new Set(['--repo', '--receive-pack', '--exec', '--mirror', '--all', '--tags', '--delete', '--prune']);
+// Exact, whole-token spellings in which a `$VAR` cannot pick the push destination: a push-option value that is ONE
+// double-quoted simple variable (no word splitting, nothing glued to it), or a redirect target (a redirect word is
+// never split). Matched on the RAW text and removed; ANY other `$`/backtick left over (unquoted, partly quoted,
+// ANSI-C `$'..'`, command substitution, positional remote/refspec, --repo/--receive-pack/--exec) stays denied.
+const PUSH_SAFE_EXPANSION = /(?:^|\s)(?:--push-option=|--push-option\s+|-o\s+)"\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)"(?=\s|$)|(?:^|\s)\d*>>?\s*"?\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)"?(?=\s|$)/g;
 
-/** Does a `git push` carry a `$`/backtick expansion where it can choose the destination? Pure. A redirect target
- *  (`2>"$LOG"`) or an unrelated option value (`--push-option="$X"`) is not a destination; an unknown option stays
- *  fail-closed, as does a command substitution that spans tokens. */
+/** Does a `git push` carry a `$`/backtick expansion where it can choose the destination? Pure, structural:
+ *  strip the two exact harmless spellings above, then any remaining `$`/backtick fails closed. */
 function pushHasUnresolvedTarget(command) {
   if (!/[$`]/.test(command)) return false;
-  const toks = shellTokens(command);
-  if (toks.some((t) => t.op && /[`]|\$\(/.test(t.text ?? ''))) return true;
-  const words = [];
-  for (let k = 0; k < toks.length; k += 1) {
-    if (toks[k].op) { if (/^\d*[<>]/.test(toks[k].text ?? '') && !/[`$]/.test(toks[k].text)) k += 1; continue; } // redirect target
-    // An UNQUOTED expansion word-splits into extra arguments (`--push-option=$X` with X="a HEAD:refs/heads/main"),
-    // so only a quoted one is a single, non-destination value.
-    words.push(/[$`]/.test(toks[k].text) && !toks[k].quoted ? `${toks[k].text}` + '\u0000split' : toks[k].text);
-  }
-  const at = words.indexOf('push');
-  if (at < 0) return true;
-  const args = words.slice(at + 1);
-  for (let i = 0; i < args.length; i += 1) {
-    const a = args[i];
-    if (!/[$`]/.test(a)) continue;
-    if (!a.startsWith('-')) return true; // positional remote/refspec
-    const name = a.replace(/=.*$/s, '');
-    if (a.endsWith('\u0000split')) return true; // unquoted: may split into a refspec
-    if (PUSH_TARGET_OPTIONS.has(name)) return true;
-    if (!['--push-option', '-o', '--force-with-lease', '--signed', '--recurse-submodules'].includes(name)) return true;
-  }
-  return false;
+  return /[$`]/.test(String(command).replace(PUSH_SAFE_EXPANSION, ' '));
 }
 
 // Separate from GIT_STATE_SUBCOMMANDS: new commands and aliases default to denied at protected targets.

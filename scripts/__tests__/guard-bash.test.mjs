@@ -1076,7 +1076,6 @@ describe('guard-bash — direct-push-to-main block (#2203)', () => {
   it('ALLOWS a lane/* push whose expansion is only a redirect target or a non-destination option value (#6262)', () => {
     allowed('git push origin HEAD:refs/heads/lane/x --push-option="$OPT"');
     allowed('git push origin HEAD:refs/heads/lane/x 2>"$LOG"');
-    allowed('git push origin HEAD:refs/heads/lane/x --force-with-lease="lane/x:$SHA"');
   });
   it('still blocks a push whose remote, refspec or helper program is an unresolved expansion (#6262)', () => {
     const unresolved = (c) => expect(decide(c), c).toMatch(/unresolved git push arguments/);
@@ -1088,6 +1087,11 @@ describe('guard-bash — direct-push-to-main block (#2203)', () => {
     unresolved('git push origin HEAD:refs/heads/lane/x --receive-pack="$X"');
     unresolved('git push origin HEAD:refs/heads/lane/x --unknown="$X"');
     unresolved('git push origin HEAD:refs/heads/lane/x --push-option=$X'); // unquoted: word-splits into a refspec
+    unresolved('git push origin HEAD:refs/heads/lane/a --push-option=""$X'); // partly quoted
+    unresolved('git push origin HEAD:refs/heads/lane/a --push-option="$X"""');
+    unresolved("git push origin HEAD:refs/heads/lane/a $'HEAD:refs/heads/m\\x61in'"); // ANSI-C quoting
+    unresolved('git push origin HEAD:refs/heads/lane/a --push-option="a$X"');
+    unresolved('git push origin HEAD:refs/heads/lane/a --force-with-lease="lane/a:$SHA"');
   });
   it('ALLOWS a lane/* push (the sanctioned path — PR-gated)', () => {
     allowed('git push origin HEAD:refs/heads/lane/foo-2210');
