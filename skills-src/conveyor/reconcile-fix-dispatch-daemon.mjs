@@ -74,7 +74,7 @@ import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs';
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
-import { unlinkSync } from 'node:fs';
+import { unlinkSync, readdirSync, statSync } from 'node:fs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
 import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
@@ -763,14 +763,21 @@ export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThr
   return map;
 }
 
+/** Names + sizes + mtimes of every settings file: any edit during a pass changes it. */
+function defaultSettingsStamp(dir = resolve(DAEMON_REPO_ROOT, 'scripts', 'settings')) {
+  return readdirSync(dir).sort().map((name) => { const st = statSync(resolve(dir, name)); return `${name}:${st.size}:${st.mtimeMs}`; }).join('|');
+}
+
 /**
  * Default live probe for claims and sessions: `claim:<repo>:<pr>` for every live fix/ci-heal claim, and
- * `agent:<id>` for every live agent session (the planner's liveness gate reads these), and `mainred:` for the published main-red records.
+ * `agent:<id>` for every live agent session (the planner's liveness gate reads these), `mainred:` for the published main-red records, and `settings:` for the policy files.
  */
-export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()), readMainRed = () => [readMainRedPriority(), readMainRedState()] } = {}) {
-  const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
+export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()), readMainRed = () => [readMainRedPriority(), readMainRedState()], readSettingsStamp = defaultSettingsStamp } = {}) {
+  const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}:${c.meta.kind}`));
   // The published main-red records feed the planner's main-fix holds (`mainFixHeldFor`): any change drops every row.
   out.add(`mainred:${JSON.stringify(readMainRed())}`);
+  // Policy files read by the planner (join wait, round caps, ...): an edit mid-pass changes the gates.
+  out.add(`settings:${readSettingsStamp()}`);
   const agents = readAgents();
   if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
   // The WHOLE enriched session record is the key (identity, cwd, lane HEAD, pid liveness, hung / idle / self-reported
@@ -813,7 +820,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
       if (baseline.claims.has(key)) continue;
       // A session that appeared since the plan could bind to any PR: the liveness gate must be re-run, so every row is stale.
       if (!key.startsWith('claim:')) return 'all';
-      stale.add(Number(key.split(':').pop()));
+      stale.add(Number(key.split(':')[2]));
     }
     return stale;
   };

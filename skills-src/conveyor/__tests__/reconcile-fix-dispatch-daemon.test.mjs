@@ -1870,7 +1870,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
 
   it('drops rows for a PR that gained a live fix claim after the plan was made', async () => {
     let reads = 0;
-    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set() : new Set(['claim:repo-a:8'])) });
+    const plan = await readBack({ readPlanClaimSet: () => (reads++ < 1 ? new Set() : new Set(['claim:repo-a:8:fix'])) });
     expect(plan.dispatch).toEqual([{ kind: 'ci-heal', prNumber: 7 }]);
   });
 
@@ -1929,5 +1929,16 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     const plan = await readBack({ readPlanClaimSet: () => new Set([reads++ < 1 ? 'mainred:[null,null]' : 'mainred:[{"pr":3},null]']) });
     expect(plan.dispatch).toEqual([]);
     expect([...readPlanClaims({ readAgents: () => [], readMainRed: () => [{ pr: 3 }, null] })]).toContain('mainred:[{"pr":3},null]');
+  });
+
+  it('claim keys keep the claim kind, and an edited policy file drops every row', async () => {
+    const keys = [...readPlanClaims({ readAgents: () => [], readMainRed: () => [null, null], readSettingsStamp: () => 's1' })];
+    expect(keys).toContain('settings:s1');
+    let reads = 0;
+    const plan = await readBack({ readPlanClaimSet: () => new Set([`settings:${reads++ < 1 ? 's1' : 's2'}`]) });
+    expect(plan.dispatch).toEqual([]);
+    let n = 0;
+    const kind = await readBack({ readPlanClaimSet: () => new Set(['claim:repo-a:7:fix', ...(n++ < 1 ? [] : ['claim:repo-a:7:fixing'])]) });
+    expect(kind.dispatch).toEqual([{ kind: 'promote-draft', prNumber: 8 }]);
   });
 });
