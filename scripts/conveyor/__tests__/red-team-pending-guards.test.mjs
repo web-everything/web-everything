@@ -115,21 +115,22 @@ describe('shared head budget and additional restart ceiling', () => {
   const record = (it, phase = 'would-do') => ({ ...it, phase, ts: new Date(NOW - 60_000).toISOString() });
   const restarts = [1, 2].map(n => item('restart-red-team', `restart-${n}`));
   const ordinary = [item('ask-review-daemon'), item('tooling-card')];
-  it.each(['would-do', 'intent', 'current pass'])('ordinary actions at the shared ceiling block restarts with %s evidence', source => {
-    const extra = item('publish-red-team-result');
-    const result = planStallActions(source === 'current pass' ? [...ordinary, extra, ...restarts] : [extra, ...restarts], {
-      now: NOW, limits, history: source === 'current pass' ? [] : ordinary.map(it => record(it, source)),
+  // R452: two restarts per head are a separate, restart-specific budget; the shared ceiling (1) is unchanged for every other action.
+  const shared = { ...limits, maxActionsPerPrHead: 1 };
+  it.each(['would-do', 'intent', 'current pass'])('R452: ordinary actions at the shared ceiling do not block restarts, with %s evidence', source => {
+    const result = planStallActions(source === 'current pass' ? [ordinary[0], ...restarts] : restarts, {
+      now: NOW, limits: shared, history: source === 'current pass' ? [] : [record(ordinary[0], source)],
     });
-    expect(result.act).toEqual(source === 'current pass' ? ordinary : []);
-    expect(result.held).toEqual([extra, ...restarts].map(it => ({ ...it, held: 'per-PR-head cap' })));
+    expect(result.act).toEqual(source === 'current pass' ? [ordinary[0], ...restarts] : restarts);
+    expect(result.held).toEqual([]);
   });
-  it.each(['would-do', 'intent', 'current pass'])('restarts spend the shared budget with %s evidence', source => {
+  it.each(['would-do', 'intent', 'current pass'])('R452: restarts do not spend the shared budget, but a second ordinary action on the head is still refused, with %s evidence', source => {
     const extra = item('publish-red-team-result');
-    const result = planStallActions(source === 'current pass' ? [...restarts, ...ordinary, extra] : [...ordinary, extra], {
-      now: NOW, limits, history: source === 'current pass' ? [] : restarts.map(it => record(it, source)),
+    const result = planStallActions(source === 'current pass' ? [...restarts, ordinary[0], ordinary[1], extra] : [ordinary[0], ordinary[1], extra], {
+      now: NOW, limits: shared, history: source === 'current pass' ? [] : restarts.map(it => record(it, source)),
     });
-    expect(result.act).toEqual(source === 'current pass' ? restarts : []);
-    expect(result.held).toEqual([...ordinary, extra].map(it => ({ ...it, held: 'per-PR-head cap' })));
+    expect(result.act).toEqual(source === 'current pass' ? [...restarts, ordinary[0]] : [ordinary[0]]);
+    expect(result.held).toEqual([ordinary[1], extra].map(it => ({ ...it, held: 'per-PR-head cap' })));
   });
   it.each(['would-do', 'intent', 'current pass'])('restart ceiling is independent of ordinary count with %s evidence', source => {
     const next = item('restart-red-team', 'restart-3');
