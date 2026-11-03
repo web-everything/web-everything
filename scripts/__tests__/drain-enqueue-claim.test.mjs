@@ -23,12 +23,25 @@ describe('per-PR enqueue claims', () => {
     for (const result of results.filter(r => !r.won)) expect(result).toMatchObject({ reason: 'held', heldBy: { pid: 1, kind: 'serial' } });
   });
 
-  it('reclaims expired or dead-owner claims but holds fresh live claims at the TTL boundary', () => {
+  it('holds live owners beyond ttlMs through the default 60-minute hard cap, then reclaims', () => {
     const dir = temp();
     claim(make(dir));
-    expect(claim(make(dir, { now: () => 600_100 }))).toMatchObject({ won: false, reason: 'held' });
-    expect(claim(make(dir, { now: () => 600_101 }))).toMatchObject({ won: true });
-    expect(claim(make(dir, { now: () => 600_102, pidAlive: () => false }))).toMatchObject({ won: true });
+    expect(claim(make(dir, { now: () => 600_101 }))).toMatchObject({ won: false, reason: 'held' });
+    expect(claim(make(dir, { now: () => 3_600_100 }))).toMatchObject({ won: false, reason: 'held' });
+    expect(claim(make(dir, { now: () => 3_600_101 }))).toMatchObject({ won: true });
+  });
+
+  it('reclaims a live owner past an injected hard cap', () => {
+    const dir = temp();
+    claim(make(dir));
+    expect(claim(make(dir, { now: () => 1100, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: false, reason: 'held' });
+    expect(claim(make(dir, { now: () => 1101, ttlMs: 10, hardTtlMs: 1000 }))).toMatchObject({ won: true });
+  });
+
+  it('reclaims a dead owner immediately before either TTL expires', () => {
+    const dir = temp();
+    claim(make(dir));
+    expect(claim(make(dir, { pidAlive: () => false }))).toMatchObject({ won: true });
   });
 
   it('keys repository, PR number and new head independently', () => {
@@ -155,9 +168,13 @@ describe('per-PR enqueue claims', () => {
     expect(readdirSync(dir)).toEqual([`${filename(candidate)}.lock`]);
   });
 
-  it.each(['{broken', 'null', '{}', '{"state":"claimed","pid":0}'])('reclaims corrupt or invalid records: %s', source => {
+  it.each(['{broken', 'null', '{}', '{"state":"claimed","pid":0}'])('holds fresh corrupt or invalid records and reclaims only past ttlMs: %s', source => {
     const dir = temp(); const path = join(dir, filename(candidate)); writeFileSync(path, source);
-    const result = claim(make(dir));
+    utimesSync(path, new Date(1000), new Date(1000));
+    expect(claim(make(dir, { now: () => 1999, ttlMs: 1000 }))).toEqual({ won: false, reason: 'unreadable-record' });
+    expect(claim(make(dir, { now: () => 2000, ttlMs: 1000 }))).toEqual({ won: false, reason: 'unreadable-record' });
+    expect(readFileSync(path, 'utf8')).toBe(source);
+    const result = claim(make(dir, { now: () => 2001, ttlMs: 1000 }));
     expect(result.won).toBe(true);
     expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ state: 'claimed', token: result.token });
   });
@@ -175,9 +192,35 @@ describe('per-PR enqueue claims', () => {
     expect(claim(make(dir, { pidAlive: undefined }))).toMatchObject({ won: false, reason: 'held' });
   });
 
-  it('throws record IO errors distinctly from corrupt records and lock-busy', () => {
+  it('holds a fresh unreadable record rather than throwing a storage fault', () => {
     const dir = temp(); mkdirSync(join(dir, filename(candidate)));
-    expect(() => claim(make(dir))).toThrow(expect.objectContaining({ code: 'EISDIR' }));
+    expect(claim(make(dir))).toEqual({ won: false, reason: 'unreadable-record' });
+  });
+
+  it('reclaims an unreadable file only after its mtime TTL expires', () => {
+    const dir = temp(); const path = join(dir, filename(candidate));
+    writeFileSync(path, 'unreadable'); utimesSync(path, new Date(1000), new Date(1000));
+    const program = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { createEnqueueClaims } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/drain-enqueue-claim.mjs')).href)};
+      const read = fs.readFileSync;
+      fs.readFileSync = function(path, ...args) {
+        if (path === ${JSON.stringify(path)}) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        return read.call(this, path, ...args);
+      };
+      syncBuiltinESMExports();
+      let clock = 2000;
+      const claims = createEnqueueClaims({ dir: ${JSON.stringify(dir)}, now: () => clock, ttlMs: 1000 });
+      const candidate = ${JSON.stringify({ ...candidate, kind: 'serial' })};
+      const fresh = claims.claim(candidate);
+      clock = 2001;
+      console.log(JSON.stringify([fresh, claims.claim(candidate)]));
+    `;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', program], { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([{ won: false, reason: 'unreadable-record' }, { won: true, token: expect.any(String) }]);
+    expect(JSON.parse(readFileSync(path, 'utf8')).state).toBe('claimed');
   });
 
   it('property: serial enqueue lists are identical with claims enabled or disabled', () => {
@@ -205,6 +248,17 @@ describe('per-PR enqueue claims', () => {
 
 describe('serial enqueue claim diagnostics', () => {
   const warning = op => `drain-enqueue-claim: ${op} failed for owner/repo#7@head-a: broken storage — proceeding fail-open\n`;
+
+  it('warns on initialization failure at the serial call site and leaves claims disabled', () => {
+    const source = readFileSync(join(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
+    const start = source.indexOf('try { enqueueClaims = createEnqueueClaims(); }');
+    const end = source.indexOf('    try {\n      asyncShadow', start);
+    expect(start).toBeGreaterThan(-1); expect(end).toBeGreaterThan(start);
+    const stderr = { write: vi.fn() };
+    const initialize = new Function('createEnqueueClaims', 'process', `let enqueueClaims; ${source.slice(start, end)}; return enqueueClaims;`);
+    expect(initialize(() => { throw new Error('broken\nstorage'); }, { stderr })).toBeUndefined();
+    expect(stderr.write.mock.calls).toEqual([['drain-enqueue-claim: initialization failed: broken storage — proceeding fail-open\n']]);
+  });
 
   it('still enqueues and warns once with a daemon event when claim throws', () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);

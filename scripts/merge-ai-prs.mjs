@@ -6677,7 +6677,10 @@ async function runCli() {
   let asyncShadow;
   let enqueueClaims;
   if (!AS_JSON && !DRY_RUN) {
-    try { enqueueClaims = createEnqueueClaims(); } catch { /* Claims fail open for the serial pass. */ }
+    try { enqueueClaims = createEnqueueClaims(); } catch (error) {
+      const message = String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+      process.stderr.write(`drain-enqueue-claim: initialization failed: ${message} — proceeding fail-open\n`);
+    }
     try {
       asyncShadow = createAsyncShadow();
       // A dependency-held candidate may not have reached ready ordering. Never trigger a label read for telemetry.
