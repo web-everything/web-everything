@@ -3873,7 +3873,6 @@ clearing as a false-positive proof of detector completeness.
 
 `lane-pool release` checks HEAD and every local branch against origin remote-tracking refs (excluding
 `origin/HEAD`, `origin/ops/*`, and all non-origin remotes) after known-litter cleanup and salvage. A
-best-effort origin prune fetch runs first with a 20-second bound; failures are logged and tolerated.
 Untracked files deliberately do not block release: the guard covers tracked changes only.
 URL-based salvage may leave no tracking ref: only its verified
 remote SHA is an additional exclusion, and unrelated local branches still block release. Tests that
