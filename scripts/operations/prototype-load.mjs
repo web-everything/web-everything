@@ -48,7 +48,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true) {
 }
 /** Include BOTH sides of renames/copies; NUL output preserves whitespace and quoted paths. */
 /** Resolve a worker-supplied daemon name to its settings key (R502 item 1: workers guessed wrong 3 times).
- * Accepts: the key, its launchd label (with or without the com.we./com.plateau. prefix and -daemon suffix), and the explicit
+ * Accepts: the key, its launchd label (exact, or with the com.we./com.plateau. prefix removed), and the explicit
  * `daemonAliases` table (clone dir names live there: a generic basename like `code` must never self-select). An exact key always wins. More than one candidate key is
  * `ambiguous` and refused, never guessed. Returns { key } or { reason: 'unknown'|'ambiguous', valid, candidates? }. */
 export function resolveDaemonKey(daemons = {}, aliases = {}, name = '') {
@@ -58,7 +58,7 @@ export function resolveDaemonKey(daemons = {}, aliases = {}, name = '') {
   const found = new Set();
   for (const [key, d] of Object.entries(daemons)) {
     const names = new Set();
-    if (d?.label) { names.add(d.label); const bare = d.label.replace(/^com\.(?:we|plateau)\./, ''); names.add(bare); names.add(bare.replace(/-daemon$/, '')); names.add(`${bare}-daemon`); }
+    if (d?.label) { names.add(d.label); const bare = d.label.replace(/^com\.(?:we|plateau)\./, ''); names.add(bare); }
     if (names.has(name)) found.add(key);
   }
   const explicit = aliases && Object.hasOwn(aliases, name) ? aliases[name] : null;
