@@ -28,7 +28,8 @@ function sameSpot(a, b) {
   // Fail closed: a missing line on either side is not the same spot.
   const pos = (n) => Number.isInteger(n) && n > 0;
   return pos(a.line) && pos(b.line) && a.line === b.line
-    && a.verdict === b.verdict && a.impactIfUnfixed === b.impactIfUnfixed;
+    && a.verdict === b.verdict && a.impactIfUnfixed === b.impactIfUnfixed
+    && (a.failure_scenario ?? '') === (b.failure_scenario ?? '') && (a.reproCommand ?? '') === (b.reproCommand ?? '');
 }
 
 const rawClaim = (f) => String(f?.summary ?? '');

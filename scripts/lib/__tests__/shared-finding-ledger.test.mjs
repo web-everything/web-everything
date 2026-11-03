@@ -404,3 +404,12 @@ describe('audit round 12 hardening', () => {
     expect(renderOpenForBrief(p, { pinStillHolds: () => true })).toContain(SUMMARY);
   });
 });
+
+describe('audit round 13 hardening', () => {
+  it('a different failure scenario or repro is a different counterexample', () => {
+    const a = finding({ failure_scenario: 'GET /login without token returns 200' });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [finding({ failure_scenario: 'GET /admin without token returns 200' })], { pinStillHolds: () => true }).dropped).toEqual([]);
+    expect(filterReraises(l, [{ ...a }], { pinStillHolds: () => true }).dropped).toHaveLength(1);
+  });
+});
