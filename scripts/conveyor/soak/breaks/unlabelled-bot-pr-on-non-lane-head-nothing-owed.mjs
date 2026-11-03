@@ -14,6 +14,7 @@ export default {
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { planReconcile } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
+    const { mapGraphqlPr } = await import(pathToFileURL(join(root, 'scripts/lib/pr-list-paged.mjs')).href);
     const pr = { number: 6254, state: 'OPEN', headRefName: 'ci/refresh-test-timings', headRefOid: 'f81bcb488ef9fdb3a38ea92fac80830b17753b69',
       author: { login: 'app/web-everything', is_bot: true }, isDraft: false, labels: [], comments: [], mergeStateStatus: 'CLEAN',
       statusCheckRollup: ['test', 'smoke', 'daemon-soak'].map(done) };
@@ -22,6 +23,17 @@ export default {
     const violations = [];
     if (!plan.dispatch.some((d) => d.prNumber === 6254 && d.kind === 'restore-review-label')) {
       violations.push(`PR #6254 (open, green, bot, no review label) was not owed a label: ${JSON.stringify(plan.refusals.map((r) => r.kind))}`);
+    }
+    // PR #6296 red-team: the real paged mapper exposes StatusContext.createdAt as startedAt.
+    const mapped = mapGraphqlPr({ commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
+      done('test'), { __typename: 'StatusContext', context: 'external-ci', state: 'SUCCESS', createdAt: '2026-11-02T15:20:00Z' },
+    ] } } } }] } });
+    for (const now of ['2026-11-02T16:20:00Z', '2026-11-03T16:20:00Z']) {
+      const mixed = planReconcile({ prs: [{ ...pr, statusCheckRollup: mapped.statusCheckRollup }], agents: [], durableCounts: {},
+        now: Date.parse(now), requiredChecks: ['test'] });
+      if (!mixed.dispatch.some((d) => d.prNumber === 6254 && d.kind === 'restore-review-label' && d.label === 'review:pending')) {
+        violations.push(`Successful optional StatusContext still prevents review restoration at ${now}`);
+      }
     }
     return { violations };
   },

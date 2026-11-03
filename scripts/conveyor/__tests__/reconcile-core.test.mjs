@@ -29,6 +29,7 @@
  *   say when.
  */
 import { describe, it, expect } from 'vitest';
+import { mapGraphqlPr } from '../../lib/pr-list-paged.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
   staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
@@ -36,6 +37,7 @@ import {
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
   ACCEPT_LABEL_GRACE_MS, acceptLabelDropped, CARD_BATCH_EXTRACT_WIRED, BLOCKED_CANCELLED_RERUN_CAP,
+  greenSettledForRestoreGrace, RESTORE_REVIEW_LABEL_GRACE_MS,
 } from '../reconcile-core.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
@@ -3977,6 +3979,34 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
   it('a non-lane bot PR with no readable check timestamps is not settled (strict grace)', () => {
     const p = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: greenRollup.map(({ completedAt, ...c }) => c) });
     expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
+  });
+  it.each([
+    ['old success', 'SUCCESS', NOW - HOUR, true],
+    ['at grace boundary', 'SUCCESS', NOW - RESTORE_REVIEW_LABEL_GRACE_MS, true],
+    ['before grace boundary', 'SUCCESS', NOW - RESTORE_REVIEW_LABEL_GRACE_MS + 1, false],
+    ['future success', 'SUCCESS', NOW + HOUR, false],
+    ['missing timestamp', 'SUCCESS', undefined, false],
+    ['invalid timestamp', 'SUCCESS', 'unreadable', false],
+    ['pending status', 'PENDING', NOW - HOUR, false],
+    ['failed status', 'FAILURE', NOW - HOUR, false],
+  ])('mapped optional StatusContext: %s', (_name, state, timestamp, owed) => {
+    const createdAt = typeof timestamp === 'number' ? new Date(timestamp).toISOString() : timestamp;
+    const mapped = mapGraphqlPr({
+      headRefName: 'ci/x', author: { login: 'external-app', __typename: 'Bot' },
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
+        { __typename: 'CheckRun', name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: new Date(NOW - HOUR).toISOString() },
+        { __typename: 'StatusContext', context: 'external-ci', state, createdAt },
+      ] } } } }] },
+    });
+    const pr = open({ headRefName: mapped.headRefName, author: mapped.author, statusCheckRollup: mapped.statusCheckRollup });
+    const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch.some((d) => d.kind === 'restore-review-label' && d.label === 'review:pending')).toBe(owed);
+  });
+  it.each(['CheckRun', undefined])('strict grace never substitutes startedAt for a %s completion', (__typename) => {
+    const check = { __typename, name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: new Date(NOW - HOUR).toISOString() };
+    for (const completedAt of [undefined, 'unreadable']) {
+      expect(greenSettledForRestoreGrace([{ ...check, completedAt }], NOW, undefined, { strict: true })).toBe(false);
+    }
   });
   it('a non-lane bot PR with ONE old and one timestamp-less green check is not settled (strict grace)', () => {
     const rollup = [{ ...greenRollup[0], completedAt: new Date(NOW - 30 * 60_000).toISOString() }, { ...greenRollup[0], name: 'other' }];

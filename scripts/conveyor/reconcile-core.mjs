@@ -2072,10 +2072,13 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
  *  `review:pending` that would hold an auto-landing PR for a review it does not need. */
 export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
-/** True when the newest completed check finished at least the grace ago (or no timestamp is readable). */
+/** True when the newest completion/success status is at least the grace old (or, non-strictly, no timestamp is readable). */
 export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
   const checks = Array.isArray(rollup) ? rollup : [];
-  const times = checks.map((c) => Date.parse(c?.completedAt)).filter(Number.isFinite);
+  // gh and the paged mapper expose StatusContext.createdAt as startedAt: it dates the reported
+  // success, not a CheckRun's start. CheckRuns must still supply their own completion time.
+  const times = checks.map((c) => Date.parse(c?.__typename === 'StatusContext' && c?.state === 'SUCCESS'
+    ? c.startedAt : c?.completedAt)).filter(Number.isFinite);
   if (strict && (times.length !== checks.length)) return false; // strict: ANY unreadable timing is NOT settled
   if (!times.length || !Number.isFinite(now) || !now) return !strict; // strict: unknown timing is NOT settled
   return now - Math.max(...times) >= graceMs;
