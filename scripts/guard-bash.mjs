@@ -4978,29 +4978,57 @@ export function decide(command, ctx = {}) {
   // Visit nested shells at their invocation, with a copy of the environment at that point. Flattening
   // first applies future exports to earlier commands and lets assignments in child shells leak out.
   let nestedBudget = NESTED_NODE_CAP;
-  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = []) => {
+  const copyAlternates = (from) => new Map([...from].map(([key, values]) => [key, new Set(values)]));
+  const checkScope = (list, whole, inherited, depth, persist = null, inheritedReadonly = [], inheritedAlternates = new Map()) => {
     const gitConfigEnv = { ...inherited };
     const readonlyNames = new Set(inheritedReadonly);
+    // Other values a variable may hold because an assignment may not have run. Each is checked on its own:
+    // every env-derived Git target is added separately, so one swapped key at a time covers every mix.
+    const alternates = copyAlternates(inheritedAlternates);
     // Clearing evidence must be unconditional. This scanner does not evaluate shell control flow;
     // retain possible targets in conditional lists, loops and pipelines rather than assume unset ran.
     const canUnset = !/[&|]|\b(?:if|then|else|elif|while|until|for|do|case)\b/.test(whole);
-    const setAssignment = (key, value, readonly = false) => {
+    const setAssignment = (key, value, readonly = false, conditional = false) => {
       if (value === undefined && !canUnset) return;
       if (readonlyNames.has(key)) return; // failed assignment/unset leaves a readonly target active
+      if (conditional || !canUnset) {
+        // The assignment may be skipped: it adds a possible value and never replaces the earlier one, and a
+        // readonly that may not have run never blocks a later assignment.
+        if (gitConfigEnv[key] !== value) {
+          const values = alternates.get(key) || new Set();
+          values.add(gitConfigEnv[key]);
+          values.delete(value);
+          alternates.set(key, values);
+        }
+        gitConfigEnv[key] = value;
+        if (persist) persist(key, value, false, true);
+        return;
+      }
       gitConfigEnv[key] = value;
+      alternates.delete(key);
       if (readonly) readonlyNames.add(key);
-      if (persist) persist(key, value, readonly);
+      if (persist) persist(key, value, readonly, false);
     };
-    const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames) => {
+    const checkNested = (text, env, persistChanges = null, childReadonly = readonlyNames, childAlternates = alternates) => {
       if (!String(text).trim() || depth >= NESTED_DEPTH_CAP || nestedBudget <= 0) return null;
       nestedBudget -= 1;
-      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly);
+      return checkScope(parseSegments(text).segments, text, env, depth + 1, persistChanges, childReadonly, childAlternates);
     };
     for (const seg of list) {
       const r = reason(seg, { ...ctx, gitConfigEnv });
       if (r) return r;
+      for (const [key, values] of alternates) {
+        for (const value of values) {
+          const alt = reason(seg, { ...ctx, gitConfigEnv: { ...gitConfigEnv, [key]: value } });
+          if (alt) return alt;
+        }
+      }
       const localEnv = { ...gitConfigEnv };
-      for (const assignment of gitLeadingAssignments(seg)) localEnv[assignment[1]] = assignment[2];
+      const localAlternates = copyAlternates(alternates);
+      for (const assignment of gitLeadingAssignments(seg)) {
+        localEnv[assignment[1]] = assignment[2];
+        localAlternates.delete(assignment[1]); // a command-local assignment always applies to that command
+      }
       // Substitutions run before the command's local assignments take effect; explicit child shells
       // and runners receive those assignments even behind wrappers such as `command env`.
       const substitutionCount = substitutionBodies(seg).length;
@@ -5009,7 +5037,8 @@ export function decide(command, ctx = {}) {
         const newProcess = !substitution && (SHELL_PROGRAMS.has(programWord(seg)) || runnerInvocation(canonicalCommand(seg))?.exec);
         // eval executes in this shell; explicit assignments in its script survive the invocation.
         const nestedReason = checkNested(text, substitution ? gitConfigEnv : localEnv,
-          !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames);
+          !substitution && programWord(seg) === 'eval' ? setAssignment : null, newProcess ? [] : readonlyNames,
+          substitution ? alternates : localAlternates);
         if (nestedReason) return nestedReason;
       }
       const words = shellTokens(seg).filter((t) => !t.op).map((t) => t.text);
@@ -5049,7 +5078,7 @@ export function decide(command, ctx = {}) {
     // separators may not be reconstructible from an individual segment. Never use future assignments.
     const group = leadingGroupBody(whole);
     for (const text of [...substitutionBodies(whole), ...(group === null ? [] : [group])]) {
-      const r = checkNested(text, inherited, null, inheritedReadonly);
+      const r = checkNested(text, inherited, null, inheritedReadonly, inheritedAlternates);
       if (r) return r;
     }
     return null;

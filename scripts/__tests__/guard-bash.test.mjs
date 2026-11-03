@@ -3724,6 +3724,51 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
     },
   );
 
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'TARGET'])(
+    'DENIES when a possibly-skipped reassignment would hide an active protected target: %s', (key) => {
+      // A conditional assignment may not run. Its value must join the earlier one, never replace it.
+      const target = key === 'GIT_DIR' ? `${CLONE}/.git` : key === 'GIT_CONFIG' ? `${CLONE}/config` : CLONE;
+      const safe = key === 'GIT_DIR' ? `${LANE}/.git` : key === 'GIT_CONFIG' ? `${LANE}/config` : LANE;
+      const mutation = key === 'GIT_CONFIG' ? 'git config user.name example'
+        : key === 'TARGET' ? 'git --config-env=core.worktree=TARGET reset --hard' : 'git reset --hard';
+      const ctx = { cwd: LANE, daemonCloneRoots: roots };
+      for (const skipped of [
+        `false && export ${key}=${safe}`, `true || export ${key}=${safe}`, `false && ${key}=${safe}`,
+        `export ${key}=${safe} | cat`, `false && declare -x ${key}=${safe}`, `false && eval 'export ${key}=${safe}'`,
+        `if false; then export ${key}=${safe}; fi`, `false && readonly ${key}=${safe}`,
+        `false && eval 'false && export ${key}=${safe}'`,
+      ]) {
+        expect(decide(`export ${key}=${target}; ${skipped}; ${mutation}`, ctx), skipped).toMatch(/DAEMON CLONE/);
+      }
+      // A readonly declaration that may not have run must not block a later protected assignment.
+      expect(decide(`false && readonly ${key}=${safe}; export ${key}=${target}; ${mutation}`, ctx)).toMatch(/DAEMON CLONE/);
+      // Unconditional reassignment still replaces the protected target; conditional safe values stay allowed.
+      expect(decide(`export ${key}=${target}; export ${key}=${safe}; ${mutation}`, ctx)).toBeNull();
+      expect(decide(`false && export ${key}=${safe}; ${mutation}`, { ...ctx, gitConfigEnv: { [key]: safe } })).toBeNull();
+      // A possibly-skipped first assignment leaves the variable possibly unset; an unset worktree source is unknown.
+      expect(decide(`export ${key}=${safe} && ${mutation}`, ctx)).toSatisfy((r) => (key === 'TARGET' ? /DAEMON CLONE/.test(r) : r === null));
+      // The possible protected value reaches child shells, substitutions and eval scripts too.
+      const quoted = mutation.replace(/'/g, '');
+      for (const command of [
+        `export ${key}=${target}; false && export ${key}=${safe}; bash -c '${quoted}'`,
+        `export ${key}=${target}; false && export ${key}=${safe}; echo "$(${quoted})"`,
+        `export ${key}=${target}; false && export ${key}=${safe}; eval '${quoted}'`,
+        // A conditional inside an eval script keeps the earlier value in the calling shell as well.
+        `export ${key}=${target}; eval 'false && export ${key}=${safe}'; ${mutation}`,
+        `export ${key}=${target}; eval 'export ${key}=${safe} | cat'; ${mutation}`,
+      ]) expect(decide(command, ctx), command).toMatch(/DAEMON CLONE/);
+      // A command-local assignment always applies to its own command and child shell.
+      expect(decide(`export ${key}=${target}; false && export ${key}=${safe}; ${key}=${safe} bash -c '${quoted}'`, ctx)).toBeNull();
+    },
+  );
+
+  it('ALLOWS lane mutations after many skipped unrelated assignments', () => {
+    // Possible values are tracked per variable, so unrelated conditional assignments add no unknown target.
+    const skipped = Array.from({ length: 12 }, (_, i) => `false && export V${i}=${i}`).join('; ');
+    expect(decide(`${skipped}; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toBeNull();
+    expect(decide(`${skipped}; export GIT_DIR=${CLONE}/.git; git reset --hard`, { cwd: LANE, daemonCloneRoots: roots })).toMatch(/DAEMON CLONE/);
+  });
+
   it.each(['refs/*', 'refs/h*', 'refs/heads*', 'refs/hea*s/*'])(
     'DENIES explicit and configured fetch glob destinations that can write branches: %s', (destination) => {
       for (const command of [
