@@ -764,7 +764,7 @@ export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgen
   // any of those changing means the planner's liveness reading would differ.
   for (const a of agents) {
     const laneBound = a?.kind !== 'interactive' || /[\\/]\.lanes[\\/]/.test(String(a?.cwd ?? ''));
-    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${a?.cwd ?? ''}${laneBound ? `:${a?.status ?? ''}:${a?.laneHeadOid ?? ''}` : ''}`);
+    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${a?.cwd ?? ''}${laneBound ? `:${a?.status ?? ''}:${a?.laneHeadOid ?? ''}:${a?.pidAlive ?? ''}` : ''}`);
   }
   return out;
 }
