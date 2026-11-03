@@ -11,21 +11,24 @@ import { HOUR } from '../health-watch-core.mjs';
 const MIN = 60 * 1000;
 
 /** PURE: the stall over the last `windowMs`, or null when the drain landed something / had nothing queued / is not covered. */
+/** The newest INFORMATIVE pass (a merge, queued work, or a clean empty queue — failed zero-count passes tell us nothing) was queued-and-unmerged more than `windowMs` ago and nothing since proves recovery. */
+function staleStall(history, now, windowMs) {
+  const informative = history.filter((p) => now - p.at >= 0 && ((Number(p.merged) || 0) > 0 || (Number(p.considered) || 0) > 0 || (p.exit === 0 && !(Number(p.failed) > 0))))
+    .sort((a, b) => b.at - a.at)[0];
+  if (informative && now - informative.at > windowMs && (Number(informative.considered) || 0) > 0 && (Number(informative.merged) || 0) === 0) {
+    return { passes: 0, considered: Number(informative.considered) || 0, reason: `no informative drain pass in ${Math.round((now - informative.at) / MIN)} min; the last one had ${Number(informative.considered)} queued and landed none` };
+  }
+  return null;
+}
+
 export function landedNothing(rawHistory, { now, windowMs = 30 * MIN, minPasses = 2 } = {}) {
   const history = (rawHistory || []).filter((p) => p.valid !== false); // a record with a missing/invalid count is UNKNOWN, never "landed something" or "nothing queued"
   const inWin = history.filter((p) => now - p.at >= 0 && now - p.at <= windowMs).sort((a, b) => a.at - b.at);
-  if (inWin.length < minPasses) {
-    // The drain stopped completing passes: if its LAST pass (any age) had queued PRs and merged none, that is still a stall.
-    const lastAny = (history || []).filter((p) => now - p.at >= 0).sort((a, b) => b.at - a.at)[0];
-    if (lastAny && now - lastAny.at > windowMs && (Number(lastAny.considered) || 0) > 0 && (Number(lastAny.merged) || 0) === 0) {
-      return { passes: 0, considered: Number(lastAny.considered) || 0, reason: `no drain pass completed in ${Math.round((now - lastAny.at) / MIN)} min; the last pass had ${Number(lastAny.considered)} queued and landed none` };
-    }
-    return null;
-  }
+  if (inWin.length < minPasses) return staleStall(history, now, windowMs);
   const everyIdle = inWin.every((p) => (Number(p.considered) || 0) > 0 && (Number(p.merged) || 0) === 0);
-  if (!everyIdle) return null;
+  if (!everyIdle) return staleStall(history, now, windowMs);
   const earlierCover = (history || []).some((p) => now - p.at >= windowMs * 0.9);
-  if (!earlierCover && inWin[0].at - (now - windowMs) > windowMs * 0.5) return null; // passes only cover the tail of the window
+  if (!earlierCover && inWin[0].at - (now - windowMs) > windowMs * 0.5) return staleStall(history, now, windowMs); // passes only cover the tail of the window
   const last = inWin[inWin.length - 1];
   const bits = [...(last.skippedPrs || []), ...(last.deferredDetail || [])].map((x) => String(typeof x === 'string' ? x : JSON.stringify(x)).replace(/\s+/g, ' ').slice(0, 160));
   return { passes: inWin.length, considered: Number(last.considered) || 0, reason: bits.length ? bits.slice(0, 2).join(' | ') : 'no hold reason in history; see daemon.log' };

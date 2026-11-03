@@ -89,4 +89,11 @@ describe('drain-landed-nothing delivery (real core + planner, default shadow mod
     expect(ok[0].breach).toBe(false);
     expect(s0).toBeTruthy();
   });
+  it('failed zero-candidate passes after queued work open an alert from scratch', () => {
+    const now = T0 + 60 * MIN;
+    const h = [{ at: now - 45 * MIN, considered: 4, merged: 0 }, { at: now - 10 * MIN, considered: 0, merged: 0, exit: 1, failed: 1 }, { at: now - 2 * MIN, considered: 0, merged: 0, exit: 1, failed: 1 }];
+    const out = stepEpisodes(empty, [{ smell, results: smell.evaluate({ drainHistory: h }, { now }) }], now);
+    const plan = planActions(out.transitions, { [smell.id]: smell }, { mode: 'shadow' }).filter((p) => p.kind === 'notify');
+    expect(plan.length).toBe(1);
+  });
 });
