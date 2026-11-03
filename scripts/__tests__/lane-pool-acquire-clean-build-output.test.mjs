@@ -243,11 +243,11 @@ describe('ignored build output cleanup', () => {
 
   it('derives custom names from dir.output and every Playwright output, deduplicating them', () => {
     git(['init', '--quiet'], base);
-    put(base, '.gitignore', 'custom-site/\nvisual-one/\nvisual-two/\n');
-    put(base, '.eleventy.js', 'output: "unrelated",\n' + eleventyConfig('custom-site'));
-    put(base, 'playwright.config.ts', ['visual-one', 'visual-two', 'visual-one'].map(playwrightCommand).join(''));
-    for (const name of ['custom-site', 'visual-one', 'visual-two']) put(base, `${name}/stale.test.ts`);
-    expect(ignoredBuildOutputDirs(base)).toEqual(['custom-site', 'visual-one', 'visual-two']);
+    put(base, '.gitignore', '_site-custom/\n_site-one/\n_site-two/\n');
+    put(base, '.eleventy.js', 'output: "unrelated",\n' + eleventyConfig('_site-custom'));
+    put(base, 'playwright.config.ts', ['_site-one', '_site-two', '_site-one'].map(playwrightCommand).join(''));
+    for (const name of ['_site-custom', '_site-one', '_site-two']) put(base, `${name}/stale.test.ts`);
+    expect(ignoredBuildOutputDirs(base)).toEqual(['_site-custom', '_site-one', '_site-two']);
   });
 
   it.each(['node_modules', '.git', '.claude', 'src', 'scripts', 'docs'])('refuses denylisted output %s from either config', (name) => {
@@ -262,15 +262,15 @@ describe('ignored build output cleanup', () => {
   });
 
   it('refuses configured outputs when Git eligibility evidence is unavailable', () => {
-    put(base, '.eleventy.js', eleventyConfig('output'));
-    put(base, '.gitignore', 'output/\n');
-    put(base, 'output/keep.txt');
+    put(base, '.eleventy.js', eleventyConfig('_site-x'));
+    put(base, '.gitignore', '_site-x/\n');
+    put(base, '_site-x/keep.txt');
     expect(() => ignoredBuildOutputDirs(base)).toThrow();
     expect(() => cleanIgnoredBuildOutput(base)).toThrow(expect.objectContaining({
       message: expect.stringContaining('ignored build output cleanup failed'),
       ignoredBuildOutputCleanupFailure: true,
     }));
-    expect(existsSync(join(base, 'output/keep.txt'))).toBe(true);
+    expect(existsSync(join(base, '_site-x/keep.txt'))).toBe(true);
   });
 
   it.each(['', '.', '..', '../outside', 'nested/output', '/absolute', '.hidden', 'a..b', 'a\\b', '*', ':(glob)*', '${output}'])('rejects unsafe output name %j', (name) => {

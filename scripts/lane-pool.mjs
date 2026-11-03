@@ -305,7 +305,9 @@ export function ignoredBuildOutputDirs(dir) {
   const denied = new Set(['node_modules', '.git', '.claude', 'src', 'scripts', 'docs']);
   const add = (name) => {
     // Also exclude pathspec magic/globs and platform-specific separators: these must be literal children.
-    if (/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(name) && !name.includes('..')) dirs.add(name);
+    // Parsing config source cannot be made fully sound (string literals, block comments), so a hard backstop:
+    // only the repo's generated-site naming convention (`_site`, `_site-*`) can ever be cleaned.
+    if (/^_site(?:-[A-Za-z0-9_.-]+)?$/.test(name) && !name.includes('..')) dirs.add(name);
   };
   try {
     // Consume quoted strings (including escaped characters) before recognizing comments.
