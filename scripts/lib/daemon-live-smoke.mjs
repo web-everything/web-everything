@@ -435,6 +435,7 @@ export function smokeLaneHints({ root, env = process.env, max = SMOKE_LANE_HINT_
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
   let laneNum = null;
+  let viaHint = false;
   // The child must outlive its own `--wait-ms` plus the real clone/refresh work, but never past the busy cap.
   const acquireCapMs = Math.max(budgets.laneAcquireWaitMs + 30_000, Math.min(budgets.laneAcquireBusyCapMs, Math.max(budgets.laneAcquireMs, budgets.laneAcquireWaitMs + 60_000)));
   const t0 = (ctx.clock ?? Date.now)();
@@ -492,6 +493,7 @@ async function checkLaneAcquireRelease(ctx) {
         const hinted = await acquireHinted();
         // Distinct wording on purpose: no busy-pool signature, so an exhausted/failed hint set is a real failure.
         if (hinted === undefined) throw new Error(`auto-pick timed out and every free-lane hint failed (${hints.join(',')}): ${firstLine(e)}`);
+        viaHint = true;
         return hinted;
       }
     };
@@ -529,6 +531,10 @@ async function checkLaneAcquireRelease(ctx) {
     await runChild('node', ['scripts/lane-pool.mjs', 'release', `--lane=${laneNum}`, `--session=${sessionSlug}`], {
       cwd: root, timeoutMs: budgets.laneReleaseMs, env,
     });
+    // The auto-pick itself did NOT finish (timed out on a busy host): report it as a visible skip, like any
+    // other busy-pool timeout, never as an unqualified pass. The explicit-lane acquire+release is the evidence.
+    if (viaHint) return { ok: true, skipped: true, skipReason: 'busy-pool', lane: laneNum,
+      detail: `skipped: busy pool — auto-pick timed out with the host busy; explicit-lane acquire + release of lane-${laneNum} (published free-lane hint) succeeded` };
     return { ok: true, detail: `acquired + released lane-${laneNum}`, lane: laneNum };
   } catch (e) {
     // A stuck release still leaves a REAL lease held against the live pool — surfacing it as a gate failure

@@ -97,7 +97,7 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     it('a timed-out scan (bounded first try) falls back to the explicit hinted lane', async () => {
       const runChild = vi.fn().mockRejectedValueOnce(timedOut()).mockResolvedValueOnce('')
         .mockResolvedValueOnce(JSON.stringify({ lane: 7 })).mockResolvedValueOnce('');
-      expect(await check.run(hinted([7, 9], runChild))).toMatchObject({ ok: true, lane: 7 });
+      expect(await check.run(hinted([7, 9], runChild))).toMatchObject({ ok: true, skipped: true, skipReason: 'busy-pool', lane: 7 });
       const a = acquires(runChild);
       expect(a[0][2].timeoutMs).toBe(120_000);
       expect(a[1][1]).toContain('--lane=7');
