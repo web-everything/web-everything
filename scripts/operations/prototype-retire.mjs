@@ -8,6 +8,9 @@
  * A registration retires only on git-proved evidence:
  *   - `in-main` / `pr-merged`: merging it onto main changes nothing (exact tree compare, so any history shape:
  *     merged, squash-merged, or a loader `-m<N>` merge ref of a merged branch).
+ *   - `source-in-main`: a loader `-m<N>` merge ref (commit-tree, parents main + the pinned source branch tip) whose
+ *     SOURCE (second parent) is reachable from main and which carries no other non-merge commit off main. Needed
+ *     when main later edits the same files (tests moved), so the exact tree compare no longer says "no-op" (R512).
  *   - `superseded`: its PR is CLOSED unmerged, a MERGED PR of the same repository, merged into main and reachable
  *     from main, cross-references it and declares `Supersedes #N` in visible prose. Its author and any post-merge
  *     body editor must be trusted (supersede-rule.mjs). Every non-merge commit the
@@ -100,6 +103,22 @@ function ghJson(gh, args) {
   try { return { ok: true, value: JSON.parse(String(result.stdout || 'null')) }; } catch { return { ok: false }; }
 }
 
+/**
+ * The pinned source sha of a loader `-m<N>` merge ref, when it is proved fully in main; else null (keep).
+ * The loader builds the ref as a commit with parents [main-at-load, source tip], so the source is the second parent.
+ * Requires: a `-m<N>` name, a two-parent tip, the source an ancestor of main, no non-merge commit beyond main,
+ * and the tip the only merge beyond main. Any unreadable git answer returns null.
+ */
+function sourceInMain({ git, ref, tip, carried, mainRef }) {
+  if (!mergeRefBase(ref)) return null;
+  if (carried.unique.length !== 0) return null;
+  if (carried.merges.some((merge) => merge !== tip)) return null;
+  const parents = lines(git(['rev-list', '--parents', '-n', '1', tip]).stdout)[0]?.split(/\s+/).slice(1) || [];
+  if (parents.length !== 2 || !parents.every((sha) => SHA.test(sha))) return null;
+  const source = parents[1];
+  return git(['merge-base', '--is-ancestor', source, mainRef]).code === 0 ? source : null;
+}
+
 /** The registration's PR: its recorded number, else a PR whose head is the ref, else (for `-m<N>`) its base branch. */
 function findPr({ gh, row, repo }) {
   if (Number.isInteger(row.pr)) {
@@ -176,6 +195,12 @@ export function planRetirements({ rows, git, gh, repo, mainRef = 'origin/main' }
     if (carried.contentInMain) {
       return { ref: row.ref, action: 'retire', reason: pr?.state === 'MERGED' ? 'pr-merged' : 'in-main', tip, pr: prNumber,
         evidence: { ...evidence, ...(pr ? { prVia: found.via, prState: pr.state } : {}) } };
+    }
+    // A -m<N> merge ref whose pinned source landed in main: its only off-main commit is its own merge commit.
+    const source = sourceInMain({ git, ref: row.ref, tip, carried, mainRef });
+    if (source) {
+      return { ref: row.ref, action: 'retire', reason: 'source-in-main', tip, pr: prNumber,
+        evidence: { ...evidence, source, ...(pr ? { prVia: found.via, prState: pr.state } : {}) } };
     }
     if (pr?.state === 'CLOSED') {
       const sup = findSuperseder({ gh, git, pr: prNumber, repo, mainRef });
