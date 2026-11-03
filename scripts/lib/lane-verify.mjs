@@ -128,6 +128,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from '
 import { join, sep } from 'node:path';
 import { constants } from 'node:os';
 import { boundFailureDetails } from './verify-failures.mjs';
+import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 
 /** 75c — the isolated-retry audit fields a record carries forward to every reader (marker, check, verdict). */
 function retryAuditOf(rec) {
@@ -345,6 +346,10 @@ export function verifyStartBody({ sha, suites, startedAt, treeHash, runId }) {
  *  legacy callers that pass their own start body as `prev`. */
 /** Classify process termination without inventing an OOM/host-load diagnosis from a signal alone. */
 export function verificationInfrastructureFailure({ exitCode, signal, timedOutPhase, ceilingMs, killer = 'dispatcher' } = {}) {
+  if (exitCode === SHARD_UNSETTLED_EXIT && !signal && !timedOutPhase) return {
+    reason: 'verify-unsettled',
+    detail: 'verification unsettled: a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait); no test verdict, not red, not green. Retry or wait.',
+  };
   const inferred = Number.isInteger(exitCode) && exitCode > 128
     ? Object.entries(constants.signals).find(([, n]) => n === exitCode - 128)?.[0] : null;
   const killedBy = signal || inferred;

@@ -8,6 +8,7 @@
  *   (`scripts/verify-lane.mjs`) and pr-land's finish-guard calls `verifyGateDecision` here.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { classifyRedCause } from '../lib/red-cause.mjs';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -17,6 +18,7 @@ import {
   DEFAULT_VERIFY_TTL_MINUTES,
   verifyStartBody,
   verifyFinishBody,
+  verificationInfrastructureFailure,
   isVerifyAbandoned,
   verifyGateDecision,
   normalizeVerifyRecord,
@@ -46,6 +48,25 @@ describe('marker lifecycle bodies (running → green/red)', () => {
     const done = verifyFinishBody(verifyStartBody({ sha: SHA, suites: 'gate', startedAt: 't' }), { finishedAt: 'u', exitCode: 2 });
     expect(done.status).toBe('red');
     expect(done.exitCode).toBe(2);
+  });
+});
+
+describe('unsettled shard classification', () => {
+  const detail = 'verification unsettled: a test shard stayed INVENTORY-INCOMPLETE after one split retry (capacity/wait); no test verdict, not red, not green. Retry or wait.';
+  it('classifies exit 75 as verify-unsettled infrastructure failure', () => {
+    expect(verificationInfrastructureFailure({ exitCode: 75 })).toEqual({ reason: 'verify-unsettled', detail });
+  });
+  it('redCause treats exit 75 as infrastructure rather than a test failure', () => {
+    const infrastructure = verificationInfrastructureFailure({ exitCode: 75 });
+    expect(classifyRedCause({ exitCode: 75, infrastructure,
+      phaseResults: [{ phase: 'vitest', result: { exitCode: 75 } }] }))
+      .toEqual({ redCause: 'infra', redCauseFiles: [] });
+  });
+  it('verifyFinishBody records a non-green, non-red status without failing-test names', () => {
+    const done = verifyFinishBody({ sha: SHA }, { exitCode: 75, failureDetails: { tests: [{ file: 'a', name: 'test' }] } });
+    expect(done).toMatchObject({ status: 'infrastructure-failure', exitCode: 75, infrastructure: { reason: 'verify-unsettled', detail } });
+    expect(done.failureDetails).toBeUndefined();
+    expect(verifyGateDecision({ record: done, headSha: SHA, requireVerified: true }).ok).toBe(false);
   });
 });
 
