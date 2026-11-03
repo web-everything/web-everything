@@ -122,7 +122,7 @@ describe('immutable shared ledger', () => {
 describe('filterReraises — suppress only a currently proven test pin', () => {
   it('drops only the matching test-pinned finding when the test exists on head and passes', () => {
     const ledger = deepFreeze(pinned());
-    const reraised = finding({ category: 'security', line: 13 });
+    const reraised = finding({ category: 'security', line: 12 });
     const unrelated = finding({ file: 'policy/other.md' });
     const findings = deepFreeze([reraised, unrelated]);
     const pinStillHolds = vi.fn(entry => {
@@ -311,7 +311,7 @@ describe('audit round 4 hardening', () => {
     const b = finding({ line: 90, quote: 'if (!token) return next(); // admin route' });
     const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
     expect(filterReraises(l, [b], { pinStillHolds: () => true }).dropped).toEqual([]);
-    expect(filterReraises(l, [{ ...a, line: 14 }], { pinStillHolds: () => true }).dropped).toHaveLength(1);
+    expect(filterReraises(l, [{ ...a }], { pinStillHolds: () => true }).dropped).toHaveLength(1);
   });
 });
 
@@ -327,5 +327,19 @@ describe('audit round 5 hardening', () => {
     const a = finding({ line: 12 });
     const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
     expect(filterReraises(l, [finding({ line: undefined })], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+});
+
+describe('audit round 6 hardening', () => {
+  it('claims differing only in a number (port) are not suppressed', () => {
+    const a = finding({ summary: 'server binds localhost:3000 without auth' });
+    const b = finding({ summary: 'server binds localhost:4000 without auth' });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [b], { pinStillHolds: () => true }).dropped).toEqual([]);
+  });
+  it('a nearby but different line is not suppressed', () => {
+    const a = finding({ line: 12 });
+    const l = pinFinding(markFixed(record(emptyLedger(), [a]), findingKey(a), { head: H2 }), findingKey(a), PIN);
+    expect(filterReraises(l, [finding({ line: 14 })], { pinStillHolds: () => true }).dropped).toEqual([]);
   });
 });
