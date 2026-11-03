@@ -81,6 +81,7 @@ import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
 import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
+import { readMainRedPriority, readMainRedState } from '../../scripts/lib/main-red-priority.mjs';
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
@@ -764,10 +765,12 @@ export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThr
 
 /**
  * Default live probe for claims and sessions: `claim:<repo>:<pr>` for every live fix/ci-heal claim, and
- * `agent:<id>` for every live agent session (the planner's liveness gate reads these).
+ * `agent:<id>` for every live agent session (the planner's liveness gate reads these), and `mainred:` for the published main-red records.
  */
-export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()) } = {}) {
+export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()), readMainRed = () => [readMainRedPriority(), readMainRedState()] } = {}) {
   const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
+  // The published main-red records feed the planner's main-fix holds (`mainFixHeldFor`): any change drops every row.
+  out.add(`mainred:${JSON.stringify(readMainRed())}`);
   const agents = readAgents();
   if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
   // The WHOLE enriched session record is the key (identity, cwd, lane HEAD, pid liveness, hung / idle / self-reported
@@ -809,7 +812,7 @@ export function createReconcilePlanCache({ reconcile = (input) => runReconcilePa
     for (const key of live.claims) {
       if (baseline.claims.has(key)) continue;
       // A session that appeared since the plan could bind to any PR: the liveness gate must be re-run, so every row is stale.
-      if (key.startsWith('agent:')) return 'all';
+      if (!key.startsWith('claim:')) return 'all';
       stale.add(Number(key.split(':').pop()));
     }
     return stale;

@@ -1923,4 +1923,11 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(probe([{ ...chat('idle'), laneHeadOid: 'a' }])).not.toEqual(probe([{ ...chat('idle'), laneHeadOid: 'b' }]));
     expect(() => readPlanClaims({ readAgents: () => null })).toThrow(/unreadable/);
   });
+
+  it('a main-red record published since the plan was made drops every row (main-fix hold must be re-read)', async () => {
+    let reads = 0;
+    const plan = await readBack({ readPlanClaimSet: () => new Set([reads++ < 1 ? 'mainred:[null,null]' : 'mainred:[{"pr":3},null]']) });
+    expect(plan.dispatch).toEqual([]);
+    expect([...readPlanClaims({ readAgents: () => [], readMainRed: () => [{ pr: 3 }, null] })]).toContain('mainred:[{"pr":3},null]');
+  });
 });
