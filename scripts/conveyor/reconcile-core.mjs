@@ -2074,9 +2074,9 @@ function roundCapExhaustedNoteText(prNumber, attempts, cap, capKind) {
 export const RESTORE_REVIEW_LABEL_GRACE_MS = 10 * 60_000;
 
 /** True when the newest completed check finished at least the grace ago (or no timestamp is readable). */
-export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS) {
+export function greenSettledForRestoreGrace(rollup, now, graceMs = RESTORE_REVIEW_LABEL_GRACE_MS, { strict = false } = {}) {
   const times = (Array.isArray(rollup) ? rollup : []).map((c) => Date.parse(c?.completedAt)).filter(Number.isFinite);
-  if (!times.length || !Number.isFinite(now) || !now) return true;
+  if (!times.length || !Number.isFinite(now) || !now) return !strict; // strict: unknown timing is NOT settled
   return now - Math.max(...times) >= graceMs;
 }
 
@@ -2803,7 +2803,7 @@ export function planReconcile({
     }
 
     // ── `restore-review-label` (LIVE INCIDENT 2026-10-03/04, PR #3830 — an approval-time prevention-card PR) —
-    // an OPEN, GREEN, non-draft `lane/*` PR carrying NO `review:*` label (and no `ready-to-merge` landing-gate
+    // an OPEN, GREEN, non-draft PR carrying NO `review:*` label (and no `ready-to-merge` landing-gate
     // label either) is in limbo forever: `classifyPr` reads phase `open` ("no hold recorded"), the generic table
     // answers `nothing-owed`, and no daemon ever owns it. The producer (`pr-land --label-on-green`) exits
     // WITHOUT any label when its green-wait ends red/timeout/behind, and the fix daemon later heals the red —
@@ -2817,13 +2817,18 @@ export function planReconcile({
     // whose checks are not red is owed the same neutral `review:pending`; review itself still waits on CI via
     // {@link reviewChecksAllow}, exactly as for a labelled stacked PR.
     const stackedLanePr = typeof pr?.baseRefName === 'string' && pr.baseRefName.startsWith('lane/') && pr.baseRefName !== defaultBranch;
-    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red'))
-        && String(pr?.headRefName ?? '').startsWith('lane/')
+    // D-R338 (#6254): a bot-authored non-lane PR (e.g. `ci/refresh-test-timings`) is owed the same label, but ONLY
+    // when its checks are green — the stacked-base exception and human non-lane PRs stay out (explicit hand-off).
+    const laneHead = String(pr?.headRefName ?? '').startsWith('lane/');
+    const botAuthored = /^app\//.test(String(pr?.author?.login ?? '')) || /\[bot\]$/.test(String(pr?.author?.login ?? '')) || pr?.author?.is_bot === true;
+    if (reviewLabelHeal !== 'off' && phase === 'open' && !pr?.isDraft
+        && ((laneHead && (withPhase.check === 'green' || (stackedLanePr && withPhase.check !== 'red')))
+          || (!laneHead && botAuthored && withPhase.check === 'green'))
         && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
-        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now, undefined, { strict: !laneHead })) {
       dispatch.push({
         ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending',
-        why: 'open lane PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
+        why: 'open PR, every required check is green, and it carries no review:* (or ready-to-merge) label — '
           + 'nothing would ever own it; apply review:pending so the ordinary review path picks it up',
       });
       continue;
