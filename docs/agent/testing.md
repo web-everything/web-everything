@@ -3839,6 +3839,13 @@ with injected readers in `pr-sweep-invariant-four-cases.soak.test.mjs`; run that
 PR dependency edges require the target in the same repository's current open-PR listing.
 The named blocker-removal regression in `pr-sweep.test.mjs` keeps the textual annotation
 unchanged while removing the target, then proves the dependent retains its running stall clock and normal alert schedule.
+unchanged while removing the target, then proves the dependent regains a stall episode and alert.
+The named cross-repository number-collision regression lists the same dependent number in
+two repositories, with its blocker open only in one and absent or merged in the other.
+Both listing orders must preserve the other repository's stall episode and eventual alert.
+Its same-repository control uses
+`Blocked by: #6244`; dependency phrases accept an optional colon, still excluding quoted
+examples and references split across lines.
 
 `prSweep.deadlineMinutes` accepts either a positive scalar for every action budget or a
 per-action map. The settings-to-evaluator contract cases in `pr-sweep.test.mjs` exercise

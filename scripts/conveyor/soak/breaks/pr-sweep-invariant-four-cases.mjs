@@ -17,7 +17,7 @@ export default {
     const { runPrSweep } = await import(pathToFileURL(join(root, 'scripts/conveyor/pr-sweep.mjs')).href);
     const now = Date.parse('2026-11-02T23:00:00Z'), repo = CONSTELLATION_REPOS.we.slug;
     const base = { repo, headRefOid: 'a'.repeat(40), updatedAt: new Date(now).toISOString(), changedFiles: 5, title: 'replay', labels: [] };
-    const prs = [{ ...base, number: 6254 }, { ...base, number: 6193, body: 'blocked by #6244', labels: ['status:fixing'] },
+    const prs = [{ ...base, number: 6254 }, { ...base, number: 6193, body: 'Blocked by: #6244', labels: ['status:fixing'] },
       { ...base, number: 6244, labels: ['red-team:pending'], stateSince: now - 420 * 60000 },
       { ...base, number: 6268, labels: ['review:accepted'], changedFiles: 0, body: 'blocked by #6244' }];
     const report = await runPrSweep({ now, dryRun: true, env: {}, config: {},
