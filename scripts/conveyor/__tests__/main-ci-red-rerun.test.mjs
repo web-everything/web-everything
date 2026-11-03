@@ -283,7 +283,7 @@ describe('rerun IO and ledger', () => {
       if (argv[1].includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ id: 42, name: 'integration', conclusion: 'failure' }] });
       throw new Error('unreadable evidence');
     };
-    expect(io.probeMainCiRuns({ exec, settings }).failing).toMatchObject({ failures: null, changedFiles: null,
+    expect(io.probeMainCiRuns({ exec, settings, readRequired: () => ({ checks: ['integration', 'test'] }) }).failing).toMatchObject({ failures: null, changedFiles: null,
       prevRunGreen: true, flake: { eligible: false, reason: 'not-flaky' } });
   });
   it('probes non-summary logs, previous green, and compares only when needed', () => {
@@ -298,7 +298,7 @@ describe('rerun IO and ledger', () => {
       if (argv[1].includes('/compare/')) return '["backlog/a.md"]';
       throw new Error('no tip');
     };
-    const probe = () => io.probeMainCiRuns({ exec, repoSlug: 'o/r', settings });
+    const probe = () => io.probeMainCiRuns({ exec, repoSlug: 'o/r', settings, readRequired: () => ({ checks: ['integration', 'test'] }) });
     expect(probe().failing).toMatchObject({ failures: [failure], prevRunGreen: true, flake: { eligible: true, reason: 'flaky-signature' } });
     expect(calls.some((argv) => argv[1]?.includes('/compare/'))).toBe(false);
     raw = 'no failures';

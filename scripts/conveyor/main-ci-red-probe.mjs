@@ -65,6 +65,17 @@ export function readRunJobs(runId, { exec = execFileSyncThrottled, repoSlug = DE
   };
 }
 
+/**
+ * Tag the jobs read with `gatingFailed`: the failed jobs named in the required set. The full `failed` list stays (it names
+ * root causes such as a failing shard); only `gatingFailed` decides whether the run is a code failure of main. With no
+ * required set every failed job gates (fail closed). PURE.
+ */
+export function onlyGatingFailures(jobs, requiredChecks) {
+  if (!jobs) return jobs;
+  const gating = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
+  return { ...jobs, gatingFailed: gating ? jobs.failed.filter((j) => gating.has(j.name)) : jobs.failed };
+}
+
 /** Failing test titles from one job's check-run annotations (CI output — untrusted text, quoted later). */
 export function readFailingTests(jobId, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
   const rows = ghJson(exec, ['api', `repos/${repoSlug}/check-runs/${jobId}/annotations?per_page=50`]);
@@ -118,19 +129,24 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
   }
   const sorted = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const failing = { jobs: [], tests: [] };
+  // R516: main health is judged by REQUIRED checks only. A failed or cancelled non-gating job (continue-on-error, e.g.
+  // test-selection-measure) is not a code failure of main. Real failures surface in the required `test` / `daemon-soak`
+  // summary jobs. An unreadable or empty required set filters nothing (fail closed: every failed job stays gating).
+  let requiredChecks = null;
+  try { const c = readRequired({ repo: repoSlug })?.checks; requiredChecks = Array.isArray(c) && c.length ? c : null; } catch { requiredChecks = null; }
   // One job read per run, however many passes below look at it. `null` = unreadable (stays red: never promoted on a blind read).
   const jobsRead = new Map();
   const jobsOf = (r) => {
     if (!jobsRead.has(r.databaseId)) {
       let jobs = null;
-      try { jobs = readRunJobs(r.databaseId, { exec, repoSlug }); } catch { jobs = null; }
+      try { jobs = onlyGatingFailures(readRunJobs(r.databaseId, { exec, repoSlug }), requiredChecks); } catch { jobs = null; }
       jobsRead.set(r.databaseId, jobs);
     }
     return jobsRead.get(r.databaseId);
   };
   // A failure whose job list is complete, NON-EMPTY and holds no failed job (only cancelled / never ran) is infra, not
   // code. An empty list is not infra: a `startup_failure` run (a broken workflow file) has zero jobs and IS the defect.
-  const markInfraOnly = (r, jobs) => { if (jobs && jobs.complete && jobs.count > 0 && jobs.failed.length === 0) { r.infraOnly = true; return true; } return false; };
+  const markInfraOnly = (r, jobs) => { if (jobs && jobs.complete && jobs.count > 0 && (jobs.gatingFailed ?? jobs.failed).length === 0) { r.infraOnly = true; return true; } return false; };
   let failingRun = null;
   let reads = 0;
   for (const r of sorted) {
@@ -161,7 +177,7 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     if (!candidate || jobsRead.has(candidate.databaseId)) break; // already inspected: genuine, or unreadable
     if (!markInfraOnly(candidate, jobsOf(candidate))) break;
   }
-  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired });
+  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired, ...(requiredChecks ? { requiredChecks } : {}) });
   if (settings.mainCiRedFlakeRerun && failingRun) {
     // Rerun evidence is best-effort: unreadable logs/diffs never poison the primary runs probe.
     failing.failures = null;

@@ -38,7 +38,7 @@ describe('main-red judges required checks only (R516)', () => {
   it('a failed REQUIRED job still makes main red', () => {
     const p = probe([job(1, 'test', 'failure'), job(2, 'smoke', 'success'), job(3, 'test-selection-measure', 'timed_out')]);
     expect(mainRedState(p.runs, { tip: p.tip }).status).toBe('red');
-    expect(p.failing.jobs).toEqual(['test']);
+    expect(p.failing.jobs).toEqual(['test', 'test-selection-measure']); // root-cause names stay
   });
   it('fails closed: an unreadable required set keeps every failed job gating', () => {
     const p = probe([job(1, 'test', 'success'), job(3, 'test-selection-measure', 'timed_out')], { required: [] });
