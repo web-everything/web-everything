@@ -606,6 +606,7 @@ describe('R502 wait state replaces the implied daemon owner', () => {
     // freshness: a months-old refusal, or no clock, is not a wait state
     expect(resolveWaitState(open, { daemons: [{ ...refusal, at: new Date(now - 90 * 86400000).toISOString() }] }, ctx)).toBeNull();
     expect(resolveWaitState(open, { daemons: [refusal] })).toBeNull();
+    expect(resolveWaitState(open, { daemons: [{ ...refusal, at: new Date(now + 365 * 86400000).toISOString() }] }, ctx)).toBeNull();
     expect(resolveWaitState({ ...open, isDraft: true }, {})).toMatchObject({ kind: 'parked' });
     expect(resolveWaitState(open, {})).toBeNull();
   });
@@ -620,6 +621,10 @@ describe('R502 wait state replaces the implied daemon owner', () => {
   });
   it('an unreadable owner (state unknown) keeps owner-stale even with a wait state', async () => {
     const r = await evalFor(open, { kind: 'refused', detail: 'x' }, { state: 'unknown', owner: null });
+    expect(r.violation).toBe('owner-stale');
+  });
+  it('an owner carrying a health smell (stuck fixer, claim held with no progress) keeps owner-stale', async () => {
+    const r = await evalFor(open, { kind: 'live-claim', detail: 'fix-12' }, { ...stale, state: 'stuck', smell: 'fix-claim-held-no-progress' });
     expect(r.violation).toBe('owner-stale');
   });
   it('without a wait state the old owner-stale report is unchanged; deadline-passed still wins', async () => {
