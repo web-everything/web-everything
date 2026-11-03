@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, existsSync} from 'node:fs';
+import {mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, existsSync, utimesSync} from 'node:fs';
 import {join} from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
@@ -248,7 +248,8 @@ ${gate?`if(!fs.existsSync(${JSON.stringify(join(root,'release'))})){const watch=
 
 describe('remote controls', () => {
   it('resolves every new default with provenance and rejects invalid values', () => {
-    const defaults={maxConcurrent:8,backoffMs:120000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15};
+    const defaults={maxConcurrent:8,backoffMs:120000,backoffFailures:3,maxLoadPerCore:0.8,minFreeRamPct:15,
+      stuckMinSlots:2,stuckAgeMs:600000,stuckSignalEveryMs:600000};
     const standard=resolveAdmissionPolicy({});
     expect(standard.settings.remote).toMatchObject(defaults);
     for(const [key,value] of Object.entries(defaults)) {
@@ -262,6 +263,7 @@ describe('remote controls', () => {
   it.each([
     ['maxConcurrent',0],['maxConcurrent',1.5],['maxConcurrent',257],['backoffMs',86400001],['backoffMs',1.5],
     ['backoffFailures',0],['backoffFailures',1.5],['maxLoadPerCore',Infinity],['minFreeRamPct',101],
+    ['stuckMinSlots',0],['stuckMinSlots',1.5],['stuckAgeMs',-1],['stuckAgeMs',1.5],['stuckSignalEveryMs',-1],['stuckSignalEveryMs',1.5],
   ])('falls back to the named standard for invalid/oversized remote.%s=%s', (key,value) => {
     const configured=policy({[key]:value}),standard=resolveAdmissionPolicy({});
     expect(configured.settings.remote[key]).toBe(standard.settings.remote[key]);
@@ -273,6 +275,40 @@ describe('remote controls', () => {
     return {argv:command,policy:policy(remote),cwd:root,env:{},lockRoot,clock:()=>now,
       readTelemetry:vi.fn(async()=>sample()),remoteExec:vi.fn(async()=>({mode:'remote',code:0})),log:vi.fn()};
   }
+  describe('forge-slots-stuck coroner signal through runWithRemoteDecision',()=>{
+    const deadPid=()=>spawnSync(process.execPath,['-e','']).pid;
+    function stuckFixture(remote,count){
+      const f=fixture({maxConcurrent:3,...remote});let time=now;
+      mkdirSync(join(f.cwd,'remote'));
+      const pid=deadPid();
+      for(let i=0;i<count;i++){
+        const file=join(f.cwd,'remote',`slot-${i}.unconfirmed`);
+        writeFileSync(file,JSON.stringify({v:1,host:'forge',owner:'o'+i,pid,at:now-400000}));
+        utimesSync(file,(now-400000)/1000,(now-400000)/1000);
+      }
+      const events=[];
+      f.clock=()=>time;f.readTelemetry=vi.fn(async()=>sample(time));
+      f.sleep=async ms=>{time+=ms;};
+      f.appendEvent=async event=>{events.push({...event,at:time});return true;};
+      return {f,events};
+    }
+    it('forwards non-default stuck thresholds into forge-slots-stuck events and re-signals only after the configured interval expires',async()=>{
+      const {f,events}=stuckFixture({stuckMinSlots:3,stuckAgeMs:300000,stuckSignalEveryMs:10000},3);
+      expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+      const stuck=events.filter(e=>e.detail.reason==='stuck-slots');
+      expect(stuck.length).toBeGreaterThanOrEqual(2);
+      expect(stuck[0]).toMatchObject({kind:'forge-slots-stuck',daemon:'heavy-admission',
+        detail:{reason:'stuck-slots',host:'forge',minAgeMs:300000,slots:['slot-0.unconfirmed','slot-1.unconfirmed','slot-2.unconfirmed']}});
+      for(let i=1;i<stuck.length;i++) expect(stuck[i].at-stuck[i-1].at).toBeGreaterThanOrEqual(10000);
+    });
+    it('does not signal below the configured minimum slot count or age bound',async()=>{
+      const few=stuckFixture({stuckMinSlots:3,stuckAgeMs:300000,stuckSignalEveryMs:10000},2);
+      await runWithRemoteDecision(few.f);
+      const young=stuckFixture({stuckMinSlots:2,stuckAgeMs:500000,stuckSignalEveryMs:10000},3);
+      await runWithRemoteDecision(young.f);
+      expect([...few.events,...young.events].filter(e=>e.detail.reason==='stuck-slots')).toEqual([]);
+    });
+  });
   it('refreshes an idle server through SSH on the heavy-admission remote path after its cache expires',async()=>{
     const f=fixture({maxLoadPerCore:Number.MAX_VALUE,minFreeRamPct:0}),serverRoot=scratch();let time=now;
     const server=runner.createRunner({testRoot:serverRoot,clock:()=>time});
