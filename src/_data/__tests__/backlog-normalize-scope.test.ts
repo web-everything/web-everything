@@ -5,12 +5,13 @@ import { mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { withFrozenBacklogDir } from './frozen-backlog';
-import { normalizeBriefScope } from '../../../scripts/operations/dispatch-lane.mjs';
+import { normalizeBriefScope, SCOPE_PREFIX_ALIASES } from '../../../scripts/operations/dispatch-lane.mjs';
 import { dispatchPlan } from '../../../scripts/readiness/dispatch-plan.mjs';
+import { repoProfile } from '../../../scripts/lib/repo-profile.mjs';
 import { LOCI } from '../../../scripts/check-standards-rules.mjs';
 
 const require = createRequire(import.meta.url);
-const { normalizeScope } = require('../backlog.js');
+const { normalizeScope, SCOPE_PREFIX_LOCUS, inferLocusFromScope } = require('../backlog.js');
 const matter = require('gray-matter');
 
 // Historical malformed scopes restored by the PR #6244 operator cleanup. They must remain refused;
@@ -25,6 +26,27 @@ const refusedCorpusEntries = new Map([
 ]);
 
 describe('backlog loader normalizeScope — multi-path entries (R372)', () => {
+  it('keeps every declared loader and dispatcher prefix in parity with repoProfile', () => {
+    const prefixes = new Set([
+      ...Object.keys(SCOPE_PREFIX_LOCUS),
+      ...Object.keys(SCOPE_PREFIX_ALIASES),
+    ]);
+    for (const prefix of prefixes) {
+      const profile = repoProfile(prefix);
+      expect(profile, prefix).not.toBeNull();
+      const locus = profile.key === 'we' ? 'webeverything' : profile.key;
+      expect(SCOPE_PREFIX_LOCUS[prefix], prefix).toBe(locus);
+      expect(inferLocusFromScope([`${prefix}:src/a.mjs`]), prefix).toBe(locus);
+      for (const spelling of [prefix, prefix.toUpperCase()]) {
+        const input = [`${spelling}:src/a.mjs src/b.mjs`];
+        const expected = ['src/a.mjs', 'src/b.mjs'].map((path) => `${profile.canonicalPrefix}:${path}`);
+        expect(normalizeScope(input), spelling).toEqual(expected);
+        expect(normalizeBriefScope(input), spelling).toEqual(expected);
+        expect(normalizeBriefScope(normalizeScope(input)), spelling).toEqual(expected);
+      }
+    }
+  });
+
   it.each([
     { name: 'FrontierUI tag with bare paths', tags: ['frontierui'], scope: ['src/a.mjs b.mjs,src/c.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs', 'fui:b.mjs', 'fui:src/c.mjs'] },
     { name: 'FrontierUI tag alias', tags: ['frontier-ui'], scope: ['src/a.mjs'], locus: 'frontierui', expected: ['fui:src/a.mjs'] },

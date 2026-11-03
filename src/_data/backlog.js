@@ -1058,6 +1058,8 @@ module.exports.HUMAN_GATE_KINDS = HUMAN_GATE_KINDS;
 // Named export of the pure `scope:` sanitizer (#x53zzf9) for direct regression testing — inert to the
 // Eleventy build, which only invokes the default function export.
 module.exports.normalizeScope = normalizeScope;
+// Expose the declared prefixes so parity tests cover newly added aliases automatically.
+module.exports.SCOPE_PREFIX_LOCUS = SCOPE_PREFIX_LOCUS;
 // Named export of the pure has-predicted-scope lens predicate (#2618) for direct regression testing — inert
 // to the Eleventy build, which only invokes the default function export.
 module.exports.deriveUnshapedNoScope = deriveUnshapedNoScope;

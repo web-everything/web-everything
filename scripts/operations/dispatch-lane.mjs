@@ -412,7 +412,7 @@ export const BRIEF_SCOPE_VALUE_RE = /^[A-Za-z0-9_.,:/@#*-]+$/;
 
 // Mirror repo-profile's scope aliases without importing its filesystem-backed profile resolver into this
 // pure declaration. The dispatch tests pin these values against repoProfile(...).canonicalPrefix.
-const SCOPE_PREFIX_ALIASES = Object.freeze({ webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau', pa: 'plateau' });
+export const SCOPE_PREFIX_ALIASES = Object.freeze({ webeverything: 'we', frontierui: 'fui', 'plateau-app': 'plateau', pa: 'plateau' });
 function canonicalScopePrefix(value) {
   const lower = String(value).toLowerCase();
   const key = repoKeyForSlug(lower) ?? lower;
