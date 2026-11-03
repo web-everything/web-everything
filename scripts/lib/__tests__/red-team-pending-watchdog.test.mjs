@@ -32,8 +32,16 @@ describe('planPendingRedTeam', () => {
   it.each(['queued', 'running'])('waits for an unknown %s owner before 120 minutes', status => {
     expectKind({ ageMinutes: 1000, status: { status, startedAt: new Date(-119.99 * 60_000).toISOString() }, ownerAlive: null }, 'wait');
   });
-  it.each(['queued', 'running'])('restarts an unknown %s owner at the stale deadline', status => {
-    expectKind({ ageMinutes: 1000, status: { status, startedAt: new Date(-120 * 60_000).toISOString() }, ownerAlive: null }, 'restart');
+  it.each(['queued', 'running'])('escalates an unknown %s owner at the stale deadline without restarting', status => {
+    expectKind({ ageMinutes: 1000, status: { status, startedAt: new Date(-120 * 60_000).toISOString() }, ownerAlive: null }, 'owner-unknown');
+  });
+  it.each([0, 1, 2, 100])('unknown ownership escalates even with %s prior restarts', restarts => {
+    const result = expectKind({ restarts, minutesSinceLastRestart: 0, ageMinutes: 1000,
+      status: { status: 'running', startedAt: new Date(-500 * 60_000).toISOString() } }, 'owner-unknown');
+    expect(result.reason).toMatch(/run age.*500.*ownership could not be proven.*operator.*needs-you/);
+  });
+  it.each(['failed', 'skipped'])('a terminal %s status permits restart', status => {
+    expectKind({ status: { status } }, 'restart');
   });
   it.each(['queued', 'running'])('restarts a proven-dead %s owner before the stale deadline', status => {
     expectKind({ status: { status }, ownerAlive: false }, 'restart');

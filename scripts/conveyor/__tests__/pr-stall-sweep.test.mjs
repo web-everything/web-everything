@@ -463,7 +463,7 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(out.items).toEqual([]);
     expect(out.act).toEqual([]);
   });
-  it('an owner on another host waits before the stale deadline and restarts after it', async () => {
+  it('an owner on another host waits before the stale deadline and escalates after it', async () => {
     const ninetyMinutesAgo = new Date(NOW - 90 * 60_000).toISOString();
     const status = statusFor({ host: 'another-host', startedAt: ninetyMinutesAgo });
     const young = await sweep({ status, prs: [pendingPr({ updatedAt: ninetyMinutesAgo, createdAt: ninetyMinutesAgo })] });
@@ -471,7 +471,9 @@ describe('pending red-team watchdog in the shadow sweep', () => {
     expect(young.out.act).toEqual([]);
     expect(young.probe.isAlive).not.toHaveBeenCalled();
     const stale = await sweep({ status, now: NOW + 30 * 60_000 });
-    expect(stale.out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(stale.out.act).toEqual([]);
+    expect(stale.out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown',
+      reason: expect.stringMatching(/run age.*120.*ownership could not be proven.*needs-you/) }]);
     expect(stale.probe.isAlive).not.toHaveBeenCalled();
   });
   it('a finished real result with its label still pending is published instead of restarted', async () => {
@@ -545,8 +547,8 @@ describe('pending red-team watchdog in the shadow sweep', () => {
       restartRecord(5, { phase: 'would-skip', key: 'held' }), restartRecord(5, { phase: 'operator', key: 'operator' })]);
     const { out } = await sweep({ dir });
     expect(out.items).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
-    expect(out.act).toEqual([]);
-    expect(out.held).toMatchObject([{ held: 'per-PR-head cap' }]);
+    expect(out.act).toEqual(out.items);
+    expect(out.held).toEqual([]);
   });
   it.each(['restart-red-team', 'publish-red-team-result'])('disabling %s yields an operator item in the sweep', async action => {
     const { out } = await sweep({ settings: shadow({ systemActions: { ...STALL_SWEEP_DEFAULTS.systemActions, [action]: false } }),
@@ -609,9 +611,9 @@ describe('watchdog headCap buckets', () => {
   const prHead = `${REPO}#11@${HEAD}`;
   const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, headCap: 2, key: `${prHead}:restart-${n}` });
   const record = (item, phase = 'would-do') => ({ ...item, phase, ts: new Date(NOW - 90 * 60_000).toISOString() });
-  it('a prior daemon nudge exhausts the shared budget and holds a restart', () => {
+  it('a prior daemon nudge still permits the bounded restart allowance', () => {
     const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
-    expect(planStallActions([restart(1)], { now: NOW, limits, history })).toMatchObject({ act: [], held: [{ ...restart(1), held: 'per-PR-head cap' }] });
+    expect(planStallActions([restart(1)], { now: NOW, limits, history })).toEqual({ act: [restart(1)], held: [] });
   });
   it.each(['would-do', 'intent'])('a second restart bypasses the shared one-action head cap after a prior %s', phase => {
     expect(planStallActions([restart(2)], { now: NOW, limits, history: [record(restart(1), phase)] }).act).toEqual([restart(2)]);
@@ -642,10 +644,10 @@ describe('watchdog headCap buckets', () => {
     const other = { ...restart(1), prHead: `${REPO}#12@${HEAD}`, key: 'other' };
     expect(planStallActions([other], { now: NOW, limits, history: [record(restart(1)), record(restart(2))] }).act).toEqual([other]);
   });
-  it('separates two capped actions on the same head by action name', () => {
+  it('different capped actions still share the total head ceiling', () => {
     const publish = { ...restart(1), action: 'publish-red-team-result', key: `${prHead}:publish`, headCap: 1 };
     expect(planStallActions([publish], { now: NOW, limits,
-      history: [record(restart(1)), record(restart(2))] }).act).toEqual([publish]);
+      history: [record(restart(1)), record(restart(2))] })).toEqual({ act: [], held: [{ ...publish, held: 'per-PR-head cap' }] });
   });
 });
 

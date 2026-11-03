@@ -140,8 +140,8 @@ export function planStallActions(items, { history = [], now, limits }) {
   const perAction = new Map();
   const bucket = it => `${it.prHead}|${it.action}`;
   for (const h of done) perAction.set(bucket(h), (perAction.get(bucket(h)) ?? 0) + 1);
-  // Legacy records without headCap conservatively spend the shared budget.
-  for (const h of done.filter(h => h.headCap === undefined)) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
+  // Every action spends the shared head budget, including capped and legacy records.
+  for (const h of done) perHead.set(h.prHead, (perHead.get(h.prHead) ?? 0) + 1);
   const seen = new Set(done.map((h) => `${h.key}|${h.action}`));
   const once = new Set(done.map((h) => h.onceKey).filter(Boolean));
   const act = []; const held = [];
@@ -149,11 +149,11 @@ export function planStallActions(items, { history = [], now, limits }) {
     if (it.lane === 'operator') continue;
     if (seen.has(`${it.key}|${it.action}`) || (it.onceKey && once.has(it.onceKey))) continue;
     const why = act.length >= limits.maxActionsPerSweep ? 'per-sweep cap' : hour >= limits.maxActionsPerHour ? 'per-hour cap'
-      : ((perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead
+      : ((perHead.get(it.prHead) ?? 0) >= limits.maxActionsPerPrHead + (it.headCap ?? 0)
         || (it.headCap !== undefined && (!Number.isSafeInteger(it.headCap) || it.headCap <= 0 || (perAction.get(bucket(it)) ?? 0) >= it.headCap))) ? 'per-PR-head cap' : null;
     if (why) { held.push({ ...it, held: why }); continue; }
     act.push(it); perAction.set(bucket(it), (perAction.get(bucket(it)) ?? 0) + 1); hour += 1;
-    if (it.headCap === undefined) perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
+    perHead.set(it.prHead, (perHead.get(it.prHead) ?? 0) + 1);
   }
   return { act, held };
 }
@@ -247,8 +247,24 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       let status; let ownerAlive = null;
       try {
         status = await readRedTeamStatus({ repo: row.repo, pr: row.number, head, env });
-        if (status?.unreadable) readFailed = true;
-        if (status && !status.unreadable && (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head)) throw new Error('red-team status identity mismatch');
+        if (status !== null) {
+          const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+          if (!object(status) || status.unreadable
+            || !['queued', 'running', 'finished', 'failed', 'skipped'].includes(status.status)
+            || !(status.result == null || typeof status.result === 'string' || object(status.result))) {
+            throw new Error('unreadable red-team status content');
+          }
+          if (status.repo !== row.repo || Number(status.pr) !== row.number || status.head !== head) throw new Error('red-team status identity mismatch');
+          if (['queued', 'running'].includes(status.status)) {
+            // Missing timing is allowed (the watchdog waits), but malformed owner fields cannot be evidence.
+            const text = value => typeof value === 'string' && value.trim().length > 0;
+            if (['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => status[field] != null && !text(status[field]))
+              || (status.pid != null && (!Number.isSafeInteger(status.pid) || status.pid <= 0))
+              || !['host', 'pidNamespace', 'pidStart', 'startedAt', 'createdAt'].some(field => text(status[field]))) {
+              throw new Error('unreadable active red-team status shape');
+            }
+          }
+        }
       } catch (e) { status = { unreadable: true }; readFailed = true; base.errors.push(`red-team ${row.repo}#${row.number}: ${msg(e)}`); }
       try {
         if (['queued', 'running'].includes(status?.status)) {

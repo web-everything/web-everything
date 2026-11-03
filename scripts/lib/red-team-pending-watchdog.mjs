@@ -9,7 +9,7 @@ export function planPendingRedTeam(input) {
     || !Number.isSafeInteger(maxRestarts) || maxRestarts < 0 || !Number.isSafeInteger(restarts) || restarts < 0
     || ![true, false, null].includes(ownerAlive) || (restarts > 0 && !duration(minutesSinceLastRestart))) return wait('unreadable timing or restart evidence');
   if (status !== null && (!status || typeof status !== 'object' || Array.isArray(status)
-    || status.unreadable || !['queued', 'running', 'finished'].includes(status.status))) return wait('unreadable status');
+    || status.unreadable || !['queued', 'running', 'finished', 'failed', 'skipped'].includes(status.status))) return wait('unreadable status');
   if (ageMinutes < thresholdMinutes) return wait('pending head is below the age threshold');
   if (status?.status === 'finished' && status.result && typeof status.result === 'object'
     && !Array.isArray(status.result) && status.result.status === 'ran') return { kind: 'publish-result', reason: 'finished red-team ran result awaits publication' };
@@ -20,7 +20,9 @@ export function planPendingRedTeam(input) {
         .map(value => typeof value === 'string' && value.trim() ? Date.parse(value) : NaN)
         .find(Number.isFinite);
       if (!Number.isFinite(now) || started === undefined || started > now) return wait('red-team run age is unreadable; operator must inspect the pending head');
-      if ((now - started) / 60_000 < staleRunMinutes) return wait('red-team owner is unknown before stale deadline');
+      const runAgeMinutes = (now - started) / 60_000;
+      if (runAgeMinutes < staleRunMinutes) return wait('red-team owner is unknown before stale deadline');
+      return { kind: 'owner-unknown', reason: `red-team run age is ${runAgeMinutes} minutes; ownership could not be proven; operator must inspect the pending head (needs-you)` };
     }
   }
   if (restarts >= maxRestarts) return { kind: 'exhausted', reason: `${restarts} red-team restarts exhausted at age ${ageMinutes} minutes; operator must inspect the pending head` };

@@ -562,9 +562,10 @@ describe('pending red-team watchdog evidence', () => {
     expect(at(state, { redTeam: pending({ status: { status: 'running' }, ownerAlive: false }) }))
       .toMatchObject({ lane: 'system', action: 'restart-red-team' });
   });
-  it.each(states)('%s restarts an unknown owner exactly at the stale deadline', state => {
+  it.each(states)('%s routes unknown ownership to needs-you exactly at the stale deadline', state => {
     expect(at(state, { redTeam: pending({ now: 0, ageMinutes: 1000, status: { status: 'running', startedAt: new Date(-120 * 60_000).toISOString() } }) }))
-      .toMatchObject({ lane: 'system', action: 'restart-red-team' });
+      .toMatchObject({ lane: 'operator', action: 'red-team-owner-unknown', command: expect.any(String),
+        reason: expect.stringMatching(/run age.*120.*ownership could not be proven.*needs-you/) });
   });
   it.each(states)('%s does not publish a finished status with only a legacy result string', state => {
     expect(at(state, { redTeam: pending({ status: { status: 'finished', result: 'ran' } }) }))

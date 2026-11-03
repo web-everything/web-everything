@@ -1,4 +1,4 @@
-/** Guard regressions supplement the committed phase-1 contract without changing its fixtures. */
+/** Guard regressions for pending watchdog evidence and shared action budgets. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +17,7 @@ describe('explicit watchdog guard boundaries', () => {
   it('unknown-owner grace honors the configured stale deadline inclusively', () => {
     const status = { status: 'queued', startedAt: new Date(0).toISOString() };
     expect(planPendingRedTeam(evidence({ status, now: 239.99 * 60_000 })).kind).toBe('wait');
-    expect(planPendingRedTeam(evidence({ status, now: 240 * 60_000 })).kind).toBe('restart');
+    expect(planPendingRedTeam(evidence({ status, now: 240 * 60_000 })).kind).toBe('owner-unknown');
   });
   it('restart cooldown honors a nondefault threshold inclusively', () => {
     expect(planPendingRedTeam(evidence({ restarts: 1, minutesSinceLastRestart: 89.99 })).kind).toBe('wait');
@@ -116,24 +116,33 @@ describe('headCap and shared head budgets', () => {
   const record = (it, phase = 'would-do') => ({ ...it, phase, ts: new Date(NOW - 60_000).toISOString() });
   const capped = item('restart-red-team', 2);
   const ordinary = [item('ask-review-daemon'), item('rerun-check')];
-  it.each(['would-do', 'intent'])('two different ordinary %s actions exhaust the shared head budget', phase => {
+  it.each(['would-do', 'intent'])('two different ordinary %s actions hold ordinary items but permit the capped allowance', phase => {
     const result = planStallActions([item('third-action'), capped], {
       now: NOW, limits, history: ordinary.map(it => record(it, phase)),
     });
-    expect(result.act).toEqual([]);
-    expect(result.held).toMatchObject([{ held: 'per-PR-head cap' }, { ...capped, held: 'per-PR-head cap' }]);
+    expect(result.act).toEqual([capped]);
+    expect(result.held).toEqual([{ ...item('third-action'), held: 'per-PR-head cap' }]);
   });
-  it('ordinary actions planned this pass hold a later headCap item', () => {
+  it('ordinary actions planned this pass permit the bounded headCap allowance', () => {
     const result = planStallActions([...ordinary, capped], { now: NOW, limits });
-    expect(result.act).toEqual(ordinary);
-    expect(result.held).toEqual([{ ...capped, held: 'per-PR-head cap' }]);
+    expect(result.act).toEqual([...ordinary, capped]);
+    expect(result.held).toEqual([]);
   });
-  it.each(['history', 'current pass'])('headCap actions in %s do not spend the shared budget', source => {
+  it.each(['history', 'current pass'])('headCap actions in %s spend the shared budget', source => {
     const result = planStallActions(source === 'history' ? ordinary : [capped, ...ordinary], {
       now: NOW, limits, history: source === 'history' ? [record(capped)] : [],
     });
-    expect(result.act).toEqual(source === 'history' ? ordinary : [capped, ...ordinary]);
-    expect(result.held).toEqual([]);
+    expect(result.act).toEqual(source === 'history' ? [ordinary[0]] : [capped, ordinary[0]]);
+    expect(result.held).toEqual([{ ...ordinary[1], held: 'per-PR-head cap' }]);
+  });
+  it.each(['would-do', 'intent', 'current pass'])('mixed capped buckets stop at shared maximum plus headCap with %s evidence', source => {
+    const prior = [...ordinary, item('other-capped', 10), { ...capped, key: 'previous' }];
+    const next = { ...capped, key: 'next' };
+    const result = planStallActions(source === 'current pass' ? [...prior, next] : [next], {
+      now: NOW, limits, history: source === 'current pass' ? [] : prior.map(it => record(it, source)),
+    });
+    expect(result.act).toEqual(source === 'current pass' ? prior : []);
+    expect(result.held).toEqual([{ ...next, held: 'per-PR-head cap' }]);
   });
   it('headCap actions still stop at their own bucket below the shared ceiling', () => {
     const result = planStallActions([{ ...capped, key: 'next' }], {
@@ -144,7 +153,7 @@ describe('headCap and shared head budgets', () => {
   });
   it('legacy records missing headCap conservatively spend the shared budget', () => {
     const { headCap, ...legacy } = capped;
-    const result = planStallActions([{ ...capped, key: 'next' }], {
+    const result = planStallActions([ordinary[0]], {
       now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 }, history: [record(legacy)],
     });
     expect(result.act).toEqual([]);
@@ -158,6 +167,41 @@ describe('headCap and shared head budgets', () => {
 });
 
 describe('whole-pass red-team evidence integrity', () => {
+  it.each([
+    ['array with valid identity', []],
+    ['primitive', false],
+    ['unknown status', { status: 'mystery' }],
+    ['missing status', { status: undefined }],
+    ['numeric result', { result: 1 }],
+    ['boolean result', { result: false }],
+    ['array result', { result: [] }],
+    ['running with no owner or timing shape', { status: 'running' }],
+    ['queued with no owner or timing shape', { status: 'queued' }],
+    ['invalid pid', { status: 'running', host: 'remote', pid: '123' }],
+    ['invalid host', { status: 'queued', host: {} }],
+    ['invalid namespace', { status: 'running', host: 'remote', pidNamespace: [] }],
+    ['invalid timestamp shape', { status: 'running', host: 'remote', startedAt: {} }],
+  ])('%s content blocks the whole pass despite an actionable peer', async (_name, content) => {
+    const malformed = typeof content === 'object'
+      ? Object.assign(Array.isArray(content) ? [] : { status: 'finished', result: null },
+        { repo: REPO, pr: 11, head: HEAD }, content)
+      : content;
+    const { out, probe } = await sweep({ peer: true, incomplete: true,
+      readStatus: ({ pr }) => pr === 12 ? null : malformed });
+    expect(out.items).toContainEqual(expect.objectContaining({ pr: 12, action: 'restart-red-team' }));
+    expect(out.act).toEqual([]);
+    expect(out.held).toEqual([]);
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.records.filter(r => ['would-do', 'intent'].includes(r.phase))).toEqual([]);
+    expect(out.records.find(r => r.phase === 'pass')).toMatchObject({ incomplete: true, readFailed: true });
+    expect(out.errors).toContainEqual(expect.stringMatching(/unreadable.*status/));
+  });
+  it.each(['failed', 'skipped'])('terminal %s evidence is readable and permits restart', async status => {
+    const { out } = await sweep({ status });
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(out.records.find(r => r.phase === 'pass')).toMatchObject({ incomplete: false, readFailed: false });
+  });
+
   it.each(['throws', 'unreadable', 'wrong-repo', 'wrong-pr', 'wrong-head'])('%s status blocks an otherwise actionable peer', async fault => {
     const valid = { repo: REPO, pr: 11, head: HEAD, status: 'finished', result: { status: 'ran' } };
     const readStatus = ({ pr }) => {
@@ -202,12 +246,14 @@ describe('owner probes preserve unknown liveness', () => {
       expect(out.act).toEqual([]);
     } finally { kill.mockRestore(); }
   });
-  it('a throwing probe still uses retained stale run evidence for bounded recovery', async () => {
+  it('a throwing probe escalates retained stale run evidence without restarting', async () => {
     const { out } = await sweep({ ageMinutes: 1000, readStatus: () => ({
       repo: REPO, pr: 11, head: HEAD, status: 'running', host: 'local-host', pidNamespace: 'local-ns',
       pid: 12345, startedAt: new Date(NOW - 120 * 60_000).toISOString(),
     }), probePatch: { isAlive: () => { throw new Error('probe failed'); } } });
-    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown',
+      reason: expect.stringMatching(/run age.*120.*ownership could not be proven/) }]);
   });
 });
 
@@ -220,7 +266,7 @@ describe('unknown active owners use run age', () => {
   it.each(['pidStart', 'startedAt', 'createdAt'])('%s supplies the inclusive run deadline independently of pending age', field => {
     const status = { status: 'running', [field]: new Date(NOW - 240 * 60_000).toISOString() };
     expect(planPendingRedTeam(evidence({ now: NOW - 1, status })).kind).toBe('wait');
-    expect(planPendingRedTeam(evidence({ now: NOW, status })).kind).toBe('restart');
+    expect(planPendingRedTeam(evidence({ now: NOW, status })).kind).toBe('owner-unknown');
   });
   it('a fresh process birth time takes precedence over old fallback timestamps', () => {
     expect(planPendingRedTeam(evidence({ now: NOW, status: { status: 'running',
@@ -230,7 +276,7 @@ describe('unknown active owners use run age', () => {
   it('unreadable process birth and start timestamps fall back to readable creation time', () => {
     expect(planPendingRedTeam(evidence({ now: NOW, status: { status: 'running',
       pidStart: 'unreadable', startedAt: null, createdAt: new Date(NOW - 240 * 60_000).toISOString(),
-    } })).kind).toBe('restart');
+    } })).kind).toBe('owner-unknown');
   });
   it.each([{}, { pidStart: 'bad', startedAt: '', createdAt: false }, { pidStart: new Date(NOW + 1).toISOString() }])('unreadable or future run timing %j waits with operator fallback even when exhausted', timestamps => {
     const result = planPendingRedTeam(evidence({ now: NOW, ageMinutes: 1000, restarts: 3, minutesSinceLastRestart: 300,
@@ -244,6 +290,8 @@ describe('unknown active owners use run age', () => {
     const young = await sweep({ ageMinutes: 1000, readStatus });
     expect(young.out.act).toEqual([]);
     const stale = await sweep({ ageMinutes: 1000, now: NOW + 60_000, readStatus });
-    expect(stale.out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(stale.out.act).toEqual([]);
+    expect(stale.out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown',
+      reason: expect.stringMatching(/run age.*120.*ownership could not be proven/) }]);
   });
 });

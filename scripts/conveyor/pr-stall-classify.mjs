@@ -214,6 +214,7 @@ function classifyUnsafe(o = {}) {
     if (['red-team-pending', 'drain-skip:red-team-pending'].includes(state) && redTeam !== undefined) {
       const plan = planPendingRedTeam(redTeam);
       if (plan.kind === 'wait') return null;
+      if (plan.kind === 'owner-unknown') return operator('red-team-owner-unknown', plan.reason);
       if (plan.kind === 'exhausted') return operator('red-team-restart-exhausted', plan.reason);
       if (plan.kind === 'publish-result') return out('system', 'publish-red-team-result', plan.reason, { headCap: 1 });
       return out('system', 'restart-red-team', plan.reason, { headCap: 2, key: `${key}:restart-${redTeam.restarts + 1}` });
