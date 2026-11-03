@@ -916,7 +916,11 @@ export async function runWithRemoteDecision({
       terminated = (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254)
         || ((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true);
       await record(result);
-      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) {
+        // Forge keeps no stdout/stderr after the run: say so, so a failing caller knows the streamed output is the only copy.
+        if (result.code !== 0) log(`heavy-admission: remote run ${typeof result.run === 'string' ? result.run : '(unknown)'} exited ${result.code} (Forge receipt verified; real test/command failure). Forge keeps no stdout/stderr for finished runs - the output streamed above is the only copy; rerun to reproduce.\n`);
+        return { handled: true, exitCode: result.code, remoteResult: result };
+      }
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');

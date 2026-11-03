@@ -392,7 +392,17 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv: originalArgv, cwd: f.cwd }));
     expect(f.remoteExec.mock.calls[0][0].argv).toBe(f.argv);
     expect(f.argv).toEqual(originalArgv);
-    expectLines(f.log, 1, 'remote');
+    expectLines(f.log, code === 0 ? 1 : 2, 'remote');
+  });
+
+  it('names the receipt run id and says Forge keeps no output when a remote run exits nonzero', async () => {
+    const f = fixture({ result: { mode: 'remote', code: 1, run: 'r-abc123' } });
+    expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 1 });
+    const text = f.log.mock.calls.map(c => c[0]).join('');
+    expect(text).toContain('r-abc123');
+    expect(text).toContain('exited 1');
+    expect(text).toContain('keeps no stdout/stderr');
+    expect(text).not.toContain('unconfirmed');
   });
 
   it.each([0, 254])('accepts remote completion at valid exit boundary %s', async code => {

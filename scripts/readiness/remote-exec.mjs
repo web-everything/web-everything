@@ -1291,6 +1291,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         }
         return {mode:'not-started',terminated:true,reason:'forge-rejected:'+reply.reason};
       }
+      // A lost ssh run reply (result undefined) is resolved by the protected finish receipt, which is bound to this
+      // run's nonce, run id and digests. A reply that disagrees with the receipt stays unconfirmed (tamper guard).
+      const receiptCode = Number.isInteger(reply?.code) && reply.code >= 0 && reply.code < 255 ? reply.code : undefined;
+      if(!result && receiptCode !== undefined && verifyReceipt(text,expected,receiptCode)) result = {code: receiptCode};
       if(!result || !verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if (argv[2] === 'check:standards') {
         observeStandards(result.stdout ?? '', 'stdout');

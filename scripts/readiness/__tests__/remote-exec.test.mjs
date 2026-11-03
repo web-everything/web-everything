@@ -768,6 +768,22 @@ describe('standards input parity', () => {
     expect(await runRemote(f)).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs'});
   });
 
+  // Card 2026-11-02 19:04: a lost or mismatched run reply must not hide a real exit the protected receipt proves.
+  describe('protected receipt is the source of truth for the exit code', () => {
+    const lostRun = (f) => { const original = f.exec; f.exec = vi.fn(async call => { if (isRun(call)) { await original(call); throw new Error('ssh dropped'); } return original(call); }); return f; };
+    it('reports the receipt exit 1 as remote (not unconfirmed) when the run reply is lost', async () => {
+      const f = lostRun(fixture({runCode:1}));
+      expect(await runRemote(f)).toMatchObject({mode:'remote', code:1, run: expect.stringMatching(/^r-/)});
+    });
+    it('stays unconfirmed when the run reply is lost and no receipt exists', async () => {
+      expect(await runRemote(lostRun(fixture({runCode:1, receiptCode:1})))).toEqual({mode:'unconfirmed', reason:'ambiguous-result'});
+    });
+    it.each(['wrong nonce', 'wrong run'])('stays unconfirmed for a forged receipt (%s) when the run reply is lost', async kind => {
+      const f = lostRun(fixture({runCode:1, receipt:(_n, value) => JSON.stringify({...value, ...(kind === 'wrong nonce' ? {nonce:'0'.repeat(32)} : {run:'r-'+'0'.repeat(32)})})}));
+      expect(await runRemote(f)).toEqual({mode:'unconfirmed', reason:'ambiguous-result'});
+    });
+  });
+
   it('keeps skipped standards unconfirmed when the completion receipt is invalid', async () => {
     const f = fixture({receipt:'untrusted completion'}), original = f.exec;
     f.argv = ['npm','run','check:standards'];
