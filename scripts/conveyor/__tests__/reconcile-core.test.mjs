@@ -3962,6 +3962,18 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
     const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', prNumber: 6254, label: 'review:pending' })]);
   });
+  it('restores review for a [bot]-suffix author', () => {
+    const pr = open({ headRefName: 'ci/refresh-test-timings', author: { login: 'some-app[bot]' },
+      statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() })) });
+    const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
+  it('restores review for an is_bot-only author', () => {
+    const pr = open({ headRefName: 'ci/refresh-test-timings', author: { login: 'some-user', is_bot: true },
+      statusCheckRollup: greenRollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() })) });
+    const plan = planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
   it('a non-lane bot PR with no readable check timestamps is not settled (strict grace)', () => {
     const p = open({ headRefName: 'ci/x', author: { login: 'app/web-everything' }, statusCheckRollup: greenRollup.map(({ completedAt, ...c }) => c) });
     expect(planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW }).dispatch.some((d) => d.kind === 'restore-review-label')).toBe(false);
