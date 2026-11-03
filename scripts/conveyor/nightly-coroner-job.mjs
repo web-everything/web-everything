@@ -234,7 +234,8 @@ function readJudgeCoverage(sourceRoot, home) {
     if (statSync(path).size > cap) throw new Error('coroner coverage exceeds byte bound; run manual /coroner');
     return readFileSync(path, 'utf8');
   };
-  const held = boundedRead(join(home, 'cards-to-file.md'), 512 * 1024);
+  let held = ''; // a missing held list means nothing is held yet
+  try { held = boundedRead(join(home, 'cards-to-file.md'), 512 * 1024); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   const openPrs = JSON.parse(runGhSync(['pr', 'list', '--state', 'open', '--limit', '201', '--json', 'number,title'],
     { cwd: sourceRoot, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 }));
   if (!Array.isArray(openPrs) || openPrs.length > 200 || openPrs.some((p) => !Number.isSafeInteger(p.number) || typeof p.title !== 'string')) {
@@ -307,12 +308,13 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
   loadJudgeSpawn = () => import('../lib/judge-spawn.mjs'),
   judge = async (request) => {
     signal?.throwIfAborted();
-    const coverage = readJudgeCoverage(sourceRoot, home);
+    const coverage = readCoverage(sourceRoot, home);
     signal?.throwIfAborted();
     // judgeSpawn enforces the schema and --tools ""; an unavailable provider fails judgment closed.
     return spawnToolFreeCoronerJudge({ ...request, input: `${request.input}\n${fenceUntrusted('material', JSON.stringify(coverage))}`,
       timeoutMs: 5 * 60000 }, { load: loadJudgeSpawn });
   },
+  readCoverage = readJudgeCoverage,
   fileItem = async (input) => appendHeldCoronerCard(input, { home, night }),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');

@@ -733,7 +733,7 @@ it('cannot forge held item headers or key receipts through proposedFix, and late
 
 it('routes the default judge through tool-free judgeSpawn and adapts its value', async () => {
   const { input, io } = judgedExtraction();
-  const answer = await io.judge(); delete io.judge;
+  const answer = await io.judge(); delete io.judge; io.readCoverage = () => ({ held: '', openPrs: [], recentCards: [] });
   providers.judgeSpawn.mockResolvedValue({ ...answer, sessionId: 'juror-session' });
   await extractNightlyCoroner(input, io);
   expect(providers.judgeSpawn).toHaveBeenCalledOnce();
@@ -747,12 +747,12 @@ it('routes the default judge through tool-free judgeSpawn and adapts its value',
 
 it.each(['missing module', 'missing export', 'provider failure'])
 ('fails closed through judge-failed without Codex fallback on %s', async (failure) => {
-  const { input, io } = judgedExtraction(); delete io.judge;
+  const { input, io } = judgedExtraction(); delete io.judge; io.readCoverage = () => ({ held: '', openPrs: [], recentCards: [] });
   io.loadJudgeSpawn = async () => {
     if (failure === 'missing module') throw new Error('module missing');
     return failure === 'missing export' ? {} : { judgeSpawn: async () => { throw new Error('provider down'); } };
   };
-  await extractNightlyCoroner(input, io);
+  await expect(extractNightlyCoroner(input, io)).rejects.toThrow('tool-free judgeSpawn');
   expect(io.fileItem).not.toHaveBeenCalled();
   expect(readFileSync(io.statusFeed, 'utf8')).toContain('coroner-judge-failed');
   expect(readFileSync(io.statusFeed, 'utf8')).toContain('tool-free judgeSpawn');
