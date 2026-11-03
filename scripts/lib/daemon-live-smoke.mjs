@@ -459,8 +459,9 @@ async function checkLaneAcquireRelease(ctx) {
           ], { cwd: root, timeoutMs: Math.min(SMOKE_LANE_HINT_TIMEOUT_MS, acquireCapMs), env });
           if (Number.isInteger(JSON.parse(hinted)?.lane)) return hinted;
         } catch {
-          // A failed explicit acquire may still have written a lease: drop this session's leases (10-minute TTL backstops).
-          try { await releaseSession(); } catch { /* TTL covers it */ }
+          // A failed explicit acquire may still have written a lease: drop this session's leases; if even that
+          // fails, stop trying hints (the caller re-throws the original failure).
+          try { await releaseSession(); } catch { return undefined; }
         }
       }
       return undefined;
@@ -470,8 +471,12 @@ async function checkLaneAcquireRelease(ctx) {
       try {
         return await acquire(hints.length ? Math.min(acquireCapMs, SMOKE_AUTOPICK_FIRST_MS) : acquireCapMs);
       } catch (e) {
-        if (!hints.length || !isTimeout(e)) throw e;
-        try { await releaseSession(); } catch { /* TTL covers it */ }
+        // Only a timeout on a genuinely BUSY host (the same evidence busyPoolSkip demands) is load, not a hung
+        // auto-pick; an idle-host timeout stays a failure. A failed cleanup also refuses the fallback, so a
+        // possibly-leaked lease can never be hidden behind a later hinted success.
+        const busy = typeof ctx.hostBusy === 'function' ? ctx.hostBusy() : hostLooksBusy(env);
+        if (!hints.length || !isTimeout(e) || !busy) throw e;
+        try { await releaseSession(); } catch { throw e; }
         const hinted = await acquireHinted();
         if (hinted === undefined) throw e;
         return hinted;

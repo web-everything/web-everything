@@ -84,7 +84,7 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
   });
 
   describe('explicit-lane fallback from the published free-lane hints when the auto-pick scan times out', () => {
-    const hinted = (hints, runChild) => ({ ...context(runChild), laneHints: () => hints });
+    const hinted = (hints, runChild, hostBusy = () => true) => ({ ...context(runChild), laneHints: () => hints, hostBusy });
     const timedOut = () => exit(1, { message: 'timed out after 120000ms (process group killed)' });
     it('a healthy auto-pick is used as before and the hints are never touched', async () => {
       const runChild = vi.fn().mockResolvedValueOnce(JSON.stringify({ lane: 3 })).mockResolvedValueOnce('');
@@ -99,6 +99,16 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
       const a = acquires(runChild);
       expect(a[0][2].timeoutMs).toBe(120_000);
       expect(a[1][1]).toContain('--lane=7');
+    });
+    it('a timeout on an IDLE host is a failure, never rescued by a hint', async () => {
+      const runChild = vi.fn().mockRejectedValue(timedOut());
+      expect((await check.run(hinted([7], runChild, () => false))).ok).toBe(false);
+      expect(acquires(runChild).some(([, args]) => args.some((x) => x.startsWith('--lane=')))).toBe(false);
+    });
+    it('a failed cleanup after the timeout refuses the fallback (no leaked lease hidden)', async () => {
+      const runChild = vi.fn().mockRejectedValueOnce(timedOut()).mockRejectedValueOnce(exit(1));
+      expect((await check.run(hinted([7], runChild))).ok).toBe(false);
+      expect(acquires(runChild)).toHaveLength(1);
     });
     it('a fast "no free lane" is NEVER rescued by a hint (no laundering)', async () => {
       const runChild = vi.fn().mockRejectedValue(exit(1, { stderr: '✗ no free lane in pool "web-everything" (3 all held/dirty)' }));
