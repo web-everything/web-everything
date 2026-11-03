@@ -147,7 +147,7 @@ import '../lib/tools-root-guard.mjs';
 import { constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile } from 'node:child_process';
-import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
+import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -165,7 +165,7 @@ import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
-import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
+import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey, readTailBytes } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
 import {
   classifyCommandKind, refineKind, holderLabel, holdBreakdown, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
@@ -753,6 +753,21 @@ export function hostOverloadedForRemote(env = process.env, admit = hostLoadAdmis
   return verdict?.admitted === false && DEFINITE_OVERLOAD.test(String(verdict.reason ?? ''));
 }
 
+// Diagnostic history is best-effort and bounded, including oversized refusal details.
+function recordRemoteFallback({lockRoot, reason, detail = null, cwd, argv, env, clock}) {
+  try {
+    const file = join(lockRoot, 'remote-fallbacks.jsonl');
+    const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
+    const row = {ts:new Date(clock()).toISOString(), reason:bounded(reason),
+      detail:detail == null ? null : bounded(detail), lane:basename(cwd),
+      kind:classifyCommandKind(argv.map(shellQuoteWord).join(' '), env)};
+    mkdirSync(lockRoot, {recursive:true});
+    const tail = existsSync(file) ? readTailBytes(file, 512 * 1024) : '';
+    if (existsSync(file) && statSync(file).size > 512 * 1024) writeFileSync(file, tail, 'utf8');
+    appendFileSync(file, (tail && !tail.endsWith('\n') ? '\n' : '') + JSON.stringify(row) + '\n', 'utf8');
+  } catch { /* Observability must never prevent local admission. */ }
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -792,6 +807,7 @@ export async function runWithRemoteDecision({
   const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason) => {
+    recordRemoteFallback({lockRoot, reason, cwd, argv, env, clock});
     log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
     return { handled: false };
   };
@@ -920,6 +936,7 @@ export async function runWithRemoteDecision({
       if(!outstanding)releaseOwnedSlot({...slotOptions,fastSlots:0});
     }
   }
+  recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}${detail ? ` (${oneLine(detail)})` : ''}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
@@ -2199,6 +2216,14 @@ export function poolRootOf(lockRoot) {
  * @param {(ms:number) => Promise<void>} [opts.sleep]
  * @returns {Promise<{ exitCode:number, admission:object }>}
  */
+// A child killed by a signal has status null: report the shell convention 128+signal so callers' infrastructure-failure
+// guards see a killed runner, never a plain test failure (exit 1).
+function childExitCode(e) {
+  if (Number.isFinite(e && e.status)) return e.status;
+  const n = e && typeof e.signal === 'string' ? osConstants.signals[e.signal] : undefined;
+  return Number.isInteger(n) ? 128 + n : 1;
+}
+
 export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
@@ -2210,7 +2235,7 @@ export async function runUnderAdmission({
   if (bypass) {
     let exitCode = 0;
     try { exec(command, { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv }); }
-    catch (e) { exitCode = Number.isFinite(e && e.status) ? e.status : 1; }
+    catch (e) { exitCode = childExitCode(e); }
     return { exitCode, admission: { ok: false, slot: null, timedOut: false, waitedMs: 0, bypassed: bypass } };
   }
   mkdirSync(lockRoot, { recursive: true });
@@ -2232,7 +2257,7 @@ export async function runUnderAdmission({
     if (runKind === 'files') execOpts.timeout = resolveFastRunTimeoutMs(env);
     exec(command, execOpts);
   } catch (e) {
-    exitCode = Number.isFinite(e && e.status) ? e.status : 1;
+    exitCode = childExitCode(e);
     if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
   } finally {
     if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });

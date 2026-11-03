@@ -157,7 +157,7 @@ function clearReaderStarved(starvedRoot, readerKey) {
 /** The live starved reader (if any, other than `owner`) that writers must yield to. A claim lapses with the same
  *  lease as a lock entry (`lastRefusedAt` older than `leaseMinutes`) or when its same-host pid is dead — those
  *  are removed on sight, so a crashed reader can never hold writers off. */
-function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after }) {
+function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, after, startedBeforeMs = null }) {
   if (!(after > 0)) return null;
   for (const rec of readStarvedRecords(starvedRoot)) {
     const asEntry = { owner: rec.owner, pid: rec.pid, heartbeatAt: rec.lastRefusedAt };
@@ -166,6 +166,10 @@ function findPriorityReader(starvedRoot, { owner, nowMs, leaseMinutes, probe, af
       continue;
     }
     if (rec.owner === owner) continue;
+    // Bounded: the override lives only inside one writer wait (capped by waitMs); the starved reader's claim is
+    // kept, so the writer's NEXT attempt (and its start check) yields to it again. A bounded-wait writer only yields to a reader whose starvation began BEFORE the writer's wait did.
+    // Fail closed: a record with a missing/invalid timestamp is treated as older, so the writer still yields.
+    if (startedBeforeMs !== null && Number.isFinite(isoMs(rec.firstRefusedAt)) && !(isoMs(rec.firstRefusedAt) < startedBeforeMs)) continue;
     if (rec.count >= after) return rec;
   }
   return null;
@@ -192,6 +196,25 @@ export const DEFAULT_WRITER_PRIORITY_AFTER = 1;
  *  start re-tries; a claim never outlives a dead owner pid). Default 30 min — longer than one sibling tick. */
 export const WRITER_CLAIM_TTL_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_CLAIM_TTL_MS';
 export const DEFAULT_WRITER_CLAIM_TTL_MS = 30 * 60_000;
+
+/** Setting: how long (ms) a writer must have waited for readers to drain before it stops backing off to readers
+ *  that began starving AFTER its wait began (the reader stream its own reservation refuses). Already-held
+ *  reader locks are never broken; the writer intent is its ordinary lease/pid-liveness reservation, so a crashed
+ *  writer's intent lapses on its own. Default `0` = OFF (today's reader-priority behaviour, exactly); a daemon
+ *  opts in with a positive value (enabling needs an operator ruling). */
+export const WRITER_WAIT_PRIORITY_ENV = 'WE_DAEMON_CLONE_LOCK_WRITER_WAIT_PRIORITY_MS';
+export const DEFAULT_WRITER_WAIT_PRIORITY_MS = 0;
+/** The override is a bounded window, not forever: this long after the threshold the writer yields to starved
+ *  readers again (so a stream of starved readers is queued behind a writer for at most this long). */
+export const WRITER_WAIT_PRIORITY_WINDOW_MS = 5 * 60_000;
+
+/** PURE: the writer wait-priority threshold from env (a non-negative number of ms, else the default 0 = off). */
+export function resolveWriterWaitPriorityMs(env = process.env) {
+  const raw = env?.[WRITER_WAIT_PRIORITY_ENV];
+  if (raw === undefined || String(raw).trim() === '') return DEFAULT_WRITER_WAIT_PRIORITY_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_WRITER_WAIT_PRIORITY_MS;
+}
 
 /** PURE: the writer-priority threshold from env (a non-negative integer, else the default; 0 = off). */
 export function resolveWriterPriorityAfter(env = process.env) {
@@ -455,9 +478,11 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *       a dead/expired one is reclaimed by {@link reserve} itself, same as any other stale key.
  *   (2) poll `readers/` until no LIVE entry other than `owner` remains, or `waitMs` elapses. Any dead/expired
  *       reader entry seen along the way is removed on sight (reclaim) rather than left to rot.
+ *       explicitly supplied `ignoreOwners` (default: []) never block;
+ *       their entries are retained unless the liveness probe proves them dead.
  *       Timeout ⇒ release the writer key we took and report `tick-in-progress` (a live tick is still running).
  * @param {string} root
- * @param {{owner?:string, lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
+ * @param {{owner?:string, ignoreOwners?:string[], lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
  *   now?:()=>number, pid?:number, leaseMinutes?:number, probe?:(entry:object|null)=>('dead'|'alive'|'unknown')}} [opts]
  * Reader fairness: before reserving, and on every drain poll, a live starved reader (refused
  * `readerPriorityAfter` times in a row) makes this writer back off — `reader-priority`, writer key released. Only
@@ -467,8 +492,10 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function acquireWrite(root, opts = {}) {
   const {
     owner = defaultOwner(opts.pid),
+    // Callers must explicitly opt in to excluding readers; inherited env never grants a bypass.
+    ignoreOwners = [],
     lockRoot = defaultLockRoot(),
-    waitMs = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
+    waitMs: waitMsOpt = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
     pollMs = 1000,
     sleep = defaultSleep,
     now = () => Date.now(),
@@ -479,9 +506,19 @@ export async function acquireWrite(root, opts = {}) {
     readerPriorityAfter = resolveReaderPriorityAfter(),
     writerPriorityAfter = resolveWriterPriorityAfter(),
     writerClaimTtlMs = resolveWriterClaimTtlMs(),
+    writerWaitPriorityMs: writerWaitPriorityMsOpt = resolveWriterWaitPriorityMs(),
+    writerWaitPriorityWindowMs: writerWaitPriorityWindowMsOpt = WRITER_WAIT_PRIORITY_WINDOW_MS,
   } = opts;
   const { writerRoot, readersRoot, starvedRoot } = cloneLockDirs(root, lockRoot);
+  // Fail closed on an unbounded/invalid wait: the wait-priority override must always end.
+  const waitMs = Number.isFinite(Number(waitMsOpt)) && Number(waitMsOpt) >= 0 ? Number(waitMsOpt) : 600_000;
 
+  // The override window can only shrink below the built-in cap; a non-finite or negative value uses the cap.
+  // Normalize a direct option too (a string must not concatenate); invalid or negative means off.
+  const writerWaitPriorityMs = Number.isFinite(Number(writerWaitPriorityMsOpt)) && Number(writerWaitPriorityMsOpt) > 0
+    ? Number(writerWaitPriorityMsOpt) : 0;
+  const windowMs = Number.isFinite(Number(writerWaitPriorityWindowMsOpt)) && Number(writerWaitPriorityWindowMsOpt) >= 0
+    ? Math.min(Number(writerWaitPriorityWindowMsOpt), WRITER_WAIT_PRIORITY_WINDOW_MS) : WRITER_WAIT_PRIORITY_WINDOW_MS;
   const startMs = now();
   const startIso = new Date(startMs).toISOString();
   // Writer fairness: our own live, effective claim (we already starved). Older claim wins — we only yield to a
@@ -494,8 +531,12 @@ export async function acquireWrite(root, opts = {}) {
   };
   // Reader fairness: a starved reader has priority — never even reserve while one is waiting to get in.
   const priorityFor = (nowMsN) => {
+    const waited = nowMsN - startMs;
+    const waitedPast = writerWaitPriorityMs > 0 && waited >= writerWaitPriorityMs
+      && waited < writerWaitPriorityMs + windowMs;
     const r = findPriorityReader(starvedRoot, {
       owner, nowMs: nowMsN, leaseMinutes, probe, after: readerPriorityAfter,
+      startedBeforeMs: waitedPast ? startMs : null,
     });
     if (!r) return null;
     const mine = ownClaim();
@@ -524,6 +565,11 @@ export async function acquireWrite(root, opts = {}) {
     const blockers = [];
     for (const entry of listReaderEntries(readersRoot)) {
       if (entry.owner === owner) continue;
+      if (ignoreOwners.includes(entry.owner)) {
+        // An ignored reader still owns its entry, even after lease expiry; only proven death reclaims it.
+        if (probe(entry) === 'dead') releaseLockDir(readersRoot, entry.owner);
+        continue;
+      }
       if (entryIsLive(entry, nowMsN, leaseMinutes, probe)) {
         blockers.push(entry.owner);
       } else {

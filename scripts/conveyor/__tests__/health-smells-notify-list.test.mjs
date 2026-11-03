@@ -28,3 +28,7 @@ describe('operator-hold-aged on the notify list', () => {
     expect(unlisted).toEqual([{ kind: 'notify', key: `operator-hold-aged::${WE}#7:ruling-dispute`, suppressed: 'shadow mode' }]);
   });
 });
+
+it.each(['pr-no-movement', 'pr-stage-stall'])('R437 enables %s in shadow', id => {
+  expect(NOTIFY_EVEN_IN_SHADOW.has(id)).toBe(true);
+});

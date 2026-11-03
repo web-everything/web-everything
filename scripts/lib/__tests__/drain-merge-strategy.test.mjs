@@ -115,6 +115,18 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it('a fresh same-head admission hold records no enqueue success or retry backoff', () => {
+    const h = harness({ strategy: 'github-merge-queue' });
+    const reason = `mq-same-head-failed: #42 head ${HEAD} — failed_checks`;
+    const sameHeadAdmission = vi.fn(() => ({ hold: true, line: reason }));
+    expect(h.s.enqueue({ num: 42 }, HEAD, { comments: [], sameHeadAdmission })).toEqual({
+      enqueued: false, kind: 'mq-same-head-failed', reason,
+    });
+    expect(sameHeadAdmission).toHaveBeenCalledTimes(1);
+    expect(h.calls.some(c => c.some(arg => typeof arg === 'string' && arg.includes('enqueuePullRequest')))).toBe(false);
+    expect(h.state()).toBeNull();
+    expect(h.calls.some(c => c.includes('comment') && c.some(arg => typeof arg === 'string' && arg.includes('we-drain-enqueue-clearance')))).toBe(false);
+  });
   it.each([true, false])('R212: setting %s controls enqueue with exact operator approval', enabled => {
     const read = vi.spyOn(completeComments, 'readCompletePrComments').mockReturnValue([
       { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: operator -->` },
@@ -636,9 +648,11 @@ describe('merge-ai-prs hook wiring', () => {
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs'), 'utf8');
   it('enqueue returns inside the land lock BEFORE the merge API call', () => {
     const lock = src.slice(src.indexOf('const landLock = withLandWriteLock('), src.indexOf('if (landLock.contended'));
-    const enq = lock.indexOf('if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(');
+    const enq = lock.indexOf('if (mergeStrategy.enqueues(c.repo)) return enqueueWithSameHeadGuard(c, traceHeadSha,');
+    const merge = lock.indexOf('mergePr(');
     expect(enq).toBeGreaterThan(-1);
-    expect(enq).toBeLessThan(lock.indexOf('mergePr('));
+    expect(merge).toBeGreaterThan(-1);
+    expect(enq).toBeLessThan(merge);
   });
   it('a queued PR is never recorded as merged by the cascade', () => {
     const i = src.indexOf("if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find");
