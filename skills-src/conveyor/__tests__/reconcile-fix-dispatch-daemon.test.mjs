@@ -1891,6 +1891,10 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     expect(exec.mock.calls[0][0]).toBe('gh');
     expect(exec.mock.calls[0][1].join(' ')).toMatch(/updatedAt/);
     expect([...out.keys()]).toEqual([7]);
+    // A required check flipping red to green must change the fingerprint even when nothing else does.
+    const at = (conclusion) => readPlanFingerprints('we', { exec: () => JSON.stringify([{ ...rows[0],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion }] }]) }).get(7);
+    expect(at('FAILURE')).not.toBe(at('SUCCESS'));
     expect(() => readPlanFingerprints('we', { exec: () => JSON.stringify([{ number: 7 }]) })).toThrow(/unreadable/);
   });
 

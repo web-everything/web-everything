@@ -733,9 +733,11 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
 /** How long (ms) a pass-local reconcile plan may be reused. Older than this, the next phase recomputes. */
 export const RECONCILE_PLAN_MAX_AGE_MS = 15 * 60 * 1000;
 
-/** Stable per-PR fingerprint of everything a phase's decision reads live: head, draft, labels, last activity. */
+/** Stable per-PR fingerprint of everything a phase's decision reads live: head, draft, merge state, labels, check state, last activity. */
 function prFingerprint(pr) {
-  return JSON.stringify([pr.headRefOid, pr.isDraft, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), pr.updatedAt]);
+  const checks = (pr.statusCheckRollup ?? []).map((c) => [c?.name ?? c?.context ?? null, c?.workflowName ?? null, c?.status ?? c?.state ?? null,
+    c?.conclusion ?? null, c?.completedAt ?? c?.startedAt ?? null]).map((row) => JSON.stringify(row)).sort();
+  return JSON.stringify([pr.headRefOid, pr.isDraft, pr.mergeStateStatus ?? null, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), checks, pr.updatedAt]);
 }
 
 /**
@@ -745,7 +747,7 @@ function prFingerprint(pr) {
  */
 export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThrottled(...args) } = {}) {
   // A wrapper `exec` (not the throttled function itself) makes defaultReadOpenPrs skip the shared snapshot.
-  const rows = defaultReadOpenPrs({ exec, repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt'] });
+  const rows = defaultReadOpenPrs({ exec, repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt', 'mergeStateStatus'] });
   if (!Array.isArray(rows) || rows.some((pr) => !pr || typeof pr.updatedAt !== 'string')) throw new Error('plan fingerprint unreadable');
   return new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
 }
