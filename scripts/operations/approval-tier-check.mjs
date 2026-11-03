@@ -8,7 +8,7 @@ import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { checkPr, reviewed, latestAudit, matchesGlob } from './d-r379-check.mjs';
+import { checkPr, reviewed, latestAudit, matchesGlob, validateSettings as validatePathSettings } from './d-r379-check.mjs';
 import { createCheckDeps } from './d-r379-check-io.mjs';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 
@@ -31,7 +31,7 @@ export function validateSettings(s) {
     requireFact(typeof value === 'boolean', 'invalid approval setting boolean');
   }
   for (const list of [s.alwaysHuman?.pathGlobs, s.alwaysHuman?.categories, s.securityCriticalGlobs,
-    elevated.rules, emergency?.knownWontSelfResolveKinds, emergency?.neverEmergencyApprovable]) {
+    s.preExistingException?.requiredPhrases, elevated.rules, emergency?.knownWontSelfResolveKinds, emergency?.neverEmergencyApprovable]) {
     requireFact(Array.isArray(list) && list.length > 0 && list.length <= 1000
       && list.every(v => text(v) && v.length <= 4096), 'invalid or oversized approval setting list');
   }
@@ -71,11 +71,13 @@ function findingCards(line) {
 }
 
 /** Conservative R455 classifier: every named file must be outside the net diff. */
-export function classifyFindings(findings, netDiffPaths) {
+export function classifyFindings(findings, netDiffPaths, requiredPhrases) {
   // This prose tokenizer cannot preserve whitespace inside filenames. If the
   // diff contains one, split fragments cannot prove a finding is outside it;
   // refuse the R455 exception and require operator review instead.
-  if (!Array.isArray(findings) || !findings.length || findings.some(line => !text(line))
+  if (!Array.isArray(requiredPhrases) || !requiredPhrases.length || requiredPhrases.length > 1000
+    || requiredPhrases.some(phrase => !text(phrase) || phrase.length > 4096)
+    || !Array.isArray(findings) || !findings.length || findings.some(line => !text(line))
     || netDiffPaths.some(path => /\s/.test(path))) {
     return { status: 'UNKNOWN', securityInDiff: false };
   }
@@ -91,8 +93,9 @@ export function classifyFindings(findings, netDiffPaths) {
       || paths.some(path => netDiffPaths.includes(path));
     securityInDiff ||= inDiff && /security|secret|credential/i.test(line);
     if (!paths.length || parsed.includes(null) || /[\x00-\x1f\x7f-\x9f]/.test(line)) status = 'UNKNOWN';
-    else if (status !== 'UNKNOWN' && (inDiff || !/\bpre-existing\b/i.test(line)
-      || !findingCards(line).length || /\b(?:relies|depends|now\s+exposes|newly)\b/i.test(line))) status = 'FAIL';
+    else if (status !== 'UNKNOWN' && (inDiff
+      || !requiredPhrases.every(phrase => line.toLowerCase().includes(phrase.toLowerCase()))
+      || !findingCards(line).length)) status = 'FAIL';
   }
   return { status, securityInDiff };
 }
@@ -174,7 +177,7 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     const settings = validateSettings(await deps.readApprovalSettings());
     // Cache promises, including failures: checkPr and reviewed must see identical evidence.
     const snapshot = { ...deps };
-    for (const key of ['readPr', 'fetchNetDiff', 'readLabels', 'readReviewLedger', 'readAudits', 'readLabelEvents']) {
+    for (const key of ['readSettings', 'readPr', 'fetchNetDiff', 'readLabels', 'readReviewLedger', 'readAudits', 'readLabelEvents']) {
       let promise;
       snapshot[key] = (...args) => promise ??= Promise.resolve().then(() => deps[key](...args));
     }
@@ -204,7 +207,7 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     const shape = await deps.readShape(facts.netDiffPaths);
     requireFact(typeof shape?.humanRequired === 'boolean', 'shape humanRequired unknown');
     const classification = audit.verdict === 'WEAKENED'
-      ? await (deps.classifyFindings ?? classifyFindings)(audit.findings, facts.netDiffPaths)
+      ? await (deps.classifyFindings ?? classifyFindings)(audit.findings, facts.netDiffPaths, settings.preExistingException.requiredPhrases)
       : { status: 'PASS', securityInDiff: false };
     requireFact(['PASS', 'FAIL'].includes(classification?.status)
       && typeof classification.securityInDiff === 'boolean', 'audit findings unclassifiable');
@@ -225,7 +228,7 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     if (!redTeamClear) reasons.push('red-team not clear on current head');
     if (alwaysHuman.length) reasons.push(`always-human paths: ${alwaysHuman.join(', ')}`);
     if (acceptance.status !== 'PASS') reasons.push(`acceptance/red-team failed: ${acceptance.evidence.join('; ')}`);
-    if (!auditPassing) reasons.push('audit failing: WEAKENED findings are not all pre-existing, outside the net diff and carded');
+    if (!auditPassing) reasons.push('audit failing: WEAKENED findings are not all explicitly pre-existing on main, unrelated to this change, outside the net diff and carded');
     for (const c of conditions) if (c.status === 'FAIL') reasons.push(`condition ${c.id} failed: ${c.evidence.join('; ')}`);
     if (shape.humanRequired) reasons.push('shape humanRequired=true (R454)');
     let emergencyEligible = false;
@@ -254,6 +257,14 @@ export async function checkApprovalTier(pr, deps, repo = REPO) {
     }
     const elevated = settings.tiers.elevated;
     const blockers = [];
+    // Condition 4 stops at protected hits. Independently account for every path
+    // before elevating so a protected file cannot hide unrelated runtime changes.
+    const pathPolicy = validatePathSettings(await snapshot.readSettings());
+    const unclassified = facts.netDiffPaths.filter(path =>
+      ![...settings.securityCriticalGlobs, ...pathPolicy.protectedPaths].some(glob => matchesGlob(path, glob))
+      && (!pathPolicy.harmlessPaths.some(glob => matchesGlob(path, glob))
+        || pathPolicy.enforcementTrees.some(glob => matchesGlob(path, glob))));
+    if (unclassified.length) blockers.push(`unclassified paths require human review: ${unclassified.join(', ')}`);
     if (elevated.killSwitch) blockers.push('elevated kill-switch enabled');
     if (elevated.judge.requireDifferentModelFamilyFromAuthor) {
       const author = await deps.readAuthorModelFamily?.(pr), judge = await deps.readJudgeModelFamily?.(pr);

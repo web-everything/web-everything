@@ -302,7 +302,7 @@ export function matchesGlob(path, glob) {
     && new RegExp(globToRegExp(glob).source, 's').test(path);
 }
 
-function validateSettings(settings) {
+export function validateSettings(settings) {
   if (settings?.reviewedSafePaths !== undefined
     && (!Array.isArray(settings.reviewedSafePaths) || settings.reviewedSafePaths.length !== 0)) {
     throw new Error('reviewedSafePaths is no longer supported; human review required');

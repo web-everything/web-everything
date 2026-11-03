@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { checkApprovalTier, classifyFindings, createApprovalDeps, main } from '../approval-tier-check.mjs';
+import { checkApprovalTier, classifyFindings as classify, createApprovalDeps, main } from '../approval-tier-check.mjs';
 import { buildVerdictRecord } from '../../lib/verdict-ledger.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 
@@ -9,7 +9,8 @@ const repo = 'web-everything/web-everything', head = '6'.repeat(40), base = 'a'.
 const load = name => JSON.parse(readFileSync(fileURLToPath(new NodeURL(`../../settings/${name}.json`, import.meta.url)), 'utf8'));
 const policy = load('approval-tiers'), pathsPolicy = load('d-r379-protected-paths');
 const clear = { head, base, at: '2026-11-02T10:00:00Z', verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH, findings: [] };
-const oldFinding = 'blocks/old.ts:12 pre-existing on main; tracked in backlog #123';
+const classifyFindings = (findings, paths) => classify(findings, paths, policy.preExistingException?.requiredPhrases);
+const oldFinding = 'blocks/old.ts:12 pre-existing on main; unrelated to this change; tracked in backlog #123';
 function deps({ paths = ['docs/examples/example.md'], humanRequired = false, settings = policy, audit = clear, ...extra } = {}) {
   return {
     readPr: async () => ({ headRefOid: head, baseRefName: 'main', title: 'Fix #6244', body: '' }),
@@ -35,7 +36,7 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     expect(classifyFindings(findings, [path]).status).not.toBe('PASS');
     expect((await check(deps({ paths: [path], audit: weakened(findings) }))).approvableBy).toBe('operator');
   });
-  it.each([false, true])('red-team evidence is required on the current head (elevated=%s)', async humanRequired => {
+  it.each([false, true])('red-team:clear label cannot replace current-head evidence (elevated=%s)', async humanRequired => {
     for (const [evidence, tier] of [[null, 'unknown'], [{ head: base, result: 'clear' }, 'human'],
       [{ head, result: 'held' }, 'human'], [{ head }, 'human']]) {
       const readRedTeam = vi.fn(async () => evidence);
@@ -46,13 +47,10 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
       expect(await main(['--pr=6244', `--repo=${repo}`], deps({ humanRequired, readRedTeam }))).toBe(2);
     }
   });
-  it('R455 requires an existing card and rejects reliance on a pre-existing weakness', async () => {
+  it('R455 requires an existing card', async () => {
     const cardExists = vi.fn(async () => false);
     expect((await check(deps({ audit: weakened([oldFinding]), cardExists }))).tier).toBe('human');
     expect(cardExists).toHaveBeenCalledWith('123');
-    for (const phrase of ['relies on', 'depends on', 'now exposes', 'newly exposes']) {
-      expect(classifyFindings([`${oldFinding}; change ${phrase} weakness`], ['docs/examples/example.md']).status).not.toBe('PASS');
-    }
     expect((await check(deps({ audit: weakened([oldFinding]), cardExists: async () => { throw Error('unreadable cards'); } }))).tier).toBe('unknown');
   });
   it.each([
@@ -148,10 +146,52 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
     ['same family', { readExplicitAsk: async () => ask, readJudgeModelFamily: async () => 'author' }, 'human'],
     ['unknown family', { readExplicitAsk: async () => ask, readJudgeModelFamily: undefined }, 'human'],
   ])('%s => %s', async (_name, extra, tier) => {
-    const r = await check(deps({ paths: ['docs/agent/platform-decisions.md', 'scripts/example-guard.mjs'], ...extra }));
+    const r = await check(deps({ paths: ['standards/example.test.ts', 'scripts/example-guard.mjs'], ...extra }));
     expect(r.tier).toBe(tier);
     if (tier === 'human') expect(r.reasons.length).toBeGreaterThan(0);
   });
+  it.each(['scripts/example-guard.mjs', 'tests/example.spec.ts', 'custom/protected.mjs'])
+    ('mixed diff with protected %s names every unknown runtime path and requires human review', async protectedPath => {
+      const readSettings = vi.fn(async () => ({ ...pathsPolicy,
+        protectedPaths: [...pathsPolicy.protectedPaths, 'custom/protected.mjs'] }));
+      const r = await check(deps({ paths: [protectedPath, 'blocks/runtime.ts', 'scripts/runtime.mjs'], readSettings }));
+      expect(r).toMatchObject({ tier: 'human', approvableBy: 'operator' });
+      expect(r.reasons.join(' ')).toContain('blocks/runtime.ts');
+      expect(r.reasons.join(' ')).toContain('scripts/runtime.mjs');
+      expect(readSettings).toHaveBeenCalledTimes(1);
+    });
+  it('an explicit direction ask cannot exempt an unclassified direction path', async () => {
+    const r = await check(deps({ paths: ['docs/agent/platform-decisions.md', 'scripts/example-guard.mjs'],
+      readExplicitAsk: async () => ask }));
+    expect(r.tier).toBe('human');
+    expect(r.reasons.join(' ')).toContain('docs/agent/platform-decisions.md');
+  });
+  it('elevates protected paths mixed only with harmless docs, tests and images', async () => {
+    expect((await check(deps({ paths: ['scripts/example-guard.mjs', 'docs/examples/example.md',
+      'tests/example.spec.ts', 'assets/example.png'] }))).tier).toBe('elevated');
+  });
+  it.each(['pre-existing on main', 'unrelated to this change', 'pre-existing; this patch uses it',
+    'pre-existing on main; this patch builds on it', 'pre-existing on main; needed for this change'])
+    ('R455 refuses incomplete independence evidence: %s', async prose => {
+      const finding = `blocks/old.ts:12 ${prose}; backlog #123`;
+      expect(classifyFindings([finding], ['docs/examples/example.md']).status).toBe('FAIL');
+      expect(classifyFindings([oldFinding, finding], ['docs/examples/example.md']).status).toBe('FAIL');
+      expect((await check(deps({ audit: weakened([oldFinding, finding]) }))).tier).toBe('human');
+    });
+  it('R455 uses every configured required phrase', async () => {
+    const settings = structuredClone(policy);
+    settings.preExistingException = { requiredPhrases: ['pre-existing on main', 'unrelated to this change', 'independently confirmed'] };
+    expect((await check(deps({ settings, audit: weakened([oldFinding]) }))).tier).toBe('human');
+    expect((await check(deps({ settings, audit: weakened([`${oldFinding}; independently confirmed`]) }))).tier).toBe('standard');
+  });
+  it.each([undefined, {}, { requiredPhrases: [] }, { requiredPhrases: [''] },
+    { requiredPhrases: Array(1001).fill('phrase') }, { requiredPhrases: ['x'.repeat(4097)] }])
+    ('R455 invalid or oversized phrase settings require operator repair (case %#)', async preExistingException => {
+      const settings = { ...policy, preExistingException };
+      const d = deps({ settings });
+      expect(await main(['--pr=6244', `--repo=${repo}`, '--json'], d)).toBe(2);
+      expect(JSON.parse(d.stdout.mock.calls[0][0]).reasons.join(' ')).toContain('operator');
+    });
   it('elevates a guard path with head-bound red-team acceptance', async () => {
     expect((await check(deps({ paths: ['scripts/example-guard.mjs'] }))).tier).toBe('elevated');
     expect((await check(deps({ paths: ['scripts/example-guard.mjs'], readLabels: async () => ['review:accepted'] }))).tier).toBe('human');
@@ -238,12 +278,12 @@ describe('approval tiers (synthetic, in-memory evidence)', () => {
 describe('finding classification and default shape IO', () => {
   it.each(['a/blocks/old.ts', 'b/blocks/old.ts', './blocks/old.ts'])
     ('R455 accepts supported outside-diff path form %s', path => {
-      expect(classifyFindings([`${path}:12 pre-existing on main; backlog #123`],
+      expect(classifyFindings([`${path}:12 pre-existing on main; unrelated to this change; backlog #123`],
         ['docs/examples/example.md']).status).toBe('PASS');
     });
   it('R455 retains real a/ and b/ directories when checking Git-prefix ambiguity', () => {
     for (const path of ['a/blocks/old.ts', 'b/blocks/old.ts']) {
-      expect(classifyFindings([`${path}:12 pre-existing on main; backlog #123`], [path]).status).toBe('FAIL');
+      expect(classifyFindings([`${path}:12 pre-existing on main; unrelated to this change; backlog #123`], [path]).status).toBe('FAIL');
     }
   });
   it.each([

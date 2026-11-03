@@ -28,6 +28,7 @@
       "**/*pricing*", "**/*licens*", "**/monetization*/**"
     ]
   },
+  "preExistingException": { "requiredPhrases": ["pre-existing on main", "unrelated to this change"] },
   "securityCriticalGlobs": ["scripts/**/*guard*", "scripts/**/*gate*", "scripts/**/*verdict*", "scripts/**/*approval*", "scripts/**/*label*", ".claude/hooks/**", "scripts/hooks/**", "scripts/review-set-label*"],
   "emergency1": {
     "_doc": "R458: ONE emergency definition. Blocking AND won't self-resolve (known now, or unknown after fallback).",
