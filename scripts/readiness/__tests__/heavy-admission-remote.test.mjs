@@ -317,6 +317,8 @@ describe('adaptLegacyRemoteResult', () => {
     'forge-unreachable',
     'copy-failed',
     'ignored-test-file',
+    'ignored-dependency',
+    'unresolvable-dynamic-import',
     'invalid-diff-coverage-base',
     'diff-coverage-base-unavailable',
     'coverage-report-not-portable',
@@ -416,13 +418,15 @@ describe('runWithRemoteDecision', () => {
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
   });
 
-  it.each(['not-started','cancelled'])('records exactly one structured fallback for %s', async mode => {
-    const f = fixture({result:{mode,terminated:true,reason:'ignored-test-file',detail:'hidden.test.mjs'}});
+  it.each(['not-started','cancelled'].flatMap(mode=>
+    ['ignored-test-file','ignored-dependency','unresolvable-dynamic-import'].map(reason=>[mode,reason])))
+  ('records exactly one structured fallback for %s / %s', async (mode, reason) => {
+    const f = fixture({result:{mode,terminated:true,reason,detail:'hidden.test.mjs'}});
     const now = Date.now();
     expect(await runWithRemoteDecision({...f,clock:()=>now})).toEqual({handled:false});
     const lines = readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason:'ignored-test-file',
+    expect(JSON.parse(lines[0])).toEqual({ts:new Date(now).toISOString(),reason,
       detail:'hidden.test.mjs',lane:'fixture-checkout',kind:'files'});
   });
 

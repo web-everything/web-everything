@@ -2187,13 +2187,27 @@ Remote Vitest argv compatibility belongs in the client: `normalizeRemoteArgv` re
 the local `./` file prefix and worker controls before Forge validation and dispatch.
 Keep the server allowlist strict and local fallback argv unchanged. The producer-backed
 regressions live in `scripts/readiness/__tests__/remote-argv-allowlist.test.mjs`.
-Explicit selections may omit ignored tests only when their execution dependencies
-are certified. Vitest/Vite configuration can load files outside selected-test imports
-through `setupFiles` and `globalSetup`; until that graph is certified, configuration
-presence plus ignored tests keeps local admission (`unresolved-test-dependency`).
-Package imports (`#name`), package self-references and other non-relative specifiers
-also keep local admission while ignored tests exist: relative traversal cannot
-certify their resolved graph. Only Node built-ins may bypass that traversal.
+Ignored test files outside `node_modules`, `.git` and `.claude` ship through the ordinary
+manifest safety checks. Ignored non-test files never ship, including coverage JSON.
+Selected test source closures are parsed before transport: every relative literal resolution
+candidate (exact, supported extension, TypeScript extension substitution and directory index)
+is checked, without first-match shortcuts. An ignored non-test dependency refuses with `ignored-dependency`; unresolved
+dynamic import/require, unsupported createRequire use, unreadable source, invalid syntax
+or a closure over the 4 MiB/100,000-source bounds refuses with
+`unresolvable-dynamic-import`. Both reasons preserve local admission and structured fallback
+logging. When any ignored non-test files coexist with a Vite/Vitest configuration or
+workspace file, configuration execution dependencies are not certified: refuse with
+`unresolvable-dynamic-import` and the repo-relative configuration path before transport.
+Do not treat selected-test import closure as proof about configuration imports, `setupFiles`
+or `globalSetup`. Non-relative specifiers also lack dependency certification: when
+ignored non-test files exist, refuse package imports (`#helper`), package self-references
+and other non-builtin specifiers with `unresolvable-dynamic-import` and the importing
+source's repo-relative path. Only actual Node builtins (checked with `isBuiltin`, including
+`node:`-only builtins) bypass that fallback; an arbitrary `node:` prefix is insufficient.
+Keep the named package-import/self-reference refusal and builtin-control regressions. Preserve the named configuration matrix and `.js` → `.ts`/`.tsx`,
+`.jsx` → `.tsx`, `.mjs` → `.mts`, `.cjs` → `.cts` substitution matrix in
+`remote-exec.test.mjs`. Unselected stale generated tests still ship without forcing
+dependency traversal when this conservative configuration boundary does not apply.
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
@@ -3385,13 +3399,10 @@ or concurrent writes: hash those leaves normally, and use fresh stat/mode and ba
 checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
 warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
 read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
-Outside dependency/Git internals, ignored test-shaped files force local fallback, including
-files under wholly ignored build directories: Git ignore evidence does not prove exclusion
-from the test runner. The named
-`refuses runnable scripts/build tests ignored by …` cases cover `.gitignore` and
-`.git/info/exclude` for full and delta manifests; `remote-exec.test.mjs`'s
-`falls back before transport for a whole-directory ignored test` table pins remote refusal.
-Run this fixture and the affected Forge tests through heavy admission.
+Outside dependency/Git internals, ignored test-shaped files ship in full and delta
+manifests with the same safety checks as tracked tests. Ignored status never certifies
+that Vitest cannot execute or import a file. Keep shipping and specific unsafe-file
+refusal cases in `remote-exec.test.mjs`; run affected tests through heavy admission.
 
 `forge-manifest-parity.test.mjs` checks full and delta inventories against an independent
 filesystem oracle, including hostile `GIT_*` environments, omitted tests, memory bridges,
@@ -3420,7 +3431,7 @@ and pin `-c core.fsmonitor=false` on every manifest Git command after binding.
 Remote discovery may overlap reachability, HEAD and base discovery, but drain every
 speculative process before returning fallback. `buildManifest` always lists ignored files
 fresh after base-manifest retrieval; ignored tests created during retrieval must still
-refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
+ship or refuse with their specific safety reason. Capture all base lstat metadata before diff/status, attributes
 and index flags. Metadata capture uses at most 16 workers and drains failures before
 full scanning. Manifest timing substages appear inside the existing stage report;
 `inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
@@ -3708,7 +3719,7 @@ ignored byte inventory; it still refuses untracked symlinks, missing projections
 for non-ignored regular files, and policy-excluded source leaves, even when ignored.
 `forge-manifest-parity.test.mjs` rows 20–25 and 31 cover those boundaries for full and
 delta manifests, including ignored runtime JSON beside a `node_modules/.bin` symlink
-and the earlier `ignored-test-file` refusal. Row 20 omits ignored runtime data at the
+and test-leaf shipping through the ordinary safety checks. Row 20 omits ignored runtime data at the
 excluded `.claude/skills` alias only when the leaf is not source code and the remainder
 after the link prefix is not policy-excluded; row 31 retains omission parity through an allowed alias.
 Check every projected alias before skipping an ignored leaf, including nested link
@@ -3726,24 +3737,18 @@ workspace selection or include patterns omit `b.test.mjs` from `globTestFiles(fi
 Static imports, re-exports, dynamic imports and imports through helpers all need the
 dependency bytes at execution time. Discovery alone is insufficient evidence for omission.
 
-Full and delta manifest admission refuse `ignored-test-file` with the path for unknown
-selection (whole-suite runs), selected ignored tests, and ignored tests whose top-level
-directory contains any Git-tracked file. Root-level ignored tests also refuse. Only an
-unselected ignored test inside a top-level directory with zero tracked files may be omitted
-as generated output (for example `_site/` or `_site-visual-fixtures/`). The complete Git index,
-not the transport inventory, establishes that directory boundary; unavailable index evidence
-keeps execution local. Do not traverse imports or use test discovery to relax this rule.
-This directory rule does not establish execution dependency closure: a selected test can
-import an omitted ignored test beneath a generated directory. Such imports may fail remotely
-or be caught by the test. The named generated-directory import regression pins this deliberate
-policy boundary for full and delta manifests; selecting the ignored test itself still refuses.
-Requiring reachability-based refusal would change this policy and must not be added as an
-import-traversal repair.
+Full and delta manifests ship every ignored test-shaped file outside `node_modules`
+and `.git`/`.claude`, including stale `_site/` tests, root-level tests and tests beside tracked
+files. They enter the ordinary inventory and use the same hashing, exclusion, symlink,
+size and inventory bounds as other leaves. No directory-tracking heuristic, test
+discovery or import traversal establishes permission to omit them.
 
-The independent filesystem walk still refuses unshipped tests (`unshipped-test-file`) and
-ignored leaves projected into test paths by tracked directory aliases (`unshipped-symlink`).
-Keep full/delta tests for omitted generated tests and pre-transport refusals for selected
-ignored tests, unknown selection and ignored tests beside tracked files.
+The independent filesystem walk still refuses unshipped tests (`unshipped-test-file`),
+unsafe symlinks (`unshipped-symlink`) and walk-limit violations (`manifest-walk-limit`).
+Policy-excluded tests retain `excluded-source-file`; other existing bounds retain their
+specific fallback. Ignored status must not mask the actual safety refusal.
+Keep full/delta and transport tests for stale generated tests, a real remote execution
+that imports an ignored test, and pre-transport refusals for selected unsafe tests.
 
 Remote argv normalization only removes a leading `./` from Vitest file arguments. Isolated
 verify-lane and verify-base-rerun retries are local-only by design: retain `--maxWorkers=1`,
