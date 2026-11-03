@@ -29,7 +29,7 @@ export default {
   },
   async run({ log } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-stale-candidate-'));
-    const git = (cwd, ...a) => execFileSync('git', ['-c', 'user.name=soak', '-c', 'user.email=soak@example.invalid', ...a], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const git = (cwd, ...a) => execFileSync('git', ['-c', 'user.name=soak', '-c', 'user.email=soak@example.invalid', ...a], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 });
     const violations = [];
     try {
       git(dir, 'init', '-q', '--bare', '-b', 'main', 'origin.git');
@@ -46,7 +46,7 @@ export default {
       git(daemon, 'fetch', '-q', 'origin');
       git(daemon, 'merge', '-q', '--no-edit', 'origin/lane/a'); // the stale candidate: has A, lacks B
       const realRun = (args, opts) => {
-        try { return { status: 0, stdout: execFileSync('git', args, { ...opts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; }
+        try { return { status: 0, stdout: execFileSync('git', args, { ...opts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }) }; }
         catch (e) { return { status: e.status ?? 1, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
       };
       const quiet = { error() {}, log() {}, warn() {} };
